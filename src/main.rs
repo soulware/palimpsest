@@ -27,6 +27,18 @@ enum Command {
         image: String,
         #[arg(long, default_value_t = 10809)]
         port: u16,
+        /// Write a boot trace file on disconnect (for use with cold-boot)
+        #[arg(long)]
+        save_trace: Option<String>,
+    },
+    /// Combine a boot trace with cross-image dedup + delta to estimate cold-boot fetch cost
+    ColdBoot {
+        image1: String,
+        image2: String,
+        #[arg(long)]
+        trace: String,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
     },
     /// Extract kernel and initrd from an ext4 image's /boot directory
     ExtractBoot {
@@ -45,8 +57,17 @@ fn main() {
                 .expect("extents failed");
         }
 
-        Command::Serve { image, port } => {
-            nbd::run(&image, port).expect("NBD server error");
+        Command::Serve { image, port, save_trace } => {
+            nbd::run(&image, port, save_trace.as_deref()).expect("NBD server error");
+        }
+
+        Command::ColdBoot { image1, image2, trace, level } => {
+            extents::run_cold_boot(
+                Path::new(&image1),
+                Path::new(&image2),
+                Path::new(&trace),
+                level,
+            ).expect("cold-boot analysis failed");
         }
 
         Command::ExtractBoot { image, out_dir } => {

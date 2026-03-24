@@ -147,6 +147,193 @@ pub struct ExtentEntry {
     pub byte_count: u64,
 }
 
+// --- extent tree (with logical block numbers, for correct file ordering) ---
+
+// Like collect_extents but also captures the logical block number of each leaf,
+// so callers can sort extents into logical file order before hashing.
+fn collect_extents_with_logical(
+    data: &[u8],
+    f: &mut File,
+    sb: &Superblock,
+    out: &mut Vec<(u32, u64, u16)>, // (logical_block, phys_start_block, num_blocks)
+) -> io::Result<()> {
+    if data.len() < EXTENT_ENTRY_SIZE {
+        return Ok(());
+    }
+    if u16le(data, 0) != EXTENT_MAGIC {
+        return Ok(());
+    }
+
+    let num_entries = u16le(data, 2) as usize;
+    let depth = u16le(data, 6);
+
+    for i in 0..num_entries {
+        let off = (i + 1) * EXTENT_ENTRY_SIZE;
+        if off + EXTENT_ENTRY_SIZE > data.len() {
+            break;
+        }
+        let entry = &data[off..off + EXTENT_ENTRY_SIZE];
+
+        if depth == 0 {
+            let logical = u32le(entry, 0);
+            let len = u16le(entry, 4) & 0x7fff;
+            let phys = hilo64(u16le(entry, 6) as u32, u32le(entry, 8));
+            out.push((logical, phys, len));
+        } else {
+            let child = hilo64(u16le(entry, 8) as u32, u32le(entry, 4));
+            let mut child_data = vec![0u8; sb.block_size as usize];
+            f.seek(SeekFrom::Start(child * sb.block_size))?;
+            f.read_exact(&mut child_data)?;
+            collect_extents_with_logical(&child_data, f, sb, out)?;
+        }
+    }
+
+    Ok(())
+}
+
+// Per-inode data: full-file hash (for joining with ext4_view paths) plus
+// per-extent disk locations and hashes.
+struct InodeExtents {
+    full_hash: blake3::Hash,
+    extents: Vec<(u64, u64, blake3::Hash)>, // (start_byte, byte_count, extent_hash)
+}
+
+// Scan all regular-file inodes, grouping extents by inode and computing both
+// a per-extent hash and the full-file hash (in logical block order).
+fn scan_file_extents_with_full_hash(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeExtents>> {
+    let mut results = Vec::new();
+    let mut inode_buf = vec![0u8; sb.inode_size];
+
+    for group in 0..sb.num_block_groups {
+        let table_block = inode_table_block(f, sb, group)?;
+        let table_offset = table_block * sb.block_size;
+
+        for idx in 0..sb.inodes_per_group {
+            let inode_offset = table_offset + idx as u64 * sb.inode_size as u64;
+            f.seek(SeekFrom::Start(inode_offset))?;
+            if f.read_exact(&mut inode_buf).is_err() { break; }
+
+            let i_mode = u16le(&inode_buf, 0x00);
+            if (i_mode & S_IFMT) != S_IFREG { continue; }
+            if u16le(&inode_buf, 0x1a) == 0 { continue; }
+            let i_flags = u32le(&inode_buf, 0x20);
+            if (i_flags & INODE_FLAG_EXTENTS) == 0 { continue; }
+            let i_size = hilo64(u32le(&inode_buf, 0x6c), u32le(&inode_buf, 0x04));
+            if i_size == 0 { continue; }
+
+            let i_block = inode_buf[0x28..0x28 + 60].to_vec();
+            let mut raw: Vec<(u32, u64, u16)> = Vec::new();
+            collect_extents_with_logical(&i_block, f, sb, &mut raw)?;
+            if raw.is_empty() { continue; }
+
+            raw.sort_by_key(|&(logical, _, _)| logical);
+
+            let mut full_hasher = blake3::Hasher::new();
+            let mut extent_entries = Vec::new();
+            let mut bytes_remaining = i_size;
+
+            for (_, phys_block, num_blocks) in raw {
+                if bytes_remaining == 0 { break; }
+                let allocated = num_blocks as u64 * sb.block_size;
+                let byte_count = allocated.min(bytes_remaining);
+                bytes_remaining = bytes_remaining.saturating_sub(byte_count);
+
+                let start_byte = phys_block * sb.block_size;
+                let mut buf = vec![0u8; byte_count as usize];
+                f.seek(SeekFrom::Start(start_byte))?;
+                f.read_exact(&mut buf)?;
+
+                full_hasher.update(&buf);
+                extent_entries.push((start_byte, byte_count, blake3::hash(&buf)));
+            }
+
+            results.push(InodeExtents { full_hash: full_hasher.finalize(), extents: extent_entries });
+        }
+    }
+
+    Ok(results)
+}
+
+// Build a map from extent_hash → (file_path, start_byte, byte_count) for the given image.
+// The join key is the full-file hash: raw scan computes it in logical block order;
+// enumerate_file_hashes computes it via ext4_view (same bytes, same hash for unfragmented files).
+fn build_extent_path_map(image: &Path) -> io::Result<HashMap<blake3::Hash, (String, u64, u64)>> {
+    let mut f = File::open(image)?;
+    let sb = Superblock::read(&mut f)?;
+    let inode_data = scan_file_extents_with_full_hash(&mut f, &sb)?;
+
+    let file_hashes = enumerate_file_hashes(image)?;
+    let hash_to_path: HashMap<blake3::Hash, String> =
+        file_hashes.into_iter().map(|(path, (hash, _))| (hash, path)).collect();
+
+    let mut map = HashMap::new();
+    for inode in inode_data {
+        let path = hash_to_path.get(&inode.full_hash).cloned().unwrap_or_default();
+        for (start_byte, byte_count, ext_hash) in inode.extents {
+            map.insert(ext_hash, (path.clone(), start_byte, byte_count));
+        }
+    }
+    Ok(map)
+}
+
+// --- boot trace I/O ---
+
+pub struct TraceEntry {
+    pub hash: blake3::Hash,
+    pub start_byte: u64,
+    pub byte_count: u64,
+}
+
+pub fn save_trace(path: &Path, entries: &[TraceEntry]) -> io::Result<()> {
+    let mut out = String::from("# palimpsest-boot-trace v1\n");
+    for e in entries {
+        out.push_str(&format!("{} {} {}\n", e.hash.to_hex(), e.start_byte, e.byte_count));
+    }
+    std::fs::write(path, out)
+}
+
+fn load_trace(path: &Path) -> io::Result<Vec<TraceEntry>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() { continue; }
+        let mut parts = line.split_whitespace();
+        let hash_str = parts.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hash"))?;
+        let start_byte: u64 = parts.next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad start_byte"))?;
+        let byte_count: u64 = parts.next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad byte_count"))?;
+        let hash = hex_to_hash(hash_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad hash"))?;
+        entries.push(TraceEntry { hash, start_byte, byte_count });
+    }
+    Ok(entries)
+}
+
+fn hex_to_hash(s: &str) -> Option<blake3::Hash> {
+    if s.len() != 64 { return None; }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        bytes[i] = (hi << 4) | lo;
+    }
+    Some(blake3::Hash::from(bytes))
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 // Reads every regular-file inode in the image and yields its extents.
 // Returns (entries, block_size).
 fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<ExtentEntry>> {
@@ -557,4 +744,164 @@ fn scan_inode(path: &Path) -> io::Result<(Vec<ExtentEntry>, u64)> {
     let block_size = sb.block_size;
     let entries = scan_file_extents(&mut f, &sb)?;
     Ok((entries, block_size))
+}
+
+// --- cold boot analysis ---
+
+pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32) -> io::Result<()> {
+    println!("Loading boot trace from {} ...", trace_path.display());
+    let trace = load_trace(trace_path)?;
+    println!("  {} extents in trace", trace.len());
+
+    println!("Building image2 extent → path map ...");
+    let extent_to_file = build_extent_path_map(image2)?;
+
+    println!("Scanning image2 total size ...");
+    let total_image2_bytes: u64 = {
+        let mut f = File::open(image2)?;
+        let sb = Superblock::read(&mut f)?;
+        scan_file_extents(&mut f, &sb)?.iter().map(|e| e.byte_count).sum()
+    };
+
+    println!("Scanning image1 extent hashes ...");
+    let image1_hashes: std::collections::HashSet<blake3::Hash> = {
+        let mut f = File::open(image1)?;
+        let sb = Superblock::read(&mut f)?;
+        scan_file_extents(&mut f, &sb)?.iter().map(|e| e.hash).collect()
+    };
+
+    println!("Loading image1 filesystem ...");
+    let fs1 = Ext4::load_from_path(image1)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut image2_raw = File::open(image2)?;
+
+    let mut exact_count = 0usize;
+    let mut exact_bytes = 0u64;
+    let mut delta_count = 0usize;
+    let mut delta_raw_bytes = 0u64;
+    let mut delta_compressed_bytes = 0u64;
+    let mut new_count = 0usize;
+    let mut new_bytes = 0u64;
+    let mut unmapped = 0usize;
+    let mut total_boot_bytes = 0u64;
+
+    println!("Classifying {} boot extents ...", trace.len());
+    for entry in &trace {
+        if image1_hashes.contains(&entry.hash) {
+            exact_count += 1;
+            exact_bytes += entry.byte_count;
+            total_boot_bytes += entry.byte_count;
+            continue;
+        }
+
+        match extent_to_file.get(&entry.hash) {
+            None => {
+                unmapped += 1;
+            }
+            Some((path, _start, _len)) => {
+                total_boot_bytes += entry.byte_count;
+
+                if path.is_empty() {
+                    // extent belongs to a file we couldn't map to a path
+                    new_count += 1;
+                    new_bytes += entry.byte_count;
+                    continue;
+                }
+
+                let ext4_path = Ext4PathBuf::new(path);
+                match fs1.read(&ext4_path) {
+                    Ok(data1) => {
+                        let mut buf = vec![0u8; entry.byte_count as usize];
+                        image2_raw.seek(SeekFrom::Start(entry.start_byte))?;
+                        image2_raw.read_exact(&mut buf)?;
+
+                        let standalone = zstd::bulk::compress(&buf, level).unwrap_or_default();
+                        let dict_compressed = zstd::bulk::Compressor::with_dictionary(level, &data1)
+                            .ok()
+                            .and_then(|mut c| c.compress(&buf).ok())
+                            .unwrap_or_else(|| standalone.clone());
+
+                        delta_count += 1;
+                        delta_raw_bytes += entry.byte_count;
+                        // Take whichever is smaller — dict can sometimes be worse for tiny extents
+                        delta_compressed_bytes += dict_compressed.len().min(standalone.len()) as u64;
+                    }
+                    Err(_) => {
+                        // File is genuinely new in image2
+                        new_count += 1;
+                        new_bytes += entry.byte_count;
+                    }
+                }
+            }
+        }
+    }
+
+    let warm_host_fetch = delta_compressed_bytes + new_bytes;
+    let cold_host_fetch = exact_bytes + delta_compressed_bytes + new_bytes;
+
+    println!("\n=== Cold Boot Analysis ===");
+    println!("  image1: {}", image1.display());
+    println!("  image2: {}", image2.display());
+    println!("  trace:  {}", trace_path.display());
+    println!();
+
+    let boot_extents = trace.len() - unmapped;
+    println!(
+        "  Boot footprint:      {:>5} extents   {:>7.1} MB  ({:.1}% of {:.1} MB total image)",
+        boot_extents,
+        total_boot_bytes as f64 / MB,
+        100.0 * total_boot_bytes as f64 / total_image2_bytes.max(1) as f64,
+        total_image2_bytes as f64 / MB,
+    );
+    if unmapped > 0 {
+        println!("  Unmapped reads:      {:>5} extents             (metadata/journal — excluded)", unmapped);
+    }
+    println!();
+    println!(
+        "  Exact match (dedup): {:>5} extents   {:>7.1} MB  ({:.1}% of boot)",
+        exact_count, exact_bytes as f64 / MB,
+        100.0 * exact_bytes as f64 / total_boot_bytes.max(1) as f64,
+    );
+    if delta_count > 0 {
+        println!(
+            "  Delta-compressible:  {:>5} extents   {:>7.1} MB raw  →  {:.1} MB delta  ({:.1}% smaller)",
+            delta_count, delta_raw_bytes as f64 / MB, delta_compressed_bytes as f64 / MB,
+            100.0 * (1.0 - delta_compressed_bytes as f64 / delta_raw_bytes.max(1) as f64),
+        );
+    }
+    println!(
+        "  New (no prior):      {:>5} extents   {:>7.1} MB",
+        new_count, new_bytes as f64 / MB,
+    );
+
+    println!();
+    println!("  Fetch cost — warm host (deduped extents already in local SSD cache):");
+    println!(
+        "    {:.1} MB  vs  {:.1} MB boot footprint  ({:.1}% reduction from dedup + delta)",
+        warm_host_fetch as f64 / MB,
+        total_boot_bytes as f64 / MB,
+        100.0 * (1.0 - warm_host_fetch as f64 / total_boot_bytes.max(1) as f64),
+    );
+    println!("  Fetch cost — cold host (no local cache, fetch all from S3):");
+    println!(
+        "    {:.1} MB  vs  {:.1} MB boot footprint  ({:.1}% reduction from delta only)",
+        cold_host_fetch as f64 / MB,
+        total_boot_bytes as f64 / MB,
+        100.0 * (1.0 - cold_host_fetch as f64 / total_boot_bytes.max(1) as f64),
+    );
+
+    println!();
+    println!("  Combined saving vs naive full-image download ({:.1} MB):", total_image2_bytes as f64 / MB);
+    println!(
+        "    Warm host:  {:.1} MB  ({:.1}% reduction)  [demand-fetch × dedup × delta]",
+        warm_host_fetch as f64 / MB,
+        100.0 * (1.0 - warm_host_fetch as f64 / total_image2_bytes.max(1) as f64),
+    );
+    println!(
+        "    Cold host:  {:.1} MB  ({:.1}% reduction)  [demand-fetch × delta]",
+        cold_host_fetch as f64 / MB,
+        100.0 * (1.0 - cold_host_fetch as f64 / total_image2_bytes.max(1) as f64),
+    );
+
+    Ok(())
 }

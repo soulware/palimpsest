@@ -115,7 +115,7 @@ fn print_report(stats: &ReadStats, index: &ExtentIndex, image_size: u64) {
     let _ = std::fs::write(report_path(), &lines);
 }
 
-pub fn run(image_path: &str, port: u16) -> io::Result<()> {
+pub fn run(image_path: &str, port: u16, save_trace: Option<&str>) -> io::Result<()> {
     let image_size = std::fs::metadata(image_path)?.len();
 
     print!("Building extent index for {} ...", image_path);
@@ -135,6 +135,9 @@ pub fn run(image_path: &str, port: u16) -> io::Result<()> {
     println!("Connect QEMU with: -drive file=nbd://127.0.0.1:{},format=raw,if=virtio", port);
     println!("Send SIGUSR1 (kill -USR1 {}) for a mid-boot report", std::process::id());
     println!("Report file:  {}", report_path());
+    if let Some(t) = save_trace {
+        println!("Boot trace:   {} (written on disconnect)", t);
+    }
     println!("Waiting for connection...\n");
 
     for stream in listener.incoming() {
@@ -154,6 +157,17 @@ pub fn run(image_path: &str, port: u16) -> io::Result<()> {
             index.total_bytes as f64 / (1024.0 * 1024.0),
             100.0 * accessed_bytes as f64 / index.total_bytes.max(1) as f64);
         println!("  Unmapped reads:    {} (metadata/journal)", stats.unmapped_reads);
+
+        if let Some(trace_path) = save_trace {
+            let entries: Vec<crate::extents::TraceEntry> = stats.accessed.iter().map(|&i| {
+                let e = &index.extents[i];
+                crate::extents::TraceEntry { hash: e.hash, start_byte: e.start_byte, byte_count: e.byte_count }
+            }).collect();
+            match crate::extents::save_trace(std::path::Path::new(trace_path), &entries) {
+                Ok(()) => println!("  Boot trace:        {} ({} extents)", trace_path, entries.len()),
+                Err(e) => eprintln!("  Boot trace error:  {}", e),
+            }
+        }
 
         if let Err(e) = result {
             eprintln!("[connection error: {}]", e);
