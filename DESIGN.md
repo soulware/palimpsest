@@ -17,17 +17,41 @@ The combination is particularly effective for the VM-at-scale use case because: 
 
 **Block** — the fundamental unit of a block device, 4KB. This is what the VM sees.
 
-**Extent** — a contiguous run of blocks written in a single operation, and the fundamental unit of dedup and storage. Extents are variable-size and identified by the BLAKE3 hash of their content. On a live write path, extent boundaries are naturally observable as discontinuities in the LBA sequence between writes. For static images, ext4 inode extent trees provide the boundaries directly. The approximation "one extent ≈ one file" holds well for ext4 images — 84% of extents match exactly between Ubuntu point releases.
+**Extent** — a contiguous run of blocks at adjacent LBA addresses, and the fundamental unit of dedup and storage. Extents are variable-size and identified by the BLAKE3 hash of their content. BLAKE3 is chosen because: it is as fast as non-cryptographic hashes on modern hardware (SIMD-parallel tree construction), its 256-bit output makes accidental collisions negligible (birthday bound ~2^128 operations), and it has first-class Rust support. Collisions cannot be prevented by any hash function, but with 256-bit output the probability is effectively zero for any realistic chunk count.
+
+Note: "extent" is also an ext4 term — an ext4 extent is a mapping from a range of logical file blocks to physical disk blocks, recorded in the inode extent tree. These are distinct concepts. Where the distinction matters, "ext4 extent" or "filesystem extent" refers to the filesystem structure; "extent" alone refers to the LSVD storage unit.
+
+**Live write extents** are bounded by fsync and contiguous LBA writes. A write to LBA 100–115 and an adjacent write to LBA 116–131 arriving before the next fsync are coalesced into one extent covering LBA 100–131. Writes to non-contiguous LBAs stay as separate extents regardless of fsync timing — coalescing only applies to adjacent LBA ranges. Live write extents are **opportunistic dedup candidates**: full-file writes (e.g. `apt install`) may happen to align with file boundaries and dedup well; partial file edits will not.
 
 **Manifest** — a sorted list of `(start_LBA, length, extent_hash)` triples describing the complete state of a volume at a point in time. Held in memory on the host for running volumes. **The manifest is always derivable from the segments** — each segment carries the LBA metadata for the extents it contains, so the manifest can be reconstructed by scanning segments on startup. S3 persistence of the manifest is an optimisation (to avoid expensive segment scans at startup), not a correctness requirement.
 
 **Snapshot** — a frozen, immutable manifest. Snapshots and images are the same thing — there is no separate image concept. A snapshot is taken by freezing the current in-memory manifest. Since extents are immutable and content-addressed, no data is copied. Snapshot identity is `blake3(all extent hashes in LBA order)` — derived from the manifest, not stored separately.
 
-**Segment** — a packed collection of extents, typically ~32MB, stored as a single S3 object. Each segment carries the LBA metadata for its extents, making the manifest reconstructible from segments alone. Segments are the unit of S3 I/O.
+**Segment** — a packed collection of extents, typically ~32MB, stored as a single S3 object. The 32MB size is a soft flush threshold inherited from the lab47/lsvd reference implementation. Each segment carries the LBA metadata for its extents, making the manifest reconstructible from segments alone. Segments are the unit of S3 I/O.
 
 **Write log** — the local durability boundary. Writes land here first (fsync = durable). Extents are promoted to segments in the background.
 
 **Extent index** — maps `extent_hash → S3 location`. Tells the read path where in S3 a given extent lives. Maintained by the global service, updated by GC when extents are repacked.
+
+## Operation Modes
+
+The system operates in two tiers depending on whether the volume's filesystem is understood:
+
+**Basic LSVD** (any filesystem or raw block usage):
+- Write coalescing, local durability, demand-fetch, S3 backend, snapshots — all work correctly
+- Dedup is opportunistic: fsync-bounded extents may or may not align with file boundaries
+- Cross-version dedup quality is low without alignment — raw fixed-offset blocks yield ~1% overlap between image versions
+- Suitable for data volumes, Windows VMs, XFS/btrfs volumes, or any use case where dedup is not the primary concern
+
+**Enhanced LSVD + dedup** (ext4 volumes):
+- Everything above, plus snapshot-time ext4 re-alignment of extents to file boundaries
+- Reliable file-aligned extents → ~84% exact match between Ubuntu point releases
+- Delta compression maximally effective because extents correspond to files
+- The approximation "one extent ≈ one file" holds well — the palimpsest `extents` subcommand, which parses ext4 inode extent trees directly, is the prototype for this
+
+The block device itself is filesystem-agnostic in both modes. ext4 awareness is an optional layer that sits alongside the snapshot process — it re-slices and re-hashes extents at file boundaries using the ext4 extent tree as ground truth. A coalesced extent spanning multiple files is split; multiple extents covering one file are merged. The live write path is unaffected in either mode.
+
+Other filesystem parsers (XFS, btrfs) could bring additional filesystems into the enhanced tier over time. The interface is simply: "given this volume at snapshot time, return file extent boundaries."
 
 ## Architecture
 
@@ -83,6 +107,8 @@ Global service (per host)
 ```
 
 Durability is at the write log. S3 upload is asynchronous and not on the critical path.
+
+Live write dedup is **opportunistic** — extents are fsync-bounded and contiguous-LBA-bounded, not file-aligned. Full file writes (e.g. `apt install`, library replacement) may happen to align with file boundaries and dedup well; partial file edits will not. Reliable file-aligned dedup happens at snapshot time via ext4 re-alignment.
 
 ## Read Path
 
@@ -180,11 +206,94 @@ A snapshot is a frozen manifest. Taking a snapshot is cheap: copy the current in
 
 **Snapshots are images.** There is no separate image concept. Deploying a new image version means taking a snapshot on a configured VM and distributing the manifest. The storage layer handles dedup, delta compression, and locality transparently — the snapshot mechanism is unaware of them.
 
-**GC interaction:** the GC sweep walks all manifests, including frozen snapshots. Chunks referenced by any snapshot are kept alive. Deleting a snapshot releases its chunk references; the next GC sweep reclaims chunks no longer referenced by any remaining manifest.
+**Taking a snapshot:**
+
+```
+1. Pause writes briefly (or use a copy-on-write fence)
+2. Freeze the current in-memory manifest → snapshot manifest
+3. [Enhanced mode only] Parse ext4 extent tree from the frozen filesystem state
+   Re-align extents to file boundaries: re-slice data at ext4 boundaries, re-hash
+   - Coalesced extents spanning multiple files → split into per-file extents
+   - Multiple extents covering one file → merged into one extent
+4. Write snapshot manifest to S3
+5. Write consolidated extent index to S3 (see below)
+6. Resume writes
+```
+
+In enhanced mode, the ext4 re-alignment is what makes snapshot extents reliable dedup candidates. The ext4 metadata is the ground truth; the current manifest's extent boundaries are discarded and replaced with file-aligned ones. In basic mode, the manifest is frozen as-is — dedup quality is lower but correctness is unaffected.
+
+**A snapshot is self-contained.** At snapshot time, all referenced extents are guaranteed to be in S3. This is the natural moment to write a consolidated extent index covering exactly those extents:
+
+```
+s3://bucket/snapshots/<id>/manifest   — LBA → extent hash
+s3://bucket/snapshots/<id>/index      — extent hash → segment+offset
+```
+
+The snapshot index covers no more and no less than what is needed to read that snapshot. Serving a specific image on a new host requires only these two files — no global index scan, no segment enumeration.
+
+**Cross-image dedup on a new host** is bootstrapped by unioning the snapshot indexes for the images being served. Only the relevant snapshots need to be loaded, not a global index of everything that ever existed.
+
+**The gap between snapshots** — extents written since the last snapshot — is covered by per-segment `.idx` files (see S3 Layout). Recovery is therefore: latest snapshot index + `.idx` files for segments written since.
+
+**GC interaction:** the GC sweep walks all manifests, including frozen snapshots. Extents referenced by any snapshot are kept alive. Deleting a snapshot releases its extent references; the next GC sweep reclaims extents no longer referenced by any remaining manifest.
 
 **Rollback:** replace the live manifest with a snapshot manifest and discard the write log since the snapshot point. Instant at the block device level.
 
-**Migration and disaster recovery** share the snapshot code path: start a volume from a manifest on a new host. One operation, multiple use cases.
+**Migration and disaster recovery** share the snapshot code path: start a volume from a snapshot manifest on a new host. One operation, multiple use cases.
+
+## S3 Layout and Index
+
+Segments are the unit of S3 storage. Each segment is a packed collection of extents (~32MB). Alongside each segment, a small companion index file is written:
+
+```
+s3://bucket/segments/<id>       — packed extents (~32MB)
+s3://bucket/segments/<id>.idx   — extent hash → byte offset within segment
+```
+
+The `.idx` file is small: ~40 bytes per extent × ~1000 extents per 32MB segment ≈ ~40KB, roughly 1/700th the size of the segment. It is written atomically with the segment upload.
+
+**Inline extents:** small extents are stored directly in the `.idx` file rather than referenced by offset into the segment. A byte-range GET has fixed overhead (latency + S3 request cost) that dominates for tiny extents — inlining eliminates that round-trip entirely. The `.idx` entry format distinguishes the two cases:
+
+```
+For each entry:
+  hash   (32 bytes)
+  flags  (1 byte: reference | inline)
+  if reference: offset (8 bytes) + length (4 bytes)
+  if inline:    length (4 bytes) + data bytes
+```
+
+This is particularly effective for the boot path: small config files, scripts, and locale data appear frequently during boot and are naturally small. Inlining them means loading the snapshot index delivers those extents with zero additional S3 requests. The empirical finding that 84% of extents by count are small files (representing only 35% of bytes) means inlining captures the majority of extents with modest `.idx` size growth.
+
+The inline threshold is an open question — too low misses most small extents, too high bloats `.idx` files and makes index reconstruction expensive. A threshold in the range of a few KB seems reasonable; the actual extent size distribution from image analysis should drive the final value.
+
+**The extent index on the global service** (on-disk, hash → S3 location) is built from these `.idx` files. It is a cache — always reconstructible from S3 without reading segment data. On a cold start or after index loss, reconstruction is: download all `.idx` files (fast, small) rather than scanning all segment data (slow, large).
+
+**Snapshot indexes** are consolidated views written at snapshot time. They cover all extents reachable from that snapshot and remain immutable. A snapshot index is smaller than the full global index — it contains only live extents at that point in time, not historical or GC'd ones.
+
+**Index recovery flow:**
+
+```
+1. Download latest snapshot index for each relevant image
+2. Download .idx files for segments written since that snapshot
+3. Union → full extent index for the extents you care about
+4. Rebuild xor/ribbon filter from index
+```
+
+**Adaptive segment fetch:** when extents are needed from a segment, the `.idx` file is consulted first to subtract any already cached locally. The fetch strategy for the remainder is then chosen based on how much of the segment is needed:
+
+```
+missing = extents needed from segment not in local cache
+if missing.bytes / segment.total_bytes > threshold:
+    fetch full segment → populate cache with all extents
+else:
+    byte-range GET per missing extent individually
+```
+
+A full segment fetch amortises the S3 request overhead across all extents; individual byte-range GETs avoid transferring data that won't be used. The threshold is byte-ratio based rather than count-based, since extents are variable size. Boot-hint repacking makes this decision easy in the common case — boot extents are co-located in boot segments, so the ratio is high and a full segment fetch triggers naturally.
+
+**Range coalescing** (fetching one range covering multiple nearby extents, accepting some wasted bytes for gaps) is a possible intermediate strategy but probably not worth the added complexity. The two-choice strategy covers the common cases well, repacking eliminates most of the messy intermediate cases, and gap tolerance would introduce another tunable parameter. Worth revisiting if profiling shows the intermediate case is significant in practice.
+
+**Segment indexes are the ground truth.** The global service's on-disk extent index, the in-memory filter, and the snapshot indexes are all derived from segment `.idx` files. Segments (data + `.idx`) are the canonical record — everything else is a cache.
 
 ## GC and Repacking
 
@@ -197,6 +306,56 @@ A snapshot is a frozen manifest. Taking a snapshot is cheap: copy the current in
 **Boot hint accumulation:** every VM boot records which extents were accessed during the boot phase (identified by time window after volume attach, or explicit VM lifecycle signals from the hypervisor). These observations accumulate per snapshot. After sufficient boots (converges quickly at scale — 500 VMs/day = 500 observations/day), the hint set is stable enough to guide repacking decisions.
 
 **Continuous improvement:** first boot is cold; boot access patterns are recorded; next GC repack co-locates those extents; subsequent boots are faster. The feedback loop strengthens with scale. This is novel in production block storage — most S3-backed systems are write-once and never reorganise for locality.
+
+**Snapshot-aligned repacking:** GC can reorganise segments around snapshot boundaries, converging toward a two-tier layout:
+
+```
+s3://bucket/segments/base-<hash>     — extents shared across many snapshots
+s3://bucket/segments/snap-<id>-N     — extents unique to a specific snapshot
+```
+
+Shared extents (e.g. the ~84% identical between Ubuntu 22.04 point releases) are consolidated into base segments. A new host serving any image from the same family fetches these once — they are amortised across all versions. Snapshot-specific segments contain only the extents that changed, stored as deltas against their counterparts in the base segments.
+
+The result is that bringing up a new host to serve a specific snapshot requires fetching only:
+1. **Base segments** — large but shared; already cached if any image from the same family has been served on this host
+2. **Snapshot-specific segments** — small; contain only the changed extents as deltas
+
+This unifies the repacking objectives: boot hint ordering applies *within* segments (extents ordered by boot access sequence), while snapshot alignment determines *which* extents go into which segment. The snapshot index records exactly which base segments and snapshot-specific segments are needed, making new host setup fully declarative.
+
+GC repacking loop: observe which extents are referenced across multiple snapshots → consolidate into base segments → write per-snapshot remainder into small delta segments → update snapshot indexes. Layout converges toward optimal with each GC cycle.
+
+**Ext4 re-alignment during GC:** GC is a natural point to perform or improve extent re-alignment, not just snapshot time. The scope differs by what is being processed:
+
+- **Snapshot manifests:** safe and clean — a snapshot is frozen, the filesystem state is fixed. GC can parse ext4 metadata from the snapshot and re-align any snapshot that was not aligned at creation time (e.g. created in basic mode). This retroactively upgrades basic-mode snapshots to enhanced dedup quality.
+
+- **Live volumes:** the filesystem is in flux; parsing ext4 directly risks inconsistency. GC instead uses the most recent snapshot's ext4 metadata as a proxy for the current filesystem layout. Re-alignment is approximate (files created or moved since the snapshot won't be captured) but safe — dedup quality improves progressively without risk of data corruption.
+
+The effect is that volumes gain better extent alignment over successive GC cycles regardless of whether explicit enhanced-mode snapshots were taken. Dedup quality converges upward automatically.
+
+## Filesystem Metadata Awareness
+
+Since the system controls the underlying block device, it sees every write — including writes to ext4 metadata structures (superblock, group descriptors, inode tables, extent trees, journal). This visibility is an opportunity to handle metadata blocks smarter than opaque data blocks.
+
+**Metadata extent tagging:** once metadata LBAs are identified from the superblock (all at well-defined offsets), those extents can be tagged in the manifest. Tagged metadata extents receive special treatment:
+- Skip dedup — inode tables and group descriptors are volume-specific (unique inode numbers, volume-specific block addresses) and will never match across volumes
+- Stay local-tier — no point routing through the global dedup service
+- Cache aggressively — metadata blocks are hot; every filesystem operation reads them
+
+**Incremental shadow filesystem view:** because every write to a known metadata LBA is visible, the system could maintain a continuously-updated internal view of the filesystem layout — which LBA ranges belong to which files, as files are created, deleted, and modified. At snapshot time, the shadow view is already current: no parse-from-scratch, re-alignment is essentially free.
+
+**The journal problem:** ext4 metadata does not go directly to its final LBA. It is written to the jbd2 journal first (write → journal commit → checkpoint to final location). There are three levels of journal handling with very different complexity profiles:
+
+- **Level 1 — detect that metadata changed (trivial):** writes to journal LBAs are visible at the block device level. We know a transaction is in flight but not what changed. Useful only for invalidating the shadow view ("metadata changed, re-parse at next opportunity"). No journal parsing required.
+
+- **Level 2 — parse committed transactions at snapshot/GC time (moderate):** at a known-clean point (snapshot or GC checkpoint), read the journal, walk committed transactions, and replay them to recover current metadata state. This is what `e2fsck` does. The jbd2 format is well-documented with reference implementations in `e2fsprogs` and the kernel. A few hundred lines of careful Rust. Risk is low — we are parsing a frozen, consistent state. This is sufficient for snapshot and GC re-alignment.
+
+- **Level 3 — live transaction tracking (high):** intercept journal writes in real time, parse each transaction as it commits, and update the shadow view incrementally. Requires recognising journal LBAs in the write stream, parsing jbd2 descriptor blocks to correlate data blocks with their final destinations, and correctly handling the circular log structure, transaction abort/rollback, and journal checkpointing. Getting this wrong silently produces an incorrect shadow view. The kernel's jbd2 module is the authoritative reference and is non-trivial.
+
+One simplifying factor across all levels: ext4's default journaling mode is `data=ordered` — only metadata goes through the journal; data blocks are written directly to their final locations. Journal handling is therefore scoped to metadata only, not the full write stream.
+
+**Recommended approach:** implement Level 2 first — sufficient for snapshot/GC re-alignment and well-understood. Level 3 (live shadow view) is only needed for real-time file-identity-aware dedup decisions and should be deferred until Level 2 is working well.
+
+**Future potential:** a live shadow filesystem view would enable real-time dedup decisions informed by file identity — knowing that a write is to a known shared library vs. a per-VM log file, for example, without waiting for snapshot time. This is a significant capability that falls out naturally from controlling the block device, and is worth designing toward even if not implemented immediately.
 
 ## Empirical Findings
 
@@ -251,7 +410,9 @@ Ubuntu 22.04 (~762MB of file data): ~33,700 extents. At 44 bytes per entry, the 
 
 ## Open Questions
 
-- **Entropy threshold:** 7.0 bits used in experiments. Optimal value depends on workload mix.
+- **Inline extent threshold:** extents below this size are stored inline in `.idx` files rather than referenced by segment offset. Needs empirical validation against the actual extent size distribution in target images.
+- **Entropy threshold:** 7.0 bits used in experiments, taken from the lab47/lsvd reference implementation. Optimal value depends on workload mix.
+- **Segment size:** ~32MB soft threshold, taken from the lab47/lsvd reference implementation (`FlushThreshHold = 32MB`). Not a hard maximum — a segment closes when it exceeds the threshold. Optimal value depends on S3 request cost vs read amplification tradeoff.
 - **Write log format:** not yet designed. Affects recovery, promotion to segments, snapshot consistency.
 - **Extent index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
 - **Shared extent index:** per-host or shared service? DynamoDB, S3-backed, or dedicated process?
