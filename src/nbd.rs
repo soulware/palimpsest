@@ -2,8 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::extents::{locate_extents, LocatedExtent};
 
 // Handshake magic
 const NBD_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
@@ -63,29 +66,72 @@ fn report_path() -> String {
     format!("/tmp/palimpsest-{}.report", std::process::id())
 }
 
-fn print_report(accessed: &HashSet<u64>, total_chunks: u64, chunk_size: usize, image_size: u64) {
-    let n = accessed.len();
+// --- extent index ---
+
+struct ExtentIndex {
+    extents: Vec<LocatedExtent>,
+    total_bytes: u64,
+}
+
+impl ExtentIndex {
+    fn build(image_path: &str) -> io::Result<Self> {
+        let extents = locate_extents(Path::new(image_path))?;
+        let total_bytes = extents.iter().map(|e| e.byte_count).sum();
+        Ok(Self { extents, total_bytes })
+    }
+
+    // Indices of extents overlapping [offset, offset+length).
+    // Valid because non-overlapping extents sorted by start are also sorted by end.
+    fn overlapping(&self, offset: u64, length: u64) -> std::ops::Range<usize> {
+        let end = offset + length;
+        let start_idx = self.extents.partition_point(|e| e.start_byte + e.byte_count <= offset);
+        let end_idx = self.extents.partition_point(|e| e.start_byte < end);
+        start_idx..end_idx
+    }
+}
+
+// --- reporting ---
+
+struct ReadStats {
+    accessed: HashSet<usize>,  // extent indices
+    unmapped_reads: u64,       // reads that hit no extent (metadata, journal, etc.)
+}
+
+fn print_report(stats: &ReadStats, index: &ExtentIndex, image_size: u64) {
+    let n = stats.accessed.len();
+    let total = index.extents.len();
+    let accessed_bytes: u64 = stats.accessed.iter().map(|&i| index.extents[i].byte_count).sum();
     let lines = format!(
-        "\n=== Chunk Report ===\n  Chunks read: {} / {} ({:.1}%)\n  Data read:   {:.1} MB / {:.1} MB\n",
-        n, total_chunks,
-        100.0 * n as f64 / total_chunks as f64,
-        n as f64 * chunk_size as f64 / (1024.0 * 1024.0),
-        image_size as f64 / (1024.0 * 1024.0),
+        "\n=== Extent Report ===\n  Extents accessed:  {} / {} ({:.1}%)\n  Data accessed:     {:.1} MB / {:.1} MB ({:.1}%)\n  Unmapped reads:    {} (metadata/journal)\n",
+        n, total,
+        100.0 * n as f64 / total.max(1) as f64,
+        accessed_bytes as f64 / (1024.0 * 1024.0),
+        index.total_bytes as f64 / (1024.0 * 1024.0),
+        100.0 * accessed_bytes as f64 / index.total_bytes.max(1) as f64,
+        stats.unmapped_reads,
     );
+    let _ = image_size; // kept for context in callers
     print!("{}", lines);
     let _ = std::fs::write(report_path(), &lines);
 }
 
-pub fn run(image_path: &str, port: u16, chunk_size: usize) -> io::Result<()> {
+pub fn run(image_path: &str, port: u16) -> io::Result<()> {
     let image_size = std::fs::metadata(image_path)?.len();
-    let total_chunks = (image_size + chunk_size as u64 - 1) / chunk_size as u64;
-    let accessed: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    print!("Building extent index for {} ...", image_path);
+    let index = ExtentIndex::build(image_path)?;
+    println!(" {} extents ({:.1} MB file data)", index.extents.len(), index.total_bytes as f64 / (1024.0 * 1024.0));
+
+    let stats: Arc<Mutex<ReadStats>> = Arc::new(Mutex::new(ReadStats {
+        accessed: HashSet::new(),
+        unmapped_reads: 0,
+    }));
 
     install_sigusr1_handler();
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
     println!("NBD server on 127.0.0.1:{}", port);
-    println!("Image: {} ({:.1} MB, {} chunks)", image_path, image_size as f64 / (1024.0 * 1024.0), total_chunks);
+    println!("Image: {} ({:.1} MB)", image_path, image_size as f64 / (1024.0 * 1024.0));
     println!("Connect QEMU with: -drive file=nbd://127.0.0.1:{},format=raw,if=virtio", port);
     println!("Send SIGUSR1 (kill -USR1 {}) for a mid-boot report", std::process::id());
     println!("Report file:  {}", report_path());
@@ -95,16 +141,19 @@ pub fn run(image_path: &str, port: u16, chunk_size: usize) -> io::Result<()> {
         let stream = stream?;
         println!("[connected: {}]", stream.peer_addr()?);
 
-        let result = handle_connection(stream, image_path, image_size, chunk_size, total_chunks, Arc::clone(&accessed));
+        let result = handle_connection(stream, image_path, image_size, &index, Arc::clone(&stats));
 
-        let accessed = accessed.lock().unwrap();
+        let stats = stats.lock().unwrap();
         println!("\n=== Boot Read Report ===");
-        println!("  Chunks read from base: {} / {} ({:.1}%)",
-            accessed.len(), total_chunks,
-            100.0 * accessed.len() as f64 / total_chunks as f64);
-        println!("  Data read (approx):    {:.1} MB / {:.1} MB",
-            accessed.len() as f64 * chunk_size as f64 / (1024.0 * 1024.0),
-            image_size as f64 / (1024.0 * 1024.0));
+        let n = stats.accessed.len();
+        let total = index.extents.len();
+        let accessed_bytes: u64 = stats.accessed.iter().map(|&i| index.extents[i].byte_count).sum();
+        println!("  Extents accessed:  {} / {} ({:.1}%)", n, total, 100.0 * n as f64 / total.max(1) as f64);
+        println!("  Data accessed:     {:.1} MB / {:.1} MB ({:.1}%)",
+            accessed_bytes as f64 / (1024.0 * 1024.0),
+            index.total_bytes as f64 / (1024.0 * 1024.0),
+            100.0 * accessed_bytes as f64 / index.total_bytes.max(1) as f64);
+        println!("  Unmapped reads:    {} (metadata/journal)", stats.unmapped_reads);
 
         if let Err(e) = result {
             eprintln!("[connection error: {}]", e);
@@ -112,7 +161,6 @@ pub fn run(image_path: &str, port: u16, chunk_size: usize) -> io::Result<()> {
             println!("[disconnected]");
         }
 
-        // Accept another connection (e.g. VM reboot) or break here
         break;
     }
 
@@ -123,9 +171,8 @@ fn handle_connection(
     mut s: TcpStream,
     image_path: &str,
     image_size: u64,
-    chunk_size: usize,
-    total_chunks: u64,
-    accessed: Arc<Mutex<HashSet<u64>>>,
+    index: &ExtentIndex,
+    stats: Arc<Mutex<ReadStats>>,
 ) -> io::Result<()> {
     // --- Newstyle handshake ---
     s.write_all(&NBD_MAGIC.to_be_bytes())?;
@@ -199,8 +246,8 @@ fn handle_connection(
             Err(e) if e.kind() == io::ErrorKind::WouldBlock
                    || e.kind() == io::ErrorKind::TimedOut => {
                 if PRINT_STATS.swap(false, Ordering::Relaxed) {
-                    let acc = accessed.lock().unwrap();
-                    print_report(&acc, total_chunks, chunk_size, image_size);
+                    let st = stats.lock().unwrap();
+                    print_report(&st, index, image_size);
                 }
                 continue;
             }
@@ -227,13 +274,16 @@ fn handle_connection(
                 // Overlay COW blocks
                 cow_read_overlay(&cow, offset, &mut buf);
 
-                // Track which base chunks were accessed
+                // Map this read back to extents
                 {
-                    let mut acc = accessed.lock().unwrap();
-                    let first = offset / chunk_size as u64;
-                    let last = (offset + length as u64 - 1) / chunk_size as u64;
-                    for idx in first..=last {
-                        acc.insert(idx);
+                    let mut st = stats.lock().unwrap();
+                    let range = index.overlapping(offset, length as u64);
+                    if range.is_empty() {
+                        st.unmapped_reads += 1;
+                    } else {
+                        for i in range {
+                            st.accessed.insert(i);
+                        }
                     }
                 }
 
@@ -265,8 +315,8 @@ fn handle_connection(
 
         // Check for SIGUSR1 — print report without interrupting
         if PRINT_STATS.swap(false, Ordering::Relaxed) {
-            let acc = accessed.lock().unwrap();
-            print_report(&acc, total_chunks, chunk_size, image_size);
+            let st = stats.lock().unwrap();
+            print_report(&st, index, image_size);
         }
     }
 

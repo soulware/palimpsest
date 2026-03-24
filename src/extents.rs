@@ -473,6 +473,63 @@ fn analyse_delta(image1: &Path, image2: &Path, level: i32) -> io::Result<()> {
     Ok(())
 }
 
+// --- located extents (for NBD read tracking) ---
+
+/// An extent with its disk byte offset, for mapping NBD reads back to extents.
+pub struct LocatedExtent {
+    pub start_byte: u64,
+    pub byte_count: u64,
+    pub hash: blake3::Hash,
+}
+
+/// Scan all regular-file extents and return them sorted by disk byte offset.
+pub fn locate_extents(image: &Path) -> io::Result<Vec<LocatedExtent>> {
+    let mut f = File::open(image)?;
+    let sb = Superblock::read(&mut f)?;
+    let mut results = Vec::new();
+    let mut inode_buf = vec![0u8; sb.inode_size];
+
+    for group in 0..sb.num_block_groups {
+        let table_block = inode_table_block(&mut f, &sb, group)?;
+        let table_offset = table_block * sb.block_size;
+
+        for idx in 0..sb.inodes_per_group {
+            let inode_offset = table_offset + idx as u64 * sb.inode_size as u64;
+            f.seek(SeekFrom::Start(inode_offset))?;
+            if f.read_exact(&mut inode_buf).is_err() { break; }
+
+            let i_mode = u16le(&inode_buf, 0x00);
+            if (i_mode & S_IFMT) != S_IFREG { continue; }
+            if u16le(&inode_buf, 0x1a) == 0 { continue; }
+            let i_flags = u32le(&inode_buf, 0x20);
+            if (i_flags & INODE_FLAG_EXTENTS) == 0 { continue; }
+            let i_size = hilo64(u32le(&inode_buf, 0x6c), u32le(&inode_buf, 0x04));
+            if i_size == 0 { continue; }
+
+            let i_block = inode_buf[0x28..0x28 + 60].to_vec();
+            let mut raw_extents: Vec<(u64, u16)> = Vec::new();
+            collect_extents(&i_block, &mut f, &sb, &mut raw_extents)?;
+
+            let mut bytes_remaining = i_size;
+            for (start_block, num_blocks) in raw_extents {
+                if bytes_remaining == 0 { break; }
+                let allocated = num_blocks as u64 * sb.block_size;
+                let byte_count = allocated.min(bytes_remaining);
+                bytes_remaining = bytes_remaining.saturating_sub(byte_count);
+
+                let start_byte = start_block * sb.block_size;
+                let mut buf = vec![0u8; byte_count as usize];
+                f.seek(SeekFrom::Start(start_byte))?;
+                f.read_exact(&mut buf)?;
+                results.push(LocatedExtent { start_byte, byte_count, hash: blake3::hash(&buf) });
+            }
+        }
+    }
+
+    results.sort_by_key(|e| e.start_byte);
+    Ok(results)
+}
+
 // --- entry point ---
 
 pub fn run(image1: &Path, image2: Option<&Path>, level: i32) -> io::Result<()> {
