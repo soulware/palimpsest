@@ -9,5 +9,8 @@
 /boot/
 /boot-arm64/
 
+# Manifest files
+*.tsv
+
 # Rust build output
 /target/

@@ -9,6 +9,7 @@ use ext4_view::{DirEntry, Ext4, Ext4Error, Metadata, PathBuf as Ext4PathBuf};
 use ext4_view::FileType;
 
 mod delta;
+mod manifest;
 mod nbd;
 mod similar;
 
@@ -55,6 +56,21 @@ enum Command {
         image: String,
         #[arg(long, default_value = ".")]
         out_dir: String,
+    },
+    /// Generate a chunk manifest from an ext4 image
+    Manifest {
+        image: String,
+        #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
+        chunk_kb: usize,
+        #[arg(long, default_value = "manifest.tsv")]
+        out: String,
+    },
+    /// Diff two chunk manifests, reporting what changed between snapshots
+    Diff {
+        manifest1: String,
+        manifest2: String,
+        #[arg(long)]
+        verbose: bool,
     },
     /// Find similar (non-identical) chunks within one or two images using MinHash/LSH
     Similar {
@@ -274,6 +290,14 @@ fn main() {
 
         Command::Serve { image, port, chunk_kb } => {
             nbd::run(&image, port, chunk_kb * 1024).expect("NBD server error");
+        }
+
+        Command::Manifest { image, chunk_kb, out } => {
+            manifest::generate(Path::new(&image), chunk_kb, Path::new(&out)).expect("manifest failed");
+        }
+
+        Command::Diff { manifest1, manifest2, verbose } => {
+            manifest::diff(Path::new(&manifest1), Path::new(&manifest2), verbose);
         }
 
         Command::Similar { image1, image2, chunk_kb } => {
