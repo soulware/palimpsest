@@ -1,0 +1,10 @@
+[package]
+name = "palimpsest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ext4-view = { version = "0.9", features = ["std"] }
+libc = "0.2"

@@ -1,0 +1,13 @@
+# Claude Code local settings
+.claude/
+
+# Disk images
+*.img
+*.raw
+
+# Extracted boot files
+/boot/
+/boot-arm64/
+
+# Rust build output
+/target/
