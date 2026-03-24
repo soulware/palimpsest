@@ -8,7 +8,9 @@ use ext4_view::{DirEntry, Ext4, Ext4Error, Metadata, PathBuf as Ext4PathBuf};
 #[allow(unused_imports)]
 use ext4_view::FileType;
 
+mod delta;
 mod nbd;
+mod similar;
 
 const DEFAULT_CHUNK_KB: usize = 32;
 const DEFAULT_ENTROPY_THRESHOLD: f64 = 7.0;
@@ -53,6 +55,21 @@ enum Command {
         image: String,
         #[arg(long, default_value = ".")]
         out_dir: String,
+    },
+    /// Find similar (non-identical) chunks within a single image using MinHash/LSH
+    Similar {
+        image: String,
+        #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
+        chunk_kb: usize,
+    },
+    /// Compare chunks between two images, measuring delta compression benefit
+    Delta {
+        image1: String,
+        image2: String,
+        #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
+        chunk_kb: usize,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
     },
 }
 
@@ -256,6 +273,16 @@ fn main() {
 
         Command::Serve { image, port, chunk_kb } => {
             nbd::run(&image, port, chunk_kb * 1024).expect("NBD server error");
+        }
+
+        Command::Similar { image, chunk_kb } => {
+            similar::run(Path::new(&image), chunk_kb * 1024).expect("similar failed");
+        }
+
+        Command::Delta { image1, image2, chunk_kb, level } => {
+            let chunk_size = chunk_kb * 1024;
+            delta::run(Path::new(&image1), Path::new(&image2), chunk_size, level)
+                .expect("delta failed");
         }
 
         Command::ExtractBoot { image, out_dir } => {
