@@ -8,6 +8,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use ext4_view::{DirEntry, Ext4, Metadata};
+use ext4_view::PathBuf as Ext4PathBuf;
+
 // --- ext4 constants ---
 
 const SUPERBLOCK_OFFSET: u64 = 1024;
@@ -138,9 +141,15 @@ fn collect_extents(
 
 // --- inode iteration ---
 
-// Reads every regular-file inode in the image and yields its extents
-// (each as a content hash).  Returns a vec of (hash, byte_count) pairs.
-fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<(blake3::Hash, u64)>> {
+/// One extent from a regular file: content hash and byte count.
+pub struct ExtentEntry {
+    pub hash: blake3::Hash,
+    pub byte_count: u64,
+}
+
+// Reads every regular-file inode in the image and yields its extents.
+// Returns (entries, block_size).
+fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<ExtentEntry>> {
     let mut results = Vec::new();
     let mut inode_buf = vec![0u8; sb.inode_size];
     let mut block_buf: Vec<u8>;
@@ -154,10 +163,9 @@ fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<(blake3::H
             f.seek(SeekFrom::Start(inode_offset))?;
             match f.read_exact(&mut inode_buf) {
                 Ok(_) => {}
-                Err(_) => break, // past end of image
+                Err(_) => break,
             }
 
-            // Skip non-regular files and deleted inodes.
             let i_mode = u16le(&inode_buf, 0x00);
             if (i_mode & S_IFMT) != S_IFREG {
                 continue;
@@ -176,17 +184,14 @@ fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<(blake3::H
                 continue;
             }
 
-            // Parse extent tree rooted at i_block (bytes 0x28..0x64).
-            let i_block = &inode_buf[0x28..0x28 + 60].to_vec();
+            let i_block = inode_buf[0x28..0x28 + 60].to_vec();
             let mut extents: Vec<(u64, u16)> = Vec::new();
-            collect_extents(i_block, f, sb, &mut extents)?;
+            collect_extents(&i_block, f, sb, &mut extents)?;
 
             if extents.is_empty() {
                 continue;
             }
 
-            // Hash each physical extent's content independently.
-            // Trim the last extent to the actual file size.
             let mut bytes_remaining = i_size;
             for (start_block, num_blocks) in &extents {
                 if bytes_remaining == 0 {
@@ -200,14 +205,17 @@ fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<(blake3::H
                 f.seek(SeekFrom::Start(start_block * sb.block_size))?;
                 f.read_exact(&mut block_buf)?;
 
-                let hash = blake3::hash(&block_buf);
-                results.push((hash, to_read));
+                results.push(ExtentEntry {
+                    hash: blake3::hash(&block_buf),
+                    byte_count: to_read,
+                });
             }
         }
     }
 
     Ok(results)
 }
+
 
 // --- stats ---
 
@@ -228,6 +236,14 @@ impl ExtentStats {
     fn unique(&self) -> usize {
         self.hash_to_bytes.len()
     }
+}
+
+fn build_stats(entries: &[ExtentEntry]) -> ExtentStats {
+    let mut stats = ExtentStats::default();
+    for e in entries {
+        stats.record(e.hash, e.byte_count);
+    }
+    stats
 }
 
 // --- output ---
@@ -278,31 +294,210 @@ fn print_overlap(stats1: &ExtentStats, stats2: &ExtentStats) {
     );
 }
 
-// --- entry point ---
+// --- delta analysis (path-based) ---
 
-pub fn run(image1: &Path, image2: Option<&Path>) -> io::Result<()> {
-    println!("Scanning extents in {} ...", image1.display());
-    let mut stats1 = ExtentStats::default();
-    for (hash, bytes) in scan_inode(image1)? {
-        stats1.record(hash, bytes);
-    }
-    print_stats(&image1.display().to_string(), &stats1);
+const MB: f64 = 1024.0 * 1024.0;
 
-    if let Some(img2) = image2 {
-        println!("Scanning extents in {} ...", img2.display());
-        let mut stats2 = ExtentStats::default();
-        for (hash, bytes) in scan_inode(img2)? {
-            stats2.record(hash, bytes);
+/// Walk an ext4 image and return a map of path → (blake3 hash of full file, byte count).
+fn enumerate_file_hashes(image: &Path) -> io::Result<HashMap<String, (blake3::Hash, u64)>> {
+    let fs = Ext4::load_from_path(image)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut out = HashMap::new();
+    let mut queue: Vec<Ext4PathBuf> = vec![Ext4PathBuf::new("/")];
+
+    while let Some(dir) = queue.pop() {
+        let entries = match fs.read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry: DirEntry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let path = entry.path();
+            let metadata: Metadata = match fs.symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_dir() {
+                queue.push(path);
+            } else if metadata.file_type().is_regular_file() {
+                let data = match fs.read(&path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let hash = blake3::hash(&data);
+                let bytes = data.len() as u64;
+                out.insert(path.to_str().unwrap_or("").to_string(), (hash, bytes));
+            }
         }
-        print_stats(&img2.display().to_string(), &stats2);
-        print_overlap(&stats1, &stats2);
+    }
+
+    Ok(out)
+}
+
+fn analyse_delta(image1: &Path, image2: &Path, level: i32) -> io::Result<()> {
+    // Pass 1: enumerate all file hashes for both images.
+    let hashes1 = enumerate_file_hashes(image1)?;
+    let hashes2 = enumerate_file_hashes(image2)?;
+
+    let total_bytes2: u64 = hashes2.values().map(|&(_, b)| b).sum();
+
+    let mut exact_count = 0usize;
+    let mut exact_bytes = 0u64;
+    let mut changed_paths: Vec<String> = Vec::new();
+    let mut new_bytes = 0u64;
+    let mut removed_bytes = 0u64;
+
+    for (path, &(h2, b2)) in &hashes2 {
+        match hashes1.get(path) {
+            Some(&(h1, _)) if h1 == h2 => {
+                exact_count += 1;
+                exact_bytes += b2;
+            }
+            Some(_) => {
+                changed_paths.push(path.clone());
+            }
+            None => {
+                new_bytes += b2;
+            }
+        }
+    }
+    for (path, &(_, b1)) in &hashes1 {
+        if !hashes2.contains_key(path) {
+            removed_bytes += b1;
+        }
+    }
+
+    // Pass 2: measure delta compression on changed files.
+    let fs1 = Ext4::load_from_path(image1)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let fs2 = Ext4::load_from_path(image2)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    let mut raw_changed = 0u64;
+    let mut standalone_total = 0u64;
+    let mut dict_total = 0u64;
+    let mut buckets = [0usize; 5];
+
+    for path in &changed_paths {
+        let ext4_path = Ext4PathBuf::new(path);
+        let data1 = match fs1.read(&ext4_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let data2 = match fs2.read(&ext4_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        raw_changed += data2.len() as u64;
+
+        let standalone = zstd::bulk::compress(&data2, level).unwrap_or_default();
+        let dict_compressed = zstd::bulk::Compressor::with_dictionary(level, &data1)
+            .ok()
+            .and_then(|mut c| c.compress(&data2).ok())
+            .unwrap_or_else(|| standalone.clone());
+
+        let s = standalone.len();
+        let d = dict_compressed.len();
+        standalone_total += s as u64;
+        dict_total += d as u64;
+
+        let saving_pct = if s > 0 { 100.0 * (1.0 - d as f64 / s as f64) } else { 0.0 };
+        buckets[((saving_pct / 20.0) as usize).min(4)] += 1;
+    }
+
+    let marginal_cost = dict_total + new_bytes;
+
+    println!("=== Delta Analysis ===");
+    println!(
+        "  Exact match:   {:>6} files  {:>7.1} MB ({:.1}%)  — zero marginal cost",
+        exact_count,
+        exact_bytes as f64 / MB,
+        100.0 * exact_bytes as f64 / total_bytes2.max(1) as f64,
+    );
+    println!(
+        "  Changed:       {:>6} files  {:>7.1} MB raw",
+        changed_paths.len(),
+        raw_changed as f64 / MB,
+    );
+    if !changed_paths.is_empty() {
+        println!(
+            "    Standalone compressed:  {:.1} MB",
+            standalone_total as f64 / MB,
+        );
+        println!(
+            "    Dict compressed:       {:.1} MB  ({:.1}% reduction vs standalone)",
+            dict_total as f64 / MB,
+            100.0 * (standalone_total as f64 - dict_total as f64) / standalone_total.max(1) as f64,
+        );
+    }
+    println!(
+        "  New (img2 only):        {:>7.1} MB  — full store",
+        new_bytes as f64 / MB,
+    );
+    println!(
+        "  Removed (img1 only):    {:>7.1} MB",
+        removed_bytes as f64 / MB,
+    );
+    println!(
+        "\n  Marginal cost: {:.1} MB of {:.1} MB total ({:.1}% saving vs full fetch)",
+        marginal_cost as f64 / MB,
+        total_bytes2 as f64 / MB,
+        100.0 * (1.0 - marginal_cost as f64 / total_bytes2.max(1) as f64),
+    );
+
+    if !changed_paths.is_empty() {
+        println!("\n  Delta benefit distribution (dict vs standalone):");
+        let labels = [
+            "worse/same  (0–20%)",
+            "modest     (20–40%)",
+            "good       (40–60%)",
+            "great      (60–80%)",
+            "excellent  (80–100%)",
+        ];
+        let n = changed_paths.len() as f64;
+        for (i, &count) in buckets.iter().enumerate() {
+            let pct = 100.0 * count as f64 / n;
+            let bar: String = "#".repeat((pct / 2.0) as usize);
+            println!("    {}  {:>6} ({:>5.1}%)  {}", labels[i], count, pct, bar);
+        }
     }
 
     Ok(())
 }
 
-fn scan_inode(path: &Path) -> io::Result<Vec<(blake3::Hash, u64)>> {
+// --- entry point ---
+
+pub fn run(image1: &Path, image2: Option<&Path>, level: i32) -> io::Result<()> {
+    println!("Scanning extents in {} ...", image1.display());
+    let (entries1, _) = scan_inode(image1)?;
+    let stats1 = build_stats(&entries1);
+    print_stats(&image1.display().to_string(), &stats1);
+
+    if let Some(img2) = image2 {
+        println!("Scanning extents in {} ...", img2.display());
+        let (entries2, _) = scan_inode(img2)?;
+        let stats2 = build_stats(&entries2);
+        print_stats(&img2.display().to_string(), &stats2);
+        print_overlap(&stats1, &stats2);
+        println!();
+        analyse_delta(image1, img2, level)?;
+    }
+
+    Ok(())
+}
+
+fn scan_inode(path: &Path) -> io::Result<(Vec<ExtentEntry>, u64)> {
     let mut f = File::open(path)?;
     let sb = Superblock::read(&mut f)?;
-    scan_file_extents(&mut f, &sb)
+    let block_size = sb.block_size;
+    let entries = scan_file_extents(&mut f, &sb)?;
+    Ok((entries, block_size))
 }

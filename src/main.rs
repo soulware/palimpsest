@@ -100,10 +100,12 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
         chunk_kb: usize,
     },
-    /// Scan an image for contiguous non-zero block runs (extents) and analyse dedup potential
+    /// Scan an image for file extents and analyse dedup + delta compression potential
     Extents {
         image1: String,
         image2: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
     },
     /// Compare chunks between two images, measuring delta compression benefit
     Delta {
@@ -347,8 +349,8 @@ fn main() {
             similar::run(Path::new(&image1), image2.as_deref().map(Path::new), chunk_kb * 1024).expect("similar failed");
         }
 
-        Command::Extents { image1, image2 } => {
-            extents::run(Path::new(&image1), image2.as_deref().map(Path::new))
+        Command::Extents { image1, image2, level } => {
+            extents::run(Path::new(&image1), image2.as_deref().map(Path::new), level)
                 .expect("extents failed");
         }
 
