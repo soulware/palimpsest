@@ -9,6 +9,7 @@ use ext4_view::{DirEntry, Ext4, Ext4Error, Metadata, PathBuf as Ext4PathBuf};
 use ext4_view::FileType;
 
 mod delta;
+mod extents;
 mod manifest;
 mod nbd;
 mod similar;
@@ -98,6 +99,11 @@ enum Command {
         image2: Option<String>,
         #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
         chunk_kb: usize,
+    },
+    /// Scan an image for contiguous non-zero block runs (extents) and analyse dedup potential
+    Extents {
+        image1: String,
+        image2: Option<String>,
     },
     /// Compare chunks between two images, measuring delta compression benefit
     Delta {
@@ -339,6 +345,11 @@ fn main() {
 
         Command::Similar { image1, image2, chunk_kb } => {
             similar::run(Path::new(&image1), image2.as_deref().map(Path::new), chunk_kb * 1024).expect("similar failed");
+        }
+
+        Command::Extents { image1, image2 } => {
+            extents::run(Path::new(&image1), image2.as_deref().map(Path::new))
+                .expect("extents failed");
         }
 
         Command::Delta { image1, image2, chunk_kb, level } => {
