@@ -162,10 +162,7 @@ pub fn read_idx(path: &Path) -> io::Result<Vec<IdxEntry>> {
 }
 
 fn parse_entry(data: &[u8], pos: &mut usize) -> io::Result<IdxEntry> {
-    let hash_bytes: [u8; 32] = read_bytes(data, pos, 32)?
-        .try_into()
-        .expect("read_bytes(32) always returns 32 bytes");
-    let hash = blake3::Hash::from_bytes(hash_bytes);
+    let hash = blake3::Hash::from_bytes(read_fixed(data, pos)?);
 
     let start_lba = u64::from_le_bytes(read_fixed(data, pos)?);
     let lba_length = u32::from_le_bytes(read_fixed(data, pos)?);

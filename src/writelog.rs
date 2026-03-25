@@ -232,10 +232,13 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
 // --- slice-based read helpers ---
 
 fn read_hash(data: &[u8], pos: &mut usize) -> io::Result<blake3::Hash> {
-    let bytes: [u8; 32] = read_bytes(data, pos, 32)?
+    Ok(blake3::Hash::from_bytes(read_fixed(data, pos)?))
+}
+
+fn read_fixed<const N: usize>(data: &[u8], pos: &mut usize) -> io::Result<[u8; N]> {
+    read_bytes(data, pos, N)?
         .try_into()
-        .expect("read_bytes(32) always returns 32 bytes");
-    Ok(blake3::Hash::from_bytes(bytes))
+        .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated record"))
 }
 
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> io::Result<&'a [u8]> {
