@@ -71,7 +71,10 @@ impl WriteLog {
     /// Create a new write log. Fails if the file already exists.
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        let mut wl = Self { writer: BufWriter::new(file), size: 0 };
+        let mut wl = Self {
+            writer: BufWriter::new(file),
+            size: 0,
+        };
         wl.write_all_bytes(MAGIC)?;
         Ok(wl)
     }
@@ -81,7 +84,10 @@ impl WriteLog {
     pub fn reopen(path: &Path, size: u64) -> io::Result<Self> {
         let mut file = OpenOptions::new().write(true).open(path)?;
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { writer: BufWriter::new(file), size })
+        Ok(Self {
+            writer: BufWriter::new(file),
+            size,
+        })
     }
 
     /// Append a new data extent. `data` must already be compressed if FLAG_COMPRESSED is set.
@@ -98,7 +104,10 @@ impl WriteLog {
         flags: u8,
         data: &[u8],
     ) -> io::Result<u64> {
-        debug_assert!(flags & FLAG_DEDUP_REF == 0, "use append_ref for dedup references");
+        debug_assert!(
+            flags & FLAG_DEDUP_REF == 0,
+            "use append_ref for dedup references"
+        );
 
         let mut header = Vec::with_capacity(32 + 10 + 5 + 1 + 5);
         header.extend_from_slice(hash.as_bytes());
@@ -151,7 +160,10 @@ pub fn scan(path: &Path) -> io::Result<(Vec<LogRecord>, u64)> {
     let data = std::fs::read(path)?;
 
     if data.len() < MAGIC.len() || &data[..MAGIC.len()] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad write log magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad write log magic",
+        ));
     }
 
     let mut pos = MAGIC.len();
@@ -166,7 +178,10 @@ pub fn scan(path: &Path) -> io::Result<(Vec<LogRecord>, u64)> {
             }
             Err(_) => {
                 // Partial write at tail — truncate the file and stop.
-                OpenOptions::new().write(true).open(path)?.set_len(last_good as u64)?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)?
+                    .set_len(last_good as u64)?;
                 break;
             }
         }
@@ -184,14 +199,25 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     let flags = read_u8(data, pos)?;
 
     if flags & FLAG_DEDUP_REF != 0 {
-        return Ok(LogRecord::Ref { hash, start_lba, lba_length });
+        return Ok(LogRecord::Ref {
+            hash,
+            start_lba,
+            lba_length,
+        });
     }
 
     let data_len = read_varint32(data, pos)? as usize;
     let body_offset = *pos as u64;
     let payload = read_bytes(data, pos, data_len)?.to_vec();
 
-    Ok(LogRecord::Data { hash, start_lba, lba_length, flags, body_offset, data: payload })
+    Ok(LogRecord::Data {
+        hash,
+        start_lba,
+        lba_length,
+        flags,
+        body_offset,
+        data: payload,
+    })
 }
 
 // --- slice-based read helpers ---
@@ -205,7 +231,10 @@ fn read_hash(data: &[u8], pos: &mut usize) -> io::Result<blake3::Hash> {
 
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> io::Result<&'a [u8]> {
     if *pos + n > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated record"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated record",
+        ));
     }
     let slice = &data[*pos..*pos + n];
     *pos += n;
@@ -214,7 +243,10 @@ fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> io::Result<&'a [
 
 fn read_u8(data: &[u8], pos: &mut usize) -> io::Result<u8> {
     if *pos >= data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated record"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated record",
+        ));
     }
     let b = data[*pos];
     *pos += 1;
@@ -232,7 +264,10 @@ fn read_varint(data: &[u8], pos: &mut usize) -> io::Result<u64> {
         }
         shift += 7;
         if shift >= 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint overflow",
+            ));
         }
     }
 }
@@ -265,13 +300,17 @@ fn push_varint32(buf: &mut Vec<u8>, v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("palimpsest-writelog-test-{}-{}", std::process::id(), n));
+        p.push(format!(
+            "palimpsest-writelog-test-{}-{}",
+            std::process::id(),
+            n
+        ));
         p
     }
 
@@ -291,7 +330,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
         let (records, size) = scan(&path).unwrap();
         assert_eq!(records.len(), 1);
         match &records[0] {
-            LogRecord::Data { hash: h, start_lba, lba_length, flags, body_offset, data } => {
+            LogRecord::Data {
+                hash: h,
+                start_lba,
+                lba_length,
+                flags,
+                body_offset,
+                data,
+            } => {
                 assert_eq!(h, &hash);
                 assert_eq!(*start_lba, 42);
                 assert_eq!(*lba_length, 4);
@@ -322,7 +368,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
         let (records, _) = scan(&path).unwrap();
         assert_eq!(records.len(), 1);
         match &records[0] {
-            LogRecord::Ref { hash: h, start_lba, lba_length } => {
+            LogRecord::Ref {
+                hash: h,
+                start_lba,
+                lba_length,
+            } => {
                 assert_eq!(h, &hash);
                 assert_eq!(*start_lba, 100);
                 assert_eq!(*lba_length, 8);
