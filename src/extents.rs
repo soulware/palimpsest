@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use ext4_view::{DirEntry, Ext4, Metadata};
 use ext4_view::PathBuf as Ext4PathBuf;
+use ext4_view::{DirEntry, Ext4, Metadata};
 
 // --- ext4 constants ---
 
@@ -65,15 +65,24 @@ impl Superblock {
         let is_64bit = (u32le(&buf, 0x60) & INCOMPAT_64BIT) != 0;
 
         let num_data_blocks = blocks_count.saturating_sub(first_data_block);
-        let num_block_groups =
-            ((num_data_blocks + blocks_per_group as u64 - 1) / blocks_per_group as u64) as u32;
+        let num_block_groups = num_data_blocks.div_ceil(blocks_per_group as u64) as u32;
 
-        Ok(Self { block_size, inode_size, inodes_per_group, num_block_groups, is_64bit })
+        Ok(Self {
+            block_size,
+            inode_size,
+            inodes_per_group,
+            num_block_groups,
+            is_64bit,
+        })
     }
 
     fn bgdt_start(&self) -> u64 {
         // Block group descriptor table starts at block 1 (or 2 if block_size==1024).
-        if self.block_size == 1024 { 2 * self.block_size } else { self.block_size }
+        if self.block_size == 1024 {
+            2 * self.block_size
+        } else {
+            self.block_size
+        }
     }
 
     fn bgd_size(&self) -> u64 {
@@ -90,7 +99,11 @@ fn inode_table_block(f: &mut File, sb: &Superblock, group: u32) -> io::Result<u6
     f.read_exact(&mut buf)?;
 
     let lo = u32le(&buf, 0x08) as u64;
-    let hi = if sb.is_64bit { u32le(&buf, 0x28) as u64 } else { 0 };
+    let hi = if sb.is_64bit {
+        u32le(&buf, 0x28) as u64
+    } else {
+        0
+    };
     Ok((hi << 32) | lo)
 }
 
@@ -200,7 +213,10 @@ struct InodeExtents {
 
 // Scan all regular-file inodes, grouping extents by inode and computing both
 // a per-extent hash and the full-file hash (in logical block order).
-fn scan_file_extents_with_full_hash(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeExtents>> {
+fn scan_file_extents_with_full_hash(
+    f: &mut File,
+    sb: &Superblock,
+) -> io::Result<Vec<InodeExtents>> {
     let mut results = Vec::new();
     let mut inode_buf = vec![0u8; sb.inode_size];
 
@@ -211,20 +227,32 @@ fn scan_file_extents_with_full_hash(f: &mut File, sb: &Superblock) -> io::Result
         for idx in 0..sb.inodes_per_group {
             let inode_offset = table_offset + idx as u64 * sb.inode_size as u64;
             f.seek(SeekFrom::Start(inode_offset))?;
-            if f.read_exact(&mut inode_buf).is_err() { break; }
+            if f.read_exact(&mut inode_buf).is_err() {
+                break;
+            }
 
             let i_mode = u16le(&inode_buf, 0x00);
-            if (i_mode & S_IFMT) != S_IFREG { continue; }
-            if u16le(&inode_buf, 0x1a) == 0 { continue; }
+            if (i_mode & S_IFMT) != S_IFREG {
+                continue;
+            }
+            if u16le(&inode_buf, 0x1a) == 0 {
+                continue;
+            }
             let i_flags = u32le(&inode_buf, 0x20);
-            if (i_flags & INODE_FLAG_EXTENTS) == 0 { continue; }
+            if (i_flags & INODE_FLAG_EXTENTS) == 0 {
+                continue;
+            }
             let i_size = hilo64(u32le(&inode_buf, 0x6c), u32le(&inode_buf, 0x04));
-            if i_size == 0 { continue; }
+            if i_size == 0 {
+                continue;
+            }
 
             let i_block = inode_buf[0x28..0x28 + 60].to_vec();
             let mut raw: Vec<(u32, u64, u16)> = Vec::new();
             collect_extents_with_logical(&i_block, f, sb, &mut raw)?;
-            if raw.is_empty() { continue; }
+            if raw.is_empty() {
+                continue;
+            }
 
             raw.sort_by_key(|&(logical, _, _)| logical);
 
@@ -233,7 +261,9 @@ fn scan_file_extents_with_full_hash(f: &mut File, sb: &Superblock) -> io::Result
             let mut bytes_remaining = i_size;
 
             for (_, phys_block, num_blocks) in raw {
-                if bytes_remaining == 0 { break; }
+                if bytes_remaining == 0 {
+                    break;
+                }
                 let allocated = num_blocks as u64 * sb.block_size;
                 let byte_count = allocated.min(bytes_remaining);
                 bytes_remaining = bytes_remaining.saturating_sub(byte_count);
@@ -247,7 +277,10 @@ fn scan_file_extents_with_full_hash(f: &mut File, sb: &Superblock) -> io::Result
                 extent_entries.push((start_byte, byte_count, blake3::hash(&buf)));
             }
 
-            results.push(InodeExtents { full_hash: full_hasher.finalize(), extents: extent_entries });
+            results.push(InodeExtents {
+                full_hash: full_hasher.finalize(),
+                extents: extent_entries,
+            });
         }
     }
 
@@ -263,12 +296,17 @@ fn build_extent_path_map(image: &Path) -> io::Result<HashMap<blake3::Hash, (Stri
     let inode_data = scan_file_extents_with_full_hash(&mut f, &sb)?;
 
     let file_hashes = enumerate_file_hashes(image)?;
-    let hash_to_path: HashMap<blake3::Hash, String> =
-        file_hashes.into_iter().map(|(path, (hash, _))| (hash, path)).collect();
+    let hash_to_path: HashMap<blake3::Hash, String> = file_hashes
+        .into_iter()
+        .map(|(path, (hash, _))| (hash, path))
+        .collect();
 
     let mut map = HashMap::new();
     for inode in inode_data {
-        let path = hash_to_path.get(&inode.full_hash).cloned().unwrap_or_default();
+        let path = hash_to_path
+            .get(&inode.full_hash)
+            .cloned()
+            .unwrap_or_default();
         for (start_byte, byte_count, ext_hash) in inode.extents {
             map.insert(ext_hash, (path.clone(), start_byte, byte_count));
         }
@@ -287,7 +325,12 @@ pub struct TraceEntry {
 pub fn save_trace(path: &Path, entries: &[TraceEntry]) -> io::Result<()> {
     let mut out = String::from("# palimpsest-boot-trace v1\n");
     for e in entries {
-        out.push_str(&format!("{} {} {}\n", e.hash.to_hex(), e.start_byte, e.byte_count));
+        out.push_str(&format!(
+            "{} {} {}\n",
+            e.hash.to_hex(),
+            e.start_byte,
+            e.byte_count
+        ));
     }
     std::fs::write(path, out)
 }
@@ -297,25 +340,36 @@ fn load_trace(path: &Path) -> io::Result<Vec<TraceEntry>> {
     let mut entries = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.is_empty() { continue; }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
         let mut parts = line.split_whitespace();
-        let hash_str = parts.next()
+        let hash_str = parts
+            .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hash"))?;
-        let start_byte: u64 = parts.next()
+        let start_byte: u64 = parts
+            .next()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad start_byte"))?;
-        let byte_count: u64 = parts.next()
+        let byte_count: u64 = parts
+            .next()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad byte_count"))?;
         let hash = hex_to_hash(hash_str)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad hash"))?;
-        entries.push(TraceEntry { hash, start_byte, byte_count });
+        entries.push(TraceEntry {
+            hash,
+            start_byte,
+            byte_count,
+        });
     }
     Ok(entries)
 }
 
 fn hex_to_hash(s: &str) -> Option<blake3::Hash> {
-    if s.len() != 64 { return None; }
+    if s.len() != 64 {
+        return None;
+    }
     let mut bytes = [0u8; 32];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
         let hi = hex_nibble(chunk[0])?;
@@ -403,7 +457,6 @@ fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<ExtentEntr
     Ok(results)
 }
 
-
 // --- stats ---
 
 #[derive(Default)]
@@ -438,7 +491,11 @@ fn build_stats(entries: &[ExtentEntry]) -> ExtentStats {
 fn print_stats(label: &str, stats: &ExtentStats) {
     let unique = stats.unique();
     let total_mb = stats.total_bytes as f64 / (1024.0 * 1024.0);
-    let dedup_ratio = if unique > 0 { stats.extent_count as f64 / unique as f64 } else { 1.0 };
+    let dedup_ratio = if unique > 0 {
+        stats.extent_count as f64 / unique as f64
+    } else {
+        1.0
+    };
 
     println!("=== {} ===", label);
     println!("  File extents:     {}", stats.extent_count);
@@ -453,7 +510,11 @@ fn print_stats(label: &str, stats: &ExtentStats) {
 }
 
 fn print_overlap(stats1: &ExtentStats, stats2: &ExtentStats) {
-    let common = stats1.hash_to_bytes.keys().filter(|h| stats2.hash_to_bytes.contains_key(h)).count();
+    let common = stats1
+        .hash_to_bytes
+        .keys()
+        .filter(|h| stats2.hash_to_bytes.contains_key(h))
+        .count();
 
     let common_bytes: u64 = stats1
         .hash_to_bytes
@@ -487,8 +548,7 @@ const MB: f64 = 1024.0 * 1024.0;
 
 /// Walk an ext4 image and return a map of path → (blake3 hash of full file, byte count).
 fn enumerate_file_hashes(image: &Path) -> io::Result<HashMap<String, (blake3::Hash, u64)>> {
-    let fs = Ext4::load_from_path(image)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let fs = Ext4::load_from_path(image).map_err(|e| io::Error::other(e.to_string()))?;
     let mut out = HashMap::new();
     let mut queue: Vec<Ext4PathBuf> = vec![Ext4PathBuf::new("/")];
 
@@ -562,10 +622,8 @@ fn analyse_delta(image1: &Path, image2: &Path, level: i32) -> io::Result<()> {
     }
 
     // Pass 2: measure delta compression on changed files.
-    let fs1 = Ext4::load_from_path(image1)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    let fs2 = Ext4::load_from_path(image2)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let fs1 = Ext4::load_from_path(image1).map_err(|e| io::Error::other(e.to_string()))?;
+    let fs2 = Ext4::load_from_path(image2).map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut raw_changed = 0u64;
     let mut standalone_total = 0u64;
@@ -596,7 +654,11 @@ fn analyse_delta(image1: &Path, image2: &Path, level: i32) -> io::Result<()> {
         standalone_total += s as u64;
         dict_total += d as u64;
 
-        let saving_pct = if s > 0 { 100.0 * (1.0 - d as f64 / s as f64) } else { 0.0 };
+        let saving_pct = if s > 0 {
+            100.0 * (1.0 - d as f64 / s as f64)
+        } else {
+            0.0
+        };
         buckets[((saving_pct / 20.0) as usize).min(4)] += 1;
     }
 
@@ -683,15 +745,25 @@ pub fn locate_extents(image: &Path) -> io::Result<Vec<LocatedExtent>> {
         for idx in 0..sb.inodes_per_group {
             let inode_offset = table_offset + idx as u64 * sb.inode_size as u64;
             f.seek(SeekFrom::Start(inode_offset))?;
-            if f.read_exact(&mut inode_buf).is_err() { break; }
+            if f.read_exact(&mut inode_buf).is_err() {
+                break;
+            }
 
             let i_mode = u16le(&inode_buf, 0x00);
-            if (i_mode & S_IFMT) != S_IFREG { continue; }
-            if u16le(&inode_buf, 0x1a) == 0 { continue; }
+            if (i_mode & S_IFMT) != S_IFREG {
+                continue;
+            }
+            if u16le(&inode_buf, 0x1a) == 0 {
+                continue;
+            }
             let i_flags = u32le(&inode_buf, 0x20);
-            if (i_flags & INODE_FLAG_EXTENTS) == 0 { continue; }
+            if (i_flags & INODE_FLAG_EXTENTS) == 0 {
+                continue;
+            }
             let i_size = hilo64(u32le(&inode_buf, 0x6c), u32le(&inode_buf, 0x04));
-            if i_size == 0 { continue; }
+            if i_size == 0 {
+                continue;
+            }
 
             let i_block = inode_buf[0x28..0x28 + 60].to_vec();
             let mut raw_extents: Vec<(u64, u16)> = Vec::new();
@@ -699,7 +771,9 @@ pub fn locate_extents(image: &Path) -> io::Result<Vec<LocatedExtent>> {
 
             let mut bytes_remaining = i_size;
             for (start_block, num_blocks) in raw_extents {
-                if bytes_remaining == 0 { break; }
+                if bytes_remaining == 0 {
+                    break;
+                }
                 let allocated = num_blocks as u64 * sb.block_size;
                 let byte_count = allocated.min(bytes_remaining);
                 bytes_remaining = bytes_remaining.saturating_sub(byte_count);
@@ -708,7 +782,11 @@ pub fn locate_extents(image: &Path) -> io::Result<Vec<LocatedExtent>> {
                 let mut buf = vec![0u8; byte_count as usize];
                 f.seek(SeekFrom::Start(start_byte))?;
                 f.read_exact(&mut buf)?;
-                results.push(LocatedExtent { start_byte, byte_count, hash: blake3::hash(&buf) });
+                results.push(LocatedExtent {
+                    start_byte,
+                    byte_count,
+                    hash: blake3::hash(&buf),
+                });
             }
         }
     }
@@ -767,7 +845,7 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
     }
 
     let mut exact_renames: Vec<(String, String, u64)> = Vec::new(); // (old, new, bytes)
-    let mut size_candidates: Vec<(String, u64)> = Vec::new();       // (new_path, size)
+    let mut size_candidates: Vec<(String, u64)> = Vec::new(); // (new_path, size)
     let mut genuinely_new: Vec<(String, u64)> = Vec::new();
 
     for (path2, (hash2, size2)) in &hashes2 {
@@ -781,20 +859,23 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
             continue;
         }
         // Check for size match — rename + modification candidate
-        if let Some(candidates) = size_to_paths1.get(size2) {
-            if !candidates.is_empty() && *size2 > 0 {
-                size_candidates.push((path2.clone(), *size2));
-                continue;
-            }
+        if let Some(candidates) = size_to_paths1.get(size2)
+            && !candidates.is_empty()
+            && *size2 > 0
+        {
+            size_candidates.push((path2.clone(), *size2));
+            continue;
         }
         genuinely_new.push((path2.clone(), *size2));
     }
 
     // Files removed in image2 (present in image1 but not image2, not accounted for as rename source)
-    let renamed_away: std::collections::HashSet<String> = exact_renames.iter()
+    let renamed_away: std::collections::HashSet<String> = exact_renames
+        .iter()
         .map(|(old, _, _)| old.clone())
         .collect();
-    let removed: Vec<(&String, u64)> = hashes1.iter()
+    let removed: Vec<(&String, u64)> = hashes1
+        .iter()
         .filter(|(path, _)| !hashes2.contains_key(*path) && !renamed_away.contains(*path))
         .map(|(path, (_, size))| (path, *size))
         .collect();
@@ -808,15 +889,26 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
     println!("  image2: {}", image2.display());
     println!();
     println!("  New paths in image2 (not present in image1 by path):");
-    println!("    Exact renames (same content, different path): {:>5} files  {:>7.1} MB",
-        exact_renames.len(), exact_bytes as f64 / MB);
-    println!("    Size-matched (rename+modify candidates):      {:>5} files  {:>7.1} MB",
-        size_candidates.len(), candidate_bytes as f64 / MB);
-    println!("    Genuinely new (no size match in image1):      {:>5} files  {:>7.1} MB",
-        genuinely_new.len(), new_bytes as f64 / MB);
+    println!(
+        "    Exact renames (same content, different path): {:>5} files  {:>7.1} MB",
+        exact_renames.len(),
+        exact_bytes as f64 / MB
+    );
+    println!(
+        "    Size-matched (rename+modify candidates):      {:>5} files  {:>7.1} MB",
+        size_candidates.len(),
+        candidate_bytes as f64 / MB
+    );
+    println!(
+        "    Genuinely new (no size match in image1):      {:>5} files  {:>7.1} MB",
+        genuinely_new.len(),
+        new_bytes as f64 / MB
+    );
     println!();
-    println!("  Removed paths in image2 (not accounted for as rename source): {:>5} files",
-        removed.len());
+    println!(
+        "  Removed paths in image2 (not accounted for as rename source): {:>5} files",
+        removed.len()
+    );
 
     if !exact_renames.is_empty() {
         println!("\n  Exact renames:");
@@ -847,7 +939,12 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
 
 // --- cold boot analysis ---
 
-pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32) -> io::Result<()> {
+pub fn run_cold_boot(
+    image1: &Path,
+    image2: &Path,
+    trace_path: &Path,
+    level: i32,
+) -> io::Result<()> {
     println!("Loading boot trace from {} ...", trace_path.display());
     let trace = load_trace(trace_path)?;
     println!("  {} extents in trace", trace.len());
@@ -859,19 +956,24 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
     let total_image2_bytes: u64 = {
         let mut f = File::open(image2)?;
         let sb = Superblock::read(&mut f)?;
-        scan_file_extents(&mut f, &sb)?.iter().map(|e| e.byte_count).sum()
+        scan_file_extents(&mut f, &sb)?
+            .iter()
+            .map(|e| e.byte_count)
+            .sum()
     };
 
     println!("Scanning image1 extent hashes ...");
     let image1_hashes: std::collections::HashSet<blake3::Hash> = {
         let mut f = File::open(image1)?;
         let sb = Superblock::read(&mut f)?;
-        scan_file_extents(&mut f, &sb)?.iter().map(|e| e.hash).collect()
+        scan_file_extents(&mut f, &sb)?
+            .iter()
+            .map(|e| e.hash)
+            .collect()
     };
 
     println!("Loading image1 filesystem ...");
-    let fs1 = Ext4::load_from_path(image1)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let fs1 = Ext4::load_from_path(image1).map_err(|e| io::Error::other(e.to_string()))?;
     let mut image2_raw = File::open(image2)?;
 
     let mut exact_count = 0usize;
@@ -922,16 +1024,18 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
                         image2_raw.read_exact(&mut buf)?;
 
                         let standalone = zstd::bulk::compress(&buf, level).unwrap_or_default();
-                        let dict_compressed = zstd::bulk::Compressor::with_dictionary(level, &data1)
-                            .ok()
-                            .and_then(|mut c| c.compress(&buf).ok())
-                            .unwrap_or_else(|| standalone.clone());
+                        let dict_compressed =
+                            zstd::bulk::Compressor::with_dictionary(level, &data1)
+                                .ok()
+                                .and_then(|mut c| c.compress(&buf).ok())
+                                .unwrap_or_else(|| standalone.clone());
 
                         delta_count += 1;
                         delta_raw_bytes += entry.byte_count;
                         delta_standalone_bytes += standalone.len() as u64;
                         // Take whichever is smaller — dict can sometimes be worse for tiny extents
-                        delta_compressed_bytes += dict_compressed.len().min(standalone.len()) as u64;
+                        delta_compressed_bytes +=
+                            dict_compressed.len().min(standalone.len()) as u64;
                     }
                     Err(_) => {
                         // File is genuinely new in image2
@@ -968,19 +1072,25 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
         total_image2_bytes as f64 / MB,
     );
     if unmapped > 0 {
-        println!("  Unmapped reads:      {:>5} extents             (metadata/journal — excluded)", unmapped);
+        println!(
+            "  Unmapped reads:      {:>5} extents             (metadata/journal — excluded)",
+            unmapped
+        );
     }
     println!();
     println!(
         "  Exact match (dedup): {:>5} extents   {:>7.1} MB  ({:.1}% of boot)",
-        exact_count, exact_bytes as f64 / MB,
+        exact_count,
+        exact_bytes as f64 / MB,
         100.0 * exact_bytes as f64 / total_boot_bytes.max(1) as f64,
     );
     if delta_count > 0 {
-        let delta_extra_pct = 100.0 * (1.0 - delta_compressed_bytes as f64 / delta_standalone_bytes.max(1) as f64);
+        let delta_extra_pct =
+            100.0 * (1.0 - delta_compressed_bytes as f64 / delta_standalone_bytes.max(1) as f64);
         println!(
             "  Delta-compressible:  {:>5} extents   {:>7.1} MB raw  →  {:.1} MB zstd  →  {:.1} MB delta  ({:.1}% beyond zstd)",
-            delta_count, delta_raw_bytes as f64 / MB,
+            delta_count,
+            delta_raw_bytes as f64 / MB,
             delta_standalone_bytes as f64 / MB,
             delta_compressed_bytes as f64 / MB,
             delta_extra_pct,
@@ -988,7 +1098,9 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
     }
     println!(
         "  New (no prior):      {:>5} extents   {:>7.1} MB raw  →  {:.1} MB zstd",
-        new_count, new_bytes as f64 / MB, new_compressed_bytes as f64 / MB,
+        new_count,
+        new_bytes as f64 / MB,
+        new_compressed_bytes as f64 / MB,
     );
 
     println!();
@@ -1008,7 +1120,10 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
     );
 
     println!();
-    println!("  Combined saving vs naive full-image download ({:.1} MB):", total_image2_bytes as f64 / MB);
+    println!(
+        "  Combined saving vs naive full-image download ({:.1} MB):",
+        total_image2_bytes as f64 / MB
+    );
     println!(
         "    Warm host:  {:.1} MB  ({:.1}% reduction)  [demand-fetch × dedup × delta]",
         warm_host_fetch as f64 / MB,

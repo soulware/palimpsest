@@ -5,7 +5,10 @@ use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 
 mod extents;
 mod nbd;
+// Infrastructure modules under active development; not yet wired to main.
+#[allow(dead_code)]
 mod segment;
+#[allow(dead_code)]
 mod writelog;
 
 /// Analyse ext4 disk images for dedup and delta compression potential.
@@ -43,10 +46,7 @@ enum Command {
         level: i32,
     },
     /// Measure file renames between two images (exact renames and size-matched rename+modify candidates)
-    RenameAnalysis {
-        image1: String,
-        image2: String,
-    },
+    RenameAnalysis { image1: String, image2: String },
     /// Extract kernel and initrd from an ext4 image's /boot directory
     ExtractBoot {
         image: String,
@@ -59,22 +59,36 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Command::Extents { image1, image2, level } => {
+        Command::Extents {
+            image1,
+            image2,
+            level,
+        } => {
             extents::run(Path::new(&image1), image2.as_deref().map(Path::new), level)
                 .expect("extents failed");
         }
 
-        Command::Serve { image, port, save_trace } => {
+        Command::Serve {
+            image,
+            port,
+            save_trace,
+        } => {
             nbd::run(&image, port, save_trace.as_deref()).expect("NBD server error");
         }
 
-        Command::ColdBoot { image1, image2, trace, level } => {
+        Command::ColdBoot {
+            image1,
+            image2,
+            trace,
+            level,
+        } => {
             extents::run_cold_boot(
                 Path::new(&image1),
                 Path::new(&image2),
                 Path::new(&trace),
                 level,
-            ).expect("cold-boot analysis failed");
+            )
+            .expect("cold-boot analysis failed");
         }
 
         Command::RenameAnalysis { image1, image2 } => {
@@ -99,7 +113,12 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
             Ok(data) => {
                 let dst = out_dir.join(name);
                 std::fs::write(&dst, &data).expect("write failed");
-                println!("Extracted /boot/{} → {} ({:.1} MB)", name, dst.display(), data.len() as f64 / (1024.0 * 1024.0));
+                println!(
+                    "Extracted /boot/{} → {} ({:.1} MB)",
+                    name,
+                    dst.display(),
+                    data.len() as f64 / (1024.0 * 1024.0)
+                );
             }
             Err(e) => eprintln!("Could not read /boot/{}: {}", name, e),
         }

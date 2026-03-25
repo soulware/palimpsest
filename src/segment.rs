@@ -86,7 +86,10 @@ impl IdxEntry {
     ) -> Self {
         let body_length = data.len() as u32;
         // Inline small extents when inlining is enabled.
-        let inline = INLINE_THRESHOLD > 0 && data.len() <= INLINE_THRESHOLD;
+        // INLINE_THRESHOLD is 0 (disabled) until S3 integration; the comparison
+        // is intentionally a no-op for now and will become meaningful when enabled.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        let inline = INLINE_THRESHOLD != 0 && data.len() <= INLINE_THRESHOLD;
         Self {
             hash,
             start_lba,
@@ -202,7 +205,10 @@ fn parse_entry(data: &[u8], pos: &mut usize) -> io::Result<IdxEntry> {
 
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> io::Result<&'a [u8]> {
     if *pos + n > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated .idx entry"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated .idx entry",
+        ));
     }
     let slice = &data[*pos..*pos + n];
     *pos += n;
@@ -217,7 +223,10 @@ fn read_fixed<const N: usize>(data: &[u8], pos: &mut usize) -> io::Result<[u8; N
 
 fn read_u8(data: &[u8], pos: &mut usize) -> io::Result<u8> {
     if *pos >= data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated .idx entry"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated .idx entry",
+        ));
     }
     let b = data[*pos];
     *pos += 1;
@@ -271,7 +280,12 @@ mod tests {
     fn temp_path(suffix: &str) -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("palimpsest-segment-test-{}-{}{}", std::process::id(), n, suffix));
+        p.push(format!(
+            "palimpsest-segment-test-{}-{}{}",
+            std::process::id(),
+            n,
+            suffix
+        ));
         p
     }
 
@@ -280,7 +294,7 @@ mod tests {
             blake3::hash(data),
             start_lba,
             lba_length,
-            0, // no flags
+            0,    // no flags
             1024, // arbitrary body_offset
             data.to_vec(),
         )
@@ -318,14 +332,8 @@ mod tests {
 
         let data = vec![0xabu8; 2048];
         let hash = blake3::hash(&data);
-        let entry = IdxEntry::from_wal_data(
-            hash,
-            42,
-            2,
-            writelog::FLAG_COMPRESSED,
-            8192,
-            data.clone(),
-        );
+        let entry =
+            IdxEntry::from_wal_data(hash, 42, 2, writelog::FLAG_COMPRESSED, 8192, data.clone());
 
         write_idx(&path, &[entry]).unwrap();
 
@@ -381,7 +389,12 @@ mod tests {
             wl.fsync().unwrap();
 
             let entries = vec![IdxEntry::from_wal_data(
-                hash, 0, 1, 0, body_offset, data.to_vec(),
+                hash,
+                0,
+                1,
+                0,
+                body_offset,
+                data.to_vec(),
             )];
 
             promote(&wal_path, ulid, &base.join("pending"), &entries).unwrap();
@@ -389,9 +402,21 @@ mod tests {
 
         // WAL should be gone; pending body and .idx should exist.
         assert!(!wal_path.exists(), "WAL should have been renamed away");
-        assert!(base.join("pending").join(ulid).exists(), "segment body missing");
-        assert!(base.join("pending").join(format!("{ulid}.idx")).exists(), ".idx missing");
-        assert!(!base.join("pending").join(format!("{ulid}.idx.tmp")).exists(), ".idx.tmp should be gone");
+        assert!(
+            base.join("pending").join(ulid).exists(),
+            "segment body missing"
+        );
+        assert!(
+            base.join("pending").join(format!("{ulid}.idx")).exists(),
+            ".idx missing"
+        );
+        assert!(
+            !base
+                .join("pending")
+                .join(format!("{ulid}.idx.tmp"))
+                .exists(),
+            ".idx.tmp should be gone"
+        );
 
         std::fs::remove_dir_all(base).unwrap();
     }

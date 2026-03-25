@@ -3,10 +3,10 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::extents::{locate_extents, LocatedExtent};
+use crate::extents::{LocatedExtent, locate_extents};
 
 // Handshake magic
 const NBD_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
@@ -58,7 +58,10 @@ extern "C" fn sigusr1_handler(_: libc::c_int) {
 
 fn install_sigusr1_handler() {
     unsafe {
-        libc::signal(libc::SIGUSR1, sigusr1_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGUSR1,
+            sigusr1_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -77,14 +80,19 @@ impl ExtentIndex {
     fn build(image_path: &str) -> io::Result<Self> {
         let extents = locate_extents(Path::new(image_path))?;
         let total_bytes = extents.iter().map(|e| e.byte_count).sum();
-        Ok(Self { extents, total_bytes })
+        Ok(Self {
+            extents,
+            total_bytes,
+        })
     }
 
     // Indices of extents overlapping [offset, offset+length).
     // Valid because non-overlapping extents sorted by start are also sorted by end.
     fn overlapping(&self, offset: u64, length: u64) -> std::ops::Range<usize> {
         let end = offset + length;
-        let start_idx = self.extents.partition_point(|e| e.start_byte + e.byte_count <= offset);
+        let start_idx = self
+            .extents
+            .partition_point(|e| e.start_byte + e.byte_count <= offset);
         let end_idx = self.extents.partition_point(|e| e.start_byte < end);
         start_idx..end_idx
     }
@@ -93,17 +101,22 @@ impl ExtentIndex {
 // --- reporting ---
 
 struct ReadStats {
-    accessed: HashSet<usize>,  // extent indices
-    unmapped_reads: u64,       // reads that hit no extent (metadata, journal, etc.)
+    accessed: HashSet<usize>, // extent indices
+    unmapped_reads: u64,      // reads that hit no extent (metadata, journal, etc.)
 }
 
 fn print_report(stats: &ReadStats, index: &ExtentIndex, image_size: u64) {
     let n = stats.accessed.len();
     let total = index.extents.len();
-    let accessed_bytes: u64 = stats.accessed.iter().map(|&i| index.extents[i].byte_count).sum();
+    let accessed_bytes: u64 = stats
+        .accessed
+        .iter()
+        .map(|&i| index.extents[i].byte_count)
+        .sum();
     let lines = format!(
         "\n=== Extent Report ===\n  Extents accessed:  {} / {} ({:.1}%)\n  Data accessed:     {:.1} MB / {:.1} MB ({:.1}%)\n  Unmapped reads:    {} (metadata/journal)\n",
-        n, total,
+        n,
+        total,
         100.0 * n as f64 / total.max(1) as f64,
         accessed_bytes as f64 / (1024.0 * 1024.0),
         index.total_bytes as f64 / (1024.0 * 1024.0),
@@ -120,7 +133,11 @@ pub fn run(image_path: &str, port: u16, save_trace: Option<&str>) -> io::Result<
 
     print!("Building extent index for {} ...", image_path);
     let index = ExtentIndex::build(image_path)?;
-    println!(" {} extents ({:.1} MB file data)", index.extents.len(), index.total_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        " {} extents ({:.1} MB file data)",
+        index.extents.len(),
+        index.total_bytes as f64 / (1024.0 * 1024.0)
+    );
 
     let stats: Arc<Mutex<ReadStats>> = Arc::new(Mutex::new(ReadStats {
         accessed: HashSet::new(),
@@ -131,16 +148,26 @@ pub fn run(image_path: &str, port: u16, save_trace: Option<&str>) -> io::Result<
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
     println!("NBD server on 127.0.0.1:{}", port);
-    println!("Image: {} ({:.1} MB)", image_path, image_size as f64 / (1024.0 * 1024.0));
-    println!("Connect QEMU with: -drive file=nbd://127.0.0.1:{},format=raw,if=virtio", port);
-    println!("Send SIGUSR1 (kill -USR1 {}) for a mid-boot report", std::process::id());
+    println!(
+        "Image: {} ({:.1} MB)",
+        image_path,
+        image_size as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Connect QEMU with: -drive file=nbd://127.0.0.1:{},format=raw,if=virtio",
+        port
+    );
+    println!(
+        "Send SIGUSR1 (kill -USR1 {}) for a mid-boot report",
+        std::process::id()
+    );
     println!("Report file:  {}", report_path());
     if let Some(t) = save_trace {
         println!("Boot trace:   {} (written on disconnect)", t);
     }
     println!("Waiting for connection...\n");
 
-    for stream in listener.incoming() {
+    if let Some(stream) = listener.incoming().next() {
         let stream = stream?;
         println!("[connected: {}]", stream.peer_addr()?);
 
@@ -150,21 +177,47 @@ pub fn run(image_path: &str, port: u16, save_trace: Option<&str>) -> io::Result<
         println!("\n=== Boot Read Report ===");
         let n = stats.accessed.len();
         let total = index.extents.len();
-        let accessed_bytes: u64 = stats.accessed.iter().map(|&i| index.extents[i].byte_count).sum();
-        println!("  Extents accessed:  {} / {} ({:.1}%)", n, total, 100.0 * n as f64 / total.max(1) as f64);
-        println!("  Data accessed:     {:.1} MB / {:.1} MB ({:.1}%)",
+        let accessed_bytes: u64 = stats
+            .accessed
+            .iter()
+            .map(|&i| index.extents[i].byte_count)
+            .sum();
+        println!(
+            "  Extents accessed:  {} / {} ({:.1}%)",
+            n,
+            total,
+            100.0 * n as f64 / total.max(1) as f64
+        );
+        println!(
+            "  Data accessed:     {:.1} MB / {:.1} MB ({:.1}%)",
             accessed_bytes as f64 / (1024.0 * 1024.0),
             index.total_bytes as f64 / (1024.0 * 1024.0),
-            100.0 * accessed_bytes as f64 / index.total_bytes.max(1) as f64);
-        println!("  Unmapped reads:    {} (metadata/journal)", stats.unmapped_reads);
+            100.0 * accessed_bytes as f64 / index.total_bytes.max(1) as f64
+        );
+        println!(
+            "  Unmapped reads:    {} (metadata/journal)",
+            stats.unmapped_reads
+        );
 
         if let Some(trace_path) = save_trace {
-            let entries: Vec<crate::extents::TraceEntry> = stats.accessed.iter().map(|&i| {
-                let e = &index.extents[i];
-                crate::extents::TraceEntry { hash: e.hash, start_byte: e.start_byte, byte_count: e.byte_count }
-            }).collect();
+            let entries: Vec<crate::extents::TraceEntry> = stats
+                .accessed
+                .iter()
+                .map(|&i| {
+                    let e = &index.extents[i];
+                    crate::extents::TraceEntry {
+                        hash: e.hash,
+                        start_byte: e.start_byte,
+                        byte_count: e.byte_count,
+                    }
+                })
+                .collect();
             match crate::extents::save_trace(std::path::Path::new(trace_path), &entries) {
-                Ok(()) => println!("  Boot trace:        {} ({} extents)", trace_path, entries.len()),
+                Ok(()) => println!(
+                    "  Boot trace:        {} ({} extents)",
+                    trace_path,
+                    entries.len()
+                ),
                 Err(e) => eprintln!("  Boot trace error:  {}", e),
             }
         }
@@ -174,8 +227,6 @@ pub fn run(image_path: &str, port: u16, save_trace: Option<&str>) -> io::Result<
         } else {
             println!("[disconnected]");
         }
-
-        break;
     }
 
     Ok(())
@@ -201,7 +252,10 @@ fn handle_connection(
     loop {
         let magic = read_u64(&mut s)?;
         if magic != NBD_OPTS_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad option magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad option magic",
+            ));
         }
         let option = read_u32(&mut s)?;
         let len = read_u32(&mut s)? as usize;
@@ -257,8 +311,9 @@ fn handle_connection(
     loop {
         let magic = match read_u32(&mut s) {
             Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                   || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 if PRINT_STATS.swap(false, Ordering::Relaxed) {
                     let st = stats.lock().unwrap();
                     print_report(&st, index, image_size);
@@ -268,7 +323,10 @@ fn handle_connection(
             Err(e) => return Err(e),
         };
         if magic != NBD_REQUEST_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad request magic",
+            ));
         }
         let _flags = read_u16(&mut s)?;
         let cmd = read_u16(&mut s)?;
@@ -359,7 +417,13 @@ fn cow_read_overlay(cow: &HashMap<u64, Vec<u8>>, offset: u64, buf: &mut [u8]) {
 }
 
 // Write buf at offset into the COW layer, initialising blocks from the base file as needed
-fn cow_write(cow: &mut HashMap<u64, Vec<u8>>, file: &mut File, image_size: u64, offset: u64, buf: &[u8]) -> io::Result<()> {
+fn cow_write(
+    cow: &mut HashMap<u64, Vec<u8>>,
+    file: &mut File,
+    image_size: u64,
+    offset: u64,
+    buf: &[u8],
+) -> io::Result<()> {
     let length = buf.len() as u64;
     let first_block = offset / COW_BLOCK;
     let last_block = (offset + length - 1) / COW_BLOCK;
