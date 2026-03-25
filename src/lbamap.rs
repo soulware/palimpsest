@@ -24,18 +24,26 @@ use std::path::Path;
 use crate::segment;
 use crate::writelog;
 
+/// Value stored per LBA map entry.
+#[derive(Clone, Copy)]
+struct MapEntry {
+    lba_length: u32,
+    hash: blake3::Hash,
+    /// Number of 4KB blocks from the start of the stored payload to the data
+    /// for this entry's `start_lba`. Zero for freshly inserted entries;
+    /// non-zero only for entries produced by splitting a larger entry —
+    /// e.g. if `[0, 100) → H` is split by a write to `[30, 50)`, the
+    /// resulting tail `[50, 100) → H` has `payload_block_offset = 50`.
+    payload_block_offset: u32,
+}
+
 /// The live in-memory LBA map.
 ///
-/// Maps `start_lba → (lba_length, hash, payload_block_offset)` for every
-/// committed extent. Unwritten LBA ranges have no entry (implicitly zero).
-///
-/// `payload_block_offset` is the number of 4KB blocks from the start of the
-/// stored payload (identified by `hash`) to the data for `start_lba`. It is
-/// zero for freshly inserted entries and non-zero only for entries created by
-/// splitting a larger entry — e.g. if `[0, 100) → H` is split by a write to
-/// `[30, 50)`, the resulting tail `[50, 100) → H` has `payload_block_offset = 50`.
+/// Maps `start_lba → MapEntry` for every committed extent. Unwritten LBA
+/// ranges have no entry (implicitly zero, as the block device presents
+/// unwritten blocks as zeroes).
 pub struct LbaMap {
-    inner: BTreeMap<u64, (u32, blake3::Hash, u32)>,
+    inner: BTreeMap<u64, MapEntry>,
 }
 
 impl LbaMap {
@@ -56,27 +64,30 @@ impl LbaMap {
 
         // Step 1: Handle a predecessor entry that starts before `start_lba`
         // but whose tail overlaps the new range.
-        if let Some((&pred_start, &(pred_len, pred_hash, pred_pbo))) =
-            self.inner.range(..start_lba).next_back()
-        {
-            let pred_end = pred_start + pred_len as u64;
+        if let Some((&pred_start, &pred)) = self.inner.range(..start_lba).next_back() {
+            let pred_end = pred_start + pred.lba_length as u64;
             if pred_end > start_lba {
                 self.inner.remove(&pred_start);
                 // Prefix [pred_start, start_lba): same payload_block_offset.
                 self.inner.insert(
                     pred_start,
-                    ((start_lba - pred_start) as u32, pred_hash, pred_pbo),
+                    MapEntry {
+                        lba_length: (start_lba - pred_start) as u32,
+                        hash: pred.hash,
+                        payload_block_offset: pred.payload_block_offset,
+                    },
                 );
                 // Suffix [new_end, pred_end): only present in the "hole punch"
                 // case. payload_block_offset advances by (new_end - pred_start).
                 if pred_end > new_end {
                     self.inner.insert(
                         new_end,
-                        (
-                            (pred_end - new_end) as u32,
-                            pred_hash,
-                            pred_pbo + (new_end - pred_start) as u32,
-                        ),
+                        MapEntry {
+                            lba_length: (pred_end - new_end) as u32,
+                            hash: pred.hash,
+                            payload_block_offset: pred.payload_block_offset
+                                + (new_end - pred_start) as u32,
+                        },
                     );
                 }
             }
@@ -92,25 +103,32 @@ impl LbaMap {
             .collect();
         for key in overlapping {
             // Key was found in range query above; remove cannot fail.
-            let Some((len, h, pbo)) = self.inner.remove(&key) else {
+            let Some(e) = self.inner.remove(&key) else {
                 continue;
             };
-            let entry_end = key + len as u64;
+            let entry_end = key + e.lba_length as u64;
             if entry_end > new_end {
                 // Entry extends past the new range; preserve its tail.
                 // payload_block_offset advances by (new_end - key).
                 self.inner.insert(
                     new_end,
-                    (
-                        (entry_end - new_end) as u32,
-                        h,
-                        pbo + (new_end - key) as u32,
-                    ),
+                    MapEntry {
+                        lba_length: (entry_end - new_end) as u32,
+                        hash: e.hash,
+                        payload_block_offset: e.payload_block_offset + (new_end - key) as u32,
+                    },
                 );
             }
         }
 
-        self.inner.insert(start_lba, (lba_length, hash, 0));
+        self.inner.insert(
+            start_lba,
+            MapEntry {
+                lba_length,
+                hash,
+                payload_block_offset: 0,
+            },
+        );
     }
 
     /// Look up the extent containing `lba`.
@@ -122,9 +140,9 @@ impl LbaMap {
     ///
     /// Returns `None` if `lba` falls in an unwritten region.
     pub fn lookup(&self, lba: u64) -> Option<(blake3::Hash, u32)> {
-        let (&start, &(len, hash, pbo)) = self.inner.range(..=lba).next_back()?;
-        if lba < start + len as u64 {
-            Some((hash, pbo + (lba - start) as u32))
+        let (&start, &e) = self.inner.range(..=lba).next_back()?;
+        if lba < start + e.lba_length as u64 {
+            Some((e.hash, e.payload_block_offset + (lba - start) as u32))
         } else {
             None
         }
@@ -215,7 +233,8 @@ fn collect_idx_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
 }
 
 /// Return all regular files in `dir`. Returns an empty Vec if the directory
-/// does not exist.
+/// does not exist. Uses `DirEntry::file_type()` to avoid an extra stat per
+/// entry on Linux (the file type is returned by `getdents64`).
 fn collect_dir_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -223,9 +242,9 @@ fn collect_dir_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
         Ok(entries) => {
             let mut paths = Vec::new();
             for entry in entries {
-                let path = entry?.path();
-                if path.is_file() {
-                    paths.push(path);
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    paths.push(entry.path());
                 }
             }
             Ok(paths)
