@@ -621,6 +621,23 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 
 ---
 
+## Implementation Notes
+
+**S3 is intentionally deferred.** The system can be developed and validated end-to-end using local storage only — `pending/` and `segments/` act as local-only segment stores without any upload step. This covers the full write path, promotion pipeline, LBA map, crash recovery, and read path. S3 hookup comes later.
+
+A clean progression for introducing S3:
+1. **Local only** — `pending/` and `segments/` as local stores, no upload step
+2. **Local S3-compatible service** (MinIO, LocalStack) — write the S3 client code against a local service; real upload/download paths exercised without cloud dependency
+3. **Real S3** — swap in credentials, no code changes needed
+
+Constraints to keep in mind so S3 integration stays straightforward:
+- Segment IDs (ULIDs) are already globally unique and suitable as S3 object keys
+- The `pending/` → `segments/` transition maps cleanly to "upload to S3, then rename locally"
+- The `.idx` format is already valid as a standalone S3 object
+- Persistent structures (manifests, `.idx` files) reference segment IDs only — local paths are derived at runtime, never stored
+
+---
+
 ## Open Questions
 
 - **Hash output size:** BLAKE3 at full 256-bit is the current choice — collision probability is negligible (~2^-128 birthday bound) at any realistic extent count, and speed is equivalent to non-cryptographic hashes on AVX2/NEON hardware. A truncated 128-bit output would halve the per-entry cost in the extent index (~1.6GB saved at 80M entries) while keeping collision probability effectively zero at practical scales (birthday bound ~2^64). Worth revisiting once the index size and memory pressure are measured empirically.
