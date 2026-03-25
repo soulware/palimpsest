@@ -162,6 +162,8 @@ One entry per extent. Unwritten LBA ranges have no entry (implicitly zero).
 
 Maps `extent_hash → S3 location`. Separate from the manifest — the manifest is purely logical (what data is at each LBA range), the extent index is physical (where that data lives in S3).
 
+**Contrast with lab47/lsvd:** the reference implementation uses a single `lba2pba` map — a direct `LBA → segment+offset` (physical location) index. GC repacking requires updating this map for every moved extent. The manifest + extent index split replaces that single map with two levels of indirection: the manifest is purely logical (`LBA → hash`) and never changes after a snapshot is frozen; only the extent index (`hash → physical location`) is updated during GC. Manifests and snapshots are therefore immutable once written.
+
 This separation means GC can repack extents (changing their S3 location) by updating only the extent index. Manifests are never rewritten after being frozen.
 
 The extent index also stores delta compression metadata: if extent B is stored as a delta against extent A, the index records `hash_B → {segment, offset, delta_source: hash_A}`. The manifest is unaware of this — it just records `(start_lba, length, hash_B)`. The read path fetches the delta and the source extent, reconstructs B, and caches the full extent locally.
@@ -246,21 +248,42 @@ The snapshot index covers no more and no less than what is needed to read that s
 Segments are the unit of S3 storage. Each segment is a packed collection of extents (~32MB). Alongside each segment, a small companion index file is written:
 
 ```
-s3://bucket/segments/<id>       — packed extents (~32MB)
-s3://bucket/segments/<id>.idx   — extent hash → byte offset within segment
+s3://bucket/segments/<id>       — packed extents (~32MB), raw bytes
+s3://bucket/segments/<id>.idx   — per-extent metadata (LBA, hash, body location)
 ```
 
-The `.idx` file is small: ~40 bytes per extent × ~1000 extents per 32MB segment ≈ ~40KB, roughly 1/700th the size of the segment. It is written atomically with the segment upload.
+The segment body is raw bytes — concatenated extent data with no per-extent framing. All structure lives in the `.idx` file. The `.idx` is always fetched before the segment body: it tells the read path whether a segment fetch is needed at all, and if so which byte ranges to request.
 
-**Inline extents:** small extents are stored directly in the `.idx` file rather than referenced by offset into the segment. A byte-range GET has fixed overhead (latency + S3 request cost) that dominates for tiny extents — inlining eliminates that round-trip entirely. The `.idx` entry format distinguishes the two cases:
+The `.idx` file is small: ~60 bytes per extent × ~1000 extents per 32MB segment ≈ ~60KB, roughly 1/500th the size of the segment. It is written atomically with the segment upload.
+
+**`.idx` entry format:**
 
 ```
 For each entry:
-  hash   (32 bytes)
-  flags  (1 byte: reference | inline)
-  if reference: offset (8 bytes) + length (4 bytes)
-  if inline:    length (4 bytes) + data bytes
+  hash        (32 bytes) — BLAKE3 extent hash
+  start_lba   (8 bytes)  — first logical block address (u64 le)
+  lba_length  (4 bytes)  — extent length in 4KB blocks (u32 le); uncompressed size = lba_length × 4096
+  flags       (1 byte)   — bits: 0=inline, 1=delta, 2=compressed
+
+  if delta:
+    source_hash  (32 bytes) — BLAKE3 hash of the source extent to apply delta against
+
+  if !inline (reference):
+    body_offset  (8 bytes) — byte offset within segment body (u64 le)
+    body_length  (4 bytes) — byte length in segment body (u32 le); equals lba_length×4096 if not compressed
+
+  if inline:
+    body_length  (4 bytes) — byte length of inline data (u32 le)
+    data bytes   (body_length bytes) — extent or delta bytes, compressed if flag set
 ```
+
+`inline` and `delta` are orthogonal bits: a delta can be inlined (delta bytes stored directly in `.idx`) or referenced (delta bytes in segment body). Inlined deltas are common — delta bytes for a patched file are often small, and storing them in `.idx` eliminates a byte-range GET against the segment body. The source extent is always fetched separately via its own hash lookup regardless.
+
+The `.idx` entry serves two purposes with a single scan: manifest reconstruction (`start_lba + lba_length + hash`) and extent index population (`hash → segment_id + body_offset + body_length`). No separate pass needed. These could be split into separate files (the global service only needs the hash→location part; the per-volume process only needs the LBA part), but the hash would then be stored twice and two S3 fetches would be required. Since `.idx` files are small and manifest reconstruction is a rare cold-start path, a single combined file is the better tradeoff.
+
+**Compression:** low-entropy extents (those routed through the global service) are compressed with zstd before being written to the segment body. The `compressed` flag is set in `.idx`; `body_length` records the compressed size, which is what determines byte-range GET size. `lba_length × 4096` always gives the uncompressed size — no second size field needed. High-entropy extents (routed to per-volume segments) are stored uncompressed; the entropy check already tells us compression will not help.
+
+**Inline extents:** small extents are stored directly in the `.idx` file rather than referenced by offset into the segment. A byte-range GET has fixed overhead (latency + S3 request cost) that dominates for tiny extents — inlining eliminates that round-trip entirely.
 
 This is particularly effective for the boot path: small config files, scripts, and locale data appear frequently during boot and are naturally small. Inlining them means loading the snapshot index delivers those extents with zero additional S3 requests. The empirical finding that 84% of extents by count are small files (representing only 35% of bytes) means inlining captures the majority of extents with modest `.idx` size growth.
 
