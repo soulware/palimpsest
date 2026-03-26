@@ -35,6 +35,16 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - This validates the value at the boundary and produces a canonical string if re-serialised (e.g. `Ulid::from_string(s)?.to_string()`, not `s.to_owned()`).
 - The same applies to any structured string: paths, hashes, addresses, IDs.
 
+## Documentation
+
+Design documentation is indexed in `DESIGN.md` and lives in `docs/`.
+
+- `docs/overview.md` — problem statement, key concepts, operation modes, empirical findings
+- `docs/architecture.md` — system architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots
+- `docs/formats.md` — WAL format, segment file format, S3 retrieval strategies
+- `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
+- `docs/reference.md` — lsvd reference comparison, implementation notes, open questions
+
 ## References
 
 - [Beating the I/O Bottleneck: A Case for Log-Structured Virtual Disks](https://dl.acm.org/doi/pdf/10.1145/3492321.3524271) — the original LSVD paper
