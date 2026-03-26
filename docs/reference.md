@@ -34,12 +34,16 @@ WAL files live at the root alongside `head.map`. There is no upload-state distin
 │   └── <ULID>                      — WAL file(s): active or awaiting promotion
 ├── pending/
 │   └── <ULID>                      — segment file committed locally, S3 upload pending
-└── segments/
-    └── <ULID>                      — segment file confirmed uploaded to S3 (evictable)
+├── segments/
+│   └── <ULID>                      — segment file confirmed uploaded to S3 (evictable)
+└── children/                        — snapshot and fork children (absent until first snapshot)
+    └── <ULID>/                      — child node directory
 
 <parent-node-dir>/                   — frozen; no wal/ or pending/
-└── segments/
-    └── <ULID>                      — segment file (read-only)
+├── segments/
+│   └── <ULID>                      — segment file (read-only)
+└── children/
+    └── <ULID>/                      — child node directory
 ```
 
 The `pending/` directory exists because palimpsest decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory structure makes the full lifecycle visible via `ls`: `wal/` = in flight, `pending/` = local only, `segments/` = safely in S3.

@@ -30,16 +30,18 @@ All volume state lives under a shared root directory on a dedicated local NVMe m
   volumes/
     <volume-id>/                  — root node of a volume tree
       segments/                   — frozen after first snapshot
-      <snap-ulid>/                — child node (snapshot or fork)
-        segments/                 — frozen after next snapshot
-        <snap-ulid>/              — grandchild node
-          segments/
-          wal/                    — live leaf: this is the current write target
-          pending/
-        <fork-ulid>/              — another live fork from the same parent
-          segments/
-          wal/
-          pending/
+      children/                   — child nodes (snapshots and forks)
+        <snap-ulid>/              — child node
+          segments/               — frozen after next snapshot
+          children/
+            <snap-ulid>/          — grandchild node
+              segments/
+              wal/                — live leaf: this is the current write target
+              pending/
+            <fork-ulid>/          — another live fork from the same parent
+              segments/
+              wal/
+              pending/
   service.sock                    — Unix socket at a stable, known path
 ```
 
@@ -47,11 +49,12 @@ All volume state lives under a shared root directory on a dedicated local NVMe m
 - `wal/` present → live leaf; the volume process writes here
 - `wal/` absent → frozen; contents are immutable
 - `pending/` always accompanies `wal/`
+- `children/` holds snapshot and fork child nodes; may be absent on a leaf with no children yet
 - All ancestor nodes of a live leaf are frozen and shared across all sibling forks; GC must not modify them
 
 **Finding live volumes:** scan for directories containing `wal/`. Each such directory is an independently running volume process.
 
-**Finding a volume's ancestry:** walk up the directory tree from the live leaf to the root. Each parent directory is a frozen snapshot layer; its `segments/` contribute to the LBA map via layer merging (ancestors first, descendants shadow).
+**Finding a volume's ancestry:** walk up from the live leaf, stepping up two directory levels at each hop (the node directory, then `children/`). Each ancestor node is a frozen snapshot layer; its `segments/` contribute to the LBA map via layer merging (ancestors first, descendants shadow).
 
 ```
 VM
@@ -220,12 +223,12 @@ A snapshot freezes the current live node and starts a new live child. Snapshots 
 **Taking a snapshot:**
 
 ```
-1. Create <snap-ulid>/ as a child of the current live node
-2. Create <snap-ulid>/wal/, <snap-ulid>/pending/, <snap-ulid>/segments/
+1. Create children/<snap-ulid>/ under the current live node
+2. Create children/<snap-ulid>/wal/, children/<snap-ulid>/pending/, children/<snap-ulid>/segments/
 3. Redirect new writes to the child immediately (live volume continues uninterrupted)
 4. Background: flush any remaining WAL data to segments/ in the current (now-freezing) node
 5. Background: remove wal/ and pending/ from the current node when flush completes
-   → node is now frozen; directory contains only segments/
+   → node is now frozen; directory contains segments/ and children/
 ```
 
 Steps 1–3 are the only blocking part and are instantaneous. Steps 4–5 are background and do not block I/O.
@@ -235,14 +238,15 @@ Steps 1–3 are the only blocking part and are instantaneous. Steps 4–5 are ba
 ```
 volumes/<base-id>/
   segments/                 ← frozen, shared by both forks
-  <fork-a-ulid>/            ← VM A
-    wal/
-    pending/
-    segments/
-  <fork-b-ulid>/            ← VM B
-    wal/
-    pending/
-    segments/
+  children/
+    <fork-a-ulid>/          ← VM A
+      wal/
+      pending/
+      segments/
+    <fork-b-ulid>/          ← VM B
+      wal/
+      pending/
+      segments/
 ```
 
 **Rollback:** delete the live leaf (and any of its descendants if needed), then re-create `wal/` and `pending/` in the target ancestor. The ancestor's segments are untouched.
@@ -253,10 +257,11 @@ volumes/<base-id>/
 Before snapshot:          After snapshot:
 volumes/<base>/           volumes/<base>/
   segments/                 segments/         ← frozen
-  wal/               →      <snap-1>/
-  pending/                    wal/            ← live continues here
-                              pending/
-                              segments/
+  wal/               →      children/
+  pending/                    <snap-1>/
+                                wal/          ← live continues here
+                                pending/
+                                segments/
 ```
 
 **The directory tree is the source of truth.** No manifest file is required to understand the snapshot relationships or to reconstruct the LBA map. A manifest may be written as an optional startup optimisation, but its absence never affects correctness.
