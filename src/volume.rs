@@ -94,6 +94,21 @@ impl Volume {
         }
         wal_files.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
+        // Edge case: if pending/<ulid> already exists alongside wal/<ulid>,
+        // the promotion completed (rename succeeded) but the WAL delete was
+        // interrupted. The segment is authoritative — delete any such stale
+        // WAL files before deciding what to replay. rebuild_segments above
+        // has already loaded the committed segment into lbamap/extent_index.
+        wal_files.retain(|path| {
+            let ulid = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if pending_dir.join(ulid).exists() {
+                let _ = fs::remove_file(path);
+                false
+            } else {
+                true
+            }
+        });
+
         // recover_wal does the single WAL scan: truncates any partial tail,
         // replays records into the LBA map, and rebuilds pending_entries.
         let (wal, wal_ulid, wal_path, pending_entries) =
@@ -631,6 +646,58 @@ mod tests {
             .filter(|e| e.is_ok())
             .count();
         assert_eq!(pending_count, 1, "expected one segment file in pending/");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn wal_deleted_when_pending_segment_exists() {
+        // Simulate a crash between the segment rename and the WAL delete:
+        // both wal/<ulid> and pending/<ulid> exist. On reopen, the WAL must
+        // be silently discarded and data read from the committed segment.
+        let base = temp_dir();
+
+        // Phase 1: write two blocks and promote so a segment lands in pending/.
+        let ulid;
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &vec![0xaau8; 4096]).unwrap();
+            vol.write(1, &vec![0xbbu8; 4096]).unwrap();
+            vol.promote_for_test().unwrap();
+            // Grab the segment ULID (there is exactly one file in pending/).
+            ulid = fs::read_dir(base.join("pending"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+        }
+
+        // Simulate the crash: copy the segment back as a WAL file so both exist.
+        fs::copy(
+            base.join("pending").join(&ulid),
+            base.join("wal").join(&ulid),
+        )
+        .unwrap();
+
+        // Reopen — should delete the stale WAL and load cleanly from the segment.
+        let vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.lbamap_len(), 2);
+        assert!(
+            vol.read(0, 1).unwrap().iter().all(|&b| b == 0xaa),
+            "LBA 0 should be 0xaa"
+        );
+        assert!(
+            vol.read(1, 1).unwrap().iter().all(|&b| b == 0xbb),
+            "LBA 1 should be 0xbb"
+        );
+        // The stale WAL file should be gone.
+        assert!(
+            !base.join("wal").join(&ulid).exists(),
+            "stale WAL was not removed"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }
