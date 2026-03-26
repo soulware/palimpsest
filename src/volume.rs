@@ -22,6 +22,7 @@
 //   replays entries into the LBA map, extent index, and pending_entries.
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,13 @@ pub struct Volume {
     /// DATA and REF extents written since the last promotion; used to write
     /// the clean segment file on the next promote().
     pending_entries: Vec<segment::SegmentEntry>,
+    /// Single-entry file handle cache for the read path.
+    ///
+    /// Retains the last opened segment file across `read` calls so that
+    /// sequential reads hitting the same segment avoid repeated `open` syscalls.
+    /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
+    /// the cache to be updated internally.
+    file_cache: RefCell<Option<(String, fs::File)>>,
 }
 
 impl Volume {
@@ -175,6 +183,7 @@ impl Volume {
             wal_ulid,
             wal_path,
             pending_entries,
+            file_cache: RefCell::new(None),
         })
     }
 
@@ -258,19 +267,36 @@ impl Volume {
 
         let mut out = vec![0u8; lba_count as usize * 4096];
         for er in self.lbamap.extents_in_range(lba, lba + lba_count as u64) {
-            let Some(loc) = self.extent_index.lookup(&er.hash) else {
-                continue; // hash not indexed — treat as unwritten
+            // Extract owned copies so the borrow of self.extent_index ends before
+            // we mutate self.file_cache.
+            let (segment_id, body_offset, body_length, compressed) = {
+                let Some(loc) = self.extent_index.lookup(&er.hash) else {
+                    continue; // hash not indexed — treat as unwritten
+                };
+                (
+                    loc.segment_id.clone(),
+                    loc.body_offset,
+                    loc.body_length,
+                    loc.compressed,
+                )
             };
-            let path = find_segment_file(&self.base_dir, &loc.segment_id)?;
-            let mut f = fs::File::open(path)?;
+
+            // Reuse the cached file handle if it is for the same segment;
+            // otherwise open the new segment and replace the cache entry.
+            let mut cache = self.file_cache.borrow_mut();
+            if cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str()) {
+                let path = find_segment_file(&self.base_dir, &segment_id)?;
+                *cache = Some((segment_id, fs::File::open(path)?));
+            }
+            let f = &mut cache.as_mut().unwrap().1;
 
             let block_count = (er.range_end - er.range_start) as usize;
             let out_start = (er.range_start - lba) as usize * 4096;
             let out_slice = &mut out[out_start..out_start + block_count * 4096];
 
-            if loc.compressed {
-                f.seek(SeekFrom::Start(loc.body_offset))?;
-                let mut compressed_buf = vec![0u8; loc.body_length as usize];
+            if compressed {
+                f.seek(SeekFrom::Start(body_offset))?;
+                let mut compressed_buf = vec![0u8; body_length as usize];
                 f.read_exact(&mut compressed_buf)?;
                 let decompressed =
                     zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
@@ -278,7 +304,7 @@ impl Volume {
                 out_slice.copy_from_slice(&decompressed[src_start..src_start + block_count * 4096]);
             } else {
                 f.seek(SeekFrom::Start(
-                    loc.body_offset + er.payload_block_offset as u64 * 4096,
+                    body_offset + er.payload_block_offset as u64 * 4096,
                 ))?;
                 f.read_exact(out_slice)?;
             }
