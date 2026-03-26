@@ -148,10 +148,12 @@ impl LbaMap {
     }
 
     /// Number of extents in the map.
+    #[allow(dead_code)] // used in tests; available for diagnostics
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }

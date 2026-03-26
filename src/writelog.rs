@@ -30,7 +30,8 @@ use std::path::Path;
 // --- flag bits ---
 
 /// Payload is zstd-compressed; data_length is the compressed size.
-pub const FLAG_COMPRESSED: u8 = 0x01;
+#[allow(dead_code)] // used when compression is wired up
+pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
 /// No data payload; this LBA range maps to an existing extent identified by hash.
 pub const FLAG_DEDUP_REF: u8 = 0x02;
 
@@ -127,6 +128,7 @@ impl WriteLog {
     }
 
     /// Append a dedup reference. No data payload is written.
+    #[allow(dead_code)] // used when dedup is wired up
     pub fn append_ref(
         &mut self,
         start_lba: u64,

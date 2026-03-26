@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::volume::Volume;
+
 use crate::extents::{LocatedExtent, locate_extents};
 
 // Handshake magic
@@ -31,6 +33,7 @@ const NBD_REP_ERR_UNSUP: u32 = (1 << 31) | 1;
 
 // Info types
 const NBD_INFO_EXPORT: u16 = 0;
+const NBD_INFO_BLOCK_SIZE: u16 = 3;
 
 // Transmission magic
 const NBD_REQUEST_MAGIC: u32 = 0x25609513;
@@ -454,6 +457,208 @@ fn cow_write(
     Ok(())
 }
 
+// --- Volume NBD server ---
+
+pub fn run_volume(dir: &Path, size_bytes: u64, port: u16) -> io::Result<()> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+    let actual_port = listener.local_addr()?.port();
+    println!("NBD volume server on 127.0.0.1:{}", actual_port);
+    println!(
+        "Volume: {} ({:.1} MB)",
+        dir.display(),
+        size_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Connect with: sudo nbd-client 127.0.0.1 {} -N export /dev/nbdX",
+        actual_port
+    );
+    println!("Waiting for connection...\n");
+    serve_volume_listener(dir, size_bytes, listener)
+}
+
+/// Serve one NBD connection on an already-bound listener.
+/// Separated from `run_volume` so tests can bind port 0 and learn the port.
+fn serve_volume_listener(dir: &Path, size_bytes: u64, listener: TcpListener) -> io::Result<()> {
+    install_sigusr1_handler();
+
+    let mut volume = Volume::open(dir)?;
+
+    if let Some(stream) = listener.incoming().next() {
+        let stream = stream?;
+        println!("[connected: {}]", stream.peer_addr()?);
+
+        let result = handle_volume_connection(stream, &mut volume, size_bytes);
+
+        if let Err(e) = result {
+            eprintln!("[connection error: {}]", e);
+        } else {
+            println!("[disconnected]");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_volume_connection(
+    mut s: TcpStream,
+    volume: &mut Volume,
+    volume_size: u64,
+) -> io::Result<()> {
+    // Newstyle handshake
+    s.write_all(&NBD_MAGIC.to_be_bytes())?;
+    s.write_all(&NBD_OPTS_MAGIC.to_be_bytes())?;
+    s.write_all(&NBD_FLAG_FIXED_NEWSTYLE.to_be_bytes())?;
+
+    let _client_flags = read_u32(&mut s)?;
+
+    let tx_flags: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH;
+
+    // Options loop
+    loop {
+        let magic = read_u64(&mut s)?;
+        if magic != NBD_OPTS_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad option magic",
+            ));
+        }
+        let option = read_u32(&mut s)?;
+        let len = read_u32(&mut s)? as usize;
+        let mut data = vec![0u8; len];
+        s.read_exact(&mut data)?;
+
+        match option {
+            NBD_OPT_EXPORT_NAME => {
+                s.write_all(&volume_size.to_be_bytes())?;
+                s.write_all(&tx_flags.to_be_bytes())?;
+                s.write_all(&[0u8; 124])?;
+                break;
+            }
+            NBD_OPT_GO | NBD_OPT_INFO => {
+                // Export info
+                let mut info = Vec::new();
+                info.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
+                info.extend_from_slice(&volume_size.to_be_bytes());
+                info.extend_from_slice(&tx_flags.to_be_bytes());
+                opt_reply(&mut s, option, NBD_REP_INFO, &info)?;
+
+                // Block size: minimum=4096, preferred=4096, maximum=4MB
+                let mut bsz = Vec::new();
+                bsz.extend_from_slice(&NBD_INFO_BLOCK_SIZE.to_be_bytes());
+                bsz.extend_from_slice(&4096u32.to_be_bytes());
+                bsz.extend_from_slice(&4096u32.to_be_bytes());
+                bsz.extend_from_slice(&(4u32 * 1024 * 1024).to_be_bytes());
+                opt_reply(&mut s, option, NBD_REP_INFO, &bsz)?;
+
+                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
+                if option == NBD_OPT_GO {
+                    break;
+                }
+            }
+            NBD_OPT_LIST => {
+                let mut entry = Vec::new();
+                entry.extend_from_slice(&0u32.to_be_bytes());
+                opt_reply(&mut s, option, NBD_REP_SERVER, &entry)?;
+                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
+            }
+            NBD_OPT_ABORT => {
+                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
+                return Ok(());
+            }
+            _ => {
+                opt_reply(&mut s, option, NBD_REP_ERR_UNSUP, &[])?;
+            }
+        }
+    }
+
+    // Transmission loop
+    let mut reads: u64 = 0;
+    let mut writes: u64 = 0;
+    s.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+
+    loop {
+        let magic = match read_u32(&mut s) {
+            Ok(m) => m,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if magic != NBD_REQUEST_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad request magic",
+            ));
+        }
+        let _flags = read_u16(&mut s)?;
+        let cmd = read_u16(&mut s)?;
+        let handle = read_u64(&mut s)?;
+        let offset = read_u64(&mut s)?;
+        let length = read_u32(&mut s)? as usize;
+
+        match cmd {
+            NBD_CMD_READ => {
+                reads += 1;
+                if !offset.is_multiple_of(4096) || !length.is_multiple_of(4096) {
+                    tx_reply(&mut s, 22, handle)?; // EINVAL
+                    continue;
+                }
+                let lba = offset / 4096;
+                let lba_count = (length / 4096) as u32;
+                match volume.read(lba, lba_count) {
+                    Ok(buf) => {
+                        tx_reply(&mut s, 0, handle)?;
+                        s.write_all(&buf)?;
+                    }
+                    Err(e) => {
+                        eprintln!("[read error lba={} count={}: {}]", lba, lba_count, e);
+                        tx_reply(&mut s, 5, handle)?; // EIO — no data follows on error
+                    }
+                }
+            }
+
+            NBD_CMD_WRITE => {
+                writes += 1;
+                let mut buf = vec![0u8; length];
+                s.read_exact(&mut buf)?;
+                if !offset.is_multiple_of(4096) || !length.is_multiple_of(4096) {
+                    tx_reply(&mut s, 22, handle)?; // EINVAL
+                    continue;
+                }
+                let lba = offset / 4096;
+                match volume.write(lba, &buf) {
+                    Ok(()) => tx_reply(&mut s, 0, handle)?,
+                    Err(e) => {
+                        eprintln!("[write error lba={} len={}: {}]", lba, length, e);
+                        tx_reply(&mut s, 5, handle)?; // EIO
+                    }
+                }
+            }
+
+            NBD_CMD_DISC => {
+                println!("[reads: {}, writes: {}]", reads, writes);
+                break;
+            }
+
+            NBD_CMD_FLUSH => match volume.fsync() {
+                Ok(()) => tx_reply(&mut s, 0, handle)?,
+                Err(e) => {
+                    eprintln!("[fsync error: {}]", e);
+                    tx_reply(&mut s, 5, handle)?; // EIO
+                }
+            },
+
+            _ => {
+                tx_reply(&mut s, 22, handle)?; // EINVAL
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // --- Wire helpers ---
 
 fn opt_reply(s: &mut TcpStream, option: u32, reply_type: u32, data: &[u8]) -> io::Result<()> {
@@ -488,4 +693,253 @@ fn read_u64(s: &mut TcpStream) -> io::Result<u64> {
     let mut b = [0u8; 8];
     s.read_exact(&mut b)?;
     Ok(u64::from_be_bytes(b))
+}
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("palimpsest-nbd-test-{}-{}", std::process::id(), n));
+        p
+    }
+
+    // Bind on port 0, spawn the server, return the port.
+    // The listener is already bound before the thread starts, so the client can
+    // connect immediately — the OS queues the connection until accept() is called.
+    fn start_server(dir: &std::path::Path, size_bytes: u64) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            serve_volume_listener(&dir, size_bytes, listener).ok();
+        });
+        port
+    }
+
+    // --- NBD client helpers ---
+
+    struct NbdClient {
+        s: TcpStream,
+    }
+
+    impl NbdClient {
+        /// Connect and complete the newstyle NBD handshake via NBD_OPT_GO.
+        fn connect(port: u16) -> io::Result<Self> {
+            let mut s = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+
+            // Server greeting
+            let mut buf = [0u8; 8];
+            s.read_exact(&mut buf)?;
+            assert_eq!(u64::from_be_bytes(buf), NBD_MAGIC, "bad server magic");
+
+            s.read_exact(&mut buf)?;
+            assert_eq!(u64::from_be_bytes(buf), NBD_OPTS_MAGIC, "bad opts magic");
+
+            let mut flags = [0u8; 2];
+            s.read_exact(&mut flags)?; // server flags — just consume
+
+            // Client flags (0 = support fixed newstyle only)
+            s.write_all(&0u32.to_be_bytes())?;
+
+            // Send NBD_OPT_GO with empty export name, no info requests:
+            //   u32 name_length=0, u16 num_info_requests=0  (6 bytes)
+            s.write_all(&NBD_OPTS_MAGIC.to_be_bytes())?;
+            s.write_all(&NBD_OPT_GO.to_be_bytes())?;
+            s.write_all(&6u32.to_be_bytes())?; // data length
+            s.write_all(&0u32.to_be_bytes())?; // name_length = 0
+            s.write_all(&0u16.to_be_bytes())?; // num_info_requests = 0
+
+            // Consume option replies until NBD_REP_ACK
+            loop {
+                let mut b8 = [0u8; 8];
+                s.read_exact(&mut b8)?;
+                assert_eq!(
+                    u64::from_be_bytes(b8),
+                    NBD_OPTS_REPLY_MAGIC,
+                    "bad reply magic"
+                );
+                let mut b4 = [0u8; 4];
+                s.read_exact(&mut b4)?; // echoed option code
+                s.read_exact(&mut b4)?;
+                let reply_type = u32::from_be_bytes(b4);
+                s.read_exact(&mut b4)?;
+                let data_len = u32::from_be_bytes(b4) as usize;
+                let mut data = vec![0u8; data_len];
+                s.read_exact(&mut data)?;
+
+                if reply_type == NBD_REP_ACK {
+                    break;
+                }
+            }
+
+            Ok(NbdClient { s })
+        }
+
+        fn read(&mut self, handle: u64, offset: u64, length: u32) -> io::Result<Vec<u8>> {
+            self.s.write_all(&NBD_REQUEST_MAGIC.to_be_bytes())?;
+            self.s.write_all(&0u16.to_be_bytes())?; // flags
+            self.s.write_all(&NBD_CMD_READ.to_be_bytes())?;
+            self.s.write_all(&handle.to_be_bytes())?;
+            self.s.write_all(&offset.to_be_bytes())?;
+            self.s.write_all(&length.to_be_bytes())?;
+
+            let mut b4 = [0u8; 4];
+            self.s.read_exact(&mut b4)?;
+            assert_eq!(u32::from_be_bytes(b4), NBD_REPLY_MAGIC, "bad reply magic");
+            self.s.read_exact(&mut b4)?;
+            let error = u32::from_be_bytes(b4);
+            let mut b8 = [0u8; 8];
+            self.s.read_exact(&mut b8)?;
+            assert_eq!(u64::from_be_bytes(b8), handle, "handle mismatch");
+
+            if error != 0 {
+                return Err(io::Error::other(format!("NBD read error {}", error)));
+            }
+            let mut data = vec![0u8; length as usize];
+            self.s.read_exact(&mut data)?;
+            Ok(data)
+        }
+
+        fn write(&mut self, handle: u64, offset: u64, data: &[u8]) -> io::Result<()> {
+            self.s.write_all(&NBD_REQUEST_MAGIC.to_be_bytes())?;
+            self.s.write_all(&0u16.to_be_bytes())?;
+            self.s.write_all(&NBD_CMD_WRITE.to_be_bytes())?;
+            self.s.write_all(&handle.to_be_bytes())?;
+            self.s.write_all(&offset.to_be_bytes())?;
+            self.s.write_all(&(data.len() as u32).to_be_bytes())?;
+            self.s.write_all(data)?;
+
+            let mut b4 = [0u8; 4];
+            self.s.read_exact(&mut b4)?;
+            assert_eq!(u32::from_be_bytes(b4), NBD_REPLY_MAGIC, "bad reply magic");
+            self.s.read_exact(&mut b4)?;
+            let error = u32::from_be_bytes(b4);
+            let mut b8 = [0u8; 8];
+            self.s.read_exact(&mut b8)?;
+            assert_eq!(u64::from_be_bytes(b8), handle, "handle mismatch");
+
+            if error != 0 {
+                return Err(io::Error::other(format!("NBD write error {}", error)));
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self, handle: u64) -> io::Result<()> {
+            self.s.write_all(&NBD_REQUEST_MAGIC.to_be_bytes())?;
+            self.s.write_all(&0u16.to_be_bytes())?;
+            self.s.write_all(&NBD_CMD_FLUSH.to_be_bytes())?;
+            self.s.write_all(&handle.to_be_bytes())?;
+            self.s.write_all(&0u64.to_be_bytes())?; // offset
+            self.s.write_all(&0u32.to_be_bytes())?; // length
+
+            let mut b4 = [0u8; 4];
+            self.s.read_exact(&mut b4)?;
+            assert_eq!(u32::from_be_bytes(b4), NBD_REPLY_MAGIC, "bad reply magic");
+            self.s.read_exact(&mut b4)?;
+            let error = u32::from_be_bytes(b4);
+            let mut b8 = [0u8; 8];
+            self.s.read_exact(&mut b8)?;
+            assert_eq!(u64::from_be_bytes(b8), handle, "handle mismatch");
+
+            if error != 0 {
+                return Err(io::Error::other(format!("NBD flush error {}", error)));
+            }
+            Ok(())
+        }
+
+        fn disconnect(mut self) -> io::Result<()> {
+            self.s.write_all(&NBD_REQUEST_MAGIC.to_be_bytes())?;
+            self.s.write_all(&0u16.to_be_bytes())?;
+            self.s.write_all(&NBD_CMD_DISC.to_be_bytes())?;
+            self.s.write_all(&0u64.to_be_bytes())?; // handle
+            self.s.write_all(&0u64.to_be_bytes())?; // offset
+            self.s.write_all(&0u32.to_be_bytes())?; // length
+            Ok(())
+        }
+    }
+
+    // --- Tests ---
+
+    #[test]
+    fn unwritten_blocks_read_as_zeros() {
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+        let buf = c.read(1, 0, 4096).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        let data: Vec<u8> = (0..4096u16).map(|i| (i & 0xff) as u8).collect();
+        c.write(1, 0, &data).unwrap();
+        let back = c.read(2, 0, 4096).unwrap();
+        assert_eq!(back, data);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn multi_block_write_and_partial_read() {
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        // Write 3 blocks starting at LBA 2 (offset 8192)
+        let data: Vec<u8> = (0..12288u16).map(|i| (i & 0xff) as u8).collect();
+        c.write(1, 8192, &data).unwrap();
+
+        // Read them back as a unit
+        let back = c.read(2, 8192, 12288).unwrap();
+        assert_eq!(back, data);
+
+        // LBA 0 and 1 should still be zero
+        let zero = c.read(3, 0, 8192).unwrap();
+        assert!(zero.iter().all(|&b| b == 0));
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flush_succeeds() {
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+        c.flush(1).unwrap();
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overwrite_block_returns_new_data() {
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        let first = vec![0xaau8; 4096];
+        let second = vec![0xbbu8; 4096];
+        c.write(1, 0, &first).unwrap();
+        c.write(2, 0, &second).unwrap();
+        let back = c.read(3, 0, 4096).unwrap();
+        assert_eq!(back, second);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

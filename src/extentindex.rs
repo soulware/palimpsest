@@ -33,6 +33,7 @@ pub struct ExtentLocation {
     /// Absolute byte offset of the start of the payload in the file.
     pub body_offset: u64,
     /// Byte length of the payload (compressed size if the entry is compressed).
+    #[allow(dead_code)] // used for bounds checking / compressed reads
     pub body_length: u32,
 }
 
@@ -59,10 +60,12 @@ impl ExtentIndex {
     }
 
     /// Number of entries in the index.
+    #[allow(dead_code)] // used in tests; available for diagnostics
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
