@@ -250,34 +250,35 @@ impl Volume {
     /// Read `lba_count` blocks (4096 bytes each) starting at `lba`.
     ///
     /// Blocks that have never been written are returned as zeros (the
-    /// block-device convention for unwritten regions). Each written block
-    /// is fetched from the segment file identified by the extent index.
+    /// block-device convention for unwritten regions). Written blocks are
+    /// fetched extent-by-extent: one file open and one read (or decompress)
+    /// per extent, regardless of how many blocks within the extent are needed.
     pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
 
         let mut out = vec![0u8; lba_count as usize * 4096];
-        for i in 0..lba_count as u64 {
-            let cur_lba = lba + i;
-            let Some((hash, block_offset)) = self.lbamap.lookup(cur_lba) else {
-                continue; // unwritten region — block stays zero
-            };
-            let Some(loc) = self.extent_index.lookup(&hash) else {
+        for er in self.lbamap.extents_in_range(lba, lba + lba_count as u64) {
+            let Some(loc) = self.extent_index.lookup(&er.hash) else {
                 continue; // hash not indexed — treat as unwritten
             };
             let path = find_segment_file(&self.base_dir, &loc.segment_id)?;
             let mut f = fs::File::open(path)?;
-            let out_slice = &mut out[i as usize * 4096..(i as usize + 1) * 4096];
+
+            let block_count = (er.range_end - er.range_start) as usize;
+            let out_start = (er.range_start - lba) as usize * 4096;
+            let out_slice = &mut out[out_start..out_start + block_count * 4096];
+
             if loc.compressed {
                 f.seek(SeekFrom::Start(loc.body_offset))?;
                 let mut compressed_buf = vec![0u8; loc.body_length as usize];
                 f.read_exact(&mut compressed_buf)?;
                 let decompressed =
                     zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
-                let start = block_offset as usize * 4096;
-                out_slice.copy_from_slice(&decompressed[start..start + 4096]);
+                let src_start = er.payload_block_offset as usize * 4096;
+                out_slice.copy_from_slice(&decompressed[src_start..src_start + block_count * 4096]);
             } else {
                 f.seek(SeekFrom::Start(
-                    loc.body_offset + block_offset as u64 * 4096,
+                    loc.body_offset + er.payload_block_offset as u64 * 4096,
                 ))?;
                 f.read_exact(out_slice)?;
             }
