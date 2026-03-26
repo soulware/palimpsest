@@ -171,6 +171,26 @@ One entry per extent. Unwritten LBA ranges have no entry (implicitly zero).
 
 **Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the live LBA map, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised. The directory ancestry is the authoritative parent chain; `parent_id` in the manifest is a convenience field for S3 contexts where directory structure is not available.
 
+### S3 cold start
+
+When a volume is started on a host with no local data — pulled from a snapshot in S3 rather than built from local writes — there are no local segment files to scan and no `lba.map` cache. To reconstruct the LBA map, the volume would otherwise need to fetch the index section of every segment in the entire ancestry tree from S3: potentially hundreds of GETs before serving the first read.
+
+The manifest eliminates this. At snapshot time, the manifest is uploaded to S3 at a well-known key:
+
+```
+s3://bucket/manifests/<snapshot-id>
+```
+
+Cold start from S3 then becomes:
+
+```
+1. Given a snapshot ID, fetch s3://bucket/manifests/<snapshot-id>  — one GET
+2. Verify freshness guard; load LBA map from manifest entries
+3. Begin serving reads via demand-fetch — no segment scanning required
+```
+
+The segment index sections remain the ground truth and are always sufficient to rebuild the LBA map if the manifest is absent or corrupt, but the manifest is the expected path for any cold start from S3. Writing the manifest to S3 at snapshot time is therefore a required part of the snapshot operation, not an optional optimisation.
+
 ## Extent Index
 
 Maps `extent_hash → (segment_ULID, body_offset)`. Separate from the LBA map — the LBA map is purely logical (what data is at each LBA range), the extent index is physical (where that data lives on disk or in S3).
