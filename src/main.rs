@@ -55,6 +55,9 @@ enum Command {
         /// ignored on subsequent opens (size is stored in <dir>/size).
         #[arg(long)]
         size: Option<String>,
+        /// Address to bind (use 0.0.0.0 to allow connections from VMs)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
         #[arg(long, default_value_t = 10809)]
         port: u16,
     },
@@ -107,11 +110,16 @@ fn main() {
                 .expect("rename-analysis failed");
         }
 
-        Command::ServeVolume { dir, size, port } => {
+        Command::ServeVolume {
+            dir,
+            size,
+            bind,
+            port,
+        } => {
             let dir = Path::new(&dir);
             let size_bytes =
                 resolve_volume_size(dir, size.as_deref()).expect("failed to determine volume size");
-            nbd::run_volume(dir, size_bytes, port).expect("volume NBD server error");
+            nbd::run_volume(dir, size_bytes, &bind, port).expect("volume NBD server error");
         }
 
         Command::ExtractBoot { image, out_dir } => {

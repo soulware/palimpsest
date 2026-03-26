@@ -459,18 +459,19 @@ fn cow_write(
 
 // --- Volume NBD server ---
 
-pub fn run_volume(dir: &Path, size_bytes: u64, port: u16) -> io::Result<()> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-    let actual_port = listener.local_addr()?.port();
-    println!("NBD volume server on 127.0.0.1:{}", actual_port);
+pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Result<()> {
+    let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
+    let addr = listener.local_addr()?;
+    println!("NBD volume server on {}", addr);
     println!(
         "Volume: {} ({:.1} MB)",
         dir.display(),
         size_bytes as f64 / (1024.0 * 1024.0)
     );
     println!(
-        "Connect with: sudo nbd-client 127.0.0.1 {} -N export /dev/nbdX",
-        actual_port
+        "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+        addr.ip(),
+        addr.port()
     );
     println!("Waiting for connection...\n");
     serve_volume_listener(dir, size_bytes, listener)
