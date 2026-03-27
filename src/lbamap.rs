@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::segment;
 
@@ -240,17 +240,25 @@ impl Default for LbaMap {
 ///
 /// The caller (`Volume::open`) is responsible for replaying the in-progress
 /// WAL on top of the result — doing so in one pass also builds `pending_entries`.
-pub fn rebuild_segments(base_dir: &Path) -> io::Result<LbaMap> {
+/// Rebuild the LBA map from all committed segments across an ancestor chain.
+///
+/// `node_chain` is ordered oldest-first (root ancestor first, live node last).
+/// Each node's `pending/` and `segments/` are scanned in ULID order. Applying
+/// nodes oldest-to-newest means later layers shadow earlier ones for any
+/// overlapping LBA range, which is the correct layer-merge semantics.
+pub fn rebuild_segments(node_chain: &[PathBuf]) -> io::Result<LbaMap> {
     let mut map = LbaMap::new();
 
-    let mut paths = segment::collect_segment_files(&base_dir.join("pending"))?;
-    paths.extend(segment::collect_segment_files(&base_dir.join("segments"))?);
-    paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for node_dir in node_chain {
+        let mut paths = segment::collect_segment_files(&node_dir.join("pending"))?;
+        paths.extend(segment::collect_segment_files(&node_dir.join("segments"))?);
+        paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    for path in &paths {
-        let (_body_section_start, entries) = segment::read_segment_index(path)?;
-        for entry in entries {
-            map.insert(entry.start_lba, entry.lba_length, entry.hash);
+        for path in &paths {
+            let (_body_section_start, entries) = segment::read_segment_index(path)?;
+            for entry in entries {
+                map.insert(entry.start_lba, entry.lba_length, entry.hash);
+            }
         }
     }
 
@@ -414,7 +422,7 @@ mod tests {
                 .unwrap();
         }
 
-        let map = rebuild_segments(&base).unwrap();
+        let map = rebuild_segments(&[base.clone()]).unwrap();
 
         // [0, 5) should be from segment 1.
         assert_eq!(map.lookup(0), Some((h(1), 0)));
@@ -431,9 +439,50 @@ mod tests {
         let base = temp_dir();
         // No subdirs at all — fresh volume.
         std::fs::create_dir_all(&base).unwrap();
-        let map = rebuild_segments(&base).unwrap();
+        let map = rebuild_segments(&[base.clone()]).unwrap();
         assert!(map.is_empty());
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rebuild_merges_ancestor_chain() {
+        use crate::segment::SegmentEntry;
+
+        let ancestor = temp_dir();
+        let live = temp_dir();
+        std::fs::create_dir_all(ancestor.join("segments")).unwrap();
+        std::fs::create_dir_all(live.join("pending")).unwrap();
+
+        // Ancestor: LBA 0..10 → h(1)
+        {
+            let mut entries = vec![SegmentEntry::new_data(h(1), 0, 10, 0, vec![0u8; 40960])];
+            segment::write_segment(
+                &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &mut entries,
+            )
+            .unwrap();
+        }
+        // Live node: LBA 5..10 → h(2) (shadows ancestor)
+        {
+            let mut entries = vec![SegmentEntry::new_data(h(2), 5, 5, 0, vec![0u8; 20480])];
+            segment::write_segment(
+                &live.join("pending").join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
+                &mut entries,
+            )
+            .unwrap();
+        }
+
+        let map = rebuild_segments(&[ancestor.clone(), live.clone()]).unwrap();
+
+        // Ancestor range not overwritten.
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.lookup(4), Some((h(1), 4)));
+        // Live node shadows ancestor.
+        assert_eq!(map.lookup(5), Some((h(2), 0)));
+        assert_eq!(map.lookup(9), Some((h(2), 4)));
+
+        std::fs::remove_dir_all(ancestor).unwrap();
+        std::fs::remove_dir_all(live).unwrap();
     }
 
     // --- extents_in_range tests ---

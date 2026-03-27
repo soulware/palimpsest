@@ -92,6 +92,11 @@ enum Command {
         #[arg(long, default_value_t = 0.7)]
         min_live_ratio: f64,
     },
+    /// Take a snapshot of a live volume node, freezing it and continuing in a new child node
+    SnapshotVolume {
+        /// Path to the live volume node directory
+        dir: String,
+    },
 }
 
 fn main() {
@@ -174,6 +179,12 @@ fn main() {
                 "segments compacted: {}  bytes freed: {}  extents removed: {}",
                 stats.segments_compacted, stats.bytes_freed, stats.extents_removed,
             );
+        }
+
+        Command::SnapshotVolume { dir } => {
+            let mut vol = volume::Volume::open(Path::new(&dir)).expect("failed to open volume");
+            let child_path = vol.snapshot().expect("snapshot failed");
+            println!("{}", child_path.display());
         }
     }
 }

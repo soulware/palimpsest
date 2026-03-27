@@ -25,6 +25,7 @@
 use std::cell::RefCell;
 use std::fs;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
@@ -107,6 +108,12 @@ pub struct CompactionStats {
 /// Owns the in-memory LBA map, the active WAL, and the directory layout.
 pub struct Volume {
     base_dir: PathBuf,
+    /// Ancestor node directories, oldest-first. Does not include `base_dir`.
+    ancestor_dirs: Vec<PathBuf>,
+    /// Exclusive lock on `base_dir/volume.lock`. Held for the lifetime of the
+    /// Volume; dropped (releasing the lock) when Volume is dropped or when
+    /// `snapshot()` is called and transitions writes to a child node.
+    lock_file: fs::File,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
     wal: writelog::WriteLog,
@@ -130,7 +137,21 @@ impl Volume {
     /// Creates `wal/`, `pending/`, and `segments/` subdirectories if they do
     /// not exist. Rebuilds the LBA map from all committed segments and any
     /// in-progress WAL, then reopens or creates the WAL.
+    ///
+    /// If `base_dir` is a frozen node (`children/` exists, meaning `snapshot()`
+    /// has been called on it at least once), a new child node is created
+    /// automatically and opened instead. The caller always gets a live, writable
+    /// volume; the actual node path may differ from `base_dir` in this case.
     pub fn open(base_dir: &Path) -> io::Result<Self> {
+        // A frozen node has had snapshot() called on it at least once, leaving
+        // children/ present and wal/ absent. Rather than erroring, create a new
+        // sibling child and open that — the caller gets a fresh live node that
+        // inherits the frozen node's data via the ancestor chain.
+        if base_dir.join("children").exists() {
+            let child_dir = base_dir.join("children").join(Ulid::new().to_string());
+            return Self::open(&child_dir);
+        }
+
         let wal_dir = base_dir.join("wal");
         let pending_dir = base_dir.join("pending");
         let segments_dir = base_dir.join("segments");
@@ -138,6 +159,10 @@ impl Volume {
         fs::create_dir_all(&wal_dir)?;
         fs::create_dir_all(&pending_dir)?;
         fs::create_dir_all(&segments_dir)?;
+
+        // Acquire exclusive lock. Fails immediately if another process has this
+        // node open. The lock is released when Volume is dropped.
+        let lock_file = acquire_lock(base_dir)?;
 
         // Remove any .tmp files in pending/ — these are incomplete promotions
         // left behind by a crash between write and rename.
@@ -148,9 +173,17 @@ impl Volume {
             }
         }
 
+        // Build the full node chain: ancestors oldest-first, live node last.
+        let ancestor_dirs = walk_ancestors(base_dir);
+        let node_chain: Vec<PathBuf> = ancestor_dirs
+            .iter()
+            .cloned()
+            .chain(std::iter::once(base_dir.to_owned()))
+            .collect();
+
         // Rebuild the LBA map and extent index from all committed segments.
-        let mut lbamap = lbamap::rebuild_segments(base_dir)?;
-        let mut extent_index = extentindex::rebuild(base_dir)?;
+        let mut lbamap = lbamap::rebuild_segments(&node_chain)?;
+        let mut extent_index = extentindex::rebuild(&node_chain)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -188,6 +221,8 @@ impl Volume {
 
         Ok(Self {
             base_dir: base_dir.to_owned(),
+            ancestor_dirs,
+            lock_file,
             lbamap,
             extent_index,
             wal,
@@ -307,7 +342,7 @@ impl Volume {
             // otherwise open the new segment and replace the cache entry.
             let mut cache = self.file_cache.borrow_mut();
             if cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str()) {
-                let path = find_segment_file(&self.base_dir, &segment_id)?;
+                let path = self.find_segment_file(&segment_id)?;
                 *cache = Some((segment_id, fs::File::open(path)?));
             }
             let f = &mut cache.as_mut().unwrap().1;
@@ -455,9 +490,19 @@ impl Volume {
         Ok(stats)
     }
 
-    /// Promote the current WAL to a pending segment, then open a fresh WAL.
-    fn promote(&mut self) -> io::Result<()> {
+    /// Flush the current WAL to a segment in this node's `pending/`, update
+    /// the extent index, and clear `pending_entries`. The WAL file is deleted.
+    ///
+    /// If `pending_entries` is empty (nothing written since last flush), the
+    /// WAL file is deleted directly without writing a segment.
+    ///
+    /// Does NOT open a new WAL — the caller is responsible for that.
+    fn flush_wal_to_pending(&mut self) -> io::Result<()> {
         self.wal.fsync()?;
+        if self.pending_entries.is_empty() {
+            fs::remove_file(&self.wal_path)?;
+            return Ok(());
+        }
         let body_section_start = segment::promote(
             &self.wal_path,
             &self.wal_ulid,
@@ -480,15 +525,97 @@ impl Volume {
                 },
             );
         }
+        self.pending_entries.clear();
+        Ok(())
+    }
+
+    /// Promote the current WAL to a pending segment, then open a fresh WAL.
+    fn promote(&mut self) -> io::Result<()> {
+        self.flush_wal_to_pending()?;
         // Create the fresh WAL. If this fails the segment is safe in pending/
         // and will be found on the next startup rebuild.
         let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"))?;
         self.wal = wal;
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
-        self.pending_entries.clear();
-
         Ok(())
+    }
+
+    /// Freeze the current live node and continue writing in a new child node.
+    ///
+    /// This is the snapshot operation (verb). After it returns:
+    /// - This node is a frozen node: `wal/` is absent, `children/<ulid>/` exists,
+    ///   data is preserved in `pending/` and `segments/`.
+    /// - `self` now points at the new child node, which is the live continuation.
+    ///   All subsequent writes go to the child.
+    ///
+    /// The exclusive lock transfers atomically to the child (child lock acquired
+    /// before the old lock is released).
+    ///
+    /// Returns the path of the new child (live) node.
+    pub fn snapshot(&mut self) -> io::Result<PathBuf> {
+        let child_ulid = Ulid::new().to_string();
+        let child_dir = self.base_dir.join("children").join(&child_ulid);
+
+        // Create child directory structure.
+        fs::create_dir_all(child_dir.join("wal"))?;
+        fs::create_dir_all(child_dir.join("pending"))?;
+        fs::create_dir_all(child_dir.join("segments"))?;
+
+        // Acquire exclusive lock on the child before redirecting writes.
+        let child_lock = acquire_lock(&child_dir)?;
+
+        // Flush current WAL to a segment in this node's pending/ before freezing.
+        // After this: WAL file is deleted, any data is in pending/<wal_ulid>.
+        self.flush_wal_to_pending()?;
+
+        // Freeze this node: remove the now-empty wal/ directory.
+        fs::remove_dir(self.base_dir.join("wal"))?;
+
+        // Open a fresh WAL in the child node.
+        let (wal, wal_ulid, wal_path, pending_entries) = create_fresh_wal(&child_dir.join("wal"))?;
+
+        // Transition self to the child node. Replacing lock_file releases the
+        // old lock; the child lock is already held.
+        let old_base = std::mem::replace(&mut self.base_dir, child_dir.clone());
+        self.ancestor_dirs.push(old_base);
+        self.wal = wal;
+        self.wal_ulid = wal_ulid;
+        self.wal_path = wal_path;
+        self.pending_entries = pending_entries;
+        self.lock_file = child_lock;
+        *self.file_cache.borrow_mut() = None;
+
+        Ok(child_dir)
+    }
+
+    /// Locate the segment body file for `segment_id` within this volume's
+    /// node chain. Checks the live node's `wal/`, `pending/`, `segments/`
+    /// first, then searches ancestor nodes' `pending/` and `segments/`.
+    ///
+    /// Ancestor nodes have no `wal/` (they are frozen), but may still have
+    /// `pending/` segments awaiting S3 upload.
+    fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
+        for subdir in ["wal", "pending", "segments"] {
+            let path = self.base_dir.join(subdir).join(segment_id);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+        for ancestor in self.ancestor_dirs.iter().rev() {
+            for subdir in ["pending", "segments"] {
+                let path = ancestor.join(subdir).join(segment_id);
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+        }
+        Err(io::Error::other(format!("segment not found: {segment_id}")))
+    }
+
+    #[cfg(test)]
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
     }
 
     #[cfg(test)]
@@ -504,19 +631,50 @@ impl Volume {
 
 // --- helpers ---
 
-/// Locate the segment body file for `segment_id` by checking each storage
-/// directory in order: wal/ (in-progress), pending/ (promoted), segments/.
+/// Acquire an exclusive non-blocking flock on `<dir>/volume.lock`.
 ///
-/// Returns the first path that exists. WAL files are found here before
-/// promotion; after promotion the same ULID lives in pending/.
-fn find_segment_file(base_dir: &Path, segment_id: &str) -> io::Result<PathBuf> {
-    for subdir in ["wal", "pending", "segments"] {
-        let path = base_dir.join(subdir).join(segment_id);
-        if path.exists() {
-            return Ok(path);
-        }
+/// Creates the lock file if it does not exist. Returns the open `File` — the
+/// lock is held for as long as this handle is open and released when dropped.
+/// Returns an error immediately if the lock is already held by another process.
+fn acquire_lock(dir: &Path) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("volume.lock"))?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(file)
     }
-    Err(io::Error::other(format!("segment not found: {segment_id}")))
+}
+
+/// Walk up the directory tree from `base_dir` and return all ancestor node
+/// directories, oldest-first. `base_dir` itself is NOT included.
+///
+/// A non-root live node lives at `<parent>/children/<ulid>/`. This function
+/// detects that pattern and climbs until it reaches the root (a directory
+/// whose parent is not named `children`).
+pub fn walk_ancestors(base_dir: &Path) -> Vec<PathBuf> {
+    let mut ancestors = Vec::new();
+    let mut cur = base_dir.to_owned();
+    while let Some(children_dir) = cur.parent().map(|p| p.to_owned()) {
+        if children_dir
+            .file_name()
+            .map(|n| n != "children")
+            .unwrap_or(true)
+        {
+            break;
+        }
+        let Some(parent_node) = children_dir.parent().map(|p| p.to_owned()) else {
+            break;
+        };
+        ancestors.push(parent_node.clone());
+        cur = parent_node;
+    }
+    ancestors.reverse();
+    ancestors
 }
 
 // --- WAL helpers ---
@@ -1234,6 +1392,225 @@ mod tests {
         let data = vec![0xCDu8; 4096];
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- walk_ancestors tests ---
+
+    #[test]
+    fn walk_ancestors_root_returns_empty() {
+        let root = temp_dir();
+        assert!(walk_ancestors(&root).is_empty());
+    }
+
+    #[test]
+    fn walk_ancestors_one_level() {
+        let root = temp_dir();
+        let child = root.join("children").join("01CHILDULID000000000000000");
+        let ancestors = walk_ancestors(&child);
+        assert_eq!(ancestors, vec![root]);
+    }
+
+    #[test]
+    fn walk_ancestors_two_levels() {
+        let root = temp_dir();
+        let child = root.join("children").join("01CHILDULID000000000000000");
+        let grandchild = child.join("children").join("01GRANDULID000000000000000");
+        let ancestors = walk_ancestors(&grandchild);
+        assert_eq!(ancestors, vec![root, child]);
+    }
+
+    // --- ancestor-aware open / read integration test ---
+
+    /// Set up a frozen ancestor node with a written extent, then open a child
+    /// live node on top. The child should be able to read the ancestor's data.
+    #[test]
+    fn open_reads_ancestor_segments() {
+        let root = temp_dir();
+        let child_dir = root.join("children").join("01CHILDULID000000000000000");
+
+        // Write data into the ancestor (root) and promote to a segment.
+        let data = vec![0xABu8; 4096];
+        {
+            let mut vol = Volume::open(&root).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+        // Freeze the ancestor: remove wal/ to simulate a node after snapshot() was called.
+        fs::remove_dir_all(root.join("wal")).unwrap();
+
+        // Open the child node (empty — no local writes yet).
+        let vol = Volume::open(&child_dir).unwrap();
+
+        // Child should see the ancestor's data through layer merge.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Ancestor data is shadowed by a write in the live child node.
+    #[test]
+    fn child_write_shadows_ancestor() {
+        let root = temp_dir();
+        let child_dir = root.join("children").join("01CHILDULID000000000000000");
+
+        let ancestor_data = vec![0xAAu8; 4096];
+        let child_data = vec![0xBBu8; 4096];
+
+        // Write into ancestor, promote, freeze.
+        {
+            let mut vol = Volume::open(&root).unwrap();
+            vol.write(0, &ancestor_data).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+        fs::remove_dir_all(root.join("wal")).unwrap();
+
+        // Open child, write different data at the same LBA, promote.
+        {
+            let mut vol = Volume::open(&child_dir).unwrap();
+            vol.write(0, &child_data).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        // Re-open child and verify child data wins.
+        let vol = Volume::open(&child_dir).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), child_data);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- lock tests ---
+
+    #[test]
+    fn double_open_same_node_fails() {
+        let base = temp_dir();
+        let _vol = Volume::open(&base).unwrap();
+        // Second open on the same live node must fail (lock already held).
+        assert!(Volume::open(&base).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- snapshot() operation tests ---
+
+    #[test]
+    fn snapshot_freezes_parent_and_continues_in_child() {
+        let base = temp_dir();
+        let data = vec![0xAAu8; 4096];
+
+        let mut vol = Volume::open(&base).unwrap();
+        vol.write(0, &data).unwrap();
+
+        let child_path = vol.snapshot().unwrap();
+
+        // Parent wal/ is gone (frozen).
+        assert!(!base.join("wal").exists());
+        // Child wal/ exists.
+        assert!(child_path.join("wal").is_dir());
+        // child_path is under base/children/.
+        assert_eq!(child_path.parent().unwrap(), base.join("children"));
+
+        // Writes after snapshot go to the child.
+        let new_data = vec![0xBBu8; 4096];
+        vol.write(1, &new_data).unwrap();
+
+        // Both LBAs readable.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(1, 1).unwrap(), new_data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_data_readable_after_reopen_of_child() {
+        let base = temp_dir();
+        let pre_snap = vec![0xAAu8; 4096];
+        let post_snap = vec![0xBBu8; 4096];
+
+        let child_path = {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &pre_snap).unwrap();
+            let child = vol.snapshot().unwrap();
+            vol.write(1, &post_snap).unwrap();
+            vol.promote_for_test().unwrap();
+            child
+        };
+
+        // Re-open the child: should see both pre- and post-snapshot data.
+        let vol = Volume::open(&child_path).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), pre_snap);
+        assert_eq!(vol.read(1, 1).unwrap(), post_snap);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_lock_transfers_to_child() {
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+        let child_path = vol.snapshot().unwrap();
+
+        // Base is now a frozen node (wal/ gone, lock released).
+        // Verify the child node is locked by attempting a second open on it.
+        let _vol2_child_fail = Volume::open(&child_path);
+        assert!(_vol2_child_fail.is_err());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn open_frozen_node_creates_new_child() {
+        let base = temp_dir();
+        let data = vec![0xAAu8; 4096];
+
+        // Write, call snapshot(), drop — base is now a frozen node.
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        // Opening the frozen base should silently create a new child.
+        let vol = Volume::open(&base).unwrap();
+        // The live node is under base/children/, not base itself.
+        assert!(vol.base_dir().starts_with(base.join("children")));
+        // Ancestor data is visible.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn open_frozen_node_two_callers_get_siblings() {
+        let base = temp_dir();
+
+        // Call snapshot() to freeze base.
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        // Two independent opens of the frozen base should produce two
+        // distinct sibling live nodes (different ULIDs, both under children/).
+        let vol_a = Volume::open(&base).unwrap();
+        let vol_b = Volume::open(&base).unwrap();
+        assert_ne!(vol_a.base_dir(), vol_b.base_dir());
+        assert!(vol_a.base_dir().starts_with(base.join("children")));
+        assert!(vol_b.base_dir().starts_with(base.join("children")));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_empty_wal_no_segment_written() {
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+        // No writes — WAL is empty.
+        vol.snapshot().unwrap();
+
+        // Parent pending/ should be empty (no segment written for empty WAL).
+        let pending: Vec<_> = fs::read_dir(base.join("pending")).unwrap().collect();
+        assert!(pending.is_empty());
 
         fs::remove_dir_all(base).unwrap();
     }

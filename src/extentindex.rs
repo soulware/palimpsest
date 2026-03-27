@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::segment;
 
@@ -85,11 +85,13 @@ impl Default for ExtentIndex {
 
 // --- rebuild from disk ---
 
-/// Rebuild the extent index from all committed segments.
+/// Rebuild the extent index from all committed segments across an ancestor chain.
 ///
-/// Scans `<base>/pending/` and `<base>/segments/` in ULID order (oldest
-/// first). Reads the index section of each segment file; body_offset is
-/// stored as an absolute file offset (`body_section_start + stored_offset`).
+/// `node_chain` is ordered oldest-first (root ancestor first, live node last).
+/// Each node's `pending/` and `segments/` are scanned in ULID order. Later
+/// entries for the same hash overwrite earlier ones (same segment ULID is
+/// globally unique, so this only matters across layers for moved extents after
+/// GC repacking).
 ///
 /// Inline entries and dedup-ref entries are skipped:
 /// - Inline entries: read path not yet implemented (INLINE_THRESHOLD = 0).
@@ -97,38 +99,40 @@ impl Default for ExtentIndex {
 ///   from the ancestor segment that holds the actual data.
 ///
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
-pub fn rebuild(base_dir: &Path) -> io::Result<ExtentIndex> {
+pub fn rebuild(node_chain: &[PathBuf]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
-    let mut paths = segment::collect_segment_files(&base_dir.join("pending"))?;
-    paths.extend(segment::collect_segment_files(&base_dir.join("segments"))?);
-    paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for node_dir in node_chain {
+        let mut paths = segment::collect_segment_files(&node_dir.join("pending"))?;
+        paths.extend(segment::collect_segment_files(&node_dir.join("segments"))?);
+        paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    for path in &paths {
-        let segment_id = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| io::Error::other("bad segment filename"))?;
-        // Validate as ULID and canonicalize.
-        let segment_id = ulid::Ulid::from_string(segment_id)
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .to_string();
+        for path in &paths {
+            let segment_id = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::other("bad segment filename"))?;
+            // Validate as ULID and canonicalize.
+            let segment_id = ulid::Ulid::from_string(segment_id)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .to_string();
 
-        let (body_section_start, entries) = segment::read_segment_index(path)?;
+            let (body_section_start, entries) = segment::read_segment_index(path)?;
 
-        for entry in entries {
-            if entry.is_dedup_ref || entry.is_inline {
-                continue;
+            for entry in entries {
+                if entry.is_dedup_ref || entry.is_inline {
+                    continue;
+                }
+                index.insert(
+                    entry.hash,
+                    ExtentLocation {
+                        segment_id: segment_id.clone(),
+                        body_offset: body_section_start + entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                    },
+                );
             }
-            index.insert(
-                entry.hash,
-                ExtentLocation {
-                    segment_id: segment_id.clone(),
-                    body_offset: body_section_start + entry.stored_offset,
-                    body_length: entry.stored_length,
-                    compressed: entry.compressed,
-                },
-            );
         }
     }
 
@@ -198,7 +202,7 @@ mod tests {
         let bss = segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
             .unwrap();
 
-        let index = rebuild(&base).unwrap();
+        let index = rebuild(&[base.clone()]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         // body_offset should be absolute (body_section_start + 0).
@@ -228,7 +232,7 @@ mod tests {
         ];
         segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries).unwrap();
 
-        let index = rebuild(&base).unwrap();
+        let index = rebuild(&[base.clone()]).unwrap();
         // Only the DATA entry should be indexed; the dedup-ref is skipped.
         assert_eq!(index.len(), 1);
         assert!(index.lookup(&ref_hash).is_none());
@@ -268,7 +272,7 @@ mod tests {
             stored_offset2 = entries[1].stored_offset;
         }
 
-        let index = rebuild(&base).unwrap();
+        let index = rebuild(&[base.clone()]).unwrap();
         // Newer segment's offset wins.
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, bss2 + stored_offset2);
@@ -280,8 +284,40 @@ mod tests {
     fn rebuild_empty_dirs_returns_empty() {
         let base = temp_dir();
         std::fs::create_dir_all(&base).unwrap();
-        let index = rebuild(&base).unwrap();
+        let index = rebuild(&[base.clone()]).unwrap();
         assert!(index.is_empty());
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rebuild_indexes_ancestor_segments() {
+        let ancestor = temp_dir();
+        let live = temp_dir();
+        std::fs::create_dir_all(ancestor.join("segments")).unwrap();
+        std::fs::create_dir_all(live.join("pending")).unwrap();
+
+        let data = vec![0xabu8; 4096];
+        let hash = blake3::hash(&data);
+
+        // Hash lives in ancestor segments/.
+        let bss;
+        let stored_offset;
+        {
+            let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+            bss = segment::write_segment(
+                &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &mut entries,
+            )
+            .unwrap();
+            stored_offset = entries[0].stored_offset;
+        }
+
+        let index = rebuild(&[ancestor.clone(), live.clone()]).unwrap();
+        assert_eq!(index.len(), 1);
+        let loc = index.lookup(&hash).unwrap();
+        assert_eq!(loc.body_offset, bss + stored_offset);
+
+        std::fs::remove_dir_all(ancestor).unwrap();
+        std::fs::remove_dir_all(live).unwrap();
     }
 }

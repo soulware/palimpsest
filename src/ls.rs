@@ -4,10 +4,7 @@
 // then presents the virtual disk as an Ext4Read implementor so that
 // ext4_view can parse the filesystem without mounting it.
 //
-// Limitation: reads only the given node's own data (pending/ + segments/ +
-// wal/). Volumes with snapshot ancestry may show zeros for blocks that live
-// only in ancestor nodes. Multi-node support requires walking the ancestor
-// chain.
+// Reads the given node and all ancestor nodes in the snapshot chain.
 
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -15,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 
-use crate::{extentindex, lbamap, segment, writelog};
+use crate::{extentindex, lbamap, segment, volume, writelog};
 
 pub fn run(dir: &Path, fs_path: &str) -> io::Result<()> {
     let reader = VolumeReader::open(dir)?;
@@ -111,9 +108,13 @@ struct VolumeReader {
 
 impl VolumeReader {
     fn open(dir: &Path) -> io::Result<Self> {
-        // Rebuild LBA map and extent index from committed segments.
-        let mut lbamap = lbamap::rebuild_segments(dir)?;
-        let mut extent_index = extentindex::rebuild(dir)?;
+        // Rebuild LBA map and extent index from all committed segments (including ancestors).
+        let node_chain: Vec<std::path::PathBuf> = volume::walk_ancestors(dir)
+            .into_iter()
+            .chain(std::iter::once(dir.to_owned()))
+            .collect();
+        let mut lbamap = lbamap::rebuild_segments(&node_chain)?;
+        let mut extent_index = extentindex::rebuild(&node_chain)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
         // partial tails that may exist on a currently-running volume.
