@@ -1,4 +1,4 @@
-# Palimpsest
+# Elide
 
 ## Rust Code Quality Rules
 
@@ -37,7 +37,7 @@ These rules apply to all Rust code in this project. Follow them without needing 
 
 ## Documentation
 
-Design documentation is indexed in `DESIGN.md` and lives in `docs/`.
+Design documentation is indexed in `README.md` and lives in `docs/`.
 
 - `docs/overview.md` — problem statement, key concepts, operation modes, empirical findings
 - `docs/findings.md` — empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification

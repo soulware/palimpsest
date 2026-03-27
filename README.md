@@ -1,6 +1,6 @@
-# Design
+# Elide
 
-Palimpsest is a log-structured block storage system combining demand-fetch, content-addressed dedup, and delta compression, designed for running many VMs efficiently on shared infrastructure.
+Elide is a log-structured block storage system combining demand-fetch, content-addressed dedup, and delta compression, designed for running many VMs efficiently on shared infrastructure.
 
 ## Documentation
 
