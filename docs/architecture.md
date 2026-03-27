@@ -25,18 +25,33 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 All volume state lives under a shared root directory on a dedicated local NVMe mount. **The directory tree is the snapshot tree**: each node is a volume state at a point in time. A node containing `wal/` is a live (writable) leaf. A node without `wal/` is frozen (read-only). The parent chain is the directory ancestry — no manifest is needed to traverse it.
 
+**Before any snapshot is taken**, the root node is the live leaf:
+
 ```
 /var/lib/elide/
   volumes/
-    <volume-id>/                  — root node of a volume tree
-      segments/                   — frozen after first snapshot
-      children/                   — child nodes (snapshots and forks)
-        <snap-ulid>/              — child node
-          segments/               — frozen after next snapshot
+    <volume-id>/                  — root node; also the live leaf initially
+      wal/                        — live: write target
+      pending/
+      segments/
+  service.sock
+```
+
+**After snapshots have been taken**, the root becomes a frozen ancestor and live work continues in descendant nodes:
+
+```
+/var/lib/elide/
+  volumes/
+    <volume-id>/                  — root node; frozen after first snapshot()
+      segments/
+      children/                   — created when snapshot() is first called
+        <snap-ulid>/              — child node; frozen after next snapshot()
+          segments/
+          pending/                — may be present: segments awaiting S3 upload
           children/
-            <snap-ulid>/          — grandchild node
+            <snap-ulid>/          — grandchild node; live leaf
               segments/
-              wal/                — live leaf: this is the current write target
+              wal/                — live: current write target
               pending/
             <fork-ulid>/          — another live fork from the same parent
               segments/
@@ -46,15 +61,19 @@ All volume state lives under a shared root directory on a dedicated local NVMe m
 ```
 
 **Invariants:**
-- `wal/` present → live leaf; the volume process writes here
+- `wal/` present → live leaf; exactly one process writes here (enforced by `volume.lock`)
 - `wal/` absent → frozen; contents are immutable
-- `pending/` always accompanies `wal/`
-- `children/` holds snapshot and fork child nodes; may be absent on a leaf with no children yet
+- `pending/` is always present in a live node; frozen nodes may also retain `pending/` while segments await S3 upload
+- `children/` is created lazily by the first `snapshot()` call; absent on nodes that have never been snapshotted
 - All ancestor nodes of a live leaf are frozen and shared across all sibling forks; GC must not modify them
 
 **Finding live volumes:** scan for directories containing `wal/`. Each such directory is an independently running volume process.
 
-**Finding a volume's ancestry:** walk up from the live leaf, stepping up two directory levels at each hop (the node directory, then `children/`). Each ancestor node is a frozen snapshot layer; its `segments/` contribute to the LBA map via layer merging (ancestors first, descendants shadow).
+**Exclusive access:** each live node holds an exclusive `flock` on `<node>/volume.lock` for the lifetime of the volume process. Attempting to open a node whose lock is already held fails immediately — no two processes can write to the same node. The lock is released when the process exits or calls `snapshot()` (which transfers the lock to the child atomically: the child lock is acquired before the old one is released).
+
+**Opening a frozen node:** `Volume::open` on a frozen node (one where `children/` already exists) automatically creates a new child node and opens that instead. The caller always gets a live, writable node; the actual path may differ from the one passed in. This is the correct behaviour for forks: the frozen node is the shared base, and each caller gets an independent live descendant.
+
+**Finding a volume's ancestry:** walk up from the live leaf, stepping up two directory levels at each hop (the node directory, then `children/`). Each ancestor node is a frozen snapshot layer; its `segments/` and `pending/` contribute to the LBA map via layer merging (ancestors first, descendants shadow).
 
 ```
 VM
@@ -259,18 +278,18 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 
 A snapshot freezes the current live node and starts a new live child. Snapshots serve two purposes: **checkpointing** (a rollback point for the same ongoing volume) and **forking** (launching a new independent volume from a known state). Both use the same mechanism.
 
-**Taking a snapshot:**
+**Taking a snapshot** (`Volume::snapshot()`):
 
 ```
-1. Create children/<snap-ulid>/ under the current live node
-2. Create children/<snap-ulid>/wal/, children/<snap-ulid>/pending/, children/<snap-ulid>/segments/
-3. Redirect new writes to the child immediately (live volume continues uninterrupted)
-4. Background: flush any remaining WAL data to segments/ in the current (now-freezing) node
-5. Background: remove wal/ and pending/ from the current node when flush completes
-   → node is now frozen; directory contains segments/ and children/
+1. Create children/<snap-ulid>/  with wal/, pending/, segments/ subdirs
+2. Acquire exclusive lock on the child node
+3. Flush current WAL to a segment in this node's pending/  (synchronous; bounded by WAL size ≤ 32 MB)
+4. Remove wal/  from this node  → node is now frozen
+5. Open fresh WAL in the child node
+6. Volume process transitions to the child: all subsequent writes go there
 ```
 
-Steps 1–3 are the only blocking part and are instantaneous. Steps 4–5 are background and do not block I/O.
+The operation is synchronous. Steps 3–4 involve at most one WAL flush (≤ 32 MB), which completes in milliseconds on local NVMe. The old node's `pending/` segments are retained — they are part of the frozen node's data and remain until S3 upload completes. `wal/` (the directory) is removed as the freeze marker.
 
 **Forking** (two VMs from the same snapshot point): once a node is frozen, create multiple children. Each child is an independent live volume that inherits the parent's data via the directory ancestry.
 
@@ -288,16 +307,17 @@ volumes/<base-id>/
       segments/
 ```
 
-**Rollback:** delete the live leaf (and any of its descendants if needed), then re-create `wal/` and `pending/` in the target ancestor. The ancestor's segments are untouched.
+**Rollback:** delete the live leaf (and any of its descendants if needed). The target ancestor is a frozen node; call `Volume::open` on it to start a new live child from that point. The ancestor's segments are untouched.
 
 **Checkpoint semantics (linear history):**
 
 ```
-Before snapshot:          After snapshot:
+Before snapshot():        After snapshot():
 volumes/<base>/           volumes/<base>/
-  segments/                 segments/         ← frozen
-  wal/               →      children/
-  pending/                    <snap-1>/
+  wal/                      pending/          ← WAL flushed here; frozen
+  pending/           →      segments/
+  segments/                 children/
+                              <snap-1>/
                                 wal/          ← live continues here
                                 pending/
                                 segments/
