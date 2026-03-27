@@ -274,7 +274,109 @@ The client picks based on economics — bandwidth, request latency, cache state 
 
 Delta compression collapses this flexibility: reconstruction always requires fetching both source and delta, then applying a CPU transform. The data is not directly addressable. Sparse also composes cleanly with the boot-hint repacking optimisation: repacked segments co-locate extents contiguously for efficient byte-range fetches, and sparse preserves that property since all data remains raw bytes at fixed offsets. Delta compression complicates repacking because moving a source extent can invalidate dependent deltas.
 
-## Snapshots
+## Proposed: Named Forks and Volume Addressing
+
+> **Status: design proposal — not yet implemented.** The current implementation uses the `children/<ulid>/` nesting model described below. This section describes the intended replacement. The existing Snapshots section documents current behaviour and will be updated when this is implemented.
+
+### Concepts
+
+| Term | Definition |
+|------|------------|
+| **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
+| **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. Every volume has a default fork (name TBD — `main` is the likely choice). |
+| **Snapshot** | A frozen checkpoint of a fork's state at a point in time, identified by ULID. Snapshots are taken within a fork; they are not separately named. |
+| **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
+
+### Directory layout
+
+```
+<base>/                          ← shared volumes root (e.g. /var/lib/elide/volumes or ~/.local/share/elide/volumes)
+  myvm/                          ← volume "myvm"
+    main/                        ← default fork (live)
+      wal/                       ← present = live; absent = frozen (should not occur for a fork)
+      pending/                   ← live delta since last snapshot
+      segments/                  ← compacted history
+      snapshots/
+        <ulid-1>/                ← checkpoint: pending/ captured at snapshot time
+          pending/
+        <ulid-2>/
+          pending/
+    dev/                         ← named fork (live), branched from main
+      wal/
+      pending/
+      segments/
+      origin                     ← text file: "<fork-name>/<ulid>" (branch point)
+      snapshots/
+        <ulid-3>/
+          pending/
+  exported/                      ← export of "dev" — new self-contained volume, same base
+    main/
+      wal/
+      pending/
+      segments/
+                                 ← no origin, no snapshots/
+```
+
+**Invariants:**
+- A fork is always live (`wal/` present). Forks are never frozen in place — checkpoints are stored in `snapshots/` subdirectories.
+- `snapshots/<ulid>/pending/` holds the segment files that were in `pending/` at the time the snapshot was taken (moved, not copied).
+- `origin` is present only on non-default forks. Its value is `<fork-name>/<ulid>` identifying the snapshot within another fork where this fork branched off.
+- Fork names are unique within a volume. Volume names are unique within a base directory.
+
+### Ancestry walk
+
+To rebuild the LBA map for a fork:
+1. Follow the `origin` chain to the root fork (no `origin` file).
+2. From the root fork outward, for each fork in the chain: scan `segments/` then `snapshots/<ulid>/pending/` in ULID order up to and including the branch-point ULID recorded in the child fork's `origin`.
+3. Apply the current fork's own `segments/` and `snapshots/` (all of them, in ULID order).
+4. Apply the current fork's live `pending/`.
+5. Replay the WAL.
+
+### Operations
+
+```
+elide serve-volume myvm              # open default fork
+elide serve-volume myvm dev          # open named fork "dev"
+
+elide snapshot-volume myvm           # checkpoint default fork; fork stays live
+elide snapshot-volume myvm dev       # checkpoint named fork "dev"
+
+elide fork-volume myvm dev           # implicitly snapshot default fork, then branch "dev" from it
+elide fork-volume myvm dev --from main   # explicit source fork (same as default)
+
+elide export-volume myvm dev exported    # implicitly snapshot "dev", squash full ancestry
+                                          # into new self-contained volume "exported" in same base
+
+elide list-snapshots myvm            # snapshot history for default fork
+elide list-snapshots myvm dev        # snapshot history for "dev"
+elide list-forks myvm                # all named forks in volume "myvm"
+```
+
+**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork before branching. This gives a clean, unambiguous branch point and avoids any "which WAL state did the fork see?" question. There is no "fork from latest snapshot" shortcut — latest is always the implicit snapshot just taken.
+
+### Base directory defaulting
+
+`<base>` defaults to the value of `ELIDE_VOLUMES_DIR` if set, otherwise `~/.local/share/elide/volumes`. Commands that accept `<volume>` use this default unless `--base <path>` is passed.
+
+### Open questions
+
+1. **Default fork name.** `main` is the proposed default. Any objection or preference for a different name?
+
+2. **`serve-volume` with no ULID.** Opening a fork always opens the live state (tip of `wal/`). No ULID selection is needed for `serve-volume` — it's always the current live fork. Confirmed?
+
+3. **`export` output fork name.** When exporting to a new volume, the exported fork is placed at `<base>/<new-volume>/main/`. Should this always be `main`, or should the source fork name be preserved?
+
+4. **GC across forks.** A frozen snapshot's `pending/` data may be referenced by the live fork and by any fork that branched from it. GC of snapshot data requires checking all forks' `origin` files before removing. The exact GC protocol for multi-fork volumes is not yet designed.
+
+5. **`origin` chain depth.** If fork A branches from fork B which branched from `main`, the ancestry walk must follow two `origin` hops. Is there a maximum depth, or do we allow arbitrary depth? (Arbitrary seems fine; the walk is cheap.)
+
+6. **Rollback within a fork.** With the `children/` model, rollback was "delete live leaf, open ancestor". With named forks and internal `snapshots/`, rollback would mean "discard all data after snapshot `<ulid>` in this fork". The exact operation (remove trailing `snapshots/` dirs? recreate WAL from a checkpoint?) is not yet designed.
+
+7. **Migration from the `children/` model.** The current implementation uses nested `children/<ulid>/` directories. A migration path or a compatibility shim may be needed for existing volumes.
+
+---
+
+## Snapshots (current implementation)
 
 A snapshot freezes the current live node and starts a new live child. Snapshots serve two purposes: **checkpointing** (a rollback point for the same ongoing volume) and **forking** (launching a new independent volume from a known state). Both use the same mechanism.
 
