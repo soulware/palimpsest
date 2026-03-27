@@ -284,7 +284,7 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 |------|------------|
 | **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
 | **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. Every volume has a default fork (name TBD — `main` is the likely choice). |
-| **Snapshot** | A frozen checkpoint of a fork's state at a point in time, identified by ULID. Snapshots are taken within a fork; they are not separately named. |
+| **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments in `segments/` with ULID ≤ the snapshot ULID are part of that snapshot. The file content is empty or an optional human-readable name. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
 
 ### Directory layout
@@ -294,21 +294,18 @@ Delta compression collapses this flexibility: reconstruction always requires fet
   myvm/                          ← volume "myvm"
     main/                        ← default fork (live)
       wal/                       ← present = live; absent = frozen (should not occur for a fork)
-      pending/                   ← live delta since last snapshot
-      segments/                  ← compacted history
+      pending/                   ← segments awaiting promotion to segments/
+      segments/                  ← committed segment files, ordered by ULID
       snapshots/
-        <ulid-1>/                ← checkpoint: pending/ captured at snapshot time
-          pending/
-        <ulid-2>/
-          pending/
+        <ulid-1>                 ← marker file: empty, or contains optional human-readable name
+        <ulid-2>
     dev/                         ← named fork (live), branched from main
       wal/
       pending/
       segments/
       origin                     ← text file: "<fork-name>/<ulid>" (branch point)
       snapshots/
-        <ulid-3>/
-          pending/
+        <ulid-3>
   exported/                      ← export of "dev" — new self-contained volume, same base
     main/
       wal/
@@ -318,8 +315,9 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 ```
 
 **Invariants:**
-- A fork is always live (`wal/` present). Forks are never frozen in place — checkpoints are stored in `snapshots/` subdirectories.
-- `snapshots/<ulid>/pending/` holds the segment files that were in `pending/` at the time the snapshot was taken (moved, not copied).
+- A fork is always live (`wal/` present). Forks are never frozen in place — checkpoints are stored as marker files in `snapshots/`.
+- A snapshot marker `snapshots/<ulid>` is a plain file whose name is a ULID. The ULID is generated at snapshot time, so it sorts lexicographically after all segments present in `pending/` and `segments/` at the time of the snapshot. The file content is either empty or a single line containing an optional human-readable name.
+- Taking a snapshot requires only that the WAL be flushed (producing a segment in `pending/`). Promotion of `pending/` to `segments/` (i.e. S3 upload) is **not** required — promotion is an async S3 durability concern, independent of snapshot eligibility.
 - `origin` is present only on non-default forks. Its value is `<fork-name>/<ulid>` identifying the snapshot within another fork where this fork branched off.
 - Fork names are unique within a volume. Volume names are unique within a base directory.
 
@@ -327,10 +325,9 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 
 To rebuild the LBA map for a fork:
 1. Follow the `origin` chain to the root fork (no `origin` file).
-2. From the root fork outward, for each fork in the chain: scan `segments/` then `snapshots/<ulid>/pending/` in ULID order up to and including the branch-point ULID recorded in the child fork's `origin`.
-3. Apply the current fork's own `segments/` and `snapshots/` (all of them, in ULID order).
-4. Apply the current fork's live `pending/`.
-5. Replay the WAL.
+2. From the root fork outward, for each ancestor fork in the chain: scan both `segments/` and `pending/` in ULID order (merged), stopping at (and including) the branch-point ULID recorded in the child fork's `origin`. Snapshot markers in `snapshots/` are not scanned during replay — they exist only to record named points in the sequence.
+3. Apply the current fork's own `segments/` and `pending/` in ULID order (all of them).
+4. Replay the WAL.
 
 ### Operations
 
@@ -352,6 +349,10 @@ elide list-snapshots myvm dev        # snapshot history for "dev"
 elide list-forks myvm                # all named forks in volume "myvm"
 ```
 
+**Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The ULID is generated after the flush, so it is guaranteed to sort after every segment it encompasses in both `pending/` and `segments/`. The fork remains live throughout; no directory structure changes. Promotion of `pending/` to `segments/` (S3 upload) continues asynchronously and independently.
+
+**S3 upload for snapshots:** segment data in `pending/` is uploaded to S3 asynchronously as usual. In addition, snapshot marker files (`snapshots/<ulid>`) and fork metadata (`origin` files) must also be uploaded to S3 so that the snapshot tree structure is visible to other hosts. These are small files and should be uploaded eagerly — immediately after the snapshot marker or fork is written locally. Without them, a cold-start host has segment data but cannot reconstruct which snapshots exist or where forks branched.
+
 **Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork before branching. This gives a clean, unambiguous branch point and avoids any "which WAL state did the fork see?" question. There is no "fork from latest snapshot" shortcut — latest is always the implicit snapshot just taken.
 
 ### Base directory defaulting
@@ -366,11 +367,11 @@ elide list-forks myvm                # all named forks in volume "myvm"
 
 3. **`export` output fork name.** When exporting to a new volume, the exported fork is placed at `<base>/<new-volume>/main/`. Should this always be `main`, or should the source fork name be preserved?
 
-4. **GC across forks.** A frozen snapshot's `pending/` data may be referenced by the live fork and by any fork that branched from it. GC of snapshot data requires checking all forks' `origin` files before removing. The exact GC protocol for multi-fork volumes is not yet designed.
+4. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
 
 5. **`origin` chain depth.** If fork A branches from fork B which branched from `main`, the ancestry walk must follow two `origin` hops. Is there a maximum depth, or do we allow arbitrary depth? (Arbitrary seems fine; the walk is cheap.)
 
-6. **Rollback within a fork.** With the `children/` model, rollback was "delete live leaf, open ancestor". With named forks and internal `snapshots/`, rollback would mean "discard all data after snapshot `<ulid>` in this fork". The exact operation (remove trailing `snapshots/` dirs? recreate WAL from a checkpoint?) is not yet designed.
+6. **Rollback within a fork.** Rollback to snapshot `<ulid>` means discarding all segments with ULID > `<ulid>` from `segments/`, removing all snapshot markers after `<ulid>`, discarding `pending/`, and truncating/replacing the WAL. Alternatively, rollback could be implemented as "fork from the target snapshot, then rename". The exact operation is not yet designed.
 
 7. **Migration from the `children/` model.** The current implementation uses nested `children/<ulid>/` directories. A migration path or a compatibility shim may be needed for existing volumes.
 
