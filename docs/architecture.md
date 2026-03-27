@@ -283,7 +283,7 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 | Term | Definition |
 |------|------------|
 | **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
-| **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. Every volume has a default fork (name TBD — `main` is the likely choice). |
+| **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. Every volume has a default fork named `default`. |
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments in `segments/` with ULID ≤ the snapshot ULID are part of that snapshot. The file content is empty or an optional human-readable name. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
 
@@ -292,14 +292,14 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 ```
 <base>/                          ← shared volumes root (e.g. /var/lib/elide/volumes or ~/.local/share/elide/volumes)
   myvm/                          ← volume "myvm"
-    main/                        ← default fork (live)
+    default/                     ← default fork (live)
       wal/                       ← present = live; absent = frozen (should not occur for a fork)
       pending/                   ← segments awaiting promotion to segments/
       segments/                  ← committed segment files, ordered by ULID
       snapshots/
         <ulid-1>                 ← marker file: empty, or contains optional human-readable name
         <ulid-2>
-    dev/                         ← named fork (live), branched from main
+    dev/                         ← named fork (live), branched from default
       wal/
       pending/
       segments/
@@ -307,7 +307,7 @@ Delta compression collapses this flexibility: reconstruction always requires fet
       snapshots/
         <ulid-3>
   exported/                      ← export of "dev" — new self-contained volume, same base
-    main/
+    default/
       wal/
       pending/
       segments/
@@ -339,7 +339,7 @@ elide snapshot-volume myvm           # checkpoint default fork; fork stays live
 elide snapshot-volume myvm dev       # checkpoint named fork "dev"
 
 elide fork-volume myvm dev           # implicitly snapshot default fork, then branch "dev" from it
-elide fork-volume myvm dev --from main   # explicit source fork (same as default)
+elide fork-volume myvm dev --from default   # explicit source fork (same as default)
 
 elide export-volume myvm dev exported    # implicitly snapshot "dev", squash full ancestry
                                           # into new self-contained volume "exported" in same base
@@ -361,15 +361,15 @@ elide list-forks myvm                # all named forks in volume "myvm"
 
 ### Open questions
 
-1. **Default fork name.** `main` is the proposed default. Any objection or preference for a different name?
+1. **Default fork name.** Resolved: `default`.
 
 2. **`serve-volume` with no ULID.** Opening a fork always opens the live state (tip of `wal/`). No ULID selection is needed for `serve-volume` — it's always the current live fork. Confirmed?
 
-3. **`export` output fork name.** When exporting to a new volume, the exported fork is placed at `<base>/<new-volume>/main/`. Should this always be `main`, or should the source fork name be preserved?
+3. **`export` output fork name.** When exporting to a new volume, the exported fork is placed at `<base>/<new-volume>/default/`. Should this always be `default`, or should the source fork name be preserved?
 
 4. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
 
-5. **`origin` chain depth.** If fork A branches from fork B which branched from `main`, the ancestry walk must follow two `origin` hops. Is there a maximum depth, or do we allow arbitrary depth? (Arbitrary seems fine; the walk is cheap.)
+5. **`origin` chain depth.** If fork A branches from fork B which branched from `default`, the ancestry walk must follow two `origin` hops. Is there a maximum depth, or do we allow arbitrary depth? (Arbitrary seems fine; the walk is cheap.)
 
 6. **Rollback within a fork.** Rollback to snapshot `<ulid>` means discarding all segments with ULID > `<ulid>` from `segments/`, removing all snapshot markers after `<ulid>`, discarding `pending/`, and truncating/replacing the WAL. Alternatively, rollback could be implemented as "fork from the target snapshot, then rename". The exact operation is not yet designed.
 
