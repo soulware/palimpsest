@@ -14,6 +14,7 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - Avoid `.to_vec()`, `.clone()`, or `Vec::new()` allocations on hot paths unless genuinely necessary.
 - If a function only reads data, take a slice not an owned value.
 - Avoid allocating a `Vec` for a small, fixed-size header — use a stack buffer (`[u8; N]`) instead.
+- When you already own an allocation, pass it by value rather than borrowing it only to copy it again. The pattern `some_option.as_deref().unwrap_or(fallback)` followed by `.to_vec()` is a sign you should use `some_option.unwrap_or_else(|| fallback.to_vec())` and pass ownership directly.
 
 **Error handling.**
 - Use `io::Error::other(msg)` not `io::Error::new(io::ErrorKind::Other, msg)`.

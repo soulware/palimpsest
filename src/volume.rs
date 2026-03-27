@@ -239,8 +239,8 @@ impl Volume {
         }
 
         let compressed_data = maybe_compress(data);
-        let write_data: &[u8] = compressed_data.as_deref().unwrap_or(data);
         let compressed = compressed_data.is_some();
+        let owned_data: Vec<u8> = compressed_data.unwrap_or_else(|| data.to_vec());
         let wal_flags = if compressed {
             writelog::FLAG_COMPRESSED
         } else {
@@ -254,7 +254,7 @@ impl Volume {
 
         let body_offset = self
             .wal
-            .append_data(lba, lba_length, &hash, wal_flags, write_data)?;
+            .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
         self.lbamap.insert(lba, lba_length, hash);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
@@ -263,16 +263,12 @@ impl Volume {
             extentindex::ExtentLocation {
                 segment_id: self.wal_ulid.clone(),
                 body_offset,
-                body_length: write_data.len() as u32,
+                body_length: owned_data.len() as u32,
                 compressed,
             },
         );
         self.pending_entries.push(segment::SegmentEntry::new_data(
-            hash,
-            lba,
-            lba_length,
-            seg_flags,
-            write_data.to_vec(),
+            hash, lba, lba_length, seg_flags, owned_data,
         ));
 
         if self.wal.size() >= FLUSH_THRESHOLD {
