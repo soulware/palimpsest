@@ -64,10 +64,14 @@ fn maybe_compress(block: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Write `entries` to `segments/<ulid>` using the standard tmp-rename commit.
-/// Clears `entries` on success.
-fn flush_segment(segments_dir: &Path, entries: &mut Vec<SegmentEntry>) -> io::Result<()> {
+/// Clears `entries` on success. Returns the ULID used, or `None` if there was
+/// nothing to write.
+fn flush_segment(
+    segments_dir: &Path,
+    entries: &mut Vec<SegmentEntry>,
+) -> io::Result<Option<String>> {
     if entries.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let ulid = Ulid::new().to_string();
     let tmp = segments_dir.join(format!("{ulid}.tmp"));
@@ -75,7 +79,7 @@ fn flush_segment(segments_dir: &Path, entries: &mut Vec<SegmentEntry>) -> io::Re
     segment::write_segment(&tmp, entries)?;
     fs::rename(&tmp, &final_path)?;
     entries.clear();
-    Ok(())
+    Ok(Some(ulid))
 }
 
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
@@ -120,6 +124,7 @@ pub fn import_image(
     let mut block = [0u8; LBA_SIZE];
     let mut entries: Vec<SegmentEntry> = Vec::new();
     let mut batch_raw_bytes: usize = 0;
+    let mut last_segment_ulid: Option<String> = None;
 
     for lba in 0..total_blocks {
         image.read_exact(&mut block)?;
@@ -138,15 +143,20 @@ pub fn import_image(
         batch_raw_bytes += LBA_SIZE;
 
         if batch_raw_bytes >= IMPORT_SEGMENT_BYTES {
-            flush_segment(&segments_dir, &mut entries)?;
+            if let Some(ulid) = flush_segment(&segments_dir, &mut entries)? {
+                last_segment_ulid = Some(ulid);
+            }
             batch_raw_bytes = 0;
         }
     }
-    flush_segment(&segments_dir, &mut entries)?;
+    if let Some(ulid) = flush_segment(&segments_dir, &mut entries)? {
+        last_segment_ulid = Some(ulid);
+    }
 
-    // Snapshot marker: Ulid::new() here sorts after all segment ULIDs written
-    // above because ULID timestamps are monotonically non-decreasing.
-    let snap_ulid = Ulid::new().to_string();
+    // Snapshot marker reuses the last segment's ULID so the branch point is
+    // self-describing. Falls back to a fresh ULID only for all-zero images
+    // where no segments were written.
+    let snap_ulid = last_segment_ulid.unwrap_or_else(|| Ulid::new().to_string());
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
     // Volume-root size marker (readonly is written by the caller in meta.toml).
@@ -190,11 +200,25 @@ mod tests {
         assert!(vol_dir.join("base").join("segments").exists());
         assert!(!vol_dir.join("base").join("pending").exists()); // frozen base: no pending/
 
-        // Exactly one snapshot marker.
+        // Exactly one snapshot marker, and its ULID matches the segment ULID.
+        let segs: Vec<_> = fs::read_dir(vol_dir.join("base").join("segments"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(segs.len(), 1);
+        let seg_name = segs[0].file_name().into_string().unwrap();
+
         let snaps: Vec<_> = fs::read_dir(vol_dir.join("base").join("snapshots"))
             .unwrap()
+            .filter_map(|e| e.ok())
             .collect();
         assert_eq!(snaps.len(), 1);
+        let snap_name = snaps[0].file_name().into_string().unwrap();
+
+        assert_eq!(
+            snap_name, seg_name,
+            "snapshot ULID must match last segment ULID"
+        );
     }
 
     #[test]

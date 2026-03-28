@@ -140,6 +140,10 @@ pub struct Volume {
     /// `snapshot()` to decide whether a new marker is needed or the latest
     /// existing snapshot can be reused.
     has_new_segments: bool,
+    /// ULID of the most recently committed segment across pending/ and segments/,
+    /// or `None` if no segments exist. Used by `snapshot()` to name the snapshot
+    /// marker with the same ULID as the segment it covers.
+    last_segment_ulid: Option<String>,
     /// Single-entry file handle cache for the read path.
     ///
     /// Retains the last opened segment file across `read` calls so that
@@ -223,29 +227,27 @@ impl Volume {
                 create_fresh_wal(&wal_dir)?
             };
 
-        // Determine whether there is uncommitted (un-snapshotted) data from a
-        // previous session. WAL records already recovered into pending_entries
-        // count; so do any segment files in pending/ or segments/ that postdate
-        // the latest snapshot. Cross-session ULID comparison is reliable because
-        // those files were written in earlier runs at distinct timestamps.
-        let has_new_segments = !pending_entries.is_empty() || {
-            match latest_snapshot(base_dir)? {
-                None => false,
-                Some(ref snap) => {
-                    ["pending", "segments"]
-                        .iter()
-                        .try_fold(false, |acc, subdir| {
-                            let files = segment::collect_segment_files(&base_dir.join(subdir))?;
-                            let newer = files.iter().any(|p| {
-                                p.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .is_some_and(|n| n > snap.as_str())
-                            });
-                            io::Result::Ok(acc || newer)
-                        })?
+        // Scan pending/ and segments/ to find the latest committed segment ULID
+        // and determine whether any segments postdate the latest snapshot.
+        // Cross-session ULID comparison is reliable: those files came from
+        // earlier runs at distinct timestamps.
+        let latest_snap = latest_snapshot(base_dir)?;
+        let mut all_segment_ulids: Vec<String> = Vec::new();
+        for subdir in ["pending", "segments"] {
+            for p in segment::collect_segment_files(&base_dir.join(subdir))? {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    all_segment_ulids.push(name.to_owned());
                 }
             }
-        };
+        }
+        all_segment_ulids.sort_unstable();
+        let last_segment_ulid = all_segment_ulids.last().cloned();
+
+        let has_new_segments = !pending_entries.is_empty()
+            || match (&latest_snap, &last_segment_ulid) {
+                (Some(snap), Some(last)) => last.as_str() > snap.as_str(),
+                _ => false,
+            };
 
         Ok(Self {
             base_dir: base_dir.to_owned(),
@@ -258,6 +260,7 @@ impl Volume {
             wal_path,
             pending_entries,
             has_new_segments,
+            last_segment_ulid,
             file_cache: RefCell::new(None),
         })
     }
@@ -494,6 +497,7 @@ impl Volume {
             return Ok(());
         }
         self.has_new_segments = true;
+        self.last_segment_ulid = Some(self.wal_ulid.clone());
         let body_section_start = segment::promote(
             &self.wal_path,
             &self.wal_ulid,
@@ -561,11 +565,18 @@ impl Volume {
             return Ulid::from_string(&latest_str).map_err(|e| io::Error::other(e.to_string()));
         }
 
-        // Write a new snapshot marker.
-        let snap_ulid = Ulid::new();
+        // Write a new snapshot marker, reusing the last segment's ULID so the
+        // branch point is self-describing. Falls back to a fresh ULID only when
+        // no segments exist (e.g. first snapshot on an empty fork).
+        let snap_ulid_str = match &self.last_segment_ulid {
+            Some(ulid) => ulid.clone(),
+            None => Ulid::new().to_string(),
+        };
+        let snap_ulid =
+            Ulid::from_string(&snap_ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
         let snapshots_dir = self.base_dir.join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;
-        fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
+        fs::write(snapshots_dir.join(&snap_ulid_str), "")?;
         self.has_new_segments = false;
 
         // Open a fresh WAL to continue writing.
@@ -1762,6 +1773,26 @@ mod tests {
         vol.write(1, &new_data).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), new_data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_ulid_matches_last_segment_ulid() {
+        let base = temp_dir();
+        let fork_dir = base.join("base");
+        let mut vol = Volume::open(&fork_dir).unwrap();
+        vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+        let snap_ulid = vol.snapshot().unwrap().to_string();
+
+        // The snapshot file name must equal the segment file name in pending/.
+        let pending_files: Vec<_> = fs::read_dir(fork_dir.join("pending"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(pending_files.len(), 1);
+        let seg_name = pending_files[0].file_name().into_string().unwrap();
+        assert_eq!(snap_ulid, seg_name);
 
         fs::remove_dir_all(base).unwrap();
     }
