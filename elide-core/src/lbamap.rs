@@ -424,15 +424,23 @@ mod tests {
         // Segment 1 (ULID "01A..."): covers [0, 10) → hash_1.
         {
             let mut entries = vec![SegmentEntry::new_data(h(1), 0, 10, 0, vec![0u8; 40960])];
-            segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
-                .unwrap();
+            segment::write_segment(
+                &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &mut entries,
+                None,
+            )
+            .unwrap();
         }
 
         // Segment 2 (ULID "01B..."): overwrites [5, 10) → hash_2.
         {
             let mut entries = vec![SegmentEntry::new_data(h(2), 5, 5, 0, vec![0u8; 20480])];
-            segment::write_segment(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"), &mut entries)
-                .unwrap();
+            segment::write_segment(
+                &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
+                &mut entries,
+                None,
+            )
+            .unwrap();
         }
 
         let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
@@ -472,6 +480,7 @@ mod tests {
             segment::write_segment(
                 &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
+                None,
             )
             .unwrap();
         }
@@ -481,6 +490,7 @@ mod tests {
             segment::write_segment(
                 &live.join("pending").join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
                 &mut entries,
+                None,
             )
             .unwrap();
         }

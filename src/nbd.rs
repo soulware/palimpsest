@@ -459,7 +459,7 @@ fn cow_write(
 }
 
 // --- Volume NBD server ---
-
+#[allow(dead_code)]
 pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
@@ -475,7 +475,34 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener)
+    serve_volume_listener(dir, size_bytes, listener, None)
+}
+
+/// Serve a fork over NBD with a signing key attached.
+///
+/// Segments promoted during this session will be signed with `signer`.
+pub fn run_volume_signed(
+    dir: &Path,
+    size_bytes: u64,
+    bind: &str,
+    port: u16,
+    signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
+    let addr = listener.local_addr()?;
+    println!("NBD volume server on {}", addr);
+    println!(
+        "Volume: {} ({:.1} MB)",
+        dir.display(),
+        size_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+        addr.ip(),
+        addr.port()
+    );
+    println!("Waiting for connection...\n");
+    serve_volume_listener(dir, size_bytes, listener, Some(signer))
 }
 
 /// Serve a fork as a read-only NBD device.
@@ -672,10 +699,18 @@ fn serve_readonly_volume_listener(
 /// listener is closed. The volume is opened once and reused across connections
 /// so the in-memory LBA map is preserved between reconnects.
 /// Separated from `run_volume` so tests can bind port 0 and learn the port.
-fn serve_volume_listener(dir: &Path, size_bytes: u64, listener: TcpListener) -> io::Result<()> {
+fn serve_volume_listener(
+    dir: &Path,
+    size_bytes: u64,
+    listener: TcpListener,
+    signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+) -> io::Result<()> {
     install_sigusr1_handler();
 
-    let mut volume = Volume::open(dir)?;
+    let mut volume = match signer {
+        Some(s) => Volume::open_with_signer(dir, s)?,
+        None => Volume::open(dir)?,
+    };
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -922,7 +957,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, listener).ok();
+            serve_volume_listener(&dir, size_bytes, listener, None).ok();
         });
         port
     }

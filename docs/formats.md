@@ -10,7 +10,7 @@ The write log is the local durability boundary. Writes land here on fsync; the l
 
 A single append-only file per in-progress segment, living at `wal/<ULID>`. One file, records appended sequentially, no separate index.
 
-**Magic header:** `PLMPWL\x00\x01` (8 bytes)
+**Magic header:** `ELIDWAL\x01` (8 bytes)
 
 **Record types:**
 
@@ -156,26 +156,27 @@ Each segment is a **single file** both locally and in S3. The same format is use
 ### File layout
 
 ```
-[Header: 32 bytes]
-  magic          (8 bytes)  — "PLMPSEG\x01"
+[Header: 96 bytes]
+  magic          (8 bytes)  — "ELIDSEG\x02"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
   body_length    (8 bytes)  — byte length of full extent body (u64 le)
   delta_length   (4 bytes)  — byte length of delta body (u32 le); 0 if no deltas
+  signature      (64 bytes) — Ed25519 signature (see Fork ownership and signing below)
 
-[Index section]             — starts at byte 32; length = index_length
-[Inline section]            — starts at byte 32 + index_length; length = inline_length
-[Full body]                 — starts at byte 32 + index_length + inline_length; length = body_length
-[Delta body]                — starts at byte 32 + index_length + inline_length + body_length; length = delta_length
+[Index section]             — starts at byte 96; length = index_length
+[Inline section]            — starts at byte 96 + index_length; length = inline_length
+[Full body]                 — starts at byte 96 + index_length + inline_length; length = body_length
+[Delta body]                — starts at byte 96 + index_length + inline_length + body_length; length = delta_length
 ```
 
 Derived section offsets (computable from the header alone):
 ```
-index_offset  = 32
-inline_offset = 32 + index_length
-body_offset   = 32 + index_length + inline_length
-delta_offset  = 32 + index_length + inline_length + body_length
+index_offset  = 96
+inline_offset = 96 + index_length
+body_offset   = 96 + index_length + inline_length
+delta_offset  = 96 + index_length + inline_length + body_length
 ```
 
 **The full body** is raw concatenated extent data — DATA-record extents only, clean bytes, no framing. REF-record extents contribute nothing to the body. All navigation is via the index section.
@@ -265,7 +266,7 @@ Benefits of this scheme:
 
 ### Retrieval strategies
 
-The header is 32 bytes; all section offsets are computable from it. This drives three distinct retrieval patterns:
+The header is 96 bytes; all section offsets are computable from it. This drives three distinct retrieval patterns:
 
 **Cold start** (no local data — cannot use deltas):
 ```
@@ -302,3 +303,54 @@ Snapshot indexes are consolidated index-section views written at snapshot time, 
 ```
 
 **Segment files are the ground truth.** All derived structures (in-memory extent index, optional manifest) are caches reconstructible from segment files. On cold start or after index loss, reconstruction is: download index sections of all segment files (fast, small) rather than full segment bodies.
+
+---
+
+## Fork Ownership and Signing
+
+Each fork has exactly one owner: the host that holds its private key. This is a convention enforced at consumption time — signing does not prevent an unauthorised client from uploading bytes to S3 (that is an access-control concern handled at the object-store level), but it does mean any such upload will be **detected and rejected** when a demand-fetch client verifies the segment.
+
+**This is not a key management system.** Elide generates an Ed25519 keypair when a fork is created and stores both files in the fork directory. There is no key escrow, rotation, revocation, or HSM integration. The guarantee is simple: a client without the private key cannot produce a valid segment signature for that fork. If `fork.key` is copied to another host, that host becomes an equally valid signer — the single-owner property then depends entirely on the operator keeping the key on one machine.
+
+The practical value is narrow but real: it catches the common misconfiguration case where a coordinator is pointed at the wrong fork, and it provides per-segment integrity at demand-fetch time. It does not replace proper access control on the S3 bucket.
+
+"Moving" a fork to a different host is done by creating a new fork from a snapshot on the destination host; the new fork gets a fresh keypair. The original fork's private key is not transferred — that would make two valid signers for the same fork.
+
+### Key files
+
+Two files live in the fork directory:
+
+```
+forks/<name>/fork.key   — Ed25519 private key (32 bytes); never leaves the host
+forks/<name>/fork.pub   — Ed25519 public key (32 bytes); also uploaded to S3 at fork creation
+```
+
+S3 location of the public key:
+```
+<volume_id>/<fork_name>/fork.pub
+```
+
+The S3 copy of `fork.pub` is a convenience for hosts that need to verify ancestor segments they do not own. It is not authoritative — if S3 credentials are compromised an attacker could overwrite it, which would allow a crafted segment to pass verification. Locally-pinned public keys (see Verification below) are more trustworthy.
+
+### Signing
+
+Every segment is signed by its fork's private key at **promotion time** — when the WAL is promoted to `pending/<ulid>`. The segment file is complete and signed before it leaves the host.
+
+**Signing input:** `BLAKE3(header[0..32] || index_section_bytes)`
+
+The first 32 bytes of the header (all fields except the 64-byte signature field) are hashed together with the raw bytes of the index section. The signature field at `header[32..96]` is not included — it holds the output.
+
+Signing at promotion rather than upload means every copy of the segment (`pending/`, `segments/`, S3) carries the same signature. The coordinator uploads the file unchanged; no re-signing step.
+
+**Segments written before key generation** (e.g. by `elide-import`) have an all-zero signature field. These are accepted locally but will be rejected on demand-fetch by a strict verifier. This is expected: imported base segments predate the fork keypair and are not covered by the single-writer guarantee.
+
+### Verification
+
+Verification at demand-fetch time requires only the header and index section — the same bytes retrieved in an index-only fetch (`GET [0, inline_offset)`):
+
+1. Verify `sig` against `BLAKE3(header[0..32] || index_bytes)` using the fork's public key — confirms the index was written by the keyholder
+2. On each subsequent byte-range fetch from the body: verify `BLAKE3(fetched_bytes) == entry.hash` against the signed index — confirms the body bytes are what the keyholder wrote
+
+A segment with a missing, malformed, or invalid signature is rejected: not cached, not served.
+
+**Public key trust:** verification uses a locally-pinned copy of the public key, not the S3 copy. For the live fork this is `forks/<name>/fork.pub` on disk. For ancestor forks (segments written by a parent fork that this host does not own), the public key is fetched from S3 once and pinned locally before demand-fetch is enabled for that ancestor. Trust-on-first-use from S3 is a known limitation — it is weaker than out-of-band key distribution but sufficient for the misconfiguration-detection use case.

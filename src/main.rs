@@ -9,6 +9,7 @@ mod extents;
 mod inspect;
 mod ls;
 mod nbd;
+mod signing;
 
 /// Analyse ext4 disk images for dedup and delta compression potential.
 #[derive(Parser)]
@@ -66,6 +67,9 @@ enum Command {
         /// Serve as a read-only block device (required for readonly-base forks)
         #[arg(long)]
         readonly: bool,
+        /// Skip the fork.origin hostname/path check (use after an intentional move)
+        #[arg(long)]
+        force_origin: bool,
     },
     /// Extract kernel and initrd from an ext4 image's /boot directory
     ExtractBoot {
@@ -175,6 +179,7 @@ fn main() {
             bind,
             port,
             readonly,
+            force_origin,
         } => {
             let vol_path = Path::new(&vol_dir);
             let fork_dir = vol_path.join("forks").join(&fork);
@@ -184,7 +189,22 @@ fn main() {
                 nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port)
                     .expect("readonly NBD server error");
             } else {
-                nbd::run_volume(&fork_dir, size_bytes, &bind, port)
+                // Ensure the fork directory exists before touching key files.
+                std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
+                let signer = if fork_dir.join("fork.key").exists() {
+                    if !force_origin {
+                        signing::verify_fork_origin(&fork_dir).expect("fork.origin check failed");
+                    }
+                    signing::load_signer(&fork_dir).expect("failed to load fork signing key")
+                } else {
+                    // First use: generate keypair and record origin.
+                    let key = signing::generate_keypair(&fork_dir)
+                        .expect("failed to generate fork keypair");
+                    signing::write_fork_origin(&fork_dir, &key)
+                        .expect("failed to write fork.origin");
+                    signing::load_signer(&fork_dir).expect("failed to load fork signing key")
+                };
+                nbd::run_volume_signed(&fork_dir, size_bytes, &bind, port, signer)
                     .expect("volume NBD server error");
             }
         }
@@ -234,6 +254,9 @@ fn main() {
         } => {
             let fork_dir = volume::fork_volume(Path::new(&vol_dir), &fork_name, &from)
                 .expect("fork-volume failed");
+            let key =
+                signing::generate_keypair(&fork_dir).expect("failed to generate fork keypair");
+            signing::write_fork_origin(&fork_dir, &key).expect("failed to write fork.origin");
             println!("{}", fork_dir.display());
         }
 

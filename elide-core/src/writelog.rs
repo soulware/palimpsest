@@ -35,7 +35,7 @@ pub const FLAG_COMPRESSED: u8 = 0x01;
 /// No data payload; this LBA range maps to an existing extent identified by hash.
 pub const FLAG_DEDUP_REF: u8 = 0x02;
 
-const MAGIC: &[u8; 8] = b"PLMPWL\x00\x01";
+const MAGIC: &[u8; 8] = b"ELIDWAL\x01";
 
 // ---
 

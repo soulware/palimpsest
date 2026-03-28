@@ -221,8 +221,12 @@ mod tests {
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
-        let bss = segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
-            .unwrap();
+        let bss = segment::write_segment(
+            &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            &mut entries,
+            None,
+        )
+        .unwrap();
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
@@ -252,7 +256,12 @@ mod tests {
                 b"real data".repeat(512)[..4096].to_vec(),
             ),
         ];
-        segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries).unwrap();
+        segment::write_segment(
+            &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            &mut entries,
+            None,
+        )
+        .unwrap();
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
         // Only the DATA entry should be indexed; the dedup-ref is skipped.
@@ -275,8 +284,12 @@ mod tests {
         // Older segment.
         {
             let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data.clone())];
-            segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
-                .unwrap();
+            segment::write_segment(
+                &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &mut entries,
+                None,
+            )
+            .unwrap();
         }
         // Newer segment: same hash, different position.
         let bss2;
@@ -288,9 +301,12 @@ mod tests {
                 SegmentEntry::new_data(hash2, 10, 2, 0, data2),
                 SegmentEntry::new_data(hash, 0, 1, 0, data),
             ];
-            bss2 =
-                segment::write_segment(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"), &mut entries)
-                    .unwrap();
+            bss2 = segment::write_segment(
+                &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
+                &mut entries,
+                None,
+            )
+            .unwrap();
             stored_offset2 = entries[1].stored_offset;
         }
 
@@ -329,6 +345,7 @@ mod tests {
             bss = segment::write_segment(
                 &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
+                None,
             )
             .unwrap();
             stored_offset = entries[0].stored_offset;

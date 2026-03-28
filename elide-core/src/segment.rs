@@ -1,19 +1,20 @@
 // Segment file: unified on-disk and S3 format.
 //
 // Layout:
-//   [Header: 32 bytes]
-//   [Index section: index_length bytes]   — starts at byte 32
-//   [Inline section: inline_length bytes] — starts at byte 32 + index_length
-//   [Full body: body_length bytes]        — starts at byte 32 + index_length + inline_length
+//   [Header: 96 bytes]
+//   [Index section: index_length bytes]   — starts at byte 96
+//   [Inline section: inline_length bytes] — starts at byte 96 + index_length
+//   [Full body: body_length bytes]        — starts at byte 96 + index_length + inline_length
 //   [Delta body: delta_length bytes]      — absent locally (delta_length = 0)
 //
-// Header (32 bytes):
-//   0..8   magic         "PLMPSEG\x01"
+// Header (96 bytes):
+//   0..8   magic         "ELIDSEG\x02"
 //   8..12  entry_count   u32 le
 //   12..16 index_length  u32 le
 //   16..20 inline_length u32 le; 0 if no inline data
 //   20..28 body_length   u64 le
 //   28..32 delta_length  u32 le; 0 for locally-stored files
+//   32..96 signature     Ed25519 sig over BLAKE3(header[0..32] || index_bytes); zeros if unsigned
 //
 // Index entry format:
 //   hash       (32 bytes) BLAKE3 extent hash
@@ -45,8 +46,17 @@ use std::path::{Path, PathBuf};
 
 // --- constants ---
 
-const MAGIC: &[u8; 8] = b"PLMPSEG\x01";
-const HEADER_LEN: u64 = 32;
+const MAGIC: &[u8; 8] = b"ELIDSEG\x02";
+const HEADER_LEN: u64 = 96;
+
+/// Trait for signing segment files at promotion time.
+///
+/// The signing input is `BLAKE3(header[0..32] || index_section_bytes)`.
+/// Returning a 64-byte Ed25519 signature. Implementations must be infallible
+/// — a missing or corrupt key should be caught at startup, not per-segment.
+pub trait SegmentSigner: Send + Sync {
+    fn sign(&self, msg: &[u8]) -> [u8; 64];
+}
 
 /// Size of a DEDUP_REF index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
 const IDX_ENTRY_REF_LEN: u32 = 45;
@@ -152,26 +162,53 @@ impl SegmentEntry {
 /// body, and fsyncs before returning. `path` should be the `.tmp` path; the
 /// caller renames it to the final name after this returns.
 ///
+/// If `signer` is provided the segment is signed: the 64-byte Ed25519
+/// signature over `BLAKE3(header[0..32] || index_bytes)` is written at
+/// `header[32..96]`. Without a signer the signature field is all zeros.
+///
 /// Returns `body_section_start` (the absolute byte offset of the body section
 /// in the file). Callers use this to convert body entries' `stored_offset` to
 /// absolute file offsets: `body_section_start + entry.stored_offset`.
-pub fn write_segment(path: &Path, entries: &mut [SegmentEntry]) -> io::Result<u64> {
+pub fn write_segment(
+    path: &Path,
+    entries: &mut [SegmentEntry],
+    signer: Option<&dyn SegmentSigner>,
+) -> io::Result<u64> {
     let (index_length, inline_length, body_length) = assign_offsets(entries);
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let mut w = BufWriter::new(file);
+    // Build index section into a buffer first — needed for signing.
+    let mut index_buf = Vec::with_capacity(index_length as usize);
+    for entry in entries.iter() {
+        write_index_entry(&mut index_buf, entry)?;
+    }
 
-    write_header(
-        &mut w,
+    // Build the first 32 bytes of the header (fields only, no signature).
+    let header_fields = build_header_fields(
         entries.len() as u32,
         index_length,
         inline_length,
         body_length,
-    )?;
-    for entry in entries.iter() {
-        write_index_entry(&mut w, entry)?;
-    }
+    );
+
+    // Compute signature: BLAKE3(header[0..32] || index_bytes), then sign.
+    let signature: [u8; 64] = if let Some(s) = signer {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header_fields);
+        hasher.update(&index_buf);
+        s.sign(hasher.finalize().as_bytes())
+    } else {
+        [0u8; 64]
+    };
+
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut w = BufWriter::new(file);
+
+    // Header: 32 bytes of fields + 64 bytes of signature = 96 bytes.
+    w.write_all(&header_fields)?;
+    w.write_all(&signature)?;
+    w.write_all(&index_buf)?;
+
     // Inline section (currently empty: INLINE_THRESHOLD = 0).
     for entry in entries.iter() {
         if entry.is_inline {
@@ -217,21 +254,23 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
     (index_length, inline_cursor as u32, body_cursor)
 }
 
-fn write_header<W: Write>(
-    w: &mut W,
+/// Build the first 32 bytes of the segment header (the signed fields).
+///
+/// These are the bytes hashed when computing the segment signature.
+fn build_header_fields(
     entry_count: u32,
     index_length: u32,
     inline_length: u32,
     body_length: u64,
-) -> io::Result<()> {
-    let mut h = [0u8; HEADER_LEN as usize];
+) -> [u8; 32] {
+    let mut h = [0u8; 32];
     h[0..8].copy_from_slice(MAGIC);
     h[8..12].copy_from_slice(&entry_count.to_le_bytes());
     h[12..16].copy_from_slice(&index_length.to_le_bytes());
     h[16..20].copy_from_slice(&inline_length.to_le_bytes());
     h[20..28].copy_from_slice(&body_length.to_le_bytes());
     h[28..32].copy_from_slice(&0u32.to_le_bytes()); // delta_length = 0 locally
-    w.write_all(&h)
+    h
 }
 
 fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
@@ -273,6 +312,7 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
 pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let mut f = fs::File::open(path)?;
 
+    // Header is 96 bytes: 32 bytes of fields + 64 bytes of signature.
     let mut h = [0u8; HEADER_LEN as usize];
     f.read_exact(&mut h)?;
 
@@ -290,6 +330,8 @@ pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let inline_length = u32::from_le_bytes(read_fixed(&h, &mut pos)?);
     let _body_length = u64::from_le_bytes(read_fixed::<8>(&h, &mut pos)?);
     let _delta_length = u32::from_le_bytes(read_fixed(&h, &mut pos)?);
+    // Signature field bytes[32..96] — not parsed here; available for verification
+    // via read_and_verify_segment_index when a SegmentSigner/verifier is present.
 
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
@@ -385,11 +427,12 @@ pub fn promote(
     ulid: &str,
     pending_dir: &Path,
     entries: &mut [SegmentEntry],
+    signer: Option<&dyn SegmentSigner>,
 ) -> io::Result<u64> {
     let tmp_path = pending_dir.join(format!("{ulid}.tmp"));
     let final_path = pending_dir.join(ulid);
 
-    let body_section_start = write_segment(&tmp_path, entries)?;
+    let body_section_start = write_segment(&tmp_path, entries, signer)?;
 
     // Atomic rename — COMMIT POINT.
     fs::rename(&tmp_path, &final_path)?;
@@ -494,7 +537,7 @@ mod tests {
         let hash = blake3::hash(&data);
 
         let mut entries = vec![SegmentEntry::new_data(hash, 10, 1, 0, data.clone())];
-        let bss = write_segment(&path, &mut entries).unwrap();
+        let bss = write_segment(&path, &mut entries, None).unwrap();
 
         let (bss2, read_entries) = read_segment_index(&path).unwrap();
         assert_eq!(bss, bss2);
@@ -525,7 +568,7 @@ mod tests {
             })
             .collect();
 
-        write_segment(&path, &mut entries).unwrap();
+        write_segment(&path, &mut entries, None).unwrap();
 
         let (_, read_back) = read_segment_index(&path).unwrap();
         assert_eq!(read_back.len(), 4);
@@ -546,7 +589,7 @@ mod tests {
         let hash = blake3::hash(b"existing extent");
 
         let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3)];
-        write_segment(&path, &mut entries).unwrap();
+        write_segment(&path, &mut entries, None).unwrap();
 
         let (_, read_back) = read_segment_index(&path).unwrap();
         assert_eq!(read_back.len(), 1);
@@ -576,7 +619,7 @@ mod tests {
             SegmentEntry::new_data(blake3::hash(b"x"), 10, 1, 0, b"x".repeat(4096).to_vec()),
         ];
 
-        write_segment(&path, &mut entries).unwrap();
+        write_segment(&path, &mut entries, None).unwrap();
 
         let (_, read_back) = read_segment_index(&path).unwrap();
         assert_eq!(read_back.len(), 3);
@@ -601,7 +644,7 @@ mod tests {
         let hash = blake3::hash(&data);
 
         let mut entries = vec![SegmentEntry::new_data(hash, 20, 1, FLAG_COMPRESSED, data)];
-        write_segment(&path, &mut entries).unwrap();
+        write_segment(&path, &mut entries, None).unwrap();
 
         let (_, read_back) = read_segment_index(&path).unwrap();
         assert_eq!(read_back.len(), 1);
@@ -627,7 +670,7 @@ mod tests {
             SegmentEntry::new_data(h2, 1, 1, 0, data2.clone()),
         ];
 
-        let bss = write_segment(&path, &mut entries).unwrap();
+        let bss = write_segment(&path, &mut entries, None).unwrap();
 
         let (bss2, index) = read_segment_index(&path).unwrap();
         assert_eq!(bss, bss2);
@@ -652,7 +695,10 @@ mod tests {
     #[test]
     fn bad_magic_returns_error() {
         let path = temp_path(".seg");
-        fs::write(&path, b"BADMAGIC12345678901234567890123456789").unwrap();
+        // File must be at least HEADER_LEN (96) bytes for the magic check to be reached.
+        let mut buf = [0u8; HEADER_LEN as usize];
+        buf[..8].copy_from_slice(b"BADMAGIC");
+        fs::write(&path, buf).unwrap();
         let err = read_segment_index(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_file(&path).unwrap();
@@ -679,7 +725,7 @@ mod tests {
         }
 
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, payload.to_vec())];
-        let bss = promote(&wal_path, ulid, &base.join("pending"), &mut entries).unwrap();
+        let bss = promote(&wal_path, ulid, &base.join("pending"), &mut entries, None).unwrap();
 
         // WAL must be gone.
         assert!(!wal_path.exists(), "WAL should be deleted after promotion");

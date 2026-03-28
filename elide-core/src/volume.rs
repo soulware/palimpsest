@@ -27,6 +27,7 @@ use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
@@ -151,6 +152,10 @@ pub struct Volume {
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
     file_cache: RefCell<Option<(String, fs::File)>>,
+    /// Optional signer for segment promotion. When set, every segment written
+    /// by this volume (at WAL promotion and compaction) is signed with the
+    /// fork's private key. See `segment::SegmentSigner`.
+    signer: Option<Arc<dyn segment::SegmentSigner>>,
 }
 
 impl Volume {
@@ -160,7 +165,28 @@ impl Volume {
     /// volume root. Creates `wal/`, `pending/`, and `segments/` if they do not exist.
     /// Rebuilds the LBA map from all committed segments across the ancestry chain
     /// (following `origin` files), then recovers or creates the WAL.
+    ///
+    /// Segments written by this volume will be unsigned. Use `open_with_signer`
+    /// when the fork's private key is available.
     pub fn open(base_dir: &Path) -> io::Result<Self> {
+        Self::open_impl(base_dir, None)
+    }
+
+    /// Open (or create) a fork, signing every promoted segment with `signer`.
+    ///
+    /// Same as `open` but attaches a `SegmentSigner` so that each WAL promotion
+    /// and compaction output is signed with the fork's private key.
+    pub fn open_with_signer(
+        base_dir: &Path,
+        signer: Arc<dyn segment::SegmentSigner>,
+    ) -> io::Result<Self> {
+        Self::open_impl(base_dir, Some(signer))
+    }
+
+    fn open_impl(
+        base_dir: &Path,
+        signer: Option<Arc<dyn segment::SegmentSigner>>,
+    ) -> io::Result<Self> {
         let wal_dir = base_dir.join("wal");
         let pending_dir = base_dir.join("pending");
         let segments_dir = base_dir.join("segments");
@@ -262,6 +288,7 @@ impl Volume {
             has_new_segments,
             last_segment_ulid,
             file_cache: RefCell::new(None),
+            signer,
         })
     }
 
@@ -460,7 +487,8 @@ impl Volume {
                 let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
                 let final_path = pending_dir.join(&new_ulid);
                 // write_segment reassigns stored_offset in live_entries to new positions.
-                let new_bss = segment::write_segment(&tmp_path, &mut live_entries)?;
+                let new_bss =
+                    segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_deref())?;
                 fs::rename(&tmp_path, &final_path)?;
 
                 for entry in &live_entries {
@@ -515,6 +543,7 @@ impl Volume {
             &self.wal_ulid,
             &self.base_dir.join("pending"),
             &mut self.pending_entries,
+            self.signer.as_deref(),
         )?;
         // Update the extent index: replace temporary WAL offsets with absolute
         // offsets into the committed segment file.

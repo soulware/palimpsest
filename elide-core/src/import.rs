@@ -76,7 +76,7 @@ fn flush_segment(
     let ulid = Ulid::new().to_string();
     let tmp = segments_dir.join(format!("{ulid}.tmp"));
     let final_path = segments_dir.join(&ulid);
-    segment::write_segment(&tmp, entries)?;
+    segment::write_segment(&tmp, entries, None)?;
     fs::rename(&tmp, &final_path)?;
     entries.clear();
     Ok(Some(ulid))
