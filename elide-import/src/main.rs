@@ -1,11 +1,14 @@
-// elide-import: pull an OCI image and import it as a readonly Elide volume.
+// elide-import: import a readonly Elide volume from an OCI image or a raw ext4 file.
 //
-// Pipeline:
+// OCI pipeline (default):
 //   1. Pull the image manifest (resolving multi-platform indexes to linux/<arch>)
 //   2. Download all layer blobs concurrently to a temp directory
 //   3. Merge layers into a rootfs directory via ocirender's StreamingPacker
 //   4. Create an ext4 disk image from the rootfs (mke2fs or genext2fs)
 //   5. Import the ext4 image into an Elide volume via elide_core::import
+//
+// Raw ext4 (--from-file):
+//   1. Import the ext4 image directly into an Elide volume via elide_core::import
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,19 +26,27 @@ use tempfile::TempDir;
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(about = "Import an OCI image as a readonly Elide volume")]
+#[command(about = "Import a readonly Elide volume from an OCI image or a raw ext4 file")]
 struct Args {
-    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag)
-    image: String,
+    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag).
+    /// Mutually exclusive with --from-file.
+    image: Option<String>,
 
     /// Path to the volume directory to create (e.g. volumes/ubuntu-22.04)
     vol_dir: String,
 
+    /// Import a raw ext4 image directly, skipping OCI pull.
+    /// Mutually exclusive with the image positional argument.
+    #[arg(long, value_name = "PATH")]
+    from_file: Option<PathBuf>,
+
     /// Disk image size (e.g. 4G, 2048M). Auto-sized from unpacked rootfs if omitted.
+    /// Ignored when using --from-file (size is read from the image).
     #[arg(long)]
     size: Option<String>,
 
     /// Target CPU architecture (e.g. amd64, arm64). Defaults to host architecture.
+    /// Ignored when using --from-file.
     #[arg(long)]
     arch: Option<String>,
 }
@@ -49,18 +60,61 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let target_arch = args
-        .arch
-        .as_deref()
-        .map(parse_arch)
-        .unwrap_or_else(host_arch);
+    let vol_dir = Path::new(&args.vol_dir);
+
+    match (&args.image, &args.from_file) {
+        (Some(_), Some(_)) => {
+            bail!("--from-file and an image reference are mutually exclusive");
+        }
+        (None, None) => {
+            bail!("provide an OCI image reference or --from-file <path>");
+        }
+        (None, Some(ext4_path)) => {
+            run_from_file(ext4_path, vol_dir)?;
+        }
+        (Some(image), None) => {
+            run_oci(image, vol_dir, args.size.as_deref(), args.arch.as_deref()).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
+    eprintln!(
+        "Importing {} into {}...",
+        ext4_path.display(),
+        vol_dir.display()
+    );
+    let mut last_pct = u64::MAX;
+    elide_core::import::import_image(ext4_path, vol_dir, |done, total| {
+        let pct = done * 100 / total;
+        if pct != last_pct {
+            last_pct = pct;
+            eprint!("\r  {pct}%");
+        }
+        if done == total {
+            eprintln!();
+        }
+    })?;
+    write_meta(vol_dir, &ext4_path.display().to_string(), "", "")?;
+    eprintln!("Done. Volume ready at {}", vol_dir.display());
+    Ok(())
+}
+
+async fn run_oci(
+    image: &str,
+    vol_dir: &Path,
+    size: Option<&str>,
+    arch: Option<&str>,
+) -> anyhow::Result<()> {
+    let target_arch = arch.map(parse_arch).unwrap_or_else(host_arch);
 
     // 1. Pull manifest
-    eprintln!("Pulling manifest for {}...", args.image);
-    let reference: Reference = args
-        .image
+    eprintln!("Pulling manifest for {image}...");
+    let reference: Reference = image
         .parse()
-        .with_context(|| format!("invalid image reference: {}", args.image))?;
+        .with_context(|| format!("invalid image reference: {image}"))?;
     let client = Arc::new(Client::new(Default::default()));
     let (manifest, initial_digest) = client
         .pull_manifest(&reference, &RegistryAuth::Anonymous)
@@ -95,15 +149,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
         "Rootfs unpacked: {:.1} GiB",
         unpacked_bytes as f64 / (1 << 30) as f64
     );
-    let ext4_size = match &args.size {
+    let ext4_size = match size {
         Some(s) => parse_size(s).with_context(|| format!("invalid --size: {s}"))?,
         None => {
-            let size = auto_size(unpacked_bytes);
+            let s = auto_size(unpacked_bytes);
             eprintln!(
                 "Auto-sized ext4 image: {:.1} GiB",
-                size as f64 / (1 << 30) as f64
+                s as f64 / (1 << 30) as f64
             );
-            size
+            s
         }
     };
 
@@ -113,8 +167,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     create_ext4(&rootfs_dir, &ext4_path, ext4_size)?;
 
     // 7. Import into Elide volume
-    eprintln!("Importing into {}...", args.vol_dir);
-    let vol_dir = Path::new(&args.vol_dir);
+    eprintln!("Importing into {}...", vol_dir.display());
     let mut last_pct = u64::MAX;
     elide_core::import::import_image(&ext4_path, vol_dir, |done, total| {
         let pct = done * 100 / total;
@@ -128,9 +181,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     })?;
 
     // 8. Write volume metadata
-    write_meta(vol_dir, &args.image, &digest, &target_arch.to_string())?;
+    write_meta(vol_dir, image, &digest, &target_arch.to_string())?;
 
-    eprintln!("Done. Volume ready at {}", args.vol_dir);
+    eprintln!("Done. Volume ready at {}", vol_dir.display());
     Ok(())
 }
 

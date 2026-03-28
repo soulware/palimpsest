@@ -64,6 +64,14 @@ sudo mount /dev/nbd0 /mnt
 
 Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 
+## Import a raw ext4 image directly
+
+If you already have an ext4 image (e.g. extracted from a cloud image), use `--from-file` to skip the OCI pull:
+
+```sh
+./target/debug/elide-import --from-file ubuntu-22.04.ext4 /tmp/elide-test/ubuntu-22.04
+```
+
 ## Other useful commands
 
 ```sh
