@@ -475,18 +475,21 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener, None)
+    serve_volume_listener(dir, size_bytes, listener, None, None)
 }
 
 /// Serve a fork over NBD with a signing key attached.
 ///
 /// Segments promoted during this session will be signed with `signer`.
+/// If `fetch_config` is provided, missing segments are fetched from remote
+/// storage on demand and cached in `segments/`.
 pub fn run_volume_signed(
     dir: &Path,
     size_bytes: u64,
     bind: &str,
     port: u16,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
+    fetch_config: Option<crate::fetcher::FetchConfig>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
@@ -502,7 +505,7 @@ pub fn run_volume_signed(
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener, Some(signer))
+    serve_volume_listener(dir, size_bytes, listener, Some(signer), fetch_config)
 }
 
 /// Serve a fork as a read-only NBD device.
@@ -510,7 +513,14 @@ pub fn run_volume_signed(
 /// The fork is opened without acquiring a write lock or creating a WAL. The
 /// NBD device is advertised as read-only; write commands return EPERM.
 /// Requires `--readonly` to be passed explicitly so the intent is unambiguous.
-pub fn run_volume_readonly(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Result<()> {
+/// If `fetch_config` is provided, missing segments are fetched on demand.
+pub fn run_volume_readonly(
+    dir: &Path,
+    size_bytes: u64,
+    bind: &str,
+    port: u16,
+    fetch_config: Option<crate::fetcher::FetchConfig>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
     println!("NBD readonly volume server on {}", addr);
@@ -527,7 +537,14 @@ pub fn run_volume_readonly(dir: &Path, size_bytes: u64, bind: &str, port: u16) -
     println!("Waiting for connection...\n");
 
     install_sigusr1_handler();
-    let volume = ReadonlyVolume::open(dir)?;
+    let mut volume = ReadonlyVolume::open(dir)?;
+
+    if let Some(config) = fetch_config {
+        let forks = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
+        let fetcher = crate::fetcher::ObjectStoreFetcher::new(&config, forks)?;
+        volume.set_fetcher(std::sync::Arc::new(fetcher));
+        println!("[demand-fetch enabled]");
+    }
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -704,6 +721,7 @@ fn serve_volume_listener(
     size_bytes: u64,
     listener: TcpListener,
     signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+    fetch_config: Option<crate::fetcher::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
@@ -711,6 +729,13 @@ fn serve_volume_listener(
         Some(s) => Volume::open_with_signer(dir, s)?,
         None => Volume::open(dir)?,
     };
+
+    if let Some(config) = fetch_config {
+        let forks = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
+        let fetcher = crate::fetcher::ObjectStoreFetcher::new(&config, forks)?;
+        volume.set_fetcher(std::sync::Arc::new(fetcher));
+        println!("[demand-fetch enabled]");
+    }
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -957,7 +982,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, listener, None).ok();
+            serve_volume_listener(&dir, size_bytes, listener, None, None).ok();
         });
         port
     }

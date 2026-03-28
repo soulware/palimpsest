@@ -558,12 +558,15 @@ name = "elide"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chrono",
  "clap",
  "elide-core",
  "elide-signing",
  "ext4-view",
  "libc",
+ "object_store",
  "serde",
+ "tokio",
  "toml",
  "ulid",
  "zstd",

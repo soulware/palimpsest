@@ -29,6 +29,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use segment::BoxFetcher;
+
 use ulid::Ulid;
 
 use crate::{extentindex, lbamap, segment, writelog};
@@ -156,6 +158,10 @@ pub struct Volume {
     /// by this volume (at WAL promotion and compaction) is signed with the
     /// fork's private key. See `segment::SegmentSigner`.
     signer: Option<Arc<dyn segment::SegmentSigner>>,
+    /// Optional fetcher for demand-fetch on segment cache miss. When set,
+    /// `find_segment_file` fetches missing segments from remote storage and
+    /// caches them in `segments/`. See `segment::SegmentFetcher`.
+    fetcher: Option<BoxFetcher>,
 }
 
 impl Volume {
@@ -289,6 +295,7 @@ impl Volume {
             last_segment_ulid,
             file_cache: RefCell::new(None),
             signer,
+            fetcher: None,
         })
     }
 
@@ -633,7 +640,8 @@ impl Volume {
 
     /// Locate the segment body file for `segment_id` within this fork's
     /// ancestry chain. Checks the current fork's `wal/`, `pending/`, `segments/`
-    /// first, then searches ancestor forks' `pending/` and `segments/`.
+    /// first, then searches ancestor forks' `pending/` and `segments/`. On a
+    /// miss with a fetcher attached, fetches from remote storage into `segments/`.
     fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
         for subdir in ["wal", "pending", "segments"] {
             let path = self.base_dir.join(subdir).join(segment_id);
@@ -649,6 +657,11 @@ impl Volume {
                 }
             }
         }
+        if let Some(fetcher) = &self.fetcher {
+            let dest = self.base_dir.join("segments").join(segment_id);
+            fetcher.fetch(segment_id, &dest)?;
+            return Ok(dest);
+        }
         Err(io::Error::other(format!("segment not found: {segment_id}")))
     }
 
@@ -662,6 +675,27 @@ impl Volume {
 
     pub fn lbamap_len(&self) -> usize {
         self.lbamap.len()
+    }
+
+    /// Attach a `SegmentFetcher` for demand-fetch on segment cache miss.
+    ///
+    /// Once set, `find_segment_file` will call the fetcher after all local
+    /// directories are checked, caching the result in `segments/`.
+    pub fn set_fetcher(&mut self, fetcher: BoxFetcher) {
+        self.fetcher = Some(fetcher);
+    }
+
+    /// Return all fork directories in the ancestry chain, oldest-first,
+    /// with the current fork last.
+    ///
+    /// Used by callers building a `SegmentFetcher` that needs to know which
+    /// forks to search on a cache miss.
+    pub fn fork_dirs(&self) -> Vec<PathBuf> {
+        self.ancestor_layers
+            .iter()
+            .map(|l| l.dir.clone())
+            .chain(std::iter::once(self.base_dir.clone()))
+            .collect()
     }
 
     pub fn promote_for_test(&mut self) -> io::Result<()> {
@@ -760,6 +794,7 @@ pub struct ReadonlyVolume {
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
     file_cache: RefCell<Option<(String, fs::File)>>,
+    fetcher: Option<BoxFetcher>,
 }
 
 impl ReadonlyVolume {
@@ -784,6 +819,7 @@ impl ReadonlyVolume {
             lbamap,
             extent_index,
             file_cache: RefCell::new(None),
+            fetcher: None,
         })
     }
 
@@ -815,7 +851,27 @@ impl ReadonlyVolume {
                 }
             }
         }
+        if let Some(fetcher) = &self.fetcher {
+            let dest = self.base_dir.join("segments").join(segment_id);
+            fetcher.fetch(segment_id, &dest)?;
+            return Ok(dest);
+        }
         Err(io::Error::other(format!("segment not found: {segment_id}")))
+    }
+
+    /// Attach a `SegmentFetcher` for demand-fetch on segment cache miss.
+    pub fn set_fetcher(&mut self, fetcher: BoxFetcher) {
+        self.fetcher = Some(fetcher);
+    }
+
+    /// Return all fork directories in the ancestry chain, oldest-first,
+    /// with the current fork last.
+    pub fn fork_dirs(&self) -> Vec<PathBuf> {
+        self.ancestor_dirs
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.base_dir.clone()))
+            .collect()
     }
 }
 

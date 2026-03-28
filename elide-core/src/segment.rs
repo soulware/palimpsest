@@ -43,6 +43,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // --- constants ---
 
@@ -57,6 +58,24 @@ const HEADER_LEN: u64 = 96;
 pub trait SegmentSigner: Send + Sync {
     fn sign(&self, msg: &[u8]) -> [u8; 64];
 }
+
+/// Trait for fetching segments from remote storage on a local cache miss.
+///
+/// Implementations download the segment and write it atomically to `dest`
+/// (write to a `.tmp` file, then rename). `elide-core` is synchronous; async
+/// fetchers must wrap their runtime (e.g. `Runtime::block_on`) inside this
+/// interface.
+pub trait SegmentFetcher: Send + Sync {
+    /// Fetch `segment_id` from remote storage and write it atomically to `dest`.
+    ///
+    /// `dest` is the target path inside `segments/`. The implementation is
+    /// responsible for the atomic write (tmp + rename). Returns `Ok(())` on
+    /// success or an error if the segment cannot be fetched.
+    fn fetch(&self, segment_id: &str, dest: &Path) -> io::Result<()>;
+}
+
+/// Convenience alias for an optional heap-allocated `SegmentFetcher`.
+pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
 /// Size of a DEDUP_REF index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
 const IDX_ENTRY_REF_LEN: u32 = 45;

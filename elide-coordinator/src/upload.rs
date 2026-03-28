@@ -78,7 +78,9 @@ pub fn segment_key(volume_id: &str, fork_name: &str, ulid_str: &str) -> Result<S
 }
 
 /// Upload all committed segments from `pending/` to the object store, moving
-/// each successfully uploaded segment to `segments/`.
+/// each successfully uploaded segment to `segments/`. Also uploads the fork's
+/// public key to `<volume_id>/<fork_name>/fork.pub` so that new hosts can
+/// verify fetched segments (trust-on-first-use).
 pub async fn drain_pending(
     fork_dir: &Path,
     volume_id: &str,
@@ -87,6 +89,17 @@ pub async fn drain_pending(
 ) -> Result<DrainResult> {
     let pending_dir = fork_dir.join("pending");
     let segments_dir = fork_dir.join("segments");
+
+    // Upload the fork public key before segments so that any host that
+    // demand-fetches a segment immediately after upload can verify it.
+    // For the base fork the key lives at <vol_root>/base.pub; for named forks
+    // it is fork.pub inside the fork directory.
+    let pub_key_path = pub_key_path(fork_dir, fork_name);
+    if pub_key_path.exists() {
+        if let Err(e) = upload_pub_key(&pub_key_path, volume_id, fork_name, store).await {
+            eprintln!("pub key upload failed: {e:#}");
+        }
+    }
 
     let mut entries = tokio::fs::read_dir(&pending_dir)
         .await
@@ -125,6 +138,39 @@ pub async fn drain_pending(
     }
 
     Ok(DrainResult { uploaded, failed })
+}
+
+/// Return the local path of the fork's public key.
+///
+/// The base fork stores its key at `<vol_root>/base.pub` (sibling of `base/`).
+/// Named forks store it at `<fork_dir>/fork.pub`.
+fn pub_key_path(fork_dir: &Path, fork_name: &str) -> std::path::PathBuf {
+    if fork_name == "base" {
+        // base fork: key is at <vol_root>/base.pub, next to the base/ directory
+        fork_dir
+            .parent()
+            .map(|p| p.join("base.pub"))
+            .unwrap_or_else(|| fork_dir.join("base.pub"))
+    } else {
+        fork_dir.join("fork.pub")
+    }
+}
+
+async fn upload_pub_key(
+    pub_key_path: &Path,
+    volume_id: &str,
+    fork_name: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<()> {
+    let data = tokio::fs::read(pub_key_path)
+        .await
+        .with_context(|| format!("reading pub key: {}", pub_key_path.display()))?;
+    let key = StorePath::from(format!("{volume_id}/{fork_name}/fork.pub"));
+    store
+        .put(&key, Bytes::from(data).into())
+        .await
+        .with_context(|| format!("uploading pub key to {key}"))?;
+    Ok(())
 }
 
 async fn upload_segment(
@@ -243,5 +289,65 @@ mod tests {
             .head(&key2)
             .await
             .expect("object 2 should be in store");
+    }
+
+    #[tokio::test]
+    async fn drain_pending_uploads_pub_key_for_base_fork() {
+        let volume_tmp = TempDir::new().unwrap();
+        let fork_dir = volume_tmp.path().join("myvm").join("base");
+        let pending_dir = fork_dir.join("pending");
+        let segments_dir = fork_dir.join("segments");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        std::fs::create_dir_all(&segments_dir).unwrap();
+
+        // Write a fake base.pub at the volume root (sibling of base/).
+        let vol_root = volume_tmp.path().join("myvm");
+        let fake_pub = b"fakepublickey12345678901234567890";
+        std::fs::write(vol_root.join("base.pub"), fake_pub).unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        let result = drain_pending(&fork_dir, "myvm", "base", &store)
+            .await
+            .unwrap();
+        assert_eq!(result.uploaded, 0);
+        assert_eq!(result.failed, 0);
+
+        // fork.pub must have been uploaded to the expected key
+        let pub_key = StorePath::from("myvm/base/fork.pub");
+        let got = store.get(&pub_key).await.expect("fork.pub not in store");
+        let bytes = got.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), fake_pub);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_uploads_pub_key_for_named_fork() {
+        let volume_tmp = TempDir::new().unwrap();
+        let fork_dir = volume_tmp.path().join("myvm").join("forks").join("vm1");
+        let pending_dir = fork_dir.join("pending");
+        let segments_dir = fork_dir.join("segments");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        std::fs::create_dir_all(&segments_dir).unwrap();
+
+        // Write a fake fork.pub inside the fork directory.
+        let fake_pub = b"fakeforkpublickey0123456789012345";
+        std::fs::write(fork_dir.join("fork.pub"), fake_pub).unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        let result = drain_pending(&fork_dir, "myvm", "vm1", &store)
+            .await
+            .unwrap();
+        assert_eq!(result.uploaded, 0);
+        assert_eq!(result.failed, 0);
+
+        let pub_key = StorePath::from("myvm/vm1/fork.pub");
+        let got = store.get(&pub_key).await.expect("fork.pub not in store");
+        let bytes = got.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), fake_pub);
     }
 }

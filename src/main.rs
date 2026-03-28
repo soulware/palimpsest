@@ -7,6 +7,7 @@ use elide_core::volume;
 use elide_signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
 
 mod extents;
+mod fetcher;
 mod inspect;
 mod ls;
 mod nbd;
@@ -185,8 +186,10 @@ fn main() {
             let fork_dir = vol_path.join("forks").join(&fork);
             let size_bytes = resolve_volume_size(vol_path, size.as_deref())
                 .expect("failed to determine volume size");
+            let fetch_config =
+                fetcher::FetchConfig::load(vol_path).expect("failed to load fetch config");
             if readonly {
-                nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port)
+                nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port, fetch_config)
                     .expect("readonly NBD server error");
             } else {
                 // Ensure the fork directory exists before touching key files.
@@ -213,7 +216,7 @@ fn main() {
                     elide_signing::load_signer(&fork_dir, FORK_KEY_FILE)
                         .expect("failed to load fork signing key")
                 };
-                nbd::run_volume_signed(&fork_dir, size_bytes, &bind, port, signer)
+                nbd::run_volume_signed(&fork_dir, size_bytes, &bind, port, signer, fetch_config)
                     .expect("volume NBD server error");
             }
         }

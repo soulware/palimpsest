@@ -19,12 +19,16 @@ Background reading, implementation notes, and open questions.
 
 **The imported base volume also has its own keypair.** `elide-import` generates `base.key` / `base.pub` / `base.origin` at the volume root before writing any segments, so every imported segment is signed. This prevents a second import from silently writing to the same volume root. The signing logic is shared via the `elide-signing` crate, which both `elide` and `elide-import` depend on.
 
-**Demand-fetch is the current next step.** Segments in `segments/` are S3-backed and evictable; segments in `pending/` are local-only and must not be evicted. The hook point is `find_segment_file()` in `elide-core/src/volume.rs` — it currently returns an error on miss after checking all local directories. Demand-fetch inserts an S3 fetch at that point, verifying the segment signature against locally-pinned `fork.pub` before caching in `segments/`. Open design questions:
+**Demand-fetch is implemented (phase 1).** Segments in `segments/` are S3-backed and evictable; segments in `pending/` are local-only and must not be evicted. The hook point is `find_segment_file()` in `elide-core/src/volume.rs` — after all local directory checks fail, it delegates to an optional `SegmentFetcher` trait object, which downloads the segment and caches it in `segments/`. The fetcher is implemented in `elide/src/fetcher.rs` using `object_store` with a `tokio::runtime::Runtime::block_on` wrapper to satisfy the sync interface.
 
-1. **Where does fetch logic live?** `elide-core` has no async/HTTP. Fetch must be injected via a trait object (similar to `SegmentSigner`) or handled in the `elide` binary before the miss propagates.
-2. **Eviction policy:** currently nothing evicts `segments/`. A simple LRU or size-cap policy is needed before demand-fetch is useful as a capacity tier rather than just a durability tier.
-3. **Fetch config:** bucket, endpoint, and ancestor `fork.pub` paths need to reach the volume process — likely via a config file alongside the volume directory.
-4. **Ancestor public keys:** fetching segments from an ancestor fork requires that fork's `fork.pub` pinned locally. A new host must fetch it from S3 once (trust-on-first-use) before demand-fetch for that ancestor is enabled.
+Key design decisions:
+
+1. **`SegmentFetcher` trait in `elide-core`** (mirrors `SegmentSigner`): sync interface, `fn fetch(&self, segment_id: &str, dest: &Path) -> io::Result<()>`. `elide-core` stays async-free; async fetcher wraps `block_on`.
+2. **Eviction deferred (phase 1)**: `segments/` grows unbounded. Eviction (LRU size cap) is the natural next step once fetch is validated in production.
+3. **Fetch config via `fetch.toml`** in the volume directory; env var fallback (`ELIDE_S3_BUCKET`, `AWS_ENDPOINT_URL`). A `local_path` key enables local-filesystem testing with no object store server.
+4. **Ancestor public keys via coordinator upload**: `drain_pending` uploads `fork.pub` (or `base.pub`) to `<volume_id>/<fork_name>/fork.pub` *before* any segments, so the key is always present when segments are fetchable. Signature verification at fetch time (TOFU) is not yet wired — the segment signature is stored in the file and can be verified in a future pass.
+
+**Next: segment eviction.** `segments/` is now a cache tier but has no size cap. A simple policy: scan `segments/` by `mtime` (touched on fetch), evict oldest when total size exceeds a configured cap. Only `segments/` files are evictable — `pending/` files must never be removed (they are not yet in S3).
 
 ---
 
