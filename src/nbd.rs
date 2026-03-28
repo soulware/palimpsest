@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::volume::Volume;
+use crate::volume::{ReadonlyVolume, Volume};
 
 use crate::extents::{LocatedExtent, locate_extents};
 
@@ -47,6 +47,7 @@ const NBD_CMD_FLUSH: u16 = 3;
 
 // Transmission flags
 const NBD_FLAG_HAS_FLAGS: u16 = 1;
+const NBD_FLAG_READ_ONLY: u16 = 2;
 const NBD_FLAG_SEND_FLUSH: u16 = 4;
 
 // COW granularity — 4KB blocks
@@ -475,6 +476,176 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
     );
     println!("Waiting for connection...\n");
     serve_volume_listener(dir, size_bytes, listener)
+}
+
+/// Serve a fork as a read-only NBD device.
+///
+/// The fork is opened without acquiring a write lock or creating a WAL. The
+/// NBD device is advertised as read-only; write commands return EPERM.
+/// Requires `--readonly` to be passed explicitly so the intent is unambiguous.
+pub fn run_volume_readonly(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Result<()> {
+    let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
+    let addr = listener.local_addr()?;
+    println!("NBD readonly volume server on {}", addr);
+    println!(
+        "Volume: {} ({:.1} MB)  [read-only]",
+        dir.display(),
+        size_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+        addr.ip(),
+        addr.port()
+    );
+    println!("Waiting for connection...\n");
+
+    install_sigusr1_handler();
+    let volume = ReadonlyVolume::open(dir)?;
+
+    for stream in listener.incoming() {
+        let stream = stream?;
+        println!("[connected: {}]", stream.peer_addr()?);
+        let result = handle_readonly_connection(stream, &volume, size_bytes);
+        match result {
+            Ok(()) => println!("[disconnected]"),
+            Err(e) => eprintln!("[connection error: {}]", e),
+        }
+        println!("Waiting for connection...\n");
+    }
+    Ok(())
+}
+
+fn handle_readonly_connection(
+    mut s: TcpStream,
+    volume: &ReadonlyVolume,
+    volume_size: u64,
+) -> io::Result<()> {
+    // Newstyle handshake
+    s.write_all(&NBD_MAGIC.to_be_bytes())?;
+    s.write_all(&NBD_OPTS_MAGIC.to_be_bytes())?;
+    s.write_all(&NBD_FLAG_FIXED_NEWSTYLE.to_be_bytes())?;
+
+    let _client_flags = read_u32(&mut s)?;
+
+    let tx_flags: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY;
+
+    loop {
+        let magic = read_u64(&mut s)?;
+        if magic != NBD_OPTS_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad option magic",
+            ));
+        }
+        let option = read_u32(&mut s)?;
+        let len = read_u32(&mut s)? as usize;
+        let mut data = vec![0u8; len];
+        s.read_exact(&mut data)?;
+
+        match option {
+            NBD_OPT_EXPORT_NAME => {
+                s.write_all(&volume_size.to_be_bytes())?;
+                s.write_all(&tx_flags.to_be_bytes())?;
+                s.write_all(&[0u8; 124])?;
+                break;
+            }
+            NBD_OPT_GO | NBD_OPT_INFO => {
+                let mut info = Vec::new();
+                info.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
+                info.extend_from_slice(&volume_size.to_be_bytes());
+                info.extend_from_slice(&tx_flags.to_be_bytes());
+                opt_reply(&mut s, option, NBD_REP_INFO, &info)?;
+
+                let mut bsz = Vec::new();
+                bsz.extend_from_slice(&NBD_INFO_BLOCK_SIZE.to_be_bytes());
+                bsz.extend_from_slice(&512u32.to_be_bytes());
+                bsz.extend_from_slice(&4096u32.to_be_bytes());
+                bsz.extend_from_slice(&(4u32 * 1024 * 1024).to_be_bytes());
+                opt_reply(&mut s, option, NBD_REP_INFO, &bsz)?;
+
+                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
+                if option == NBD_OPT_GO {
+                    break;
+                }
+            }
+            NBD_OPT_LIST => {
+                let mut entry = Vec::new();
+                entry.extend_from_slice(&0u32.to_be_bytes());
+                opt_reply(&mut s, option, NBD_REP_SERVER, &entry)?;
+                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
+            }
+            NBD_OPT_ABORT => {
+                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
+                return Ok(());
+            }
+            _ => {
+                opt_reply(&mut s, option, NBD_REP_ERR_UNSUP, &[])?;
+            }
+        }
+    }
+
+    let mut reads: u64 = 0;
+    s.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+
+    loop {
+        let magic = match read_u32(&mut s) {
+            Ok(m) => m,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if magic != NBD_REQUEST_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad request magic",
+            ));
+        }
+        let _flags = read_u16(&mut s)?;
+        let cmd = read_u16(&mut s)?;
+        let handle = read_u64(&mut s)?;
+        let offset = read_u64(&mut s)?;
+        let length = read_u32(&mut s)? as usize;
+
+        match cmd {
+            NBD_CMD_READ => {
+                reads += 1;
+                let start_lba = offset / 4096;
+                let end_lba = (offset + length as u64).div_ceil(4096);
+                let lba_count = (end_lba - start_lba) as u32;
+                match volume.read(start_lba, lba_count) {
+                    Ok(blocks) => {
+                        let skip = (offset % 4096) as usize;
+                        tx_reply(&mut s, 0, handle)?;
+                        s.write_all(&blocks[skip..skip + length])?;
+                    }
+                    Err(e) => {
+                        eprintln!("[read error offset={} len={}: {}]", offset, length, e);
+                        tx_reply(&mut s, 5, handle)?; // EIO
+                    }
+                }
+            }
+            NBD_CMD_WRITE => {
+                // Drain the write payload before responding.
+                let mut buf = vec![0u8; length];
+                s.read_exact(&mut buf)?;
+                tx_reply(&mut s, 1, handle)?; // EPERM — device is read-only
+            }
+            NBD_CMD_DISC => {
+                println!("[reads: {}]", reads);
+                break;
+            }
+            NBD_CMD_FLUSH => {
+                tx_reply(&mut s, 0, handle)?; // flush is a no-op on readonly
+            }
+            _ => {
+                tx_reply(&mut s, 22, handle)?; // EINVAL
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serve NBD connections on an already-bound listener, looping until the

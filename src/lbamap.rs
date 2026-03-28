@@ -237,22 +237,35 @@ impl Default for LbaMap {
 /// Scans `<base>/pending/` and `<base>/segments/` in ULID order (oldest
 /// first). Reads the index section of each segment file. Directories that do
 /// not exist are silently skipped.
+/// Rebuild the LBA map from all committed segments across a fork ancestry chain.
+///
+/// `layers` is ordered oldest-first (root ancestor first, live fork last).
+/// Each element is `(fork_dir, branch_ulid)`:
+/// - `fork_dir`: the fork directory containing `pending/` and `segments/`.
+/// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
+///   are included. `None` means include all segments (used for the live fork).
+///
+/// Applying layers oldest-to-newest means later layers shadow earlier ones for
+/// any overlapping LBA range, which is the correct layer-merge semantics.
 ///
 /// The caller (`Volume::open`) is responsible for replaying the in-progress
-/// WAL on top of the result — doing so in one pass also builds `pending_entries`.
-/// Rebuild the LBA map from all committed segments across an ancestor chain.
-///
-/// `node_chain` is ordered oldest-first (root ancestor first, live node last).
-/// Each node's `pending/` and `segments/` are scanned in ULID order. Applying
-/// nodes oldest-to-newest means later layers shadow earlier ones for any
-/// overlapping LBA range, which is the correct layer-merge semantics.
-pub fn rebuild_segments(node_chain: &[PathBuf]) -> io::Result<LbaMap> {
+/// WAL on top of the result.
+pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaMap> {
     let mut map = LbaMap::new();
 
-    for node_dir in node_chain {
-        let mut paths = segment::collect_segment_files(&node_dir.join("pending"))?;
-        paths.extend(segment::collect_segment_files(&node_dir.join("segments"))?);
+    for (fork_dir, branch_ulid) in layers {
+        let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
+        paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
         paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        if let Some(cutoff) = branch_ulid {
+            paths.retain(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+        }
 
         for path in &paths {
             let (_body_section_start, entries) = segment::read_segment_index(path)?;
@@ -422,7 +435,7 @@ mod tests {
                 .unwrap();
         }
 
-        let map = rebuild_segments(&[base.clone()]).unwrap();
+        let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
 
         // [0, 5) should be from segment 1.
         assert_eq!(map.lookup(0), Some((h(1), 0)));
@@ -439,7 +452,7 @@ mod tests {
         let base = temp_dir();
         // No subdirs at all — fresh volume.
         std::fs::create_dir_all(&base).unwrap();
-        let map = rebuild_segments(&[base.clone()]).unwrap();
+        let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
         assert!(map.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -472,7 +485,7 @@ mod tests {
             .unwrap();
         }
 
-        let map = rebuild_segments(&[ancestor.clone(), live.clone()]).unwrap();
+        let map = rebuild_segments(&[(ancestor.clone(), None), (live.clone(), None)]).unwrap();
 
         // Ancestor range not overwritten.
         assert_eq!(map.lookup(0), Some((h(1), 0)));

@@ -51,12 +51,12 @@ enum Command {
     RenameAnalysis { image1: String, image2: String },
     /// Measure sparse-strategy savings: within changed files, how many 4KB blocks actually differ?
     SparseAnalysis { image1: String, image2: String },
-    /// Serve an elide volume directory over NBD
+    /// Serve an elide fork directory over NBD
     ServeVolume {
-        /// Path to the volume directory (created if it doesn't exist)
+        /// Path to the fork directory (e.g. volumes/myvm/default)
         dir: String,
         /// Volume size (e.g. "4G", "512M", "1073741824"). Required on first use;
-        /// ignored on subsequent opens (size is stored in <dir>/size).
+        /// ignored on subsequent opens (size is stored in <vol-dir>/size).
         #[arg(long)]
         size: Option<String>,
         /// Address to bind (use 0.0.0.0 to allow connections from VMs)
@@ -64,6 +64,9 @@ enum Command {
         bind: String,
         #[arg(long, default_value_t = 10809)]
         port: u16,
+        /// Serve as a read-only block device (required for readonly-base forks)
+        #[arg(long)]
+        readonly: bool,
     },
     /// Extract kernel and initrd from an ext4 image's /boot directory
     ExtractBoot {
@@ -92,10 +95,25 @@ enum Command {
         #[arg(long, default_value_t = 0.7)]
         min_live_ratio: f64,
     },
-    /// Take a snapshot of a live volume node, freezing it and continuing in a new child node
+    /// Checkpoint a fork by writing a snapshot marker; the fork stays live
     SnapshotVolume {
-        /// Path to the live volume node directory
+        /// Path to the fork directory (e.g. volumes/myvm/default)
         dir: String,
+    },
+    /// Create a new named fork branched from the latest snapshot of the source fork
+    ForkVolume {
+        /// Path to the volume directory (contains the named forks)
+        vol_dir: String,
+        /// Name for the new fork
+        fork_name: String,
+        /// Source fork to branch from (default: "default")
+        #[arg(long, default_value = "default")]
+        from: String,
+    },
+    /// List all forks in a volume directory
+    ListForks {
+        /// Path to the volume directory
+        vol_dir: String,
     },
 }
 
@@ -150,11 +168,21 @@ fn main() {
             size,
             bind,
             port,
+            readonly,
         } => {
-            let dir = Path::new(&dir);
-            let size_bytes =
-                resolve_volume_size(dir, size.as_deref()).expect("failed to determine volume size");
-            nbd::run_volume(dir, size_bytes, &bind, port).expect("volume NBD server error");
+            let fork_dir = Path::new(&dir);
+            // The size file lives at the volume root (parent of the fork dir), falling
+            // back to the fork dir itself for single-fork layouts during development.
+            let size_dir = fork_dir.parent().unwrap_or(fork_dir);
+            let size_bytes = resolve_volume_size(size_dir, size.as_deref())
+                .expect("failed to determine volume size");
+            if readonly {
+                nbd::run_volume_readonly(fork_dir, size_bytes, &bind, port)
+                    .expect("readonly NBD server error");
+            } else {
+                nbd::run_volume(fork_dir, size_bytes, &bind, port)
+                    .expect("volume NBD server error");
+            }
         }
 
         Command::ExtractBoot { image, out_dir } => {
@@ -183,10 +211,77 @@ fn main() {
 
         Command::SnapshotVolume { dir } => {
             let mut vol = volume::Volume::open(Path::new(&dir)).expect("failed to open volume");
-            let child_path = vol.snapshot().expect("snapshot failed");
-            println!("{}", child_path.display());
+            let snap_ulid = vol.snapshot().expect("snapshot failed");
+            println!("{snap_ulid}");
+        }
+
+        Command::ForkVolume {
+            vol_dir,
+            fork_name,
+            from,
+        } => {
+            let fork_dir = volume::fork_volume(Path::new(&vol_dir), &fork_name, &from)
+                .expect("fork-volume failed");
+            println!("{}", fork_dir.display());
+        }
+
+        Command::ListForks { vol_dir } => {
+            list_forks(Path::new(&vol_dir)).expect("list-forks failed");
         }
     }
+}
+
+fn list_forks(vol_dir: &Path) -> std::io::Result<()> {
+    use std::fs;
+
+    let is_readonly = vol_dir.join("readonly").exists();
+
+    let mut forks: Vec<(String, bool)> = Vec::new(); // (name, is_live)
+    for entry in fs::read_dir(vol_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        // Skip reserved names that aren't forks.
+        if matches!(name.as_str(), "readonly" | "size") {
+            continue;
+        }
+        let is_live = path.join("wal").is_dir();
+        forks.push((name, is_live));
+    }
+    forks.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if is_readonly {
+        println!("readonly volume");
+    }
+    for (name, is_live) in &forks {
+        let state = if *is_live { "live" } else { "base" };
+        let snap_count = count_snapshots(&vol_dir.join(name));
+        println!("  {name}  [{state}]  {snap_count} snapshot(s)");
+    }
+    Ok(())
+}
+
+fn count_snapshots(fork_dir: &Path) -> usize {
+    let snapshots_dir = fork_dir.join("snapshots");
+    std::fs::read_dir(&snapshots_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| ulid::Ulid::from_string(n).ok())
+                        .is_some()
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Parse a human-readable size string: plain bytes, or with suffix K/M/G/T (base-2).

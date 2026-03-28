@@ -98,14 +98,36 @@ impl Default for ExtentIndex {
 /// - Dedup-ref entries: no body in this segment; the hash is already indexed
 ///   from the ancestor segment that holds the actual data.
 ///
+/// Rebuild the extent index from all committed segments across a fork ancestry chain.
+///
+/// `layers` is ordered oldest-first (root ancestor first, live fork last).
+/// Each element is `(fork_dir, branch_ulid)`:
+/// - `fork_dir`: the fork directory containing `pending/` and `segments/`.
+/// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
+///   are included. `None` means include all segments (used for the live fork).
+///
+/// Inline entries and dedup-ref entries are skipped:
+/// - Inline entries: read path not yet implemented (INLINE_THRESHOLD = 0).
+/// - Dedup-ref entries: no body in this segment; the hash is already indexed
+///   from the ancestor segment that holds the actual data.
+///
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
-pub fn rebuild(node_chain: &[PathBuf]) -> io::Result<ExtentIndex> {
+pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
-    for node_dir in node_chain {
-        let mut paths = segment::collect_segment_files(&node_dir.join("pending"))?;
-        paths.extend(segment::collect_segment_files(&node_dir.join("segments"))?);
+    for (fork_dir, branch_ulid) in layers {
+        let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
+        paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
         paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        if let Some(cutoff) = branch_ulid {
+            paths.retain(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+        }
 
         for path in &paths {
             let segment_id = path
@@ -202,7 +224,7 @@ mod tests {
         let bss = segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
             .unwrap();
 
-        let index = rebuild(&[base.clone()]).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         // body_offset should be absolute (body_section_start + 0).
@@ -232,7 +254,7 @@ mod tests {
         ];
         segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries).unwrap();
 
-        let index = rebuild(&[base.clone()]).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         // Only the DATA entry should be indexed; the dedup-ref is skipped.
         assert_eq!(index.len(), 1);
         assert!(index.lookup(&ref_hash).is_none());
@@ -272,7 +294,7 @@ mod tests {
             stored_offset2 = entries[1].stored_offset;
         }
 
-        let index = rebuild(&[base.clone()]).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         // Newer segment's offset wins.
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, bss2 + stored_offset2);
@@ -284,7 +306,7 @@ mod tests {
     fn rebuild_empty_dirs_returns_empty() {
         let base = temp_dir();
         std::fs::create_dir_all(&base).unwrap();
-        let index = rebuild(&[base.clone()]).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert!(index.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -312,7 +334,7 @@ mod tests {
             stored_offset = entries[0].stored_offset;
         }
 
-        let index = rebuild(&[ancestor.clone(), live.clone()]).unwrap();
+        let index = rebuild(&[(ancestor.clone(), None), (live.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, bss + stored_offset);

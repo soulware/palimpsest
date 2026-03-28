@@ -276,24 +276,34 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 
 ## Proposed: Named Forks and Volume Addressing
 
-> **Status: design proposal — not yet implemented.** The current implementation uses the `children/<ulid>/` nesting model described below. This section describes the intended replacement. The existing Snapshots section documents current behaviour and will be updated when this is implemented.
+> **Status: design proposal — not yet implemented.** The current implementation uses the `children/<ulid>/` nesting model described in the Snapshots section below. This section describes the intended replacement — including readonly volumes, which are only defined for the Named Forks model.
+>
+> **Changes from current implementation:**
+> - `children/<ulid>/` nesting is removed; forks are named sibling directories within the volume
+> - `snapshot()` no longer freezes the current node and moves to a child; it writes a marker file and the fork stays live in place
+> - `walk_ancestors` reads `origin` files instead of detecting the `children/` directory pattern
+> - `rebuild_segments` / `rebuild` (extent index) gain a per-ancestor ULID cutoff so that only segments up to the branch point are included from each ancestor fork
+> - The `readonly` marker and the import path are new; no equivalent exists in the current implementation
 
 ### Concepts
 
 | Term | Definition |
 |------|------------|
 | **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
-| **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. Every volume has a default fork named `default`. |
+| **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. Every writable volume has a default fork named `default`. |
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments in `segments/` with ULID ≤ the snapshot ULID are part of that snapshot. The file content is empty or an optional human-readable name. |
+| **Readonly volume** | A volume flagged with a `readonly` marker at creation time. Its `default` fork is populated by an import (no `wal/`) and cannot be served directly. Named forks branch from it and are fully writable. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
 
 ### Directory layout
+
+**Writable volume:**
 
 ```
 <base>/                          ← shared volumes root (e.g. /var/lib/elide/volumes or ~/.local/share/elide/volumes)
   myvm/                          ← volume "myvm"
     default/                     ← default fork (live)
-      wal/                       ← present = live; absent = frozen (should not occur for a fork)
+      wal/                       ← present = live
       pending/                   ← segments awaiting promotion to segments/
       segments/                  ← committed segment files, ordered by ULID
       snapshots/
@@ -306,74 +316,103 @@ Delta compression collapses this flexibility: reconstruction always requires fet
       origin                     ← text file: "<fork-name>/<ulid>" (branch point)
       snapshots/
         <ulid-3>
-  exported/                      ← export of "dev" — new self-contained volume, same base
-    default/
+```
+
+**Readonly volume:**
+
+```
+  ubuntu-22.04/                  ← readonly volume
+    readonly                     ← plain file: explicit readonly flag; no direct serving allowed
+    default/                     ← frozen base populated by import (no wal/)
+      segments/
+      pending/
+      snapshots/
+        <import-ulid>            ← single marker written at end of import
+    server-1/                    ← named fork branched from default (live)
       wal/
       pending/
       segments/
-                                 ← no origin, no snapshots/
+      origin                     ← "default/<import-ulid>"
+      snapshots/
+    dev-test/                    ← another named fork (live)
+      wal/
+      pending/
+      segments/
+      origin                     ← "default/<import-ulid>"
 ```
 
 **Invariants:**
-- A fork is always live (`wal/` present). Forks are never frozen in place — checkpoints are stored as marker files in `snapshots/`.
-- A snapshot marker `snapshots/<ulid>` is a plain file whose name is a ULID. The ULID is generated at snapshot time, so it sorts lexicographically after all segments present in `pending/` and `segments/` at the time of the snapshot. The file content is either empty or a single line containing an optional human-readable name.
-- Taking a snapshot requires only that the WAL be flushed (producing a segment in `pending/`). Promotion of `pending/` to `segments/` (i.e. S3 upload) is **not** required — promotion is an async S3 durability concern, independent of snapshot eligibility.
-- `origin` is present only on non-default forks. Its value is `<fork-name>/<ulid>` identifying the snapshot within another fork where this fork branched off.
+- A live fork has `wal/` present. The default fork of a readonly volume has no `wal/` — it is populated by an import and never written to directly.
+- A snapshot marker `snapshots/<ulid>` is a plain file whose name is a ULID. The ULID is generated after the WAL flush, so it sorts after all segments present at snapshot time. Content is empty or a single line with an optional human-readable name.
+- Taking a snapshot requires only that the WAL be flushed (producing a segment in `pending/`). S3 upload is not required — that is an async durability concern.
+- `origin` is present only on non-default forks. Its value is `<fork-name>/<ulid>` identifying the snapshot within the parent fork where this fork branched.
+- `readonly` at the volume root is a plain file (content ignored). It blocks `serve-volume` on `default` and prevents any direct write to `default`. Named forks of a readonly volume are fully writable.
 - Fork names are unique within a volume. Volume names are unique within a base directory.
+- `children/` is not present in this layout. It belongs to the old implementation model.
 
 ### Ancestry walk
 
 To rebuild the LBA map for a fork:
 1. Follow the `origin` chain to the root fork (no `origin` file).
-2. From the root fork outward, for each ancestor fork in the chain: scan both `segments/` and `pending/` in ULID order (merged), stopping at (and including) the branch-point ULID recorded in the child fork's `origin`. Snapshot markers in `snapshots/` are not scanned during replay — they exist only to record named points in the sequence.
+2. From the root fork outward, for each ancestor fork in the chain: scan both `segments/` and `pending/` in ULID order (merged), stopping at (and including) the branch-point ULID recorded in the child fork's `origin`. Snapshot markers are not scanned during replay.
 3. Apply the current fork's own `segments/` and `pending/` in ULID order (all of them).
 4. Replay the WAL.
+
+The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fork from leaking newer data into the derived fork's view.
 
 ### Operations
 
 ```
-elide serve-volume myvm              # open default fork
-elide serve-volume myvm dev          # open named fork "dev"
+elide serve-volume <vol-dir> [--fork <name>]   # serve a fork (default: "default")
+                                                # errors if volume is readonly and fork is "default"
 
-elide snapshot-volume myvm           # checkpoint default fork; fork stays live
-elide snapshot-volume myvm dev       # checkpoint named fork "dev"
+elide snapshot-volume <vol-dir> [--fork <name>]  # checkpoint a fork; fork stays live
 
-elide fork-volume myvm dev           # implicitly snapshot default fork, then branch "dev" from it
-elide fork-volume myvm dev --from default   # explicit source fork (same as default)
+elide fork-volume <vol-dir> <fork-name> [--from <source-fork>]
+                                                # implicitly snapshot source fork (default: "default"),
+                                                # then create <fork-name> branched from it
 
-elide export-volume myvm dev exported    # implicitly snapshot "dev", squash full ancestry
-                                          # into new self-contained volume "exported" in same base
+elide create-readonly-volume <vol-dir> --size <size>
+                                                # create a readonly volume; populate default/ via import
 
-elide list-snapshots myvm            # snapshot history for default fork
-elide list-snapshots myvm dev        # snapshot history for "dev"
-elide list-forks myvm                # all named forks in volume "myvm"
+elide import-volume <vol-dir> <image-path>      # write image data into a readonly volume's default fork,
+                                                # then write the import snapshot marker
+
+elide list-forks <vol-dir>                      # all named forks in a volume
+elide list-snapshots <vol-dir> [--fork <name>]  # snapshot history for a fork
+
+elide export-volume <vol-dir> <fork-name> <new-vol-dir>
+                                                # implicitly snapshot fork, squash full ancestry
+                                                # into new self-contained volume
 ```
 
-**Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The ULID is generated after the flush, so it is guaranteed to sort after every segment it encompasses in both `pending/` and `segments/`. The fork remains live throughout; no directory structure changes. Promotion of `pending/` to `segments/` (S3 upload) continues asynchronously and independently.
+**Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The fork remains live; no directory structure changes.
 
-**S3 upload for snapshots:** segment data in `pending/` is uploaded to S3 asynchronously as usual. In addition, snapshot marker files (`snapshots/<ulid>`) and fork metadata (`origin` files) must also be uploaded to S3 so that the snapshot tree structure is visible to other hosts. These are small files and should be uploaded eagerly — immediately after the snapshot marker or fork is written locally. Without them, a cold-start host has segment data but cannot reconstruct which snapshots exist or where forks branched.
+**Import procedure for readonly volumes:** the import path writes data directly into `default/segments/` (or `default/pending/`), bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `default/snapshots/<import-ulid>` is written. This ULID is used as the branch point by all forks created from this volume. The `readonly` marker at the volume root is written at volume creation time, before any data is present.
 
-**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork before branching. This gives a clean, unambiguous branch point and avoids any "which WAL state did the fork see?" question. There is no "fork from latest snapshot" shortcut — latest is always the implicit snapshot just taken.
+**S3 upload for snapshots:** snapshot marker files and `origin` files must also be uploaded to S3 so the fork tree structure is visible to other hosts. These are small and should be uploaded eagerly.
+
+**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork. For a readonly volume's `default` fork (which already has a snapshot from import), a new snapshot is not needed — `fork-volume` uses the latest existing snapshot marker from `default/snapshots/`.
 
 ### Base directory defaulting
 
-`<base>` defaults to the value of `ELIDE_VOLUMES_DIR` if set, otherwise `~/.local/share/elide/volumes`. Commands that accept `<volume>` use this default unless `--base <path>` is passed.
+`<base>` defaults to `ELIDE_VOLUMES_DIR` if set, otherwise `~/.local/share/elide/volumes`. Commands that accept `<vol-dir>` use this default unless an explicit path is given.
 
 ### Open questions
 
-1. **Default fork name.** Resolved: `default`.
+1. **`serve-volume` with no ULID.** Opening a fork always opens the live state (tip of `wal/`). No ULID selection needed for `serve-volume`. Resolved.
 
-2. **`serve-volume` with no ULID.** Opening a fork always opens the live state (tip of `wal/`). No ULID selection is needed for `serve-volume` — it's always the current live fork. Confirmed?
+2. **`export` output fork name.** The exported fork is placed at `<new-vol>/default/`. Always `default`. Resolved.
 
-3. **`export` output fork name.** When exporting to a new volume, the exported fork is placed at `<base>/<new-volume>/default/`. Should this always be `default`, or should the source fork name be preserved?
+3. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
 
-4. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
+4. **`origin` chain depth.** Arbitrary depth is fine; the walk is cheap.
 
-5. **`origin` chain depth.** If fork A branches from fork B which branched from `default`, the ancestry walk must follow two `origin` hops. Is there a maximum depth, or do we allow arbitrary depth? (Arbitrary seems fine; the walk is cheap.)
+5. **Rollback within a fork.** Not yet designed. Two candidate approaches: (a) discard segments and WAL above target snapshot ULID in-place; (b) fork from the target snapshot and rename.
 
-6. **Rollback within a fork.** Rollback to snapshot `<ulid>` means discarding all segments with ULID > `<ulid>` from `segments/`, removing all snapshot markers after `<ulid>`, discarding `pending/`, and truncating/replacing the WAL. Alternatively, rollback could be implemented as "fork from the target snapshot, then rename". The exact operation is not yet designed.
+6. **Migration from the `children/` model.** The current implementation uses `children/<ulid>/` nesting. A migration path or compatibility shim may be needed for existing volumes.
 
-7. **Migration from the `children/` model.** The current implementation uses nested `children/<ulid>/` directories. A migration path or a compatibility shim may be needed for existing volumes.
+7. **Readonly fork naming.** For readonly volumes, `fork-volume` creates forks in the volume directory alongside `default/`. Should there be a naming convention or reserved prefix to distinguish these from the base `default/` (e.g., rejecting a fork named `default`)? Resolved: fork names that conflict with reserved names (`default`, `readonly`, `size`) are rejected.
 
 ---
 

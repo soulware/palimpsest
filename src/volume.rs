@@ -103,16 +103,29 @@ pub struct CompactionStats {
     pub extents_removed: usize,
 }
 
+/// A fork ancestry layer used when rebuilding the LBA map and extent index.
+///
+/// `branch_ulid` is the latest segment ULID from this fork that belongs to the
+/// derived fork's view — segments with a strictly greater ULID were written after
+/// the branch point and must not be included. `None` for the live (current) fork,
+/// where all segments are always included.
+pub struct AncestorLayer {
+    pub dir: PathBuf,
+    pub branch_ulid: Option<String>,
+}
+
 /// A writable block-device volume backed by a content-addressable store.
 ///
 /// Owns the in-memory LBA map, the active WAL, and the directory layout.
+/// In the Named Forks model, `base_dir` is the fork directory (e.g.
+/// `volumes/myvm/default/`), not the volume root.
 pub struct Volume {
     base_dir: PathBuf,
-    /// Ancestor node directories, oldest-first. Does not include `base_dir`.
-    ancestor_dirs: Vec<PathBuf>,
-    /// Exclusive lock on `base_dir/volume.lock`. Held for the lifetime of the
-    /// Volume; dropped (releasing the lock) when Volume is dropped or when
-    /// `snapshot()` is called and transitions writes to a child node.
+    /// Ancestor fork layers, oldest-first. Does not include the current fork.
+    ancestor_layers: Vec<AncestorLayer>,
+    /// Exclusive lock on `base_dir/volume.lock`. Held for the lifetime of the Volume.
+    /// Never explicitly read — the file handle exists solely to hold the flock.
+    #[allow(dead_code)]
     lock_file: fs::File,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
@@ -132,26 +145,13 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// Open (or create) a volume rooted at `base_dir`.
+    /// Open (or create) a fork at `base_dir`.
     ///
-    /// Creates `wal/`, `pending/`, and `segments/` subdirectories if they do
-    /// not exist. Rebuilds the LBA map from all committed segments and any
-    /// in-progress WAL, then reopens or creates the WAL.
-    ///
-    /// If `base_dir` is a frozen node (`children/` exists, meaning `snapshot()`
-    /// has been called on it at least once), a new child node is created
-    /// automatically and opened instead. The caller always gets a live, writable
-    /// volume; the actual node path may differ from `base_dir` in this case.
+    /// `base_dir` must be the fork directory (e.g. `volumes/myvm/default/`), not the
+    /// volume root. Creates `wal/`, `pending/`, and `segments/` if they do not exist.
+    /// Rebuilds the LBA map from all committed segments across the ancestry chain
+    /// (following `origin` files), then recovers or creates the WAL.
     pub fn open(base_dir: &Path) -> io::Result<Self> {
-        // A frozen node has had snapshot() called on it at least once, leaving
-        // children/ present and wal/ absent. Rather than erroring, create a new
-        // sibling child and open that — the caller gets a fresh live node that
-        // inherits the frozen node's data via the ancestor chain.
-        if base_dir.join("children").exists() {
-            let child_dir = base_dir.join("children").join(Ulid::new().to_string());
-            return Self::open(&child_dir);
-        }
-
         let wal_dir = base_dir.join("wal");
         let pending_dir = base_dir.join("pending");
         let segments_dir = base_dir.join("segments");
@@ -161,11 +161,10 @@ impl Volume {
         fs::create_dir_all(&segments_dir)?;
 
         // Acquire exclusive lock. Fails immediately if another process has this
-        // node open. The lock is released when Volume is dropped.
+        // fork open. The lock is released when Volume is dropped.
         let lock_file = acquire_lock(base_dir)?;
 
-        // Remove any .tmp files in pending/ — these are incomplete promotions
-        // left behind by a crash between write and rename.
+        // Remove any .tmp files in pending/ — incomplete promotions from a crash.
         for entry in fs::read_dir(&pending_dir)? {
             let path = entry?.path();
             if path.extension().is_some_and(|e| e == "tmp") {
@@ -173,17 +172,19 @@ impl Volume {
             }
         }
 
-        // Build the full node chain: ancestors oldest-first, live node last.
-        let ancestor_dirs = walk_ancestors(base_dir);
-        let node_chain: Vec<PathBuf> = ancestor_dirs
+        // Walk the origin chain to collect ancestor layers, oldest-first.
+        let ancestor_layers = walk_ancestors(base_dir)?;
+
+        // Build the rebuild chain: ancestor layers (with ULID cutoffs) + current fork.
+        let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
             .iter()
-            .cloned()
-            .chain(std::iter::once(base_dir.to_owned()))
+            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+            .chain(std::iter::once((base_dir.to_owned(), None)))
             .collect();
 
         // Rebuild the LBA map and extent index from all committed segments.
-        let mut lbamap = lbamap::rebuild_segments(&node_chain)?;
-        let mut extent_index = extentindex::rebuild(&node_chain)?;
+        let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
+        let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -197,9 +198,7 @@ impl Volume {
 
         // Edge case: if pending/<ulid> already exists alongside wal/<ulid>,
         // the promotion completed (rename succeeded) but the WAL delete was
-        // interrupted. The segment is authoritative — delete any such stale
-        // WAL files before deciding what to replay. rebuild_segments above
-        // has already loaded the committed segment into lbamap/extent_index.
+        // interrupted. The segment is authoritative — delete the stale WAL file.
         wal_files.retain(|path| {
             let ulid = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if pending_dir.join(ulid).exists() {
@@ -221,7 +220,7 @@ impl Volume {
 
         Ok(Self {
             base_dir: base_dir.to_owned(),
-            ancestor_dirs,
+            ancestor_layers,
             lock_file,
             lbamap,
             extent_index,
@@ -320,53 +319,14 @@ impl Volume {
     /// fetched extent-by-extent: one file open and one read (or decompress)
     /// per extent, regardless of how many blocks within the extent are needed.
     pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
-
-        let mut out = vec![0u8; lba_count as usize * 4096];
-        for er in self.lbamap.extents_in_range(lba, lba + lba_count as u64) {
-            // Extract owned copies so the borrow of self.extent_index ends before
-            // we mutate self.file_cache.
-            let (segment_id, body_offset, body_length, compressed) = {
-                let Some(loc) = self.extent_index.lookup(&er.hash) else {
-                    continue; // hash not indexed — treat as unwritten
-                };
-                (
-                    loc.segment_id.clone(),
-                    loc.body_offset,
-                    loc.body_length,
-                    loc.compressed,
-                )
-            };
-
-            // Reuse the cached file handle if it is for the same segment;
-            // otherwise open the new segment and replace the cache entry.
-            let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str()) {
-                let path = self.find_segment_file(&segment_id)?;
-                *cache = Some((segment_id, fs::File::open(path)?));
-            }
-            let f = &mut cache.as_mut().unwrap().1;
-
-            let block_count = (er.range_end - er.range_start) as usize;
-            let out_start = (er.range_start - lba) as usize * 4096;
-            let out_slice = &mut out[out_start..out_start + block_count * 4096];
-
-            if compressed {
-                f.seek(SeekFrom::Start(body_offset))?;
-                let mut compressed_buf = vec![0u8; body_length as usize];
-                f.read_exact(&mut compressed_buf)?;
-                let decompressed =
-                    zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
-                let src_start = er.payload_block_offset as usize * 4096;
-                out_slice.copy_from_slice(&decompressed[src_start..src_start + block_count * 4096]);
-            } else {
-                f.seek(SeekFrom::Start(
-                    body_offset + er.payload_block_offset as u64 * 4096,
-                ))?;
-                f.read_exact(out_slice)?;
-            }
-        }
-        Ok(out)
+        read_extents(
+            lba,
+            lba_count,
+            &self.lbamap,
+            &self.extent_index,
+            &self.file_cache,
+            |id| self.find_segment_file(id),
+        )
     }
 
     /// Flush buffered WAL writes and fsync to disk.
@@ -541,60 +501,41 @@ impl Volume {
         Ok(())
     }
 
-    /// Freeze the current live node and continue writing in a new child node.
+    /// Checkpoint the fork at the current point in the segment sequence.
     ///
-    /// This is the snapshot operation (verb). After it returns:
-    /// - This node is a frozen node: `wal/` is absent, `children/<ulid>/` exists,
-    ///   data is preserved in `pending/` and `segments/`.
-    /// - `self` now points at the new child node, which is the live continuation.
-    ///   All subsequent writes go to the child.
+    /// Flushes the WAL to a segment in `pending/`, then writes a
+    /// `snapshots/<ulid>` marker file. The fork stays live and continues
+    /// writing in the same directory — no directory structure changes occur.
     ///
-    /// The exclusive lock transfers atomically to the child (child lock acquired
-    /// before the old lock is released).
+    /// The snapshot ULID is guaranteed to sort after all segments present in
+    /// `pending/` and `segments/` at the time of the snapshot, making it a
+    /// stable branch point for `fork-volume`.
     ///
-    /// Returns the path of the new child (live) node.
-    pub fn snapshot(&mut self) -> io::Result<PathBuf> {
-        let child_ulid = Ulid::new().to_string();
-        let child_dir = self.base_dir.join("children").join(&child_ulid);
-
-        // Create child directory structure.
-        fs::create_dir_all(child_dir.join("wal"))?;
-        fs::create_dir_all(child_dir.join("pending"))?;
-        fs::create_dir_all(child_dir.join("segments"))?;
-
-        // Acquire exclusive lock on the child before redirecting writes.
-        let child_lock = acquire_lock(&child_dir)?;
-
-        // Flush current WAL to a segment in this node's pending/ before freezing.
-        // After this: WAL file is deleted, any data is in pending/<wal_ulid>.
+    /// Returns the snapshot ULID.
+    pub fn snapshot(&mut self) -> io::Result<Ulid> {
+        // Flush WAL to pending/ first so the snapshot marker sorts after it.
         self.flush_wal_to_pending()?;
 
-        // Freeze this node: remove the now-empty wal/ directory.
-        fs::remove_dir(self.base_dir.join("wal"))?;
+        // Write the snapshot marker.
+        let snap_ulid = Ulid::new();
+        let snapshots_dir = self.base_dir.join("snapshots");
+        fs::create_dir_all(&snapshots_dir)?;
+        fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
 
-        // Open a fresh WAL in the child node.
-        let (wal, wal_ulid, wal_path, pending_entries) = create_fresh_wal(&child_dir.join("wal"))?;
-
-        // Transition self to the child node. Replacing lock_file releases the
-        // old lock; the child lock is already held.
-        let old_base = std::mem::replace(&mut self.base_dir, child_dir.clone());
-        self.ancestor_dirs.push(old_base);
+        // Open a fresh WAL to continue writing.
+        let (wal, wal_ulid, wal_path, pending_entries) =
+            create_fresh_wal(&self.base_dir.join("wal"))?;
         self.wal = wal;
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
         self.pending_entries = pending_entries;
-        self.lock_file = child_lock;
-        *self.file_cache.borrow_mut() = None;
 
-        Ok(child_dir)
+        Ok(snap_ulid)
     }
 
-    /// Locate the segment body file for `segment_id` within this volume's
-    /// node chain. Checks the live node's `wal/`, `pending/`, `segments/`
-    /// first, then searches ancestor nodes' `pending/` and `segments/`.
-    ///
-    /// Ancestor nodes have no `wal/` (they are frozen), but may still have
-    /// `pending/` segments awaiting S3 upload.
+    /// Locate the segment body file for `segment_id` within this fork's
+    /// ancestry chain. Checks the current fork's `wal/`, `pending/`, `segments/`
+    /// first, then searches ancestor forks' `pending/` and `segments/`.
     fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
         for subdir in ["wal", "pending", "segments"] {
             let path = self.base_dir.join(subdir).join(segment_id);
@@ -602,9 +543,9 @@ impl Volume {
                 return Ok(path);
             }
         }
-        for ancestor in self.ancestor_dirs.iter().rev() {
+        for layer in self.ancestor_layers.iter().rev() {
             for subdir in ["pending", "segments"] {
-                let path = ancestor.join(subdir).join(segment_id);
+                let path = layer.dir.join(subdir).join(segment_id);
                 if path.exists() {
                     return Ok(path);
                 }
@@ -619,8 +560,8 @@ impl Volume {
     }
 
     #[cfg(test)]
-    pub fn ancestor_dirs(&self) -> &[PathBuf] {
-        &self.ancestor_dirs
+    pub fn ancestor_count(&self) -> usize {
+        self.ancestor_layers.len()
     }
 
     #[cfg(test)]
@@ -635,6 +576,68 @@ impl Volume {
 }
 
 // --- helpers ---
+
+/// Read `lba_count` 4KB blocks starting at `lba` from the given LBA map and extent index.
+///
+/// Unwritten blocks are returned as zeros. Written blocks are fetched extent-by-extent
+/// using `find_segment` to locate each segment file, with the last-opened file handle
+/// cached in `file_cache` to amortize `open` syscalls across sequential reads.
+fn read_extents(
+    lba: u64,
+    lba_count: u32,
+    lbamap: &lbamap::LbaMap,
+    extent_index: &extentindex::ExtentIndex,
+    file_cache: &RefCell<Option<(String, fs::File)>>,
+    find_segment: impl Fn(&str) -> io::Result<PathBuf>,
+) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut out = vec![0u8; lba_count as usize * 4096];
+    for er in lbamap.extents_in_range(lba, lba + lba_count as u64) {
+        // Extract owned copies so the borrow of extent_index ends before
+        // we mutate file_cache.
+        let (segment_id, body_offset, body_length, compressed) = {
+            let Some(loc) = extent_index.lookup(&er.hash) else {
+                continue; // hash not indexed — treat as unwritten
+            };
+            (
+                loc.segment_id.clone(),
+                loc.body_offset,
+                loc.body_length,
+                loc.compressed,
+            )
+        };
+
+        // Reuse the cached file handle if it is for the same segment;
+        // otherwise open the new segment and replace the cache entry.
+        let mut cache = file_cache.borrow_mut();
+        if cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str()) {
+            let path = find_segment(&segment_id)?;
+            *cache = Some((segment_id, fs::File::open(path)?));
+        }
+        let f = &mut cache.as_mut().unwrap().1;
+
+        let block_count = (er.range_end - er.range_start) as usize;
+        let out_start = (er.range_start - lba) as usize * 4096;
+        let out_slice = &mut out[out_start..out_start + block_count * 4096];
+
+        if compressed {
+            f.seek(SeekFrom::Start(body_offset))?;
+            let mut compressed_buf = vec![0u8; body_length as usize];
+            f.read_exact(&mut compressed_buf)?;
+            let decompressed =
+                zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
+            let src_start = er.payload_block_offset as usize * 4096;
+            out_slice.copy_from_slice(&decompressed[src_start..src_start + block_count * 4096]);
+        } else {
+            f.seek(SeekFrom::Start(
+                body_offset + er.payload_block_offset as u64 * 4096,
+            ))?;
+            f.read_exact(out_slice)?;
+        }
+    }
+    Ok(out)
+}
 
 /// Acquire an exclusive non-blocking flock on `<dir>/volume.lock`.
 ///
@@ -655,31 +658,182 @@ fn acquire_lock(dir: &Path) -> io::Result<fs::File> {
     }
 }
 
-/// Walk up the directory tree from `base_dir` and return all ancestor node
-/// directories, oldest-first. `base_dir` itself is NOT included.
-///
-/// A non-root live node lives at `<parent>/children/<ulid>/`. This function
-/// detects that pattern and climbs until it reaches the root (a directory
-/// whose parent is not named `children`).
-pub fn walk_ancestors(base_dir: &Path) -> Vec<PathBuf> {
-    let mut ancestors = Vec::new();
-    let mut cur = base_dir.to_owned();
-    while let Some(children_dir) = cur.parent().map(|p| p.to_owned()) {
-        if children_dir
-            .file_name()
-            .map(|n| n != "children")
-            .unwrap_or(true)
-        {
-            break;
-        }
-        let Some(parent_node) = children_dir.parent().map(|p| p.to_owned()) else {
-            break;
-        };
-        ancestors.push(parent_node.clone());
-        cur = parent_node;
+/// A read-only view of a fork. Used for readonly NBD serving (no WAL, no write lock).
+/// Reads work identically to `Volume`; writes and fsyncs are not supported.
+pub struct ReadonlyVolume {
+    base_dir: PathBuf,
+    ancestor_dirs: Vec<PathBuf>,
+    lbamap: lbamap::LbaMap,
+    extent_index: extentindex::ExtentIndex,
+    file_cache: RefCell<Option<(String, fs::File)>>,
+}
+
+impl ReadonlyVolume {
+    /// Open a fork directory for read-only access.
+    ///
+    /// Does not create `wal/`, does not acquire an exclusive lock, and does not
+    /// replay the WAL. WAL records from an active writer on the same fork will
+    /// not be visible. Intended for the `--readonly` NBD serve path.
+    pub fn open(fork_dir: &Path) -> io::Result<Self> {
+        let ancestor_layers = walk_ancestors(fork_dir)?;
+        let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
+            .iter()
+            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+            .chain(std::iter::once((fork_dir.to_owned(), None)))
+            .collect();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
+        let extent_index = extentindex::rebuild(&rebuild_chain)?;
+        let ancestor_dirs = ancestor_layers.into_iter().map(|l| l.dir).collect();
+        Ok(Self {
+            base_dir: fork_dir.to_owned(),
+            ancestor_dirs,
+            lbamap,
+            extent_index,
+            file_cache: RefCell::new(None),
+        })
     }
-    ancestors.reverse();
-    ancestors
+
+    /// Read `lba_count` 4KB blocks starting at `start_lba`.
+    /// Unwritten blocks are returned as zeros.
+    pub fn read(&self, start_lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        read_extents(
+            start_lba,
+            lba_count,
+            &self.lbamap,
+            &self.extent_index,
+            &self.file_cache,
+            |id| self.find_segment_file(id),
+        )
+    }
+
+    fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
+        for subdir in ["pending", "segments"] {
+            let path = self.base_dir.join(subdir).join(segment_id);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+        for dir in self.ancestor_dirs.iter().rev() {
+            for subdir in ["pending", "segments"] {
+                let path = dir.join(subdir).join(segment_id);
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+        }
+        Err(io::Error::other(format!("segment not found: {segment_id}")))
+    }
+}
+
+/// Walk the fork ancestry chain and return ancestor layers, oldest-first.
+/// Public so that `ls.rs` and other read-only tools can build the rebuild chain.
+///
+/// Each layer holds the ancestor fork directory and the branch-point ULID.
+/// Segments with ULID > `branch_ulid` in that ancestor fork were written after
+/// the branch and are excluded when rebuilding the LBA map.
+///
+/// A fork with no `origin` file is the root fork; returns an empty vec.
+/// The `origin` file format is `<fork-name>/<branch-ulid>`.
+pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
+    let origin_path = fork_dir.join("origin");
+    let content = match fs::read_to_string(&origin_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let origin = content.trim();
+    let (parent_fork_name, branch_ulid_str) = origin.split_once('/').ok_or_else(|| {
+        io::Error::other(format!(
+            "malformed origin file in {}: {origin}",
+            fork_dir.display()
+        ))
+    })?;
+    let branch_ulid = Ulid::from_string(branch_ulid_str)
+        .map_err(|e| io::Error::other(format!("bad branch ULID in origin: {e}")))?
+        .to_string();
+
+    let volume_dir = fork_dir
+        .parent()
+        .ok_or_else(|| io::Error::other("fork directory has no parent"))?;
+    let parent_fork_dir = volume_dir.join(parent_fork_name);
+
+    // Recurse into the parent's ancestry first (builds oldest-first order).
+    let mut ancestors = walk_ancestors(&parent_fork_dir)?;
+    ancestors.push(AncestorLayer {
+        dir: parent_fork_dir,
+        branch_ulid: Some(branch_ulid),
+    });
+    Ok(ancestors)
+}
+
+/// Return the latest snapshot ULID string for a fork, or `None` if no
+/// snapshots exist. Snapshots live as plain files under `fork_dir/snapshots/`.
+pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
+    let snapshots_dir = fork_dir.join("snapshots");
+    let mut ulids: Vec<String> = match fs::read_dir(&snapshots_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                Ulid::from_string(&name).ok()?;
+                Some(name)
+            })
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if ulids.is_empty() {
+        return Ok(None);
+    }
+    ulids.sort();
+    Ok(ulids.into_iter().last())
+}
+
+/// Create a new named fork within a volume, branched from the latest snapshot
+/// of the source fork.
+///
+/// The source fork must have at least one snapshot (written by `snapshot()`).
+/// The new fork directory is created with `wal/`, `pending/`, `segments/`, and
+/// an `origin` file pointing to `<source_fork_name>/<latest_snapshot_ulid>`.
+///
+/// Returns the path of the newly created fork directory.
+pub fn fork_volume(
+    volume_dir: &Path,
+    new_fork_name: &str,
+    source_fork_name: &str,
+) -> io::Result<PathBuf> {
+    // Reject reserved names that would conflict with volume-level files.
+    for reserved in ["readonly", "size"] {
+        if new_fork_name == reserved {
+            return Err(io::Error::other(format!(
+                "fork name '{new_fork_name}' is reserved"
+            )));
+        }
+    }
+
+    let new_fork_dir = volume_dir.join(new_fork_name);
+    if new_fork_dir.exists() {
+        return Err(io::Error::other(format!(
+            "fork '{new_fork_name}' already exists"
+        )));
+    }
+
+    let source_fork_dir = volume_dir.join(source_fork_name);
+    let branch_ulid = latest_snapshot(&source_fork_dir)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "source fork '{source_fork_name}' has no snapshots; run snapshot-volume first"
+        ))
+    })?;
+
+    fs::create_dir_all(new_fork_dir.join("wal"))?;
+    fs::create_dir_all(new_fork_dir.join("pending"))?;
+    fs::create_dir_all(new_fork_dir.join("segments"))?;
+    fs::write(
+        new_fork_dir.join("origin"),
+        format!("{source_fork_name}/{branch_ulid}"),
+    )?;
+
+    Ok(new_fork_dir)
 }
 
 // --- WAL helpers ---
@@ -1405,73 +1559,104 @@ mod tests {
 
     #[test]
     fn walk_ancestors_root_returns_empty() {
-        let root = temp_dir();
-        assert!(walk_ancestors(&root).is_empty());
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("default");
+        // No origin file → root fork; ancestors are empty.
+        assert!(walk_ancestors(&fork_dir).unwrap().is_empty());
     }
 
     #[test]
     fn walk_ancestors_one_level() {
-        let root = temp_dir();
-        let child = root.join("children").join("01CHILDULID000000000000000");
-        let ancestors = walk_ancestors(&child);
-        assert_eq!(ancestors, vec![root]);
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+        let dev_dir = vol_dir.join("dev");
+
+        // dev's origin points to default at a fixed branch ULID.
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::write(dev_dir.join("origin"), "default/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+
+        let ancestors = walk_ancestors(&dev_dir).unwrap();
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(ancestors[0].dir, default_dir);
+        assert_eq!(
+            ancestors[0].branch_ulid.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
     }
 
     #[test]
     fn walk_ancestors_two_levels() {
-        let root = temp_dir();
-        let child = root.join("children").join("01CHILDULID000000000000000");
-        let grandchild = child.join("children").join("01GRANDULID000000000000000");
-        let ancestors = walk_ancestors(&grandchild);
-        assert_eq!(ancestors, vec![root, child]);
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+        let mid_dir = vol_dir.join("mid");
+        let leaf_dir = vol_dir.join("leaf");
+
+        fs::create_dir_all(&mid_dir).unwrap();
+        fs::write(mid_dir.join("origin"), "default/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+
+        fs::create_dir_all(&leaf_dir).unwrap();
+        fs::write(leaf_dir.join("origin"), "mid/01BX5ZZKJKTSV4RRFFQ69G5FAV").unwrap();
+
+        let ancestors = walk_ancestors(&leaf_dir).unwrap();
+        assert_eq!(ancestors.len(), 2);
+        assert_eq!(ancestors[0].dir, default_dir);
+        assert_eq!(ancestors[1].dir, mid_dir);
+        assert_eq!(
+            ancestors[0].branch_ulid.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            ancestors[1].branch_ulid.as_deref(),
+            Some("01BX5ZZKJKTSV4RRFFQ69G5FAV")
+        );
     }
 
     // --- ancestor-aware open / read integration test ---
 
-    /// Set up a frozen ancestor node with a written extent, then open a child
-    /// live node on top. The child should be able to read the ancestor's data.
+    /// Write data into a root fork, snapshot it, create a child fork via
+    /// fork_volume, and verify the child can read the ancestor's data.
     #[test]
     fn open_reads_ancestor_segments() {
-        let root = temp_dir();
-        let child_dir = root.join("children").join("01CHILDULID000000000000000");
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
 
-        // Write data into the ancestor (root) and promote to a segment.
+        // Write data into the default fork and promote to a segment.
         let data = vec![0xABu8; 4096];
         {
-            let mut vol = Volume::open(&root).unwrap();
+            let mut vol = Volume::open(&default_dir).unwrap();
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
+            vol.snapshot().unwrap();
         }
-        // Freeze the ancestor: remove wal/ to simulate a node after snapshot() was called.
-        fs::remove_dir_all(root.join("wal")).unwrap();
 
-        // Open the child node (empty — no local writes yet).
-        let vol = Volume::open(&child_dir).unwrap();
+        // Create a child fork branched from default.
+        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
 
         // Child should see the ancestor's data through layer merge.
+        let vol = Volume::open(&child_dir).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(vol_dir).unwrap();
     }
 
-    /// Ancestor data is shadowed by a write in the live child node.
+    /// Ancestor data is shadowed by a write in the live child fork.
     #[test]
     fn child_write_shadows_ancestor() {
-        let root = temp_dir();
-        let child_dir = root.join("children").join("01CHILDULID000000000000000");
-
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
         let ancestor_data = vec![0xAAu8; 4096];
         let child_data = vec![0xBBu8; 4096];
 
-        // Write into ancestor, promote, freeze.
+        // Write into the default fork, promote, snapshot.
         {
-            let mut vol = Volume::open(&root).unwrap();
+            let mut vol = Volume::open(&default_dir).unwrap();
             vol.write(0, &ancestor_data).unwrap();
             vol.promote_for_test().unwrap();
+            vol.snapshot().unwrap();
         }
-        fs::remove_dir_all(root.join("wal")).unwrap();
 
-        // Open child, write different data at the same LBA, promote.
+        // Create child fork, write different data at the same LBA, promote.
+        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
         {
             let mut vol = Volume::open(&child_dir).unwrap();
             vol.write(0, &child_data).unwrap();
@@ -1482,44 +1667,46 @@ mod tests {
         let vol = Volume::open(&child_dir).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), child_data);
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(vol_dir).unwrap();
     }
 
     // --- lock tests ---
 
     #[test]
-    fn double_open_same_node_fails() {
+    fn double_open_same_fork_fails() {
         let base = temp_dir();
-        let _vol = Volume::open(&base).unwrap();
-        // Second open on the same live node must fail (lock already held).
-        assert!(Volume::open(&base).is_err());
+        let fork_dir = base.join("default");
+        let _vol = Volume::open(&fork_dir).unwrap();
+        // Second open on the same live fork must fail (lock already held).
+        assert!(Volume::open(&fork_dir).is_err());
         fs::remove_dir_all(base).unwrap();
     }
 
-    // --- snapshot() operation tests ---
+    // --- snapshot() tests ---
 
     #[test]
-    fn snapshot_freezes_parent_and_continues_in_child() {
+    fn snapshot_writes_marker_and_stays_live() {
         let base = temp_dir();
+        let fork_dir = base.join("default");
         let data = vec![0xAAu8; 4096];
 
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&fork_dir).unwrap();
         vol.write(0, &data).unwrap();
+        let snap_ulid = vol.snapshot().unwrap();
 
-        let child_path = vol.snapshot().unwrap();
+        // Fork still has wal/ (still live).
+        assert!(fork_dir.join("wal").is_dir());
+        // Snapshot marker file exists.
+        assert!(
+            fork_dir
+                .join("snapshots")
+                .join(snap_ulid.to_string())
+                .exists()
+        );
 
-        // Parent wal/ is gone (frozen).
-        assert!(!base.join("wal").exists());
-        // Child wal/ exists.
-        assert!(child_path.join("wal").is_dir());
-        // child_path is under base/children/.
-        assert_eq!(child_path.parent().unwrap(), base.join("children"));
-
-        // Writes after snapshot go to the child.
+        // Writes after snapshot still go to the same fork.
         let new_data = vec![0xBBu8; 4096];
         vol.write(1, &new_data).unwrap();
-
-        // Both LBAs readable.
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), new_data);
 
@@ -1527,127 +1714,145 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_data_readable_after_reopen_of_child() {
-        let base = temp_dir();
-        let pre_snap = vec![0xAAu8; 4096];
-        let post_snap = vec![0xBBu8; 4096];
-
-        let child_path = {
-            let mut vol = Volume::open(&base).unwrap();
-            vol.write(0, &pre_snap).unwrap();
-            let child = vol.snapshot().unwrap();
-            vol.write(1, &post_snap).unwrap();
-            vol.promote_for_test().unwrap();
-            child
-        };
-
-        // Re-open the child: should see both pre- and post-snapshot data.
-        let vol = Volume::open(&child_path).unwrap();
-        assert_eq!(vol.read(0, 1).unwrap(), pre_snap);
-        assert_eq!(vol.read(1, 1).unwrap(), post_snap);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn snapshot_lock_transfers_to_child() {
-        let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
-        let child_path = vol.snapshot().unwrap();
-
-        // Base is now a frozen node (wal/ gone, lock released).
-        // Verify the child node is locked by attempting a second open on it.
-        let _vol2_child_fail = Volume::open(&child_path);
-        assert!(_vol2_child_fail.is_err());
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn open_frozen_node_creates_new_child() {
-        let base = temp_dir();
-        let data = vec![0xAAu8; 4096];
-
-        // Write, call snapshot(), drop — base is now a frozen node.
-        {
-            let mut vol = Volume::open(&base).unwrap();
-            vol.write(0, &data).unwrap();
-            vol.snapshot().unwrap();
-        }
-
-        // Opening the frozen base should silently create a new child.
-        let vol = Volume::open(&base).unwrap();
-        // The live node is under base/children/, not base itself.
-        assert!(vol.base_dir().starts_with(base.join("children")));
-        // Ancestor data is visible.
-        assert_eq!(vol.read(0, 1).unwrap(), data);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn open_frozen_node_two_callers_get_siblings() {
-        let base = temp_dir();
-
-        // Call snapshot() to freeze base.
-        {
-            let mut vol = Volume::open(&base).unwrap();
-            vol.snapshot().unwrap();
-        }
-
-        // Two independent opens of the frozen base should produce two
-        // distinct sibling live nodes (different ULIDs, both under children/).
-        let vol_a = Volume::open(&base).unwrap();
-        let vol_b = Volume::open(&base).unwrap();
-        assert_ne!(vol_a.base_dir(), vol_b.base_dir());
-        assert!(vol_a.base_dir().starts_with(base.join("children")));
-        assert!(vol_b.base_dir().starts_with(base.join("children")));
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
     fn snapshot_empty_wal_no_segment_written() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let fork_dir = base.join("default");
+        let mut vol = Volume::open(&fork_dir).unwrap();
         // No writes — WAL is empty.
         vol.snapshot().unwrap();
 
-        // Parent pending/ should be empty (no segment written for empty WAL).
-        let pending: Vec<_> = fs::read_dir(base.join("pending")).unwrap().collect();
+        // pending/ should be empty (no segment written for empty WAL).
+        let pending: Vec<_> = fs::read_dir(fork_dir.join("pending")).unwrap().collect();
         assert!(pending.is_empty());
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn two_sequential_snapshots_data_visible_at_grandchild() {
+    fn snapshot_lock_held_after_snapshot() {
         let base = temp_dir();
-        let data_a = vec![0xAAu8; 4096];
-        let data_b = vec![0xBBu8; 4096];
-        let data_c = vec![0xCCu8; 4096];
+        let fork_dir = base.join("default");
+        let mut vol = Volume::open(&fork_dir).unwrap();
+        vol.snapshot().unwrap();
 
-        // Write at root, snapshot → child, write, snapshot → grandchild, write.
-        let grandchild_path = {
-            let mut vol = Volume::open(&base).unwrap();
-            vol.write(0, &data_a).unwrap(); // root
-            vol.snapshot().unwrap(); // root frozen → child
-            vol.write(1, &data_b).unwrap(); // child
-            vol.snapshot().unwrap(); // child frozen → grandchild
-            vol.write(2, &data_c).unwrap(); // grandchild
-            vol.promote_for_test().unwrap();
-            vol.base_dir().to_owned()
-        };
+        // Fork is still locked (still live); second open must fail.
+        assert!(Volume::open(&fork_dir).is_err());
+        drop(vol); // now released
 
-        // Grandchild sees all three layers.
-        let vol = Volume::open(&grandchild_path).unwrap();
-        assert_eq!(vol.read(0, 1).unwrap(), data_a);
-        assert_eq!(vol.read(1, 1).unwrap(), data_b);
-        assert_eq!(vol.read(2, 1).unwrap(), data_c);
-
-        // Ancestry chain is root → child → grandchild (two levels deep).
-        assert_eq!(vol.ancestor_dirs().len(), 2);
+        // After drop, a fresh open succeeds.
+        assert!(Volume::open(&fork_dir).is_ok());
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- fork_volume tests ---
+
+    #[test]
+    fn fork_volume_creates_fork_with_origin() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+
+        // snapshot default to give it a branch point.
+        let mut vol = Volume::open(&default_dir).unwrap();
+        vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+        let snap_ulid = vol.snapshot().unwrap().to_string();
+        drop(vol);
+
+        // Create the fork.
+        let fork_dir = fork_volume(&vol_dir, "dev", "default").unwrap();
+        assert!(fork_dir.join("wal").is_dir());
+        assert!(fork_dir.join("pending").is_dir());
+        assert!(fork_dir.join("segments").is_dir());
+
+        let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
+        assert_eq!(origin.trim(), format!("default/{snap_ulid}"));
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    #[test]
+    fn fork_volume_errors_if_source_has_no_snapshots() {
+        let vol_dir = temp_dir();
+        // default has no snapshot yet.
+        let err = fork_volume(&vol_dir, "dev", "default").unwrap_err();
+        assert!(err.to_string().contains("no snapshots"), "{err}");
+    }
+
+    #[test]
+    fn fork_volume_errors_on_reserved_name() {
+        let vol_dir = temp_dir();
+        let err = fork_volume(&vol_dir, "readonly", "default").unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn fork_volume_errors_if_fork_exists() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+        let mut vol = Volume::open(&default_dir).unwrap();
+        vol.snapshot().unwrap();
+        drop(vol);
+
+        fork_volume(&vol_dir, "dev", "default").unwrap();
+        let err = fork_volume(&vol_dir, "dev", "default").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    // --- multi-snapshot read tests ---
+
+    #[test]
+    fn two_snapshots_data_readable_after_reopen() {
+        let base = temp_dir();
+        let fork_dir = base.join("default");
+        let data_a = vec![0xAAu8; 4096];
+        let data_b = vec![0xBBu8; 4096];
+
+        {
+            let mut vol = Volume::open(&fork_dir).unwrap();
+            vol.write(0, &data_a).unwrap();
+            vol.snapshot().unwrap();
+            vol.write(1, &data_b).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        // Re-open the same fork: both writes visible.
+        let vol = Volume::open(&fork_dir).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data_a);
+        assert_eq!(vol.read(1, 1).unwrap(), data_b);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fork_data_visible_across_ancestry() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+        let data_a = vec![0xAAu8; 4096];
+        let data_b = vec![0xBBu8; 4096];
+
+        // Write to default, snapshot, create fork, write to fork.
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(0, &data_a).unwrap();
+            vol.promote_for_test().unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        {
+            let mut vol = Volume::open(&child_dir).unwrap();
+            vol.write(1, &data_b).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        // Re-open child: sees both ancestor and own data.
+        let vol = Volume::open(&child_dir).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data_a);
+        assert_eq!(vol.read(1, 1).unwrap(), data_b);
+        assert_eq!(vol.ancestor_count(), 1);
+
+        fs::remove_dir_all(vol_dir).unwrap();
     }
 }

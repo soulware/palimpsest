@@ -109,12 +109,14 @@ struct VolumeReader {
 impl VolumeReader {
     fn open(dir: &Path) -> io::Result<Self> {
         // Rebuild LBA map and extent index from all committed segments (including ancestors).
-        let node_chain: Vec<std::path::PathBuf> = volume::walk_ancestors(dir)
+        let ancestor_layers = volume::walk_ancestors(dir)?;
+        let rebuild_chain: Vec<(std::path::PathBuf, Option<String>)> = ancestor_layers
             .into_iter()
-            .chain(std::iter::once(dir.to_owned()))
+            .map(|l| (l.dir, l.branch_ulid))
+            .chain(std::iter::once((dir.to_owned(), None)))
             .collect();
-        let mut lbamap = lbamap::rebuild_segments(&node_chain)?;
-        let mut extent_index = extentindex::rebuild(&node_chain)?;
+        let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
+        let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
         // partial tails that may exist on a currently-running volume.

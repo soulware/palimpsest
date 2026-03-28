@@ -1,8 +1,10 @@
 // Inspect a volume directory and print a human-readable summary.
 //
-// Walks the volume node tree (root + frozen/live children under children/<ulid>/),
-// reads WAL and segment index sections, and prints a tree view with counts
-// and sizes. Does not modify any files.
+// In the Named Forks layout, `dir` is the volume directory containing named
+// fork subdirectories (default/, dev/, etc.). Each fork has its own wal/,
+// pending/, segments/, and snapshots/.
+//
+// Does not modify any files.
 
 use std::fs;
 use std::io;
@@ -16,34 +18,68 @@ pub fn run(dir: &Path) -> io::Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("<unknown>");
     let size_bytes = read_size(dir)?;
+    let is_readonly = dir.join("readonly").exists();
 
     println!("Volume: {vol_name}");
     match size_bytes {
         Some(b) => println!("Size:   {} ({} bytes)", fmt_size(b), fmt_commas(b)),
         None => println!("Size:   (no size file found)"),
     }
+    if is_readonly {
+        println!("Type:   readonly");
+    }
     println!();
 
-    let node = collect_node(dir, true)?;
-    print_node(&node, "", "  ");
+    // Collect all forks (subdirectories that look like fork directories).
+    let mut fork_dirs: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| !matches!(n, "readonly" | "size"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    fork_dirs.sort();
 
-    let t = totals(&node);
-    println!();
-    if t.wal_files > 0 {
-        println!(
-            "Total: {} segment entries, {} stored  (+{} WAL records across {} file{})",
-            fmt_commas(t.seg_entries as u64),
-            fmt_size(t.body_bytes),
-            t.wal_records,
-            t.wal_files,
-            if t.wal_files == 1 { "" } else { "s" },
-        );
+    if fork_dirs.is_empty() {
+        // Legacy: treat dir itself as a single fork node.
+        let node = collect_node(dir, true, true)?;
+        print_node(&node, "", "  ");
+        let t = totals(&node);
+        print_totals(&t);
     } else {
-        println!(
-            "Total: {} entries, {} stored",
-            fmt_commas(t.seg_entries as u64),
-            fmt_size(t.body_bytes),
-        );
+        let mut grand_total = Totals::default();
+        let n = fork_dirs.len();
+        for (i, fork_dir) in fork_dirs.iter().enumerate() {
+            let fork_name = fork_dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+            let last = i + 1 == n;
+            let (connector, child_prefix) = if last {
+                ("└── ", "    ")
+            } else {
+                ("├── ", "│   ")
+            };
+            let node = collect_node(fork_dir, false, false)?;
+            let snap_count = count_snapshots(fork_dir);
+            let state = if node.is_live { "live" } else { "base" };
+            let origin = read_origin(fork_dir);
+            print!("{connector}{fork_name}  [{state}]");
+            if let Some(ref o) = origin {
+                print!("  origin: {o}");
+            }
+            if snap_count > 0 {
+                print!("  {snap_count} snapshot(s)");
+            }
+            println!();
+            print_wal_section(&node.wal_files, child_prefix, node.is_live);
+            print_seg_section("pending", &node.pending, child_prefix, node.is_live);
+            print_seg_section("segments", &node.segments, child_prefix, true);
+            accumulate(&node, &mut grand_total);
+        }
+        println!();
+        print_totals(&grand_total);
     }
 
     Ok(())
@@ -82,7 +118,7 @@ struct SegInfo {
     error: Option<String>,
 }
 
-fn collect_node(dir: &Path, is_root: bool) -> io::Result<NodeInfo> {
+fn collect_node(dir: &Path, is_root: bool, with_children: bool) -> io::Result<NodeInfo> {
     let ulid = if is_root {
         None
     } else {
@@ -97,30 +133,32 @@ fn collect_node(dir: &Path, is_root: bool) -> io::Result<NodeInfo> {
     let pending = collect_seg_dir(&dir.join("pending"))?;
     let segments = collect_seg_dir(&dir.join("segments"))?;
 
-    // Children live under <node>/children/<ulid>/. Sorted chronologically by ULID.
+    // Children only used in legacy single-node mode; Named Forks lists forks separately.
     let mut children = Vec::new();
-    let children_dir = dir.join("children");
-    match fs::read_dir(&children_dir) {
-        Ok(entries) => {
-            let mut child_dirs: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.is_dir()
-                        && p.file_name()
-                            .and_then(|s| s.to_str())
-                            .map(|s| ulid::Ulid::from_string(s).is_ok())
-                            .unwrap_or(false)
-                })
-                .collect();
-            child_dirs.sort();
-            for child_dir in child_dirs {
-                children.push(collect_node(&child_dir, false)?);
+    if with_children {
+        let children_dir = dir.join("children");
+        match fs::read_dir(&children_dir) {
+            Ok(entries) => {
+                let mut child_dirs: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_dir()
+                            && p.file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|s| ulid::Ulid::from_string(s).is_ok())
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                child_dirs.sort();
+                for child_dir in child_dirs {
+                    children.push(collect_node(&child_dir, false, true)?);
+                }
             }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            eprintln!("warning: cannot read {}: {e}", children_dir.display());
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("warning: cannot read {}: {e}", children_dir.display());
+            }
         }
     }
 
@@ -133,6 +171,48 @@ fn collect_node(dir: &Path, is_root: bool) -> io::Result<NodeInfo> {
         segments,
         children,
     })
+}
+
+fn count_snapshots(fork_dir: &Path) -> usize {
+    let snapshots_dir = fork_dir.join("snapshots");
+    fs::read_dir(&snapshots_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| ulid::Ulid::from_string(n).ok())
+                        .is_some()
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn read_origin(fork_dir: &Path) -> Option<String> {
+    fs::read_to_string(fork_dir.join("origin"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+fn print_totals(t: &Totals) {
+    if t.wal_files > 0 {
+        println!(
+            "Total: {} segment entries, {} stored  (+{} WAL records across {} file{})",
+            fmt_commas(t.seg_entries as u64),
+            fmt_size(t.body_bytes),
+            t.wal_records,
+            t.wal_files,
+            if t.wal_files == 1 { "" } else { "s" },
+        );
+    } else {
+        println!(
+            "Total: {} entries, {} stored",
+            fmt_commas(t.seg_entries as u64),
+            fmt_size(t.body_bytes),
+        );
+    }
 }
 
 fn collect_wal_dir(dir: &Path) -> io::Result<Vec<WalInfo>> {
@@ -276,7 +356,6 @@ fn print_node(node: &NodeInfo, line_prefix: &str, child_prefix: &str) {
         println!("{line_prefix}{ulid}  [{state}]");
     }
 
-    // Sections: wal/ and pending/ only shown for live nodes (or when non-empty).
     print_wal_section(&node.wal_files, child_prefix, node.is_live);
     print_seg_section("pending", &node.pending, child_prefix, node.is_live);
     print_seg_section("segments", &node.segments, child_prefix, true);
@@ -423,104 +502,54 @@ mod tests {
     }
 
     #[test]
-    fn fresh_live_volume() {
-        let base = temp_dir();
-        let _vol = Volume::open(&base).unwrap();
+    fn fresh_live_fork() {
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("default");
+        let _vol = Volume::open(&fork_dir).unwrap();
 
-        let node = collect_node(&base, true).unwrap();
+        let node = collect_node(&fork_dir, true, false).unwrap();
         assert!(node.is_live);
         assert!(node.is_root);
         assert!(node.children.is_empty());
-        // Volume::open creates a fresh (empty) WAL file.
         assert_eq!(node.wal_files.len(), 1);
         assert_eq!(node.wal_files[0].record_count, 0);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(vol_dir).unwrap();
     }
 
     #[test]
-    fn after_snapshot_shows_frozen_root_and_live_child() {
-        let base = temp_dir();
+    fn after_snapshot_fork_stays_live() {
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("default");
 
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&fork_dir).unwrap();
             vol.write(0, &vec![0xAAu8; 4096]).unwrap();
             vol.snapshot().unwrap();
-            // vol now lives in the child; drop releases child lock
         }
 
-        let node = collect_node(&base, true).unwrap();
-
-        // Root is frozen (snapshot() removed wal/).
-        assert!(!node.is_live);
-        assert!(node.is_root);
-
-        // One child was created by snapshot().
-        assert_eq!(node.children.len(), 1);
-        let child = &node.children[0];
-        assert!(child.is_live);
-        assert!(!child.is_root);
-        assert!(child.children.is_empty());
-
-        // Root pending/ has the segment flushed from the WAL before freezing.
+        // Fork is still live after snapshot (wal/ still present).
+        let node = collect_node(&fork_dir, true, false).unwrap();
+        assert!(node.is_live);
+        // Snapshot flushed the WAL → one segment in pending/.
         assert_eq!(node.pending.len(), 1);
         assert_eq!(node.pending[0].entry_count, 1);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(vol_dir).unwrap();
     }
 
     #[test]
-    fn sibling_children_from_frozen_root() {
-        let base = temp_dir();
+    fn readonly_base_fork_shows_not_live() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
 
-        // snapshot() freezes root, continues in child_1.
-        {
-            let mut vol = Volume::open(&base).unwrap();
-            vol.snapshot().unwrap();
-        }
+        // Simulate a readonly base: create segments/ with no wal/.
+        fs::create_dir_all(default_dir.join("segments")).unwrap();
+        fs::create_dir_all(default_dir.join("pending")).unwrap();
 
-        // Two independent opens of the frozen root each create a new sibling.
-        let _vol_a = Volume::open(&base).unwrap();
-        let _vol_b = Volume::open(&base).unwrap();
-
-        let node = collect_node(&base, true).unwrap();
+        let node = collect_node(&default_dir, true, false).unwrap();
         assert!(!node.is_live);
-        // 3 children: 1 from snapshot() + 2 from open() on frozen root.
-        assert_eq!(node.children.len(), 3);
-        assert!(node.children.iter().all(|c| c.is_live));
 
-        drop(_vol_a);
-        drop(_vol_b);
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn two_sequential_snapshots_produce_linear_chain() {
-        let base = temp_dir();
-
-        {
-            let mut vol = Volume::open(&base).unwrap();
-            vol.snapshot().unwrap(); // root frozen → child
-            vol.snapshot().unwrap(); // child frozen → grandchild
-            // vol dropped: grandchild lock released
-        }
-
-        let root = collect_node(&base, true).unwrap();
-
-        // Root is frozen with exactly one child.
-        assert!(!root.is_live);
-        assert_eq!(root.children.len(), 1);
-
-        // Child is also frozen with exactly one grandchild.
-        let child = &root.children[0];
-        assert!(!child.is_live);
-        assert_eq!(child.children.len(), 1);
-
-        // Grandchild is the live leaf.
-        let grandchild = &child.children[0];
-        assert!(grandchild.is_live);
-        assert!(grandchild.children.is_empty());
-
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(vol_dir).unwrap();
     }
 }
