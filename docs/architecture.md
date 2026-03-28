@@ -32,8 +32,10 @@ elide-core/        — shared library: segment format, WAL, LBA map, extent inde
 
 elide/             — volume process binary: NBD server, analysis tools (extents,
                      inspect, ls), and the import-volume CLI subcommand. Adds:
-                     clap, ext4-view. Stays small and synchronous — no HTTP
-                     client, no async runtime.
+                     clap, ext4-view, object_store, tokio (rt-multi-thread only).
+                     The async runtime is used exclusively by the demand-fetch
+                     path (ObjectStoreFetcher), which wraps block_on to satisfy
+                     the sync SegmentFetcher interface. NBD I/O remains synchronous.
 
 elide-import/      — OCI import binary: pulls public OCI images from a container
                      registry, extracts a rootfs, converts to ext4, and calls

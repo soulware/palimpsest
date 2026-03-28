@@ -30,6 +30,66 @@ The rename in step 3 is the local commit point. If the coordinator crashes betwe
 
 **GC and upload ordering:** see the GC section below for the required sequencing between GC and upload when both operate on `pending/` segments.
 
+## Demand-fetch
+
+Segments in `segments/` are S3-backed and evictable. When `find_segment_file` is called during a read and the segment file is absent locally, the volume delegates to an optional `SegmentFetcher`. If a fetcher is configured, it downloads the segment from the object store, writes it atomically to `segments/`, and the read proceeds normally. If no fetcher is configured, the read fails with "segment not found".
+
+**Important constraint — rebuild vs. runtime:** demand-fetch operates at read time, after the volume is open. The LBA map and extent index are rebuilt at `Volume::open` by reading segment index sections directly from disk. If a segment is missing at open time, the rebuild simply won't see it — that data will appear as zeros, not as a fetch opportunity. Demand-fetch therefore only applies to segments that go missing while the volume is already running (i.e. after eviction removes them from `segments/`). Cold-start scenarios (fresh host with no local segments) require either full pre-fetch before open, or manifest persistence so the LBA map can be rebuilt without segment files present.
+
+**Configuration — `fetch.toml`** in the volume root directory:
+
+```toml
+# S3 / S3-compatible (MinIO, Tigris, etc.)
+bucket   = "my-elide-bucket"
+endpoint = "https://s3.amazonaws.com"   # omit for AWS default
+region   = "us-east-1"                  # optional; falls back to AWS_DEFAULT_REGION
+
+# Local filesystem — for testing without a real object store
+# local_path = "/tmp/elide-store"
+```
+
+If `fetch.toml` is absent, the following env vars are tried: `ELIDE_S3_BUCKET` (required), `AWS_ENDPOINT_URL`, `AWS_DEFAULT_REGION`. If neither is present, demand-fetch is disabled and `serve-volume` runs normally.
+
+**Manual test procedure (local store):**
+
+```bash
+# 1. Import a base volume (if not already done)
+elide-import volumes/ubuntu-22.04 --image ubuntu:22.04
+
+# 2. Fork and serve it; connect from a VM, write data, disconnect
+elide fork-volume volumes/ubuntu-22.04 vm1
+elide serve-volume volumes/ubuntu-22.04 vm1 --size 4G --bind 0.0.0.0
+# ... (in VM) nbd-client <host> 10809, mkfs, write, unmount, nbd-client -d ...
+
+# 3. Upload vm1 segments to a local store
+mkdir -p /tmp/elide-store
+elide-coordinator drain-pending --local /tmp/elide-store volumes/ubuntu-22.04/forks/vm1
+
+# After drain: vm1 segments are in both forks/vm1/segments/ and /tmp/elide-store/
+
+# 4. Configure demand-fetch
+cat > volumes/ubuntu-22.04/fetch.toml << 'EOF'
+local_path = "/tmp/elide-store"
+EOF
+
+# 5. Serve vm1 again. The volume opens normally (all segments present locally).
+elide serve-volume volumes/ubuntu-22.04 vm1 --size 4G --bind 0.0.0.0 &
+NBD_PID=$!
+
+# 6. In a second terminal: delete a segment from the running volume to simulate eviction.
+#    (Find a segment ULID from forks/vm1/segments/ first.)
+#    SEGMENT=<ulid>
+rm volumes/ubuntu-22.04/forks/vm1/segments/$SEGMENT
+
+# 7. From the VM, read data that was stored in that segment. The read should succeed
+#    because the fetcher pulls the segment from /tmp/elide-store.
+#    "[demand-fetch enabled]" appears in the serve-volume output at startup.
+```
+
+**Current limitation — no eviction:** step 6 (manual deletion) is only necessary because eviction is not yet implemented. Once a size-cap LRU eviction policy is added, the fetcher fires automatically when `segments/` exceeds the cap and old segments are removed. Until then, demand-fetch is wired and testable but does not activate in normal operation.
+
+**Next step: eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
+
 ## GC and Repacking
 
 **GC has two distinct scopes with different constraints:**
