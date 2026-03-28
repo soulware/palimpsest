@@ -178,10 +178,20 @@ impl VolumeReader {
         let loc = loc.clone();
         let path = find_segment_file(&self.base_dir, &loc.segment_id)?;
         let mut f = fs::File::open(path)?;
-        let byte_offset = loc.body_offset + block_offset as u64 * 4096;
-        f.seek(SeekFrom::Start(byte_offset))?;
         let mut block = [0u8; 4096];
-        f.read_exact(&mut block)?;
+        if loc.compressed {
+            f.seek(SeekFrom::Start(loc.body_offset))?;
+            let mut buf = vec![0u8; loc.body_length as usize];
+            f.read_exact(&mut buf)?;
+            let decompressed = zstd::decode_all(buf.as_slice()).map_err(io::Error::other)?;
+            let src = block_offset as usize * 4096;
+            block.copy_from_slice(&decompressed[src..src + 4096]);
+        } else {
+            f.seek(SeekFrom::Start(
+                loc.body_offset + block_offset as u64 * 4096,
+            ))?;
+            f.read_exact(&mut block)?;
+        }
         Ok(block)
     }
 }
