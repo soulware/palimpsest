@@ -36,7 +36,13 @@ The Ubuntu cloud kernel (`vmlinuz` + `initrd.img`, extractable from any Ubuntu c
 ## Serving the Volume
 
 ```sh
-elide serve-volume /path/to/volume/default
+elide serve-volume /path/to/volume <fork-name>
+```
+
+For example, if you forked the volume to create a fork named `vm1`:
+
+```sh
+elide serve-volume /path/to/ubuntu-22.04 vm1
 ```
 
 This starts an NBD server on `127.0.0.1:10809`. Leave it running in a separate terminal.

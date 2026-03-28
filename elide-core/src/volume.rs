@@ -786,7 +786,10 @@ impl ReadonlyVolume {
 /// the branch and are excluded when rebuilding the LBA map.
 ///
 /// A fork with no `origin` file is the root fork; returns an empty vec.
-/// The `origin` file format is `<fork-name>/<branch-ulid>`.
+/// The `origin` file format is `<fork-rel-path>/snapshots/<branch-ulid>`, where
+/// `fork-rel-path` is the fork directory relative to the volume root — e.g.
+/// `base/snapshots/<ulid>` or `forks/vm1/snapshots/<ulid>`. This makes the
+/// `origin` file a real relative path from the volume root.
 pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     let origin_path = fork_dir.join("origin");
     let content = match fs::read_to_string(&origin_path) {
@@ -795,7 +798,7 @@ pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
         Err(e) => return Err(e),
     };
     let origin = content.trim();
-    let (parent_fork_name, branch_ulid_str) = origin.split_once('/').ok_or_else(|| {
+    let (fork_rel_path, branch_ulid_str) = origin.rsplit_once("/snapshots/").ok_or_else(|| {
         io::Error::other(format!(
             "malformed origin file in {}: {origin}",
             fork_dir.display()
@@ -805,9 +808,23 @@ pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
         .map_err(|e| io::Error::other(format!("bad branch ULID in origin: {e}")))?
         .to_string();
 
+    // Validate fork_rel_path: must be "base" or "forks/<name>" (no empty component,
+    // no path traversal, no nested forks/).
+    let valid_rel_path = match fork_rel_path.split_once('/') {
+        None => fork_rel_path == "base",
+        Some(("forks", name)) => !name.is_empty() && !name.contains('/'),
+        _ => false,
+    };
+    if !valid_rel_path {
+        return Err(io::Error::other(format!(
+            "malformed origin file in {}: invalid fork path '{fork_rel_path}'",
+            fork_dir.display()
+        )));
+    }
+
     // A fork in forks/ has the structure vol/forks/<name>; its parent is
     // vol/forks/ and its grandparent is the volume root. The base fork
-    // (default/) lives directly under the volume root, not under forks/.
+    // lives directly under the volume root, not under forks/.
     let parent = fork_dir
         .parent()
         .ok_or_else(|| io::Error::other("fork directory has no parent"))?;
@@ -818,11 +835,8 @@ pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     } else {
         parent
     };
-    let parent_fork_dir = if parent_fork_name == "base" {
-        volume_dir.join("base")
-    } else {
-        volume_dir.join("forks").join(parent_fork_name)
-    };
+    // fork_rel_path is relative to the volume root (e.g. "base" or "forks/vm1").
+    let parent_fork_dir = volume_dir.join(fork_rel_path);
 
     // Recurse into the parent's ancestry first (builds oldest-first order).
     let mut ancestors = walk_ancestors(&parent_fork_dir)?;
@@ -861,7 +875,8 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
 ///
 /// The source fork must have at least one snapshot (written by `snapshot()`).
 /// The new fork directory is created with `wal/`, `pending/`, `segments/`, and
-/// an `origin` file pointing to `<source_fork_name>/<latest_snapshot_ulid>`.
+/// an `origin` file pointing to `<fork-rel-path>/snapshots/<latest_snapshot_ulid>`,
+/// where `fork-rel-path` is the source fork directory relative to the volume root.
 ///
 /// Returns the path of the newly created fork directory.
 pub fn fork_volume(
@@ -892,10 +907,14 @@ pub fn fork_volume(
     fs::create_dir_all(new_fork_dir.join("wal"))?;
     fs::create_dir_all(new_fork_dir.join("pending"))?;
     fs::create_dir_all(new_fork_dir.join("segments"))?;
-    fs::write(
-        new_fork_dir.join("origin"),
-        format!("{source_fork_name}/{branch_ulid}"),
-    )?;
+    // origin uses the fork's path relative to the volume root so it is a real
+    // inspectable path: "base/snapshots/<ulid>" or "forks/<name>/snapshots/<ulid>".
+    let origin_rel = if source_fork_name == "base" {
+        format!("base/snapshots/{branch_ulid}")
+    } else {
+        format!("forks/{source_fork_name}/snapshots/{branch_ulid}")
+    };
+    fs::write(new_fork_dir.join("origin"), origin_rel)?;
 
     Ok(new_fork_dir)
 }
@@ -1630,6 +1649,35 @@ mod tests {
     }
 
     #[test]
+    fn walk_ancestors_rejects_invalid_origin_paths() {
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("forks").join("dev");
+        fs::create_dir_all(&fork_dir).unwrap();
+
+        let bad_origins = [
+            // direct segment reference (no snapshots/ component)
+            "base/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // path traversal
+            "../other/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // nested forks
+            "forks/a/b/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // empty fork name
+            "forks//snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // segments/ instead of snapshots/
+            "base/segments/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // completely wrong
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ];
+        for bad in bad_origins {
+            fs::write(fork_dir.join("origin"), bad).unwrap();
+            assert!(
+                walk_ancestors(&fork_dir).is_err(),
+                "expected error for origin: {bad}"
+            );
+        }
+    }
+
+    #[test]
     fn walk_ancestors_one_level() {
         let vol_dir = temp_dir();
         let default_dir = vol_dir.join("base");
@@ -1637,7 +1685,11 @@ mod tests {
 
         // dev's origin points to default at a fixed branch ULID.
         fs::create_dir_all(&dev_dir).unwrap();
-        fs::write(dev_dir.join("origin"), "base/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        fs::write(
+            dev_dir.join("origin"),
+            "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        )
+        .unwrap();
 
         let ancestors = walk_ancestors(&dev_dir).unwrap();
         assert_eq!(ancestors.len(), 1);
@@ -1656,10 +1708,18 @@ mod tests {
         let leaf_dir = vol_dir.join("forks").join("leaf");
 
         fs::create_dir_all(&mid_dir).unwrap();
-        fs::write(mid_dir.join("origin"), "base/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        fs::write(
+            mid_dir.join("origin"),
+            "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        )
+        .unwrap();
 
         fs::create_dir_all(&leaf_dir).unwrap();
-        fs::write(leaf_dir.join("origin"), "mid/01BX5ZZKJKTSV4RRFFQ69G5FAV").unwrap();
+        fs::write(
+            leaf_dir.join("origin"),
+            "forks/mid/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV",
+        )
+        .unwrap();
 
         let ancestors = walk_ancestors(&leaf_dir).unwrap();
         assert_eq!(ancestors.len(), 2);
@@ -1905,7 +1965,7 @@ mod tests {
         assert!(fork_dir.join("segments").is_dir());
 
         let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
-        assert_eq!(origin.trim(), format!("base/{snap_ulid}"));
+        assert_eq!(origin.trim(), format!("base/snapshots/{snap_ulid}"));
 
         fs::remove_dir_all(vol_dir).unwrap();
     }
@@ -1942,7 +2002,7 @@ mod tests {
         let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
         assert_eq!(
             origin.trim(),
-            format!("base/{snap2}"),
+            format!("base/snapshots/{snap2}"),
             "origin should point to the latest snapshot"
         );
 
@@ -1984,11 +2044,14 @@ mod tests {
         // origin chain: leaf → mid → default.
         let leaf_origin = fs::read_to_string(leaf_dir.join("origin")).unwrap();
         assert!(
-            leaf_origin.starts_with("mid/"),
+            leaf_origin.starts_with("forks/mid/snapshots/"),
             "leaf origin: {leaf_origin}"
         );
         let mid_origin = fs::read_to_string(mid_dir.join("origin")).unwrap();
-        assert!(mid_origin.starts_with("base/"), "mid origin: {mid_origin}");
+        assert!(
+            mid_origin.starts_with("base/snapshots/"),
+            "mid origin: {mid_origin}"
+        );
 
         // Leaf sees data from all three levels.
         let vol = Volume::open(&leaf_dir).unwrap();
