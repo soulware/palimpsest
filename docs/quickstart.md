@@ -83,10 +83,3 @@ Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 ./target/debug/elide fork-volume /tmp/elide-test/ubuntu-22.04 vm2 --from vm1
 ```
 
-## Import a raw ext4 image directly
-
-If you already have an ext4 image (e.g. extracted from a cloud image):
-
-```sh
-./target/debug/elide import-volume ubuntu-22.04.ext4 /tmp/elide-test/ubuntu-22.04
-```

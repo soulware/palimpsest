@@ -357,10 +357,11 @@ Not yet implemented:
 
 ```
 elide create-readonly-volume <vol-dir> --size <size>
-elide import-volume <vol-dir> <image-path>
 elide list-snapshots <vol-dir> [--fork <name>]
 elide export-volume <vol-dir> <fork-name> <new-vol-dir>
 ```
+
+Import is handled by the separate `elide-import` binary (OCI pull → ext4 → volume ingest). There is no `elide import-volume` subcommand.
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The fork remains live; no directory structure changes.
 

@@ -120,13 +120,6 @@ enum Command {
         /// Path to the volume directory
         vol_dir: String,
     },
-    /// Import an ext4 disk image as a readonly base volume
-    ImportVolume {
-        /// Path to the ext4 disk image to import
-        image: String,
-        /// Path to the volume directory to create (e.g. volumes/ubuntu-22.04)
-        vol_dir: String,
-    },
 }
 
 fn main() {
@@ -246,36 +239,6 @@ fn main() {
 
         Command::ListForks { vol_dir } => {
             list_forks(Path::new(&vol_dir)).expect("list-forks failed");
-        }
-
-        Command::ImportVolume { image, vol_dir } => {
-            let image_path = Path::new(&image);
-            let vol_dir_path = Path::new(&vol_dir);
-            let image_size = std::fs::metadata(image_path)
-                .expect("cannot stat image")
-                .len();
-            let total_blocks = image_size / 4096;
-            eprintln!(
-                "Importing {} ({} MiB, {} blocks)...",
-                image,
-                image_size >> 20,
-                total_blocks
-            );
-            let mut last_pct = u64::MAX;
-            elide_core::import::import_image(image_path, vol_dir_path, |done, total| {
-                let pct = done * 100 / total;
-                if pct != last_pct {
-                    last_pct = pct;
-                    eprint!("\r  {pct}% ({done}/{total} blocks)");
-                }
-                if done == total {
-                    eprintln!();
-                }
-            })
-            .expect("import failed");
-            std::fs::write(vol_dir_path.join("meta.toml"), "readonly = true\n")
-                .expect("failed to write meta.toml");
-            eprintln!("Done. Volume ready at {vol_dir}");
         }
     }
 }
