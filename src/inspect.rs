@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use elide_core::{segment, writelog};
 
+use crate::ls;
+
 pub fn run(dir: &Path) -> io::Result<()> {
     let vol_name = dir
         .file_name()
@@ -76,6 +78,9 @@ pub fn run(dir: &Path) -> io::Result<()> {
             print_wal_section(&node.wal_files, child_prefix, node.is_live);
             print_seg_section("pending", &node.pending, child_prefix, node.is_live);
             print_seg_section("segments", &node.segments, child_prefix, true);
+            if let Some(summary) = ls::try_fs_summary(fork_dir) {
+                print_fs_summary(&summary, child_prefix);
+            }
             accumulate(&node, &mut grand_total);
         }
         println!();
@@ -440,6 +445,17 @@ fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: b
             s.lba_blocks,
             ref_note,
         );
+    }
+}
+
+fn print_fs_summary(summary: &ls::FsSummary, prefix: &str) {
+    println!("{prefix}filesystem (ext4):");
+    if let Some(ref name) = summary.os_name {
+        println!("{prefix}  os: {name}");
+    }
+    if !summary.root_entries.is_empty() {
+        let listing = summary.root_entries.join("  ");
+        println!("{prefix}  /:  {listing}");
     }
 }
 

@@ -14,6 +14,62 @@ use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 
 use elide_core::{extentindex, lbamap, segment, volume, writelog};
 
+/// Brief summary of a fork's ext4 filesystem, for use in inspect output.
+pub struct FsSummary {
+    /// Value of PRETTY_NAME from /etc/os-release, if present.
+    pub os_name: Option<String>,
+    /// Names of entries at the filesystem root, sorted.
+    pub root_entries: Vec<String>,
+}
+
+/// Try to load `fork_dir` as an ext4 volume and return a brief summary.
+///
+/// Returns `None` silently if the volume is not ext4 or cannot be read.
+pub fn try_fs_summary(fork_dir: &Path) -> Option<FsSummary> {
+    let reader = VolumeReader::open(fork_dir).ok()?;
+    let fs = Ext4::load(Box::new(reader)).ok()?;
+
+    let os_name = read_os_name(&fs);
+
+    let root = Ext4PathBuf::new("/");
+    let mut root_entries = fs
+        .read_dir(&root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().display().to_string();
+            n != "." && n != ".."
+        })
+        .map(|e| {
+            let name = e.file_name().display().to_string();
+            let suffix = e
+                .metadata()
+                .ok()
+                .map(|m| entry_suffix(m.file_type()))
+                .unwrap_or("");
+            format!("{name}{suffix}")
+        })
+        .collect::<Vec<_>>();
+    root_entries.sort();
+
+    Some(FsSummary {
+        os_name,
+        root_entries,
+    })
+}
+
+fn read_os_name(fs: &Ext4) -> Option<String> {
+    let path = Ext4PathBuf::new("/etc/os-release");
+    let data = fs.read(&path).ok()?;
+    let text = std::str::from_utf8(&data).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+            return Some(rest.trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
 pub fn run(dir: &Path, fs_path: &str) -> io::Result<()> {
     let reader = VolumeReader::open(dir)?;
     let fs =
