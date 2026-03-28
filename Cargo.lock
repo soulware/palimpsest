@@ -559,11 +559,10 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
- "ed25519-dalek",
  "elide-core",
+ "elide-signing",
  "ext4-view",
  "libc",
- "rand_core 0.6.4",
  "serde",
  "toml",
  "ulid",
@@ -602,6 +601,7 @@ dependencies = [
  "anyhow",
  "clap",
  "elide-core",
+ "elide-signing",
  "oci-client",
  "oci-spec",
  "ocirender",
@@ -609,6 +609,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "elide-signing"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "elide-core",
+ "libc",
+ "rand_core 0.6.4",
 ]
 
 [[package]]

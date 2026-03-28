@@ -11,10 +11,10 @@
 //   1. Import the ext4 image directly into an Elide volume via elide_core::import
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
+use elide_signing::{BASE_KEY_FILE, BASE_ORIGIN_FILE, BASE_PUB_FILE};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -94,8 +94,14 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
         ext4_path.display(),
         vol_dir.display()
     );
+    std::fs::create_dir_all(vol_dir).context("create volume directory")?;
+    let key = elide_signing::generate_keypair(vol_dir, BASE_KEY_FILE, BASE_PUB_FILE)
+        .context("generate base keypair")?;
+    elide_signing::write_origin(vol_dir, &key, BASE_ORIGIN_FILE).context("write base.origin")?;
+    let signer =
+        elide_signing::load_signer(vol_dir, BASE_KEY_FILE).context("load base signing key")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(ext4_path, vol_dir, |done, total| {
+    elide_core::import::import_image(ext4_path, vol_dir, Some(&*signer), |done, total| {
         let pct = done * 100 / total;
         if pct != last_pct {
             last_pct = pct;
@@ -177,8 +183,14 @@ async fn run_oci(
 
     // 7. Import into Elide volume
     eprintln!("Importing into {}...", vol_dir.display());
+    std::fs::create_dir_all(vol_dir).context("create volume directory")?;
+    let key = elide_signing::generate_keypair(vol_dir, BASE_KEY_FILE, BASE_PUB_FILE)
+        .context("generate base keypair")?;
+    elide_signing::write_origin(vol_dir, &key, BASE_ORIGIN_FILE).context("write base.origin")?;
+    let signer =
+        elide_signing::load_signer(vol_dir, BASE_KEY_FILE).context("load base signing key")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(&ext4_path, vol_dir, |done, total| {
+    elide_core::import::import_image(&ext4_path, vol_dir, Some(&*signer), |done, total| {
         let pct = done * 100 / total;
         if pct != last_pct {
             last_pct = pct;

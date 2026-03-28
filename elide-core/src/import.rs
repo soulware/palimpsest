@@ -18,7 +18,7 @@ use std::path::Path;
 
 use ulid::Ulid;
 
-use crate::segment::{self, FLAG_COMPRESSED, SegmentEntry};
+use crate::segment::{self, FLAG_COMPRESSED, SegmentEntry, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
 const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
@@ -69,6 +69,7 @@ fn maybe_compress(block: &[u8]) -> Option<Vec<u8>> {
 fn flush_segment(
     segments_dir: &Path,
     entries: &mut Vec<SegmentEntry>,
+    signer: Option<&dyn SegmentSigner>,
 ) -> io::Result<Option<String>> {
     if entries.is_empty() {
         return Ok(None);
@@ -76,7 +77,7 @@ fn flush_segment(
     let ulid = Ulid::new().to_string();
     let tmp = segments_dir.join(format!("{ulid}.tmp"));
     let final_path = segments_dir.join(&ulid);
-    segment::write_segment(&tmp, entries, None)?;
+    segment::write_segment(&tmp, entries, signer)?;
     fs::rename(&tmp, &final_path)?;
     entries.clear();
     Ok(Some(ulid))
@@ -99,12 +100,16 @@ fn flush_segment(
 pub fn import_image(
     image_path: &Path,
     vol_dir: &Path,
+    signer: Option<&dyn SegmentSigner>,
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
-    if vol_dir.exists() {
+    // `vol_dir` may already exist (caller may have created it to write key files
+    // before calling import). Fail only if the base fork directory already exists,
+    // which means a previous import completed or is in progress.
+    if vol_dir.join("base").exists() {
         return Err(io::Error::other(format!(
-            "volume directory already exists: {}",
-            vol_dir.display()
+            "volume base already exists: {}",
+            vol_dir.join("base").display()
         )));
     }
 
@@ -143,13 +148,13 @@ pub fn import_image(
         batch_raw_bytes += LBA_SIZE;
 
         if batch_raw_bytes >= IMPORT_SEGMENT_BYTES {
-            if let Some(ulid) = flush_segment(&segments_dir, &mut entries)? {
+            if let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)? {
                 last_segment_ulid = Some(ulid);
             }
             batch_raw_bytes = 0;
         }
     }
-    if let Some(ulid) = flush_segment(&segments_dir, &mut entries)? {
+    if let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)? {
         last_segment_ulid = Some(ulid);
     }
 
@@ -189,7 +194,7 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("testimport");
-        import_image(&image_path, &vol_dir, |_, _| {}).unwrap();
+        import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
         // readonly is now in meta.toml (written by caller, not import_image)
         assert!(!vol_dir.join("readonly").exists());
@@ -229,7 +234,7 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("zeroimport");
-        import_image(&image_path, &vol_dir, |_, _| {}).unwrap();
+        import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
         // All-zero image: no segment files should be written.
         let segs: Vec<_> = fs::read_dir(vol_dir.join("base").join("segments"))
@@ -246,7 +251,7 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("bad");
-        let err = import_image(&path, &vol_dir, |_, _| {}).unwrap_err();
+        let err = import_image(&path, &vol_dir, None, |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("multiple of 4096"));
     }
 
@@ -261,7 +266,7 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("readable");
-        import_image(&image_path, &vol_dir, |_, _| {}).unwrap();
+        import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
         // Re-open with ReadonlyVolume and verify the blocks.
         let rv = crate::volume::ReadonlyVolume::open(&vol_dir.join("base")).unwrap();
