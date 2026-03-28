@@ -6,6 +6,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 
 | Document | Contents |
 |---|---|
+| [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, fork it, and serve it over NBD |
 | [docs/overview.md](docs/overview.md) | Problem statement, key concepts, operation modes, empirical findings |
 | [docs/findings.md](docs/findings.md) | Empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification |
 | [docs/architecture.md](docs/architecture.md) | System architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots |
