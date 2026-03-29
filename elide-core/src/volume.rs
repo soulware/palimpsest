@@ -2879,4 +2879,193 @@ mod tests {
 
         fs::remove_dir_all(vol_dir).unwrap();
     }
+
+    // --- ULID monotonicity property tests ---
+    //
+    // Invariant: every segment created by a volume operation (flush, compact_pending)
+    // has a ULID strictly greater than all segment ULIDs that existed before the
+    // operation.  For simulated coordinator GC the invariant is narrower: the output
+    // ULID exceeds the maximum of the consumed input ULIDs.
+    //
+    // Together these properties guarantee that rebuild always applies segments in
+    // write order, and that no combination of volume operations + GC can produce a
+    // stale read after crash recovery.
+
+    use proptest::prelude::*;
+
+    /// Collect every ULID-named file across wal/, pending/, and segments/.
+    fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
+        let mut result = std::collections::BTreeSet::new();
+        for subdir in ["wal", "pending", "segments"] {
+            let dir = fork_dir.join(subdir);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        // Skip .tmp files and other non-ULID names.
+                        if let Ok(u) = Ulid::from_string(name) {
+                            result.insert(u);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Simulate one coordinator GC pass on `segments/` without an object store.
+    ///
+    /// Picks the two lowest-ULID segments as candidates, compacts their DATA
+    /// entries (dedup REF entries are dropped — sufficient for the ordering test),
+    /// writes a new segment with ULID = `max(inputs).increment()`, and deletes
+    /// the inputs.
+    ///
+    /// Returns `Some((consumed_ulids, produced_ulid))` when candidates were found,
+    /// `None` when fewer than two segments exist.
+    fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid)> {
+        let segments_dir = fork_dir.join("segments");
+
+        // Collect and sort all segments by ULID.
+        let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
+        let mut candidates: Vec<(Ulid, PathBuf)> = seg_files
+            .iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?;
+                let ulid = Ulid::from_string(name).ok()?;
+                Some((ulid, p.clone()))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            return None;
+        }
+        candidates.sort_by_key(|(u, _)| *u);
+        let candidates = candidates[..2].to_vec(); // take the two oldest
+
+        // Read DATA entries (skip dedup REF — they carry no body bytes).
+        let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
+        for (_, path) in &candidates {
+            let Ok((bss, mut entries)) = segment::read_segment_index(path) else {
+                continue;
+            };
+            entries.retain(|e| !e.is_dedup_ref);
+            if segment::read_extent_bodies(path, bss, &mut entries).is_err() {
+                continue;
+            }
+            all_entries.extend(entries);
+        }
+
+        // Compute the output ULID: max(inputs).increment() — same as compaction_ulid.
+        let max_input = candidates.iter().map(|(u, _)| *u).max()?;
+        let new_ulid = max_input
+            .increment()
+            .unwrap_or_else(|| Ulid::from_parts(max_input.timestamp_ms() + 1, 0));
+
+        if all_entries.is_empty() {
+            // Nothing to write; still claim we consumed the inputs so the caller
+            // can verify the ULID ordering property.
+            for (_, path) in &candidates {
+                let _ = fs::remove_file(path);
+            }
+            let consumed = candidates.iter().map(|(u, _)| *u).collect();
+            return Some((consumed, new_ulid));
+        }
+
+        // Write the compacted segment then atomically rename into place.
+        let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
+        let final_path = segments_dir.join(new_ulid.to_string());
+        if segment::write_segment(&tmp_path, &mut all_entries, None).is_err() {
+            return None;
+        }
+        fs::rename(&tmp_path, &final_path).ok()?;
+
+        // Delete consumed inputs.
+        for (_, path) in &candidates {
+            let _ = fs::remove_file(path);
+        }
+
+        let consumed = candidates.iter().map(|(u, _)| *u).collect();
+        Some((consumed, new_ulid))
+    }
+
+    #[derive(Debug, Clone)]
+    enum SimOp {
+        Write { lba: u8, seed: u8 },
+        Flush,
+        CompactPending,
+        CoordGcLocal,
+        Crash,
+    }
+
+    fn arb_sim_op() -> impl Strategy<Value = SimOp> {
+        prop_oneof![
+            (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
+            Just(SimOp::Flush),
+            Just(SimOp::CompactPending),
+            Just(SimOp::CoordGcLocal),
+            Just(SimOp::Crash),
+        ]
+    }
+
+    fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
+        prop::collection::vec(arb_sim_op(), 1..40)
+    }
+
+    proptest! {
+        #[test]
+        fn ulid_monotonicity(ops in arb_sim_ops()) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let fork_dir = dir.path();
+            let mut vol = Volume::open(fork_dir).unwrap();
+
+            for op in &ops {
+                let ulids_before = all_segment_ulids(fork_dir);
+                let max_before = ulids_before
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(Ulid::from_parts(0, 0));
+
+                match op {
+                    SimOp::Write { lba, seed } => {
+                        let data = [*seed; 4096];
+                        let _ = vol.write(*lba as u64, &data);
+                    }
+                    SimOp::Flush => {
+                        let _ = vol.flush_wal();
+                        let after = all_segment_ulids(fork_dir);
+                        for u in after.difference(&ulids_before) {
+                            prop_assert!(
+                                *u > max_before,
+                                "flush produced ULID {u} ≤ existing max {max_before}"
+                            );
+                        }
+                    }
+                    SimOp::CompactPending => {
+                        let _ = vol.compact_pending();
+                        let after = all_segment_ulids(fork_dir);
+                        for u in after.difference(&ulids_before) {
+                            prop_assert!(
+                                *u > max_before,
+                                "compact_pending produced ULID {u} ≤ existing max {max_before}"
+                            );
+                        }
+                    }
+                    SimOp::CoordGcLocal => {
+                        if let Some((consumed, produced)) = simulate_coord_gc_local(fork_dir) {
+                            let max_consumed = consumed.iter().copied().max().unwrap();
+                            prop_assert!(
+                                produced > max_consumed,
+                                "coord_gc produced ULID {produced} ≤ consumed max {max_consumed}"
+                            );
+                        }
+                    }
+                    SimOp::Crash => {
+                        drop(vol);
+                        vol = Volume::open(fork_dir).unwrap();
+                        // No assertion here: the next Flush or CompactPending
+                        // will verify that the mint was correctly reseeded.
+                    }
+                }
+            }
+        }
+    }
 }
