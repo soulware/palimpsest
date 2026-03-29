@@ -13,6 +13,7 @@
 //   it exits, then restarts it. If the pid file is stale (process gone), the
 //   file is removed and a fresh process is spawned.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -86,12 +87,12 @@ fn spawn_volume(
 
     // Place the child in a new session so it is not signalled when the
     // coordinator's process group receives SIGHUP or is terminated.
+    // pre_exec is unsafe because the callback runs between fork() and exec()
+    // where only async-signal-safe functions may be called. setsid() is
+    // async-signal-safe.
     #[cfg(unix)]
     unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+        cmd.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(io::Error::from));
     }
 
     cmd.spawn()
@@ -109,23 +110,12 @@ async fn poll_until_dead(pid: u32) {
 
 /// Returns true if the process exists and we have permission to signal it.
 fn is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // pid_t is i32; a u32 value that overflows (e.g. u32::MAX → -1) would
-        // have special meaning for kill(2) (-1 targets all processes in the
-        // session). Reject values that don't fit.
-        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        // kill(pid, 0) checks process existence without sending a signal.
-        // Returns -1 with ESRCH if the process does not exist.
-        unsafe { libc::kill(pid_t, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    // Pid::from_raw takes i32; reject u32 values that would overflow.
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    // kill(pid, None) sends signal 0: checks existence without delivering a signal.
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok()
 }
 
 fn read_pid(fork_dir: &Path) -> Option<u32> {

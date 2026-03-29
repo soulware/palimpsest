@@ -1,6 +1,4 @@
-// elide-signing: Ed25519 keypair management and origin sanity checks.
-//
-// Used by both the `elide` binary (fork keys) and `elide-import` (base keys).
+// Ed25519 keypair management and origin sanity checks.
 //
 // Key file naming conventions:
 //   Forks:  fork.key / fork.pub / fork.origin  (under <vol_dir>/forks/<name>/)
@@ -28,7 +26,7 @@ use std::sync::Arc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 
-use elide_core::segment::SegmentSigner;
+use crate::segment::SegmentSigner;
 
 // File name constants.
 pub const FORK_KEY_FILE: &str = "fork.key";
@@ -195,15 +193,10 @@ fn parse_origin(content: &str, origin_file: &str) -> io::Result<(String, String,
 }
 
 fn get_hostname() -> io::Result<String> {
-    let mut buf = [0u8; 256];
-    // SAFETY: buf is valid memory of the size passed to gethostname.
-    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8(buf[..len].to_vec())
-        .map_err(|e| io::Error::other(format!("hostname is not valid UTF-8: {e}")))
+    nix::unistd::gethostname()
+        .map_err(io::Error::from)?
+        .into_string()
+        .map_err(|_| io::Error::other("hostname is not valid UTF-8"))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

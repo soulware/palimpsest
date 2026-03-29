@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "elide-core", "elide-import", "elide-coordinator", "elide-signing"]
+members = [".", "elide-core", "elide-import", "elide-coordinator"]
 resolver = "2"
 
 [package]
@@ -13,7 +13,6 @@ blake3         = "1"
 chrono         = { version = "0.4", default-features = false, features = ["clock"] }
 clap           = { version = "4", features = ["derive"] }
 elide-core     = { path = "elide-core" }
-elide-signing  = { path = "elide-signing" }
 ext4-view      = { version = "0.9", features = ["std"] }
 libc           = "0.2"
 object_store   = { version = "0.11", features = ["aws"] }

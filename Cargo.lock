@@ -561,7 +561,6 @@ dependencies = [
  "chrono",
  "clap",
  "elide-core",
- "elide-signing",
  "ext4-view",
  "libc",
  "object_store",
@@ -583,7 +582,7 @@ dependencies = [
  "clap",
  "elide-core",
  "futures",
- "libc",
+ "nix",
  "object_store",
  "serde",
  "tempfile",
@@ -597,7 +596,9 @@ name = "elide-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "libc",
+ "ed25519-dalek",
+ "nix",
+ "rand_core 0.6.4",
  "tempfile",
  "ulid",
  "zstd",
@@ -610,7 +611,6 @@ dependencies = [
  "anyhow",
  "clap",
  "elide-core",
- "elide-signing",
  "oci-client",
  "oci-spec",
  "ocirender",
@@ -618,16 +618,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
-]
-
-[[package]]
-name = "elide-signing"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "elide-core",
- "libc",
- "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1366,6 +1356,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

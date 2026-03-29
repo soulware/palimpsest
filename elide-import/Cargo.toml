@@ -7,8 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow     = "1"
 clap       = { version = "4", features = ["derive"] }
-elide-core    = { path = "../elide-core" }
-elide-signing = { path = "../elide-signing" }
+elide-core = { path = "../elide-core" }
 oci-client = "0.16"
 oci-spec   = { version = "0.9", features = ["image"] }
 ocirender  = "0.2"

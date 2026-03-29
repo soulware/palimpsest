@@ -3,8 +3,8 @@ use std::path::Path;
 use clap::{Parser, Subcommand};
 use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 
+use elide_core::signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
 use elide_core::volume;
-use elide_signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
 
 mod extents;
 mod fetcher;
@@ -222,24 +222,31 @@ fn main() {
                 std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
                 let signer = if fork_dir.join(FORK_KEY_FILE).exists() {
                     if !force_origin {
-                        elide_signing::verify_origin(&fork_dir, FORK_PUB_FILE, FORK_ORIGIN_FILE)
-                            .map_err(|e| {
-                                std::io::Error::other(format!(
-                                    "{e} — use --force-origin if this fork has been intentionally moved"
-                                ))
-                            })
-                            .expect("fork.origin check failed");
+                        elide_core::signing::verify_origin(
+                            &fork_dir,
+                            FORK_PUB_FILE,
+                            FORK_ORIGIN_FILE,
+                        )
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "{e} — use --force-origin if this fork has been intentionally moved"
+                            ))
+                        })
+                        .expect("fork.origin check failed");
                     }
-                    elide_signing::load_signer(&fork_dir, FORK_KEY_FILE)
+                    elide_core::signing::load_signer(&fork_dir, FORK_KEY_FILE)
                         .expect("failed to load fork signing key")
                 } else {
                     // First use: generate keypair and record origin.
-                    let key =
-                        elide_signing::generate_keypair(&fork_dir, FORK_KEY_FILE, FORK_PUB_FILE)
-                            .expect("failed to generate fork keypair");
-                    elide_signing::write_origin(&fork_dir, &key, FORK_ORIGIN_FILE)
+                    let key = elide_core::signing::generate_keypair(
+                        &fork_dir,
+                        FORK_KEY_FILE,
+                        FORK_PUB_FILE,
+                    )
+                    .expect("failed to generate fork keypair");
+                    elide_core::signing::write_origin(&fork_dir, &key, FORK_ORIGIN_FILE)
                         .expect("failed to write fork.origin");
-                    elide_signing::load_signer(&fork_dir, FORK_KEY_FILE)
+                    elide_core::signing::load_signer(&fork_dir, FORK_KEY_FILE)
                         .expect("failed to load fork signing key")
                 };
                 let flush_dur =
@@ -302,9 +309,10 @@ fn main() {
         } => {
             let fork_dir = volume::fork_volume(Path::new(&vol_dir), &fork_name, &from)
                 .expect("fork-volume failed");
-            let key = elide_signing::generate_keypair(&fork_dir, FORK_KEY_FILE, FORK_PUB_FILE)
-                .expect("failed to generate fork keypair");
-            elide_signing::write_origin(&fork_dir, &key, FORK_ORIGIN_FILE)
+            let key =
+                elide_core::signing::generate_keypair(&fork_dir, FORK_KEY_FILE, FORK_PUB_FILE)
+                    .expect("failed to generate fork keypair");
+            elide_core::signing::write_origin(&fork_dir, &key, FORK_ORIGIN_FILE)
                 .expect("failed to write fork.origin");
             println!("{}", fork_dir.display());
         }

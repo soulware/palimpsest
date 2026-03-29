@@ -25,7 +25,6 @@
 use std::cell::RefCell;
 use std::fs;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -129,9 +128,9 @@ pub struct Volume {
     /// Ancestor fork layers, oldest-first. Does not include the current fork.
     ancestor_layers: Vec<AncestorLayer>,
     /// Exclusive lock on `base_dir/volume.lock`. Held for the lifetime of the Volume.
-    /// Never explicitly read — the file handle exists solely to hold the flock.
+    /// The `Flock` releases the lock automatically when dropped.
     #[allow(dead_code)]
-    lock_file: fs::File,
+    lock_file: nix::fcntl::Flock<fs::File>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
     wal: writelog::WriteLog,
@@ -960,18 +959,14 @@ fn read_extents(
 /// Creates the lock file if it does not exist. Returns the open `File` — the
 /// lock is held for as long as this handle is open and released when dropped.
 /// Returns an error immediately if the lock is already held by another process.
-fn acquire_lock(dir: &Path) -> io::Result<fs::File> {
+fn acquire_lock(dir: &Path) -> io::Result<nix::fcntl::Flock<fs::File>> {
     let file = fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(dir.join("volume.lock"))?;
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if ret != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(file)
-    }
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, e)| io::Error::from(e))
 }
 
 /// A read-only view of a fork. Used for readonly NBD serving (no WAL, no write lock).
