@@ -1096,6 +1096,14 @@ fn recover_wal(
             } => {
                 let body_length = data.len() as u32;
                 let compressed = flags & writelog::FLAG_COMPRESSED != 0;
+                // Translate WAL flags to segment flags: the two flag sets use
+                // different bit values (writelog::FLAG_COMPRESSED = 0x01,
+                // segment::FLAG_COMPRESSED = 0x04).
+                let seg_flags = if compressed {
+                    segment::FLAG_COMPRESSED
+                } else {
+                    0
+                };
                 lbamap.insert(start_lba, lba_length, hash);
                 // Temporary WAL offset — updated to segment offset on promotion.
                 extent_index.insert(
@@ -1108,7 +1116,7 @@ fn recover_wal(
                     },
                 );
                 pending_entries.push(segment::SegmentEntry::new_data(
-                    hash, start_lba, lba_length, flags, data,
+                    hash, start_lba, lba_length, seg_flags, data,
                 ));
             }
             writelog::LogRecord::Ref {
@@ -1358,6 +1366,38 @@ mod tests {
         // Reopen: WAL recovery must restore both the LBA map and extent index.
         let vol = Volume::open(&base).unwrap();
         let result = vol.read(3, 1).unwrap();
+        assert_eq!(result, payload);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Regression: compressed WAL entries must be promoted with the correct
+    /// segment FLAG_COMPRESSED so reads after recovery+promote work.
+    ///
+    /// WAL uses FLAG_COMPRESSED=0x01; segment uses FLAG_COMPRESSED=0x04.
+    /// recover_wal must translate between them before calling new_data().
+    #[test]
+    fn compressed_entry_survives_recover_and_promote() {
+        let base = temp_dir();
+
+        // Write compressible data (zeros compress very well).
+        let payload = vec![0u8; 4096];
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &payload).unwrap();
+            vol.fsync().unwrap();
+            // Drop without promoting — WAL contains the compressed entry.
+        }
+
+        // Reopen (recover_wal runs) then promote (writes segment).
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        // Reopen again and read — must not fail with "failed to fill whole buffer".
+        let vol = Volume::open(&base).unwrap();
+        let result = vol.read(0, 1).unwrap();
         assert_eq!(result, payload);
 
         fs::remove_dir_all(base).unwrap();
