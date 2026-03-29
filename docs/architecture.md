@@ -365,6 +365,8 @@ This invariant is what makes ULID total-order sufficient for all correctness gua
 
 The single-writer property is enforced by the signing key: only the host holding `fork.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at demand-fetch verification time. See [formats.md](formats.md) — *Fork ownership and signing*.
 
+**Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
+
 ### Operations
 
 Implemented:
