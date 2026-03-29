@@ -11,6 +11,31 @@ volume implementation, and checks invariants after each relevant step.  When a
 test fails it automatically shrinks the input to the shortest sequence that
 still reproduces the failure — typically a handful of operations.
 
+### Correctness invariants
+
+The tests are designed to protect these invariants:
+
+1. **ULID total order is correctness.** `rebuild_segments` applies segments
+   oldest-first by ULID.  Any segment with a ULID that violates monotonicity
+   can silently shadow a newer write.  This is not a cleanliness property — it
+   is the reason crash recovery is correct.
+
+2. **WAL ULID is pre-assigned at WAL creation.** When `compact_pending` or
+   coordinator GC runs, the current WAL already has a fixed ULID.  Any new
+   segment produced by those operations must have a ULID `< wal_ulid`, not
+   `> wal_ulid`.  The mechanism: `compact_pending` uses `max(candidate_ULIDs)`
+   as output; coordinator GC uses `max(inputs).increment()`.  Both are
+   guaranteed to be below the current WAL ULID because all `pending/` and
+   `segments/` files were created before the current WAL was opened.
+
+3. **`segments/` ↔ S3 invariant.** The coordinator only touches `segments/`,
+   never `pending/`.  This boundary is what makes invariant 2 hold: coordinator
+   inputs are always from a prior write epoch.
+
+4. **Snapshot floor.** Segments at or below the latest snapshot ULID are
+   frozen — `compact_pending` and `compact_volume` must never modify or delete
+   them.
+
 ### The two properties
 
 **ULID monotonicity** (`ulid_monotonicity`)
@@ -43,14 +68,14 @@ looks intact from the outside.
 Each test runs a random sequence of `SimOp` values against a single fork
 directory:
 
-| Op | What it does |
-|----|-------------|
-| `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` |
-| `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` |
-| `CompactPending` | `vol.compact_pending()` — merges/deduplicates `pending/` segments |
-| `DrainLocal` | Moves all `pending/` files to `segments/` (simulates coordinator upload) |
-| `CoordGcLocal` | Runs a coordinator-style GC pass on `segments/` in-process |
-| `Crash` | Drops the `Volume` and reopens it (full rebuild from disk) |
+| Op | What it does | Oracle effect |
+|----|-------------|---------------|
+| `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` | `oracle.insert(lba, [seed; 4096])` |
+| `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` | none (write already recorded) |
+| `CompactPending` | `vol.compact_pending()` — merges/deduplicates `pending/` segments | none (no data change) |
+| `DrainLocal` | Moves all `pending/` files to `segments/` (simulates coordinator upload) | none |
+| `CoordGcLocal` | Runs a coordinator-style GC pass on `segments/` in-process | none (no data change) |
+| `Crash` | Drops the `Volume` and reopens it (full rebuild from disk) | assert all oracle LBAs match |
 
 `DrainLocal` is needed before `CoordGcLocal` has material to work with, just
 as in production the coordinator only compacts segments that have been
@@ -98,10 +123,24 @@ the eventual WAL flush segment.
 To add a new operation:
 
 1. Add a variant to `SimOp` in `tests/volume_proptest.rs`.
-2. Add it to `arb_sim_op()`.
-3. Handle it in both `proptest!` blocks — `ulid_monotonicity` should assert any
-   new ULID ordering guarantees; `crash_recovery_oracle` should update the
-   oracle if the operation changes visible state.
+2. Add it to `arb_sim_op()` with an appropriate weight.
+3. Handle it in **both** proptest blocks:
+   - In `ulid_monotonicity`: capture `ulids_before`, then after the op check
+     that every ULID in `after.difference(&ulids_before)` is `> max_before`.
+   - In `crash_recovery_oracle`: update `oracle` if the op changes visible LBA
+     state; otherwise just execute.
+4. If the op can produce no-op results (nothing to compact, no candidates,
+   etc.), make sure the no-op path is handled without panicking.
+
+**What to assert for each operation type:**
+
+- **State-changing** (e.g. Write): update the oracle immediately.
+- **Structural** (e.g. Flush, Compact, Drain, GC): no oracle update, but assert
+  ULID ordering in `ulid_monotonicity`.
+- **Recovery** (Crash): assert full oracle match after reopen.
+- **New feature ops**: ask two questions — does this op change which data is
+  visible? If yes, update the oracle.  Does it produce new segment files?  If
+  yes, add a ULID ordering assertion.
 
 To increase confidence after a bug fix, add the minimal failing sequence as a
 deterministic regression test in `elide-core/src/volume.rs` before verifying
