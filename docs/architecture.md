@@ -355,7 +355,7 @@ The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fo
 
 ### Single-writer invariant
 
-**Each fork directory has exactly one process that writes new segments into it.** The volume process that holds `fork.key` is the sole writer of `pending/` and `segments/` for that fork. The coordinator writes only to `gc/` and promotes results into `segments/` after S3 confirmation, using ULIDs derived from the existing write history rather than the current clock.
+**Each fork directory has exactly one process that writes new segments into it.** The volume process that holds `fork.key` is the sole writer of `pending/` and `segments/` for that fork. The coordinator writes only to `gc/` and promotes results into `segments/` after S3 confirmation. Crucially, it derives the output ULID from the fork's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the fork's timeline — it extends the sequence by one step from where the volume left off.
 
 This invariant is what makes ULID total-order sufficient for all correctness guarantees in rebuild, GC, and ancestor cutoff:
 
