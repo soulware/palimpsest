@@ -1,14 +1,16 @@
-// Coordinator daemon: watches configured volume roots, discovers forks, and
-// continuously drains pending segments to S3.
+// Coordinator daemon: watches configured volume roots, discovers forks,
+// drains pending segments to S3, and supervises volume processes.
 //
 // Architecture:
 //   - A root scanner runs every `scan_interval_secs`, walking configured root
-//     directories to find fork directories (any dir containing `pending/` or
-//     `segments/`). Each newly-discovered fork gets its own tokio task.
-//   - Each per-fork drain task polls `pending/` every `interval_secs` and calls
-//     `drain_pending` whenever segments are present. The first poll fires
-//     immediately on task start, so any backlog is cleared at startup.
-//   - Shutdown on Ctrl+C: all per-fork tasks are aborted.
+//     directories to find fork directories. Each newly-discovered fork gets:
+//       - a drain task: polls `pending/` every `interval_secs` and uploads
+//       - a supervisor task (if `serve.toml` exists): spawns and restarts
+//         `elide serve-volume`
+//   - The first scan fires immediately at startup to clear any backlog and
+//     adopt any volume processes already running.
+//   - Shutdown on Ctrl+C: all tasks are aborted. Volume processes are detached
+//     (setsid) and continue running after the coordinator exits.
 //
 // Fork directory layout expected:
 //   <root>/<volume>/base/            — base fork
@@ -25,17 +27,21 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::CoordinatorConfig;
+use crate::serve_config;
+use crate::supervisor;
 use crate::upload;
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
     let drain_interval = Duration::from_secs(config.drain.interval_secs);
     let scan_interval = Duration::from_secs(config.drain.scan_interval_secs);
+    let elide_bin = config.elide_bin.clone();
 
     eprintln!(
-        "[coordinator] watching {} root(s); drain every {}s, scan every {}s",
+        "[coordinator] watching {} root(s); drain every {}s, scan every {}s; elide bin: {}",
         config.roots.len(),
         config.drain.interval_secs,
         config.drain.scan_interval_secs,
+        elide_bin.display(),
     );
     for root in &config.roots {
         eprintln!("[coordinator] root: {}", root.display());
@@ -46,17 +52,34 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
     let mut scan_tick = tokio::time::interval(scan_interval);
     scan_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Fire immediately on first iteration.
+    // Consume the first tick so the loop body runs immediately at startup.
     scan_tick.tick().await;
 
     loop {
-        // Discover and spawn tasks for any new forks.
         let forks = discover_forks(&config.roots);
         for fork_dir in forks {
             if known.insert(fork_dir.clone()) {
                 eprintln!("[coordinator] discovered fork: {}", fork_dir.display());
-                let store = store.clone();
-                tasks.spawn(drain_loop(fork_dir, store, drain_interval));
+
+                // Always drain pending segments.
+                tasks.spawn(drain_loop(fork_dir.clone(), store.clone(), drain_interval));
+
+                // Supervise if serve.toml is present.
+                match serve_config::load(&fork_dir) {
+                    Ok(Some(sc)) => {
+                        eprintln!(
+                            "[coordinator] supervising fork: {} (bind {})",
+                            fork_dir.display(),
+                            sc.bind,
+                        );
+                        tasks.spawn(supervisor::supervise(fork_dir, sc, elide_bin.clone()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!(
+                        "[coordinator] failed to read serve.toml for {}: {e}",
+                        fork_dir.display()
+                    ),
+                }
             }
         }
 
@@ -191,7 +214,7 @@ mod tests {
         mk(root, "myvol/forks/vm1/segments");
         mk(root, "myvol/forks/vm2/pending");
 
-        // Volume "other" with only a base/ fork (no pending or segments yet — not a fork).
+        // Volume "other" with only a bare base/ dir (no pending or segments — not a fork).
         mk(root, "other/base");
 
         // Volume "empty" — just a volume root, no forks.

@@ -22,7 +22,9 @@
 mod config;
 mod daemon;
 mod prefetch;
+mod serve_config;
 mod store;
+mod supervisor;
 mod upload;
 
 use std::path::PathBuf;

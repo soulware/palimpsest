@@ -38,6 +38,15 @@ pub struct CoordinatorConfig {
     /// Drain and scan timing.
     #[serde(default)]
     pub drain: DrainConfig,
+
+    /// Path to the `elide` volume binary.
+    /// Defaults to `"elide"` (resolved via PATH).
+    #[serde(default = "default_elide_bin")]
+    pub elide_bin: PathBuf,
+}
+
+fn default_elide_bin() -> PathBuf {
+    PathBuf::from("elide")
 }
 
 #[derive(Deserialize)]
