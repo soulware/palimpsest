@@ -45,6 +45,7 @@ Design documentation is indexed in `README.md` and lives in `docs/`.
 - `docs/architecture.md` — system architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots
 - `docs/formats.md` — WAL format, segment file format, S3 retrieval strategies
 - `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
+- `docs/testing.md` — property-based tests: ULID monotonicity invariant, crash-recovery oracle, simulation model
 - `docs/reference.md` — lsvd reference comparison, implementation notes, open questions
 
 ## References
