@@ -106,3 +106,43 @@ To add a new operation:
 To increase confidence after a bug fix, add the minimal failing sequence as a
 deterministic regression test in `elide-core/src/volume.rs` before verifying
 that the proptest also passes.
+
+### Future dimensions
+
+The current tests focus on crash-recovery correctness for a single fork.
+Other dimensions worth adding:
+
+**Live read-your-writes oracle.** The crash-recovery oracle only asserts after
+`Crash`.  Asserting `vol.read(lba) == last_write` after every `Write` would
+catch in-memory state bugs (lbamap / extent_index corruption, wrong WAL offset
+tracking).  The marginal value over the existing unit tests is lower here, but
+it would close the gap for unusual sequences that unit tests don't cover.
+
+**Fork ancestry isolation oracle.** The most compelling gap.  The layered read
+path with ULID cutoffs is the most complex logic in the volume and is not
+exercised by the current proptest at all.  A fork oracle would run sequences
+like:
+
+```
+BaseWrite, BaseWrite, Snapshot, ForkFromBase,
+ChildWrite, ChildWrite, Crash(child), ...
+```
+
+...and maintain two independent `HashMap<lba, data>` views — the base's state
+at snapshot time and the child's own writes on top — asserting after every
+`Crash` that:
+- ancestral LBAs not overwritten by the child read back base data
+- child writes shadow base data at the same LBA
+- post-branch base writes are invisible to the child
+
+**Snapshot floor invariant.**  Adding a `Snapshot` op and asserting that
+`compact_pending` / `compact` never modifies segments at or below the snapshot
+ULID would cover that invariant beyond the two fixed-sequence unit tests that
+exist today.
+
+**Coordinator GC interleaved with live writes.**  The current `CoordGcLocal`
+only runs after `DrainLocal` has moved segments out of `pending/`.  A more
+realistic simulation would interleave GC with live `Flush` operations while
+segments span both `pending/` and `segments/`, stressing the boundary that the
+`max(inputs).increment() < new volume ULIDs` ordering invariant is designed to
+protect.
