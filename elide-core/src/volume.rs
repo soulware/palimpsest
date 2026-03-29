@@ -32,7 +32,7 @@ pub use segment::BoxFetcher;
 
 use ulid::Ulid;
 
-use crate::{extentindex, lbamap, segment, writelog};
+use crate::{extentindex, lbamap, segment, ulid_mint::UlidMint, writelog};
 
 /// Compute the Shannon entropy of `data` in bits per byte.
 ///
@@ -163,6 +163,10 @@ pub struct Volume {
     /// `find_segment_file` fetches missing segments from remote storage and
     /// caches them in `segments/`. See `segment::SegmentFetcher`.
     fetcher: Option<BoxFetcher>,
+    /// Monotonic ULID generator. Seeded from the highest known ULID at open
+    /// (WAL filename or max segment). Used for all WAL and compaction outputs
+    /// to guarantee strict ordering regardless of host clock behaviour.
+    mint: UlidMint,
 }
 
 impl Volume {
@@ -251,19 +255,12 @@ impl Volume {
             }
         });
 
-        // recover_wal does the single WAL scan: truncates any partial tail,
-        // replays records into the LBA map, and rebuilds pending_entries.
-        let (wal, wal_ulid, wal_path, pending_entries) =
-            if let Some(path) = wal_files.into_iter().last() {
-                recover_wal(path, &mut lbamap, &mut extent_index)?
-            } else {
-                create_fresh_wal(&wal_dir)?
-            };
-
         // Scan pending/ and segments/ to find the latest committed segment ULID
         // and determine whether any segments postdate the latest snapshot.
         // Cross-session ULID comparison is reliable: those files came from
         // earlier runs at distinct timestamps.
+        //
+        // Done before WAL recovery so we can compute the mint floor below.
         let latest_snap = latest_snapshot(base_dir)?;
         let mut all_segment_ulids: Vec<String> = Vec::new();
         for subdir in ["pending", "segments"] {
@@ -275,6 +272,30 @@ impl Volume {
         }
         all_segment_ulids.sort_unstable();
         let last_segment_ulid = all_segment_ulids.last().cloned();
+
+        // Compute the mint floor: max of the highest segment ULID and the
+        // WAL filename ULID (if one exists). This guarantees the first fresh
+        // WAL ULID is above all existing local data even when the system clock
+        // has drifted backwards.
+        let segment_floor = last_segment_ulid
+            .as_deref()
+            .and_then(|s| Ulid::from_string(s).ok())
+            .unwrap_or(Ulid::from_parts(0, 0));
+        let wal_floor = wal_files
+            .last()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+            .and_then(|s| Ulid::from_string(s).ok())
+            .unwrap_or(Ulid::from_parts(0, 0));
+        let mut mint = UlidMint::new(segment_floor.max(wal_floor));
+
+        // recover_wal does the single WAL scan: truncates any partial tail,
+        // replays records into the LBA map, and rebuilds pending_entries.
+        let (wal, wal_ulid, wal_path, pending_entries) =
+            if let Some(path) = wal_files.into_iter().last() {
+                recover_wal(path, &mut lbamap, &mut extent_index)?
+            } else {
+                create_fresh_wal(&wal_dir, mint.next())?
+            };
 
         let has_new_segments = !pending_entries.is_empty()
             || match (&latest_snap, &last_segment_ulid) {
@@ -297,6 +318,7 @@ impl Volume {
             file_cache: RefCell::new(None),
             signer,
             fetcher: None,
+            mint,
         })
     }
 
@@ -490,7 +512,7 @@ impl Volume {
                 // Read body bytes for live entries, then write a new denser segment.
                 segment::read_extent_bodies(&seg_path, body_section_start, &mut live_entries)?;
 
-                let new_ulid = Ulid::new().to_string();
+                let new_ulid = self.mint.next().to_string();
                 let pending_dir = self.base_dir.join("pending");
                 let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
                 let final_path = pending_dir.join(&new_ulid);
@@ -660,7 +682,7 @@ impl Volume {
             }
 
             let chunk = &mut merged_live[chunk_start..chunk_end];
-            let new_ulid = Ulid::new().to_string();
+            let new_ulid = self.mint.next().to_string();
             let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
             let final_path = pending_dir.join(&new_ulid);
             let new_bss = segment::write_segment(&tmp_path, chunk, self.signer.as_deref())?;
@@ -745,7 +767,8 @@ impl Volume {
         self.flush_wal_to_pending()?;
         // Create the fresh WAL. If this fails the segment is safe in pending/
         // and will be found on the next startup rebuild.
-        let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"))?;
+        let (wal, wal_ulid, wal_path, _) =
+            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
         self.wal = wal;
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
@@ -773,7 +796,7 @@ impl Volume {
             && let Some(latest_str) = latest_snapshot(&self.base_dir)?
         {
             let (wal, wal_ulid, wal_path, pending_entries) =
-                create_fresh_wal(&self.base_dir.join("wal"))?;
+                create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
             self.wal = wal;
             self.wal_ulid = wal_ulid;
             self.wal_path = wal_path;
@@ -786,7 +809,7 @@ impl Volume {
         // no segments exist (e.g. first snapshot on an empty fork).
         let snap_ulid_str = match &self.last_segment_ulid {
             Some(ulid) => ulid.clone(),
-            None => Ulid::new().to_string(),
+            None => self.mint.next().to_string(),
         };
         let snap_ulid =
             Ulid::from_string(&snap_ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
@@ -797,7 +820,7 @@ impl Volume {
 
         // Open a fresh WAL to continue writing.
         let (wal, wal_ulid, wal_path, pending_entries) =
-            create_fresh_wal(&self.base_dir.join("wal"))?;
+            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
         self.wal = wal;
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
@@ -1312,19 +1335,23 @@ fn recover_wal(
     Ok((wal, ulid, path, pending_entries))
 }
 
-/// Create a new WAL file with a fresh ULID.
+/// Create a new WAL file using the provided `ulid`.
+///
+/// The caller is responsible for generating a ULID that sorts after all
+/// existing segments and WAL files (typically via `Volume::mint`).
 fn create_fresh_wal(
     wal_dir: &Path,
+    ulid: Ulid,
 ) -> io::Result<(
     writelog::WriteLog,
     String,
     PathBuf,
     Vec<segment::SegmentEntry>,
 )> {
-    let ulid = Ulid::new().to_string();
-    let path = wal_dir.join(&ulid);
+    let ulid_str = ulid.to_string();
+    let path = wal_dir.join(&ulid_str);
     let wal = writelog::WriteLog::create(&path)?;
-    Ok((wal, ulid, path, Vec::new()))
+    Ok((wal, ulid_str, path, Vec::new()))
 }
 
 // --- tests ---

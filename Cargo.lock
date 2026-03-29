@@ -597,6 +597,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
+ "log",
  "nix",
  "rand_core 0.6.4",
  "tempfile",
