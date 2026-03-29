@@ -856,10 +856,21 @@ fn handle_volume_connection(
                 if let (Some(threshold), Some(t)) = (auto_flush, last_write)
                     && t.elapsed() >= threshold
                 {
-                    if let Err(e) = volume.flush_wal() {
-                        eprintln!("[auto-flush error: {}]", e);
-                    } else {
-                        last_write = None;
+                    match volume.flush_wal() {
+                        Err(e) => eprintln!("[auto-flush error: {}]", e),
+                        Ok(()) => {
+                            last_write = None;
+                            match volume.compact_pending() {
+                                Err(e) => eprintln!("[compact-pending error: {}]", e),
+                                Ok(s) if s.segments_compacted > 0 => eprintln!(
+                                    "[compact-pending: {} → {} segments, {:.1} MB reclaimed]",
+                                    s.segments_compacted,
+                                    s.new_segments,
+                                    s.bytes_freed as f64 / 1_048_576.0,
+                                ),
+                                Ok(_) => {}
+                            }
+                        }
                     }
                 }
                 continue;

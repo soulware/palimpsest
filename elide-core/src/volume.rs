@@ -98,8 +98,10 @@ const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
 /// Results from a single compaction run.
 #[derive(Debug, Default)]
 pub struct CompactionStats {
-    /// Number of segments rewritten (old segment deleted, new denser segment written).
+    /// Number of input segments consumed (deleted after compaction).
     pub segments_compacted: usize,
+    /// Number of output segments written.
+    pub new_segments: usize,
     /// Stored bytes reclaimed from deleted segment bodies.
     pub bytes_freed: u64,
     /// Number of dead extent entries removed from the extent index.
@@ -497,6 +499,7 @@ impl Volume {
                 let new_bss =
                     segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_deref())?;
                 fs::rename(&tmp_path, &final_path)?;
+                stats.new_segments += 1;
 
                 for entry in &live_entries {
                     if !entry.is_dedup_ref {
@@ -525,6 +528,159 @@ impl Volume {
             stats.segments_compacted += 1;
             stats.bytes_freed += total_bytes - live_bytes;
             stats.extents_removed += removed;
+        }
+
+        Ok(stats)
+    }
+
+    /// Minimum segment file size below which a `pending/` segment is always a
+    /// merge candidate regardless of its live ratio.
+    const COMPACT_SMALL_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+    /// Compact `pending/` segments opportunistically, before upload.
+    ///
+    /// Scans every segment in `pending/`. A segment is a candidate if:
+    /// - it has at least one dead extent (an LBA since overwritten), or
+    /// - its file size is below [`COMPACT_SMALL_THRESHOLD`] (8 MiB).
+    ///
+    /// All candidates are merged: their live extents are collected, written into
+    /// one or more new `pending/<ulid>` segments (split at [`FLUSH_THRESHOLD`]),
+    /// the extent index is updated, and the originals are deleted.
+    ///
+    /// Segments at or below the latest snapshot ULID are frozen and skipped.
+    /// Returns immediately (no-op) if there are no candidates.
+    pub fn compact_pending(&mut self) -> io::Result<CompactionStats> {
+        use std::collections::HashSet;
+
+        let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
+        let mut stats = CompactionStats::default();
+
+        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?
+            .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
+            .transpose()?;
+
+        let pending_dir = self.base_dir.join("pending");
+        let seg_paths = segment::collect_segment_files(&pending_dir)?;
+
+        let mut candidate_paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut merged_live: Vec<segment::SegmentEntry> = Vec::new();
+
+        for seg_path in &seg_paths {
+            let seg_filename = seg_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::other("bad segment filename"))?;
+            let seg_ulid =
+                Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
+
+            if floor.is_some_and(|f| seg_ulid <= f) {
+                continue;
+            }
+
+            let file_size = fs::metadata(seg_path)?.len();
+            let (body_section_start, mut entries) = segment::read_segment_index(seg_path)?;
+
+            let has_dead = entries
+                .iter()
+                .filter(|e| !e.is_dedup_ref)
+                .any(|e| !live.contains(&e.hash));
+            let is_small = file_size < Self::COMPACT_SMALL_THRESHOLD;
+
+            if !has_dead && !is_small {
+                continue;
+            }
+
+            let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries
+                .drain(..)
+                .partition(|e| e.is_dedup_ref || live.contains(&e.hash));
+
+            let dead_bytes: u64 = dead_entries
+                .iter()
+                .filter(|e| !e.is_dedup_ref)
+                .map(|e| e.stored_length as u64)
+                .sum();
+
+            let seg_id_str = seg_ulid.to_string();
+            for entry in &dead_entries {
+                if self
+                    .extent_index
+                    .lookup(&entry.hash)
+                    .map(|loc| loc.segment_id == seg_id_str)
+                    .unwrap_or(false)
+                {
+                    self.extent_index.remove(&entry.hash);
+                    stats.extents_removed += 1;
+                }
+            }
+
+            let mut live_entries = live_entries;
+            segment::read_extent_bodies(seg_path, body_section_start, &mut live_entries)?;
+            merged_live.extend(live_entries);
+
+            candidate_paths.push(seg_path.clone());
+            stats.segments_compacted += 1;
+            stats.bytes_freed += dead_bytes;
+        }
+
+        if candidate_paths.is_empty() {
+            return Ok(stats);
+        }
+
+        // Write merged output segments, splitting at FLUSH_THRESHOLD.
+        let mut chunk_start = 0;
+        while chunk_start < merged_live.len() {
+            let mut body_size: u64 = 0;
+            let mut chunk_end = chunk_start;
+            while chunk_end < merged_live.len() {
+                let e = &merged_live[chunk_end];
+                if !e.is_dedup_ref {
+                    let entry_size = e.data.len() as u64;
+                    if chunk_end > chunk_start && body_size + entry_size > FLUSH_THRESHOLD {
+                        break;
+                    }
+                    body_size += entry_size;
+                }
+                chunk_end += 1;
+            }
+            if chunk_end == chunk_start {
+                // Single entry larger than FLUSH_THRESHOLD — include it alone.
+                chunk_end += 1;
+            }
+
+            let chunk = &mut merged_live[chunk_start..chunk_end];
+            let new_ulid = Ulid::new().to_string();
+            let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
+            let final_path = pending_dir.join(&new_ulid);
+            let new_bss = segment::write_segment(&tmp_path, chunk, self.signer.as_deref())?;
+            fs::rename(&tmp_path, &final_path)?;
+            stats.new_segments += 1;
+
+            for entry in chunk.iter() {
+                if !entry.is_dedup_ref {
+                    self.extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: new_ulid.clone(),
+                            body_offset: new_bss + entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                        },
+                    );
+                }
+            }
+
+            chunk_start = chunk_end;
+        }
+
+        // Evict and delete originals.
+        for seg_path in &candidate_paths {
+            let seg_id = seg_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let mut cache = self.file_cache.borrow_mut();
+            if cache.as_ref().map(|(id, _)| id.as_str()) == Some(seg_id) {
+                *cache = None;
+            }
+            drop(cache);
+            fs::remove_file(seg_path)?;
         }
 
         Ok(stats)
@@ -1715,6 +1871,143 @@ mod tests {
         // Both LBAs read back correctly.
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
         assert_eq!(vol.read(1, 1).unwrap(), vec![0x44u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- compact_pending tests ---
+
+    #[test]
+    fn compact_pending_noop_when_all_live() {
+        // Two live extents in pending — no dead extents, and (in tests) small
+        // segments will qualify by size. Verify data survives intact.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.write(1, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // No dead extents; segment is small so it will be a size-candidate and
+        // merge into a single equivalent segment. Data must still read back.
+        let stats = vol.compact_pending().unwrap();
+        // Small segment qualifies as a candidate and is rewritten.
+        assert_eq!(stats.new_segments, 1);
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_pending_removes_dead_extents() {
+        // Write LBA 0, promote, overwrite LBA 0, promote.
+        // compact_pending should remove the dead extent from the first segment.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.compact_pending().unwrap();
+        assert!(stats.segments_compacted >= 1);
+        assert!(stats.bytes_freed > 0);
+        assert_eq!(stats.extents_removed, 1);
+
+        // Current value of LBA 0 must be the replacement.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_pending_only_scans_pending_not_segments() {
+        // Upload a segment (simulate by writing to segments/ directly via promote
+        // then moving to segments/). compact_pending must not touch it.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Move the pending segment to segments/ to simulate a completed upload.
+        let pending = base.join("pending");
+        let segments = base.join("segments");
+        let seg_name = fs::read_dir(&pending)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        fs::rename(pending.join(&seg_name), segments.join(&seg_name)).unwrap();
+
+        // Now overwrite LBA 0 and promote — creates a new pending segment.
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.compact_pending().unwrap();
+        // The old dead extent is in segments/ — compact_pending doesn't touch it.
+        assert_eq!(stats.extents_removed, 0);
+        // The new pending segment (all live, small) is still a size-candidate.
+        assert_eq!(stats.segments_compacted, 1);
+
+        // Data still reads correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_pending_respects_snapshot_floor() {
+        // Segments at or below the snapshot ULID must not be touched.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        // Write and promote before snapshot.
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        vol.snapshot().unwrap();
+
+        // The two pre-snapshot segments are now frozen.
+        let stats = vol.compact_pending().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "pre-snapshot segments must not be touched"
+        );
+
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_pending_merges_multiple_small_segments() {
+        // Three separate promotes → three small pending segments.
+        // compact_pending should merge them into one.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0xaau8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(1, &vec![0xbbu8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(2, &vec![0xccu8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.compact_pending().unwrap();
+        assert_eq!(stats.segments_compacted, 3);
+        assert_eq!(stats.new_segments, 1);
+
+        // All three LBAs must still read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0xaau8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0xbbu8; 4096]);
+        assert_eq!(vol.read(2, 1).unwrap(), vec![0xccu8; 4096]);
 
         fs::remove_dir_all(base).unwrap();
     }

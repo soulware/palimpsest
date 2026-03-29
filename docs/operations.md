@@ -159,6 +159,30 @@ Both commands are useful when debugging read failures: `inspect-segment` surface
 
 ## GC and Repacking
 
+### Background pending compaction
+
+`serve-volume` runs a compaction pass on `pending/` automatically, triggered by the idle flush. After `flush_wal()` succeeds in the idle arm (no write is in flight), the pass runs immediately. Because compaction only runs during the idle window, it never delays a write.
+
+**What the pass does:**
+
+1. Scan all segments in `pending/`
+2. Cross-reference against the live LBA map to identify dead extents (LBAs since overwritten)
+3. Identify candidates: any segment with at least one dead extent, or any segment below 8 MB
+4. If no candidates: return (no-op — all pending segments are fully live and dense)
+5. Collect all live extents from every candidate segment
+6. Write one new `pending/<ulid>` containing the merged live extents (split at 32 MB if the merged output would exceed the WAL promotion threshold)
+7. Update the in-memory LBA map and extent index to point to the new segment
+8. Delete the original candidate segments
+9. Log: `[compact-pending: N → M segments, X MB reclaimed]`
+
+**Write-path isolation:** neither promotion trigger (32 MB WAL threshold or idle flush) blocks on compaction. After any promotion, a new empty WAL is immediately available for writes. Compaction catches up in the next idle window.
+
+**Snapshot floor:** segments at or below the latest snapshot ULID are frozen and are never touched, even if they are in `pending/`.
+
+**Key property:** data written then deleted before `drain-pending` runs is never uploaded to S3. The compaction pass removes it from `pending/` entirely.
+
+---
+
 **GC has two distinct scopes with different constraints:**
 
 *Local GC* (space reclamation on disk) operates only on live leaf nodes — those containing `wal/`. Frozen ancestor nodes are structurally immutable and shared by all their descendants; their local segments cannot be touched while any live descendant exists. This matches the lsvd reference implementation's approach: `removeSegmentIfPossible()` refuses to delete a segment referenced by any volume. In the directory model this is structural: absence of `wal/` means no local GC.
