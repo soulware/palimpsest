@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f5df178e3f4c7919dd59350f14ce903ba20a448582cc882516c82bd0b5312164 # shrinks to ops = [Write { lba: 0, seed: 0 }, Write { lba: 2, seed: 1 }, Flush, Write { lba: 0, seed: 1 }, CompactPending, Write { lba: 2, seed: 2 }, Flush, Crash]
