@@ -78,12 +78,21 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                         continue;
                     }
                 };
+                // In production the coordinator will call gc_checkpoint on
+                // the volume process via IPC.  For now, Ulid::new() is a
+                // safe placeholder: GC inputs are always old segments whose
+                // timestamps are seconds to minutes behind the current clock,
+                // so a fresh ULID is guaranteed to sort between them and any
+                // concurrent write.
+                let checkpoint: Arc<dyn Fn() -> String + Send + Sync> =
+                    Arc::new(|| ulid::Ulid::new().to_string());
                 tasks.spawn(gc::gc_loop(
                     fork_dir.clone(),
                     vol_id,
                     frk_name,
                     store.clone(),
                     gc_config.clone(),
+                    checkpoint,
                 ));
 
                 // Supervise if serve.toml is present.

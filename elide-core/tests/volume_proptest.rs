@@ -123,8 +123,9 @@ proptest! {
                     // DrainLocal only renames files; no new ULIDs are created.
                 }
                 SimOp::CoordGcLocal => {
+                    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
                     let to_delete = if let Some((consumed, produced, paths)) =
-                        common::simulate_coord_gc_local(fork_dir)
+                        common::simulate_coord_gc_local(fork_dir, gc_ulid)
                     {
                         let max_consumed = consumed.iter().copied().max().unwrap();
                         prop_assert!(
@@ -184,7 +185,8 @@ proptest! {
                     common::drain_local(fork_dir);
                 }
                 SimOp::CoordGcLocal => {
-                    let _ = common::simulate_coord_gc_local(fork_dir);
+                    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let _ = common::simulate_coord_gc_local(fork_dir, gc_ulid);
                     // Apply any pending gc handoffs through the volume's
                     // handoff path, including handoffs from pre-crash passes.
                     let _ = vol.apply_gc_handoffs();

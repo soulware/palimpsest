@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc dbb438bf28c34ebfd49bfc12f5b98104af2e9289deaccf473ab17d23e90c4550 # shrinks to ops = [Write { lba: 0, seed: 50 }, Flush, Write { lba: 0, seed: 50 }]
-cc e6c61d03c95d56ce51165e552d7978df574406b4e395373a5cd3f4f55a88b0dc # shrinks to ops = [Write { lba: 5, seed: 0 }, Flush, Write { lba: 0, seed: 0 }, Flush, Write { lba: 5, seed: 1 }, DrainLocal, CoordGcLocal, Flush, Crash]
+cc bd5a92dea66aeef9a030542e089cbe7e1e93b831b7d47c38ba2649ec4b38f36a # shrinks to ops = [Write { lba: 0, seed: 215 }, CoordGcLocal, Write { lba: 5, seed: 215 }, CoordGcLocal, DrainLocal, Write { lba: 5, seed: 0 }, CoordGcLocal, DrainLocal, CoordGcLocal, Crash]

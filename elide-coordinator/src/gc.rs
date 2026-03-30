@@ -45,8 +45,8 @@
 // first pass these are called on the async task thread; move to spawn_blocking
 // if GC passes become long enough to stall other coordinator tasks.
 
+use std::collections::HashSet;
 use std::fs;
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,6 +60,7 @@ use tokio::time::MissedTickBehavior;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
+use elide_core::lbamap;
 use elide_core::segment::{self, SegmentEntry};
 use elide_core::volume::latest_snapshot;
 
@@ -113,6 +114,7 @@ pub async fn gc_loop(
     fork_name: String,
     store: Arc<dyn ObjectStore>,
     config: GcConfig,
+    gc_checkpoint: Arc<dyn Fn() -> String + Send + Sync>,
 ) {
     let interval = Duration::from_secs(config.interval_secs);
     let mut tick = tokio::time::interval(interval);
@@ -139,7 +141,16 @@ pub async fn gc_loop(
             Err(e) => error!("[gc {volume_id}/{fork_name}] handoff cleanup error: {e:#}"),
         }
 
-        match gc_fork(&fork_dir, &volume_id, &fork_name, &store, &config).await {
+        match gc_fork(
+            &fork_dir,
+            &volume_id,
+            &fork_name,
+            &store,
+            &config,
+            &*gc_checkpoint,
+        )
+        .await
+        {
             Ok(GcStats {
                 strategy: GcStrategy::Density,
                 bytes_freed,
@@ -170,12 +181,19 @@ pub async fn gc_loop(
 /// Strategy 2 (small-segment sweep). Returns `GcStrategy::None` if neither
 /// finds candidates.
 ///
+/// `gc_checkpoint` flushes the volume's WAL and returns a fresh ULID for the
+/// GC output segment.  Called only after confirming candidates exist (not
+/// speculatively), so that the volume is not flushed unnecessarily.  The
+/// flush ensures the extent index rebuild sees all committed writes, and the
+/// returned ULID sorts after all existing segments but before any future
+/// write.
 pub async fn gc_fork(
     fork_dir: &Path,
     volume_id: &str,
     fork_name: &str,
     store: &Arc<dyn ObjectStore>,
     config: &GcConfig,
+    gc_checkpoint: &(dyn Fn() -> String + Send + Sync),
 ) -> Result<GcStats> {
     let segments_dir = fork_dir.join("segments");
     if !segments_dir.exists() {
@@ -187,15 +205,23 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
-    let index = extentindex::rebuild(&[(fork_dir.to_path_buf(), None)])
-        .context("rebuilding extent index")?;
+    // Checkpoint: flush the volume's WAL so the rebuild below sees all
+    // committed writes, and obtain the ULID for the GC output segment.
+    // Called before the rebuild — not inside compact_segments — so that
+    // the liveness check is accurate.
+    let new_ulid_str = gc_checkpoint();
+
+    let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+    let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
+    let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
+    let live_hashes = lbamap.live_hashes();
 
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?
         .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
         .transpose()?;
 
-    let all_stats =
-        collect_stats(&segments_dir, &index, floor).context("collecting segment stats")?;
+    let all_stats = collect_stats(&segments_dir, &index, &live_hashes, floor)
+        .context("collecting segment stats")?;
 
     // Strategy 1: density pass — compact the single least-dense segment.
     if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
@@ -208,6 +234,7 @@ pub async fn gc_fork(
             volume_id,
             fork_name,
             store,
+            &new_ulid_str,
         )
         .await
         .context("density compaction")?;
@@ -248,9 +275,17 @@ pub async fn gc_fork(
 
     let candidates = small.len();
     let bytes_freed: u64 = small.iter().map(|s| s.dead_bytes()).sum();
-    compact_segments(small, &gc_dir, fork_dir, volume_id, fork_name, store)
-        .await
-        .context("small-segment sweep")?;
+    compact_segments(
+        small,
+        &gc_dir,
+        fork_dir,
+        volume_id,
+        fork_name,
+        store,
+        &new_ulid_str,
+    )
+    .await
+    .context("small-segment sweep")?;
 
     Ok(GcStats {
         strategy: GcStrategy::SmallSweep,
@@ -373,6 +408,10 @@ struct SegmentStats {
     total_body_bytes: u64,
     /// Live non-dedup body entries (data field not yet populated).
     live_entries: Vec<SegmentEntry>,
+    /// Hashes that are in the extent index but not reachable from the LBA map.
+    /// The volume must remove these from its extent index when applying the
+    /// handoff, since the old segment files will be deleted.
+    removed_hashes: Vec<blake3::Hash>,
     body_section_start: u64,
 }
 
@@ -396,6 +435,7 @@ impl SegmentStats {
 fn collect_stats(
     segments_dir: &Path,
     index: &ExtentIndex,
+    live_hashes: &HashSet<blake3::Hash>,
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
     let mut segment_files = segment::collect_segment_files(segments_dir)?;
@@ -422,6 +462,7 @@ fn collect_stats(
         let mut live_bytes: u64 = 0;
         let mut total_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
+        let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
         for entry in entries {
             // Inline is currently disabled (INLINE_THRESHOLD = 0); skip for safety.
@@ -429,12 +470,17 @@ fn collect_stats(
                 continue;
             }
             total_body_bytes += entry.stored_length as u64;
-            if index
+            let extent_live = index
                 .lookup(&entry.hash)
-                .is_some_and(|loc| loc.segment_id == ulid_str)
-            {
+                .is_some_and(|loc| loc.segment_id == ulid_str);
+            if extent_live && live_hashes.contains(&entry.hash) {
                 live_bytes += entry.stored_length as u64;
                 live_entries.push(entry);
+            } else if extent_live {
+                // Extent-index-live but not LBA-map-live: the LBA was
+                // overwritten with different data.  Record so the volume
+                // can remove the dangling extent index entry.
+                removed_hashes.push(entry.hash);
             }
         }
 
@@ -445,6 +491,7 @@ fn collect_stats(
             live_bytes,
             total_body_bytes,
             live_entries,
+            removed_hashes,
             body_section_start,
         });
     }
@@ -475,9 +522,11 @@ async fn compact_segments(
     volume_id: &str,
     fork_name: &str,
     store: &Arc<dyn ObjectStore>,
+    new_ulid_str: &str,
 ) -> Result<()> {
     // Read live extent bodies from local segment files.
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
+    let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
     for candidate in &mut candidates {
         segment::read_extent_bodies(
             &candidate.path,
@@ -487,6 +536,9 @@ async fn compact_segments(
         .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
         for entry in candidate.live_entries.drain(..) {
             all_live.push((candidate.ulid_str.clone(), entry));
+        }
+        for hash in candidate.removed_hashes.drain(..) {
+            all_removed.push((hash, candidate.ulid_str.clone()));
         }
     }
 
@@ -511,14 +563,6 @@ async fn compact_segments(
 
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
     let segments_dir = fork_dir.join("segments");
-
-    let max_input_ulid = candidates
-        .iter()
-        .filter_map(|s| Ulid::from_string(&s.ulid_str).ok())
-        .max()
-        .expect("non-empty candidates");
-    let new_ulid = compaction_ulid(max_input_ulid);
-    let new_ulid_str = new_ulid.to_string();
     // Write to a temp file first; rename into segments/ only after S3 upload
     // succeeds, so the invariant "segments/ ↔ in S3" is never violated.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
@@ -544,7 +588,7 @@ async fn compact_segments(
     let new_body_section_start = segment::write_segment(&tmp_path, &mut new_entries, None)
         .context("writing compacted segment")?;
 
-    let key = segment_key(volume_id, fork_name, &new_ulid_str)?;
+    let key = segment_key(volume_id, fork_name, new_ulid_str)?;
     let data = tokio::fs::read(&tmp_path)
         .await
         .context("reading compacted segment for upload")?;
@@ -555,13 +599,14 @@ async fn compact_segments(
 
     // Upload confirmed: move into segments/ so the volume can read it locally
     // without a demand-fetch, and so extentindex::rebuild picks it up on restart.
-    let final_path = segments_dir.join(&new_ulid_str);
+    let final_path = segments_dir.join(new_ulid_str);
     tokio::fs::rename(&tmp_path, &final_path)
         .await
         .context("moving compacted segment into segments/")?;
 
-    // Write the handoff file: one line per moved extent.
-    // Format: <hash_hex> <old_ulid> <new_ulid> <new_absolute_offset>
+    // Write the handoff file.
+    // Carried entries (4 fields): <hash> <old_ulid> <new_ulid> <offset>
+    // Removed entries (2 fields): <hash> <old_ulid>
     let mut lines = String::new();
     for ((old_ulid, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
         let new_offset = new_body_section_start + new_entry.stored_offset;
@@ -570,6 +615,9 @@ async fn compact_segments(
             old_entry.hash, old_ulid, new_ulid_str, new_offset,
         ));
     }
+    for (hash, old_ulid) in &all_removed {
+        lines.push_str(&format!("{} {}\n", hash, old_ulid));
+    }
     let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
     let pending_tmp = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
     fs::write(&pending_tmp, &lines).with_context(|| format!("writing gc result {new_ulid_str}"))?;
@@ -577,36 +625,6 @@ async fn compact_segments(
         .with_context(|| format!("committing gc result {new_ulid_str}"))?;
 
     Ok(())
-}
-
-/// Compute the ULID for a compacted output segment.
-///
-/// The output is `max(inputs).increment()` — one step ahead of the newest
-/// input in the total ULID order. This gives the compacted segment a ULID
-/// that is:
-///
-/// - strictly greater than all input segments, so it supersedes them in
-///   ULID-ordered rebuild processing;
-/// - strictly less than any concurrent write that occurs during compaction,
-///   because input segments have already passed through the drain/upload
-///   pipeline and their timestamps are seconds to minutes in the past.
-///   Any write happening *now* gets a ULID from the current wall clock,
-///   which is far ahead of `max(inputs)`.
-///
-/// This eliminates the race between compaction and concurrent writes without
-/// requiring any locking: concurrent writes always win in rebuild by
-/// timestamp alone. The worst case when the liveness check misses a
-/// concurrent write is a small space leak (the compacted output carries an
-/// extent that no LBA references), not data corruption or a stale read.
-///
-/// The `increment()` overflow case (all 80 random bits set) is effectively
-/// unreachable; the fallback advances to the next millisecond with random=0,
-/// which preserves the same ordering guarantee.
-fn compaction_ulid(max_input: Ulid) -> Ulid {
-    match max_input.increment() {
-        Some(u) => u,
-        None => Ulid::from_parts(max_input.timestamp_ms() + 1, 0),
-    }
 }
 
 /// Returns true if any `.pending` GC result files exist in `gc_dir`.
@@ -657,55 +675,6 @@ mod tests {
     }
 
     #[test]
-    fn compaction_ulid_exceeds_single_input() {
-        let input = Ulid::new();
-        let output = compaction_ulid(input);
-        assert!(output > input);
-    }
-
-    #[test]
-    fn compaction_ulid_exceeds_all_inputs() {
-        let a = Ulid::new();
-        let b = a.increment().unwrap();
-        let c = b.increment().unwrap();
-        let max = [a, b, c].into_iter().max().unwrap();
-        let output = compaction_ulid(max);
-        assert!(output > a);
-        assert!(output > b);
-        assert!(output > c);
-    }
-
-    #[test]
-    fn compaction_ulid_preserves_timestamp_when_no_overflow() {
-        let input = Ulid::new();
-        let output = compaction_ulid(input);
-        assert_eq!(output.timestamp_ms(), input.timestamp_ms());
-    }
-
-    #[test]
-    fn compaction_ulid_overflow_advances_timestamp() {
-        let max_random = (1u128 << 80) - 1;
-        let ts = 12345u64;
-        let input = Ulid::from_parts(ts, max_random);
-        assert!(input.increment().is_none(), "sanity: should overflow");
-        let output = compaction_ulid(input);
-        assert_eq!(output.timestamp_ms(), ts + 1);
-        assert!(output > input);
-    }
-
-    #[test]
-    fn compaction_ulid_less_than_current_time() {
-        let old_ts = 1_000u64;
-        let input = Ulid::from_parts(old_ts, 0);
-        let output = compaction_ulid(input);
-        let concurrent_write = Ulid::new();
-        assert!(
-            concurrent_write > output,
-            "concurrent write ({concurrent_write}) should beat compaction output ({output})"
-        );
-    }
-
-    #[test]
     fn ignores_non_pending_files_in_gc_dir() {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
@@ -725,6 +694,7 @@ mod tests {
                 live_bytes,
                 total_body_bytes: file_size,
                 live_entries: Vec::new(),
+                removed_hashes: Vec::new(),
                 body_section_start: 0,
             }
         }
@@ -747,6 +717,7 @@ mod tests {
             live_bytes: 800 * 1024,
             total_body_bytes: 1024 * 1024,
             live_entries: Vec::new(),
+            removed_hashes: Vec::new(),
             body_section_start: 0,
         };
         assert_eq!(s.dead_bytes(), 224 * 1024);
@@ -764,6 +735,7 @@ mod tests {
                 live_bytes: live,
                 total_body_bytes: 100,
                 live_entries: Vec::new(),
+                removed_hashes: Vec::new(),
                 body_section_start: 0,
             }
         }

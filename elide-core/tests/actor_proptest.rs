@@ -121,10 +121,16 @@ proptest! {
                     common::drain_local(fork_dir);
                 }
                 ActorOp::CoordGcLocal => {
+                    // Checkpoint: flush WAL and obtain a ULID for the GC
+                    // output, matching the real coordinator's gc_checkpoint.
+                    let gc_ulid = ulid::Ulid::from_string(
+                        &handle.gc_checkpoint().unwrap_or_default(),
+                    )
+                    .unwrap_or_else(|_| ulid::Ulid::new());
                     // Simulate one coordinator GC pass (writes gc/*.pending).
                     // Returns paths to delete — we hold them until after the
                     // handoff is applied, matching the real coordinator's ordering.
-                    let to_delete = common::simulate_coord_gc_local(fork_dir)
+                    let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid)
                         .map(|(_, _, paths)| paths)
                         .unwrap_or_default();
                     // Apply the handoff through the actor channel.  This

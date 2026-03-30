@@ -521,6 +521,46 @@ pub fn collect_fetched_idx_files(fetched_dir: &Path) -> io::Result<Vec<PathBuf>>
     }
 }
 
+/// Sort segment paths for rebuild, with GC output segments first.
+///
+/// GC output segments — identified by a corresponding
+/// `gc/<ulid>.{pending,applied,done}` handoff file — are processed before
+/// non-GC segments.  Within each group, segments are sorted by ULID
+/// (oldest first).  This ensures that any non-GC segment (a direct volume
+/// write) overwrites a GC output's entry for the same LBA range, because
+/// the non-GC segment is processed later and its insert replaces the
+/// GC-derived entry in the LBA map.
+///
+/// Without this ordering, a GC output whose ULID exceeds a concurrent
+/// write's segment ULID would be processed last, and its stale LBA
+/// entries would shadow the concurrent write's correct entries.
+pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
+    let gc_dir = fork_dir.join("gc");
+    // Partition into GC outputs and non-GC segments.
+    let mut gc_paths: Vec<PathBuf> = Vec::new();
+    let mut non_gc_paths: Vec<PathBuf> = Vec::new();
+    for p in paths.drain(..) {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if is_gc_output(&gc_dir, name) {
+            gc_paths.push(p);
+        } else {
+            non_gc_paths.push(p);
+        }
+    }
+    gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    non_gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    // GC outputs first (lower priority), then non-GC segments (higher priority).
+    paths.extend(gc_paths);
+    paths.extend(non_gc_paths);
+}
+
+/// Returns true if `segment_name` has a GC handoff file in `gc_dir`.
+fn is_gc_output(gc_dir: &Path, segment_name: &str) -> bool {
+    [".pending", ".applied", ".done"]
+        .iter()
+        .any(|suffix| gc_dir.join(format!("{segment_name}{suffix}")).exists())
+}
+
 // --- slice read helpers ---
 
 fn read_fixed<const N: usize>(data: &[u8], pos: &mut usize) -> io::Result<[u8; N]> {

@@ -94,6 +94,9 @@ pub(crate) enum VolumeRequest {
     ApplyGcHandoffs {
         reply: Sender<io::Result<usize>>,
     },
+    GcCheckpoint {
+        reply: Sender<io::Result<String>>,
+    },
     Shutdown,
 }
 
@@ -189,6 +192,13 @@ impl VolumeActor {
                                     extent_index,
                                     flush_gen: self.flush_gen,
                                 }));
+                            }
+                            let _ = reply.send(result);
+                        }
+                        VolumeRequest::GcCheckpoint { reply } => {
+                            let result = self.volume.gc_checkpoint();
+                            if result.is_ok() {
+                                self.after_promote();
                             }
                             let _ = reply.send(result);
                         }
@@ -347,6 +357,18 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::ApplyGcHandoffs { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Establish a GC checkpoint: flush the WAL and return a fresh ULID for
+    /// the GC output segment.  Blocks until the actor replies.
+    pub fn gc_checkpoint(&self) -> io::Result<String> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

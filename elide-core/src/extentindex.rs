@@ -172,7 +172,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
         // any fetched/ entries for the same hashes.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
-        paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+        segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {
             paths.retain(|p| {
