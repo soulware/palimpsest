@@ -554,9 +554,20 @@ pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
     paths.extend(non_gc_paths);
 }
 
-/// Returns true if `segment_name` has a GC handoff file in `gc_dir`.
+/// Returns true if `segment_name` is an in-flight GC output.
+///
+/// A segment is a GC output while its handoff file is in `.pending` or
+/// `.applied` state — i.e. while the old input segments may still exist
+/// in `segments/`. During this window `sort_for_rebuild` places these
+/// segments first (lower priority) so the originals win on rebuild.
+///
+/// `.done` is intentionally excluded: by the time a handoff reaches
+/// `.done` the coordinator has already deleted the old input segments,
+/// so there is nothing to conflict with. ULID ordering (guaranteed by
+/// `gc_checkpoint`) ensures the GC output sorts before any subsequent
+/// write without needing special classification.
 fn is_gc_output(gc_dir: &Path, segment_name: &str) -> bool {
-    [".pending", ".applied", ".done"]
+    [".pending", ".applied"]
         .iter()
         .any(|suffix| gc_dir.join(format!("{segment_name}{suffix}")).exists())
 }
@@ -856,5 +867,87 @@ mod tests {
         assert_eq!(files[0].file_name().unwrap(), ulid);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // --- sort_for_rebuild tests ---
+
+    fn make_fork_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fork_dir = tmp.path().to_path_buf();
+        fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        fs::create_dir_all(fork_dir.join("gc")).unwrap();
+        (tmp, fork_dir)
+    }
+
+    fn seg_path(fork_dir: &Path, ulid: &str) -> PathBuf {
+        fork_dir.join("segments").join(ulid)
+    }
+
+    #[test]
+    fn sort_for_rebuild_pending_is_gc_output() {
+        let (_tmp, fork_dir) = make_fork_dir();
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
+        let path = seg_path(&fork_dir, ulid);
+        fs::write(&path, b"").unwrap();
+        fs::write(fork_dir.join("gc").join(format!("{ulid}.pending")), b"").unwrap();
+
+        let mut paths = vec![path.clone()];
+        sort_for_rebuild(&fork_dir, &mut paths);
+
+        // A .pending sidecar marks the segment as a GC output (first / lower priority).
+        assert_eq!(paths, vec![path]);
+    }
+
+    #[test]
+    fn sort_for_rebuild_applied_is_gc_output() {
+        let (_tmp, fork_dir) = make_fork_dir();
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
+        let path = seg_path(&fork_dir, ulid);
+        fs::write(&path, b"").unwrap();
+        fs::write(fork_dir.join("gc").join(format!("{ulid}.applied")), b"").unwrap();
+
+        let mut paths = vec![path.clone()];
+        sort_for_rebuild(&fork_dir, &mut paths);
+
+        // A .applied sidecar marks the segment as a GC output (first / lower priority).
+        assert_eq!(paths, vec![path]);
+    }
+
+    #[test]
+    fn sort_for_rebuild_done_is_not_gc_output() {
+        let (_tmp, fork_dir) = make_fork_dir();
+        let gc_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
+        let reg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAC0";
+        let gc_path = seg_path(&fork_dir, gc_ulid);
+        let reg_path = seg_path(&fork_dir, reg_ulid);
+        fs::write(&gc_path, b"").unwrap();
+        fs::write(&reg_path, b"").unwrap();
+        // Only a .done sidecar — handoff is complete, old inputs already deleted.
+        fs::write(fork_dir.join("gc").join(format!("{gc_ulid}.done")), b"").unwrap();
+
+        let mut paths = vec![gc_path.clone(), reg_path.clone()];
+        sort_for_rebuild(&fork_dir, &mut paths);
+
+        // Both segments treated as regular; sorted by ULID (gc_ulid < reg_ulid).
+        assert_eq!(paths, vec![gc_path, reg_path]);
+    }
+
+    #[test]
+    fn sort_for_rebuild_gc_outputs_precede_regular() {
+        let (_tmp, fork_dir) = make_fork_dir();
+        let gc_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
+        let reg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAA9"; // lower ULID than gc_ulid
+        let gc_path = seg_path(&fork_dir, gc_ulid);
+        let reg_path = seg_path(&fork_dir, reg_ulid);
+        fs::write(&gc_path, b"").unwrap();
+        fs::write(&reg_path, b"").unwrap();
+        fs::write(fork_dir.join("gc").join(format!("{gc_ulid}.pending")), b"").unwrap();
+
+        let mut paths = vec![gc_path.clone(), reg_path.clone()];
+        sort_for_rebuild(&fork_dir, &mut paths);
+
+        // GC output comes first regardless of ULID order so the regular
+        // segment (higher priority) is processed last and wins on rebuild.
+        assert_eq!(paths, vec![gc_path, reg_path]);
     }
 }

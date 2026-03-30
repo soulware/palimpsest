@@ -67,6 +67,12 @@ use elide_core::volume::latest_snapshot;
 use crate::config::GcConfig;
 use crate::upload::segment_key;
 
+/// Retention window for `.done` GC handoff files.
+///
+/// `.done` files are kept for this duration after completion for post-mortem
+/// debugging, then removed by `cleanup_done_handoffs`.
+const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
 ///
@@ -139,6 +145,11 @@ pub async fn gc_loop(
             Ok(0) => {}
             Ok(n) => info!("[gc {volume_id}/{fork_name}] completed {n} GC handoff(s)"),
             Err(e) => error!("[gc {volume_id}/{fork_name}] handoff cleanup error: {e:#}"),
+        }
+
+        let pruned = cleanup_done_handoffs(&fork_dir, DONE_FILE_TTL);
+        if pruned > 0 {
+            info!("[gc {volume_id}/{fork_name}] pruned {pruned} expired .done file(s)");
         }
 
         match gc_fork(
@@ -393,6 +404,57 @@ pub async fn apply_done_handoffs(
     }
 
     Ok(count)
+}
+
+/// Delete `.done` GC handoff files older than `ttl`.
+///
+/// `.done` files are inert markers left after a completed GC handoff. They are
+/// useful for post-mortem debugging (which segments were compacted and when)
+/// but accumulate indefinitely without cleanup. At the default 5-minute GC
+/// interval a fork produces ~288 per day; this function prunes the tail.
+///
+/// Deletion is best-effort: errors on individual files are logged and skipped
+/// so a single unreadable file does not block the rest of the pass.
+///
+/// Returns the number of files deleted.
+pub fn cleanup_done_handoffs(fork_dir: &Path, ttl: Duration) -> usize {
+    let gc_dir = fork_dir.join("gc");
+    let Ok(entries) = fs::read_dir(&gc_dir) else {
+        return 0;
+    };
+
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(ttl)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.ends_with(".done") {
+            continue;
+        }
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                error!(
+                    "[gc] could not read mtime of {}: {e}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if mtime < cutoff {
+            if let Err(e) = fs::remove_file(entry.path()) {
+                error!("[gc] failed to delete {}: {e}", entry.path().display());
+            } else {
+                deleted += 1;
+            }
+        }
+    }
+    deleted
 }
 
 // --- internals ---
@@ -996,5 +1058,70 @@ mod tests {
             let name = name.to_str().unwrap();
             assert!(name.ends_with(".done"), "expected .done, got {name}");
         }
+    }
+
+    // --- cleanup_done_handoffs tests ---
+
+    #[test]
+    fn cleanup_no_gc_dir() {
+        let tmp = TempDir::new().unwrap();
+        // Should not panic or error when gc/ doesn't exist.
+        let n = cleanup_done_handoffs(tmp.path(), Duration::from_secs(0));
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn cleanup_deletes_old_done_files() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+
+        let ulid_a = Ulid::from_parts(1000, 1).to_string();
+        let ulid_b = Ulid::from_parts(1000, 2).to_string();
+        let done_a = gc_dir.join(format!("{ulid_a}.done"));
+        let done_b = gc_dir.join(format!("{ulid_b}.done"));
+        fs::write(&done_a, "").unwrap();
+        fs::write(&done_b, "").unwrap();
+
+        // TTL of zero — everything is expired.
+        let n = cleanup_done_handoffs(tmp.path(), Duration::from_secs(0));
+        assert_eq!(n, 2);
+        assert!(!done_a.exists());
+        assert!(!done_b.exists());
+    }
+
+    #[test]
+    fn cleanup_spares_recent_done_files() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+
+        let ulid = Ulid::from_parts(1000, 1).to_string();
+        let done = gc_dir.join(format!("{ulid}.done"));
+        fs::write(&done, "").unwrap();
+
+        // TTL of 7 days — a freshly written file should be kept.
+        let n = cleanup_done_handoffs(tmp.path(), Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(n, 0);
+        assert!(done.exists());
+    }
+
+    #[test]
+    fn cleanup_ignores_non_done_files() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+
+        let ulid = Ulid::from_parts(1000, 1).to_string();
+        let pending = gc_dir.join(format!("{ulid}.pending"));
+        let applied = gc_dir.join(format!("{ulid}.applied"));
+        fs::write(&pending, "").unwrap();
+        fs::write(&applied, "").unwrap();
+
+        // TTL of zero — only .done files are eligible, none present.
+        let n = cleanup_done_handoffs(tmp.path(), Duration::from_secs(0));
+        assert_eq!(n, 0);
+        assert!(pending.exists());
+        assert!(applied.exists());
     }
 }

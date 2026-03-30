@@ -304,11 +304,14 @@ A handoff file containing only 2-field lines is a *removal-only handoff*. It has
    - For each 2-field entry: if extent index still points to `old_segment_ulid` for this hash, remove the entry (LBA has been overwritten; the reference is dangling)
    - Removal-only handoffs (all 2-field lines) are applied immediately — no output segment is needed. Handoffs with 4-field entries wait until `segments/<new-ulid>` is present locally (may require a demand-fetch)
    - Rename `gc/<result-ulid>.pending` → `gc/<result-ulid>.applied`
-4. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, renames to `gc/<result-ulid>.done`
+4. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, removes old local `segments/<old-ulid>` files, renames to `gc/<result-ulid>.done`
+5. Coordinator (periodic cleanup): deletes `gc/*.done` files older than 7 days
 
-Old local `segments/<old-ulid>` files are left in place until the coordinator removes them in step 4. They remain readable by the volume until then; after deletion reads route to the new segment via the patched extent index (for carried entries) or fail-fast on dangling references that have been cleaned (for removed entries).
+Old local `segments/<old-ulid>` files are left in place until step 4. They remain readable by the volume until then; after deletion reads route to the new segment via the patched extent index (for carried entries) or fail-fast on dangling references that have been cleaned (for removed entries).
 
 This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read on next tick and the appropriate step retried. No data is lost.
+
+**`.done` file accumulation:** at the default 5-minute GC interval, a fork accumulates ~288 `.done` files per day. Each file is small (one line per moved or removed extent, ~100–130 bytes each), but directory inode count grows unboundedly without cleanup. The coordinator runs a TTL cleanup pass each tick, deleting `.done` files whose mtime is older than 7 days. This retains a recent window useful for post-mortem debugging (which segments were compacted, when) without unbounded growth. Deletion is safe because by the time a handoff reaches `.done` the old input segments are already removed; `sort_for_rebuild` only classifies `.pending` and `.applied` sidecars as in-flight GC outputs.
 
 *S3 repacking* (locality optimisation in object storage) is a coordinator-level operation and is **not subject to the leaf-only constraint**. The coordinator can read extents from any node's local segments or from S3, create new S3 objects with better layout, and update the extent index to point to them. Local files are caches — the coordinator does not modify them to repack at the S3 level.
 
