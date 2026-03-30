@@ -1843,14 +1843,13 @@ mod tests {
             vol.write(1, &vec![0xbbu8; 4096]).unwrap();
             vol.promote_for_test().unwrap();
             // Grab the segment ULID (there is exactly one file in pending/).
-            ulid = fs::read_dir(base.join("pending"))
+            let entry = fs::read_dir(base.join("pending"))
                 .unwrap()
                 .next()
                 .unwrap()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
+                .unwrap();
+            let filename = entry.file_name();
+            ulid = filename.to_string_lossy().into_owned();
         }
 
         // Simulate the crash: copy the segment back as a WAL file so both exist.
@@ -2126,14 +2125,12 @@ mod tests {
         // Move the pending segment to segments/ to simulate a completed upload.
         let pending = base.join("pending");
         let segments = base.join("segments");
-        let seg_name = fs::read_dir(&pending)
+        let entry = fs::read_dir(&pending)
             .unwrap()
             .filter_map(|e| e.ok())
             .next()
-            .unwrap()
-            .file_name()
-            .into_string()
             .unwrap();
+        let seg_name = entry.file_name().into_string().unwrap();
         fs::rename(pending.join(&seg_name), segments.join(&seg_name)).unwrap();
 
         // Now overwrite LBA 0 and promote — creates a new pending segment.
