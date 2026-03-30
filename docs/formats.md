@@ -96,6 +96,8 @@ The final row is an intentional design choice: local NVMe is the durability boun
 
 When the write log reaches the 32MB threshold (or on an explicit flush), the background promotion task converts the WAL into a committed local segment. The WAL is assigned a ULID at creation time; that same ULID becomes the segment ID.
 
+**The WAL ULID marks the start of a write epoch, not the time data was written.**  All writes accepted while the WAL is open belong to that epoch and inherit its ULID when promoted.  This pre-assignment is what makes compaction ordering safe: every segment in `pending/` was produced in an earlier epoch, so `max(pending ULIDs)` is always strictly less than the running WAL's ULID — there is no need to coordinate with the live WAL during compaction.
+
 **Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes only the raw extent data bytes (no headers) to a clean body section. REF records contribute no bytes to the body — their index entries carry only the LBA mapping and `FLAG_DEDUP_REF`. All segments — freshly promoted or GC-repacked — have the same uniform format.
 
 **WAL-to-segment flag translation:** WAL and segment index use different bit values for `FLAG_COMPRESSED` and `FLAG_DEDUP_REF` (see the WAL flag namespace note above). `recover_wal` translates WAL flags to segment flags before constructing `SegmentEntry` values — never copy a WAL `flags` byte directly into a segment index entry.
