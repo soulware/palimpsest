@@ -20,7 +20,6 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -53,17 +52,27 @@ pub struct VolumeConfig {
 
 /// Immutable snapshot of the LBA map and extent index.
 ///
-/// Published by `VolumeActor` after every `write()`.  Readers load the current
-/// snapshot via `ArcSwap::load()` — no channel round-trip, no lock.
+/// Published by `VolumeActor` after every `write()` and after every WAL
+/// promotion.  Readers load the current snapshot via `ArcSwap::load()` —
+/// no channel round-trip, no lock.
 ///
-/// Both fields are `Arc`-wrapped so that publication is O(1): the actor calls
-/// `Arc::clone` on its live maps.  If a reader is still holding the previous
-/// version when the next write occurs, `Arc::make_mut` in `Volume` performs a
-/// copy-on-write clone; in practice reads complete in microseconds so the
-/// refcount is almost always 1.
+/// Both map fields are `Arc`-wrapped so that publication is O(1): the actor
+/// calls `Arc::clone` on its live maps.  If a reader is still holding the
+/// previous version when the next write occurs, `Arc::make_mut` in `Volume`
+/// performs a copy-on-write clone; in practice reads complete in microseconds
+/// so the refcount is almost always 1.
+///
+/// `flush_gen` is incremented by the actor on every WAL promotion.  Handles
+/// compare it against their cached value; a change means the extent index now
+/// contains post-promote (segment-format) body offsets and any cached WAL file
+/// descriptor must be evicted.  Because `flush_gen` is stored inside the
+/// snapshot, a handle always sees a consistent pair: if it observes a new
+/// generation it also observes the updated extent index in the same atomic
+/// load — there is no window between the two.
 pub struct ReadSnapshot {
     pub lbamap: Arc<LbaMap>,
     pub extent_index: Arc<ExtentIndex>,
+    pub flush_gen: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,10 +107,10 @@ pub struct VolumeActor {
     volume: Volume,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
-    /// Incremented after every WAL promotion (explicit flush or threshold-triggered).
-    /// Handles compare their cached value against this to detect when their
-    /// file handle cache may be stale.
-    flush_gen: Arc<AtomicU64>,
+    /// Local promotion counter.  Incremented on every WAL promotion and
+    /// embedded into the next `ReadSnapshot` store so that handles see a
+    /// consistent (generation, extent_index) pair from a single atomic load.
+    flush_gen: u64,
 }
 
 /// Idle period after which the actor promotes a non-empty WAL to a pending
@@ -116,12 +125,13 @@ impl VolumeActor {
     /// offsets and increments `flush_gen` so that handles know to evict their
     /// file handle caches before the next read.
     fn after_promote(&mut self) {
+        self.flush_gen += 1;
         let (lbamap, extent_index) = self.volume.snapshot_maps();
         self.snapshot.store(Arc::new(ReadSnapshot {
             lbamap,
             extent_index,
+            flush_gen: self.flush_gen,
         }));
-        self.flush_gen.fetch_add(1, Ordering::Release);
     }
 
     pub fn run(mut self) {
@@ -141,6 +151,7 @@ impl VolumeActor {
                                 self.snapshot.store(Arc::new(ReadSnapshot {
                                     lbamap,
                                     extent_index,
+                                    flush_gen: self.flush_gen,
                                 }));
                             }
                             // Reply before promoting: the write caller is unblocked
@@ -202,10 +213,11 @@ pub struct VolumeHandle {
     /// Per-handle file-handle cache.  Never contended: each ublk queue thread
     /// holds its own clone.  `RefCell` is sufficient; `Mutex` is not needed.
     file_cache: RefCell<Option<(String, fs::File)>>,
-    /// Shared promotion counter.  The actor increments this after every WAL
-    /// promotion.  The handle compares its `last_flush_gen` against it before
-    /// each read; if they differ the file cache is stale and must be cleared.
-    flush_gen: Arc<AtomicU64>,
+    /// Generation of the last snapshot whose extent index offsets were used to
+    /// populate `file_cache`.  Compared against `ReadSnapshot::flush_gen` on
+    /// every read; if they differ the cache is evicted before proceeding.
+    /// Reading both the generation and the extent index from the same snapshot
+    /// load means the two are always in sync — no separate atomic needed.
     last_flush_gen: Cell<u64>,
 }
 
@@ -217,14 +229,12 @@ unsafe impl Send for VolumeHandle {}
 
 impl Clone for VolumeHandle {
     fn clone(&self) -> Self {
-        let flush_gen = Arc::clone(&self.flush_gen);
-        let current_gen = flush_gen.load(Ordering::Acquire);
+        let current_gen = self.snapshot.load().flush_gen;
         Self {
             tx: self.tx.clone(),
             snapshot: Arc::clone(&self.snapshot),
             config: Arc::clone(&self.config),
             file_cache: RefCell::new(None), // fresh cache per clone/thread
-            flush_gen,
             last_flush_gen: Cell::new(current_gen),
         }
     }
@@ -274,16 +284,14 @@ impl VolumeHandle {
     /// — no channel round-trip.  Reflects all writes that have returned `Ok`,
     /// including those not yet flushed to disk (read-your-writes guarantee).
     pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
-        // Evict the file cache if a WAL promotion has occurred since the last
-        // read.  After promotion the body offsets in the extent index change
-        // from WAL-format to segment-format; a cached WAL fd would cause
-        // reads to seek to the wrong position.
-        let current_gen = self.flush_gen.load(Ordering::Acquire);
-        if current_gen != self.last_flush_gen.get() {
-            *self.file_cache.borrow_mut() = None;
-            self.last_flush_gen.set(current_gen);
-        }
+        // Load the snapshot first.  flush_gen is embedded in the snapshot so
+        // the generation and the extent index offsets are always consistent —
+        // a single ArcSwap::load() gives both atomically with no window.
         let snap = self.snapshot.load();
+        if snap.flush_gen != self.last_flush_gen.get() {
+            *self.file_cache.borrow_mut() = None;
+            self.last_flush_gen.set(snap.flush_gen);
+        }
         read_extents(
             lba,
             lba_count,
@@ -323,6 +331,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     let initial = Arc::new(ReadSnapshot {
         lbamap,
         extent_index,
+        flush_gen: 0,
     });
     let snapshot = Arc::new(ArcSwap::new(initial));
 
@@ -335,13 +344,12 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
     let (tx, rx) = bounded(64);
-    let flush_gen = Arc::new(AtomicU64::new(0));
 
     let actor = VolumeActor {
         volume,
         snapshot: Arc::clone(&snapshot),
         rx,
-        flush_gen: Arc::clone(&flush_gen),
+        flush_gen: 0,
     };
 
     let handle = VolumeHandle {
@@ -350,7 +358,6 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         config,
         file_cache: RefCell::new(None),
         last_flush_gen: Cell::new(0),
-        flush_gen,
     };
 
     (actor, handle)
