@@ -72,10 +72,6 @@ enum Command {
         /// Skip the fork.origin hostname/path check (use after an intentional move)
         #[arg(long)]
         force_origin: bool,
-        /// Idle seconds before unflushed WAL writes are automatically promoted to
-        /// a pending segment. 0 disables. Default: 10.
-        #[arg(long, default_value_t = 10u64)]
-        auto_flush: u64,
     },
     /// Extract kernel and initrd from an ext4 image's /boot directory
     ExtractBoot {
@@ -214,7 +210,6 @@ fn main() {
             port,
             readonly,
             force_origin,
-            auto_flush,
         } => {
             let vol_path = Path::new(&vol_dir);
             let fork_dir = vol_path.join("forks").join(&fork);
@@ -257,18 +252,8 @@ fn main() {
                     elide_core::signing::load_signer(&fork_dir, FORK_KEY_FILE)
                         .expect("failed to load fork signing key")
                 };
-                let flush_dur =
-                    (auto_flush > 0).then(|| std::time::Duration::from_secs(auto_flush));
-                nbd::run_volume_signed(
-                    &fork_dir,
-                    size_bytes,
-                    &bind,
-                    port,
-                    signer,
-                    fetch_config,
-                    flush_dur,
-                )
-                .expect("volume NBD server error");
+                nbd::run_volume_signed(&fork_dir, size_bytes, &bind, port, signer, fetch_config)
+                    .expect("volume NBD server error");
             }
         }
 

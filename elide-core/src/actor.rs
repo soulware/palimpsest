@@ -20,9 +20,11 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, tick};
+use log::warn;
 
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
@@ -97,28 +99,61 @@ pub struct VolumeActor {
     rx: Receiver<VolumeRequest>,
 }
 
+/// Idle period after which the actor promotes a non-empty WAL to a pending
+/// segment even without an explicit flush request.  10 seconds is a
+/// conservative value chosen for observability during development; it can be
+/// tightened without any correctness implications.
+const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+
 impl VolumeActor {
     pub fn run(mut self) {
-        while let Ok(req) = self.rx.recv() {
-            match req {
-                VolumeRequest::Write { lba, data, reply } => {
-                    let result = self.volume.write(lba, &data);
-                    if result.is_ok() {
-                        let (lbamap, extent_index) = self.volume.snapshot_maps();
-                        self.snapshot.store(Arc::new(ReadSnapshot {
-                            lbamap,
-                            extent_index,
-                        }));
+        let idle_tick = tick(IDLE_FLUSH_INTERVAL);
+        loop {
+            crossbeam_channel::select! {
+                recv(self.rx) -> msg => {
+                    let req = match msg {
+                        Ok(r) => r,
+                        Err(_) => return, // all handles dropped
+                    };
+                    match req {
+                        VolumeRequest::Write { lba, data, reply } => {
+                            let result = self.volume.write(lba, &data);
+                            if result.is_ok() {
+                                let (lbamap, extent_index) = self.volume.snapshot_maps();
+                                self.snapshot.store(Arc::new(ReadSnapshot {
+                                    lbamap,
+                                    extent_index,
+                                }));
+                            }
+                            // Reply before promoting: the write caller is unblocked
+                            // immediately after the WAL append.  The promote cost
+                            // (fsync + segment write) is paid before the next
+                            // queued message is processed, not by this caller.
+                            let _ = reply.send(result);
+                            if self.volume.needs_promote()
+                                && let Err(e) = self.volume.flush_wal()
+                            {
+                                warn!("threshold-triggered promote failed: {e}");
+                            }
+                        }
+                        VolumeRequest::Flush { reply } => {
+                            let _ = reply.send(self.volume.flush_wal());
+                        }
+                        VolumeRequest::Compact { reply } => {
+                            let _ = reply.send(self.volume.compact_pending());
+                        }
+                        VolumeRequest::Shutdown => return,
                     }
-                    let _ = reply.send(result);
                 }
-                VolumeRequest::Flush { reply } => {
-                    let _ = reply.send(self.volume.flush_wal());
+                recv(idle_tick) -> _ => {
+                    // Promote any unflushed WAL data that has been sitting idle.
+                    // No-op if the WAL is empty.  Errors are logged and not fatal:
+                    // the data is safe in the WAL; the next write or explicit
+                    // flush will retry.
+                    if let Err(e) = self.volume.flush_wal() {
+                        warn!("idle flush failed: {e}");
+                    }
                 }
-                VolumeRequest::Compact { reply } => {
-                    let _ = reply.send(self.volume.compact_pending());
-                }
-                VolumeRequest::Shutdown => break,
             }
         }
     }

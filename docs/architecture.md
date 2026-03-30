@@ -391,11 +391,19 @@ The intended integration pattern is **actor + snapshot**:
 
 **Read-your-writes:** the snapshot is published after every `write()` call, before the response is sent back to the caller. Any read issued after a write has returned will see that write, regardless of whether it has been flushed to a `pending/` segment — the same guarantee a physical disk provides.
 
+**WAL promotion (decoupled from writes):** `Volume::write()` only appends to the WAL and updates the in-memory maps — it never touches the segment layer. The actor is responsible for promoting the WAL to a `pending/` segment via two mechanisms:
+
+1. **Threshold-triggered:** after sending the write reply, the actor checks `Volume::needs_promote()`. If the WAL has reached the 32 MiB soft cap, it calls `flush_wal()` immediately — before processing the next queued message. The write caller is already unblocked; the cost is borne by the next message in the queue.
+
+2. **Idle-flush tick:** the actor run loop uses `crossbeam_channel::tick(10s)` alongside the request channel. When the tick fires and the WAL is non-empty, `flush_wal()` is called. This ensures data is promoted even under low or zero write load. The interval is 10 seconds (chosen for observability during development; tightening it later is a one-line change).
+
+Background promotes that fail (I/O error, disk full) are logged and do not crash the actor — the data is safe in the WAL. The next explicit `Flush` or threshold-triggered promote will surface the error.
+
 **Why `crossbeam-channel`:** the actor loop and NBD/ublk handlers are synchronous threads; `crossbeam-channel` is a natural fit. When ublk integration uses io_uring, ublk queue threads remain synchronous callers — they block on the `Sender` and the actor thread owns the `Receiver`. If a fully async actor is ever needed, `crossbeam-channel` bridges cleanly into async runtimes via `block_on`.
 
 **Why this enables ublk:** ublk supports multiple queues, each driven by a separate thread. Each queue thread holds a cloned `VolumeHandle`. Reads fan out across queue threads with no contention; writes and flushes serialise through the actor. No `Mutex<Volume>` is needed anywhere.
 
-**Current state (NBD):** the NBD server is single-threaded (one TCP connection, 200ms read timeout for the idle/auto-flush arm). It uses a `VolumeHandle` through a single thread — the concurrency benefit is not yet exercised, but the structure is correct for ublk when that integration is added.
+**Current state (NBD):** the NBD server is single-threaded (one TCP connection). It uses a `VolumeHandle` through a single thread — the concurrency benefit is not yet exercised, but the structure is correct for ublk when that integration is added.
 
 **Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
 

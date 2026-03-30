@@ -357,9 +357,6 @@ impl Volume {
             Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
             self.pending_entries
                 .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
-            if self.wal.size() >= FLUSH_THRESHOLD {
-                self.promote()?;
-            }
             return Ok(());
         }
 
@@ -395,10 +392,6 @@ impl Volume {
         self.pending_entries.push(segment::SegmentEntry::new_data(
             hash, lba, lba_length, seg_flags, owned_data,
         ));
-
-        if self.wal.size() >= FLUSH_THRESHOLD {
-            self.promote()?;
-        }
 
         Ok(())
     }
@@ -917,6 +910,15 @@ impl Volume {
             return Ok(());
         }
         self.promote()
+    }
+
+    /// True if the WAL has reached the 32 MiB soft cap and should be promoted.
+    ///
+    /// The actor calls this after every write reply and promotes if true.
+    /// The check is separated from `write()` so that writes are always fast
+    /// (WAL append only) and the promotion cost is never borne by the write caller.
+    pub fn needs_promote(&self) -> bool {
+        self.wal.size() >= FLUSH_THRESHOLD
     }
 
     pub fn promote_for_test(&mut self) -> io::Result<()> {
@@ -1471,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn write_promotes_on_flush() {
+    fn write_sets_needs_promote_after_threshold() {
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
 
@@ -1486,6 +1488,15 @@ mod tests {
             }
             vol.write(i * 256, &block).unwrap();
         }
+
+        // writes no longer auto-promote; needs_promote() should be true.
+        assert!(
+            vol.needs_promote(),
+            "expected needs_promote() after 33 MiB of writes"
+        );
+
+        // Explicit flush_wal() should promote to pending/.
+        vol.flush_wal().unwrap();
 
         // At least one segment should have been promoted to pending/.
         let has_pending = fs::read_dir(base.join("pending"))

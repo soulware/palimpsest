@@ -4,19 +4,13 @@ Ongoing system behaviour: S3 upload, garbage collection, repacking, and filesyst
 
 ## WAL Promotion
 
-The WAL is promoted to a `pending/` segment in two ways:
+The WAL is promoted to a `pending/` segment in two ways, both handled by the `VolumeActor`:
 
-**Size threshold (32 MB):** every write checks whether the WAL has crossed 32 MB. If so, `promote()` is called immediately before the write returns. This is a soft cap — a single write larger than 32 MB will still succeed, producing an oversized segment.
+**Size threshold (32 MB):** after every write reply is sent, the actor checks `Volume::needs_promote()`. If the WAL has reached 32 MB, `flush_wal()` is called before the next queued message is processed. This is a soft cap — a single write larger than 32 MB will still succeed, producing an oversized segment. Crucially, the write caller receives its reply before the promote runs; the cost is borne by the next queued operation, not the caller that crossed the threshold.
 
-**Idle flush:** `serve-volume` watches for write inactivity and promotes the WAL automatically after the configured idle period. This ensures that a short burst of writes — e.g. writing a few files from a VM — lands in `pending/` without requiring an explicit `snapshot-volume` call.
+**Idle flush:** the actor run loop selects on a 10-second tick alongside the request channel. When the tick fires and the WAL is non-empty, `flush_wal()` is called. This ensures that a short burst of writes — e.g. writing a few files from a VM — lands in `pending/` without requiring an explicit `snapshot-volume` call. The interval is 10 seconds (conservative for development observability).
 
-```
-elide serve-volume <vol-dir> <fork> --auto-flush <SECS>
-```
-
-`--auto-flush` defaults to **10 seconds**. Pass `0` to disable. The server prints `[auto-flush: Xs idle]` at startup to confirm the setting. During an idle window, the 200 ms read-timeout loop checks whether `last_write.elapsed() >= threshold`; if so, `flush_wal()` is called and `last_write` is cleared. A subsequent write resets the timer.
-
-Both triggers call the same `promote()` path, producing an identical segment format. Neither is on the fsync critical path — a guest `fsync` returns as soon as the WAL record is durable; promotion happens inline on the next write (size trigger) or on the idle timer.
+Both triggers call the same `flush_wal()` → `promote()` path, producing an identical segment format. Neither is on the guest-fsync critical path — `NBD_CMD_FLUSH` sends an explicit `Flush` message through the actor channel and blocks until it completes.
 
 ## Coordinator Daemon
 

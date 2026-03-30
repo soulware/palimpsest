@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use elide_core::volume::{ReadonlyVolume, Volume};
 
@@ -477,7 +477,7 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener, None, None, None)
+    serve_volume_listener(dir, size_bytes, listener, None, None)
 }
 
 /// Serve a fork over NBD with a signing key attached.
@@ -492,7 +492,6 @@ pub fn run_volume_signed(
     port: u16,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
     fetch_config: Option<crate::fetcher::FetchConfig>,
-    auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
@@ -508,14 +507,7 @@ pub fn run_volume_signed(
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(
-        dir,
-        size_bytes,
-        listener,
-        Some(signer),
-        fetch_config,
-        auto_flush,
-    )
+    serve_volume_listener(dir, size_bytes, listener, Some(signer), fetch_config)
 }
 
 /// Serve a fork as a read-only NBD device.
@@ -732,7 +724,6 @@ fn serve_volume_listener(
     listener: TcpListener,
     signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<crate::fetcher::FetchConfig>,
-    auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
@@ -748,10 +739,6 @@ fn serve_volume_listener(
         println!("[demand-fetch enabled]");
     }
 
-    if let Some(d) = auto_flush {
-        println!("[auto-flush: {}s idle]", d.as_secs());
-    }
-
     let (actor, handle) = elide_core::actor::spawn(volume);
     let _actor_thread = std::thread::Builder::new()
         .name("volume-actor".into())
@@ -762,7 +749,7 @@ fn serve_volume_listener(
         let stream = stream?;
         println!("[connected: {}]", stream.peer_addr()?);
 
-        let result = handle_volume_connection(stream, &handle, size_bytes, auto_flush);
+        let result = handle_volume_connection(stream, &handle, size_bytes);
 
         match result {
             Ok(()) => println!("[disconnected]"),
@@ -779,7 +766,6 @@ fn handle_volume_connection(
     mut s: TcpStream,
     volume: &elide_core::actor::VolumeHandle,
     volume_size: u64,
-    auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
     // Newstyle handshake
     s.write_all(&NBD_MAGIC.to_be_bytes())?;
@@ -852,39 +838,9 @@ fn handle_volume_connection(
     // Transmission loop
     let mut reads: u64 = 0;
     let mut writes: u64 = 0;
-    let mut last_write: Option<std::time::Instant> = None;
-    s.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
     loop {
-        let magic = match read_u32(&mut s) {
-            Ok(m) => m,
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                if let (Some(threshold), Some(t)) = (auto_flush, last_write)
-                    && t.elapsed() >= threshold
-                {
-                    match volume.flush() {
-                        Err(e) => warn!("[auto-flush error: {}]", e),
-                        Ok(()) => {
-                            last_write = None;
-                            match volume.compact_pending() {
-                                Err(e) => warn!("[compact-pending error: {}]", e),
-                                Ok(s) if s.segments_compacted > 0 => info!(
-                                    "[compact-pending: {} → {} segments, {:.1} MB reclaimed]",
-                                    s.segments_compacted,
-                                    s.new_segments,
-                                    s.bytes_freed as f64 / 1_048_576.0,
-                                ),
-                                Ok(_) => {}
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
+        let magic = read_u32(&mut s)?;
         if magic != NBD_REQUEST_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -936,9 +892,6 @@ fn handle_volume_connection(
                 };
                 match result {
                     Ok(()) => {
-                        if auto_flush.is_some() {
-                            last_write = Some(std::time::Instant::now());
-                        }
                         tx_reply(&mut s, 0, handle)?;
                     }
                     Err(e) => {
