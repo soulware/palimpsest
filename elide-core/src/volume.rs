@@ -491,7 +491,12 @@ impl Volume {
             }
 
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
-                entries.drain(..).partition(|e| live.contains(&e.hash));
+                entries.drain(..).partition(|e| {
+                    if e.is_dedup_ref {
+                        return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
+                    }
+                    live.contains(&e.hash)
+                });
 
             // Remove dead entries from the extent index (only those pointing at
             // this segment — entries pointing elsewhere belong to another copy).
@@ -616,9 +621,16 @@ impl Volume {
                 any_dead = true;
             }
 
-            let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries
-                .drain(..)
-                .partition(|e| e.is_dedup_ref || live.contains(&e.hash));
+            let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries.drain(..).partition(|e| {
+                if e.is_dedup_ref {
+                    // A dedup ref is only live if the LBA still maps to
+                    // this hash. If the LBA was overwritten with different
+                    // data, carrying the stale ref would reintroduce the
+                    // old mapping after crash + rebuild.
+                    return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
+                }
+                live.contains(&e.hash)
+            });
 
             let dead_bytes: u64 = dead_entries
                 .iter()

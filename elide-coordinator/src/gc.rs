@@ -60,7 +60,7 @@ use tokio::time::MissedTickBehavior;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
-use elide_core::lbamap;
+use elide_core::lbamap::{self, LbaMap};
 use elide_core::segment::{self, SegmentEntry};
 use elide_core::volume::latest_snapshot;
 
@@ -220,7 +220,7 @@ pub async fn gc_fork(
         .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
         .transpose()?;
 
-    let all_stats = collect_stats(&segments_dir, &index, &live_hashes, floor)
+    let all_stats = collect_stats(&segments_dir, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
 
     // Strategy 1: density pass — compact the single least-dense segment.
@@ -436,6 +436,7 @@ fn collect_stats(
     segments_dir: &Path,
     index: &ExtentIndex,
     live_hashes: &HashSet<blake3::Hash>,
+    lba_map: &LbaMap,
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
     let mut segment_files = segment::collect_segment_files(segments_dir)?;
@@ -465,8 +466,18 @@ fn collect_stats(
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
         for entry in entries {
-            // Inline is currently disabled (INLINE_THRESHOLD = 0); skip for safety.
-            if entry.is_dedup_ref || entry.is_inline {
+            if entry.is_inline {
+                continue;
+            }
+            // Dedup refs have no body bytes, but carry an LBA mapping. A ref
+            // is only live if the LBA still maps to its hash — otherwise the
+            // LBA was overwritten and the ref would reintroduce a stale
+            // mapping into the GC output.
+            if entry.is_dedup_ref {
+                let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+                if lba_live {
+                    live_entries.push(entry);
+                }
                 continue;
             }
             total_body_bytes += entry.stored_length as u64;

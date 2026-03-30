@@ -70,9 +70,11 @@ pub fn simulate_coord_gc_local(
     // gc_checkpoint flushed the WAL, so the rebuild sees all committed writes.
     // An entry is only carried into the GC output if its hash is both
     // extent-index-live and LBA-map-live, preventing stale LBA entries from
-    // being compacted into the output.
+    // being compacted into the output.  Dedup-ref entries are also checked:
+    // a ref is only carried if the LBA still maps to the ref's hash.
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-    let live_hashes = lbamap::rebuild_segments(&rebuild_chain).ok()?.live_hashes();
+    let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    let live_hashes = lba_map.live_hashes();
     let extent_index = elide_core::extentindex::rebuild(&rebuild_chain).ok()?;
 
     // Track per-entry source ULIDs separately since SegmentEntry doesn't
@@ -91,9 +93,15 @@ pub fn simulate_coord_gc_local(
         }
         for entry in entries.drain(..) {
             if entry.is_dedup_ref {
-                // Always carry dedup refs so the oracle can resolve hashes.
-                source_ulids.push(*ulid);
-                all_entries.push(entry);
+                // Carry a dedup ref only if the LBA still maps to this hash.
+                // A stale ref (LBA was overwritten with different data) must
+                // be dropped — otherwise it reintroduces the old LBA mapping
+                // into the GC output and corrupts reads after rebuild.
+                let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+                if lba_live {
+                    source_ulids.push(*ulid);
+                    all_entries.push(entry);
+                }
                 continue;
             }
             // Check extent-level liveness: extent index points at this segment.
