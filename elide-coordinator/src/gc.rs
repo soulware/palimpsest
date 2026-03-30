@@ -18,11 +18,11 @@
 // Per-tick work is bounded in both cases: Strategy 1 processes one segment;
 // Strategy 2 is capped at 32 MiB of live data.
 //
-// Handoff protocol (volume side not yet implemented):
+// Handoff protocol:
 //   Coordinator writes gc/<new-ulid>.pending — one line per moved extent:
 //     <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_offset>
-//   Volume applies the patches to its in-memory extent index, then renames
-//   the file to gc/<new-ulid>.applied.
+//   Volume reads the new segment's index, applies the patches to its in-memory
+//   extent index on the next idle tick, then renames the file to gc/<new-ulid>.applied.
 //   Coordinator deletes old S3 objects and renames to gc/<new-ulid>.done.
 //
 // A pass is deferred if any .pending files already exist (at most one

@@ -190,6 +190,22 @@ impl VolumeActor {
                     } else {
                         self.after_promote();
                     }
+                    // Apply any GC handoff files written by the coordinator.
+                    // No flush_gen bump: GC is a segment-to-segment move; body
+                    // offsets remain absolute and the fd cache's segment-id
+                    // mismatch detection handles eviction naturally.
+                    match self.volume.apply_gc_handoffs() {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            let (lbamap, extent_index) = self.volume.snapshot_maps();
+                            self.snapshot.store(Arc::new(ReadSnapshot {
+                                lbamap,
+                                extent_index,
+                                flush_gen: self.flush_gen,
+                            }));
+                        }
+                        Err(e) => warn!("gc handoff apply failed: {e}"),
+                    }
                 }
             }
         }

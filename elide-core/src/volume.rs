@@ -4,6 +4,7 @@
 //   <base>/wal/       — active write-ahead log (at most one file at a time)
 //   <base>/pending/   — promoted segments awaiting S3 upload
 //   <base>/segments/  — segments confirmed uploaded to S3 (evictable)
+//   <base>/gc/        — coordinator GC handoff files (*.pending → *.applied → *.done)
 //
 // Write path:
 //   1. Volume::write(lba, data) — hashes data, appends to WAL, updates LBA map
@@ -717,6 +718,101 @@ impl Volume {
         }
 
         Ok(stats)
+    }
+
+    /// Apply any pending GC handoff files written by the coordinator.
+    ///
+    /// The coordinator writes `gc/<new-ulid>.pending` after compacting segments
+    /// in `segments/` and uploading the result to S3.  Each file signals that
+    /// `segments/<new-ulid>` is complete and ready to be used.
+    ///
+    /// For each `.pending` file this method reads the compacted segment's index
+    /// to obtain authoritative `body_offset`, `body_length`, and `compressed`
+    /// values, updates the in-memory extent index, and renames the file to
+    /// `gc/<new-ulid>.applied`.  The coordinator monitors `.applied` files and
+    /// uses them as the signal to delete the superseded S3 objects.
+    ///
+    /// Idempotent and crash-safe: if the process is killed after updating the
+    /// extent index but before the rename, the `.pending` file remains and the
+    /// update is re-applied on the next call with identical results.
+    ///
+    /// Returns the number of handoff files applied.  Returns `Ok(0)` if the
+    /// `gc/` directory does not exist yet (coordinator has not run).
+    pub fn apply_gc_handoffs(&mut self) -> io::Result<usize> {
+        let gc_dir = self.base_dir.join("gc");
+        if !gc_dir.try_exists()? {
+            return Ok(0);
+        }
+
+        let mut pending: Vec<fs::DirEntry> = fs::read_dir(&gc_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.ends_with(".pending"))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // Process oldest-first so the extent index is correct after a partial run.
+        pending.sort_by_key(|e| e.file_name());
+
+        let segments_dir = self.base_dir.join("segments");
+        let mut count = 0;
+
+        for entry in &pending {
+            let filename = entry.file_name();
+            let name = filename
+                .to_str()
+                .ok_or_else(|| io::Error::other("gc filename is not valid UTF-8"))?;
+            let new_ulid = name
+                .strip_suffix(".pending")
+                .ok_or_else(|| io::Error::other("expected .pending suffix"))?;
+
+            // Validate the ULID so we never act on a malformed filename.
+            Ulid::from_string(new_ulid).map_err(|e| io::Error::other(e.to_string()))?;
+
+            let segment_path = segments_dir.join(new_ulid);
+
+            // The segment may not be present locally yet (e.g. only in S3 and
+            // not yet fetched).  Skip and retry on the next idle tick.
+            if !segment_path.try_exists()? {
+                continue;
+            }
+
+            // Read the compacted segment's index.  `read_segment_index` gives us
+            // body_section_start so we can compute absolute body offsets, plus
+            // body_length and compressed — fields the .pending file does not carry.
+            let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
+
+            for e in &entries {
+                if e.is_dedup_ref {
+                    continue;
+                }
+                Arc::make_mut(&mut self.extent_index).insert(
+                    e.hash,
+                    extentindex::ExtentLocation {
+                        segment_id: new_ulid.to_owned(),
+                        body_offset: body_section_start + e.stored_offset,
+                        body_length: e.stored_length,
+                        compressed: e.compressed,
+                    },
+                );
+            }
+
+            // Rename to .applied — signals the coordinator it is safe to delete
+            // superseded S3 objects.
+            let applied_path = gc_dir.join(format!("{new_ulid}.applied"));
+            fs::rename(entry.path(), &applied_path)?;
+
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     /// Flush the current WAL to a segment in this node's `pending/`, update
