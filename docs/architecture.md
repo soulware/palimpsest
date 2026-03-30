@@ -379,11 +379,15 @@ The intended integration pattern is **actor + snapshot**:
 
 **`VolumeActor`** owns a `Volume` exclusively and processes requests from a `crossbeam-channel` bounded channel sequentially. It is the sole thread that mutates the fork. After every `write()` call, it publishes a new `ReadSnapshot` via an `ArcSwap`.
 
-**`VolumeHandle`** is the shareable client handle — `Clone + Send + Sync`. It holds:
+**`VolumeHandle`** is the shareable client handle — `Clone + Send`. It holds:
 - A `crossbeam_channel::Sender<VolumeRequest>` to the actor
 - An `Arc<ArcSwap<ReadSnapshot>>` for the lock-free read path
+- A per-handle file-descriptor cache (`RefCell<Option<(String, File)>>`) so sequential reads hitting the same segment avoid repeated `open` syscalls. Each clone gets a fresh empty cache — handles are not `Sync` and are intended for exclusive use by one thread.
+- `last_flush_gen: Cell<u64>` — tracks the last snapshot generation whose offsets populated the fd cache. Compared against `ReadSnapshot::flush_gen` on every read.
 
-**`ReadSnapshot`** is an immutable view of the current LBA map and extent index sufficient to serve any read. It holds `Arc<LbaMap>` and `Arc<ExtentIndex>`. The actor stores its live maps as `Arc<LbaMap>` / `Arc<ExtentIndex>` internally; publishing a snapshot is an `Arc::clone()` — O(1) unless a reader is still holding the previous version, in which case the next write triggers a copy-on-write clone via `Arc::make_mut`. In practice reads complete in microseconds, so the refcount is almost always 1.
+**`ReadSnapshot`** is an immutable view sufficient to serve any read. It holds:
+- `Arc<LbaMap>` and `Arc<ExtentIndex>` — the actor stores its live maps as `Arc`s; publishing a snapshot is an `Arc::clone()` — O(1) unless a reader is still holding the previous version, in which case the next write triggers a copy-on-write clone via `Arc::make_mut`. In practice reads complete in microseconds, so the refcount is almost always 1.
+- `flush_gen: u64` — a promotion counter incremented by the actor after every WAL promotion. Handles compare this against a cached value before each read; if it changed they evict their file-descriptor cache before proceeding. Embedding the counter inside the snapshot means a handle always sees a consistent pair: the post-promote extent index offsets and the corresponding generation arrive together in a single `ArcSwap::load()`. There is no window in which a handle could observe new offsets without knowing to evict its cache, or vice versa.
 
 **Request flow:**
 - `Write`, `Flush`, `CompactPending` — sent through the channel with an attached `crossbeam_channel::Sender` for the response. The actor processes them in arrival order and replies when done.
