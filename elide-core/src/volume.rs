@@ -3097,15 +3097,13 @@ mod tests {
         // Drain: pending/<old_ulid> → segments/<old_ulid>.
         let pending_dir = base.join("pending");
         let segments_dir = base.join("segments");
-        let old_ulid = fs::read_dir(&pending_dir)
+        let entry = fs::read_dir(&pending_dir)
             .unwrap()
             .flatten()
             .next()
-            .unwrap()
-            .file_name()
-            .to_str()
-            .unwrap()
-            .to_owned();
+            .unwrap();
+        let filename = entry.file_name();
+        let old_ulid = filename.to_str().unwrap().to_owned();
         fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
 
         // Coordinator GC: compact into new segment, write .pending.
@@ -3174,15 +3172,13 @@ mod tests {
             // Drain.
             let pending_dir = base.join("pending");
             let segments_dir = base.join("segments");
-            old_ulid = fs::read_dir(&pending_dir)
+            let entry = fs::read_dir(&pending_dir)
                 .unwrap()
                 .flatten()
                 .next()
-                .unwrap()
-                .file_name()
-                .to_str()
-                .unwrap()
-                .to_owned();
+                .unwrap();
+            let filename = entry.file_name();
+            old_ulid = filename.to_str().unwrap().to_owned();
             fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
 
             // Coordinator GC: new segment + .pending written.
