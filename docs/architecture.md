@@ -413,6 +413,16 @@ Background promotes that fail (I/O error, disk full) are logged and do not crash
 
 The volume actor processes `gc/*.pending` files on its idle tick. For each file it reads the compacted segment's index to get authoritative `body_offset`, `body_length`, and `compressed` values (the handoff file records the new absolute offset but omits length and compression flag), updates the in-memory extent index, and renames the file to `.applied`. No `flush_gen` bump is needed — GC moves data between segment files only, so body offsets remain absolute and the fd cache's existing segment-id mismatch detection handles eviction naturally when reads switch from the old segment to the new one. The update is idempotent: if the process is killed before the rename, the handoff is re-applied on the next idle tick with identical extent index results.
 
+The coordinator processes `gc/*.applied` files at the start of each GC tick. For each `.applied` file it parses the old segment ULIDs from the handoff content, deletes the corresponding S3 objects, removes the old local segment files from `segments/`, and renames the file to `.done`. S3 404 on delete is treated as success (idempotent across coordinator crashes). The `.done` files are inert markers retained for observability.
+
+**Ownership of local `segments/` deletion:** the coordinator — not the volume — deletes local segment files from `segments/`. This follows from the credential split: the coordinator owns all S3 mutations, and `segments/` files are local caches of S3 objects the coordinator uploaded. The volume never deletes from `segments/`; if it needs data after the coordinator has removed a local cache file, it demand-fetches from S3.
+
+**Race tolerance:** LBA map and extent index rebuild (`Volume::open`) collect file paths from `segments/` and then read each one. If the coordinator deletes a segment file between path collection and the read, the rebuild skips the missing file with a warning rather than failing. This is always correct: the new compacted segment (with a higher ULID) is also present in `segments/` and its entries will overwrite whatever the deleted segment would have contributed. The same tolerance is applied in `compact()` when it scans `segments/`.
+
+**The `.pending` file is written atomically** (tmp file + rename) to prevent a coordinator crash from leaving a partial handoff that the volume might misparse or that `apply_done_handoffs` might read with missing old ULIDs.
+
+**All-dead segments** bypass the handoff protocol entirely. If all extents in the GC candidates are dead (no extent index entry references them), the coordinator deletes the S3 objects and local files directly — no `.pending` file is written, because the volume has nothing to remap.
+
 ### Operations
 
 Implemented:
