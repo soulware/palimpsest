@@ -3036,4 +3036,182 @@ mod tests {
 
         fs::remove_dir_all(vol_dir).unwrap();
     }
+
+    // --- apply_gc_handoffs tests ---
+    //
+    // These tests simulate the coordinator GC workflow:
+    //   write → flush → drain (pending→segments) → coordinator compacts into
+    //   new segment + writes gc/*.pending → volume applies handoff.
+
+    /// Simulate one coordinator GC pass: read the given segment, write a
+    /// compacted copy with a new ULID into segments/, and write gc/<new>.pending.
+    /// Returns the new ULID string.  Does NOT delete the old segment — tests
+    /// that need to verify post-cleanup reads do so explicitly.
+    fn simulate_coord_gc(fork_dir: &Path, old_ulid: &str) -> String {
+        use crate::segment;
+
+        let segments_dir = fork_dir.join("segments");
+        let old_path = segments_dir.join(old_ulid);
+        let (old_bss, mut entries) = segment::read_segment_index(&old_path).unwrap();
+        segment::read_extent_bodies(&old_path, old_bss, &mut entries).unwrap();
+
+        let old = Ulid::from_string(old_ulid).unwrap();
+        let new_ulid = old
+            .increment()
+            .unwrap_or_else(|| Ulid::from_parts(old.timestamp_ms() + 1, 0))
+            .to_string();
+
+        let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
+        let new_bss = segment::write_segment(&tmp_path, &mut entries, None).unwrap();
+        fs::rename(&tmp_path, segments_dir.join(&new_ulid)).unwrap();
+
+        // Write the handoff file.  Our apply_gc_handoffs reads the segment
+        // index directly, so the content is informational only — but write
+        // the correct format so the file is realistic.
+        let gc_dir = fork_dir.join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        let mut lines = String::new();
+        for e in &entries {
+            if !e.is_dedup_ref {
+                let abs_offset = new_bss + e.stored_offset;
+                lines.push_str(&format!(
+                    "{} {} {} {}\n",
+                    e.hash, old_ulid, new_ulid, abs_offset
+                ));
+            }
+        }
+        fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines).unwrap();
+
+        new_ulid
+    }
+
+    #[test]
+    fn gc_handoff_applies_and_renames() {
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let data = vec![0x42u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Drain: pending/<old_ulid> → segments/<old_ulid>.
+        let pending_dir = base.join("pending");
+        let segments_dir = base.join("segments");
+        let old_ulid = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+
+        // Coordinator GC: compact into new segment, write .pending.
+        let new_ulid = simulate_coord_gc(&base, &old_ulid);
+
+        // Apply the handoff.
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+
+        // .pending was renamed to .applied.
+        let gc_dir = base.join("gc");
+        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
+        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
+
+        // Extent index now points to new_ulid — simulate coordinator cleanup
+        // by removing the old segment and verify reads still work.
+        fs::remove_file(segments_dir.join(&old_ulid)).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_handoff_skips_missing_segment() {
+        // gc/*.pending exists but segments/<new_ulid> has not yet been fetched
+        // locally.  apply_gc_handoffs must skip the file and return Ok(0) so
+        // the next idle tick retries when the segment is available.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let gc_dir = base.join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+
+        // Use a plausible ULID that has no matching segment file.
+        let phantom_ulid = Ulid::new().to_string();
+        let pending_path = gc_dir.join(format!("{phantom_ulid}.pending"));
+        fs::write(&pending_path, "").unwrap();
+
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 0);
+
+        // File must still be present — not renamed or deleted.
+        assert!(pending_path.exists());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_handoff_idempotent_after_crash() {
+        // Simulate a crash between coordinator writing .pending and the volume
+        // processing it.  After reopen, the extent index is rebuilt from
+        // segments/ (which includes the new compacted segment), so reads are
+        // correct before the handoff is applied.  Calling apply_gc_handoffs
+        // then renames .pending → .applied.
+        let base = temp_dir();
+
+        let old_ulid;
+        let new_ulid;
+        let data = vec![0xABu8; 4096];
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+
+            // Drain.
+            let pending_dir = base.join("pending");
+            let segments_dir = base.join("segments");
+            old_ulid = fs::read_dir(&pending_dir)
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+
+            // Coordinator GC: new segment + .pending written.
+            new_ulid = simulate_coord_gc(&base, &old_ulid);
+
+            // Coordinator deletes old local segment (data is in new segment +
+            // S3; volume hasn't processed the handoff yet).
+            fs::remove_file(segments_dir.join(&old_ulid)).unwrap();
+
+            // "Crash" — drop the volume before apply_gc_handoffs runs.
+        }
+
+        // Reopen: rebuild scans segments/ and finds <new_ulid>.  Reads work
+        // even though the in-memory extent index from before the crash pointed
+        // at the now-deleted old segment.
+        let mut vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        // Now apply the pending handoff — must succeed and rename the file.
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+
+        let gc_dir = base.join("gc");
+        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
+        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
+
+        // Reads still correct after the handoff.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }
