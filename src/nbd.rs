@@ -752,11 +752,17 @@ fn serve_volume_listener(
         println!("[auto-flush: {}s idle]", d.as_secs());
     }
 
+    let (actor, handle) = elide_core::actor::spawn(volume);
+    let _actor_thread = std::thread::Builder::new()
+        .name("volume-actor".into())
+        .spawn(move || actor.run())
+        .map_err(io::Error::other)?;
+
     for stream in listener.incoming() {
         let stream = stream?;
         println!("[connected: {}]", stream.peer_addr()?);
 
-        let result = handle_volume_connection(stream, &mut volume, size_bytes, auto_flush);
+        let result = handle_volume_connection(stream, &handle, size_bytes, auto_flush);
 
         match result {
             Ok(()) => println!("[disconnected]"),
@@ -771,7 +777,7 @@ fn serve_volume_listener(
 
 fn handle_volume_connection(
     mut s: TcpStream,
-    volume: &mut Volume,
+    volume: &elide_core::actor::VolumeHandle,
     volume_size: u64,
     auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
@@ -858,7 +864,7 @@ fn handle_volume_connection(
                 if let (Some(threshold), Some(t)) = (auto_flush, last_write)
                     && t.elapsed() >= threshold
                 {
-                    match volume.flush_wal() {
+                    match volume.flush() {
                         Err(e) => warn!("[auto-flush error: {}]", e),
                         Ok(()) => {
                             last_write = None;
@@ -920,12 +926,12 @@ fn handle_volume_connection(
                 let skip = (offset % 4096) as usize;
                 let result = if skip == 0 && length.is_multiple_of(4096) {
                     // Already block-aligned — write directly.
-                    volume.write(start_lba, &buf)
+                    volume.write(start_lba, buf)
                 } else {
                     // Sub-block write: read covering blocks, patch, write back.
                     volume.read(start_lba, lba_count).and_then(|mut blocks| {
                         blocks[skip..skip + length].copy_from_slice(&buf);
-                        volume.write(start_lba, &blocks)
+                        volume.write(start_lba, blocks)
                     })
                 };
                 match result {
@@ -947,7 +953,7 @@ fn handle_volume_connection(
                 break;
             }
 
-            NBD_CMD_FLUSH => match volume.fsync() {
+            NBD_CMD_FLUSH => match volume.flush() {
                 Ok(()) => tx_reply(&mut s, 0, handle)?,
                 Err(e) => {
                     error!("[fsync error: {}]", e);

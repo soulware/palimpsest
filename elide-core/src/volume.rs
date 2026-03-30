@@ -113,6 +113,7 @@ pub struct CompactionStats {
 /// derived fork's view — segments with a strictly greater ULID were written after
 /// the branch point and must not be included. `None` for the live (current) fork,
 /// where all segments are always included.
+#[derive(Clone)]
 pub struct AncestorLayer {
     pub dir: PathBuf,
     pub branch_ulid: Option<String>,
@@ -131,8 +132,8 @@ pub struct Volume {
     /// The `Flock` releases the lock automatically when dropped.
     #[allow(dead_code)]
     lock_file: nix::fcntl::Flock<fs::File>,
-    lbamap: lbamap::LbaMap,
-    extent_index: extentindex::ExtentIndex,
+    lbamap: Arc<lbamap::LbaMap>,
+    extent_index: Arc<extentindex::ExtentIndex>,
     wal: writelog::WriteLog,
     wal_ulid: String,
     wal_path: PathBuf,
@@ -307,8 +308,8 @@ impl Volume {
             base_dir: base_dir.to_owned(),
             ancestor_layers,
             lock_file,
-            lbamap,
-            extent_index,
+            lbamap: Arc::new(lbamap),
+            extent_index: Arc::new(extent_index),
             wal,
             wal_ulid,
             wal_path,
@@ -353,7 +354,7 @@ impl Volume {
         // REF resolves within the same S3 volume tree (self-contained uploads).
         if self.extent_index.lookup(&hash).is_some() {
             self.wal.append_ref(lba, lba_length, &hash)?;
-            self.lbamap.insert(lba, lba_length, hash);
+            Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
             self.pending_entries
                 .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
             if self.wal.size() >= FLUSH_THRESHOLD {
@@ -379,10 +380,10 @@ impl Volume {
         let body_offset = self
             .wal
             .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
-        self.lbamap.insert(lba, lba_length, hash);
+        Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
-        self.extent_index.insert(
+        Arc::make_mut(&mut self.extent_index).insert(
             hash,
             extentindex::ExtentLocation {
                 segment_id: self.wal_ulid.clone(),
@@ -503,7 +504,7 @@ impl Volume {
                     .map(|loc| loc.segment_id == seg_id)
                     .unwrap_or(false)
                 {
-                    self.extent_index.remove(&entry.hash);
+                    Arc::make_mut(&mut self.extent_index).remove(&entry.hash);
                     removed += 1;
                 }
             }
@@ -524,7 +525,7 @@ impl Volume {
 
                 for entry in &live_entries {
                     if !entry.is_dedup_ref {
-                        self.extent_index.insert(
+                        Arc::make_mut(&mut self.extent_index).insert(
                             entry.hash,
                             extentindex::ExtentLocation {
                                 segment_id: new_ulid.clone(),
@@ -634,7 +635,7 @@ impl Volume {
                     .map(|loc| loc.segment_id == seg_id_str)
                     .unwrap_or(false)
                 {
-                    self.extent_index.remove(&entry.hash);
+                    Arc::make_mut(&mut self.extent_index).remove(&entry.hash);
                     stats.extents_removed += 1;
                 }
             }
@@ -694,7 +695,7 @@ impl Volume {
 
             for entry in &merged_live {
                 if !entry.is_dedup_ref {
-                    self.extent_index.insert(
+                    Arc::make_mut(&mut self.extent_index).insert(
                         entry.hash,
                         extentindex::ExtentLocation {
                             segment_id: new_ulid.clone(),
@@ -753,7 +754,7 @@ impl Volume {
             if entry.is_dedup_ref {
                 continue; // data lives in an ancestor segment; index already correct
             }
-            self.extent_index.insert(
+            Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
                 extentindex::ExtentLocation {
                     segment_id: self.wal_ulid.clone(),
@@ -848,40 +849,12 @@ impl Volume {
     /// body-relative offsets — consistent with how `extentindex::rebuild` stores
     /// offsets for fetched entries.
     fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
-        for subdir in ["wal", "pending", "segments"] {
-            let path = self.base_dir.join(subdir).join(segment_id);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        let fetched_body = self
-            .base_dir
-            .join("fetched")
-            .join(format!("{segment_id}.body"));
-        if fetched_body.exists() {
-            return Ok(fetched_body);
-        }
-        for layer in self.ancestor_layers.iter().rev() {
-            for subdir in ["pending", "segments"] {
-                let path = layer.dir.join(subdir).join(segment_id);
-                if path.exists() {
-                    return Ok(path);
-                }
-            }
-            let fetched_body = layer.dir.join("fetched").join(format!("{segment_id}.body"));
-            if fetched_body.exists() {
-                return Ok(fetched_body);
-            }
-        }
-        if let Some(fetcher) = &self.fetcher {
-            let fetched_dir = self.base_dir.join("fetched");
-            fetcher.fetch(segment_id, &fetched_dir)?;
-            return Ok(self
-                .base_dir
-                .join("fetched")
-                .join(format!("{segment_id}.body")));
-        }
-        Err(io::Error::other(format!("segment not found: {segment_id}")))
+        find_segment_in_dirs(
+            segment_id,
+            &self.base_dir,
+            &self.ancestor_layers,
+            self.fetcher.as_ref(),
+        )
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -917,6 +890,26 @@ impl Volume {
             .collect()
     }
 
+    /// Return the current LBA map and extent index as shared references.
+    ///
+    /// Called by `VolumeActor` after every mutation to publish a new `ReadSnapshot`.
+    /// The cost is two `Arc::clone` calls — O(1) unless a snapshot reader is still
+    /// holding the previous version, in which case `Arc::make_mut` in the next
+    /// mutation triggers a copy-on-write clone.
+    pub fn snapshot_maps(&self) -> (Arc<lbamap::LbaMap>, Arc<extentindex::ExtentIndex>) {
+        (Arc::clone(&self.lbamap), Arc::clone(&self.extent_index))
+    }
+
+    /// Ancestor layers for this fork, oldest-first.
+    pub fn ancestor_layers(&self) -> &[AncestorLayer] {
+        &self.ancestor_layers
+    }
+
+    /// The attached demand-fetch fetcher, if any.
+    pub fn fetcher(&self) -> Option<&BoxFetcher> {
+        self.fetcher.as_ref()
+    }
+
     /// Flush the current WAL to a pending segment if it contains any entries.
     /// No-op if the WAL is empty. Called by the idle-flush path in the NBD server.
     pub fn flush_wal(&mut self) -> io::Result<()> {
@@ -938,7 +931,7 @@ impl Volume {
 /// Unwritten blocks are returned as zeros. Written blocks are fetched extent-by-extent
 /// using `find_segment` to locate each segment file, with the last-opened file handle
 /// cached in `file_cache` to amortize `open` syscalls across sequential reads.
-fn read_extents(
+pub(crate) fn read_extents(
     lba: u64,
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
@@ -993,6 +986,51 @@ fn read_extents(
         }
     }
     Ok(out)
+}
+
+/// Search for a segment file across the fork directory tree.
+///
+/// Search order:
+///   1. Current fork: `wal/`, `pending/`, `segments/`, `fetched/<id>.body`
+///   2. Ancestor forks (newest-first): `pending/`, `segments/`, `fetched/<id>.body`
+///   3. Demand-fetch via fetcher (writes three-file format to `fetched/`)
+///
+/// Extracted from `Volume::find_segment_file` so that `VolumeHandle` can serve
+/// reads directly from a `ReadSnapshot` without going through the actor channel.
+pub(crate) fn find_segment_in_dirs(
+    segment_id: &str,
+    base_dir: &Path,
+    ancestor_layers: &[AncestorLayer],
+    fetcher: Option<&BoxFetcher>,
+) -> io::Result<PathBuf> {
+    for subdir in ["wal", "pending", "segments"] {
+        let path = base_dir.join(subdir).join(segment_id);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let fetched_body = base_dir.join("fetched").join(format!("{segment_id}.body"));
+    if fetched_body.exists() {
+        return Ok(fetched_body);
+    }
+    for layer in ancestor_layers.iter().rev() {
+        for subdir in ["pending", "segments"] {
+            let path = layer.dir.join(subdir).join(segment_id);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+        let fetched_body = layer.dir.join("fetched").join(format!("{segment_id}.body"));
+        if fetched_body.exists() {
+            return Ok(fetched_body);
+        }
+    }
+    if let Some(fetcher) = fetcher {
+        let fetched_dir = base_dir.join("fetched");
+        fetcher.fetch(segment_id, &fetched_dir)?;
+        return Ok(base_dir.join("fetched").join(format!("{segment_id}.body")));
+    }
+    Err(io::Error::other(format!("segment not found: {segment_id}")))
 }
 
 /// Acquire an exclusive non-blocking flock on `<dir>/volume.lock`.

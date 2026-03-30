@@ -1,0 +1,274 @@
+// VolumeActor + VolumeHandle: the intended integration pattern for ublk and NBD.
+//
+// VolumeActor owns a Volume exclusively and processes requests from a
+// crossbeam-channel in a dedicated thread.  VolumeHandle is the shareable
+// client handle — Clone + Send — held by NBD/ublk queue threads.
+//
+// Reads bypass the channel entirely: the calling thread loads the current
+// ReadSnapshot via ArcSwap and resolves the read locally.  Writes, flushes,
+// and compaction go through the channel and block until the actor replies.
+//
+// The actor publishes a new ReadSnapshot after every write so that reads
+// immediately reflect all accepted writes, including those not yet flushed
+// to a pending/ segment — matching the read-your-writes guarantee of a
+// physical block device.
+//
+// See docs/architecture.md — "Concurrency model" for rationale and design.
+
+use std::cell::RefCell;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use crossbeam_channel::{Receiver, Sender, bounded};
+
+use crate::extentindex::ExtentIndex;
+use crate::lbamap::LbaMap;
+use crate::segment::BoxFetcher;
+use crate::volume::{AncestorLayer, CompactionStats, Volume, find_segment_in_dirs, read_extents};
+
+// ---------------------------------------------------------------------------
+// Static configuration
+// ---------------------------------------------------------------------------
+
+/// Static configuration for a volume session.
+///
+/// Holds the fork directory paths and optional fetcher — data that is fixed
+/// for the lifetime of the session.  Wrapped in `Arc` and shared across all
+/// `VolumeHandle` clones without copying.
+pub struct VolumeConfig {
+    pub base_dir: PathBuf,
+    pub ancestor_layers: Vec<AncestorLayer>,
+    pub fetcher: Option<BoxFetcher>,
+}
+
+// ---------------------------------------------------------------------------
+// Read snapshot
+// ---------------------------------------------------------------------------
+
+/// Immutable snapshot of the LBA map and extent index.
+///
+/// Published by `VolumeActor` after every `write()`.  Readers load the current
+/// snapshot via `ArcSwap::load()` — no channel round-trip, no lock.
+///
+/// Both fields are `Arc`-wrapped so that publication is O(1): the actor calls
+/// `Arc::clone` on its live maps.  If a reader is still holding the previous
+/// version when the next write occurs, `Arc::make_mut` in `Volume` performs a
+/// copy-on-write clone; in practice reads complete in microseconds so the
+/// refcount is almost always 1.
+pub struct ReadSnapshot {
+    pub lbamap: Arc<LbaMap>,
+    pub extent_index: Arc<ExtentIndex>,
+}
+
+// ---------------------------------------------------------------------------
+// Channel message type
+// ---------------------------------------------------------------------------
+
+pub(crate) enum VolumeRequest {
+    Write {
+        lba: u64,
+        data: Vec<u8>,
+        reply: Sender<io::Result<()>>,
+    },
+    Flush {
+        reply: Sender<io::Result<()>>,
+    },
+    Compact {
+        reply: Sender<io::Result<CompactionStats>>,
+    },
+    Shutdown,
+}
+
+// ---------------------------------------------------------------------------
+// Actor
+// ---------------------------------------------------------------------------
+
+/// Owns a `Volume` exclusively and drives the request channel.
+///
+/// Spawn a thread and call `actor.run()`.  The thread exits when the last
+/// `VolumeHandle` is dropped (channel closes) or when a `Shutdown` message
+/// is received.
+pub struct VolumeActor {
+    volume: Volume,
+    snapshot: Arc<ArcSwap<ReadSnapshot>>,
+    rx: Receiver<VolumeRequest>,
+}
+
+impl VolumeActor {
+    pub fn run(mut self) {
+        while let Ok(req) = self.rx.recv() {
+            match req {
+                VolumeRequest::Write { lba, data, reply } => {
+                    let result = self.volume.write(lba, &data);
+                    if result.is_ok() {
+                        let (lbamap, extent_index) = self.volume.snapshot_maps();
+                        self.snapshot.store(Arc::new(ReadSnapshot {
+                            lbamap,
+                            extent_index,
+                        }));
+                    }
+                    let _ = reply.send(result);
+                }
+                VolumeRequest::Flush { reply } => {
+                    let _ = reply.send(self.volume.flush_wal());
+                }
+                VolumeRequest::Compact { reply } => {
+                    let _ = reply.send(self.volume.compact_pending());
+                }
+                VolumeRequest::Shutdown => break,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handle
+// ---------------------------------------------------------------------------
+
+/// Shareable client handle for a volume session.
+///
+/// `Clone + Send`.  Each clone gets its own empty file-handle cache so that
+/// concurrent readers (e.g. separate ublk queue threads) never share file
+/// descriptors.  The channel sender and snapshot store are shared across all
+/// clones via `Arc`.
+pub struct VolumeHandle {
+    tx: Sender<VolumeRequest>,
+    snapshot: Arc<ArcSwap<ReadSnapshot>>,
+    config: Arc<VolumeConfig>,
+    /// Per-handle file-handle cache.  Never contended: each ublk queue thread
+    /// holds its own clone.  `RefCell` is sufficient; `Mutex` is not needed.
+    file_cache: RefCell<Option<(String, fs::File)>>,
+}
+
+// VolumeHandle is Send: all fields are Send and file_cache is only accessed
+// from the owning thread (each clone is intended for one thread).
+// It is not Sync: RefCell is not Sync, and handles are not meant to be shared
+// across threads — clone instead.
+unsafe impl Send for VolumeHandle {}
+
+impl Clone for VolumeHandle {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            snapshot: Arc::clone(&self.snapshot),
+            config: Arc::clone(&self.config),
+            file_cache: RefCell::new(None), // fresh cache per clone/thread
+        }
+    }
+}
+
+impl VolumeHandle {
+    /// Write `data` at `lba` via the actor.  Blocks until the actor replies.
+    pub fn write(&self, lba: u64, data: Vec<u8>) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Write {
+                lba,
+                data,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Flush the WAL to a pending segment.  Blocks until the actor replies.
+    pub fn flush(&self) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Flush { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Run a pending-compaction pass.  Blocks until the actor replies.
+    pub fn compact_pending(&self) -> io::Result<CompactionStats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Compact { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Read `lba_count` blocks starting at `lba`.
+    ///
+    /// Resolved entirely on the calling thread using the current `ReadSnapshot`
+    /// — no channel round-trip.  Reflects all writes that have returned `Ok`,
+    /// including those not yet flushed to disk (read-your-writes guarantee).
+    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let snap = self.snapshot.load();
+        read_extents(
+            lba,
+            lba_count,
+            &snap.lbamap,
+            &snap.extent_index,
+            &self.file_cache,
+            |id| {
+                find_segment_in_dirs(
+                    id,
+                    &self.config.base_dir,
+                    &self.config.ancestor_layers,
+                    self.config.fetcher.as_ref(),
+                )
+            },
+        )
+    }
+
+    /// Signal the actor to shut down and drain remaining requests.
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(VolumeRequest::Shutdown);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+/// Create a `VolumeActor` / `VolumeHandle` pair from an opened `Volume`.
+///
+/// The caller must spawn a thread and call `actor.run()` on it.  The
+/// `VolumeHandle` can be cloned freely; each clone is intended for one thread.
+///
+/// `volume_size` is the block-device size in bytes, forwarded to the handle
+/// for NBD/ublk export info.
+pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
+    let (lbamap, extent_index) = volume.snapshot_maps();
+    let initial = Arc::new(ReadSnapshot {
+        lbamap,
+        extent_index,
+    });
+    let snapshot = Arc::new(ArcSwap::new(initial));
+
+    let config = Arc::new(VolumeConfig {
+        base_dir: volume.base_dir().to_owned(),
+        ancestor_layers: volume.ancestor_layers().to_vec(),
+        fetcher: volume.fetcher().cloned(),
+    });
+
+    // Channel depth of 64: enough to absorb bursts without blocking callers
+    // while still providing backpressure if the actor falls behind.
+    let (tx, rx) = bounded(64);
+
+    let actor = VolumeActor {
+        volume,
+        snapshot: Arc::clone(&snapshot),
+        rx,
+    };
+
+    let handle = VolumeHandle {
+        tx,
+        snapshot,
+        config,
+        file_cache: RefCell::new(None),
+    };
+
+    (actor, handle)
+}

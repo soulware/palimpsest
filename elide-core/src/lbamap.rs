@@ -58,6 +58,7 @@ struct MapEntry {
 /// Maps `start_lba → MapEntry` for every committed extent. Unwritten LBA
 /// ranges have no entry (implicitly zero, as the block device presents
 /// unwritten blocks as zeroes).
+#[derive(Clone)]
 pub struct LbaMap {
     inner: BTreeMap<u64, MapEntry>,
 }

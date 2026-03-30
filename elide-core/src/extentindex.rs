@@ -39,6 +39,7 @@ pub struct ExtentLocation {
 }
 
 /// In-memory index mapping content hash to segment location.
+#[derive(Clone)]
 pub struct ExtentIndex {
     inner: HashMap<blake3::Hash, ExtentLocation>,
 }

@@ -371,6 +371,32 @@ The single-writer property is enforced by the signing key: only the host holding
 
 The ULID monotonicity invariant and crash-recovery correctness are verified by property-based tests using proptest. See [testing.md](testing.md) for the simulation model, the two properties tested, and a concrete bug these tests found and fixed.
 
+### Concurrency model
+
+`Volume` is intentionally **single-writer with no internal locking**. All mutations (WAL append, LBA map update, flush, compaction) are serialized by the caller. The serialization point is made explicit at the integration layer rather than hidden inside the struct.
+
+The intended integration pattern is **actor + snapshot**:
+
+**`VolumeActor`** owns a `Volume` exclusively and processes requests from a `crossbeam-channel` bounded channel sequentially. It is the sole thread that mutates the fork. After every `write()` call, it publishes a new `ReadSnapshot` via an `ArcSwap`.
+
+**`VolumeHandle`** is the shareable client handle — `Clone + Send + Sync`. It holds:
+- A `crossbeam_channel::Sender<VolumeRequest>` to the actor
+- An `Arc<ArcSwap<ReadSnapshot>>` for the lock-free read path
+
+**`ReadSnapshot`** is an immutable view of the current LBA map and extent index sufficient to serve any read. It holds `Arc<LbaMap>` and `Arc<ExtentIndex>`. The actor stores its live maps as `Arc<LbaMap>` / `Arc<ExtentIndex>` internally; publishing a snapshot is an `Arc::clone()` — O(1) unless a reader is still holding the previous version, in which case the next write triggers a copy-on-write clone via `Arc::make_mut`. In practice reads complete in microseconds, so the refcount is almost always 1.
+
+**Request flow:**
+- `Write`, `Flush`, `CompactPending` — sent through the channel with an attached `crossbeam_channel::Sender` for the response. The actor processes them in arrival order and replies when done.
+- `Read` — the calling thread loads the current snapshot via `ArcSwap::load()` and resolves the request entirely on that thread. No channel round-trip; no contention with the actor.
+
+**Read-your-writes:** the snapshot is published after every `write()` call, before the response is sent back to the caller. Any read issued after a write has returned will see that write, regardless of whether it has been flushed to a `pending/` segment — the same guarantee a physical disk provides.
+
+**Why `crossbeam-channel`:** the actor loop and NBD/ublk handlers are synchronous threads; `crossbeam-channel` is a natural fit. When ublk integration uses io_uring, ublk queue threads remain synchronous callers — they block on the `Sender` and the actor thread owns the `Receiver`. If a fully async actor is ever needed, `crossbeam-channel` bridges cleanly into async runtimes via `block_on`.
+
+**Why this enables ublk:** ublk supports multiple queues, each driven by a separate thread. Each queue thread holds a cloned `VolumeHandle`. Reads fan out across queue threads with no contention; writes and flushes serialise through the actor. No `Mutex<Volume>` is needed anywhere.
+
+**Current state (NBD):** the NBD server is single-threaded (one TCP connection, 200ms read timeout for the idle/auto-flush arm). It uses a `VolumeHandle` through a single thread — the concurrency benefit is not yet exercised, but the structure is correct for ublk when that integration is added.
+
 **Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
 
 ### Operations
