@@ -119,7 +119,24 @@ pub fn simulate_coord_gc_local(
         }
     }
 
+    if all_entries.is_empty() && removed.is_empty() {
+        let consumed = candidates.iter().map(|(u, _)| *u).collect();
+        let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
+        return Some((consumed, new_ulid, to_delete));
+    }
+
     if all_entries.is_empty() {
+        // No live entries to compact, but there are extent-index entries that
+        // must be removed before the old segment files are deleted (otherwise
+        // the extent index points at deleted files → "segment not found").
+        // Write a handoff file with only removed entries.
+        let gc_dir = fork_dir.join("gc");
+        let _ = fs::create_dir_all(&gc_dir);
+        let mut lines = String::new();
+        for (hash, old_ulid) in &removed {
+            lines.push_str(&format!("{} {}\n", hash, old_ulid));
+        }
+        let _ = fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines);
         let consumed = candidates.iter().map(|(u, _)| *u).collect();
         let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
         return Some((consumed, new_ulid, to_delete));

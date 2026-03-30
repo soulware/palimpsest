@@ -808,14 +808,6 @@ impl Volume {
             // Validate the ULID so we never act on a malformed filename.
             Ulid::from_string(new_ulid).map_err(|e| io::Error::other(e.to_string()))?;
 
-            let segment_path = segments_dir.join(new_ulid);
-
-            // The segment may not be present locally yet (e.g. only in S3 and
-            // not yet fetched).  Skip and retry on the next idle tick.
-            if !segment_path.try_exists()? {
-                continue;
-            }
-
             // Parse the .pending file to learn which old segment each extent
             // came from.  We only update the extent index if it still points
             // at the old segment — if a newer write has landed since GC ran,
@@ -831,43 +823,62 @@ impl Volume {
                 }
             }
 
-            // Read the compacted segment's index for authoritative body_offset,
-            // body_length, and compressed values.
-            let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
+            let segment_path = segments_dir.join(new_ulid);
+            let segment_exists = segment_path.try_exists()?;
+
+            // If the segment doesn't exist, we can only process removal-only
+            // handoffs (all 2-field lines).  Handoffs with carried entries
+            // (4-field lines) need the segment for extent index updates —
+            // defer until it's available locally (e.g. fetched from S3).
+            // Empty handoffs (nothing to do) are also deferred.
+            if !segment_exists {
+                let has_removals = !old_ulid_by_hash.is_empty();
+                let has_carried = pending_content
+                    .lines()
+                    .any(|l| l.split_whitespace().count() >= 4);
+                if has_carried || !has_removals {
+                    continue;
+                }
+            }
 
             // Track which hashes are in the GC output so we can identify
             // removed entries below.
             let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
 
-            for e in &entries {
-                if e.is_dedup_ref {
-                    continue;
+            if segment_exists {
+                // Read the compacted segment's index for authoritative
+                // body_offset, body_length, and compressed values.
+                let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
+
+                for e in &entries {
+                    if e.is_dedup_ref {
+                        continue;
+                    }
+                    carried_hashes.insert(e.hash);
+                    // Only update if the extent index still points at the old
+                    // segment that GC consumed.  If a newer write has
+                    // superseded it, the current entry is more recent and must
+                    // not be overwritten.
+                    let still_at_old = match (
+                        self.extent_index.lookup(&e.hash),
+                        old_ulid_by_hash.get(&e.hash),
+                    ) {
+                        (Some(loc), Some(old_ulid)) => loc.segment_id == *old_ulid,
+                        _ => false,
+                    };
+                    if !still_at_old {
+                        continue;
+                    }
+                    Arc::make_mut(&mut self.extent_index).insert(
+                        e.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: new_ulid.to_owned(),
+                            body_offset: body_section_start + e.stored_offset,
+                            body_length: e.stored_length,
+                            compressed: e.compressed,
+                        },
+                    );
                 }
-                carried_hashes.insert(e.hash);
-                // Only update if the extent index still points at the old
-                // segment that GC consumed.  If a newer write has superseded
-                // it, the current entry is more recent and must not be
-                // overwritten.
-                let still_at_old = match (
-                    self.extent_index.lookup(&e.hash),
-                    old_ulid_by_hash.get(&e.hash),
-                ) {
-                    (Some(loc), Some(old_ulid)) => loc.segment_id == *old_ulid,
-                    _ => false,
-                };
-                if !still_at_old {
-                    // Superseded by a newer write — skip.
-                    continue;
-                }
-                Arc::make_mut(&mut self.extent_index).insert(
-                    e.hash,
-                    extentindex::ExtentLocation {
-                        segment_id: new_ulid.to_owned(),
-                        body_offset: body_section_start + e.stored_offset,
-                        body_length: e.stored_length,
-                        compressed: e.compressed,
-                    },
-                );
             }
 
             // Remove extent index entries for hashes that were in the

@@ -553,8 +553,8 @@ async fn compact_segments(
         }
     }
 
-    if all_live.is_empty() {
-        // All candidates are fully dead — no extent index entries reference
+    if all_live.is_empty() && all_removed.is_empty() {
+        // All candidates are fully dead and no extent index entries reference
         // these segments, so no volume handoff is needed.  Delete old S3
         // objects and local files directly.
         for candidate in &candidates {
@@ -569,6 +569,23 @@ async fn compact_segments(
             }
             let _ = fs::remove_file(&candidate.path);
         }
+        return Ok(());
+    }
+
+    if all_live.is_empty() {
+        // No live entries to compact, but the extent index still references
+        // some hashes in these segments (extent-live, LBA-dead). Write a
+        // handoff file with only removed entries so the volume can clean the
+        // dangling extent index entries before the old files are deleted.
+        fs::create_dir_all(gc_dir).context("creating gc dir")?;
+        let mut lines = String::new();
+        for (hash, old_ulid) in &all_removed {
+            lines.push_str(&format!("{hash} {old_ulid}\n"));
+        }
+        let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
+        let tmp_path = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
+        fs::write(&tmp_path, lines).context("writing removal-only handoff")?;
+        fs::rename(&tmp_path, &pending_path).context("committing removal-only handoff")?;
         return Ok(());
     }
 
