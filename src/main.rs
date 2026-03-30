@@ -94,13 +94,13 @@ enum Command {
         #[arg(default_value = "/")]
         path: String,
     },
-    /// Compact sparse segments in a fork, reclaiming space from overwritten extents
-    CompactVolume {
+    /// Repack sparse segments in a fork, reclaiming space from overwritten extents
+    Repack {
         /// Path to the volume directory (e.g. volumes/ubuntu-22.04)
         vol_dir: String,
-        /// Name of the fork to compact (e.g. vm1)
+        /// Name of the fork to repack (e.g. vm1)
         fork: String,
-        /// Compact segments where fewer than this fraction of stored bytes are live (default: 0.7)
+        /// Repack segments where fewer than this fraction of stored bytes are live (default: 0.7)
         #[arg(long, default_value_t = 0.7)]
         min_live_ratio: f64,
     },
@@ -274,16 +274,16 @@ fn main() {
             ls::run(&fork_dir, &path).expect("ls-volume failed");
         }
 
-        Command::CompactVolume {
+        Command::Repack {
             vol_dir,
             fork,
             min_live_ratio,
         } => {
             let fork_dir = Path::new(&vol_dir).join("forks").join(&fork);
             let mut vol = volume::Volume::open(&fork_dir).expect("failed to open volume");
-            let stats = vol.compact(min_live_ratio).expect("compaction failed");
+            let stats = vol.repack(min_live_ratio).expect("repack failed");
             println!(
-                "segments compacted: {}  bytes freed: {}  extents removed: {}",
+                "segments repacked: {}  bytes freed: {}  extents removed: {}",
                 stats.segments_compacted, stats.bytes_freed, stats.extents_removed,
             );
         }

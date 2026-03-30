@@ -20,10 +20,10 @@ The tests are designed to protect these invariants:
    can silently shadow a newer write.  This is not a cleanliness property — it
    is the reason crash recovery is correct.
 
-2. **WAL ULID is pre-assigned at WAL creation.** When `compact_pending` or
+2. **WAL ULID is pre-assigned at WAL creation.** When `sweep_pending` or
    coordinator GC runs, the current WAL already has a fixed ULID.  Any new
    segment produced by those operations must have a ULID `< wal_ulid`, not
-   `> wal_ulid`.  The mechanism: `compact_pending` uses `max(candidate_ULIDs)`
+   `> wal_ulid`.  The mechanism: `sweep_pending` uses `max(candidate_ULIDs)`
    as output; coordinator GC uses `max(inputs).increment()`.  Both are
    guaranteed to be below the current WAL ULID because all `pending/` and
    `segments/` files were created before the current WAL was opened.
@@ -33,7 +33,7 @@ The tests are designed to protect these invariants:
    inputs are always from a prior write epoch.
 
 4. **Snapshot floor.** Segments at or below the latest snapshot ULID are
-   frozen — `compact_pending` and `compact_volume` must never modify or delete
+   frozen — `sweep_pending` and `repack` must never modify or delete
    them.
 
 ### The two properties
@@ -44,7 +44,7 @@ Every segment file produced by a volume operation must have a ULID strictly
 greater than all segment ULIDs that existed before the operation:
 
 - `flush_wal` → new segment ULID > all pre-existing ULIDs
-- `compact_pending` → output ULID > all pre-existing ULIDs (including the
+- `sweep_pending` → output ULID > all pre-existing ULIDs (including the
   segments it consumed)
 - Simulated coordinator GC → output ULID > max(consumed input ULIDs)
 
@@ -72,7 +72,7 @@ directory:
 |----|-------------|---------------|
 | `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` | `oracle.insert(lba, [seed; 4096])` |
 | `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` | none (write already recorded) |
-| `CompactPending` | `vol.compact_pending()` — merges/deduplicates `pending/` segments | none (no data change) |
+| `SweepPending` | `vol.sweep_pending()` — merges/deduplicates `pending/` segments | none (no data change) |
 | `DrainLocal` | Moves all `pending/` files to `segments/` (simulates coordinator upload) | none |
 | `CoordGcLocal` | Runs a coordinator-style GC pass on `segments/` in-process | none (no data change) |
 | `Crash` | Drops the `Volume` and reopens it (full rebuild from disk) | assert all oracle LBAs match |
@@ -90,7 +90,7 @@ the inputs — the same algorithm as the real coordinator GC in
 ### Bug found by these tests
 
 During initial implementation, `crash_recovery_oracle` immediately found a bug
-in `compact_pending`.
+in `sweep_pending`.
 
 **Failing sequence (shrunk by proptest):**
 
@@ -99,20 +99,20 @@ Write(lba=0, seed=0)   -- H0
 Write(lba=2, seed=1)   -- H1
 Flush                  -- S1: DATA(lba=0,H0), DATA(lba=2,H1)
 Write(lba=0, seed=1)   -- H1 again → dedup REF in WAL
-CompactPending         -- S1' created with mint.next() = U3
+SweepPending         -- S1' created with mint.next() = U3
 Write(lba=2, seed=2)   -- H2
 Flush                  -- S2: WAL ULID = U2 (pre-assigned at WAL creation)
 Crash                  -- rebuild: S2(U2) then S1'(U3) → lba=2 returns [1] not [2]
 ```
 
-**Root cause:** `compact_pending` used `mint.next()` to name its output
+**Root cause:** `sweep_pending` used `mint.next()` to name its output
 segment.  Because the current WAL's ULID (U2) was pre-assigned at WAL creation
 time, `mint.next()` during compaction produced U3 > U2.  When the WAL was
 later flushed, it inherited U2.  Rebuild processes in ULID order, so the
 compact output (U3) was applied after the WAL flush segment (U2) and silently
 overwrote lba=2 with stale data.
 
-**Fix:** `compact_pending` now uses `max(candidate_ULIDs)` as the output ULID,
+**Fix:** `sweep_pending` now uses `max(candidate_ULIDs)` as the output ULID,
 atomically replacing the max-ULID candidate file via `.tmp` rename.  Since all
 `pending/` segments were created before the current WAL was opened, their ULIDs
 are strictly less than the WAL ULID.  The output therefore always sorts below
@@ -162,25 +162,25 @@ exactly the state the handoff protocol is designed to make safe.  Fixed by
 collecting and deleting the consumed paths after `apply_gc_handoffs`, matching
 the real coordinator protocol.
 
-**`CompactVolume` SimOp is entirely absent.**  *(Fixed, two bugs found.)*
-`vol.compact(min_live_ratio)` is the volume-level density pass.  It iterates
+**`Repack` SimOp is entirely absent.**  *(Fixed, two bugs found.)*
+`vol.repack(min_live_ratio)` is the volume-level density pass.  It iterates
 both `pending/` and `segments/`, rewrites sparse segments, and deletes the
-originals.  Adding `CompactVolume` to the simulation immediately found two bugs:
+originals.  Adding `Repack` to the simulation immediately found two bugs:
 
-1. `compact()` used `mint.next()` for output ULIDs, producing values above the
-   current WAL ULID.  On rebuild the compact output sorted after the WAL flush
-   segment and overwrote newer data with stale compacted data.  Fixed by reusing
+1. `repack()` used `mint.next()` for output ULIDs, producing values above the
+   current WAL ULID.  On rebuild the repack output sorted after the WAL flush
+   segment and overwrote newer data with stale data.  Fixed by reusing
    the source segment's own ULID as the output ULID — the same approach as
-   `compact_pending`.
+   `sweep_pending`.
 
 2. When the source segment is in `pending/`, the output path equals the source
    path.  The `rename(.tmp → pending/<ulid>)` atomically replaced the source,
-   but the subsequent `remove_file(seg_path)` deleted the newly-written compact
+   but the subsequent `remove_file(seg_path)` deleted the newly-written repack
    output.  Fixed by skipping the delete when the source is in `pending/` (the
    rename already replaced it in-place).
 
 **Coordinator multi-segment sweep not modelled.**  `CoordGcLocal` always picks
-exactly two segments.  The real coordinator Strategy 2 can consume three or
+exactly two segments.  The real coordinator sweep can consume three or
 more segments in a single pass.  A three-segment merge that produces one output
 exercises different liveness and ULID ordering combinations that the two-segment
 model cannot reach.
@@ -208,7 +208,7 @@ at snapshot time and the child's own writes on top — asserting after every
 - post-branch base writes are invisible to the child
 
 **Snapshot floor invariant.**  Adding a `Snapshot` op and asserting that
-`compact_pending` / `compact` never modifies segments at or below the snapshot
+`sweep_pending` / `repack` never modifies segments at or below the snapshot
 ULID would cover that invariant beyond the two fixed-sequence unit tests that
 exist today.
 

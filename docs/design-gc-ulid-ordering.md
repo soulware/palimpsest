@@ -128,7 +128,7 @@ S3 objects.
 disappears between path collection and the read (e.g. coordinator GC deleting
 a segment file).  Should skip with a warning — the new compacted segment
 (higher ULID) provides the correct entries.  Same fix needed in
-`Volume::compact()`.
+`Volume::repack()`.
 
 **Fix:** match on `ErrorKind::NotFound` and continue with a `warn!()`.
 

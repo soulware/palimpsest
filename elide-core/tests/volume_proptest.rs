@@ -1,7 +1,7 @@
 // Property-based tests for volume ULID ordering and crash-recovery correctness.
 //
 // Invariant tested by `ulid_monotonicity`:
-//   Every segment created by a volume operation (flush, compact_pending) has a
+//   Every segment created by a volume operation (flush, sweep_pending) has a
 //   ULID strictly greater than all segment ULIDs that existed before the
 //   operation. For simulated coordinator GC the invariant is narrower: the
 //   output ULID exceeds the maximum of the consumed input ULIDs.
@@ -52,11 +52,11 @@ enum SimOp {
         seed: u8,
     },
     Flush,
-    CompactPending,
+    SweepPending,
     /// Volume-level density pass: rewrites sparse segments from both pending/
-    /// and segments/. Analogous to the coordinator's Strategy 1 but runs
+    /// and segments/. Analogous to the coordinator's repack pass but runs
     /// in-process on the volume.
-    CompactVolume,
+    Repack,
     /// Move all committed pending/ segments to segments/, simulating
     /// drain-pending without S3 upload. Required before CoordGcLocal has
     /// material to work with.
@@ -69,8 +69,8 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
     prop_oneof![
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
         Just(SimOp::Flush),
-        Just(SimOp::CompactPending),
-        Just(SimOp::CompactVolume),
+        Just(SimOp::SweepPending),
+        Just(SimOp::Repack),
         Just(SimOp::DrainLocal),
         Just(SimOp::CoordGcLocal),
         Just(SimOp::Crash),
@@ -113,20 +113,20 @@ proptest! {
                         );
                     }
                 }
-                SimOp::CompactPending => {
-                    let _ = vol.compact_pending();
+                SimOp::SweepPending => {
+                    let _ = vol.sweep_pending();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
                             *u > max_before,
-                            "compact_pending produced ULID {u} ≤ existing max {max_before}"
+                            "sweep_pending produced ULID {u} ≤ existing max {max_before}"
                         );
                     }
                 }
-                SimOp::CompactVolume => {
+                SimOp::Repack => {
                     // Use a high threshold so any segment with dead bytes is a
-                    // candidate, maximising the chance of actually compacting.
-                    let _ = vol.compact(0.9);
+                    // candidate, maximising the chance of actually repacking.
+                    let _ = vol.repack(0.9);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -164,7 +164,7 @@ proptest! {
                 SimOp::Crash => {
                     drop(vol);
                     vol = Volume::open(fork_dir).unwrap();
-                    // No assertion here: the next Flush or CompactPending
+                    // No assertion here: the next Flush or SweepPending
                     // will verify that the mint was correctly reseeded.
                 }
             }
@@ -195,11 +195,11 @@ proptest! {
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
                 }
-                SimOp::CompactPending => {
-                    let _ = vol.compact_pending();
+                SimOp::SweepPending => {
+                    let _ = vol.sweep_pending();
                 }
-                SimOp::CompactVolume => {
-                    let _ = vol.compact(0.9);
+                SimOp::Repack => {
+                    let _ = vol.repack(0.9);
                 }
                 SimOp::DrainLocal => {
                     common::drain_local(fork_dir);

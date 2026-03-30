@@ -226,19 +226,19 @@ Segment GC — reclaiming space from already-uploaded `segments/` files — is a
 
 **Two strategies, run per fork on a configurable interval (default: every 5 minutes):**
 
-*Strategy 1 — Density pass* (mirrors lsvd `StartGC` and volume `compact()`):
+*Repack pass* (mirrors lsvd `StartGC` and volume `repack()`):
 - Reconstruct the extent index from this fork's `segments/` and `pending/` index files
 - Find the single least-dense segment: lowest `live_bytes / file_bytes` ratio
 - If its density is below `density_threshold` (default: 0.70), compact it → one output segment
 - Return immediately after one segment; next tick handles the next candidate
 
-*Strategy 2 — Small-segment sweep* (mirrors lsvd `SweepSmallSegments` and volume `compact_pending()`):
-- Only runs if Strategy 1 finds no candidate (every segment has density ≥ threshold)
+*Sweep* (mirrors lsvd `SweepSmallSegments` and volume `sweep_pending()`):
+- Only runs if repack finds no candidate (every segment has density ≥ threshold)
 - Collect all segments below `small_segment_bytes` (default: 8 MiB), oldest-first, up to 32 MiB total live bytes
-- Skip if fewer than 2 candidates — a single small segment with density ≥ threshold has no meaningful dead space; Strategy 1 would have caught it if density were below threshold
+- Skip if fewer than 2 candidates — a single small segment with density ≥ threshold has no meaningful dead space; repack would have caught it if density were below threshold
 - Merge all candidates → one output segment
 
-The two strategies are mutually exclusive within a tick: if Strategy 1 fires, Strategy 2 is not evaluated. This bounds per-tick work: Strategy 1 processes one segment; Strategy 2 is capped at 32 MiB of live data.
+The two passes are mutually exclusive within a tick: if repack fires, sweep is not evaluated. This bounds per-tick work: repack processes one segment; sweep is capped at 32 MiB of live data.
 
 **Liveness:** an extent entry is live only if it passes two checks:
 
@@ -247,7 +247,7 @@ The two strategies are mutually exclusive within a tick: if Strategy 1 fires, St
 
 The coordinator rebuilds from on-disk files only — in-memory WAL entries are not visible. This means a WAL entry not yet flushed to `pending/` may cause the coordinator to treat a soon-to-be-dead extent as live. The worst case is a small space leak (the compacted output carries an extent whose LBA will be dead after the WAL flushes). This does not cause data corruption or stale reads — see *Output ULID assignment* below.
 
-**Dedup-ref entries during compaction:** dedup-ref segment entries carry an LBA mapping but no body data. All three compaction paths (volume `compact`, `compact_pending`, and coordinator GC) carry a dedup-ref entry only if `lbamap.hash_at(start_lba) == Some(hash)`. Unconditionally carrying a dedup-ref is wrong because a stale ref (LBA since overwritten with different data) reintroduces the old LBA mapping into the output segment, corrupting reads after a crash+rebuild. Unconditionally dropping is also wrong because a live ref (LBA still maps to that hash) loses its mapping, causing "segment not found" errors after the input segment is deleted.
+**Dedup-ref entries during compaction:** dedup-ref segment entries carry an LBA mapping but no body data. All three compaction paths (volume `repack`, `sweep_pending`, and coordinator GC) carry a dedup-ref entry only if `lbamap.hash_at(start_lba) == Some(hash)`. Unconditionally carrying a dedup-ref is wrong because a stale ref (LBA since overwritten with different data) reintroduces the old LBA mapping into the output segment, corrupting reads after a crash+rebuild. Unconditionally dropping is also wrong because a live ref (LBA still maps to that hash) loses its mapping, causing "segment not found" errors after the input segment is deleted.
 
 **Snapshot floor:** segments at or below the latest snapshot ULID are frozen and skipped. They may be referenced by child forks.
 

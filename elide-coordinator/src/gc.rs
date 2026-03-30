@@ -1,22 +1,22 @@
 // Coordinator-side S3 segment GC.
 //
 // Two strategies, matching lsvd's StartGC / SweepSmallSegments model and the
-// volume's compact() / compact_pending() split:
+// volume's repack() / sweep_pending() split:
 //
-//   Density pass (Strategy 1):
+//   Repack pass:
 //     Find the single least-dense segment (lowest live_bytes/file_bytes ratio).
-//     If it is below the density threshold, compact it into one output segment.
+//     If it is below the density threshold, repack it into one output segment.
 //     Returns after processing one segment — the next tick handles the next one.
-//     Mirrors lsvd StartGC and volume compact().
+//     Mirrors lsvd StartGC and volume repack().
 //
-//   Small-segment sweep (Strategy 2):
-//     If no segment is sparse enough to trigger Strategy 1, collect all segments
+//   Sweep:
+//     If no segment is sparse enough to trigger a repack, collect all segments
 //     below small_segment_bytes and batch them into one output, capping total
 //     live bytes at SWEEP_LIVE_CAP (32 MiB) to bound output size.
-//     Mirrors lsvd SweepSmallSegments and volume compact_pending().
+//     Mirrors lsvd SweepSmallSegments and volume sweep_pending().
 //
-// Per-tick work is bounded in both cases: Strategy 1 processes one segment;
-// Strategy 2 is capped at 32 MiB of live data.
+// Per-tick work is bounded in both cases: repack processes one segment;
+// sweep is capped at 32 MiB of live data.
 //
 // Handoff protocol (crash-safe, filesystem-only coordination):
 //
@@ -88,10 +88,10 @@ const SWEEP_LIVE_CAP: u64 = 32 * 1024 * 1024;
 pub enum GcStrategy {
     /// No candidates found; nothing done.
     None,
-    /// Compacted the single least-dense segment (Strategy 1).
-    Density,
-    /// Packed multiple small segments into one (Strategy 2).
-    SmallSweep,
+    /// Repacked the single least-dense segment.
+    Repack,
+    /// Swept multiple small segments into one.
+    Sweep,
 }
 
 /// Results from one GC pass.
@@ -163,7 +163,7 @@ pub async fn gc_loop(
         .await
         {
             Ok(GcStats {
-                strategy: GcStrategy::Density,
+                strategy: GcStrategy::Repack,
                 bytes_freed,
                 ..
             }) => {
@@ -172,7 +172,7 @@ pub async fn gc_loop(
                 );
             }
             Ok(GcStats {
-                strategy: GcStrategy::SmallSweep,
+                strategy: GcStrategy::Sweep,
                 candidates,
                 bytes_freed,
             }) => {
@@ -188,9 +188,8 @@ pub async fn gc_loop(
 
 /// Run one GC pass for a single fork.
 ///
-/// Tries Strategy 1 (density) first. If no segment is sparse enough, tries
-/// Strategy 2 (small-segment sweep). Returns `GcStrategy::None` if neither
-/// finds candidates.
+/// Tries repack first. If no segment is sparse enough, tries sweep.
+/// Returns `GcStrategy::None` if neither finds candidates.
 ///
 /// `gc_checkpoint` flushes the volume's WAL and returns a fresh ULID for the
 /// GC output segment.  Called only after confirming candidates exist (not
@@ -234,7 +233,7 @@ pub async fn gc_fork(
     let all_stats = collect_stats(&segments_dir, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
 
-    // Strategy 1: density pass — compact the single least-dense segment.
+    // Repack: density pass — compact the single least-dense segment.
     if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.into_iter().nth(pos).expect("index in bounds");
         let bytes_freed = candidate.dead_bytes();
@@ -250,13 +249,13 @@ pub async fn gc_fork(
         .await
         .context("density compaction")?;
         return Ok(GcStats {
-            strategy: GcStrategy::Density,
+            strategy: GcStrategy::Repack,
             candidates: 1,
             bytes_freed,
         });
     }
 
-    // Strategy 2: small-segment sweep — batch oldest small segments up to cap.
+    // Sweep: batch oldest small segments up to cap.
     let mut small: Vec<SegmentStats> = Vec::new();
     let mut acc_live: u64 = 0;
     for s in all_stats {
@@ -275,9 +274,9 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
-    // Strategy 1 already owns single-segment compaction: any segment with
-    // density below the threshold is caught there first. By the time we reach
-    // Strategy 2 all remaining segments have density >= threshold, so a single
+    // Repack already owns single-segment compaction: any segment with
+    // density below the threshold is caught there first. By the time sweep
+    // runs, all remaining segments have density >= threshold, so a single
     // small candidate here has no meaningful dead space to reclaim. Only
     // proceed when ≥2 segments can be merged to reduce segment count.
     if small.len() == 1 {
@@ -299,7 +298,7 @@ pub async fn gc_fork(
     .context("small-segment sweep")?;
 
     Ok(GcStats {
-        strategy: GcStrategy::SmallSweep,
+        strategy: GcStrategy::Sweep,
         candidates,
         bytes_freed,
     })
@@ -796,8 +795,8 @@ mod tests {
 
     #[test]
     fn sweep_skips_single_small_segment() {
-        // Strategy 1 owns single-segment compaction (by density). By the time
-        // Strategy 2 runs, a lone small segment — whether all-live or sparsely
+        // Repack owns single-segment compaction (by density). By the time
+        // sweep runs, a lone small segment — whether all-live or sparsely
         // live — has density >= threshold and is not worth a standalone GC pass.
         // Verify dead_bytes() is available for the ≥2 case.
         let s = SegmentStats {
@@ -811,7 +810,7 @@ mod tests {
             body_section_start: 0,
         };
         assert_eq!(s.dead_bytes(), 224 * 1024);
-        // density = 0.78 >= 0.70 threshold: Strategy 1 would have caught it if below.
+        // density = 0.78 >= 0.70 threshold: repack would have caught it if below.
         assert!(s.density() >= 0.70);
     }
 

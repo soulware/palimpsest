@@ -431,7 +431,7 @@ impl Volume {
     ///
     /// `min_live_ratio` is in [0.0, 1.0]: 0.7 compacts any segment where more
     /// than 30% of stored bytes are dead.
-    pub fn compact(&mut self, min_live_ratio: f64) -> io::Result<CompactionStats> {
+    pub fn repack(&mut self, min_live_ratio: f64) -> io::Result<CompactionStats> {
         use std::collections::HashSet;
 
         let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
@@ -522,7 +522,7 @@ impl Volume {
                 // predate the current WAL), so a subsequent WAL flush always
                 // produces a higher ULID and wins on rebuild.  Using mint.next()
                 // here would generate a ULID past the WAL ULID and break that
-                // ordering — the same bug fixed in compact_pending.
+                // ordering — the same bug fixed in sweep_pending.
                 let new_ulid = seg_id.clone();
                 let pending_dir = self.base_dir.join("pending");
                 let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
@@ -591,7 +591,7 @@ impl Volume {
     ///
     /// Segments at or below the latest snapshot ULID are frozen and skipped.
     /// Returns immediately (no-op) if there are no candidates.
-    pub fn compact_pending(&mut self) -> io::Result<CompactionStats> {
+    pub fn sweep_pending(&mut self) -> io::Result<CompactionStats> {
         use std::collections::HashSet;
 
         let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
@@ -708,7 +708,7 @@ impl Volume {
                     .and_then(|s| Ulid::from_string(s).ok())
             })
             .max()
-            .ok_or_else(|| io::Error::other("compact_pending: no valid candidate ULIDs"))?
+            .ok_or_else(|| io::Error::other("sweep_pending: no valid candidate ULIDs"))?
             .to_string();
 
         // Write the merged output, atomically replacing the max-ULID candidate.
@@ -1993,7 +1993,7 @@ mod tests {
     // --- compaction tests ---
 
     #[test]
-    fn compact_noop_when_all_live() {
+    fn repack_noop_when_all_live() {
         // Write two blocks, promote, compact — nothing should be compacted
         // since all data is still referenced.
         let base = temp_dir();
@@ -2002,7 +2002,7 @@ mod tests {
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.compact(0.7).unwrap();
+        let stats = vol.repack(0.7).unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.bytes_freed, 0);
         assert_eq!(stats.extents_removed, 0);
@@ -2015,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_reclaims_overwritten_extent() {
+    fn repack_reclaims_overwritten_extent() {
         // Write block A, promote, overwrite block A with B, promote.
         // First segment now has a dead extent; compaction should reclaim it.
         let base = temp_dir();
@@ -2031,7 +2031,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Two segments: first is 100% dead, second is live.
-        let stats = vol.compact(0.7).unwrap();
+        let stats = vol.repack(0.7).unwrap();
         assert_eq!(
             stats.segments_compacted, 1,
             "first segment should be compacted"
@@ -2046,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_reads_back_correctly_after_reopen() {
+    fn repack_reads_back_correctly_after_reopen() {
         // Verify that the compacted segment is a valid segment that survives
         // a volume reopen (LBA map rebuild + extent index rebuild).
         let base = temp_dir();
@@ -2057,7 +2057,7 @@ mod tests {
             vol.promote_for_test().unwrap();
             vol.write(0, &vec![0xBBu8; 4096]).unwrap(); // overwrite
             vol.promote_for_test().unwrap();
-            vol.compact(0.7).unwrap();
+            vol.repack(0.7).unwrap();
         }
 
         let vol = Volume::open(&base).unwrap();
@@ -2067,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_partial_segment() {
+    fn repack_partial_segment() {
         // Segment has two extents; one is overwritten (dead), one is live.
         // Compaction should rewrite the segment keeping only the live extent.
         let base = temp_dir();
@@ -2081,7 +2081,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // First segment is 50% dead — above default threshold of 30% dead (0.7 live).
-        let stats = vol.compact(0.7).unwrap();
+        let stats = vol.repack(0.7).unwrap();
         assert_eq!(stats.segments_compacted, 1);
         assert!(stats.bytes_freed > 0);
 
@@ -2093,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_respects_min_live_ratio() {
+    fn repack_respects_min_live_ratio() {
         // With a strict ratio (1.0), any dead byte triggers compaction.
         // With a lenient ratio (0.0), nothing is ever compacted.
         let base = temp_dir();
@@ -2105,18 +2105,18 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Lenient threshold: first segment is 100% dead but ratio=0.0 → nothing compacted.
-        let stats = vol.compact(0.0).unwrap();
+        let stats = vol.repack(0.0).unwrap();
         assert_eq!(stats.segments_compacted, 0);
 
         // Strict threshold: compact anything with any dead bytes.
-        let stats = vol.compact(1.0).unwrap();
+        let stats = vol.repack(1.0).unwrap();
         assert_eq!(stats.segments_compacted, 1);
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn compact_does_not_touch_pre_snapshot_segments() {
+    fn repack_does_not_touch_pre_snapshot_segments() {
         // Write and overwrite a block, then snapshot. The dead segment is
         // pre-snapshot and must not be compacted — it is frozen by the floor.
         let base = temp_dir();
@@ -2131,7 +2131,7 @@ mod tests {
         vol.snapshot().unwrap();
 
         // Even with a strict threshold the pre-snapshot segments must be skipped.
-        let stats = vol.compact(1.0).unwrap();
+        let stats = vol.repack(1.0).unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "pre-snapshot segments must not be compacted"
@@ -2144,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_only_touches_post_snapshot_segments() {
+    fn repack_only_touches_post_snapshot_segments() {
         // Pre-snapshot dead segment: frozen. Post-snapshot dead segment: compactable.
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
@@ -2164,7 +2164,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // One pre-snapshot dead segment (frozen) + one post-snapshot dead segment (eligible).
-        let stats = vol.compact(1.0).unwrap();
+        let stats = vol.repack(1.0).unwrap();
         assert_eq!(
             stats.segments_compacted, 1,
             "exactly the post-snapshot dead segment should be compacted"
@@ -2177,11 +2177,11 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    // --- compact_pending tests ---
+    // --- sweep_pending tests ---
 
     #[test]
-    fn compact_pending_noop_when_all_live() {
-        // Single pending segment with no dead extents: compact_pending must not
+    fn sweep_pending_noop_when_all_live() {
+        // Single pending segment with no dead extents: sweep_pending must not
         // rewrite it. Rewriting a single all-live small segment is a no-op that
         // only wastes IO — merging only makes sense when >=2 segments combine or
         // dead space is reclaimed.
@@ -2191,7 +2191,7 @@ mod tests {
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.compact_pending().unwrap();
+        let stats = vol.sweep_pending().unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.new_segments, 0);
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
@@ -2201,9 +2201,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_pending_removes_dead_extents() {
+    fn sweep_pending_removes_dead_extents() {
         // Write LBA 0, promote, overwrite LBA 0, promote.
-        // compact_pending should remove the dead extent from the first segment.
+        // sweep_pending should remove the dead extent from the first segment.
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
 
@@ -2212,7 +2212,7 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.compact_pending().unwrap();
+        let stats = vol.sweep_pending().unwrap();
         assert!(stats.segments_compacted >= 1);
         assert!(stats.bytes_freed > 0);
         assert_eq!(stats.extents_removed, 1);
@@ -2224,9 +2224,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_pending_only_scans_pending_not_segments() {
+    fn sweep_pending_only_scans_pending_not_segments() {
         // Upload a segment (simulate by writing to segments/ directly via promote
-        // then moving to segments/). compact_pending must not touch it.
+        // then moving to segments/). sweep_pending must not touch it.
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
 
@@ -2248,11 +2248,11 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.compact_pending().unwrap();
-        // The old dead extent is in segments/ — compact_pending doesn't touch it.
+        let stats = vol.sweep_pending().unwrap();
+        // The old dead extent is in segments/ — sweep_pending doesn't touch it.
         assert_eq!(stats.extents_removed, 0);
         // The new pending segment is small and all-live: single segment, no
-        // dead extents, so compact_pending correctly leaves it alone.
+        // dead extents, so sweep_pending correctly leaves it alone.
         assert_eq!(stats.segments_compacted, 0);
 
         // Data still reads correctly.
@@ -2262,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_pending_respects_snapshot_floor() {
+    fn sweep_pending_respects_snapshot_floor() {
         // Segments at or below the snapshot ULID must not be touched.
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
@@ -2276,7 +2276,7 @@ mod tests {
         vol.snapshot().unwrap();
 
         // The two pre-snapshot segments are now frozen.
-        let stats = vol.compact_pending().unwrap();
+        let stats = vol.sweep_pending().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "pre-snapshot segments must not be touched"
@@ -2288,9 +2288,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_pending_merges_multiple_small_segments() {
+    fn sweep_pending_merges_multiple_small_segments() {
         // Three separate promotes → three small pending segments.
-        // compact_pending should merge them into one.
+        // sweep_pending should merge them into one.
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
 
@@ -2301,7 +2301,7 @@ mod tests {
         vol.write(2, &vec![0xccu8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.compact_pending().unwrap();
+        let stats = vol.sweep_pending().unwrap();
         assert_eq!(stats.segments_compacted, 3);
         assert_eq!(stats.new_segments, 1);
 

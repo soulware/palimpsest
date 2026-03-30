@@ -88,7 +88,7 @@ pub(crate) enum VolumeRequest {
     Flush {
         reply: Sender<io::Result<()>>,
     },
-    Compact {
+    SweepPending {
         reply: Sender<io::Result<CompactionStats>>,
     },
     ApplyGcHandoffs {
@@ -180,8 +180,8 @@ impl VolumeActor {
                             }
                             let _ = reply.send(result);
                         }
-                        VolumeRequest::Compact { reply } => {
-                            let _ = reply.send(self.volume.compact_pending());
+                        VolumeRequest::SweepPending { reply } => {
+                            let _ = reply.send(self.volume.sweep_pending());
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             let result = self.volume.apply_gc_handoffs();
@@ -308,11 +308,11 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Run a pending-compaction pass.  Blocks until the actor replies.
-    pub fn compact_pending(&self) -> io::Result<CompactionStats> {
+    /// Sweep pending segments.  Blocks until the actor replies.
+    pub fn sweep_pending(&self) -> io::Result<CompactionStats> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::Compact { reply: reply_tx })
+            .send(VolumeRequest::SweepPending { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
