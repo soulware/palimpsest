@@ -94,6 +94,10 @@ pub(crate) enum VolumeRequest {
     ApplyGcHandoffs {
         reply: Sender<io::Result<usize>>,
     },
+    Repack {
+        min_live_ratio: f64,
+        reply: Sender<io::Result<CompactionStats>>,
+    },
     GcCheckpoint {
         reply: Sender<io::Result<(String, String)>>,
     },
@@ -126,10 +130,14 @@ pub struct VolumeActor {
 const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl VolumeActor {
-    /// Called after every successful WAL promotion (explicit flush, threshold,
-    /// or idle tick).  Republishes the snapshot with post-promote extent_index
-    /// offsets and increments `flush_gen` so that handles know to evict their
-    /// file handle caches before the next read.
+    /// Republish the snapshot with updated maps and increment `flush_gen`.
+    ///
+    /// Called after any operation that changes the extent index or LBA map:
+    /// WAL promotions (explicit flush, threshold, idle tick) and compaction
+    /// operations (sweep_pending, repack).  Handles compare `flush_gen` against
+    /// their cached value and evict their file-handle cache on a mismatch,
+    /// ensuring they never serve stale segment offsets after a compaction
+    /// deletes old segment files.
     fn after_promote(&mut self) {
         self.flush_gen += 1;
         let (lbamap, extent_index) = self.volume.snapshot_maps();
@@ -181,7 +189,18 @@ impl VolumeActor {
                             let _ = reply.send(result);
                         }
                         VolumeRequest::SweepPending { reply } => {
-                            let _ = reply.send(self.volume.sweep_pending());
+                            let result = self.volume.sweep_pending();
+                            if matches!(&result, Ok(s) if s.segments_compacted > 0) {
+                                self.after_promote();
+                            }
+                            let _ = reply.send(result);
+                        }
+                        VolumeRequest::Repack { min_live_ratio, reply } => {
+                            let result = self.volume.repack(min_live_ratio);
+                            if matches!(&result, Ok(s) if s.segments_compacted > 0) {
+                                self.after_promote();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             let result = self.volume.apply_gc_handoffs();
@@ -319,6 +338,21 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::SweepPending { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Repack sparse pending segments below `min_live_ratio`.  Blocks until
+    /// the actor replies.
+    pub fn repack(&self, min_live_ratio: f64) -> io::Result<CompactionStats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Repack {
+                min_live_ratio,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

@@ -163,7 +163,32 @@ async fn fork_loop(
             break;
         }
 
-        // Step 1: drain pending segments to S3.
+        // Steps 1-3: compact pending segments via volume IPC (best-effort;
+        // skipped silently if the control socket is absent so that upload
+        // still runs for forks without a live volume process).
+        if fork_dir.join("control.sock").exists() {
+            control::flush(&fork_dir).await;
+
+            if let Some(s) = control::sweep_pending(&fork_dir).await
+                && s.segments_compacted > 0
+            {
+                info!(
+                    "[drain {volume_id}/{fork_name}] sweep: {} segment(s), ~{} bytes freed",
+                    s.segments_compacted, s.bytes_freed
+                );
+            }
+
+            if let Some(s) = control::repack(&fork_dir, gc_config.density_threshold).await
+                && s.segments_compacted > 0
+            {
+                info!(
+                    "[drain {volume_id}/{fork_name}] repack: {} segment(s), ~{} bytes freed",
+                    s.segments_compacted, s.bytes_freed
+                );
+            }
+        }
+
+        // Step 4: drain pending segments to S3.
         if fork_dir.join("pending").exists() {
             match upload::drain_pending(&fork_dir, &volume_id, &fork_name, &store).await {
                 Ok(r) if r.uploaded > 0 || r.failed > 0 => {
@@ -177,7 +202,7 @@ async fn fork_loop(
             }
         }
 
-        // Step 2: GC pass (rate-limited to gc_interval).
+        // Step 5: GC pass (rate-limited to gc_interval).
         if last_gc.elapsed() >= gc_interval {
             // Get two GC output ULIDs from the volume (flushes WAL as a side
             // effect).  If the volume is unreachable, skip GC for this tick.

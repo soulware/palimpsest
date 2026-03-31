@@ -4,13 +4,25 @@
 // Each connection carries one request and one response, then closes.
 //
 // Protocol:
-//   Request:  "<op>\n"
-//   Success:  "ok <value...>\n"
+//   Request:  "<op> [args...]\n"
+//   Success:  "ok [values...]\n"
 //   Error:    "err <message>\n"
 //
 // Supported operations:
-//   gc_checkpoint  →  "ok <repack_ulid> <sweep_ulid>"
-//     Flushes the volume WAL and returns two ULIDs for GC output segments.
+//   flush
+//     Flush the WAL to a pending segment.  Returns "ok".
+//
+//   sweep_pending
+//     Compact small pending segments.
+//     Returns "ok <segments_compacted> <bytes_freed> <extents_removed>".
+//
+//   repack <min_live_ratio>
+//     Compact sparse pending segments below the given ratio.
+//     Returns "ok <segments_compacted> <bytes_freed> <extents_removed>".
+//
+//   gc_checkpoint
+//     Flush WAL and return two ULIDs for GC output segments.
+//     Returns "ok <repack_ulid> <sweep_ulid>".
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -57,17 +69,57 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
     if reader.read_line(&mut line).is_err() {
         return;
     }
-    match line.trim() {
-        "gc_checkpoint" => match handle.gc_checkpoint() {
+    let line = line.trim();
+    if line == "flush" {
+        match handle.flush() {
+            Ok(()) => {
+                let _ = writeln!(writer, "ok");
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        }
+    } else if line == "sweep_pending" {
+        match handle.sweep_pending() {
+            Ok(s) => {
+                let _ = writeln!(
+                    writer,
+                    "ok {} {} {} {}",
+                    s.segments_compacted, s.new_segments, s.bytes_freed, s.extents_removed
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        }
+    } else if let Some(ratio_str) = line.strip_prefix("repack ") {
+        match ratio_str.parse::<f64>() {
+            Ok(ratio) => match handle.repack(ratio) {
+                Ok(s) => {
+                    let _ = writeln!(
+                        writer,
+                        "ok {} {} {} {}",
+                        s.segments_compacted, s.new_segments, s.bytes_freed, s.extents_removed
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(writer, "err {e}");
+                }
+            },
+            Err(_) => {
+                let _ = writeln!(writer, "err invalid ratio: {ratio_str}");
+            }
+        }
+    } else if line == "gc_checkpoint" {
+        match handle.gc_checkpoint() {
             Ok((u1, u2)) => {
                 let _ = writeln!(writer, "ok {u1} {u2}");
             }
             Err(e) => {
                 let _ = writeln!(writer, "err {e}");
             }
-        },
-        other => {
-            let _ = writeln!(writer, "err unknown op: {other}");
         }
+    } else {
+        let _ = writeln!(writer, "err unknown op: {line}");
     }
 }
