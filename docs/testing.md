@@ -216,12 +216,13 @@ at snapshot time and the child's own writes on top — asserting after every
 this invariant with the proptest engine beyond the two fixed-sequence unit
 tests.
 
-**Coordinator GC interleaved with live writes.**  The current `CoordGcLocal`
-only runs after `DrainLocal` has moved segments out of `pending/`.  A more
-realistic simulation would interleave GC with live `Flush` operations while
-segments span both `pending/` and `segments/`, stressing the boundary that the
-`max(inputs).increment() < new volume ULIDs` ordering invariant is designed to
-protect.
+**Coordinator GC interleaved with live writes** (now implemented).
+`gc_interleaved_oracle` uses a `prop_oneof!` strategy across six starting
+states (cold start, two drained segments, snapshot in place, pending-only,
+three segments, post-GC) to ensure `CoordGcLocal` fires reliably.
+`elide-core/tests/gc_ordering_test.rs` adds two deterministic integration
+tests covering the two key interleaving scenarios: live write before GC
+(stale-entry filtering) and live write after GC (sort_for_rebuild priority).
 
 **GC handoff coverage** (now implemented): `CoordGcLocal` now goes through the
 full handoff protocol — it writes `gc/<new_ulid>.pending` before deleting the
@@ -229,6 +230,12 @@ old input segments, then calls `vol.apply_gc_handoffs()` to exercise the volume'
 handoff path.  A `Crash` after the deletion but before `apply_gc_handoffs` is
 automatically covered: the rebuilt volume reads from the new segment (which
 survived), and the pending handoff is applied on the next `CoordGcLocal`.
+
+**`ReadonlyVolume`** (now implemented).
+`elide-core/tests/readonly_volume_test.rs` covers the five key behaviours:
+unwritten LBA returns zeros; flushed `pending/` data is visible; WAL-only
+writes (not yet flushed) are invisible; drained `segments/` data is visible;
+and data remains correct after a coordinator GC pass.
 
 ---
 
