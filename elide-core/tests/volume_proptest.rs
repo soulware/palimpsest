@@ -67,6 +67,8 @@ enum SimOp {
     Crash,
     /// Read an LBA that has never been written; must return all-zero bytes.
     ReadUnwritten,
+    /// Take a snapshot; segments at or below the returned ULID are frozen.
+    Snapshot,
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -79,6 +81,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::Crash),
         Just(SimOp::ReadUnwritten),
+        Just(SimOp::Snapshot),
     ]
 }
 
@@ -94,6 +97,8 @@ proptest! {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
         let mut vol = Volume::open(fork_dir).unwrap();
+        // Tracks the latest snapshot ULID; segments at or below this are frozen.
+        let mut snapshot_floor: Option<Ulid> = None;
 
         for op in &ops {
             let ulids_before = all_segment_ulids(fork_dir);
@@ -119,6 +124,12 @@ proptest! {
                     }
                 }
                 SimOp::SweepPending => {
+                    let frozen_before: std::collections::BTreeSet<Ulid> =
+                        if let Some(floor) = snapshot_floor {
+                            ulids_before.iter().copied().filter(|u| *u <= floor).collect()
+                        } else {
+                            Default::default()
+                        };
                     let _ = vol.sweep_pending();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
@@ -127,8 +138,21 @@ proptest! {
                             "sweep_pending produced ULID {u} ≤ existing max {max_before}"
                         );
                     }
+                    for u in &frozen_before {
+                        prop_assert!(
+                            after.contains(u),
+                            "sweep_pending deleted frozen segment {u} (floor {:?})",
+                            snapshot_floor
+                        );
+                    }
                 }
                 SimOp::Repack => {
+                    let frozen_before: std::collections::BTreeSet<Ulid> =
+                        if let Some(floor) = snapshot_floor {
+                            ulids_before.iter().copied().filter(|u| *u <= floor).collect()
+                        } else {
+                            Default::default()
+                        };
                     // Use a high threshold so any segment with dead bytes is a
                     // candidate, maximising the chance of actually repacking.
                     let _ = vol.repack(0.9);
@@ -137,6 +161,13 @@ proptest! {
                         prop_assert!(
                             *u > max_before,
                             "compact produced ULID {u} ≤ existing max {max_before}"
+                        );
+                    }
+                    for u in &frozen_before {
+                        prop_assert!(
+                            after.contains(u),
+                            "repack deleted frozen segment {u} (floor {:?})",
+                            snapshot_floor
                         );
                     }
                 }
@@ -181,6 +212,11 @@ proptest! {
                         [0u8; 4096].as_slice(),
                         "unwritten lba 64 returned non-zero data"
                     );
+                }
+                SimOp::Snapshot => {
+                    if let Ok(u) = vol.snapshot() {
+                        snapshot_floor = Some(u);
+                    }
                 }
             }
         }
@@ -258,6 +294,10 @@ proptest! {
                         [0u8; 4096].as_slice(),
                         "unwritten lba 64 returned non-zero data"
                     );
+                }
+                SimOp::Snapshot => {
+                    // Snapshot does not change readable data; no oracle update.
+                    let _ = vol.snapshot();
                 }
             }
         }

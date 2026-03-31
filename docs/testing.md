@@ -34,7 +34,9 @@ The tests are designed to protect these invariants:
 
 4. **Snapshot floor.** Segments at or below the latest snapshot ULID are
    frozen — `sweep_pending` and `repack` must never modify or delete
-   them.
+   them.  Covered by the `Snapshot` SimOp in `ulid_monotonicity`: after
+   every `Snapshot` the test records the floor ULID and asserts after every
+   subsequent `SweepPending` or `Repack` that no frozen segment was deleted.
 
 ### The two properties
 
@@ -208,10 +210,11 @@ at snapshot time and the child's own writes on top — asserting after every
 - child writes shadow base data at the same LBA
 - post-branch base writes are invisible to the child
 
-**Snapshot floor invariant.**  Adding a `Snapshot` op and asserting that
-`sweep_pending` / `repack` never modifies segments at or below the snapshot
-ULID would cover that invariant beyond the two fixed-sequence unit tests that
-exist today.
+**Snapshot floor invariant** (now implemented).  The `Snapshot` SimOp in
+`ulid_monotonicity` tracks the floor ULID and asserts after every
+`SweepPending` or `Repack` that no frozen segment was deleted, covering
+this invariant with the proptest engine beyond the two fixed-sequence unit
+tests.
 
 **Coordinator GC interleaved with live writes.**  The current `CoordGcLocal`
 only runs after `DrainLocal` has moved segments out of `pending/`.  A more
