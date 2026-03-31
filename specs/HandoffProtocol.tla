@@ -259,7 +259,45 @@ Next ==
   \/ VolumeRestart
   \/ \E h \in Hashes  : NewerWrite(h)
 
-Spec == Init /\ [][Next]_vars
+(*
+  Weak fairness on the five progress actions.
+
+  WF_vars(A) means: if A is continuously enabled, it must eventually fire.
+  This rules out infinite stuttering (both actors up, a step possible, but
+  none ever taken) while still permitting any finite number of crashes.
+
+  Two kinds of fairness:
+
+  WF_vars(Restart): Restart actions are continuously enabled whenever an
+  actor is down (nothing disables them while the actor stays down).  Weak
+  fairness is sufficient — it says "if continuously enabled, eventually
+  fire", which is exactly what we want for restart.
+
+  SF_vars(progress): Progress actions (WritePending, ApplyDone, Apply*,
+  Finish) require the actor to be UP.  A crash can interrupt them at any
+  moment, so they are never continuously enabled in a trace with unbounded
+  crashes.  Weak fairness would never fire.  Strong fairness fires whenever
+  an action is enabled *infinitely often* — even intermittently.  Because
+  restarts bring actors back up, each progress action is enabled in every
+  restart window, which is infinitely often.  SF therefore guarantees that
+  every progress step eventually completes in some restart window.
+
+  Crashes and NewerWrite remain unconstrained — they are adversarial.
+
+  The \E-quantified actions get fairness at the existential level: if any
+  hash can make progress, some hash will.  This is sufficient for all
+  entries to be eventually processed.
+*)
+Spec ==
+  /\ Init
+  /\ [][Next]_vars
+  /\ WF_vars(CoordRestart)
+  /\ SF_vars(CoordWritePending)
+  /\ SF_vars(CoordApplyDone)
+  /\ WF_vars(VolumeRestart)
+  /\ SF_vars(\E h \in Carried : VolumeApplyCarried(h))
+  /\ SF_vars(\E h \in Removed : VolumeApplyRemoved(h))
+  /\ SF_vars(VolumeFinishApply)
 
 \* ---------------------------------------------------------------------------
 \* Safety invariants
@@ -285,5 +323,27 @@ NoSegmentNotFound ==
 NoLostData ==
   /\ (~old_present => \A h \in Hashes  : extent[h] # "old")
   /\ (~gc_present  => \A h \in Carried : extent[h] # "gc")
+
+\* ---------------------------------------------------------------------------
+\* Liveness property
+\* ---------------------------------------------------------------------------
+
+(*
+  The handoff eventually completes.
+
+  This is a PROPERTY (checked with <>), not an INVARIANT.  It is only
+  meaningful with the WF fairness conditions in Spec above.
+
+  <>( handoff = "done" ) holds iff every infinite execution eventually
+  reaches a state where handoff = "done".
+
+  Note: this does NOT require the handoff to complete despite unlimited
+  crashes.  WF only guarantees progress when an action is *continuously*
+  enabled.  If crashes recur forever, the CoordWritePending action may
+  never be continuously enabled, so the liveness obligation does not apply.
+  That is the correct and intended behaviour: liveness under fair scheduling,
+  not liveness under adversarial crash-forever scenarios.
+*)
+EventuallyDone == <>(handoff = "done")
 
 ====
