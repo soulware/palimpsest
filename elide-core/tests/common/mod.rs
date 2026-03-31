@@ -19,10 +19,9 @@ pub fn drain_local(fork_dir: &Path) {
     let segments = fork_dir.join("segments");
     if let Ok(entries) = fs::read_dir(&pending) {
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+            let name_str = entry.file_name().to_string_lossy().into_owned();
             if !name_str.ends_with(".tmp") {
-                let _ = fs::rename(entry.path(), segments.join(&*name_str));
+                let _ = fs::rename(entry.path(), segments.join(&name_str));
             }
         }
     }

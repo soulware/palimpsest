@@ -515,10 +515,9 @@ fn collect_stats(
 
     let mut result = Vec::new();
     for path in segment_files {
-        let Some(ulid_str) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(ulid_str) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
             continue;
         };
-        let ulid_str = ulid_str.to_owned();
 
         if let Some(f) = floor {
             match Ulid::from_string(&ulid_str) {
