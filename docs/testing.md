@@ -135,7 +135,7 @@ To add a new operation:
 **What to assert for each operation type:**
 
 - **State-changing** (e.g. Write): update the oracle immediately.
-- **Structural** (e.g. Flush, Compact, Drain, GC): no oracle update, but assert
+- **Structural** (e.g. Flush, SweepPending, Repack, Drain, GC): no oracle update, but assert
   ULID ordering in `ulid_monotonicity`.
 - **Recovery** (Crash): assert full oracle match after reopen.
 - **New feature ops**: ask two questions — does this op change which data is

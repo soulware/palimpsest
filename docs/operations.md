@@ -196,7 +196,6 @@ Both commands are useful when debugging read failures: `inspect-segment` surface
 6. Write one or more new `pending/<ulid>` segments containing the merged live extents, split at 32 MB
 7. Update the in-memory extent index to point to the new segments
 8. Delete the original candidate segments
-9. Log: `[compact-pending: N → M segments, X MB reclaimed]`
 
 **Write-path isolation:** neither promotion trigger (32 MB WAL threshold or idle flush) blocks on compaction. After any promotion, a new empty WAL is immediately available for writes. Compaction catches up in the next idle window.
 

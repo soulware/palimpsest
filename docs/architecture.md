@@ -481,7 +481,7 @@ The floor ensures segments readable by child forks are never modified or deleted
 
 `pending/` and `segments/` encode S3 upload status, not GC eligibility. The compaction floor applies to both. In practice, a snapshot is always taken against a segment that is still in `pending/` (the WAL flush lands there; promotion to `segments/` happens asynchronously at S3 upload). The ULID comparison is directory-agnostic: a frozen segment retains its ULID when promoted, so the floor check remains correct regardless of which directory the segment currently lives in.
 
-The `compact-volume` CLI command triggers compaction with a configurable `--min-live-ratio` threshold (default 0.7).
+The `repack` CLI command triggers repacking with a configurable `--min-live-ratio` threshold (default 0.7).
 
 ### Open questions
 
