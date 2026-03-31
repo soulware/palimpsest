@@ -89,10 +89,8 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop::collection::vec(arb_sim_op(), 1..40)
 }
 
-/// A fixed prefix that seeds two segments into `segments/` before random ops
-/// start, guaranteeing `CoordGcLocal` has material to compact and preventing
-/// it from silently no-opping on every sequence.
-fn seeded_prefix() -> Vec<SimOp> {
+/// Two segments drained to `segments/` — CoordGcLocal has material to compact.
+fn two_segment_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0xAA },
         SimOp::Flush,
@@ -103,17 +101,82 @@ fn seeded_prefix() -> Vec<SimOp> {
     ]
 }
 
+/// Two segments drained then a Snapshot taken — snapshot floor is non-null
+/// from the start, so every subsequent SweepPending/Repack exercises the floor
+/// guard rather than hitting the `floor.is_none()` fast path.
+fn snapshot_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::Write { lba: 2, seed: 0x11 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 3, seed: 0x22 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Snapshot,
+    ]
+}
+
+/// Two flushes left in `pending/` without draining — exercises sweep_pending
+/// and repack when data has not yet crossed the drain boundary.
+fn pending_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::Write { lba: 4, seed: 0x33 },
+        SimOp::Flush,
+        SimOp::Write { lba: 5, seed: 0x44 },
+        SimOp::Flush,
+    ]
+}
+
+/// Three segments drained to `segments/` — allows CoordGcLocal { n: 3 } to
+/// fire so the n=3..=5 range is exercised rather than always no-opping.
+fn multi_segment_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::Write { lba: 0, seed: 0x55 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 1, seed: 0x66 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 2, seed: 0x77 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+    ]
+}
+
+/// One full GC pass already applied — tests the "second round of GC" path and
+/// rebuild from a volume that already has GC history.
+fn post_gc_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::Write { lba: 0, seed: 0x88 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 1, seed: 0x99 },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::CoordGcLocal { n: 2 },
+    ]
+}
+
+fn with_prefix(prefix: Vec<SimOp>, ops: Vec<SimOp>) -> Vec<SimOp> {
+    let mut v = prefix;
+    v.extend(ops);
+    v
+}
+
 fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop_oneof![
-        // Without prefix: exercises cold-start and pathological early sequences.
+        // No prefix: cold-start and pathological early sequences.
         arb_sim_ops(),
-        // With prefix: guarantees two segments exist so CoordGcLocal has
-        // material and doesn't silently no-op on every sequence.
-        arb_sim_ops().prop_map(|ops| {
-            let mut v = seeded_prefix();
-            v.extend(ops);
-            v
-        }),
+        // Two drained segments: CoordGcLocal has material.
+        arb_sim_ops().prop_map(|ops| with_prefix(two_segment_prefix(), ops)),
+        // Snapshot in place: floor guard fires from the first SweepPending/Repack.
+        arb_sim_ops().prop_map(|ops| with_prefix(snapshot_prefix(), ops)),
+        // Pending-only: data in pending/ not yet drained to segments/.
+        arb_sim_ops().prop_map(|ops| with_prefix(pending_prefix(), ops)),
+        // Three drained segments: CoordGcLocal { n: 3..=5 } can fire.
+        arb_sim_ops().prop_map(|ops| with_prefix(multi_segment_prefix(), ops)),
+        // Post-GC: one GC pass already applied, tests second-round GC path.
+        arb_sim_ops().prop_map(|ops| with_prefix(post_gc_prefix(), ops)),
     ]
 }
 
