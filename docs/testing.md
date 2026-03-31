@@ -354,30 +354,90 @@ made the test pass.
 
 ---
 
+## Formal model: TLA+ handoff protocol
+
+`specs/HandoffProtocol.tla` is a TLA+ formal model of the GC handoff protocol,
+verified with the TLC model checker.
+
+The handoff is a three-state file lifecycle (`absent → pending → applied →
+done`) driven by two independent actors (coordinator and volume) that can crash
+and restart at any point.  The proptest suite exercises this path in-process and
+single-threaded; TLA+ covers the orthogonal concern of correctness under all
+possible interleavings and crash points, including concurrent writes that
+supersede GC results.
+
+### What the model checks
+
+**State variables** are the minimal state needed to reconstruct the protocol at
+any point: the handoff file state, the extent index entry for each hash (pre-GC,
+updated to GCOutput, removed, or superseded by a newer write), segment presence,
+and the up/down state of each actor.
+
+**Actions** are atomic steps: coordinator writes `.pending` (with GCOutput),
+volume applies each entry with its per-entry guard, volume renames to
+`.applied`, coordinator deletes old segments and renames to `.done`, and
+`NewerWrite` — an unconstrained action that can supersede any entry at any time,
+modelling concurrent writes.
+
+**Safety invariants** (checked as `INVARIANTS` — must hold in every reachable state):
+
+- `NoSegmentNotFound` — the extent index never references a segment that is not
+  present.  Catches any ordering where the volume applies the handoff before
+  GCOutput is accessible, or where the coordinator deletes a segment that the
+  extent index still points to.
+
+- `NoLostData` — segments are only removed after no extent index entry
+  references them.
+
+**Liveness property** (checked as a `PROPERTY` — must hold in every infinite execution):
+
+- `EventuallyDone` — `<>(handoff = "done")`.  The handoff eventually completes
+  given fair scheduling.
+
+### Key findings from model-checking
+
+TLC explored 204 distinct states in under 400ms and found no safety violations.
+The liveness check required working through the correct fairness conditions:
+
+- **WF (weak fairness)** for restart actions: if an actor is down, restart is
+  continuously enabled, so WF suffices.
+- **SF (strong fairness)** for all progress actions: crashes temporarily disable
+  any action that requires an actor to be UP.  WF fires only when continuously
+  enabled; SF fires when enabled *infinitely often*.  Because restarts bring
+  actors back up, each progress action is enabled in every restart window —
+  infinitely often — so SF guarantees it eventually fires in some window.
+
+TLC surfaced two liveness counterexamples (lassos) that required SF rather than
+WF: one where the coordinator stayed permanently down while the volume
+crash-looped, and one where the coordinator restarted but immediately crashed
+again before completing cleanup.  Both are valid model-checker findings: they
+identify the weakest fairness assumption needed to express the liveness claim,
+not bugs in the protocol.
+
+### Running the model
+
+```
+tlc specs/HandoffProtocol.tla -config specs/HandoffProtocol.cfg
+```
+
+Or via the VS Code TLA+ extension (`tlaplus.tlaplus`): open the `.tla` file and
+`Cmd+Shift+P → TLA+: Check Model`.  Requires a JRE (`brew install --cask
+temurin`).
+
+The `.cfg` uses two carried hashes and one removed hash — enough to exercise all
+protocol branches while keeping the state space small.  Scaling up the constants
+increases state count polynomially but does not change the result.
+
+---
+
 ## Future: deeper concurrency verification
 
 The concurrent integration test validates the ordering invariant under a fixed
-workload and real OS thread scheduling.  Two approaches would give stronger
-guarantees:
-
-**`loom`** ([tokio-rs/loom](https://github.com/tokio-rs/loom)) is a
-deterministic concurrency testing library for Rust.  It replaces the standard
-library's atomics, mutexes, and thread APIs with instrumented versions and
-exhaustively explores all possible thread interleavings of a test scenario.
-Applied here, it could prove that no scheduling of the coordinator and reader
-threads produces a `segment not found` error — not just that it didn't happen in
-practice during test runs.  The cost is rewriting the concurrent paths to use
-`loom`-aware primitives within the test, which requires some test-specific
-abstraction.
-
-**TLA+** is a formal specification language for concurrent and distributed
-systems.  The GC handoff protocol — coordinator writes `.pending`, volume reads
-new segment index, volume renames to `.applied`, coordinator deletes old files —
-is exactly the kind of multi-step protocol TLA+ excels at specifying.  A TLA+
-model would express the protocol as a state machine, define the safety property
-(`read_returns_valid_data` for all reachable states), and use the TLC model
-checker to verify it exhaustively over all interleavings and crash points.  TLA+
-catches classes of bugs that are difficult to exercise in code tests: e.g.
-partial handoff application after a crash mid-rename, or coordinator/volume
-forks seeing different filesystem states.  The model lives outside the codebase
-and does not require changes to the implementation.
+workload and real OS thread scheduling.  **`loom`**
+([tokio-rs/loom](https://github.com/tokio-rs/loom)) would give stronger
+guarantees: it replaces the standard library's atomics, mutexes, and thread APIs
+with instrumented versions and exhaustively explores all possible thread
+interleavings.  Applied here, it could prove that no scheduling of the
+coordinator and reader threads produces a `segment not found` error.  The cost
+is rewriting the concurrent paths to use `loom`-aware primitives within the
+test, which requires some test-specific abstraction.
