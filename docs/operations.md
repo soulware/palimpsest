@@ -8,7 +8,7 @@ The WAL is promoted to a `pending/` segment in two ways, both handled by the `Vo
 
 **Size threshold (32 MB):** after every write reply is sent, the actor checks `Volume::needs_promote()`. If the WAL has reached 32 MB, `flush_wal()` is called before the next queued message is processed. This is a soft cap — a single write larger than 32 MB will still succeed, producing an oversized segment. Crucially, the write caller receives its reply before the promote runs; the cost is borne by the next queued operation, not the caller that crossed the threshold.
 
-**Idle flush:** the actor run loop selects on a 10-second tick alongside the request channel. When the tick fires and the WAL is non-empty, `flush_wal()` is called. This ensures that a short burst of writes — e.g. writing a few files from a VM — lands in `pending/` without requiring an explicit `snapshot-volume` call. The interval is 10 seconds (conservative for development observability).
+**Idle flush:** the actor run loop selects on a 10-second tick alongside the request channel. When the tick fires and the WAL is non-empty, `flush_wal()` is called. This ensures that a short burst of writes — e.g. writing a few files from a VM — lands in `pending/` without requiring an explicit `snapshot-volume` call. The interval is 10 seconds (conservative for development observability). The idle tick is WAL-flush only — compaction (`sweep_pending`, `repack`) is not triggered here. All compaction is coordinator-driven, as part of the drain loop before upload.
 
 Both triggers call the same `flush_wal()` → `promote()` path, producing an identical segment format. Neither is on the guest-fsync critical path — `NBD_CMD_FLUSH` sends an explicit `Flush` message through the actor channel and blocks until it completes.
 
@@ -37,9 +37,11 @@ small_segment_bytes = 8_388_608      # also compact segments smaller than this
 
 | Trigger | Action |
 |---|---|
-| New files appear in `pending/` | Upload to S3; rename to `segments/` on success |
-| Segment density drops below threshold | Segment GC: rewrite sparse segments; upload replacements; delete old S3 objects |
+| Drain tick fires | Compact `pending/` (sweep + repack via volume IPC), then upload to S3 |
+| GC tick fires | Repack sparse `segments/` (coordinator GC, fresh ULIDs, handoff protocol) |
 | New fork opened (cold-start) | `prefetch-indexes`: download `.idx` files for ancestor segments |
+
+The volume process is a pure data servant: it accepts NBD reads and writes, flushes the WAL to `pending/` on a size threshold or idle tick, applies GC handoffs from the coordinator, and demand-fetches segments from S3 on cache miss. It does not initiate compaction or upload — those are exclusively coordinator responsibilities.
 
 **`fetched/` is the volume's concern, not the coordinator's.** The volume creates and manages the `fetched/` cache directory — writing triplets on demand-fetch, promoting fully-populated triplets to `segments/`, and evicting LRU entries when the cache exceeds capacity. The coordinator does not read or write `fetched/`.
 
@@ -67,15 +69,14 @@ The `object_store` crate is used for all store access, providing a uniform inter
 
 The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
 
-**GC and upload ordering:** the volume compacts `pending/` opportunistically in its idle arm; the coordinator uploads whatever it finds whenever it runs. There is no enforced sequencing between the two. Occasionally a sparse segment escapes to S3 before the volume has had a chance to compact it; the coordinator GC reclaims it later. This is an acceptable trade-off — adding a coordination point (e.g. a "compaction done" signal before upload) would add complexity for a narrow benefit, particularly at high write rates when the idle arm is rarely reached anyway.
+**Drain loop sequencing:** the coordinator's per-fork drain loop runs the following steps sequentially on each tick:
 
-**Concurrent compaction and upload races:** two races are possible when `repack()`/`sweep_pending()` and `drain_pending` run concurrently on the same fork.
+1. Flush WAL — ask the volume (via IPC) to flush any pending WAL data to `pending/`
+2. Sweep — ask the volume to run `sweep_pending()`, merging small `pending/` segments
+3. Repack — ask the volume to run `repack()`, compacting sparse `pending/` segments
+4. Upload — read each `pending/` file, PUT to S3, rename to `segments/` on success
 
-- *Sweep deletes a file mid-upload.* The coordinator reads `pending/<ulid-A>` into memory, then sweep removes it (merged into a new output segment). The coordinator's rename of `pending/<ulid-A>` → `segments/<ulid-A>` fails with ENOENT. The upload is logged as an error and the segment is retried on the next run; the data is safe in the sweep output. **Harmless.**
-
-- *Repack replaces a file mid-upload (ULID reuse).* The coordinator reads old sparse content from `pending/<ulid-A>` into memory. Repack then atomically replaces `pending/<ulid-A>` with compacted content and updates the extent index to new body offsets. The coordinator uploads the old content to S3, then renames the now-repacked local file to `segments/<ulid-A>`. The local file has the new layout matching the extent index; S3 has the old layout with stale offsets. Local reads are correct, but if the local file is evicted and demand-fetched from S3, reads are served data at wrong offsets. **Silent corruption on demand-fetch once S3 is live.**
-
-The fix: the coordinator must serialise `repack()`/`sweep_pending()` and `drain_pending` per-fork — never run them concurrently for the same fork. Since the coordinator owns the `Volume` instance and drives both operations, this should be enforced explicitly in the per-fork loop rather than relying on incidental ordering.
+All four steps run sequentially in one task. Because the coordinator is the only caller of sweep and repack, and upload follows immediately in the same task, there is no concurrent access to `pending/` and no race between compaction and upload. Segments that are dense at upload time will not need coordinator GC later — the S3 round-trip cost is only paid for extents whose LBAs are overwritten *after* upload.
 
 ## Demand-fetch
 
