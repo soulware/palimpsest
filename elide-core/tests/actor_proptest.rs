@@ -1,6 +1,6 @@
 // Property-based tests for the actor + snapshot layer.
 //
-// Tests three invariants:
+// Tests four invariants:
 //
 // 1. Read-your-writes: after handle.write() returns Ok, handle.read() of the
 //    same LBA immediately returns the written data. This exercises the ArcSwap
@@ -18,10 +18,16 @@
 //    verifies that the snapshot is republished so reads reflect the updated
 //    extent index immediately.
 //
+// 4. Compaction snapshot update: after SweepPending or Repack via the actor
+//    channel, every oracle LBA is still readable with correct data.  These ops
+//    delete old pending/ segment files and write new ones; if publish_snapshot()
+//    did not bump flush_gen, handles would reuse stale cached fds and get ENOENT
+//    or read from wrong offsets.
+//
 // Together these verify that the actor correctly publishes snapshots, that no
-// combination of writes, flushes, and crashes loses data visible through the
-// handle, and that coordinator GC handoffs propagate correctly through the
-// actor/snapshot layer.
+// combination of writes, flushes, compactions, and crashes loses data visible
+// through the handle, and that coordinator GC handoffs propagate correctly
+// through the actor/snapshot layer.
 
 use std::collections::HashMap;
 use std::thread;
@@ -50,6 +56,13 @@ enum ActorOp {
     CoordGcLocal {
         n: usize,
     },
+    /// Sweep small pending segments via the actor channel.  After the call,
+    /// old pending/ files are deleted; publish_snapshot() must have bumped
+    /// flush_gen so handles evict stale cached fds before the next read.
+    SweepPending,
+    /// Repack sparse pending segments via the actor channel.  Same invariant
+    /// as SweepPending: old files deleted, snapshot must be republished.
+    Repack,
     Crash,
 }
 
@@ -59,6 +72,8 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
         2 => Just(ActorOp::Flush),
         2 => Just(ActorOp::DrainLocal),
         1 => (2usize..=5).prop_map(|n| ActorOp::CoordGcLocal { n }),
+        1 => Just(ActorOp::SweepPending),
+        1 => Just(ActorOp::Repack),
         1 => Just(ActorOp::Crash),
     ]
 }
@@ -152,6 +167,36 @@ proptest! {
                             actual.as_slice(),
                             expected.as_slice(),
                             "lba {} wrong after gc handoff",
+                            lba
+                        );
+                    }
+                }
+                ActorOp::SweepPending => {
+                    let _ = handle.sweep_pending();
+                    // Old pending/ files are deleted; if publish_snapshot() did
+                    // not bump flush_gen, handles reuse stale fds and get ENOENT.
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after sweep_pending via actor",
+                            lba
+                        );
+                    }
+                }
+                ActorOp::Repack => {
+                    // Use 0.5 ratio: fires on any segment with >50% dead extents,
+                    // which occurs naturally after write-overwrite-flush sequences.
+                    let _ = handle.repack(0.5);
+                    // Same invariant: repack deletes old files; snapshot must be
+                    // republished so handles evict their cached fds.
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after repack via actor",
                             lba
                         );
                     }

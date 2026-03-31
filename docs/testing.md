@@ -268,7 +268,18 @@ without any flush.  This exercises the `ArcSwap` snapshot publication path.
 |----|--------|-----------|
 | `Write { lba, seed }` | `handle.write(lba, [seed; 4096])` | immediately read back same LBA — must match |
 | `Flush` | `handle.flush()` — promotes WAL to `pending/` | none |
+| `DrainLocal` | moves all `pending/` to `segments/` (simulates coordinator upload) | none |
+| `CoordGcLocal { n }` | coordinator-style GC on `segments/`, merges `n` segments (2–5), applies handoff | assert full oracle after handoff |
+| `SweepPending` | `handle.sweep_pending()` via actor channel — merges small `pending/` segments | assert full oracle (old files deleted; `publish_snapshot()` must evict handle fd cache) |
+| `Repack` | `handle.repack(0.5)` via actor channel — density pass on `pending/` | assert full oracle (same stale-fd invariant as `SweepPending`) |
 | `Crash` | shutdown actor + join thread + reopen Volume + new actor | assert full oracle on reopen |
+
+`SweepPending` and `Repack` cover the invariant that `publish_snapshot()` is
+called after any compaction that deletes old segment files.  Without the snapshot
+republication, a handle with a cached file descriptor to a deleted segment would
+get `ENOENT` or read from a wrong offset on the next read.  This bug is invisible
+at the `Volume` level because `Volume` serialises its own mutations; only the
+actor/handle split exposes it.
 
 `Crash` is a clean shutdown (`Shutdown` message + thread join) followed by
 `Volume::open()`, which triggers WAL recovery.  The oracle covers all writes —
