@@ -89,6 +89,34 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop::collection::vec(arb_sim_op(), 1..40)
 }
 
+/// A fixed prefix that seeds two segments into `segments/` before random ops
+/// start, guaranteeing `CoordGcLocal` has material to compact and preventing
+/// it from silently no-opping on every sequence.
+fn seeded_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::Write { lba: 0, seed: 0xAA },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 1, seed: 0xBB },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+    ]
+}
+
+fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
+    prop_oneof![
+        // Without prefix: exercises cold-start and pathological early sequences.
+        arb_sim_ops(),
+        // With prefix: guarantees two segments exist so CoordGcLocal has
+        // material and doesn't silently no-op on every sequence.
+        arb_sim_ops().prop_map(|ops| {
+            let mut v = seeded_prefix();
+            v.extend(ops);
+            v
+        }),
+    ]
+}
+
 // --- property tests ---
 
 proptest! {
@@ -297,6 +325,80 @@ proptest! {
                 }
                 SimOp::Snapshot => {
                     // Snapshot does not change readable data; no oracle update.
+                    let _ = vol.snapshot();
+                }
+            }
+        }
+    }
+
+    /// GC-interleaved crash-recovery test.
+    ///
+    /// Identical oracle logic to `crash_recovery_oracle` but always starts with
+    /// two segments already drained to `segments/`, ensuring `CoordGcLocal` has
+    /// material to compact on most sequences rather than silently no-opping.
+    #[test]
+    fn gc_interleaved_oracle(ops in arb_gc_interleaved_ops()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fork_dir = dir.path();
+        let mut vol = Volume::open(fork_dir).unwrap();
+        let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
+            std::collections::HashMap::new();
+
+        for op in &ops {
+            match op {
+                SimOp::Write { lba, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba as u64, &data);
+                    oracle.insert(*lba as u64, data);
+                }
+                SimOp::Flush => {
+                    let _ = vol.flush_wal();
+                }
+                SimOp::SweepPending => {
+                    let _ = vol.sweep_pending();
+                }
+                SimOp::Repack => {
+                    let _ = vol.repack(0.9);
+                }
+                SimOp::DrainLocal => {
+                    common::drain_local(fork_dir);
+                }
+                SimOp::CoordGcLocal { n } => {
+                    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let to_delete = if let Some((_, _, paths)) =
+                        common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                    {
+                        paths
+                    } else {
+                        vec![]
+                    };
+                    let _ = vol.apply_gc_handoffs();
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                SimOp::Crash => {
+                    drop(vol);
+                    vol = Volume::open(fork_dir).unwrap();
+                    for (&lba, expected) in &oracle {
+                        let actual = vol.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after crash+rebuild",
+                            lba
+                        );
+                    }
+                }
+                SimOp::ReadUnwritten => {
+                    let actual = vol.read(64, 1).unwrap();
+                    prop_assert_eq!(
+                        actual.as_slice(),
+                        [0u8; 4096].as_slice(),
+                        "unwritten lba 64 returned non-zero data"
+                    );
+                }
+                SimOp::Snapshot => {
                     let _ = vol.snapshot();
                 }
             }
