@@ -230,7 +230,7 @@ pub async fn gc_fork(
         .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
         .transpose()?;
 
-    let all_stats = collect_stats(&segments_dir, &index, &live_hashes, &lbamap, floor)
+    let all_stats = collect_stats(fork_dir, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
 
     // Repack: density pass — compact the single least-dense segment.
@@ -493,15 +493,25 @@ impl SegmentStats {
 /// Scan `segments_dir` and compute liveness stats for each segment.
 /// Returns segments in ULID (chronological) order; snapshot-frozen segments
 /// are excluded.
+/// Scan `segments/` and compute liveness stats for each segment.
+///
+/// Segments are sorted using `sort_for_rebuild` semantics: GC outputs (those
+/// with a `.pending` or `.applied` handoff) come first (lower priority);
+/// regular segments come last (higher priority).  This ordering is critical for
+/// `compact_segments`: when entries for the same LBA appear in multiple input
+/// segments, the last-processed segment's entry wins in the output.  Using
+/// sort_for_rebuild order ensures newer regular segments (even if they have a
+/// lower ULID than an older GC output) override stale GC-output entries.
 fn collect_stats(
-    segments_dir: &Path,
+    fork_dir: &Path,
     index: &ExtentIndex,
     live_hashes: &HashSet<blake3::Hash>,
     lba_map: &LbaMap,
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
-    let mut segment_files = segment::collect_segment_files(segments_dir)?;
-    segment_files.sort();
+    let segments_dir = fork_dir.join("segments");
+    let mut segment_files = segment::collect_segment_files(&segments_dir)?;
+    segment::sort_for_rebuild(fork_dir, &mut segment_files);
 
     let mut result = Vec::new();
     for path in segment_files {

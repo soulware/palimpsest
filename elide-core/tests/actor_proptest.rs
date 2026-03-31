@@ -47,7 +47,9 @@ enum ActorOp {
     /// Simulate one coordinator GC pass and apply the resulting handoff
     /// through the actor channel.  Verifies that the snapshot is republished
     /// and all oracle LBAs remain readable via the handle.
-    CoordGcLocal,
+    CoordGcLocal {
+        n: usize,
+    },
     Crash,
 }
 
@@ -56,7 +58,7 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
         4 => (0u8..8, any::<u8>()).prop_map(|(lba, seed)| ActorOp::Write { lba, seed }),
         2 => Just(ActorOp::Flush),
         2 => Just(ActorOp::DrainLocal),
-        1 => Just(ActorOp::CoordGcLocal),
+        1 => (2usize..=5).prop_map(|n| ActorOp::CoordGcLocal { n }),
         1 => Just(ActorOp::Crash),
     ]
 }
@@ -120,7 +122,7 @@ proptest! {
                 ActorOp::DrainLocal => {
                     common::drain_local(fork_dir);
                 }
-                ActorOp::CoordGcLocal => {
+                ActorOp::CoordGcLocal { n } => {
                     // Checkpoint: flush WAL and obtain a ULID for the GC
                     // output, matching the real coordinator's gc_checkpoint.
                     let gc_ulid = ulid::Ulid::from_string(
@@ -130,7 +132,7 @@ proptest! {
                     // Simulate one coordinator GC pass (writes gc/*.pending).
                     // Returns paths to delete — we hold them until after the
                     // handoff is applied, matching the real coordinator's ordering.
-                    let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid)
+                    let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                         .map(|(_, _, paths)| paths)
                         .unwrap_or_default();
                     // Apply the handoff through the actor channel.  This

@@ -61,7 +61,9 @@ enum SimOp {
     /// drain-pending without S3 upload. Required before CoordGcLocal has
     /// material to work with.
     DrainLocal,
-    CoordGcLocal,
+    CoordGcLocal {
+        n: usize,
+    },
     Crash,
 }
 
@@ -72,7 +74,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
         Just(SimOp::DrainLocal),
-        Just(SimOp::CoordGcLocal),
+        (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::Crash),
     ]
 }
@@ -139,10 +141,10 @@ proptest! {
                     common::drain_local(fork_dir);
                     // DrainLocal only renames files; no new ULIDs are created.
                 }
-                SimOp::CoordGcLocal => {
+                SimOp::CoordGcLocal { n } => {
                     let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
                     let to_delete = if let Some((consumed, produced, paths)) =
-                        common::simulate_coord_gc_local(fork_dir, gc_ulid)
+                        common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
                         let max_consumed = consumed.iter().copied().max().unwrap();
                         prop_assert!(
@@ -204,10 +206,10 @@ proptest! {
                 SimOp::DrainLocal => {
                     common::drain_local(fork_dir);
                 }
-                SimOp::CoordGcLocal => {
+                SimOp::CoordGcLocal { n } => {
                     let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
                     let to_delete = if let Some((_, _, paths)) =
-                        common::simulate_coord_gc_local(fork_dir, gc_ulid)
+                        common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
                         paths
                     } else {

@@ -48,6 +48,7 @@ pub fn drain_local(fork_dir: &Path) {
 pub fn simulate_coord_gc_local(
     fork_dir: &Path,
     new_ulid: Ulid,
+    n_candidates: usize,
 ) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
     let segments_dir = fork_dir.join("segments");
 
@@ -63,8 +64,29 @@ pub fn simulate_coord_gc_local(
     if candidates.len() < 2 {
         return None;
     }
-    candidates.sort_by_key(|(u, _)| *u);
-    let candidates = candidates[..2].to_vec();
+    // Sort using sort_for_rebuild semantics: GC outputs (segments that have a
+    // .pending or .applied handoff file) come first (lower priority); regular
+    // segments come last (higher priority, win on conflict).  This matches how
+    // Volume::open() applies segments during rebuild, so the GC output never
+    // contains conflicting entries for the same LBA where the stale value wins.
+    //
+    // Without this, a GC output G1 (higher ULID, but containing older writes)
+    // merged with a regular segment S3 (lower ULID, newer writes) would produce
+    // entries in the wrong order: G1's DATA for lba=X would sort last (by ULID)
+    // and override S3's REF for the same lba=X during rebuild.
+    let gc_dir = fork_dir.join("gc");
+    let is_gc = |u: &Ulid| {
+        let name = u.to_string();
+        gc_dir.join(format!("{name}.pending")).exists()
+            || gc_dir.join(format!("{name}.applied")).exists()
+    };
+    candidates.sort_by(|(ua, _), (ub, _)| match (is_gc(ua), is_gc(ub)) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => ua.cmp(ub),
+    });
+    let n = n_candidates.min(candidates.len());
+    let candidates = candidates[..n].to_vec();
 
     // Rebuild the LBA map to determine which hashes are still reachable.
     // gc_checkpoint flushed the WAL, so the rebuild sees all committed writes.
