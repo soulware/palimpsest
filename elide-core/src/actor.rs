@@ -138,7 +138,7 @@ impl VolumeActor {
     /// their cached value and evict their file-handle cache on a mismatch,
     /// ensuring they never serve stale segment offsets after a compaction
     /// deletes old segment files.
-    fn after_promote(&mut self) {
+    fn publish_snapshot(&mut self) {
         self.flush_gen += 1;
         let (lbamap, extent_index) = self.volume.snapshot_maps();
         self.snapshot.store(Arc::new(ReadSnapshot {
@@ -177,28 +177,28 @@ impl VolumeActor {
                                 if let Err(e) = self.volume.flush_wal() {
                                     warn!("threshold-triggered promote failed: {e}");
                                 } else {
-                                    self.after_promote();
+                                    self.publish_snapshot();
                                 }
                             }
                         }
                         VolumeRequest::Flush { reply } => {
                             let result = self.volume.flush_wal();
                             if result.is_ok() {
-                                self.after_promote();
+                                self.publish_snapshot();
                             }
                             let _ = reply.send(result);
                         }
                         VolumeRequest::SweepPending { reply } => {
                             let result = self.volume.sweep_pending();
                             if matches!(&result, Ok(s) if s.segments_compacted > 0) {
-                                self.after_promote();
+                                self.publish_snapshot();
                             }
                             let _ = reply.send(result);
                         }
                         VolumeRequest::Repack { min_live_ratio, reply } => {
                             let result = self.volume.repack(min_live_ratio);
                             if matches!(&result, Ok(s) if s.segments_compacted > 0) {
-                                self.after_promote();
+                                self.publish_snapshot();
                             }
                             let _ = reply.send(result);
                         }
@@ -217,7 +217,7 @@ impl VolumeActor {
                         VolumeRequest::GcCheckpoint { reply } => {
                             let result = self.volume.gc_checkpoint();
                             if result.is_ok() {
-                                self.after_promote();
+                                self.publish_snapshot();
                             }
                             let pair = result.map(|_| {
                                 let u1 = ulid::Ulid::new().to_string();
@@ -238,7 +238,7 @@ impl VolumeActor {
                     if let Err(e) = self.volume.flush_wal() {
                         warn!("idle flush failed: {e}");
                     } else {
-                        self.after_promote();
+                        self.publish_snapshot();
                     }
                     // Apply any GC handoff files written by the coordinator.
                     // No flush_gen bump: GC is a segment-to-segment move; body
