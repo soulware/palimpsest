@@ -69,14 +69,19 @@ The `object_store` crate is used for all store access, providing a uniform inter
 
 The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
 
-**Drain loop sequencing:** the coordinator's per-fork drain loop runs the following steps sequentially on each tick:
+**Drain loop sequencing:** the coordinator's per-fork drain loop (`fork_loop`) runs the following steps sequentially on each tick:
 
-1. Flush WAL — ask the volume (via IPC) to flush any pending WAL data to `pending/`
-2. Sweep — ask the volume to run `sweep_pending()`, merging small `pending/` segments
-3. Repack — ask the volume to run `repack()`, compacting sparse `pending/` segments
+1. Flush WAL — call `flush` on the volume via `control.sock` to push any pending WAL data to `pending/`
+2. Sweep — call `sweep_pending` on the volume via `control.sock`, merging small `pending/` segments
+3. Repack — call `repack` on the volume via `control.sock`, compacting sparse `pending/` segments
 4. Upload — read each `pending/` file, PUT to S3, rename to `segments/` on success
+5. GC — if the GC interval has elapsed, call `gc_checkpoint` to get two output ULIDs, run a GC pass on `segments/`, and apply any completed handoffs (see Coordinator-driven segment GC below)
 
-All four steps run sequentially in one task. Because the coordinator is the only caller of sweep and repack, and upload follows immediately in the same task, there is no concurrent access to `pending/` and no race between compaction and upload. Segments that are dense at upload time will not need coordinator GC later — the S3 round-trip cost is only paid for extents whose LBAs are overwritten *after* upload.
+Steps 1–4 run every tick; step 5 is rate-limited to a configurable `gc_interval` (default 5 minutes). All five steps run sequentially within a single task per fork. Because the coordinator is the only caller of sweep and repack, and upload follows immediately in the same task, there is no concurrent access to `pending/` and no race between compaction and upload.
+
+Steps 1–3 require `control.sock` to be present (volume running). If the socket is absent, those steps are skipped silently and the drain proceeds with upload only. Step 5 (GC) also requires the socket; if absent, the GC tick is skipped and retried next interval.
+
+Segments that are dense at upload time will not need coordinator GC later — the S3 round-trip cost is only paid for extents whose LBAs are overwritten *after* upload.
 
 ## Demand-fetch
 
@@ -287,7 +292,11 @@ The `increment()` overflow case (all 80 random bits set) is effectively unreacha
 
 **At most one outstanding GC pass per fork:** the coordinator defers a new pass if any `gc/*.pending` files exist. This prevents accumulating multiple overlapping handoffs before the volume has applied the first.
 
-**`gc_checkpoint`:** before running a GC pass, the coordinator calls `gc_checkpoint` on the volume via the actor channel. This flushes the volume's WAL (ensuring all in-flight writes are in `pending/` where the coordinator can see them) and returns a fresh ULID minted by the volume's own generator. The coordinator uses this ULID as the output segment ULID. Because the WAL was flushed before minting, no in-flight WAL segment can have a ULID below the returned value — the GC output is guaranteed to sort before any subsequent write. This closes the rebuild-time ordering race described in the design notes.
+**`gc_checkpoint`:** before running a GC pass, the coordinator calls `gc_checkpoint` on the volume via `control.sock`. This flushes the volume's WAL (ensuring all in-flight writes are in `pending/` where the coordinator can see them), then mints two ULIDs 2ms apart using the volume's own clock, and returns them as `(repack_ulid, sweep_ulid)`. The coordinator uses `repack_ulid` as the output ULID for any density-repack pass and `sweep_ulid` for any sweep pass in the same GC tick. Two ULIDs are returned in a single round trip so the coordinator can run both strategies in one tick without a second IPC call. The 2ms gap ensures they are distinct even on systems where `Ulid::new()` has millisecond resolution.
+
+Because the WAL was flushed before minting, no in-flight WAL segment can have a ULID above either returned value — both GC outputs are guaranteed to sort before any subsequent write. This closes the rebuild-time ordering race described in the design notes.
+
+ULIDs are always minted by the volume process, never by the coordinator. This is deliberate: generating them on the coordinator would be unsafe if the coordinator's clock is ahead of the volume's, as the GC output ULID could then exceed a future write's ULID and corrupt rebuild ordering. By sourcing both ULIDs from the volume's clock, clock skew between hosts is not a concern.
 
 **GC result file format (`gc/<result-ulid>.pending`):**
 
@@ -307,8 +316,8 @@ A handoff file containing only 2-field lines is a *removal-only handoff*. It has
 
 **GC handoff protocol:**
 
-1. Coordinator calls `gc_checkpoint` → flushes WAL, receives output ULID
-2. Coordinator compacts input segments, writes `gc/<result-ulid>.pending`, moves compacted segment (if any) to `segments/<new-ulid>`
+1. Coordinator calls `gc_checkpoint` → flushes WAL, receives `(repack_ulid, sweep_ulid)` minted by the volume
+2. Coordinator compacts input segments using the appropriate ULID (`repack_ulid` for density repack, `sweep_ulid` for sweep), writes `gc/<result-ulid>.pending`, moves compacted segment (if any) to `segments/<new-ulid>`
 3. Volume applies in idle arm:
    - For each 4-field entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer write — stale coordinator snapshot)
    - For each 2-field entry: if extent index still points to `old_segment_ulid` for this hash, remove the entry (LBA has been overwritten; the reference is dangling)

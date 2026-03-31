@@ -19,7 +19,7 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 **Coordinator (main process)** — spawns and supervises volume processes; owns all S3 mutations (upload, delete, segment GC rewrites); watches one or more configured volume root directories and discovers forks automatically; handles `prefetch-indexes` for forks cold-starting from S3.
 
-**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory; runs background `pending/` compaction and `fetched/` promotion in the idle arm. Does not communicate with other volume processes directly. Communicates with the coordinator via a defined IPC boundary (TBD — Unix socket or similar). Never requires the coordinator for correct I/O.
+**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory; runs background `pending/` compaction and `fetched/` promotion in the idle arm. Does not communicate with other volume processes directly. Communicates with the coordinator via `control.sock` (Unix domain socket; see Control Socket Protocol below). Never requires the coordinator for correct I/O.
 
 **S3 credential split:** the volume process requires only **read-only** S3 credentials (for demand-fetch). All S3 mutations — segment upload, segment delete, GC rewrites — are performed exclusively by the coordinator, which holds read-write credentials. This limits the blast radius if a volume host is compromised.
 
@@ -86,7 +86,7 @@ All volume state lives under a shared root directory on a dedicated local NVMe m
         origin                   — text: "forks/<fork-name>/snapshots/<ulid>" (branch point)
         snapshots/
           <ulid-3>
-  service.sock                   — Unix socket at a stable, known path
+  control.sock                   — Unix domain socket; coordinator-to-volume IPC
 ```
 
 **Readonly volume** (a template; no forks until explicitly forked):
@@ -137,7 +137,7 @@ Volume process  (one per volume)
  ├─ WAL  (wal/<ULID>)
  ├─ Pending segments  (pending/<ULID>)
  ├─ Live LBA map  (in memory, LBA → hash; merged from own + ancestor layers)
- └─ IPC  (service.sock — optional for I/O, used for coordination)
+ └─ IPC  (control.sock — optional for I/O, used for coordination)
       │
       ▼
 Coordinator (main process)
@@ -154,7 +154,32 @@ Volume processes are **detached** from the coordinator at spawn time (`setsid` /
 
 **Re-adoption on coordinator start:** when the coordinator starts, it scans for `wal/` directories and checks whether each has a running process (via a `volume.pid` file alongside `wal/`). Volumes with a live process are re-adopted. Volumes with no running process are started fresh and recover from their WAL as normal.
 
-**IPC is reconnectable:** volume processes handle `service.sock` disappearing and attempt reconnection when it reappears. The IPC channel carries coordination traffic only (GC notifications, S3 upload confirmations) — loss of the channel degrades background efficiency but never affects correctness or I/O availability.
+**IPC is optional:** the coordinator skips compaction and GC steps gracefully if `control.sock` is absent (volume not running). Loss of the channel degrades background efficiency but never affects correctness or I/O availability — the volume never blocks on the coordinator.
+
+## Control Socket Protocol
+
+The volume process listens on `<fork-dir>/control.sock`. The coordinator connects, sends one request line, reads one response line, and closes the connection. Protocol is newline-delimited plain text.
+
+**Request format:** `<op> [args...]\n`
+
+**Response format:**
+- `ok [values...]\n` — success, with optional return values
+- `err <message>\n` — error; coordinator logs a warning and proceeds
+
+**Supported operations:**
+
+| Operation | Request | Response |
+|-----------|---------|----------|
+| Flush WAL | `flush` | `ok` |
+| Sweep small pending segments | `sweep_pending` | `ok <segs> <new_segs> <bytes> <extents>` |
+| Repack sparse pending segments | `repack <min_live_ratio>` | `ok <segs> <new_segs> <bytes> <extents>` |
+| GC checkpoint | `gc_checkpoint` | `ok <repack_ulid> <sweep_ulid>` |
+
+**`gc_checkpoint` detail:** flushes the WAL (so all in-flight writes are in `pending/` and visible to the coordinator), then mints two ULIDs 2ms apart using the volume's own clock, and returns them as `repack_ulid` and `sweep_ulid`. The coordinator uses these as the output segment ULIDs for its repack and sweep GC passes respectively. Using ULIDs from the volume's clock (not the coordinator's) is deliberate — it ensures the GC output ULIDs are always in the correct order relative to the volume's write history regardless of clock skew between hosts.
+
+**Compaction stats fields** (`sweep_pending` / `repack` response): `segs` = segments consumed, `new_segs` = segments produced, `bytes` = bytes freed, `extents` = extents removed.
+
+The socket is absent when the volume is not running. All coordinator IPC calls treat a missing socket as a silent no-op and proceed with the remaining drain/GC steps that do not require volume cooperation.
 
 ## Write Path
 
