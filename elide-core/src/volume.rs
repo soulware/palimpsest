@@ -422,7 +422,7 @@ impl Volume {
         self.wal.fsync()
     }
 
-    /// Compact sparse segments in `pending/` and `segments/`.
+    /// Compact sparse segments in `pending/`.
     ///
     /// For each segment where the ratio of live stored bytes to total stored
     /// bytes is below `min_live_ratio`, the live extents are copied into a new
@@ -446,10 +446,7 @@ impl Volume {
             .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
             .transpose()?;
 
-        let mut all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
-        all_segs.extend(segment::collect_segment_files(
-            &self.base_dir.join("segments"),
-        )?);
+        let all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
 
         for seg_path in all_segs {
             let seg_id = seg_path
@@ -557,18 +554,8 @@ impl Volume {
             }
             drop(cache);
 
-            // When the source is in pending/ the rename above already replaced
-            // it atomically (final_path == seg_path), so there is nothing left
-            // to delete.  When the source is in segments/ the output went to
-            // pending/ (different path) and we remove the original to complete
-            // the replacement.
-            let source_in_pending = seg_path
-                .parent()
-                .is_some_and(|p| p == self.base_dir.join("pending"));
-            if !source_in_pending {
-                fs::remove_file(&seg_path)?;
-            }
-
+            // The rename above replaced the source atomically (final_path == seg_path),
+            // so there is nothing left to delete.
             stats.segments_compacted += 1;
             stats.bytes_freed += total_bytes - live_bytes;
             stats.extents_removed += removed;
@@ -2182,6 +2169,44 @@ mod tests {
         // Both LBAs read back correctly.
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
         assert_eq!(vol.read(1, 1).unwrap(), vec![0x44u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_does_not_touch_segments() {
+        // Simulate an uploaded segment by moving it from pending/ to segments/.
+        // repack() must not touch it even if its extents are dead.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Move the pending segment to segments/ to simulate a completed upload.
+        let pending = base.join("pending");
+        let segments = base.join("segments");
+        let entry = fs::read_dir(&pending)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .unwrap();
+        let seg_name = entry.file_name().into_string().unwrap();
+        fs::rename(pending.join(&seg_name), segments.join(&seg_name)).unwrap();
+
+        // Overwrite LBA 0 — the uploaded segment's extent is now dead.
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Strict threshold: repack anything with dead bytes.
+        let stats = vol.repack(1.0).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "repack must not touch segments/"
+        );
+
+        // Data still reads correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
 
         fs::remove_dir_all(base).unwrap();
     }

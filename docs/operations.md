@@ -67,7 +67,15 @@ The `object_store` crate is used for all store access, providing a uniform inter
 
 The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
 
-**GC and upload ordering:** see the GC section below for the required sequencing between GC and upload when both operate on `pending/` segments.
+**GC and upload ordering:** the volume compacts `pending/` opportunistically in its idle arm; the coordinator uploads whatever it finds whenever it runs. There is no enforced sequencing between the two. Occasionally a sparse segment escapes to S3 before the volume has had a chance to compact it; the coordinator GC reclaims it later. This is an acceptable trade-off — adding a coordination point (e.g. a "compaction done" signal before upload) would add complexity for a narrow benefit, particularly at high write rates when the idle arm is rarely reached anyway.
+
+**Concurrent compaction and upload races:** two races are possible when `repack()`/`sweep_pending()` and `drain_pending` run concurrently on the same fork.
+
+- *Sweep deletes a file mid-upload.* The coordinator reads `pending/<ulid-A>` into memory, then sweep removes it (merged into a new output segment). The coordinator's rename of `pending/<ulid-A>` → `segments/<ulid-A>` fails with ENOENT. The upload is logged as an error and the segment is retried on the next run; the data is safe in the sweep output. **Harmless.**
+
+- *Repack replaces a file mid-upload (ULID reuse).* The coordinator reads old sparse content from `pending/<ulid-A>` into memory. Repack then atomically replaces `pending/<ulid-A>` with compacted content and updates the extent index to new body offsets. The coordinator uploads the old content to S3, then renames the now-repacked local file to `segments/<ulid-A>`. The local file has the new layout matching the extent index; S3 has the old layout with stale offsets. Local reads are correct, but if the local file is evicted and demand-fetched from S3, reads are served data at wrong offsets. **Silent corruption on demand-fetch once S3 is live.**
+
+The fix: the coordinator must serialise `repack()`/`sweep_pending()` and `drain_pending` per-fork — never run them concurrently for the same fork. Since the coordinator owns the `Volume` instance and drives both operations, this should be enforced explicitly in the per-fork loop rather than relying on incidental ordering.
 
 ## Demand-fetch
 
@@ -213,9 +221,12 @@ Both commands are useful when debugging read failures: `inspect-segment` surface
 
 To reclaim local space from a frozen ancestor, all its live descendants must first be deleted or re-based. This constraint is intentional: it makes the invariant ("ancestor segments are immutable") enforceable without any reference counting. A practical consequence: a host running many long-lived VMs all forked from the same ancestor will accumulate unreclaimable local disk usage in that ancestor's `segments/` until the VMs are deleted or re-based onto a newer snapshot. S3 repacking is not subject to this constraint and can consolidate or remove ancestor data regardless of live descendants.
 
-Within a live leaf node, **all** of its own segments are GC-eligible — there is no distinction between segments promoted in the current session and those promoted in earlier sessions. GC operates on `pending/` and `segments/` within the live node's directory only; ancestor directories are never scanned or modified.
+Within a live leaf node there is a clean ownership split by directory: `pending/` belongs to the volume; `segments/` belongs to the coordinator.
 
-**GC and S3 upload ordering:** GC intentionally covers `pending/` segments (not yet uploaded) as well as `segments/` (already uploaded). Compacting a `pending/` segment before it is uploaded avoids sending sparse data to S3 — only the denser replacement is uploaded. This requires that GC and the S3 uploader are serialised by the coordinator and never run concurrently on the same `pending/` segment. The coordinator-level ownership of both tasks makes this natural: the intended sequencing is promote → GC → upload.
+- Volume GC (`repack`, `sweep_pending`) operates on `pending/` only. Ancestor directories are never scanned or modified.
+- Coordinator GC operates on `segments/` — it reads segment index files from both `pending/` and `segments/` to determine liveness, but only writes and deletes within `segments/` (via the handoff protocol).
+
+This split ensures the `segments/` invariant ("file present ↔ confirmed in S3") is never violated by the volume, and eliminates ULID-reuse races between local compaction and S3 upload. See *Open questions* below for details.
 
 ### Coordinator-driven segment GC
 
@@ -335,6 +346,8 @@ s3://bucket/segments/snap-<id>-N     — extents unique to a specific snapshot n
 Shared extents (e.g. the ~84% identical between Ubuntu 22.04 point releases) are consolidated into base segments. A new host serving any snapshot from the same family fetches these once. Snapshot-specific segments contain only the changed extents, stored as deltas against their counterparts in the base segments. When a repacked base segment supersedes extents previously stored in per-node S3 objects, the extent index is updated to point to the repacked location; the per-node objects can then be removed once no extent index entry references them.
 
 **Ext4 re-alignment during GC:** GC is a natural point to perform or improve extent re-alignment, not just snapshot time.
+
+---
 
 - **Snapshot nodes:** safe and clean — a snapshot is frozen, the filesystem state is fixed. GC can parse ext4 metadata and re-align any snapshot that was not aligned at creation time.
 - **Live nodes:** the filesystem is in flux. GC uses the most recent frozen ancestor's ext4 metadata as a proxy. Re-alignment is approximate but safe — dedup quality improves progressively without risk of data corruption.
