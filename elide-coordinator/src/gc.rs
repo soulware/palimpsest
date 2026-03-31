@@ -127,18 +127,18 @@ impl GcStats {
 /// Both repack and sweep run in the same tick if both find candidates.
 /// Returns `GcStrategy::None` if neither finds candidates.
 ///
-/// `gc_checkpoint` flushes the volume's WAL and returns a fresh ULID.
-/// Called once per strategy that fires — the WAL flush on the second call
-/// is a no-op, and produces a distinct monotonically greater ULID for the
-/// second output segment.  Called only after confirming candidates exist,
-/// so that the volume is not flushed unnecessarily.
+/// `repack_ulid` and `sweep_ulid` are the output segment names for each
+/// strategy.  Both must be pre-resolved via `gc_checkpoint` IPC before
+/// calling this function — they originate from the volume process so that
+/// ULID ordering is consistent with the volume's write clock.
 pub async fn gc_fork(
     fork_dir: &Path,
     volume_id: &str,
     fork_name: &str,
     store: &Arc<dyn ObjectStore>,
     config: &GcConfig,
-    gc_checkpoint: &(dyn Fn() -> String + Send + Sync),
+    repack_ulid: &str,
+    sweep_ulid: &str,
 ) -> Result<GcStats> {
     let segments_dir = fork_dir.join("segments");
     if !segments_dir.exists() {
@@ -168,8 +168,6 @@ pub async fn gc_fork(
     let ran_repack = if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.remove(pos);
         repack_bytes = candidate.dead_bytes();
-        // Checkpoint: flush WAL so liveness is accurate; get ULID for output.
-        let repack_ulid = gc_checkpoint();
         compact_segments(
             vec![candidate],
             &gc_dir,
@@ -177,7 +175,7 @@ pub async fn gc_fork(
             volume_id,
             fork_name,
             store,
-            &repack_ulid,
+            repack_ulid,
         )
         .await
         .context("density compaction")?;
@@ -212,17 +210,8 @@ pub async fn gc_fork(
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
         let sweep_bytes: u64 = small.iter().map(|s| s.dead_bytes()).sum();
-        // Second gc_checkpoint call: WAL flush is a no-op; yields a fresh ULID
-        // distinct from (and greater than) the repack ULID if both ran.
-        let sweep_ulid = gc_checkpoint();
         compact_segments(
-            small,
-            &gc_dir,
-            fork_dir,
-            volume_id,
-            fork_name,
-            store,
-            &sweep_ulid,
+            small, &gc_dir, fork_dir, volume_id, fork_name, store, sweep_ulid,
         )
         .await
         .context("small-segment sweep")?;

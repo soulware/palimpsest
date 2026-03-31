@@ -35,6 +35,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::config::CoordinatorConfig;
+use crate::control;
 use crate::gc;
 use crate::serve_config;
 use crate::supervisor;
@@ -142,13 +143,6 @@ async fn fork_loop(
     };
 
     let gc_interval = Duration::from_secs(gc_config.interval_secs);
-    // In production the coordinator will call gc_checkpoint on the volume
-    // process via IPC.  For now, Ulid::new() is a safe placeholder: GC
-    // inputs are always old segments whose timestamps are seconds to minutes
-    // behind the current clock, so a fresh ULID is guaranteed to sort between
-    // them and any concurrent write.
-    let gc_checkpoint: Arc<dyn Fn() -> String + Send + Sync> =
-        Arc::new(|| ulid::Ulid::new().to_string());
 
     // Run GC on the first tick to clear any backlog from a previous run.
     let mut last_gc = Instant::now()
@@ -185,6 +179,13 @@ async fn fork_loop(
 
         // Step 2: GC pass (rate-limited to gc_interval).
         if last_gc.elapsed() >= gc_interval {
+            // Get two GC output ULIDs from the volume (flushes WAL as a side
+            // effect).  If the volume is unreachable, skip GC for this tick.
+            let Some((repack_ulid, sweep_ulid)) = control::gc_checkpoint(&fork_dir).await else {
+                last_gc = Instant::now();
+                continue;
+            };
+
             // Process any handoffs the volume has acknowledged (.applied) before
             // running a new pass, so old segments are removed from the index first.
             match gc::apply_done_handoffs(&fork_dir, &volume_id, &fork_name, &store).await {
@@ -204,7 +205,8 @@ async fn fork_loop(
                 &fork_name,
                 &store,
                 &gc_config,
-                &*gc_checkpoint,
+                &repack_ulid,
+                &sweep_ulid,
             )
             .await
             {

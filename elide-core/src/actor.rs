@@ -95,7 +95,7 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<usize>>,
     },
     GcCheckpoint {
-        reply: Sender<io::Result<String>>,
+        reply: Sender<io::Result<(String, String)>>,
     },
     Shutdown,
 }
@@ -200,7 +200,13 @@ impl VolumeActor {
                             if result.is_ok() {
                                 self.after_promote();
                             }
-                            let _ = reply.send(result);
+                            let pair = result.map(|_| {
+                                let u1 = ulid::Ulid::new().to_string();
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                let u2 = ulid::Ulid::new().to_string();
+                                (u1, u2)
+                            });
+                            let _ = reply.send(pair);
                         }
                         VolumeRequest::Shutdown => return,
                     }
@@ -363,9 +369,11 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Establish a GC checkpoint: flush the WAL and return a fresh ULID for
-    /// the GC output segment.  Blocks until the actor replies.
-    pub fn gc_checkpoint(&self) -> io::Result<String> {
+    /// Establish a GC checkpoint: flush the WAL and return two fresh ULIDs for
+    /// GC output segments (repack and sweep).  The two ULIDs are generated 2ms
+    /// apart on the volume side so they are strictly ordered and have distinct
+    /// timestamps.  Blocks until the actor replies.
+    pub fn gc_checkpoint(&self) -> io::Result<(String, String)> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })

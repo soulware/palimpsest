@@ -6,6 +6,7 @@ use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 use elide_core::signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
 use elide_core::volume;
 
+mod control;
 mod extents;
 mod fetcher;
 mod inspect;

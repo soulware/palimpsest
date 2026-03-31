@@ -746,6 +746,7 @@ fn serve_volume_listener(
         .name("volume-actor".into())
         .spawn(move || actor.run())
         .map_err(io::Error::other)?;
+    crate::control::start(dir, handle.clone())?;
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -989,7 +990,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, listener, None, None, None).ok();
+            serve_volume_listener(&dir, size_bytes, listener, None, None).ok();
         });
         port
     }

@@ -1,0 +1,73 @@
+// Volume control socket server.
+//
+// Listens on <fork_dir>/control.sock for coordinator requests.
+// Each connection carries one request and one response, then closes.
+//
+// Protocol:
+//   Request:  "<op>\n"
+//   Success:  "ok <value...>\n"
+//   Error:    "err <message>\n"
+//
+// Supported operations:
+//   gc_checkpoint  →  "ok <repack_ulid> <sweep_ulid>"
+//     Flushes the volume WAL and returns two ULIDs for GC output segments.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::thread;
+
+use elide_core::actor::VolumeHandle;
+
+/// Start the control socket server for `fork_dir`.
+///
+/// Binds `<fork_dir>/control.sock`, removes any stale socket from a previous
+/// run first.  Spawns a dedicated thread that serves one request per
+/// connection until the listener is closed.  The socket file is removed when
+/// the thread exits.
+///
+/// The handle is cloned onto the server thread; the caller retains its own
+/// clone.
+pub fn start(fork_dir: &Path, handle: VolumeHandle) -> std::io::Result<()> {
+    let socket_path = fork_dir.join("control.sock");
+    // Remove stale socket from a previous (crashed) run.
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)?;
+    thread::Builder::new()
+        .name("control-server".into())
+        .spawn(move || run(listener, socket_path, handle))
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn run(listener: UnixListener, socket_path: PathBuf, handle: VolumeHandle) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => handle_connection(stream, &handle),
+            Err(_) => break,
+        }
+    }
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHandle) {
+    let mut reader = BufReader::new(&stream);
+    let mut writer = &stream;
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return;
+    }
+    match line.trim() {
+        "gc_checkpoint" => match handle.gc_checkpoint() {
+            Ok((u1, u2)) => {
+                let _ = writeln!(writer, "ok {u1} {u2}");
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        },
+        other => {
+            let _ = writeln!(writer, "err unknown op: {other}");
+        }
+    }
+}

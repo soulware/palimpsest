@@ -20,6 +20,7 @@
 //                           AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 
 mod config;
+mod control;
 mod daemon;
 mod gc;
 mod prefetch;
