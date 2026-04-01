@@ -30,7 +30,7 @@ use crate::import::{self, ImportRegistry, ImportState};
 
 pub async fn serve(
     socket_path: &Path,
-    roots: Arc<Vec<PathBuf>>,
+    data_dir: Arc<PathBuf>,
     rescan: Arc<Notify>,
     registry: ImportRegistry,
     elide_import_bin: Arc<PathBuf>,
@@ -50,11 +50,11 @@ pub async fn serve(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let roots = roots.clone();
+                let data_dir = data_dir.clone();
                 let rescan = rescan.clone();
                 let registry = registry.clone();
                 let bin = elide_import_bin.clone();
-                tokio::spawn(handle(stream, roots, rescan, registry, bin));
+                tokio::spawn(handle(stream, data_dir, rescan, registry, bin));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
@@ -63,7 +63,7 @@ pub async fn serve(
 
 async fn handle(
     stream: tokio::net::UnixStream,
-    roots: Arc<Vec<PathBuf>>,
+    data_dir: Arc<PathBuf>,
     rescan: Arc<Notify>,
     registry: ImportRegistry,
     elide_import_bin: Arc<PathBuf>,
@@ -88,13 +88,13 @@ async fn handle(
         return;
     }
 
-    let response = dispatch(&line, &roots, &rescan, &registry, &elide_import_bin).await;
+    let response = dispatch(&line, &data_dir, &rescan, &registry, &elide_import_bin).await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
 async fn dispatch(
     line: &str,
-    roots: &[PathBuf],
+    data_dir: &Path,
     rescan: &Notify,
     registry: &ImportRegistry,
     elide_import_bin: &Path,
@@ -118,7 +118,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: status <volume>".to_string();
             }
-            volume_status(args, roots)
+            volume_status(args, data_dir)
         }
 
         "import" => {
@@ -138,7 +138,7 @@ async fn dispatch(
                     if sub_args.is_empty() {
                         return "err usage: import <name> <oci-ref>".to_string();
                     }
-                    start_import(sub, sub_args, roots, elide_import_bin, registry).await
+                    start_import(sub, sub_args, data_dir, elide_import_bin, registry).await
                 }
             }
         }
@@ -147,7 +147,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: delete <volume>".to_string();
             }
-            delete_volume(args, roots)
+            delete_volume(args, data_dir)
         }
 
         _ => {
@@ -162,11 +162,11 @@ async fn dispatch(
 async fn start_import(
     vol_name: &str,
     oci_ref: &str,
-    roots: &[PathBuf],
+    data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
 ) -> String {
-    match import::spawn_import(vol_name, oci_ref, roots, elide_import_bin, registry).await {
+    match import::spawn_import(vol_name, oci_ref, data_dir, elide_import_bin, registry).await {
         Ok(ulid) => format!("ok {ulid}"),
         Err(e) => format!("err {e}"),
     }
@@ -229,61 +229,53 @@ async fn stream_import(ulid: &str, writer: &mut OwnedWriteHalf, registry: &Impor
 
 // ── Volume status ─────────────────────────────────────────────────────────────
 
-fn volume_status(volume_name: &str, roots: &[PathBuf]) -> String {
-    for root in roots {
-        let vol_dir = root.join(volume_name);
-        if !vol_dir.is_dir() {
-            continue;
-        }
-
-        // Check for an active import in the base fork.
-        let base_dir = vol_dir.join("base");
-        if base_dir.join(import::LOCK_FILE).exists() {
-            let ulid = std::fs::read_to_string(base_dir.join(import::LOCK_FILE))
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            return format!("ok importing {ulid}");
-        }
-
-        let mut running_forks = Vec::new();
-        let forks_dir = vol_dir.join("forks");
-        if let Ok(entries) = std::fs::read_dir(&forks_dir) {
-            for entry in entries.flatten() {
-                let fork_path = entry.path();
-                if !fork_path.is_dir() {
-                    continue;
-                }
-                if let Ok(text) = std::fs::read_to_string(fork_path.join("volume.pid"))
-                    && let Ok(pid) = text.trim().parse::<u32>()
-                    && pid_is_alive(pid)
-                    && let Some(name) = fork_path.file_name().and_then(|n| n.to_str())
-                {
-                    running_forks.push(name.to_owned());
-                }
-            }
-        }
-
-        return if running_forks.is_empty() {
-            "ok stopped".to_string()
-        } else {
-            running_forks.sort();
-            format!("ok running {}", running_forks.join(","))
-        };
+fn volume_status(volume_name: &str, data_dir: &Path) -> String {
+    let vol_dir = data_dir.join(volume_name);
+    if !vol_dir.is_dir() {
+        return format!("err volume not found: {volume_name}");
     }
 
-    format!("err volume not found: {volume_name}")
+    // Check for an active import in the base fork.
+    let base_dir = vol_dir.join("base");
+    if base_dir.join(import::LOCK_FILE).exists() {
+        let ulid = std::fs::read_to_string(base_dir.join(import::LOCK_FILE))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        return format!("ok importing {ulid}");
+    }
+
+    let mut running_forks = Vec::new();
+    let forks_dir = vol_dir.join("forks");
+    if let Ok(entries) = std::fs::read_dir(&forks_dir) {
+        for entry in entries.flatten() {
+            let fork_path = entry.path();
+            if !fork_path.is_dir() {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(fork_path.join("volume.pid"))
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid_is_alive(pid)
+                && let Some(name) = fork_path.file_name().and_then(|n| n.to_str())
+            {
+                running_forks.push(name.to_owned());
+            }
+        }
+    }
+
+    if running_forks.is_empty() {
+        "ok stopped".to_string()
+    } else {
+        running_forks.sort();
+        format!("ok running {}", running_forks.join(","))
+    }
 }
 
 // ── Volume delete ─────────────────────────────────────────────────────────────
 
-fn delete_volume(volume_name: &str, roots: &[PathBuf]) -> String {
-    let vol_dir = roots
-        .iter()
-        .map(|r| r.join(volume_name))
-        .find(|d| d.is_dir());
-
-    let Some(vol_dir) = vol_dir else {
+fn delete_volume(volume_name: &str, data_dir: &Path) -> String {
+    let vol_dir = data_dir.join(volume_name);
+    if !vol_dir.is_dir() {
         return format!("err volume not found: {volume_name}");
     };
 

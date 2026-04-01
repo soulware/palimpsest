@@ -35,12 +35,15 @@ struct Args {
 enum Command {
     /// Start the coordinator daemon.
     ///
-    /// Watches configured volume root directories, discovers forks automatically,
+    /// Watches the configured data directory, discovers forks automatically,
     /// supervises volume processes, and continuously drains pending segments to
     /// the object store. Configuration is read from coordinator.toml.
     Serve {
         #[arg(long, default_value = "coordinator.toml")]
         config: PathBuf,
+        /// Override the data_dir from the config file.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -65,8 +68,11 @@ async fn run() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Serve { config } => {
-            let config = config::load(&config)?;
+        Command::Serve { config, data_dir } => {
+            let mut config = config::load(&config)?;
+            if let Some(dir) = data_dir {
+                config.data_dir = dir;
+            }
             let store = config.store.build()?;
             daemon::run(config, store).await
         }

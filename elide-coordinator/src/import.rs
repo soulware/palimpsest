@@ -85,14 +85,11 @@ pub fn new_registry() -> ImportRegistry {
 pub async fn spawn_import(
     vol_name: &str,
     oci_ref: &str,
-    roots: &[PathBuf],
+    data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
 ) -> std::io::Result<String> {
-    let root = roots
-        .first()
-        .ok_or_else(|| std::io::Error::other("no roots configured"))?;
-    let vol_dir = root.join(vol_name);
+    let vol_dir = data_dir.join(vol_name);
     let fork_dir = vol_dir.join("base");
 
     // Reject if a volume process is already running in this fork.
@@ -199,21 +196,19 @@ pub async fn spawn_import(
 ///
 /// A lock is stale if no live process matches `import.pid`. If a process is
 /// found alive, it is sent SIGTERM so the fork is in a clean state for retry.
-pub fn cleanup_stale_locks(roots: &[PathBuf]) {
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
+pub fn cleanup_stale_locks(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for vol_entry in entries.flatten() {
+        let vol_path = vol_entry.path();
+        if !vol_path.is_dir() {
             continue;
-        };
-        for vol_entry in entries.flatten() {
-            let vol_path = vol_entry.path();
-            if !vol_path.is_dir() {
-                continue;
-            }
-            cleanup_stale_lock_in(&vol_path.join("base"));
-            if let Ok(fork_entries) = std::fs::read_dir(vol_path.join("forks")) {
-                for fork_entry in fork_entries.flatten() {
-                    cleanup_stale_lock_in(&fork_entry.path());
-                }
+        }
+        cleanup_stale_lock_in(&vol_path.join("base"));
+        if let Ok(fork_entries) = std::fs::read_dir(vol_path.join("forks")) {
+            for fork_entry in fork_entries.flatten() {
+                cleanup_stale_lock_in(&fork_entry.path());
             }
         }
     }

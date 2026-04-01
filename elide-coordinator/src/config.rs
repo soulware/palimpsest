@@ -2,7 +2,7 @@
 //
 // Example coordinator.toml:
 //
-//   roots = ["/var/lib/elide/volumes"]
+//   data_dir = "elide_data"   # directory containing volumes; default: ./elide_data
 //
 //   [store]
 //   local_path = "/tmp/elide-store"   # for testing; mutually exclusive with bucket
@@ -34,11 +34,12 @@ use crate::store::StoreConfig;
 
 #[derive(Deserialize)]
 pub struct CoordinatorConfig {
-    /// Root directories to watch for volumes and forks.
-    pub roots: Vec<PathBuf>,
+    /// Directory containing volumes. Default: `./elide_data`.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
 
     /// Path to the coordinator inbound socket.
-    /// Defaults to `<roots[0]>/coordinator.sock`.
+    /// Defaults to `<data_dir>/control.sock`.
     pub socket_path: Option<PathBuf>,
 
     /// Object store configuration.
@@ -64,15 +65,16 @@ pub struct CoordinatorConfig {
 }
 
 impl CoordinatorConfig {
-    /// Resolve the socket path: explicit config value, or `<roots[0]>/coordinator.sock`.
+    /// Resolve the socket path: explicit config value, or `<data_dir>/control.sock`.
     pub fn resolved_socket_path(&self) -> PathBuf {
-        self.socket_path.clone().unwrap_or_else(|| {
-            self.roots
-                .first()
-                .map(|r| r.join("control.sock"))
-                .unwrap_or_else(|| PathBuf::from("coordinator.sock"))
-        })
+        self.socket_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("control.sock"))
     }
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("elide_data")
 }
 
 fn default_elide_bin() -> PathBuf {

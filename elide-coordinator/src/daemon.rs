@@ -1,4 +1,4 @@
-// Coordinator daemon: watches configured volume roots, discovers forks,
+// Coordinator daemon: watches the configured data directory, discovers forks,
 // drains pending segments to S3, runs GC, and supervises volume processes.
 //
 // Architecture:
@@ -51,21 +51,18 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let elide_import_bin = Arc::new(config.elide_import_bin.clone());
     let gc_config = config.gc.clone();
     let socket_path = config.resolved_socket_path();
-    let roots = Arc::new(config.roots.clone());
+    let data_dir = Arc::new(config.data_dir.clone());
 
     info!(
-        "[coordinator] watching {} root(s); drain every {}s, scan every {}s; elide bin: {}",
-        roots.len(),
+        "[coordinator] data_dir: {}; drain every {}s, scan every {}s; elide bin: {}",
+        data_dir.display(),
         config.drain.interval_secs,
         config.drain.scan_interval_secs,
         elide_bin.display(),
     );
-    for root in roots.iter() {
-        info!("[coordinator] root: {}", root.display());
-    }
 
     // Clean up any stale import locks left by a previous coordinator run.
-    import::cleanup_stale_locks(&config.roots);
+    import::cleanup_stale_locks(&config.data_dir);
 
     // Shared notify: inbound socket triggers this to request an immediate rescan.
     let rescan_notify = Arc::new(Notify::new());
@@ -75,12 +72,12 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
     // Spawn the inbound socket server.
     {
-        let roots = roots.clone();
+        let data_dir = data_dir.clone();
         let notify = rescan_notify.clone();
         let registry = import_registry.clone();
         let bin = elide_import_bin.clone();
         tokio::spawn(async move {
-            inbound::serve(&socket_path, roots, notify, registry, bin).await;
+            inbound::serve(&socket_path, data_dir, notify, registry, bin).await;
         });
     }
 
@@ -93,7 +90,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     scan_tick.tick().await;
 
     loop {
-        let forks = discover_forks(&roots);
+        let forks = discover_forks(&data_dir);
         for fork_dir in forks {
             // Skip forks that are being actively imported — they will be picked
             // up on the next scan pass once the import.lock is removed.
@@ -368,42 +365,43 @@ async fn fork_loop(
     }
 }
 
-/// Scan configured root directories and return all fork directories found.
+/// Scan the data directory and return all fork directories found.
 ///
 /// A fork directory is any directory that contains a `pending/` or `segments/`
 /// subdirectory. Forks live at:
-///   `<root>/<volume>/base/`
-///   `<root>/<volume>/forks/<name>/`
-fn discover_forks(roots: &[PathBuf]) -> Vec<PathBuf> {
+///   `<data_dir>/<volume>/base/`
+///   `<data_dir>/<volume>/forks/<name>/`
+fn discover_forks(data_dir: &Path) -> Vec<PathBuf> {
     let mut forks = Vec::new();
-    for root in roots {
-        let entries = match std::fs::read_dir(root) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("[coordinator] cannot read root {}: {e}", root.display());
-                continue;
-            }
-        };
-        for vol_entry in entries.flatten() {
-            let vol_path = vol_entry.path();
-            if !vol_path.is_dir() {
-                continue;
-            }
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                "[coordinator] cannot read data_dir {}: {e}",
+                data_dir.display()
+            );
+            return forks;
+        }
+    };
+    for vol_entry in entries.flatten() {
+        let vol_path = vol_entry.path();
+        if !vol_path.is_dir() {
+            continue;
+        }
 
-            // base/ fork lives directly under the volume root.
-            let base = vol_path.join("base");
-            if is_fork_dir(&base) {
-                forks.push(base);
-            }
+        // base/ fork lives directly under the volume root.
+        let base = vol_path.join("base");
+        if is_fork_dir(&base) {
+            forks.push(base);
+        }
 
-            // Named forks live under forks/<name>/.
-            let forks_dir = vol_path.join("forks");
-            if let Ok(fork_entries) = std::fs::read_dir(&forks_dir) {
-                for fork_entry in fork_entries.flatten() {
-                    let fork_path = fork_entry.path();
-                    if fork_path.is_dir() && is_fork_dir(&fork_path) {
-                        forks.push(fork_path);
-                    }
+        // Named forks live under forks/<name>/.
+        let forks_dir = vol_path.join("forks");
+        if let Ok(fork_entries) = std::fs::read_dir(&forks_dir) {
+            for fork_entry in fork_entries.flatten() {
+                let fork_path = fork_entry.path();
+                if fork_path.is_dir() && is_fork_dir(&fork_path) {
+                    forks.push(fork_path);
                 }
             }
         }
@@ -441,7 +439,7 @@ mod tests {
         // Volume "empty" — just a volume root, no forks.
         mk(root, "empty");
 
-        let forks = discover_forks(&[root.to_path_buf()]);
+        let forks = discover_forks(root);
         let mut names: Vec<String> = forks
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
