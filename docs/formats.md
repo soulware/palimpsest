@@ -283,23 +283,74 @@ For each extent:
 
 Inline section size depends on the inline threshold and extent size distribution — typically small if the threshold is kept tight (e.g. ≤ a few KB per extent).
 
-### S3 object key
+### S3 object layout
+
+The store uses two top-level prefixes:
 
 ```
-<volume_id>/<fork_name>/YYYYMMDD/<ulid>
+by_id/    — one directory per volume ULID; mirrors the local by_id/ layout
+names/    — one tiny file per named volume; the name→ULID index
 ```
 
-Keys are namespaced by volume and fork, with a date prefix derived from the ULID's embedded millisecond timestamp. The date is decoded and formatted as `YYYYMMDD` rather than taken from the ULID character prefix directly — the character prefix gives either ~3-day or ~2-hour buckets depending on how many characters are used, neither of which aligns with a calendar day. The date reflects segment creation time, not upload time, so keys are stable regardless of when `drain-pending` runs.
-
-Example key for a segment promoted in the `vm1` fork of volume `ubuntu-22.04`:
+**Segment key:**
 ```
-ubuntu-22.04/vm1/20260328/01KMTENX98EN5A20523Y2JC8N5
+by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>
 ```
 
-Benefits of this scheme:
-- `list <volume_id>/<fork_name>/` returns all segments for a fork regardless of age
-- `list <volume_id>/<fork_name>/YYYYMMDD/` returns all segments written on a given day — useful for GC audit and time-bounded operations
-- Volume and fork are visible directly in the key — no manifest lookup needed to identify ownership
+The date is extracted from the segment ULID's embedded millisecond timestamp and formatted as `YYYYMMDD`. Using the ULID timestamp (creation time) rather than upload time makes keys stable and deterministic regardless of when `drain-pending` runs.
+
+Example segment key:
+```
+by_id/01KN4Q7WCJNQ9SCK4KKY5888AJ/20260401/01KN4Q887YGPWMG4CBHCZPZN4Q
+```
+
+**Volume public key:**
+```
+by_id/<volume-ulid>/volume.pub
+```
+
+Uploaded once at first drain. Enables segment signature verification on any host (trust-on-first-use).
+
+**Volume manifest:**
+```
+by_id/<volume-ulid>/manifest.toml
+```
+
+Written at import, fork, and create time. Contains everything a new host needs to reconstruct the local directory skeleton before prefetching segment indexes:
+
+```toml
+name = "ubuntu-22.04"
+size = 2361393152
+readonly = true
+
+# present on forks only
+origin = "<parent-ulid>/snapshots/<snapshot-ulid>"
+
+# present on OCI-imported volumes only
+[source]
+digest = "sha256:..."
+arch = "amd64"
+```
+
+**Snapshot markers:**
+```
+by_id/<volume-ulid>/snapshots/YYYYMMDD/<snapshot-ulid>
+```
+
+Uploaded eagerly after each `volume snapshot` and at the end of import. The date prefix matches the snapshot ULID timestamp, consistent with segment keys. Enables a pulling host to enumerate valid fork branch points.
+
+**Name index entry:**
+```
+names/<name>
+```
+
+Content: the volume ULID, plain text. Written (or atomically overwritten) at import, fork, and create time. A single `LIST names/` returns all named volumes in the store regardless of how many ULIDs exist — no per-volume GETs needed.
+
+Benefits of this layout:
+- `LIST by_id/<ulid>/YYYYMMDD/` returns all segments for a volume on a given day — useful for GC audit
+- `LIST by_id/<ulid>/snapshots/` returns all branch points — used during `remote pull` ancestry walk
+- `LIST names/` returns all named volumes — used by `volume remote list`
+- `by_id/` and `names/` are distinct top-level prefixes; ULIDs and human names can never collide
 
 ### Retrieval strategies
 

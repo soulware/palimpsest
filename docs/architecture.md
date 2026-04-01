@@ -286,6 +286,8 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
 | `elide volume fork <src> <new-name>` | Create a new volume branched from latest snapshot of `<src>`; refuses if `<new-name>` already exists |
 | `elide volume create <name> [--size N]` | Create a new empty volume (generates ULID dir, writes `volume.name`); rescan |
+| `elide volume remote list` | `LIST names/` against the store; print all named volumes with ULID and size |
+| `elide volume remote pull <name>` | Resolve name → ULID via `names/<name>`, download manifest, reconstruct local skeleton, trigger coordinator rescan; prefetch of segment indexes happens automatically on next coordinator tick |
 
 `create` and `fork` generate a fresh ULID for the new volume directory. Both send a lightweight `rescan` to the coordinator after writing to disk. If the coordinator is not running, the rescan fails with a warning and the volume is discovered on the next startup or scan.
 
@@ -855,7 +857,7 @@ Import is handled by `elide volume import <name> <oci-ref>`, which asks the coor
 
 **Import procedure:** the import path writes data directly into `<vol-dir>/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `size` marker and `meta.toml` (OCI source metadata) are written into the volume directory.
 
-**S3 upload for snapshots:** snapshot marker files and `origin` files must also be uploaded to S3 so the volume ancestry tree is visible to other hosts. These are small and should be uploaded eagerly.
+**S3 upload for volume metadata:** at import, fork, and create time, two objects are written to the store eagerly: `names/<name>` (contains the ULID, plain text) and `by_id/<ulid>/manifest.toml` (name, size, origin, source metadata). Snapshot markers are uploaded as empty objects at `by_id/<ulid>/snapshots/YYYYMMDD/<snapshot-ulid>` after each `volume snapshot` and at the end of import. Together these allow any host to reconstruct the full volume ancestry skeleton with O(depth) GETs before segment index prefetch begins. See *S3 object layout* in `docs/formats.md` for the full key structure.
 
 **Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source volume. If a snapshot already exists at the tip, `fork-volume` uses the latest existing snapshot marker rather than creating a duplicate.
 
