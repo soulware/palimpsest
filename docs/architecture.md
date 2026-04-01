@@ -153,13 +153,41 @@ Coordinator (main process)
  └─ prefetch-indexes     (downloads .idx files for cold-start forks)
 ```
 
-## Coordinator restartability
+## Coordinator lifecycle and shutdown behaviour
 
-Volume processes are **detached** from the coordinator at spawn time (`setsid` / new session) so they are not in the coordinator's process group and are not signalled when it exits. The coordinator can be stopped, upgraded, or restarted without interrupting running volumes.
+Volume processes are **detached** from the coordinator at spawn time (`setsid` / new session) so they are not in the coordinator's process group and are not automatically signalled when it exits. The coordinator runs in two modes with different shutdown semantics:
 
-**Re-adoption on coordinator start:** when the coordinator starts, it scans for `wal/` directories and checks whether each has a running process (via a `volume.pid` file alongside `wal/`). Volumes with a live process are re-adopted. Volumes with no running process are started fresh and recover from their WAL as normal.
+### Foreground mode (`elide-coordinator serve`, default)
 
-**IPC is optional:** the coordinator skips compaction and GC steps gracefully if `control.sock` is absent (volume not running). Loss of the channel degrades background efficiency but never affects correctness or I/O availability — the volume never blocks on the coordinator.
+Intended for development and testing. The coordinator and its volumes are treated as one logical unit.
+
+On **Ctrl-C or SIGTERM**, the coordinator:
+1. Sends SIGTERM to every supervised volume process (via `volume.pid`)
+2. Sends SIGTERM to every running import process (via `import.pid`)
+3. Waits briefly for all processes to exit
+4. Exits itself
+
+This gives a clean teardown: no orphaned NBD devices, no stale pid files, no lock files left behind. The user gets the behaviour they expect from a foreground process — stopping the coordinator stops everything.
+
+### Daemon mode (`elide-coordinator serve --daemon`, planned)
+
+Intended for production deployments managed by a service supervisor (systemd, launchd, etc.). The coordinator is a restartable supervisor; volumes are independent long-running services.
+
+On **SIGTERM**, the coordinator exits immediately **without signalling volume or import processes**. Running volumes continue serving. The `setsid` at spawn time ensures they are not in the coordinator's session and receive no automatic signal.
+
+On next coordinator start, running volumes are **re-adopted**: the coordinator scans for `volume.pid` files, confirms the processes are alive, and resumes supervision (drain, GC, inbound socket) without restarting them.
+
+### Re-adoption on coordinator start
+
+Regardless of mode, on startup the coordinator:
+1. Calls `cleanup_stale_locks()` to remove any `import.lock` files left by a previous run (killing surviving import processes if found)
+2. Scans all fork directories; for each `volume.pid` present: if the process is alive, re-adopt it; if dead, remove the stale pid file and start a fresh volume process
+
+Re-adoption means the supervisor task polls the existing process until it exits naturally, then restarts it as normal. The volume's WAL and segments are untouched.
+
+### IPC is optional
+
+The coordinator skips compaction and GC steps gracefully if `control.sock` is absent (volume not running). Loss of the channel degrades background efficiency but never affects correctness or I/O availability — the volume never blocks on the coordinator.
 
 ## Control Socket Protocol
 
@@ -226,9 +254,11 @@ elide serve-volume <fork-dir> [--size N] [--bind addr] [--port N] [--readonly]
 ### `elide-coordinator` CLI commands
 
 ```
-elide-coordinator serve [--config coordinator.toml]   # run daemon in foreground (default for dev)
-elide-coordinator serve --daemon                       # detach and run in background
+elide-coordinator serve [--config coordinator.toml]   # foreground mode: Ctrl-C terminates coordinator + all volumes
+elide-coordinator serve --daemon                       # daemon mode: coordinator restartable independently of volumes
 ```
+
+The `--daemon` flag changes shutdown semantics (see *Coordinator lifecycle and shutdown behaviour*); it does not currently detach the process. Process detachment (double-fork or systemd `Type=notify`) is deferred — for now, daemon mode is started via a service manager that handles detachment.
 
 ### Finding the coordinator socket
 
