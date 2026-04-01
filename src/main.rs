@@ -343,10 +343,8 @@ fn main() {
             readonly,
             force_origin,
         } => {
-            let vol_dir = fork_dir
-                .parent()
-                .and_then(|p| p.parent())
-                .expect("fork_dir must be <vol>/forks/<name>");
+            let vol_dir =
+                fork_vol_dir(&fork_dir).expect("fork_dir must be <vol>/base or <vol>/forks/<name>");
             let size_bytes = resolve_volume_size(vol_dir, size.as_deref())
                 .expect("failed to determine volume size");
             let fetch_config =
@@ -512,18 +510,31 @@ fn count_forks(vol_dir: &Path) -> usize {
 }
 
 fn create_volume(vol_dir: &Path, size: Option<&str>) -> std::io::Result<()> {
+    let size_str =
+        size.ok_or_else(|| std::io::Error::other("--size is required (e.g. --size 4G)"))?;
+    let bytes =
+        parse_size(size_str).map_err(|e| std::io::Error::other(format!("bad --size: {e}")))?;
+    if bytes == 0 {
+        return Err(std::io::Error::other("volume size must be non-zero"));
+    }
     std::fs::create_dir_all(vol_dir.join("forks"))?;
     std::fs::create_dir_all(vol_dir.join("base").join("pending"))?;
     std::fs::create_dir_all(vol_dir.join("base").join("segments"))?;
-    if let Some(s) = size {
-        let bytes = parse_size(s).map_err(|e| std::io::Error::other(format!("bad --size: {e}")))?;
-        if bytes == 0 {
-            return Err(std::io::Error::other("volume size must be non-zero"));
-        }
-        std::fs::write(vol_dir.join("size"), bytes.to_string())?;
-    }
+    std::fs::write(vol_dir.join("size"), bytes.to_string())?;
     println!("{}", vol_dir.display());
     Ok(())
+}
+
+/// Resolve the volume directory from a fork directory.
+///
+/// `base` forks live at `<vol>/base` — one level up.
+/// Named forks live at `<vol>/forks/<name>` — two levels up (skipping `forks/`).
+fn fork_vol_dir(fork_dir: &Path) -> Option<&Path> {
+    if fork_dir.file_name()? == "base" {
+        fork_dir.parent()
+    } else {
+        fork_dir.parent()?.parent()
+    }
 }
 
 /// Parse a human-readable size string: plain bytes, or with suffix K/M/G/T (base-2).
