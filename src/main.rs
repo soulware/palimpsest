@@ -179,6 +179,41 @@ enum VolumeCommand {
         /// Volume name
         name: String,
     },
+
+    /// Manage OCI imports
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
+
+    /// Stop all processes for a volume and remove its directory
+    Delete {
+        /// Volume name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// Pull an OCI image into a new volume (coordinator-spawned; returns immediately with a ULID)
+    Start {
+        /// Volume name to create
+        name: String,
+        /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag)
+        oci_ref: String,
+    },
+
+    /// Poll the state of a running or completed import
+    Status {
+        /// Import ULID (returned by `import start`)
+        ulid: String,
+    },
+
+    /// Stream output from a running or completed import
+    Attach {
+        /// Import ULID (returned by `import start`)
+        ulid: String,
+    },
 }
 
 fn main() {
@@ -257,6 +292,40 @@ fn main() {
                     }
                     _ => println!("{name}: {resp}"),
                 }
+            }
+
+            VolumeCommand::Import { command } => match command {
+                ImportCommand::Start { name, oci_ref } => {
+                    let ulid = coordinator_client::import_start(&socket_path, &name, &oci_ref)
+                        .expect("import start failed");
+                    println!("{ulid}");
+                }
+                ImportCommand::Status { ulid } => {
+                    let resp = coordinator_client::import_status(&socket_path, &ulid)
+                        .unwrap_or_else(|e| format!("err {e}"));
+                    match resp.split_once(' ') {
+                        Some(("ok", state)) => println!("{ulid}: {state}"),
+                        Some(("err", msg)) => {
+                            eprintln!("{ulid}: {msg}");
+                            std::process::exit(1);
+                        }
+                        _ => println!("{ulid}: {resp}"),
+                    }
+                }
+                ImportCommand::Attach { ulid } => {
+                    let mut stdout = std::io::stdout();
+                    if let Err(e) =
+                        coordinator_client::import_attach(&socket_path, &ulid, &mut stdout)
+                    {
+                        eprintln!("import failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            },
+
+            VolumeCommand::Delete { name } => {
+                coordinator_client::delete_volume(&socket_path, &name)
+                    .expect("volume delete failed");
             }
         },
 

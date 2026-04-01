@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use crate::config::CoordinatorConfig;
 use crate::control;
 use crate::gc;
+use crate::import;
 use crate::inbound;
 use crate::serve_config;
 use crate::supervisor;
@@ -47,6 +48,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let drain_interval = Duration::from_secs(config.drain.interval_secs);
     let scan_interval = Duration::from_secs(config.drain.scan_interval_secs);
     let elide_bin = config.elide_bin.clone();
+    let elide_import_bin = Arc::new(config.elide_import_bin.clone());
     let gc_config = config.gc.clone();
     let socket_path = config.resolved_socket_path();
     let roots = Arc::new(config.roots.clone());
@@ -62,15 +64,23 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         info!("[coordinator] root: {}", root.display());
     }
 
+    // Clean up any stale import locks left by a previous coordinator run.
+    import::cleanup_stale_locks(&config.roots);
+
     // Shared notify: inbound socket triggers this to request an immediate rescan.
     let rescan_notify = Arc::new(Notify::new());
+
+    // Import job registry: tracks running and recently-completed import jobs.
+    let import_registry = import::new_registry();
 
     // Spawn the inbound socket server.
     {
         let roots = roots.clone();
         let notify = rescan_notify.clone();
+        let registry = import_registry.clone();
+        let bin = elide_import_bin.clone();
         tokio::spawn(async move {
-            inbound::serve(&socket_path, roots, notify).await;
+            inbound::serve(&socket_path, roots, notify, registry, bin).await;
         });
     }
 
@@ -85,6 +95,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     loop {
         let forks = discover_forks(&roots);
         for fork_dir in forks {
+            // Skip forks that are being actively imported — they will be picked
+            // up on the next scan pass once the import.lock is removed.
+            if fork_dir.join(import::LOCK_FILE).exists() {
+                continue;
+            }
             if known.insert(fork_dir.clone()) {
                 info!("[coordinator] discovered fork: {}", fork_dir.display());
 
@@ -180,6 +195,11 @@ async fn fork_loop(
                 fork_dir.display()
             );
             break;
+        }
+
+        // Skip drain/GC while an import is writing to this fork.
+        if fork_dir.join(import::LOCK_FILE).exists() {
+            continue;
         }
 
         // Steps 1-3: compact pending segments via volume IPC (best-effort;

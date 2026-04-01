@@ -53,6 +53,11 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_elide_bin")]
     pub elide_bin: PathBuf,
 
+    /// Path to the `elide-import` binary.
+    /// Defaults to `"elide-import"` (resolved via PATH).
+    #[serde(default = "default_elide_import_bin")]
+    pub elide_import_bin: PathBuf,
+
     /// GC configuration.
     #[serde(default)]
     pub gc: GcConfig,
@@ -72,6 +77,10 @@ impl CoordinatorConfig {
 
 fn default_elide_bin() -> PathBuf {
     PathBuf::from("elide")
+}
+
+fn default_elide_import_bin() -> PathBuf {
+    PathBuf::from("elide-import")
 }
 
 #[derive(Deserialize)]

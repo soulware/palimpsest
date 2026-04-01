@@ -33,6 +33,12 @@ pub async fn supervise(fork_dir: PathBuf, serve_config: ServeConfig, elide_bin: 
     let label = fork_dir.display().to_string();
 
     loop {
+        // Exit if the fork directory has been removed (e.g. by `volume delete`).
+        if !fork_dir.exists() {
+            info!("[supervisor {label}] fork directory removed, stopping");
+            break;
+        }
+
         // Check for a running process left by a previous coordinator session.
         if let Some(pid) = read_pid(&fork_dir) {
             if is_alive(pid) {
