@@ -23,7 +23,8 @@
 //   <data_dir>/by_id/<ulid>/    — one directory per volume (ULID name = S3 prefix)
 //   <data_dir>/by_name/<name>   — symlinks into by_id/ for human navigation
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,7 +93,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         });
     }
 
-    let mut known: HashSet<PathBuf> = HashSet::new();
+    // Maps each known volume path to its directory inode.  The inode detects
+    // delete-and-recreate: if the same path reappears with a different inode
+    // (e.g. `volume delete` followed by `volume remote pull` of the same ULID),
+    // we treat it as a new discovery and spawn fresh tasks.
+    let mut known: HashMap<PathBuf, u64> = HashMap::new();
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     let mut scan_tick = tokio::time::interval(scan_interval);
@@ -104,7 +109,9 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         // Prune volumes that have been deleted since we last saw them so that
         // if the same ULID directory is recreated (e.g. by `volume remote pull`
         // after a `volume delete`), it will be discovered and processed again.
-        known.retain(|p| p.exists());
+        // Prune volumes whose path no longer exists OR whose directory inode
+        // changed (deleted and recreated at the same path with the same ULID).
+        known.retain(|p, ino| p.metadata().map(|m| m.ino() == *ino).unwrap_or(false));
 
         let volumes = discover_volumes(&data_dir);
         for vol_dir in volumes {
@@ -113,7 +120,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             if vol_dir.join(import::LOCK_FILE).exists() {
                 continue;
             }
-            if known.insert(vol_dir.clone()) {
+            let vol_ino = vol_dir.metadata().map(|m| m.ino()).unwrap_or(0);
+            if known
+                .insert(vol_dir.clone(), vol_ino)
+                .map_or(true, |old| old != vol_ino)
+            {
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] discovered volume: {label}");
 
@@ -148,7 +159,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
                 // SIGTERM every volume and import process across all known volumes.
                 let all_pids: Vec<u32> = known
-                    .iter()
+                    .keys()
                     .flat_map(|vol_dir| import::terminate_fork_processes(vol_dir))
                     .collect();
 
@@ -166,7 +177,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 // Clean up pid files now that processes have exited. The
                 // supervisor tasks were aborted above and cannot do this
                 // themselves.
-                for vol_dir in &known {
+                for vol_dir in known.keys() {
                     let _ = std::fs::remove_file(vol_dir.join("volume.pid"));
                 }
 
