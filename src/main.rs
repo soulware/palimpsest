@@ -510,6 +510,8 @@ fn count_forks(vol_dir: &Path) -> usize {
 
 fn create_volume(vol_dir: &Path, size: Option<&str>) -> std::io::Result<()> {
     std::fs::create_dir_all(vol_dir.join("forks"))?;
+    std::fs::create_dir_all(vol_dir.join("base").join("pending"))?;
+    std::fs::create_dir_all(vol_dir.join("base").join("segments"))?;
     if let Some(s) = size {
         let bytes = parse_size(s).map_err(|e| std::io::Error::other(format!("bad --size: {e}")))?;
         if bytes == 0 {
