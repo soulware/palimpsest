@@ -112,7 +112,9 @@ pub async fn spawn_import(
     let symlink_path = by_name_dir.join(vol_name);
 
     // Reject if a volume with this name already exists.
-    if symlink_path.exists() {
+    // Use is_symlink() || exists() so that a broken symlink (target deleted)
+    // is still treated as "name in use" rather than silently overwritten.
+    if symlink_path.is_symlink() || symlink_path.exists() {
         return Err(std::io::Error::other(format!(
             "volume already exists: {vol_name}"
         )));

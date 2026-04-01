@@ -2902,7 +2902,9 @@ mod tests {
         let by_id = temp_dir();
         let root_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
-        // root has no snapshot yet.
+        // Create root_dir so canonicalize() succeeds, but leave it without
+        // a snapshots/ directory so latest_snapshot returns "no snapshots".
+        fs::create_dir_all(&root_dir).unwrap();
         let err = fork_volume(&child_dir, &root_dir).unwrap_err();
         assert!(err.to_string().contains("no snapshots"), "{err}");
     }

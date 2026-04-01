@@ -295,12 +295,21 @@ fn main() {
                     std::process::exit(1);
                 }
                 // Copy volume.size from source so the coordinator can serve the fork.
-                if let Ok(size) = std::fs::read(source_fork_dir.join("volume.size"))
-                    && let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size)
-                {
-                    let _ = std::fs::remove_dir_all(&new_fork_dir);
-                    eprintln!("error: failed to copy volume.size: {e}");
-                    std::process::exit(1);
+                match std::fs::read(source_fork_dir.join("volume.size")) {
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&new_fork_dir);
+                        eprintln!(
+                            "error: source volume has no volume.size (import may not have completed): {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                    Ok(size) => {
+                        if let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size) {
+                            let _ = std::fs::remove_dir_all(&new_fork_dir);
+                            eprintln!("error: failed to copy volume.size: {e}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 if let Err(e) = std::fs::write(new_fork_dir.join("volume.name"), &fork_name) {
                     let _ = std::fs::remove_dir_all(&new_fork_dir);

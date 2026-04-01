@@ -86,10 +86,10 @@ fn flush_segment(
 
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
 ///
-/// Creates `<vol_dir>/base/{segments,snapshots}/`, reads
-/// `image_path` in 4 KiB blocks, and writes segment files. After all data is
-/// written, writes a snapshot marker (branch point for future forks) and the
-/// `readonly` and `size` markers at the volume root.
+/// Creates `<vol_dir>/segments/` and `<vol_dir>/snapshots/`, reads
+/// `image_path` in 4 KiB blocks, and writes segment files directly into the
+/// volume root (flat layout). After all data is written, writes a snapshot
+/// marker (branch point for future forks) and the `volume.size` marker.
 ///
 /// `progress` receives `(blocks_done, total_blocks)` after each block is
 /// processed. Pass a no-op closure if progress reporting is not needed.
@@ -105,12 +105,12 @@ pub fn import_image(
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
     // `vol_dir` may already exist (caller may have created it to write key files
-    // before calling import). Fail only if the base fork directory already exists,
-    // which means a previous import completed or is in progress.
-    if vol_dir.join("base").exists() {
+    // before calling import). Fail only if segments/ already exists, which means
+    // a previous import completed or is in progress.
+    if vol_dir.join("segments").exists() {
         return Err(io::Error::other(format!(
-            "volume base already exists: {}",
-            vol_dir.join("base").display()
+            "volume already has segments: {}",
+            vol_dir.display()
         )));
     }
 
@@ -120,9 +120,8 @@ pub fn import_image(
     }
     let total_blocks = image_size / LBA_SIZE as u64;
 
-    let fork_dir = vol_dir.join("base");
-    let segments_dir = fork_dir.join("segments");
-    let snapshots_dir = fork_dir.join("snapshots");
+    let segments_dir = vol_dir.join("segments");
+    let snapshots_dir = vol_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
     fs::create_dir_all(&snapshots_dir)?;
 
@@ -206,18 +205,18 @@ mod tests {
             fs::read_to_string(vol_dir.join("volume.size")).unwrap(),
             (LBA_SIZE * 3).to_string()
         );
-        assert!(vol_dir.join("base").join("segments").exists());
-        assert!(!vol_dir.join("base").join("pending").exists()); // frozen base: no pending/
+        assert!(vol_dir.join("segments").exists());
+        assert!(!vol_dir.join("pending").exists()); // flat layout: no pending/ on import
 
         // Exactly one snapshot marker, and its ULID matches the segment ULID.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("base").join("segments"))
+        let segs: Vec<_> = fs::read_dir(vol_dir.join("segments"))
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(segs.len(), 1);
         let seg_name = segs[0].file_name().into_string().unwrap();
 
-        let snaps: Vec<_> = fs::read_dir(vol_dir.join("base").join("snapshots"))
+        let snaps: Vec<_> = fs::read_dir(vol_dir.join("snapshots"))
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
@@ -241,9 +240,7 @@ mod tests {
         import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
         // All-zero image: no segment files should be written.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("base").join("segments"))
-            .unwrap()
-            .collect();
+        let segs: Vec<_> = fs::read_dir(vol_dir.join("segments")).unwrap().collect();
         assert_eq!(segs.len(), 0);
     }
 
@@ -272,8 +269,10 @@ mod tests {
         let vol_dir = vol_tmp.path().join("readable");
         import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
-        // Re-open with ReadonlyVolume and verify the blocks.
-        let rv = crate::volume::ReadonlyVolume::open(&vol_dir.join("base"), &vol_dir).unwrap();
+        // Re-open with Volume and verify the blocks.
+        // No ancestors in this test; by_id_dir is unused.
+        let by_id = vol_dir.parent().unwrap();
+        let rv = crate::volume::Volume::open(&vol_dir, by_id).unwrap();
         let got0 = rv.read(0, 1).unwrap();
         assert_eq!(got0, b0);
         let got1 = rv.read(1, 1).unwrap();
