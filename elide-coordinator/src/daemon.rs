@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use object_store::ObjectStore;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -60,6 +60,9 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         config.drain.scan_interval_secs,
         elide_bin.display(),
     );
+
+    std::fs::create_dir_all(data_dir.as_ref())
+        .with_context(|| format!("creating data_dir: {}", data_dir.display()))?;
 
     // Clean up any stale import locks left by a previous coordinator run.
     import::cleanup_stale_locks(&config.data_dir);
