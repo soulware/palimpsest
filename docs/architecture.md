@@ -62,92 +62,98 @@ The split keeps the volume process binary lean and focused. The async HTTP stack
 needed for OCI registry pulls belongs in tooling (`elide-import`), not in the
 process that serves block I/O.
 
-**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised short-lived process. The coordinator creates the fork directory, writes an `import.lock` marker, spawns `elide-import`, streams its output to any attached clients, and cleans up the lock on exit. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
+**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised short-lived process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, streams its output to any attached clients, and cleans up the lock on exit. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume fork <name> <new-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
 
 ## Directory layout
 
-All volume state lives under a shared root directory on a dedicated local NVMe mount. A **volume** is a named directory containing metadata files and a `forks/` subdirectory. Named forks live exclusively under `forks/` — this keeps fork directories cleanly separated from volume-level metadata. Each fork is a named subdirectory under `forks/` that maintains its own WAL, segments, and snapshot history. A fork with `wal/` present is live (writable); a fork without `wal/` is frozen or not yet started.
+All volume state lives under a shared `data_dir` on a dedicated local NVMe mount. The structure mirrors the Linux `by-id` / `by-name` devicemapper convention:
 
-**Writable volume:**
-
-```
-/var/lib/elide/volumes/
-  myvm/                          — volume "myvm"
-    size                         — volume size in bytes (plain text)
-    forks/
-      default/                   — default fork (live)
-        wal/                     — present = live; write target
-        pending/                 — segments awaiting promotion
-        segments/                — committed segment files
-        snapshots/
-          <ulid-1>               — marker file (empty, or optional name)
-          <ulid-2>
-      dev/                       — named fork branched from default
-        wal/
-        pending/
-        segments/
-        origin                   — text: "forks/<fork-name>/snapshots/<ulid>" (branch point)
-        snapshots/
-          <ulid-3>
-  control.sock                   — Unix domain socket; coordinator-to-volume IPC
-```
-
-**Imported volume** (OCI image imported via `volume import`):
+- **`by_id/`** — canonical store; one ULID-named subdirectory per volume. The ULID is the volume's stable global identity, its S3 prefix, and the target of all `origin` ancestry links. The coordinator scans only `by_id/`.
+- **`by_name/`** — pure symlink view; one symlink per volume pointing into `by_id/`. Maintained by the coordinator. Intended for human navigation and inspection.
 
 ```
-  ubuntu-22.04/
-    meta.toml                    — source metadata (OCI digest, arch)
-    size
-    forks/
-      base/                      — frozen import fork (readonly, no wal/)
-        segments/
-        snapshots/
-          <import-ulid>
-      default/                   — writable CoW fork, branched from base at import time
-        wal/
-        pending/
-        segments/
-        origin                   — "forks/base/snapshots/<import-ulid>"
-        snapshots/
-      server-1/                  — additional named fork branched from base
-        wal/
-        pending/
-        segments/
-        origin                   — "forks/base/snapshots/<import-ulid>"
-        snapshots/
+<data_dir>/
+  control.sock                        — coordinator inbound socket
+  by_id/
+    01JQAAAAAAA/                      — imported base (ULID = stable S3 prefix)
+      volume.name                     — "ubuntu-22.04"
+      volume.readonly                 — present = permanently readonly (imported/frozen)
+      size                            — volume size in bytes (plain text)
+      segments/
+        01JQXXXXX.seg
+      snapshots/
+        01JQXXXXX                     — branch point marker for derived volumes
+      meta.toml                       — OCI source metadata (digest, arch)
+      volume.key                      — Ed25519 signing key (never uploaded)
+      volume.pub                      — Ed25519 public key (uploaded to S3)
+      volume.origin                   — hostname + path + signature (tamper detection)
+      import.lock                     — present while import is running or interrupted
+    01JQBBBBBBB/                      — writable volume forked from ubuntu-22.04
+      volume.name                     — "server-1"
+      size
+      wal/                            — present = live; write target
+      pending/
+      segments/
+      snapshots/
+      origin                          — "01JQAAAAAAA/snapshots/01JQXXXXX"
+      volume.key
+      volume.pub
+      volume.origin
+      volume.pid                      — PID of running volume process
+      control.sock                    — volume process IPC socket
+    01JQCCCCCCC/
+      volume.name                     — "server-2"
+      origin                          — "01JQAAAAAAA/snapshots/01JQXXXXX"
+      ...
+    01JQDDDDDDD/
+      volume.name                     — "server-2-experiment"
+      origin                          — "01JQCCCCCCC/snapshots/<ulid>"
+      ...
+  by_name/
+    ubuntu-22.04  ->  ../by_id/01JQAAAAAAA
+    server-1      ->  ../by_id/01JQBBBBBBB
+    server-2      ->  ../by_id/01JQCCCCCCC
+    server-2-experiment  ->  ../by_id/01JQDDDDDDD
 ```
 
-`forks/base/` is created by `volume import` and holds the frozen, readonly import data. It is never written to after import completes — no `wal/`, no `pending/`. `volume import` also creates `forks/default/` as a writable CoW fork branched from `base`, so the volume is immediately usable without a separate `volume fork` step. Additional named forks can be branched from `base` at any time.
+The `origin` file contains a single line: `<parent-ulid>/snapshots/<snapshot-ulid>`, where `<parent-ulid>` is the sibling directory name within `by_id/`. Using ULIDs in `origin` means ancestry links survive renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` resolves `by_id_dir/<parent-ulid>` and follows the chain to the root.
+
+**S3 path:** `<bucket>/<volume-ulid>/segments/<segment-ulid>.seg` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path.
+
+**Name resolution:** the CLI accepts human-readable names in all commands. `by_name/<name>` is a symlink → O(1) resolution via `readlink`. Names must be unique within a `data_dir` — the CLI refuses to create a volume whose name would duplicate an existing `by_name/` entry. The uniqueness constraint is local only; different hosts sharing the same S3 bucket may assign different names to the same ULID.
+
+**`by_name/` maintenance:** the coordinator creates the symlink when a volume is discovered, updates it on rename, and removes it on delete. On startup the coordinator reconciles `by_name/` against `by_id/`: removes stale symlinks (target ULID no longer exists), adds missing symlinks (volume in `by_id/` with no corresponding `by_name/` entry).
 
 **Invariants:**
-- `wal/` present → fork is live; exactly one process writes here (enforced by `volume.lock`)
-- `wal/` absent → fork is frozen or not yet started; cannot be served writably
-- `origin` is present only on forks branched from another fork; its value is a path relative to the volume root: `forks/base/snapshots/<ulid>` for forks from the import base, or `forks/<name>/snapshots/<ulid>` for forks from a user fork
-- `snapshots/<ulid>` is a plain marker file; the ULID sorts after all segments present at snapshot time, giving a stable branch point
-- `meta.toml` at the volume root records source metadata
-- `forks/` is the exclusive home for all forks; no fork directories appear directly in the volume root
-- `forks/base/` is reserved for the import fork and is always readonly (no `wal/`)
-- `forks/default/` is the initial writable fork, created by both `volume create` and `volume import`
-- `children/` is not used; forks are named siblings, not anonymous `children/<ulid>/` descendants
+- `by_id/` entries are valid ULIDs — the coordinator skips anything else
+- `by_name/` entries are symlinks only — no real directories
+- `volume.name` is present in every volume; single non-empty line
+- `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
+- `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
+- `origin` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
+- `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
+- `meta.toml` present only on OCI-imported volumes
+- `import.lock` present only while an import is running or interrupted
 
-**Finding live forks:** scan `forks/` for subdirectories containing `wal/`.
+**Finding live volumes:** scan `by_id/` for subdirectories; skip those with `volume.readonly`.
 
-**Exclusive access:** a live fork holds an exclusive `flock` on `<fork-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked fork fails immediately.
+**Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 
-**Import lock:** `<fork-dir>/import.lock` (plain text, one line: the import ULID) is present while an import process is running or was interrupted. The coordinator removes it on clean import exit. A stale lock (import process dead) is cleaned up on the next coordinator startup or rescan pass. See *Import process lifecycle* below.
+**Import lock:** `<vol-dir>/import.lock` (plain text, one line: the import job ULID) is present while an import process is running or was interrupted. The coordinator removes it on clean import exit. Cleaned up on the next coordinator startup or rescan pass if stale. See *Import process lifecycle* below.
 
-**Stopped marker:** `<fork-dir>/volume.stopped` is written by the coordinator when a volume is explicitly stopped via `volume stop` or `coordinator quiesce`. While present, the supervisor will not start or restart the volume process. Removed by `volume start`. Persists across coordinator restarts — a stopped volume stays stopped until explicitly started.
+**Stopped marker:** `<vol-dir>/volume.stopped` is written by the coordinator when a volume is explicitly stopped via `volume stop` or `coordinator quiesce`. While present, the supervisor will not start or restart the volume process. Removed by `volume start`. Persists across coordinator restarts.
 
-**Fork process state** (readable from the filesystem without running processes):
+**Volume process state** (readable from the filesystem without running processes):
 
 | Marker files present | State |
 |---|---|
 | `volume.pid` alive | running — volume process is serving I/O |
 | `volume.stopped` | explicitly stopped — coordinator will not restart |
 | `import.lock` | import in progress or interrupted |
+| `volume.readonly` | readonly — coordinator never supervises |
 | none of the above | idle — coordinator will start the volume process |
 
-**Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. `walk_ancestors` follows this chain to the root (`forks/base/` for imported volumes, or `forks/default/` for blank volumes), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
+**Volume ancestry:** a volume's `origin` file names its parent ULID and the branch-point snapshot ULID. `walk_ancestors(vol_dir, by_id_dir)` follows this chain to the root (a volume with no `origin` file), building an oldest-first list of ancestor layers. Segments in each ancestor are included only up to the branch-point ULID — post-branch writes to an ancestor are not visible in derived volumes.
 
 ```
 VM
@@ -165,7 +171,7 @@ Volume process  (one per volume)
       ▼
 Coordinator (main process)
  ├─ Volume supervisor    (spawn/re-adopt volume processes)
- ├─ Fork watcher         (inotify on configured root dirs; discovers new forks/volumes)
+ ├─ Volume watcher       (scans by_id/; discovers new volumes)
  ├─ S3 uploader          (drains pending/ → S3; async, not on write critical path)
  ├─ Segment GC           (coordinator-driven; reads LBA map from indexes; writes gc/ result files)
  └─ prefetch-indexes     (downloads .idx files for cold-start forks)
@@ -209,11 +215,11 @@ These operations give explicit control over individual volumes or all volumes wh
 
 **`volume stop <name>`** — stop a single volume:
 1. Send SIGTERM to the volume process (via `volume.pid`)
-2. Write `<fork-dir>/volume.stopped`
+2. Write `<vol-dir>/volume.stopped`
 3. Supervisor sees the marker and does not restart
 
 **`volume start <name>`** — start a previously stopped volume:
-1. Remove `<fork-dir>/volume.stopped`
+1. Remove `<vol-dir>/volume.stopped`
 2. Supervisor picks it up on the next scan and starts the process normally
 
 **`coordinator quiesce`** — stop all running volumes:
@@ -237,7 +243,7 @@ The coordinator skips compaction and GC steps gracefully if `control.sock` is ab
 
 ## Control Socket Protocol
 
-The volume process listens on `<fork-dir>/control.sock`. The coordinator connects, sends one request line, reads one response line, and closes the connection. Protocol is newline-delimited plain text.
+The volume process listens on `<vol-dir>/control.sock`. The coordinator connects, sends one request line, reads one response line, and closes the connection. Protocol is newline-delimited plain text.
 
 **Request format:** `<op> [args...]\n`
 
@@ -268,37 +274,39 @@ The `elide` binary serves a dual role: it is both the **user-facing CLI** and th
 
 Most commands operate directly on the volume directory and require no running coordinator. A small set need the coordinator for process or device management.
 
+All user-facing commands accept a **volume name** (resolved via `by_name/<name>` symlink → O(1)) or a **volume ULID** (looked up directly in `by_id/`). Names must be unique within a `data_dir`; commands that create volumes refuse if a `by_name/` entry for that name already exists.
+
 **Filesystem-direct (no coordinator required):**
 
 | Command | What it does |
 |---|---|
-| `elide volume list` | Scan configured data directory for volumes |
-| `elide volume info <name>` | Read fork structure, segment counts, WAL size |
-| `elide volume ls <name> [path]` | Browse ext4 filesystem contents |
-| `elide volume snapshot <name> [<fork>]` | Write a snapshot marker file |
-| `elide volume fork <name> <new-fork>` | Create a named fork (directory operation) |
-| `elide volume create <name> [--size N]` | Create volume directory structure, then rescan |
+| `elide volume list` | Scan `data_dir` for ULID dirs; show name, ULID, state |
+| `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
+| `elide volume ls <name\|ulid> [path]` | Browse ext4 filesystem contents |
+| `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
+| `elide volume fork <src> <new-name>` | Create a new volume branched from latest snapshot of `<src>`; refuses if `<new-name>` already exists |
+| `elide volume create <name> [--size N]` | Create a new empty volume (generates ULID dir, writes `volume.name`); rescan |
 
-`create` does all its work on disk, then sends a lightweight `rescan` request to the coordinator so the new volume is picked up immediately rather than waiting for the next scan interval. If the coordinator is not running, the rescan request fails with a warning and the volume will be discovered on the coordinator's next startup or scan.
+`create` and `fork` generate a fresh ULID for the new volume directory. Both send a lightweight `rescan` to the coordinator after writing to disk. If the coordinator is not running, the rescan fails with a warning and the volume is discovered on the next startup or scan.
 
 **Coordinator-required (process and device management):**
 
 | Command | What it does |
 |---|---|
-| `elide volume status <name>` | Is the volume process running? What forks? |
-| `elide volume stop <name>` | Stop the volume process and set `volume.stopped`; coordinator keeps running |
-| `elide volume start <name>` | Clear `volume.stopped`; coordinator restarts the volume |
-| `elide volume delete <name>` | Stop all processes for the volume, then remove its directory |
-| `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import ULID |
-| `elide volume import status <ulid>` | Poll import state: running / done / failed |
-| `elide volume import attach <ulid>` | Stream import output lines until completion |
-| `elide coordinator quiesce` | Stop all volumes (set `volume.stopped` for each); coordinator keeps running |
-| `elide coordinator resume` | Clear `volume.stopped` on all forks; coordinator restarts them |
+| `elide volume status <name\|ulid>` | Is the volume process running? |
+| `elide volume stop <name\|ulid>` | Stop the volume process and set `volume.stopped` |
+| `elide volume start <name\|ulid>` | Clear `volume.stopped`; coordinator restarts the volume |
+| `elide volume delete <name\|ulid>` | Stop all processes, then remove the volume directory |
+| `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import job ULID |
+| `elide volume import status <job-ulid>` | Poll import state: running / done / failed |
+| `elide volume import attach <job-ulid>` | Stream import output until completion |
+| `elide coordinator quiesce` | Stop all volumes (set `volume.stopped`); coordinator keeps running |
+| `elide coordinator resume` | Clear `volume.stopped` on all volumes; coordinator restarts them |
 
 **Internal (spawned by coordinator; not intended for direct use):**
 
 ```
-elide serve-volume <fork-dir> [--size N] [--bind addr] [--port N] [--readonly]
+elide serve-volume <vol-dir> [--bind addr] [--port N] [--readonly]
 ```
 
 ### `elide-coordinator` CLI commands
@@ -316,9 +324,9 @@ Every managed process has a `control.sock` in its own directory. The directory s
 
 ```
 <data-dir>/
-  control.sock                      ← coordinator inbound (CLI talks here)
-  <volume>/forks/<fork>/
-    control.sock                    ← volume process control (coordinator talks here)
+  control.sock                         ← coordinator inbound (CLI talks here)
+  by_id/<volume-ulid>/
+    control.sock                       ← volume process control (coordinator talks here)
 ```
 
 The `elide` CLI derives the coordinator socket path from `--data-dir`:
@@ -327,37 +335,9 @@ The `elide` CLI derives the coordinator socket path from `--data-dir`:
 2. `ELIDE_DATA_DIR` environment variable → `<value>/control.sock`
 3. `./elide_data/control.sock` (default)
 
-## Future: simplified user-facing volume model
-
-The current CLI exposes both the **volume** (directory containing base + forks) and the **fork** (the writable branch) as separate concepts. Most commands take both a volume name and a fork name. This is accurate to the internal layout but unnecessarily exposes implementation detail.
-
-**Target model:** a user-facing *volume* maps directly to a single fork internally. The `forks/base/` import data is an invisible ancestor layer — users never address it directly. The fork concept disappears from the user-facing vocabulary; what users think of as "volumes" are forks under the hood.
-
-**Multi-VM use case:** today you might create one volume (`ubuntu-22.04`) with multiple named forks (`server-1`, `server-2`). In the target model, `server-1` and `server-2` are themselves named volumes that were cloned from `ubuntu-22.04`. The shared base data is still shared on disk; it's just not visible as a separate addressable object.
-
-**CLI in the target model:**
-
-```
-elide volume import <name> <oci-ref>    create a new volume from an OCI image
-elide volume create <name> [--size N]   create a new empty volume
-elide volume clone <src> <dst>          branch a new volume from the latest snapshot of <src>
-elide volume list                       list all volumes
-elide volume info <name>                show segment counts, WAL size, snapshot history
-elide volume ls <name> [path]           browse ext4 filesystem contents (no fork arg)
-elide volume snapshot <name>            write a snapshot marker
-elide volume status <name>              is the volume process running?
-elide volume delete <name>              stop process and remove volume
-```
-
-`volume clone` replaces `volume fork`. The `fork` argument disappears from all commands — there is at most one active fork per user-visible volume name.
-
-**What changes internally:** the coordinator discovers and supervises forks as it does today. The mapping from user-visible volume name to fork directory is one-to-one: each user volume corresponds to a fork under some parent volume's `forks/` directory (or to a standalone volume's `forks/default/` fork). The `forks/base/` fork of an imported volume is an internal ancestor layer not exposed as a user-addressable volume.
-
-**Migration path:** the current `volume fork` → `volume clone` rename is straightforward. The harder part is deciding what `elide volume list` shows — it should show user volumes (forks), not the internal volume root directories. This requires either a naming convention (`forks/` entries are the user objects) or a marker file. This design work is deferred.
-
 ## Proposed: Coordinator inbound socket
 
-The coordinator listens on `<data-dir>/control.sock` for commands from the `elide` CLI. Volume processes each listen on `<fork-dir>/control.sock` for commands from the coordinator. Same socket name, different directory level — the path encodes what you're talking to.
+The coordinator listens on `<data-dir>/control.sock` for commands from the `elide` CLI. Volume processes each listen on `<vol-dir>/control.sock` for commands from the coordinator. Same socket name, different directory level — the path encodes what you're talking to.
 
 Same text line protocol as the volume control socket: `<op> [args...]\n` → `ok [values...]\n` / `err <message>\n`.
 
@@ -401,7 +381,7 @@ Three auth tiers apply to this socket:
 
 | Operation | Request | Response |
 |---|---|---|
-| Register volume process, receive macaroon | `register <volume> <fork>` | `ok <macaroon>` |
+| Register volume process, receive macaroon | `register <volume>` | `ok <macaroon>` |
 | Exchange macaroon for S3 credentials | `credentials <macaroon>` | `ok <key> <secret> <session-token> <expiry-unix>` |
 
 The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**. See *Isolation model* below for what this does and does not enforce.
@@ -474,7 +454,6 @@ The coordinator holds a **root key** (random bytes, generated at first start, st
 | Caveat | Value | Purpose |
 |---|---|---|
 | `volume` | `<volume-name>` | Binds token to this volume only |
-| `fork` | `<fork-name>` | Binds token to this fork |
 | `scope` | `credentials` | Limits token to credential requests only |
 | `pid` | `<process-pid>` | Locks token to the spawned process (see below) |
 
@@ -512,8 +491,8 @@ No revocation list is needed. This holds as long as the coordinator runs on the 
 Because macaroons are additive-restriction-only, the volume can narrow its token before passing it to a subprocess (e.g. a future out-of-process demand-fetch helper):
 
 ```
-original:   volume=myvm, fork=default, scope=credentials, pid=1234
-attenuated: volume=myvm, fork=default, scope=credentials, pid=1234, not-after=<+5m>
+original:   volume=myvm, scope=credentials, pid=1234
+attenuated: volume=myvm, scope=credentials, pid=1234, not-after=<+5m>
 ```
 
 The attenuated token is derived by the volume in-process — no coordinator round-trip. The coordinator verifies all caveats including the narrowed `not-after`.
@@ -530,46 +509,48 @@ The caveat set is small and typed (`volume`, `fork`, `scope`, `pid`, optionally 
 
 OCI import is a potentially long-running operation. The coordinator supervises it as a short-lived child process, analogous to a volume process, with an explicit lifecycle marker on disk.
 
-### Fork layout after import
+### Volume layout after import
 
-`volume import start <name> <oci-ref>` creates two forks:
+`volume import <name> <oci-ref>` creates a single readonly volume at `<data_dir>/<name>/`:
 
-1. `forks/base/` — the frozen, readonly import data. Populated by `elide-import`. Never written to after import completes: no `wal/`, no `pending/`. Serves as the base layer for all derived forks.
-2. `forks/default/` — a writable CoW fork branched from `base` at the import snapshot. Created automatically so the volume is immediately usable without a separate `volume fork` step.
+- No `wal/` or `pending/` — the volume is frozen after import completes
+- `segments/` holds the imported data
+- `snapshots/<import-ulid>` marks the branch point for derived volumes
+- `meta.toml` records source metadata (OCI digest, arch)
 
-The `import.lock` is written to `forks/base/` for the duration of the import. The `default` fork is created only after `base` is fully written and the import process exits successfully.
+To get a writable copy, the user runs `elide volume fork <name> <new-name>` after import completes. This is an explicit step, not automatic.
 
 ### `import.lock`
 
-When the coordinator begins an import it writes `forks/base/import.lock` containing a single line: the import ULID. This file is the source of truth for "an import is in progress or was interrupted here". The coordinator removes the file when the import process exits (whether success or failure).
+When the coordinator begins an import it writes `<data_dir>/<name>/import.lock` containing a single line: the import ULID. This file is the source of truth for "an import is in progress or was interrupted here". The coordinator removes the file when the import process exits (whether success or failure).
 
 The ULID in `import.lock` matches the ULID returned to the caller by `import <name> <oci-ref>`. This lets an operator correlate a lock file with coordinator logs or `import status` output.
 
 ### Concurrency guard
 
-The coordinator enforces mutual exclusion between volume processes and import processes on the same fork directory:
+The coordinator enforces mutual exclusion between volume processes and import processes on the same volume directory:
 
-- Before spawning an import: check `volume.pid` — if a process is alive, refuse with `err volume already running for this fork`
-- Before spawning a volume: check `import.lock` — if present, skip this fork (logged as a warning; no volume is started until the lock is cleared)
-- The drain loop skips any fork directory that has an `import.lock` present
+- Before spawning an import: check `volume.pid` — if a process is alive, refuse with `err volume already running`
+- Before spawning a volume: check `import.lock` — if present, skip this volume (logged as a warning; no volume is started until the lock is cleared)
+- The drain loop skips any volume directory that has an `import.lock` present
 
 ### Stale lock detection and cleanup
 
 A crash (coordinator or import process) can leave `import.lock` behind with no matching live process. On every coordinator startup and rescan pass, the coordinator checks each `import.lock`:
 
 1. Read the ULID from the file
-2. If no import job with that ULID is tracked in memory, check whether any process wrote `import.pid` alongside the lock (if the import process records its own PID, analogous to `volume.pid`)
-3. If no live process is found: remove the lock, log a warning including the ULID and fork path
+2. If no import job with that ULID is tracked in memory, check whether any process wrote `import.pid` alongside the lock
+3. If no live process is found: remove the lock, log a warning including the ULID and volume path
 
-The fork directory is left intact — it may contain partial segment data useful for debugging. After the stale lock is removed, the coordinator resumes normal supervision of the fork.
+The volume directory is left intact — it may contain partial segment data useful for debugging. After the stale lock is removed, the coordinator resumes normal supervision of the volume.
 
 ### `volume delete`
 
 `elide volume delete <name>` is the recovery and cleanup command:
 
-1. For each running volume process under this volume: send SIGTERM, wait for exit
-2. For each running import process under this volume: send SIGTERM, wait for exit
-3. Remove stale `import.lock` files if present (import process already dead)
+1. Send SIGTERM to any running volume process (via `volume.pid`)
+2. Send SIGTERM to any running import process (via `import.pid`)
+3. Remove stale `import.lock` if present (import process already dead)
 4. Remove the volume directory tree (`<vol-dir>` and all contents)
 5. Respond `ok`
 
@@ -764,25 +745,25 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 
 | Term | Definition |
 |------|------------|
-| **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
-| **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. User forks live under `forks/`. |
-| **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments with ULID ≤ the snapshot ULID are part of that snapshot. The latest snapshot ULID also serves as the **compaction floor** — segments at or below it are frozen and will never be compacted. The file content is empty or an optional human-readable name. |
-| **Imported volume** | A volume populated by `volume import`. Its `forks/base/` fork holds the frozen import data (readonly, no `wal/`). `forks/default/` is created automatically as a writable CoW fork ready to use. Additional forks can be branched from `base` at any time. |
-| **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
+| **Volume** | A ULID-named directory directly under `data_dir`. Every volume is a peer. Its stable global identity is its ULID (the directory name and S3 prefix); its human-readable name is stored in `volume.name`. |
+| **Fork** | A volume created from another volume's snapshot via `volume fork`. Structurally identical to any other volume; the parent relationship is recorded in an `origin` file using ULID paths. "Fork" describes lineage, not location. |
+| **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a volume's committed segment sequence. The ULID gives the position: all segments with ULID ≤ the snapshot ULID are part of that snapshot. The latest snapshot ULID also serves as the **compaction floor** — segments at or below it are frozen and will never be compacted. The file content is empty or an optional human-readable label. |
+| **Imported volume** | A readonly volume populated by `volume import`. Marked with `volume.readonly`. No `wal/` — frozen after import completes. The user runs `volume fork <name> <new-name>` to get a writable copy. |
+| **Export** | A squash-and-detach operation that produces a new self-contained volume with no ancestry dependencies. |
 
 ### Ancestry walk
 
-To rebuild the LBA map for a fork:
-1. Follow the `origin` chain to the root fork (no `origin` file).
-2. From the root fork outward, for each ancestor fork in the chain: scan both `segments/` and `pending/` in ULID order (merged), stopping at (and including) the branch-point ULID recorded in the child fork's `origin`. Snapshot markers are not scanned during replay.
-3. Apply the current fork's own `segments/` and `pending/` in ULID order (all of them).
+To rebuild the LBA map for a volume:
+1. Follow the `origin` chain to the root volume (no `origin` file). Each `origin` file contains `<parent-ulid>/snapshots/<snapshot-ulid>` — the parent is resolved as `by_id_dir/<parent-ulid>`. Using ULIDs in `origin` means the chain is stable across renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` performs this traversal.
+2. From the root outward, for each ancestor in the chain: scan both `segments/` and `pending/` in ULID order (merged), stopping at (and including) the branch-point ULID recorded in the child's `origin`. Snapshot markers are not scanned during replay.
+3. Apply the current volume's own `segments/` and `pending/` in ULID order (all of them).
 4. Replay the WAL.
 
-The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fork from leaking newer data into the derived fork's view.
+The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor from leaking newer data into the derived volume's view.
 
 ### Single-writer invariant
 
-**Each fork directory has exactly one process that writes new segments into it.** The volume process that holds `fork.key` is the sole writer of `pending/` and `segments/` for that fork. The coordinator writes only to `gc/` and promotes results into `segments/` after S3 confirmation. Crucially, it derives the output ULID from the fork's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the fork's timeline — it extends the sequence by one step from where the volume left off.
+**Each volume directory has exactly one process that writes new segments into it.** The volume process that holds `volume.key` is the sole writer of `pending/` and `segments/` for that volume. The coordinator writes only to `gc/` and promotes results into `segments/` after S3 confirmation. Crucially, it derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
 
 This invariant is what makes ULID total-order sufficient for all correctness guarantees in rebuild, GC, and ancestor cutoff:
 
@@ -790,7 +771,7 @@ This invariant is what makes ULID total-order sufficient for all correctness gua
 - **GC ULID assignment:** `max(inputs).increment()` is safe because any write that occurs *during* compaction comes from the one writer, gets a timestamp from the current wall clock, and is therefore far ahead of the old `max(inputs)` timestamp (which has already passed through the drain pipeline). No locking is required.
 - **Ancestor cutoff:** the branch-point ULID is a stable boundary because the ancestor's writer cannot insert segments retroactively below it.
 
-The single-writer property is enforced by the signing key: only the host holding `fork.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at demand-fetch verification time. See [formats.md](formats.md) — *Fork ownership and signing*.
+The single-writer property is enforced by the signing key: only the host holding `volume.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at demand-fetch verification time. See [formats.md](formats.md) — *Volume ownership and signing*.
 
 The ULID monotonicity invariant and crash-recovery correctness are verified by property-based tests using proptest. See [testing.md](testing.md) for the simulation model, the two properties tested, and a concrete bug these tests found and fixed.
 
@@ -851,38 +832,32 @@ The coordinator processes `gc/*.applied` files at the start of each GC tick. For
 Implemented:
 
 ```
-elide serve-volume <vol-dir|fork-dir> [--readonly]
-                                                # serve a fork over NBD; accepts vol-dir
-                                                # (uses forks/default) or fork-dir directly
+elide serve-volume <vol-dir> [--readonly]      # serve a volume over NBD
 
-elide snapshot-volume <vol-dir|fork-dir>       # checkpoint a fork; fork stays live
+elide snapshot-volume <vol-dir>                # checkpoint a volume; stays live
 
-elide fork-volume <vol-dir> <fork-name> [--from <source-fork>]
-                                                # create forks/<fork-name> branched from the
-                                                # latest snapshot of source fork (default: "default")
+elide fork-volume <vol-dir> <new-vol-dir>      # create a new volume branched from the
+                                                # latest snapshot of <vol-dir>
 
-elide list-forks <vol-dir|fork-dir>            # list all named forks under forks/
-
-elide inspect-volume <vol-dir|fork-dir>        # human-readable summary; accepts either form
+elide inspect-volume <vol-dir>                 # human-readable summary
 ```
 
 Not yet implemented:
 
 ```
-elide create-readonly-volume <vol-dir> --size <size>
-elide list-snapshots <vol-dir> [--fork <name>]
-elide export-volume <vol-dir> <fork-name> <new-vol-dir>
+elide list-snapshots <vol-dir>
+elide export-volume <src-vol-dir> <new-vol-dir>
 ```
 
 Import is handled by `elide volume import <name> <oci-ref>`, which asks the coordinator to spawn the separate `elide-import` binary as a supervised short-lived process. See *Import process lifecycle* above.
 
-**Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The fork remains live; no directory structure changes.
+**Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The volume remains live; no directory structure changes.
 
-**Import procedure:** the import path writes data directly into `forks/base/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `forks/base/snapshots/<import-ulid>` is written; this ULID matches the last segment written. It is used as the branch point for `forks/default/` and any other forks created from this volume. The `size` marker and `meta.toml` (OCI source metadata) are written at the volume root. `forks/default/` is created automatically after `forks/base/` is complete.
+**Import procedure:** the import path writes data directly into `<vol-dir>/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `size` marker and `meta.toml` (OCI source metadata) are written into the volume directory.
 
-**S3 upload for snapshots:** snapshot marker files and `origin` files must also be uploaded to S3 so the fork tree structure is visible to other hosts. These are small and should be uploaded eagerly.
+**S3 upload for snapshots:** snapshot marker files and `origin` files must also be uploaded to S3 so the volume ancestry tree is visible to other hosts. These are small and should be uploaded eagerly.
 
-**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork. For `forks/base/` (which already has a snapshot from import), a new snapshot is not needed — `fork-volume` uses the latest existing snapshot marker from `forks/base/snapshots/`.
+**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source volume. If a snapshot already exists at the tip, `fork-volume` uses the latest existing snapshot marker rather than creating a duplicate.
 
 ### Base directory defaulting
 
