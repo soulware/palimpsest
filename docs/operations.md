@@ -49,16 +49,6 @@ The volume process is a pure data servant: it accepts NBD reads and writes, flus
 
 Segments accumulate in `pending/` after WAL promotion (see [formats.md](formats.md) for the promotion commit sequence). The coordinator uploads them to S3 and moves them to `segments/` on success. Each segment is handled independently — a failure on one does not block the others.
 
-**`drain-pending`** is the current one-shot upload command, used during development and testing:
-
-```
-elide-coordinator drain-pending <fork-dir>
-```
-
-Store selection:
-- `--local <path>` — use a local directory as the object store (no server needed; useful for testing)
-- default — use S3 via environment variables: `ELIDE_S3_BUCKET`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-
 The `object_store` crate is used for all store access, providing a uniform interface across local filesystem, S3, GCS, and Azure backends.
 
 **Upload commit sequence per segment:**
@@ -89,13 +79,7 @@ Segments in `segments/` are S3-backed and evictable. When `find_segment_file` is
 
 **Rebuild vs. runtime:** demand-fetch operates at read time, after the volume is open. The LBA map and extent index are rebuilt at `Volume::open` by scanning `pending/`, `segments/`, and `fetched/*.idx` on local disk. If none of these are present for an ancestor segment, that data will appear as zeros at open time rather than triggering a fetch. This is the **cold-start problem**.
 
-**`prefetch-indexes` solves cold-start.** Before opening a forked volume on a host that has no local segments for its ancestors, run:
-
-```
-elide-coordinator prefetch-indexes [--local <path>] <fork-dir>
-```
-
-This walks the fork's ancestry chain, lists S3 objects for each ancestor fork, and downloads the header+index portion (`[0, body_section_start)`) of each segment not already present locally, writing it as `fetched/<ulid>.idx` in the ancestor's fork directory. Body bytes are not downloaded. After this, `Volume::open` rebuilds the full LBA map from `fetched/*.idx`, and individual reads demand-fetch body bytes on first access.
+**Cold-start prefetch solves the cold-start problem.** When the coordinator discovers a new fork on a host with no local ancestor segments, it automatically walks the fork's ancestry chain, lists S3 objects for each ancestor fork, and downloads the header+index portion (`[0, body_section_start)`) of each segment not already present locally, writing it as `fetched/<ulid>.idx` in the ancestor's fork directory. Body bytes are not downloaded. After this, `Volume::open` rebuilds the full LBA map from `fetched/*.idx`, and individual reads demand-fetch body bytes on first access. This happens automatically as part of fork discovery — no manual invocation required.
 
 **Configuration — `fetch.toml`** in the volume root directory:
 
@@ -111,63 +95,6 @@ region   = "us-east-1"                  # optional; falls back to AWS_DEFAULT_RE
 
 If `fetch.toml` is absent, the following env vars are tried: `ELIDE_S3_BUCKET` (required), `AWS_ENDPOINT_URL`, `AWS_DEFAULT_REGION`. If neither is present, demand-fetch is disabled and `serve-volume` runs normally.
 
-**End-to-end test procedure (local store, cold-start fork):**
-
-```bash
-# 1. Create a data volume and write data from a VM
-mkdir -p volumes/data-vol
-elide serve-volume volumes/data-vol default --size 1G --bind 0.0.0.0
-# (in VM) nbd-client <host> 10809 /dev/nbd0
-#         mkfs.ext4 /dev/nbd0 && mount /dev/nbd0 /mnt
-#         echo "hello from vm1" > /mnt/testfile && umount /mnt
-#         nbd-client -d /dev/nbd0
-
-# 2. Upload the default fork's segments to a local store
-mkdir -p /tmp/elide-store
-elide-coordinator drain-pending --local /tmp/elide-store volumes/data-vol/forks/default
-
-# 3. Configure demand-fetch for the volume
-cat > volumes/data-vol/fetch.toml << 'EOF'
-local_path = "/tmp/elide-store"
-EOF
-
-# 4. Fork from the default fork for a new VM
-elide snapshot-volume volumes/data-vol default
-elide fork-volume volumes/data-vol vm2
-
-# 5. Simulate a fresh host: delete local segments from the ancestor fork
-rm -f volumes/data-vol/forks/default/segments/*
-
-# 6. Prefetch indexes — downloads .idx for each ancestor segment (no bodies)
-elide-coordinator prefetch-indexes --local /tmp/elide-store volumes/data-vol/forks/vm2
-# Output: "1 fetched, 0 already present, 0 failed" (one .idx per uploaded segment)
-
-# 7. Serve the fork — opens correctly because fetched/*.idx rebuilt the LBA map
-elide serve-volume volumes/data-vol vm2 --size 1G --bind 0.0.0.0
-# Output includes "[demand-fetch enabled]"
-
-# 8. From a VM, mount and read the data written in step 1
-# (in VM) nbd-client <host> 10809 /dev/nbd0
-#         mount /dev/nbd0 /mnt
-#         cat /mnt/testfile   ← triggers demand-fetch; should print "hello from vm1"
-#
-# serve-volume output will show the segment being fetched from /tmp/elide-store.
-# The file appears in volumes/data-vol/forks/default/fetched/ as .idx + .body + .present
-```
-
-**Warm-start test (eviction during serving):**
-
-```bash
-# Simpler scenario: serve with segments present, then delete one while running.
-elide serve-volume volumes/data-vol default --size 1G --bind 0.0.0.0 &
-# (in VM: mount, read to confirm data present)
-
-# Delete a segment mid-run to simulate eviction:
-SEGMENT=$(ls volumes/data-vol/forks/default/segments/ | head -1)
-rm volumes/data-vol/forks/default/segments/$SEGMENT
-
-# Next VM read touching that segment triggers demand-fetch transparently.
-```
 
 **Next step: eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
 

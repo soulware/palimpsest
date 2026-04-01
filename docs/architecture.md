@@ -48,18 +48,20 @@ elide-import/      — OCI import binary: pulls public OCI images from a contain
                      oci-client, ocirender. Heavy async deps isolated here.
 
 elide-coordinator/ — coordinator daemon: watches configured volume root
-                     directories; discovers forks; drains pending/ to S3;
-                     runs segment GC; prefetches indexes for cold forks.
-                     Adds: tokio, object_store (S3 and local filesystem
-                     backends), nix (process supervision). Holds read-write
-                     S3 credentials; volume holds read-only credentials only.
+                     directories; discovers forks; supervises volume and
+                     import processes; drains pending/ to S3; runs segment
+                     GC; prefetches indexes for cold-start forks on
+                     discovery. Adds: tokio, object_store (S3 and local
+                     filesystem backends), nix (process supervision). Holds
+                     read-write S3 credentials and OCI registry credentials;
+                     volumes hold read-only S3 credentials only.
 ```
 
 The split keeps the volume process binary lean and focused. The async HTTP stack
 needed for OCI registry pulls belongs in tooling (`elide-import`), not in the
-process that serves block I/O. As the coordinator is built out, OCI import
-functionality will likely migrate there, with `elide-import` becoming a thin CLI
-wrapper around coordinator APIs.
+process that serves block I/O.
+
+**Proposed: `elide volume import` migration.** OCI import functionality will migrate into the `elide` binary (`elide volume import <name> <oci-ref>`), absorbing `elide-import`. The import writes directly to the volume directory then sends a `rescan` to the coordinator. `elide-import` becomes redundant once this is in place.
 
 ## Directory layout
 
@@ -180,6 +182,208 @@ The volume process listens on `<fork-dir>/control.sock`. The coordinator connect
 **Compaction stats fields** (`sweep_pending` / `repack` response): `segs` = segments consumed, `new_segs` = segments produced, `bytes` = bytes freed, `extents` = extents removed.
 
 The socket is absent when the volume is not running. All coordinator IPC calls treat a missing socket as a silent no-op and proceed with the remaining drain/GC steps that do not require volume cooperation.
+
+## Proposed: User-facing CLI surface
+
+The `elide` binary serves a dual role: it is both the **user-facing CLI** and the **volume process binary** that the coordinator spawns. The `elide-coordinator` binary is the coordinator daemon only — it has no user-facing subcommands.
+
+### `elide` CLI commands
+
+Most commands operate directly on the volume directory and require no running coordinator. A small set need the coordinator for process or device management.
+
+**Filesystem-direct (no coordinator required):**
+
+| Command | What it does |
+|---|---|
+| `elide volume list` | Scan configured data directory for volumes |
+| `elide volume info <name>` | Read fork structure, segment counts, WAL size |
+| `elide volume ls <name> [path]` | Browse ext4 filesystem contents |
+| `elide volume snapshot <name> [<fork>]` | Write a snapshot marker file |
+| `elide volume fork <name> <new-fork>` | Create a named fork (directory operation) |
+| `elide volume create <name> [--size N]` | Create volume directory structure, then rescan |
+| `elide volume import <name> <oci-ref>` | Pull OCI image into volume directory, then rescan |
+
+`create` and `import` do all their substantive work on disk, then send a lightweight `rescan` request to the coordinator so the new volume is picked up immediately rather than waiting for the next scan interval. If the coordinator is not running, the rescan request fails with a warning and the volume will be discovered on the coordinator's next startup or scan.
+
+**Coordinator-required (process and device management):**
+
+| Command | What it does |
+|---|---|
+| `elide volume status <name>` | Is the volume process running? What device or address? |
+| `elide volume delete <name>` | Stop the volume process, then remove the directory |
+
+**Internal (spawned by coordinator; not intended for direct use):**
+
+```
+elide serve-volume <fork-dir> [--size N] [--bind addr] [--port N] [--readonly]
+```
+
+### `elide-coordinator` CLI commands
+
+```
+elide-coordinator serve [--config coordinator.toml]   # run daemon in foreground (default for dev)
+elide-coordinator serve --daemon                       # detach and run in background
+```
+
+### Finding the coordinator socket
+
+The `elide` CLI locates the coordinator inbound socket in this order:
+
+1. `--coordinator <path>` flag
+2. `ELIDE_COORDINATOR_SOCK` environment variable
+3. Same directory as `coordinator.toml` (if `--config` is given)
+4. `~/.elide/coordinator.sock` (user default)
+5. `/run/elide/coordinator.sock` (system default)
+
+## Proposed: Coordinator inbound socket
+
+The coordinator listens on an inbound socket (`coordinator.sock`, alongside `coordinator.toml`) for commands from the `elide` CLI. This is distinct from the per-fork `control.sock` that the coordinator uses to talk to volume processes.
+
+Same text line protocol as the volume control socket: `<op> [args...]\n` → `ok [values...]\n` / `err <message>\n`.
+
+Three auth tiers apply to this socket:
+
+**Unauthenticated** (read-only, no volume targeting; any connected process):
+
+| Operation | Request | Response |
+|---|---|---|
+| Trigger immediate fork discovery | `rescan` | `ok` |
+| Query volume process state | `status <volume>` | `ok running <device-or-address>` or `ok stopped` |
+
+**Operator macaroon** (CLI-originated mutations; see *Operator tokens* below):
+
+| Operation | Request | Response |
+|---|---|---|
+| Stop volume and delete directory | `delete <volume> <fork> <macaroon>` | `ok` |
+
+**Volume macaroon** (volume process identity; PID-bound; see *S3 credential distribution via macaroons* below):
+
+| Operation | Request | Response |
+|---|---|---|
+| Register volume process, receive macaroon | `register <volume> <fork>` | `ok <macaroon>` |
+| Exchange macaroon for S3 credentials | `credentials <macaroon>` | `ok <key> <secret> <session-token> <expiry-unix>` |
+
+The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**. See *Isolation model* below for what this does and does not enforce.
+
+`rescan` is the lightweight hook used by `create` and `import`. The coordinator runs a discovery pass immediately and starts supervising any new forks found.
+
+`register` is called by the volume process on startup; the coordinator verifies the caller's PID via `SO_PEERCRED` before minting and returning a macaroon. `credentials` is called by the volume whenever its S3 credentials are about to expire; the macaroon is verified (HMAC + caveats + PID check) before new credentials are issued.
+
+## Proposed: Operator tokens
+
+Operator tokens are macaroons minted by the coordinator for human operators (CLI usage). They are not PID-bound — identity is carried by the token itself, enabling audit logging and attenuation.
+
+**Issuance:**
+
+```
+elide-coordinator token create [--expires 24h] [--volume <name>]
+```
+
+Prints a macaroon to stdout. The operator stores it in `~/.elide/operator-token` or passes it explicitly. The coordinator logs token creation with a unique nonce.
+
+**Caveats on an operator token:**
+
+| Caveat | Value | Purpose |
+|---|---|---|
+| `role` | `operator` | Distinguishes from volume tokens |
+| `not-after` | `<expiry>` | Required; no indefinite operator tokens |
+| `volume` | `<name>` | Optional; restrict to a specific volume |
+
+**How the CLI uses it:**
+
+The `elide` CLI locates the operator token in this order:
+1. `--token <value>` flag
+2. `ELIDE_OPERATOR_TOKEN` environment variable
+3. `~/.elide/operator-token` file
+
+It is presented with any coordinator mutation that requires one (currently: `delete`).
+
+**Attenuation:** an operator can narrow their token before sharing it — for example, scoping it to a single volume or shortening the expiry — without involving the coordinator. The coordinator verifies all caveats on receipt.
+
+**Audit log:** the coordinator logs every operator-token-authenticated operation with the token's nonce, the operation, and the timestamp. This provides a trail of who did what and when, traceable back to the `token create` event.
+
+## Proposed: Isolation model
+
+Volume processes on the same host share a uid and a filesystem. This has direct consequences for what the macaroon scheme can and cannot enforce.
+
+**What macaroons do not enforce — local filesystem:** a compromised volume process can read or corrupt any other volume's local directory directly, without touching the coordinator. Macaroons provide no protection here. Proper local isolation requires OS-level mechanisms: separate uids per volume, Linux user namespaces, or running each volume in its own container. This is a separate layer and is not addressed by the current design.
+
+**What macaroons do enforce — S3:** S3 credentials are scoped by IAM to a specific volume's prefix. This enforcement is external to Elide — AWS (or equivalent) rejects requests that exceed the credential's scope regardless of what the caller claims. The macaroon scheme ensures a volume process can only obtain credentials for its own volume. A compromised `myvm` process cannot request credentials for `othervm`, so it cannot read, write, or delete `othervm`'s S3 objects even with full local filesystem access.
+
+**What macaroons provide for coordinator operations — defense-in-depth:** requiring a volume-scoped macaroon for coordinator mutations (e.g. `delete`) raises the bar slightly over bare socket access, and provides an audit trail. It does not prevent a compromised process from achieving the same effect via direct filesystem manipulation. The value here is auditability and protocol clarity, not a hard security boundary.
+
+**Summary:**
+
+| Resource | Isolation mechanism | Enforced by |
+|---|---|---|
+| S3 data | IAM credential scoping + macaroon gating | AWS + coordinator |
+| Local filesystem | uid separation / namespacing | OS (not yet implemented) |
+| Coordinator mutations | Macaroon + audit log | Coordinator (defense-in-depth) |
+
+## Proposed: S3 credential distribution via macaroons
+
+The coordinator holds the only copy of read-write S3 credentials. Volume processes receive **short-lived read-only credentials** for demand-fetch only, authenticated via macaroons.
+
+### Macaroon model
+
+The coordinator holds a **root key** (random bytes, generated at first start, stored alongside `coordinator.toml`). It uses this to mint per-fork macaroons — HMAC-SHA256 bearer tokens with a chain of typed caveats. Verification is stateless: the coordinator re-derives the expected HMAC from the root key and the caveat chain; no token storage is needed.
+
+**Caveats on a volume macaroon:**
+
+| Caveat | Value | Purpose |
+|---|---|---|
+| `volume` | `<volume-name>` | Binds token to this volume only |
+| `fork` | `<fork-name>` | Binds token to this fork |
+| `scope` | `credentials` | Limits token to credential requests only |
+| `pid` | `<process-pid>` | Locks token to the spawned process (see below) |
+
+### Registration flow (how a volume gets its macaroon)
+
+The PID is only known after the volume process is spawned, so the macaroon cannot be minted before spawn. Instead, the volume registers with the coordinator on startup:
+
+1. Coordinator spawns volume process, records PID in `volume.pid`
+2. Volume connects to `coordinator.sock` and sends `register <volume> <fork>`
+3. Coordinator reads `SO_PEERCRED` from the Unix socket connection → obtains peer PID
+4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>/<fork>`? If not, reject
+5. Coordinator mints a macaroon with the caveats above (including `pid = <peer-pid>`) and responds with it
+6. Volume stores the macaroon in memory for all subsequent `credentials` requests
+
+### Credential exchange flow
+
+When the volume needs S3 credentials (at startup or before expiry):
+
+1. Volume sends `credentials <macaroon>` to `coordinator.sock`
+2. Coordinator verifies the HMAC chain (proves it minted this token)
+3. Coordinator checks all caveats: volume/fork match, scope is `credentials`, `pid` matches `SO_PEERCRED` of the current connection
+4. Coordinator issues short-lived read-only STS credentials (or equivalent) scoped to the volume's S3 prefix
+5. Returns `ok <access-key> <secret-key> <session-token> <expiry-unix>`
+
+The PID check on every request (step 3) means the macaroon is useless even if exfiltrated — it can only be presented from the original process. The HMAC chain means no volume can forge a token for a different volume.
+
+### Token lifetime
+
+The macaroon lives for the lifetime of the volume process. "Token dies when process is stopped" is the revocation model: when the coordinator stops a volume (on `delete` or coordinator shutdown), the PID is no longer live. Any subsequent `credentials` request with the old macaroon fails the `SO_PEERCRED` check — the PID either doesn't exist or belongs to a different process.
+
+No revocation list is needed. This holds as long as the coordinator runs on the same host as the volumes. If the coordinator were ever moved off-host (not a current goal), the `SO_PEERCRED` check would be unavailable and explicit revocation would need to be designed.
+
+### Attenuation
+
+Because macaroons are additive-restriction-only, the volume can narrow its token before passing it to a subprocess (e.g. a future out-of-process demand-fetch helper):
+
+```
+original:   volume=myvm, fork=default, scope=credentials, pid=1234
+attenuated: volume=myvm, fork=default, scope=credentials, pid=1234, not-after=<+5m>
+```
+
+The attenuated token is derived by the volume in-process — no coordinator round-trip. The coordinator verifies all caveats including the narrowed `not-after`.
+
+### Standalone mode (no coordinator)
+
+`serve-volume` accepts `--s3-access-key`, `--s3-secret-key`, `--s3-session-token` flags for direct credential passing. No macaroon is involved. This supports the fully standalone tier and is also useful for development.
+
+### Implementation note
+
+The caveat set is small and typed (`volume`, `fork`, `scope`, `pid`, optionally `not-after`). This is implementable in ~150–200 lines of HMAC-SHA256 chain code. Existing `macaroon` crates on crates.io should be evaluated before hand-rolling; if they use untyped opaque blobs (as noted in the fly.io design), a thin typed wrapper or a minimal hand-rolled implementation may be preferable for clarity.
 
 ## Write Path
 
