@@ -547,7 +547,8 @@ pub fn run_volume_readonly(
     println!("Waiting for connection...\n");
 
     install_sigusr1_handler();
-    let mut volume = ReadonlyVolume::open(dir)?;
+    let by_id_dir = dir.parent().unwrap_or(dir);
+    let mut volume = ReadonlyVolume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let forks = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
@@ -737,9 +738,10 @@ fn run_volume_ipc_only(
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
+    let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = match signer {
-        Some(s) => Volume::open_with_signer(dir, s)?,
-        None => Volume::open(dir)?,
+        Some(s) => Volume::open_with_signer(dir, s, by_id_dir)?,
+        None => Volume::open(dir, by_id_dir)?,
     };
 
     if let Some(config) = fetch_config {
@@ -774,9 +776,10 @@ fn serve_volume_listener(
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
+    let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = match signer {
-        Some(s) => Volume::open_with_signer(dir, s)?,
-        None => Volume::open(dir)?,
+        Some(s) => Volume::open_with_signer(dir, s, by_id_dir)?,
+        None => Volume::open(dir, by_id_dir)?,
     };
 
     if let Some(config) = fetch_config {

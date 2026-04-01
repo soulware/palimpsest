@@ -27,7 +27,7 @@ mod common;
 fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    let mut vol = Volume::open(&fork_dir).unwrap();
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Seed batch 1 — LBAs 0-3 = 0xAA — drain to segments/.
     for lba in 0u64..4 {
@@ -79,7 +79,7 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
     }
 
     drop(vol);
-    let vol = Volume::open(&fork_dir).unwrap();
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
     for &(lba, byte) in expected {
         let actual = vol.read(lba, 1).unwrap();
         assert_eq!(
@@ -97,7 +97,7 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
 fn gc_output_loses_to_live_write_applied_after_gc() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    let mut vol = Volume::open(&fork_dir).unwrap();
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Seed batch 1 — LBAs 0-3 = 0xAA.
     for lba in 0u64..4 {
@@ -152,7 +152,7 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
     // Crash + rebuild: rebuild must still prefer the pending segment over the
     // GC output for LBAs 0-3.
     drop(vol);
-    let vol = Volume::open(&fork_dir).unwrap();
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
     for &(lba, byte) in expected {
         let actual = vol.read(lba, 1).unwrap();
         assert_eq!(

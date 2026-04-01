@@ -21,7 +21,7 @@ mod common;
 #[test]
 fn readonly_unwritten_lba_returns_zeros() {
     let dir = tempfile::TempDir::new().unwrap();
-    let rv = ReadonlyVolume::open(dir.path()).unwrap();
+    let rv = ReadonlyVolume::open(dir.path(), dir.path()).unwrap();
     let actual = rv.read(0, 1).unwrap();
     assert_eq!(actual, vec![0u8; 4096]);
 }
@@ -31,7 +31,7 @@ fn readonly_unwritten_lba_returns_zeros() {
 fn readonly_sees_flushed_pending_not_wal() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    let mut vol = Volume::open(&fork_dir).unwrap();
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // LBA 0: flushed to pending/ — should be visible.
     vol.write(0, &[0xAA; 4096]).unwrap();
@@ -40,7 +40,7 @@ fn readonly_sees_flushed_pending_not_wal() {
     // LBA 1: in WAL only, not flushed — should be invisible (returns zeros).
     vol.write(1, &[0xBB; 4096]).unwrap();
 
-    let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+    let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
 
     let lba0 = rv.read(0, 1).unwrap();
     assert_eq!(lba0, vec![0xAA; 4096], "flushed LBA 0 should be visible");
@@ -54,7 +54,7 @@ fn readonly_sees_flushed_pending_not_wal() {
 fn readonly_sees_drained_segments() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    let mut vol = Volume::open(&fork_dir).unwrap();
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     for lba in 0u64..4 {
         vol.write(lba, &[0xCC; 4096]).unwrap();
@@ -62,7 +62,7 @@ fn readonly_sees_drained_segments() {
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+    let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     for lba in 0u64..4 {
         let actual = rv.read(lba, 1).unwrap();
         assert_eq!(actual, vec![0xCC; 4096], "lba {lba} wrong after drain");
@@ -74,7 +74,7 @@ fn readonly_sees_drained_segments() {
 fn readonly_sees_data_after_gc() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    let mut vol = Volume::open(&fork_dir).unwrap();
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     for lba in 0u64..4 {
         vol.write(lba, &[0xDD; 4096]).unwrap();
@@ -96,7 +96,7 @@ fn readonly_sees_data_after_gc() {
         let _ = std::fs::remove_file(path);
     }
 
-    let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+    let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     for lba in 0u64..4 {
         let actual = rv.read(lba, 1).unwrap();
         assert_eq!(actual, vec![0xDD; 4096], "lba {lba} wrong after GC");
@@ -113,7 +113,7 @@ fn readonly_sees_data_after_gc() {
 fn readonly_returns_latest_flushed_value() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    let mut vol = Volume::open(&fork_dir).unwrap();
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     vol.write(0, &[0x11; 4096]).unwrap();
     vol.flush_wal().unwrap();
@@ -121,7 +121,7 @@ fn readonly_returns_latest_flushed_value() {
     vol.write(0, &[0x22; 4096]).unwrap();
     vol.flush_wal().unwrap();
 
-    let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+    let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     let actual = rv.read(0, 1).unwrap();
     assert_eq!(
         actual,

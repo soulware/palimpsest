@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 
-use elide_core::signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
+use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_ORIGIN_FILE, VOLUME_PUB_FILE};
 use elide_core::volume;
 
 mod control;
@@ -253,7 +253,9 @@ fn main() {
             VolumeCommand::Snapshot { name, fork } => {
                 let vol_dir = args.data_dir.join(&name);
                 let fork_dir = fork_dir(&vol_dir, &fork);
-                let mut vol = volume::Volume::open(&fork_dir).expect("failed to open volume");
+                let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
+                let mut vol =
+                    volume::Volume::open(&fork_dir, &by_id_dir).expect("failed to open volume");
                 let snap_ulid = vol.snapshot().expect("snapshot failed");
                 println!("{snap_ulid}");
             }
@@ -264,16 +266,17 @@ fn main() {
                 from,
             } => {
                 let vol_dir = args.data_dir.join(&name);
-                let new_fork_dir =
-                    volume::fork_volume(&vol_dir, &fork_name, &from).expect("volume fork failed");
+                let source_fork_dir = fork_dir(&vol_dir, &from);
+                let new_fork_dir = fork_dir(&vol_dir, &fork_name);
+                volume::fork_volume(&new_fork_dir, &source_fork_dir).expect("volume fork failed");
                 let key = elide_core::signing::generate_keypair(
                     &new_fork_dir,
-                    FORK_KEY_FILE,
-                    FORK_PUB_FILE,
+                    VOLUME_KEY_FILE,
+                    VOLUME_PUB_FILE,
                 )
                 .expect("failed to generate fork keypair");
-                elide_core::signing::write_origin(&new_fork_dir, &key, FORK_ORIGIN_FILE)
-                    .expect("failed to write fork.origin");
+                elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_ORIGIN_FILE)
+                    .expect("failed to write volume.origin");
                 println!("{}", new_fork_dir.display());
             }
 
@@ -354,33 +357,33 @@ fn main() {
                     .expect("readonly NBD server error");
             } else {
                 std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
-                let signer = if fork_dir.join(FORK_KEY_FILE).exists() {
+                let signer = if fork_dir.join(VOLUME_KEY_FILE).exists() {
                     if !force_origin {
                         elide_core::signing::verify_origin(
                             &fork_dir,
-                            FORK_PUB_FILE,
-                            FORK_ORIGIN_FILE,
+                            VOLUME_PUB_FILE,
+                            VOLUME_ORIGIN_FILE,
                         )
                         .map_err(|e| {
                             std::io::Error::other(format!(
                                 "{e} — use --force-origin if this fork has been intentionally moved"
                             ))
                         })
-                        .expect("fork.origin check failed");
+                        .expect("volume.origin check failed");
                     }
-                    elide_core::signing::load_signer(&fork_dir, FORK_KEY_FILE)
-                        .expect("failed to load fork signing key")
+                    elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
+                        .expect("failed to load volume signing key")
                 } else {
                     let key = elide_core::signing::generate_keypair(
                         &fork_dir,
-                        FORK_KEY_FILE,
-                        FORK_PUB_FILE,
+                        VOLUME_KEY_FILE,
+                        VOLUME_PUB_FILE,
                     )
-                    .expect("failed to generate fork keypair");
-                    elide_core::signing::write_origin(&fork_dir, &key, FORK_ORIGIN_FILE)
-                        .expect("failed to write fork.origin");
-                    elide_core::signing::load_signer(&fork_dir, FORK_KEY_FILE)
-                        .expect("failed to load fork signing key")
+                    .expect("failed to generate volume keypair");
+                    elide_core::signing::write_origin(&fork_dir, &key, VOLUME_ORIGIN_FILE)
+                        .expect("failed to write volume.origin");
+                    elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
+                        .expect("failed to load volume signing key")
                 };
                 nbd::run_volume_signed(&fork_dir, size_bytes, &bind, port, signer, fetch_config)
                     .expect("volume NBD server error");
@@ -437,7 +440,9 @@ fn main() {
             fork_dir,
             min_live_ratio,
         } => {
-            let mut vol = volume::Volume::open(&fork_dir).expect("failed to open volume");
+            let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
+            let mut vol =
+                volume::Volume::open(&fork_dir, &by_id_dir).expect("failed to open volume");
             let stats = vol.repack(min_live_ratio).expect("repack failed");
             println!(
                 "segments repacked: {}  bytes freed: {}  extents removed: {}",

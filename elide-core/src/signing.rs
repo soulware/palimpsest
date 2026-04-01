@@ -1,8 +1,7 @@
 // Ed25519 keypair management and origin sanity checks.
 //
-// Key file naming conventions:
-//   Forks:  fork.key / fork.pub / fork.origin  (under <vol_dir>/forks/<name>/)
-//   Base:   base.key / base.pub / base.origin  (under <vol_dir>/)
+// Key file naming convention (all volumes, flat layout):
+//   volume.key / volume.pub / volume.origin  (under <by_id>/<ulid>/)
 //
 // File contents:
 //   *.key    — Ed25519 private key (32 bytes, never uploaded)
@@ -29,6 +28,11 @@ use rand_core::OsRng;
 use crate::segment::SegmentSigner;
 
 // File name constants.
+pub const VOLUME_KEY_FILE: &str = "volume.key";
+pub const VOLUME_PUB_FILE: &str = "volume.pub";
+pub const VOLUME_ORIGIN_FILE: &str = "volume.origin";
+
+// Deprecated: use VOLUME_* constants instead.
 pub const FORK_KEY_FILE: &str = "fork.key";
 pub const FORK_PUB_FILE: &str = "fork.pub";
 pub const FORK_ORIGIN_FILE: &str = "fork.origin";

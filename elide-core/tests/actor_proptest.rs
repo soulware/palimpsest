@@ -102,7 +102,7 @@ proptest! {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
 
-        let vol = Volume::open(fork_dir).unwrap();
+        let vol = Volume::open(fork_dir, fork_dir).unwrap();
         let (actor, mut handle) = spawn(vol);
         let mut actor_thread = Some(
             thread::Builder::new()
@@ -209,7 +209,7 @@ proptest! {
                         let _ = t.join();
                     }
 
-                    let vol = Volume::open(fork_dir).unwrap();
+                    let vol = Volume::open(fork_dir, fork_dir).unwrap();
                     let (new_actor, new_handle) = spawn(vol);
                     actor_thread = Some(
                         thread::Builder::new()

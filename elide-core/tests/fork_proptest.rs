@@ -83,10 +83,13 @@ proptest! {
     #[test]
     fn fork_ancestry_oracle(pre_ops in arb_pre_ops(), post_ops in arb_post_ops()) {
         let dir = tempfile::TempDir::new().unwrap();
-        let volume_dir = dir.path();
-        let base_dir: PathBuf = volume_dir.join("base");
+        let by_id = dir.path().to_path_buf();
+        let base_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let base_dir: PathBuf = by_id.join(base_ulid);
+        let child_dir: PathBuf = by_id.join(child_ulid);
 
-        let mut base = Volume::open(&base_dir).unwrap();
+        let mut base = Volume::open(&base_dir, &by_id).unwrap();
         let mut base_oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
         // --- pre-fork phase: build some base state ---
@@ -105,7 +108,7 @@ proptest! {
         // snapshot() flushes the WAL, then writes a snapshot marker.
         // fork_volume() requires at least one snapshot to exist.
         let _ = base.snapshot();
-        let child_dir = fork_volume(volume_dir, "child", "base").unwrap();
+        fork_volume(&child_dir, &base_dir).unwrap();
 
         // child_oracle is the base state at the branch point.
         // Post-branch base writes must NOT be visible to the child.
@@ -115,7 +118,7 @@ proptest! {
         // These must read as zero from the child.
         let mut post_branch_base_lbas: HashSet<u64> = HashSet::new();
 
-        let mut child = Volume::open(&child_dir).unwrap();
+        let mut child = Volume::open(&child_dir, &by_id).unwrap();
 
         // --- post-fork phase ---
         for op in &post_ops {
@@ -147,7 +150,7 @@ proptest! {
 
                 PostOp::ChildCrash => {
                     drop(child);
-                    child = Volume::open(&child_dir).unwrap();
+                    child = Volume::open(&child_dir, &by_id).unwrap();
 
                     // 1. Every child oracle LBA reads back correctly.
                     for (&lba, expected) in &child_oracle {
@@ -175,7 +178,7 @@ proptest! {
 
                 PostOp::BaseCrash => {
                     drop(base);
-                    base = Volume::open(&base_dir).unwrap();
+                    base = Volume::open(&base_dir, &by_id).unwrap();
                     for (&lba, expected) in &base_oracle {
                         let actual = base.read(lba, 1).unwrap();
                         prop_assert_eq!(

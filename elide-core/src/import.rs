@@ -270,7 +270,7 @@ mod tests {
         import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
         // Re-open with ReadonlyVolume and verify the blocks.
-        let rv = crate::volume::ReadonlyVolume::open(&vol_dir.join("base")).unwrap();
+        let rv = crate::volume::ReadonlyVolume::open(&vol_dir.join("base"), &vol_dir).unwrap();
         let got0 = rv.read(0, 1).unwrap();
         assert_eq!(got0, b0);
         let got1 = rv.read(1, 1).unwrap();

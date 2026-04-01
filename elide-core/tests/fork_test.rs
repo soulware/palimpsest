@@ -8,62 +8,67 @@ use elide_core::volume::{Volume, fork_volume};
 
 mod common;
 
-/// Verifies isolation across a three-level ancestry chain: base → child → grandchild.
+/// Verifies isolation across a three-level ancestry chain: root → child → grandchild.
 ///
 /// Each level writes to distinct LBAs and takes a snapshot before forking.
-/// After creating the grandchild, post-branch writes are made at the base and
+/// After creating the grandchild, post-branch writes are made at the root and
 /// child levels, then the grandchild is crashed and reopened.
 ///
 /// Expected reads from grandchild after crash+rebuild:
-///   LBAs 0-1  base values (pre-branch from base)
+///   LBAs 0-1  root values (pre-branch from root)
 ///   LBAs 2-3  child values (pre-branch from child)
 ///   LBAs 4-5  grandchild's own values
-///   LBAs 6-7  zero (written to base/child post-branch; invisible to grandchild)
+///   LBAs 6-7  zero (written to root/child post-branch; invisible to grandchild)
 #[test]
 fn three_level_fork_isolation() {
     let dir = tempfile::TempDir::new().unwrap();
-    let volume_dir = dir.path();
-    let base_dir: PathBuf = volume_dir.join("base");
+    let by_id = dir.path().to_path_buf();
+    let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+    let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+    let grandchild_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+    let root_dir: PathBuf = by_id.join(root_ulid);
+    let child_dir: PathBuf = by_id.join(child_ulid);
+    let grandchild_dir: PathBuf = by_id.join(grandchild_ulid);
 
-    // --- base level ---
-    let mut base = Volume::open(&base_dir).unwrap();
+    // --- root level ---
+    let mut base = Volume::open(&root_dir, &by_id).unwrap();
     base.write(0, &[0xAA; 4096]).unwrap();
     base.write(1, &[0xBB; 4096]).unwrap();
     base.flush_wal().unwrap();
     base.snapshot().unwrap();
 
-    let child_dir = fork_volume(volume_dir, "child", "base").unwrap();
+    fork_volume(&child_dir, &root_dir).unwrap();
 
-    // Post-branch base write — must be invisible to child and grandchild.
+    // Post-branch root write — must be invisible to child and grandchild.
     base.write(6, &[0xDE; 4096]).unwrap();
     base.flush_wal().unwrap();
 
     // --- child level ---
-    let mut child = Volume::open(&child_dir).unwrap();
+    let mut child = Volume::open(&child_dir, &by_id).unwrap();
     child.write(2, &[0xCC; 4096]).unwrap();
     child.write(3, &[0xDD; 4096]).unwrap();
     child.flush_wal().unwrap();
     child.snapshot().unwrap();
 
-    let grandchild_dir = fork_volume(volume_dir, "grandchild", "child").unwrap();
+    fork_volume(&grandchild_dir, &child_dir).unwrap();
 
     // Post-branch child write — must be invisible to grandchild.
     child.write(7, &[0xEF; 4096]).unwrap();
     child.flush_wal().unwrap();
 
     // --- grandchild level ---
-    let mut gc = Volume::open(&grandchild_dir).unwrap();
+    let mut gc = Volume::open(&grandchild_dir, &by_id).unwrap();
     gc.write(4, &[0xEE; 4096]).unwrap();
     gc.write(5, &[0xFF; 4096]).unwrap();
     gc.flush_wal().unwrap();
 
     // Crash + reopen grandchild — walk_ancestors must traverse two levels.
     drop(gc);
-    let gc = Volume::open(&grandchild_dir).unwrap();
+    let gc = Volume::open(&grandchild_dir, &by_id).unwrap();
 
     // Ancestral data visible.
-    assert_eq!(gc.read(0, 1).unwrap(), vec![0xAA; 4096], "lba 0 (base)");
-    assert_eq!(gc.read(1, 1).unwrap(), vec![0xBB; 4096], "lba 1 (base)");
+    assert_eq!(gc.read(0, 1).unwrap(), vec![0xAA; 4096], "lba 0 (root)");
+    assert_eq!(gc.read(1, 1).unwrap(), vec![0xBB; 4096], "lba 1 (root)");
     assert_eq!(gc.read(2, 1).unwrap(), vec![0xCC; 4096], "lba 2 (child)");
     assert_eq!(gc.read(3, 1).unwrap(), vec![0xDD; 4096], "lba 3 (child)");
 
@@ -79,11 +84,11 @@ fn three_level_fork_isolation() {
         "lba 5 (grandchild)"
     );
 
-    // Post-branch writes at base and child levels must be invisible.
+    // Post-branch writes at root and child levels must be invisible.
     assert_eq!(
         gc.read(6, 1).unwrap(),
         vec![0u8; 4096],
-        "lba 6 (post-branch base write)"
+        "lba 6 (post-branch root write)"
     );
     assert_eq!(
         gc.read(7, 1).unwrap(),

@@ -165,7 +165,8 @@ struct VolumeReader {
 impl VolumeReader {
     fn open(dir: &Path) -> io::Result<Self> {
         // Rebuild LBA map and extent index from all committed segments (including ancestors).
-        let ancestor_layers = volume::walk_ancestors(dir)?;
+        let by_id_dir = dir.parent().unwrap_or(dir);
+        let ancestor_layers = volume::walk_ancestors(dir, by_id_dir)?;
         let rebuild_chain: Vec<(std::path::PathBuf, Option<String>)> = ancestor_layers
             .into_iter()
             .map(|l| (l.dir, l.branch_ulid))

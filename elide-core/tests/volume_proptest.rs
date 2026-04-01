@@ -221,7 +221,7 @@ proptest! {
     fn ulid_monotonicity(ops in arb_sim_ops()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
-        let mut vol = Volume::open(fork_dir).unwrap();
+        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         // Tracks the latest snapshot ULID; segments at or below this are frozen.
         let mut snapshot_floor: Option<Ulid> = None;
 
@@ -349,7 +349,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir).unwrap();
+                    vol = Volume::open(fork_dir, fork_dir).unwrap();
                     // No assertion here: the next Flush or SweepPending
                     // will verify that the mint was correctly reseeded.
                 }
@@ -382,7 +382,7 @@ proptest! {
     fn crash_recovery_oracle(ops in arb_sim_ops()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
-        let mut vol = Volume::open(fork_dir).unwrap();
+        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
 
@@ -439,7 +439,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir).unwrap();
+                    vol = Volume::open(fork_dir, fork_dir).unwrap();
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -477,7 +477,7 @@ proptest! {
     fn gc_interleaved_oracle(ops in arb_gc_interleaved_ops()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
-        let mut vol = Volume::open(fork_dir).unwrap();
+        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
 
@@ -531,7 +531,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir).unwrap();
+                    vol = Volume::open(fork_dir, fork_dir).unwrap();
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(

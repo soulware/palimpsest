@@ -52,7 +52,8 @@ pub async fn prefetch_indexes(
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<PrefetchResult> {
-    let ancestors = walk_ancestors(fork_dir).context("walking ancestor chain")?;
+    let by_id_dir = fork_dir.parent().unwrap_or(fork_dir);
+    let ancestors = walk_ancestors(fork_dir, by_id_dir).context("walking ancestor chain")?;
 
     let mut fetched = 0usize;
     let mut skipped = 0usize;

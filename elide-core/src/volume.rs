@@ -181,25 +181,27 @@ impl Volume {
     /// (following `origin` files), then recovers or creates the WAL.
     ///
     /// Segments written by this volume will be unsigned. Use `open_with_signer`
-    /// when the fork's private key is available.
-    pub fn open(base_dir: &Path) -> io::Result<Self> {
-        Self::open_impl(base_dir, None)
+    /// when the volume's private key is available.
+    pub fn open(base_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
+        Self::open_impl(base_dir, None, by_id_dir)
     }
 
-    /// Open (or create) a fork, signing every promoted segment with `signer`.
+    /// Open (or create) a volume, signing every promoted segment with `signer`.
     ///
     /// Same as `open` but attaches a `SegmentSigner` so that each WAL promotion
-    /// and compaction output is signed with the fork's private key.
+    /// and compaction output is signed with the volume's private key.
     pub fn open_with_signer(
         base_dir: &Path,
         signer: Arc<dyn segment::SegmentSigner>,
+        by_id_dir: &Path,
     ) -> io::Result<Self> {
-        Self::open_impl(base_dir, Some(signer))
+        Self::open_impl(base_dir, Some(signer), by_id_dir)
     }
 
     fn open_impl(
         base_dir: &Path,
         signer: Option<Arc<dyn segment::SegmentSigner>>,
+        by_id_dir: &Path,
     ) -> io::Result<Self> {
         let wal_dir = base_dir.join("wal");
         let pending_dir = base_dir.join("pending");
@@ -222,7 +224,7 @@ impl Volume {
         }
 
         // Walk the origin chain to collect ancestor layers, oldest-first.
-        let ancestor_layers = walk_ancestors(base_dir)?;
+        let ancestor_layers = walk_ancestors(base_dir, by_id_dir)?;
 
         // Build the rebuild chain: ancestor layers (with ULID cutoffs) + current fork.
         let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
@@ -1274,13 +1276,13 @@ pub struct ReadonlyVolume {
 }
 
 impl ReadonlyVolume {
-    /// Open a fork directory for read-only access.
+    /// Open a volume directory for read-only access.
     ///
     /// Does not create `wal/`, does not acquire an exclusive lock, and does not
-    /// replay the WAL. WAL records from an active writer on the same fork will
+    /// replay the WAL. WAL records from an active writer on the same volume will
     /// not be visible. Intended for the `--readonly` NBD serve path.
-    pub fn open(fork_dir: &Path) -> io::Result<Self> {
-        let ancestor_layers = walk_ancestors(fork_dir)?;
+    pub fn open(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
+        let ancestor_layers = walk_ancestors(fork_dir, by_id_dir)?;
         let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
             .iter()
             .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
@@ -1373,11 +1375,10 @@ impl ReadonlyVolume {
 /// the branch and are excluded when rebuilding the LBA map.
 ///
 /// A fork with no `origin` file is the root fork; returns an empty vec.
-/// The `origin` file format is `<fork-rel-path>/snapshots/<branch-ulid>`, where
-/// `fork-rel-path` is the fork directory relative to the volume root — e.g.
-/// `base/snapshots/<ulid>` or `forks/vm1/snapshots/<ulid>`. This makes the
-/// `origin` file a real relative path from the volume root.
-pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
+/// The `origin` file format is `<parent-ulid>/snapshots/<branch-ulid>`, where
+/// `parent-ulid` is the ULID-named directory under `by_id_dir`. Both components
+/// are validated as ULIDs to prevent path traversal.
+pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     let origin_path = fork_dir.join("origin");
     let content = match fs::read_to_string(&origin_path) {
         Ok(s) => s,
@@ -1385,48 +1386,30 @@ pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
         Err(e) => return Err(e),
     };
     let origin = content.trim();
-    let (fork_rel_path, branch_ulid_str) = origin.rsplit_once("/snapshots/").ok_or_else(|| {
-        io::Error::other(format!(
-            "malformed origin file in {}: {origin}",
-            fork_dir.display()
-        ))
-    })?;
+    let (parent_ulid_str, branch_ulid_str) =
+        origin.rsplit_once("/snapshots/").ok_or_else(|| {
+            io::Error::other(format!(
+                "malformed origin file in {}: {origin}",
+                fork_dir.display()
+            ))
+        })?;
     let branch_ulid = Ulid::from_string(branch_ulid_str)
         .map_err(|e| io::Error::other(format!("bad branch ULID in origin: {e}")))?
         .to_string();
 
-    // Validate fork_rel_path: must be "base" or "forks/<name>" (no empty component,
-    // no path traversal, no nested forks/).
-    let valid_rel_path = match fork_rel_path.split_once('/') {
-        None => fork_rel_path == "base",
-        Some(("forks", name)) => !name.is_empty() && !name.contains('/'),
-        _ => false,
-    };
-    if !valid_rel_path {
-        return Err(io::Error::other(format!(
-            "malformed origin file in {}: invalid fork path '{fork_rel_path}'",
-            fork_dir.display()
-        )));
-    }
+    // Validate parent component: must be a valid ULID (no path traversal).
+    Ulid::from_string(parent_ulid_str).map_err(|_| {
+        io::Error::other(format!(
+            "malformed origin file in {}: parent '{}' is not a valid ULID",
+            fork_dir.display(),
+            parent_ulid_str
+        ))
+    })?;
 
-    // A fork in forks/ has the structure vol/forks/<name>; its parent is
-    // vol/forks/ and its grandparent is the volume root. The base fork
-    // lives directly under the volume root, not under forks/.
-    let parent = fork_dir
-        .parent()
-        .ok_or_else(|| io::Error::other("fork directory has no parent"))?;
-    let volume_dir = if parent.file_name().and_then(|n| n.to_str()) == Some("forks") {
-        parent
-            .parent()
-            .ok_or_else(|| io::Error::other("forks directory has no parent"))?
-    } else {
-        parent
-    };
-    // fork_rel_path is relative to the volume root (e.g. "base" or "forks/vm1").
-    let parent_fork_dir = volume_dir.join(fork_rel_path);
+    let parent_fork_dir = by_id_dir.join(parent_ulid_str);
 
     // Recurse into the parent's ancestry first (builds oldest-first order).
-    let mut ancestors = walk_ancestors(&parent_fork_dir)?;
+    let mut ancestors = walk_ancestors(&parent_fork_dir, by_id_dir)?;
     ancestors.push(AncestorLayer {
         dir: parent_fork_dir,
         branch_ulid: Some(branch_ulid),
@@ -1457,53 +1440,42 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
     Ok(ulids.into_iter().last())
 }
 
-/// Create a new named fork within a volume, branched from the latest snapshot
-/// of the source fork.
+/// Create a new volume directory, branched from the latest snapshot of the source volume.
 ///
-/// The source fork must have at least one snapshot (written by `snapshot()`).
-/// The new fork directory is created with `wal/`, `pending/`, `segments/`, and
-/// an `origin` file pointing to `<fork-rel-path>/snapshots/<latest_snapshot_ulid>`,
-/// where `fork-rel-path` is the source fork directory relative to the volume root.
+/// The source volume must have at least one snapshot (written by `snapshot()`).
+/// `new_fork_dir` is created with `wal/`, `pending/`, `segments/`, and an `origin`
+/// file using the flat format: `<source-ulid>/snapshots/<branch-ulid>`.
+/// The source ULID is derived from `source_fork_dir`'s directory name.
 ///
-/// Returns the path of the newly created fork directory.
-pub fn fork_volume(
-    volume_dir: &Path,
-    new_fork_name: &str,
-    source_fork_name: &str,
-) -> io::Result<PathBuf> {
-    let forks_dir = volume_dir.join("forks");
-    let new_fork_dir = forks_dir.join(new_fork_name);
+/// Returns `Ok(())` on success; `new_fork_dir` must not already exist.
+pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()> {
     if new_fork_dir.exists() {
         return Err(io::Error::other(format!(
-            "fork '{new_fork_name}' already exists"
+            "fork directory '{}' already exists",
+            new_fork_dir.display()
         )));
     }
 
-    // Source fork: "base" lives at vol/base/; others live in forks/.
-    let source_fork_dir = if source_fork_name == "base" {
-        volume_dir.join("base")
-    } else {
-        forks_dir.join(source_fork_name)
-    };
-    let branch_ulid = latest_snapshot(&source_fork_dir)?.ok_or_else(|| {
+    let source_ulid = source_fork_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::other("source fork dir has no name"))?;
+
+    let branch_ulid = latest_snapshot(source_fork_dir)?.ok_or_else(|| {
         io::Error::other(format!(
-            "source fork '{source_fork_name}' has no snapshots; run snapshot-volume first"
+            "source volume '{}' has no snapshots; run snapshot-volume first",
+            source_fork_dir.display()
         ))
     })?;
 
     fs::create_dir_all(new_fork_dir.join("wal"))?;
     fs::create_dir_all(new_fork_dir.join("pending"))?;
     fs::create_dir_all(new_fork_dir.join("segments"))?;
-    // origin uses the fork's path relative to the volume root so it is a real
-    // inspectable path: "base/snapshots/<ulid>" or "forks/<name>/snapshots/<ulid>".
-    let origin_rel = if source_fork_name == "base" {
-        format!("base/snapshots/{branch_ulid}")
-    } else {
-        format!("forks/{source_fork_name}/snapshots/{branch_ulid}")
-    };
-    segment::write_file_atomic(&new_fork_dir.join("origin"), origin_rel.as_bytes())?;
+    // origin format: "<source-ulid>/snapshots/<branch-ulid>"
+    let origin = format!("{source_ulid}/snapshots/{branch_ulid}");
+    segment::write_file_atomic(&new_fork_dir.join("origin"), origin.as_bytes())?;
 
-    Ok(new_fork_dir)
+    Ok(())
 }
 
 // --- WAL helpers ---
@@ -1630,7 +1602,7 @@ mod tests {
     #[test]
     fn open_creates_directories() {
         let base = temp_dir();
-        let _ = Volume::open(&base).unwrap();
+        let _ = Volume::open(&base, &base).unwrap();
         assert!(base.join("wal").is_dir());
         assert!(base.join("pending").is_dir());
         assert!(base.join("segments").is_dir());
@@ -1640,16 +1612,16 @@ mod tests {
     #[test]
     fn open_is_idempotent() {
         let base = temp_dir();
-        let _ = Volume::open(&base).unwrap();
+        let _ = Volume::open(&base, &base).unwrap();
         // Second open on the same dir should succeed (dirs already exist).
-        let _ = Volume::open(&base).unwrap();
+        let _ = Volume::open(&base, &base).unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
     fn write_single_block() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(0, &vec![0x42u8; 4096]).unwrap();
         vol.fsync().unwrap();
         assert_eq!(vol.lbamap_len(), 1);
@@ -1659,7 +1631,7 @@ mod tests {
     #[test]
     fn write_multi_block_extent() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         // Write 8 LBAs (32 KiB) as a single call.
         vol.write(10, &vec![0xabu8; 8 * 4096]).unwrap();
         assert_eq!(vol.lbamap_len(), 1);
@@ -1669,7 +1641,7 @@ mod tests {
     #[test]
     fn write_rejects_empty() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         let err = vol.write(0, &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         fs::remove_dir_all(base).unwrap();
@@ -1678,7 +1650,7 @@ mod tests {
     #[test]
     fn write_rejects_misaligned() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         let err = vol.write(0, &[0u8; 1000]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         fs::remove_dir_all(base).unwrap();
@@ -1687,7 +1659,7 @@ mod tests {
     #[test]
     fn write_sets_needs_promote_after_threshold() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         // Write 33 × 1 MiB of incompressible data to exceed FLUSH_THRESHOLD (32 MiB).
         // Each block uses a unique byte value so entropy is high and compression is skipped.
@@ -1738,14 +1710,14 @@ mod tests {
 
         // Write two blocks, fsync, then drop (simulates clean shutdown before promotion).
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &vec![1u8; 4096]).unwrap();
             vol.write(1, &vec![2u8; 4096]).unwrap();
             vol.fsync().unwrap();
         }
 
         // Reopen — lbamap should contain both blocks.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.lbamap_len(), 2);
 
         fs::remove_dir_all(base).unwrap();
@@ -1754,7 +1726,7 @@ mod tests {
     #[test]
     fn read_unwritten_returns_zeros() {
         let base = temp_dir();
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         let data = vol.read(0, 4).unwrap();
         assert_eq!(data.len(), 4 * 4096);
         assert!(data.iter().all(|&b| b == 0));
@@ -1764,7 +1736,7 @@ mod tests {
     #[test]
     fn read_written_data_same_session() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let payload = vec![0x42u8; 4096];
         vol.write(5, &payload).unwrap();
@@ -1783,7 +1755,7 @@ mod tests {
     #[test]
     fn read_multi_block_extent() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         // Write 4 blocks with distinct fill bytes so we can verify each block.
         let mut payload = Vec::with_capacity(4 * 4096);
@@ -1805,7 +1777,7 @@ mod tests {
     #[test]
     fn read_after_promote() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let payload = vec![0x55u8; 4096];
         vol.write(0, &payload).unwrap();
@@ -1824,13 +1796,13 @@ mod tests {
 
         let payload = vec![0x77u8; 4096];
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(3, &payload).unwrap();
             vol.fsync().unwrap();
         }
 
         // Reopen: WAL recovery must restore both the LBA map and extent index.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         let result = vol.read(3, 1).unwrap();
         assert_eq!(result, payload);
 
@@ -1849,7 +1821,7 @@ mod tests {
         // Write compressible data (zeros compress very well).
         let payload = vec![0u8; 4096];
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &payload).unwrap();
             vol.fsync().unwrap();
             // Drop without promoting — WAL contains the compressed entry.
@@ -1857,12 +1829,12 @@ mod tests {
 
         // Reopen (recover_wal runs) then promote (writes segment).
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.promote_for_test().unwrap();
         }
 
         // Reopen again and read — must not fail with "failed to fill whole buffer".
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         let result = vol.read(0, 1).unwrap();
         assert_eq!(result, payload);
 
@@ -1886,7 +1858,7 @@ mod tests {
         let base = temp_dir();
 
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             let block = vec![0u8; 1024 * 1024]; // 1 MiB = 256 LBAs
             for i in 0u64..33 {
                 vol.write(i * 256, &block).unwrap();
@@ -1895,7 +1867,7 @@ mod tests {
         }
 
         // All 33 extents should survive across the promotion boundary.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.lbamap_len(), 33);
 
         fs::remove_dir_all(base).unwrap();
@@ -1910,7 +1882,7 @@ mod tests {
 
         // Phase 1: write two blocks, fsync, drop.
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &vec![1u8; 4096]).unwrap();
             vol.write(1, &vec![2u8; 4096]).unwrap();
             vol.fsync().unwrap();
@@ -1918,13 +1890,13 @@ mod tests {
 
         // Phase 2: recover and immediately promote.
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             assert_eq!(vol.lbamap_len(), 2); // confirm recovery
             vol.promote_for_test().unwrap();
         }
 
         // Phase 3: reopen — both blocks must now come from the pending/ segment.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.lbamap_len(), 2);
 
         // Confirm the promoted segment landed correctly: one file in pending/.
@@ -1947,7 +1919,7 @@ mod tests {
         // Phase 1: write two blocks and promote so a segment lands in pending/.
         let ulid;
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &vec![0xaau8; 4096]).unwrap();
             vol.write(1, &vec![0xbbu8; 4096]).unwrap();
             vol.promote_for_test().unwrap();
@@ -1969,7 +1941,7 @@ mod tests {
         .unwrap();
 
         // Reopen — should delete the stale WAL and load cleanly from the segment.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.lbamap_len(), 2);
         assert!(
             vol.read(0, 1).unwrap().iter().all(|&b| b == 0xaa),
@@ -2010,7 +1982,7 @@ mod tests {
         let payload_a = vec![0xAAu8; 4096];
         let payload_b = vec![0xBBu8; 4096];
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &payload_a).unwrap();
             vol.write(1, &payload_b).unwrap();
             // promote_for_test flushes the WAL to pending/ and opens a fresh WAL.
@@ -2020,7 +1992,7 @@ mod tests {
 
         // On reopen, data must come from the pending/ segment.
         // The fresh empty WAL (opened after promotion) contributes nothing.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), payload_a);
         assert_eq!(vol.read(1, 1).unwrap(), payload_b);
 
@@ -2037,7 +2009,7 @@ mod tests {
 
         let payload = vec![0xCCu8; 4096];
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &payload).unwrap();
             vol.fsync().unwrap();
             // Drop with WAL intact — simulates crash before/during promotion.
@@ -2049,7 +2021,7 @@ mod tests {
         fs::write(&orphan, b"incomplete segment bytes").unwrap();
 
         // Recovery must succeed, data must be correct, and the orphan removed.
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.lbamap_len(), 1);
         assert_eq!(vol.read(0, 1).unwrap(), payload);
         assert!(!orphan.exists(), ".tmp orphan should be cleaned up on open");
@@ -2064,7 +2036,7 @@ mod tests {
         // Write two blocks, promote, compact — nothing should be compacted
         // since all data is still referenced.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2086,7 +2058,7 @@ mod tests {
         // Write block A, promote, overwrite block A with B, promote.
         // First segment now has a dead extent; compaction should reclaim it.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let original = vec![0x11u8; 4096];
         let replacement = vec![0x22u8; 4096];
@@ -2119,7 +2091,7 @@ mod tests {
         let base = temp_dir();
 
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &vec![0xAAu8; 4096]).unwrap();
             vol.promote_for_test().unwrap();
             vol.write(0, &vec![0xBBu8; 4096]).unwrap(); // overwrite
@@ -2127,7 +2099,7 @@ mod tests {
             vol.repack(0.7).unwrap();
         }
 
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), vec![0xBBu8; 4096]);
 
         fs::remove_dir_all(base).unwrap();
@@ -2138,7 +2110,7 @@ mod tests {
         // Segment has two extents; one is overwritten (dead), one is live.
         // Compaction should rewrite the segment keeping only the live extent.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap(); // will be overwritten
         vol.write(1, &vec![0x22u8; 4096]).unwrap(); // stays live
@@ -2164,7 +2136,7 @@ mod tests {
         // With a strict ratio (1.0), any dead byte triggers compaction.
         // With a lenient ratio (0.0), nothing is ever compacted.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2187,7 +2159,7 @@ mod tests {
         // Write and overwrite a block, then snapshot. The dead segment is
         // pre-snapshot and must not be compacted — it is frozen by the floor.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2214,7 +2186,7 @@ mod tests {
     fn repack_only_touches_post_snapshot_segments() {
         // Pre-snapshot dead segment: frozen. Post-snapshot dead segment: compactable.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         // Pre-snapshot: write and overwrite LBA 0.
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2249,7 +2221,7 @@ mod tests {
         // Simulate an uploaded segment by moving it from pending/ to segments/.
         // repack() must not touch it even if its extents are dead.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2291,7 +2263,7 @@ mod tests {
         // only wastes IO — merging only makes sense when >=2 segments combine or
         // dead space is reclaimed.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2310,7 +2282,7 @@ mod tests {
         // Write LBA 0, promote, overwrite LBA 0, promote.
         // sweep_pending should remove the dead extent from the first segment.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2333,7 +2305,7 @@ mod tests {
         // Upload a segment (simulate by writing to segments/ directly via promote
         // then moving to segments/). sweep_pending must not touch it.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2370,7 +2342,7 @@ mod tests {
     fn sweep_pending_respects_snapshot_floor() {
         // Segments at or below the snapshot ULID must not be touched.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         // Write and promote before snapshot.
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2397,7 +2369,7 @@ mod tests {
         // Three separate promotes → three small pending segments.
         // sweep_pending should merge them into one.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0xaau8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
@@ -2466,7 +2438,7 @@ mod tests {
     fn read_incompressible_data() {
         // High-entropy data must not be compressed, and must read back correctly.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let payload = high_entropy_block(0x5A);
         assert!(
@@ -2484,7 +2456,7 @@ mod tests {
     fn compressed_and_uncompressed_extents_coexist() {
         // Write one compressible and one incompressible extent; both must read back correctly.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let compressible = vec![0xCCu8; 4096];
         let incompressible = high_entropy_block(0xA3);
@@ -2505,7 +2477,7 @@ mod tests {
         // Writing identical data to the same LBA twice: second write is a dedup hit.
         // The LBA map must have exactly one entry, reads must return the correct data.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let data = vec![0x42u8; 4096];
         vol.write(0, &data).unwrap();
@@ -2522,7 +2494,7 @@ mod tests {
         // Identical data written to two different LBAs: second write is a dedup hit.
         // Both LBA entries exist in the map; reads return the correct data from both.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let data = vec![0x77u8; 4096];
         vol.write(0, &data).unwrap();
@@ -2542,7 +2514,7 @@ mod tests {
         let base = temp_dir();
 
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             let data = vec![0xABu8; 4096];
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
@@ -2551,7 +2523,7 @@ mod tests {
             vol.fsync().unwrap();
         }
 
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         let data = vec![0xABu8; 4096];
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), data);
@@ -2566,7 +2538,7 @@ mod tests {
         let base = temp_dir();
 
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             let data = vec![0xCDu8; 4096];
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
@@ -2574,7 +2546,7 @@ mod tests {
             vol.promote_for_test().unwrap(); // REF lands in segment
         }
 
-        let vol = Volume::open(&base).unwrap();
+        let vol = Volume::open(&base, &base).unwrap();
         let data = vec![0xCDu8; 4096];
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), data);
@@ -2586,36 +2558,34 @@ mod tests {
 
     #[test]
     fn walk_ancestors_root_returns_empty() {
-        let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("base");
-        // No origin file → root fork; ancestors are empty.
-        assert!(walk_ancestors(&fork_dir).unwrap().is_empty());
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        // No origin file → root volume; ancestors are empty.
+        assert!(walk_ancestors(&vol_dir, &by_id).unwrap().is_empty());
     }
 
     #[test]
     fn walk_ancestors_rejects_invalid_origin_paths() {
-        let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("forks").join("dev");
+        let by_id = temp_dir();
+        let fork_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
         fs::create_dir_all(&fork_dir).unwrap();
 
         let bad_origins = [
-            // direct segment reference (no snapshots/ component)
-            "base/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // path traversal
-            "../other/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // nested forks
-            "forks/a/b/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // empty fork name
-            "forks//snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // segments/ instead of snapshots/
-            "base/segments/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // completely wrong
+            // not a ULID parent (old "base/" prefix)
+            "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // path traversal attempt
+            "../01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // parent component is not a valid ULID
+            "not-a-ulid/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // missing /snapshots/ separator entirely
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // branch ULID missing after snapshots/
+            "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
         ];
         for bad in bad_origins {
             fs::write(fork_dir.join("origin"), bad).unwrap();
             assert!(
-                walk_ancestors(&fork_dir).is_err(),
+                walk_ancestors(&fork_dir, &by_id).is_err(),
                 "expected error for origin: {bad}"
             );
         }
@@ -2623,19 +2593,21 @@ mod tests {
 
     #[test]
     fn walk_ancestors_one_level() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
-        let dev_dir = vol_dir.join("forks").join("dev");
+        let by_id = temp_dir();
+        let parent_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let default_dir = by_id.join(parent_ulid);
+        let dev_dir = by_id.join(child_ulid);
 
         // dev's origin points to default at a fixed branch ULID.
         fs::create_dir_all(&dev_dir).unwrap();
         fs::write(
             dev_dir.join("origin"),
-            "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         )
         .unwrap();
 
-        let ancestors = walk_ancestors(&dev_dir).unwrap();
+        let ancestors = walk_ancestors(&dev_dir, &by_id).unwrap();
         assert_eq!(ancestors.len(), 1);
         assert_eq!(ancestors[0].dir, default_dir);
         assert_eq!(
@@ -2646,26 +2618,29 @@ mod tests {
 
     #[test]
     fn walk_ancestors_two_levels() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
-        let mid_dir = vol_dir.join("forks").join("mid");
-        let leaf_dir = vol_dir.join("forks").join("leaf");
+        let by_id = temp_dir();
+        let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let mid_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let leaf_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let default_dir = by_id.join(root_ulid);
+        let mid_dir = by_id.join(mid_ulid);
+        let leaf_dir = by_id.join(leaf_ulid);
 
         fs::create_dir_all(&mid_dir).unwrap();
         fs::write(
             mid_dir.join("origin"),
-            "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            format!("{root_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         )
         .unwrap();
 
         fs::create_dir_all(&leaf_dir).unwrap();
         fs::write(
             leaf_dir.join("origin"),
-            "forks/mid/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV",
+            format!("{mid_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV"),
         )
         .unwrap();
 
-        let ancestors = walk_ancestors(&leaf_dir).unwrap();
+        let ancestors = walk_ancestors(&leaf_dir, &by_id).unwrap();
         assert_eq!(ancestors.len(), 2);
         assert_eq!(ancestors[0].dir, default_dir);
         assert_eq!(ancestors[1].dir, mid_dir);
@@ -2681,61 +2656,63 @@ mod tests {
 
     // --- ancestor-aware open / read integration test ---
 
-    /// Write data into a root fork, snapshot it, create a child fork via
+    /// Write data into a root volume, snapshot it, create a child volume via
     /// fork_volume, and verify the child can read the ancestor's data.
     #[test]
     fn open_reads_ancestor_segments() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
 
-        // Write data into the default fork and promote to a segment.
+        // Write data into the root volume and promote to a segment.
         let data = vec![0xABu8; 4096];
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
             vol.snapshot().unwrap();
         }
 
-        // Create a child fork branched from default.
-        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
+        // Create a child volume branched from default.
+        fork_volume(&child_dir, &default_dir).unwrap();
 
         // Child should see the ancestor's data through layer merge.
-        let vol = Volume::open(&child_dir).unwrap();
+        let vol = Volume::open(&child_dir, &by_id).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
-    /// Ancestor data is shadowed by a write in the live child fork.
+    /// Ancestor data is shadowed by a write in the live child volume.
     #[test]
     fn child_write_shadows_ancestor() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
         let ancestor_data = vec![0xAAu8; 4096];
         let child_data = vec![0xBBu8; 4096];
 
-        // Write into the default fork, promote, snapshot.
+        // Write into the root volume, promote, snapshot.
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &ancestor_data).unwrap();
             vol.promote_for_test().unwrap();
             vol.snapshot().unwrap();
         }
 
-        // Create child fork, write different data at the same LBA, promote.
-        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
+        // Create child volume, write different data at the same LBA, promote.
+        fork_volume(&child_dir, &default_dir).unwrap();
         {
-            let mut vol = Volume::open(&child_dir).unwrap();
+            let mut vol = Volume::open(&child_dir, &by_id).unwrap();
             vol.write(0, &child_data).unwrap();
             vol.promote_for_test().unwrap();
         }
 
         // Re-open child and verify child data wins.
-        let vol = Volume::open(&child_dir).unwrap();
+        let vol = Volume::open(&child_dir, &by_id).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), child_data);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     // --- lock tests ---
@@ -2744,9 +2721,9 @@ mod tests {
     fn double_open_same_fork_fails() {
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let _vol = Volume::open(&fork_dir).unwrap();
+        let _vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         // Second open on the same live fork must fail (lock already held).
-        assert!(Volume::open(&fork_dir).is_err());
+        assert!(Volume::open(&fork_dir, &fork_dir).is_err());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -2758,7 +2735,7 @@ mod tests {
         let fork_dir = base.join("base");
         let data = vec![0xAAu8; 4096];
 
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &data).unwrap();
         let snap_ulid = vol.snapshot().unwrap();
 
@@ -2785,7 +2762,7 @@ mod tests {
     fn snapshot_ulid_matches_last_segment_ulid() {
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
         let snap_ulid = vol.snapshot().unwrap().to_string();
 
@@ -2805,7 +2782,7 @@ mod tests {
     fn snapshot_empty_wal_no_segment_written() {
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         // No writes — WAL is empty.
         vol.snapshot().unwrap();
 
@@ -2820,7 +2797,7 @@ mod tests {
     fn snapshot_idempotent_when_no_new_data() {
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
 
         let ulid1 = vol.snapshot().unwrap();
@@ -2839,7 +2816,7 @@ mod tests {
     fn snapshot_not_idempotent_after_new_write() {
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
 
         let ulid1 = vol.snapshot().unwrap();
@@ -2861,7 +2838,7 @@ mod tests {
         // time) but that segment was already covered by a prior snapshot.
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
         vol.promote_for_test().unwrap(); // lands in pending/ with wal_ulid_1
         let ulid1 = vol.snapshot().unwrap(); // snapshot covers pending/wal_ulid_1
@@ -2876,15 +2853,15 @@ mod tests {
     fn snapshot_lock_held_after_snapshot() {
         let base = temp_dir();
         let fork_dir = base.join("base");
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.snapshot().unwrap();
 
         // Fork is still locked (still live); second open must fail.
-        assert!(Volume::open(&fork_dir).is_err());
+        assert!(Volume::open(&fork_dir, &fork_dir).is_err());
         drop(vol); // now released
 
         // After drop, a fresh open succeeds.
-        assert!(Volume::open(&fork_dir).is_ok());
+        assert!(Volume::open(&fork_dir, &fork_dir).is_ok());
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -2893,44 +2870,52 @@ mod tests {
 
     #[test]
     fn fork_volume_creates_fork_with_origin() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let default_dir = by_id.join(root_ulid);
+        let fork_dir = by_id.join(child_ulid);
 
         // snapshot default to give it a branch point.
-        let mut vol = Volume::open(&default_dir).unwrap();
+        let mut vol = Volume::open(&default_dir, &by_id).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
         let snap_ulid = vol.snapshot().unwrap().to_string();
         drop(vol);
 
         // Create the fork.
-        let fork_dir = fork_volume(&vol_dir, "dev", "base").unwrap();
+        fork_volume(&fork_dir, &default_dir).unwrap();
         assert!(fork_dir.join("wal").is_dir());
         assert!(fork_dir.join("pending").is_dir());
         assert!(fork_dir.join("segments").is_dir());
 
         let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
-        assert_eq!(origin.trim(), format!("base/snapshots/{snap_ulid}"));
+        assert_eq!(origin.trim(), format!("{root_ulid}/snapshots/{snap_ulid}"));
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     #[test]
     fn fork_volume_errors_if_source_has_no_snapshots() {
-        let vol_dir = temp_dir();
-        // default has no snapshot yet.
-        let err = fork_volume(&vol_dir, "dev", "base").unwrap_err();
+        let by_id = temp_dir();
+        let root_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        // root has no snapshot yet.
+        let err = fork_volume(&child_dir, &root_dir).unwrap_err();
         assert!(err.to_string().contains("no snapshots"), "{err}");
     }
 
     #[test]
     fn fork_volume_uses_latest_snapshot_when_multiple_exist() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let default_dir = by_id.join(root_ulid);
+        let fork_dir = by_id.join(child_ulid);
 
         let data_snap1 = vec![0x11u8; 4096];
         let data_snap2 = vec![0x22u8; 4096];
 
-        let mut vol = Volume::open(&default_dir).unwrap();
+        let mut vol = Volume::open(&default_dir, &by_id).unwrap();
         // First snapshot — should NOT be the branch point.
         vol.write(0, &data_snap1).unwrap();
         let snap1 = vol.snapshot().unwrap().to_string();
@@ -2942,63 +2927,68 @@ mod tests {
         // snap2 must sort after snap1 (ULIDs are monotonically increasing).
         assert!(snap2 > snap1);
 
-        let fork_dir = fork_volume(&vol_dir, "dev", "base").unwrap();
+        fork_volume(&fork_dir, &default_dir).unwrap();
         let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
         assert_eq!(
             origin.trim(),
-            format!("base/snapshots/{snap2}"),
+            format!("{root_ulid}/snapshots/{snap2}"),
             "origin should point to the latest snapshot"
         );
 
         // Fork branched from snap2 sees both pre-snap1 and pre-snap2 writes.
-        let vol = Volume::open(&fork_dir).unwrap();
+        let vol = Volume::open(&fork_dir, &by_id).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data_snap1);
         assert_eq!(vol.read(1, 1).unwrap(), data_snap2);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     #[test]
     fn fork_volume_from_child_fork_creates_three_level_chain() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let mid_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let leaf_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let default_dir = by_id.join(root_ulid);
+        let mid_dir = by_id.join(mid_ulid);
+        let leaf_dir = by_id.join(leaf_ulid);
 
         let data_root = vec![0xAAu8; 4096];
         let data_mid = vec![0xBBu8; 4096];
         let data_leaf = vec![0xCCu8; 4096];
 
-        // Root fork: write + snapshot.
+        // Root volume: write + snapshot.
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &data_root).unwrap();
             vol.snapshot().unwrap();
         }
 
-        // Mid fork: branch from default, write + snapshot.
-        let mid_dir = fork_volume(&vol_dir, "mid", "base").unwrap();
+        // Mid volume: branch from default, write + snapshot.
+        fork_volume(&mid_dir, &default_dir).unwrap();
         {
-            let mut vol = Volume::open(&mid_dir).unwrap();
+            let mut vol = Volume::open(&mid_dir, &by_id).unwrap();
             vol.write(1, &data_mid).unwrap();
             vol.snapshot().unwrap();
         }
 
-        // Leaf fork: branch from mid.
-        let leaf_dir = fork_volume(&vol_dir, "leaf", "mid").unwrap();
+        // Leaf volume: branch from mid.
+        fork_volume(&leaf_dir, &mid_dir).unwrap();
 
-        // origin chain: leaf → mid → default.
+        // origin chain: leaf → mid → default (ULID-based flat layout).
         let leaf_origin = fs::read_to_string(leaf_dir.join("origin")).unwrap();
         assert!(
-            leaf_origin.starts_with("forks/mid/snapshots/"),
+            leaf_origin.starts_with(&format!("{mid_ulid}/snapshots/")),
             "leaf origin: {leaf_origin}"
         );
         let mid_origin = fs::read_to_string(mid_dir.join("origin")).unwrap();
         assert!(
-            mid_origin.starts_with("base/snapshots/"),
+            mid_origin.starts_with(&format!("{root_ulid}/snapshots/")),
             "mid origin: {mid_origin}"
         );
 
         // Leaf sees data from all three levels.
-        let vol = Volume::open(&leaf_dir).unwrap();
+        let vol = Volume::open(&leaf_dir, &by_id).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data_root);
         assert_eq!(vol.read(1, 1).unwrap(), data_mid);
         assert_eq!(vol.read(2, 1).unwrap(), vec![0u8; 4096]); // unwritten
@@ -3006,29 +2996,30 @@ mod tests {
         // Write to leaf does not affect mid or default.
         drop(vol);
         {
-            let mut vol = Volume::open(&leaf_dir).unwrap();
+            let mut vol = Volume::open(&leaf_dir, &by_id).unwrap();
             vol.write(2, &data_leaf).unwrap();
         }
-        let vol = Volume::open(&leaf_dir).unwrap();
+        let vol = Volume::open(&leaf_dir, &by_id).unwrap();
         assert_eq!(vol.read(2, 1).unwrap(), data_leaf);
         assert_eq!(vol.ancestor_count(), 2);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     #[test]
     fn fork_volume_errors_if_fork_exists() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
-        let mut vol = Volume::open(&default_dir).unwrap();
+        let by_id = temp_dir();
+        let root_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        let mut vol = Volume::open(&root_dir, &by_id).unwrap();
         vol.snapshot().unwrap();
         drop(vol);
 
-        fork_volume(&vol_dir, "dev", "base").unwrap();
-        let err = fork_volume(&vol_dir, "dev", "base").unwrap_err();
+        fork_volume(&child_dir, &root_dir).unwrap();
+        let err = fork_volume(&child_dir, &root_dir).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     // --- multi-snapshot read tests ---
@@ -3041,7 +3032,7 @@ mod tests {
         let data_b = vec![0xBBu8; 4096];
 
         {
-            let mut vol = Volume::open(&fork_dir).unwrap();
+            let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
             vol.write(0, &data_a).unwrap();
             vol.snapshot().unwrap();
             vol.write(1, &data_b).unwrap();
@@ -3049,7 +3040,7 @@ mod tests {
         }
 
         // Re-open the same fork: both writes visible.
-        let vol = Volume::open(&fork_dir).unwrap();
+        let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data_a);
         assert_eq!(vol.read(1, 1).unwrap(), data_b);
 
@@ -3058,65 +3049,67 @@ mod tests {
 
     #[test]
     fn fork_data_visible_across_ancestry() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 4096];
 
         // Write to default, snapshot, create fork, write to fork.
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &data_a).unwrap();
             vol.promote_for_test().unwrap();
             vol.snapshot().unwrap();
         }
 
-        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
+        fork_volume(&child_dir, &default_dir).unwrap();
         {
-            let mut vol = Volume::open(&child_dir).unwrap();
+            let mut vol = Volume::open(&child_dir, &by_id).unwrap();
             vol.write(1, &data_b).unwrap();
             vol.promote_for_test().unwrap();
         }
 
         // Re-open child: sees both ancestor and own data.
-        let vol = Volume::open(&child_dir).unwrap();
+        let vol = Volume::open(&child_dir, &by_id).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data_a);
         assert_eq!(vol.read(1, 1).unwrap(), data_b);
         assert_eq!(vol.ancestor_count(), 1);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     // --- ULID cutoff tests ---
 
-    /// Segments written to an ancestor fork *after* the branch point must not
-    /// be visible to a child fork.  This is the core correctness property of
+    /// Segments written to an ancestor volume *after* the branch point must not
+    /// be visible to a child volume. This is the core correctness property of
     /// the per-ancestor ULID cutoff stored in `origin`.
     #[test]
     fn ulid_cutoff_hides_post_branch_ancestor_writes() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
 
         let pre_branch = vec![0xAAu8; 4096];
         let post_branch = vec![0xBBu8; 4096];
 
         // Write pre-branch data to ancestor, snapshot, then branch.
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &pre_branch).unwrap();
             vol.snapshot().unwrap();
         }
-        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
+        fork_volume(&child_dir, &default_dir).unwrap();
 
-        // Write post-branch data to the ancestor fork at LBA 1 (a new LBA).
+        // Write post-branch data to the ancestor volume at LBA 1 (a new LBA).
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(1, &post_branch).unwrap();
             vol.promote_for_test().unwrap();
         }
 
         // Child must see pre-branch data at LBA 0 and zeros at LBA 1.
-        let vol = Volume::open(&child_dir).unwrap();
+        let vol = Volume::open(&child_dir, &by_id).unwrap();
         assert_eq!(
             vol.read(0, 1).unwrap(),
             pre_branch,
@@ -3128,38 +3121,39 @@ mod tests {
             "post-branch ancestor write must be invisible"
         );
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     /// A post-branch write to an ancestor that *overwrites* a pre-branch LBA
     /// must also be invisible — the child must still see the original value.
     #[test]
     fn ulid_cutoff_overwrite_stays_invisible() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
 
         let original = vec![0xAAu8; 4096];
         let overwrite = vec![0xBBu8; 4096];
 
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &original).unwrap();
             vol.snapshot().unwrap();
         }
-        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
+        fork_volume(&child_dir, &default_dir).unwrap();
 
         // Ancestor overwrites LBA 0 after the branch.
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &overwrite).unwrap();
             vol.promote_for_test().unwrap();
         }
 
         // Child must still see the original pre-branch value.
-        let vol = Volume::open(&child_dir).unwrap();
+        let vol = Volume::open(&child_dir, &by_id).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), original);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     // --- ReadonlyVolume tests ---
@@ -3172,7 +3166,7 @@ mod tests {
         fs::create_dir_all(fork_dir.join("segments")).unwrap();
         fs::create_dir_all(fork_dir.join("pending")).unwrap();
 
-        let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+        let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
         assert_eq!(rv.read(0, 1).unwrap(), vec![0u8; 4096]);
 
         fs::remove_dir_all(vol_dir).unwrap();
@@ -3187,7 +3181,7 @@ mod tests {
 
         // Write data into the fork via Volume, then drop the lock.
         {
-            let mut vol = Volume::open(&fork_dir).unwrap();
+            let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
         }
@@ -3196,7 +3190,7 @@ mod tests {
         //  no-WAL path.)
         fs::remove_dir_all(fork_dir.join("wal")).unwrap();
 
-        let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+        let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
         assert_eq!(rv.read(0, 1).unwrap(), data);
 
         fs::remove_dir_all(vol_dir).unwrap();
@@ -3204,25 +3198,25 @@ mod tests {
 
     #[test]
     fn readonly_volume_reads_ancestor_data() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("base");
+        let by_id = temp_dir();
+        let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
 
         let ancestor_data = vec![0xDDu8; 4096];
 
         // Write data into default, snapshot, fork.
         {
-            let mut vol = Volume::open(&default_dir).unwrap();
+            let mut vol = Volume::open(&default_dir, &by_id).unwrap();
             vol.write(0, &ancestor_data).unwrap();
             vol.snapshot().unwrap();
         }
-        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
-        // Drop child lock so ReadonlyVolume can open it without conflict.
-        // (ReadonlyVolume doesn't take a write lock, so this always works.)
+        fork_volume(&child_dir, &default_dir).unwrap();
+        // ReadonlyVolume doesn't take a write lock, so this always works.
 
-        let rv = ReadonlyVolume::open(&child_dir).unwrap();
+        let rv = ReadonlyVolume::open(&child_dir, &by_id).unwrap();
         assert_eq!(rv.read(0, 1).unwrap(), ancestor_data);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     #[test]
@@ -3234,7 +3228,7 @@ mod tests {
         let in_wal = vec![0xFFu8; 4096];
 
         // Write and promote LBA 0, then write LBA 1 to the WAL only.
-        let mut vol = Volume::open(&fork_dir).unwrap();
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &committed).unwrap();
         vol.promote_for_test().unwrap();
         vol.write(1, &in_wal).unwrap();
@@ -3243,7 +3237,7 @@ mod tests {
         drop(vol);
 
         // ReadonlyVolume skips WAL replay: LBA 1 must appear as zeros.
-        let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+        let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
         assert_eq!(rv.read(0, 1).unwrap(), committed);
         assert_eq!(rv.read(1, 1).unwrap(), vec![0u8; 4096]);
 
@@ -3297,7 +3291,7 @@ mod tests {
     #[test]
     fn gc_handoff_applies_and_renames() {
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let data = vec![0x42u8; 4096];
         vol.write(0, &data).unwrap();
@@ -3341,7 +3335,7 @@ mod tests {
         // locally.  apply_gc_handoffs must skip the file and return Ok(0) so
         // the next idle tick retries when the segment is available.
         let base = temp_dir();
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
 
         let gc_dir = base.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
@@ -3374,7 +3368,7 @@ mod tests {
         let data = vec![0xABu8; 4096];
 
         {
-            let mut vol = Volume::open(&base).unwrap();
+            let mut vol = Volume::open(&base, &base).unwrap();
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
 
@@ -3403,7 +3397,7 @@ mod tests {
         // Reopen: rebuild scans segments/ and finds <new_ulid>.  Reads work
         // even though the in-memory extent index from before the crash pointed
         // at the now-deleted old segment.
-        let mut vol = Volume::open(&base).unwrap();
+        let mut vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
         // Now apply the pending handoff — must succeed and rename the file.
