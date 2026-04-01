@@ -35,8 +35,9 @@ elide-core/        — shared library: segment format, WAL, LBA map, extent inde
                      Deps: blake3, zstd, ulid, nix, ed25519-dalek, rand_core.
                      No async, no network. Usable standalone.
 
-elide/             — volume process binary: NBD server, analysis tools (extents,
-                     inspect, ls), and the import-volume CLI subcommand. Adds:
+elide/             — volume process binary and user CLI: NBD server, analysis
+                     tools (extents, inspect, ls), and volume management
+                     subcommands including `volume import`. Adds:
                      clap, ext4-view, object_store, tokio (rt-multi-thread only).
                      The async runtime is used exclusively by the demand-fetch
                      path (ObjectStoreFetcher), which wraps block_on to satisfy
@@ -61,7 +62,7 @@ The split keeps the volume process binary lean and focused. The async HTTP stack
 needed for OCI registry pulls belongs in tooling (`elide-import`), not in the
 process that serves block I/O.
 
-**Proposed: `elide volume import` migration.** OCI import functionality will migrate into the `elide` binary (`elide volume import <name> <oci-ref>`), absorbing `elide-import`. The import writes directly to the volume directory then sends a `rescan` to the coordinator. `elide-import` becomes redundant once this is in place.
+**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised short-lived process. The coordinator creates the fork directory, writes an `import.lock` marker, spawns `elide-import`, streams its output to any attached clients, and cleans up the lock on exit. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
 
 ## Directory layout
 
@@ -125,6 +126,8 @@ The readonly volume's `base/` directory lives directly under the volume root (no
 **Finding live forks:** scan `forks/` for subdirectories containing `wal/`.
 
 **Exclusive access:** a live fork holds an exclusive `flock` on `<fork-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked fork fails immediately.
+
+**Import lock:** `<fork-dir>/import.lock` (plain text, one line: the import ULID) is present while an import process is running or was interrupted. The coordinator removes it on clean import exit. A stale lock (import process dead) is cleaned up on the next coordinator startup or rescan pass. See *Import process lifecycle* below.
 
 **Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. For forks in `forks/`, `walk_ancestors` follows this chain to the root (`base/`), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
 
@@ -201,16 +204,18 @@ Most commands operate directly on the volume directory and require no running co
 | `elide volume snapshot <name> [<fork>]` | Write a snapshot marker file |
 | `elide volume fork <name> <new-fork>` | Create a named fork (directory operation) |
 | `elide volume create <name> [--size N]` | Create volume directory structure, then rescan |
-| `elide volume import <name> <oci-ref>` | Pull OCI image into volume directory, then rescan |
 
-`create` and `import` do all their substantive work on disk, then send a lightweight `rescan` request to the coordinator so the new volume is picked up immediately rather than waiting for the next scan interval. If the coordinator is not running, the rescan request fails with a warning and the volume will be discovered on the coordinator's next startup or scan.
+`create` does all its work on disk, then sends a lightweight `rescan` request to the coordinator so the new volume is picked up immediately rather than waiting for the next scan interval. If the coordinator is not running, the rescan request fails with a warning and the volume will be discovered on the coordinator's next startup or scan.
 
 **Coordinator-required (process and device management):**
 
 | Command | What it does |
 |---|---|
-| `elide volume status <name>` | Is the volume process running? What device or address? |
-| `elide volume delete <name>` | Stop the volume process, then remove the directory |
+| `elide volume status <name>` | Is the volume process running? What forks? |
+| `elide volume delete <name>` | Stop all processes for the volume, then remove its directory |
+| `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import ULID |
+| `elide volume import status <ulid>` | Poll import state: running / done / failed |
+| `elide volume import attach <ulid>` | Stream import output lines until completion |
 
 **Internal (spawned by coordinator; not intended for direct use):**
 
@@ -257,11 +262,21 @@ Three auth tiers apply to this socket:
 | Trigger immediate fork discovery | `rescan` | `ok` |
 | Query volume process state | `status <volume>` | `ok running <device-or-address>` or `ok stopped` |
 
+**Unauthenticated — import management:**
+
+| Operation | Request | Response |
+|---|---|---|
+| Start OCI import | `import <name> <oci-ref>` | `ok <ulid>` |
+| Poll import state | `import status <ulid>` | `ok running` / `ok done` / `err failed: <msg>` |
+| Stream import output | `import attach <ulid>` | lines… then `ok done` or `err failed: <msg>` |
+
+`import` and `import status` follow the standard one-request / one-response model. `import attach` is the exception: the coordinator streams buffered and live output lines until the import completes, then sends a terminal `ok done\n` or `err failed: <message>\n` and closes the connection. If the import has already finished, the stored output is replayed immediately followed by the terminal line.
+
 **Operator macaroon** (CLI-originated mutations; see *Operator tokens* below):
 
 | Operation | Request | Response |
 |---|---|---|
-| Stop volume and delete directory | `delete <volume> <fork> <macaroon>` | `ok` |
+| Stop volume and delete directory | `delete <volume> <macaroon>` | `ok` |
 
 **Volume macaroon** (volume process identity; PID-bound; see *S3 credential distribution via macaroons* below):
 
@@ -391,6 +406,50 @@ The attenuated token is derived by the volume in-process — no coordinator roun
 ### Implementation note
 
 The caveat set is small and typed (`volume`, `fork`, `scope`, `pid`, optionally `not-after`). This is implementable in ~150–200 lines of HMAC-SHA256 chain code. Existing `macaroon` crates on crates.io should be evaluated before hand-rolling; if they use untyped opaque blobs (as noted in the fly.io design), a thin typed wrapper or a minimal hand-rolled implementation may be preferable for clarity.
+
+## Proposed: Import process lifecycle
+
+OCI import is a potentially long-running operation. The coordinator supervises it as a short-lived child process, analogous to a volume process, with an explicit lifecycle marker on disk.
+
+### `import.lock`
+
+When the coordinator begins an import it writes `<fork-dir>/import.lock` containing a single line: the import ULID. This file is the source of truth for "an import is in progress or was interrupted here". The coordinator removes the file when the import process exits (whether success or failure).
+
+The ULID in `import.lock` matches the ULID returned to the caller by `import <name> <oci-ref>`. This lets an operator correlate a lock file with coordinator logs or `import status` output.
+
+### Concurrency guard
+
+The coordinator enforces mutual exclusion between volume processes and import processes on the same fork directory:
+
+- Before spawning an import: check `volume.pid` — if a process is alive, refuse with `err volume already running for this fork`
+- Before spawning a volume: check `import.lock` — if present, skip this fork (logged as a warning; no volume is started until the lock is cleared)
+- The drain loop skips any fork directory that has an `import.lock` present
+
+### Stale lock detection and cleanup
+
+A crash (coordinator or import process) can leave `import.lock` behind with no matching live process. On every coordinator startup and rescan pass, the coordinator checks each `import.lock`:
+
+1. Read the ULID from the file
+2. If no import job with that ULID is tracked in memory, check whether any process wrote `import.pid` alongside the lock (if the import process records its own PID, analogous to `volume.pid`)
+3. If no live process is found: remove the lock, log a warning including the ULID and fork path
+
+The fork directory is left intact — it may contain partial segment data useful for debugging. After the stale lock is removed, the coordinator resumes normal supervision of the fork.
+
+### `volume delete`
+
+`elide volume delete <name>` is the recovery and cleanup command:
+
+1. For each running volume process under this volume: send SIGTERM, wait for exit
+2. For each running import process under this volume: send SIGTERM, wait for exit
+3. Remove stale `import.lock` files if present (import process already dead)
+4. Remove the volume directory tree (`<vol-dir>` and all contents)
+5. Respond `ok`
+
+After `volume delete`, `volume import <name> <oci-ref>` starts fresh with a clean directory.
+
+### Output retention
+
+The coordinator captures the import process's stdout and stderr. Output lines are buffered in memory for the lifetime of the coordinator (or until a configurable retention limit). `import attach` replays buffered output to any client that connects after the process has already exited, so a brief disconnect during a long import does not lose the log.
 
 ## Write Path
 
@@ -687,7 +746,7 @@ elide list-snapshots <vol-dir> [--fork <name>]
 elide export-volume <vol-dir> <fork-name> <new-vol-dir>
 ```
 
-Import is handled by the separate `elide-import` binary (OCI pull → ext4 → volume ingest). There is no `elide import-volume` subcommand.
+Import is handled by `elide volume import <name> <oci-ref>`, which asks the coordinator to spawn the separate `elide-import` binary as a supervised short-lived process. See *Import process lifecycle* above.
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The fork remains live; no directory structure changes.
 
