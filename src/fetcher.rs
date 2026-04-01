@@ -76,7 +76,7 @@ impl FetchConfig {
         Ok(None)
     }
 
-    fn build_store(&self) -> io::Result<Arc<dyn ObjectStore>> {
+    pub fn build_store(&self) -> io::Result<Arc<dyn ObjectStore>> {
         if let Some(path) = &self.local_path {
             let store = object_store::local::LocalFileSystem::new_with_prefix(path)
                 .map_err(|e| io::Error::other(format!("local store at {path}: {e}")))?;

@@ -701,6 +701,7 @@ dependencies = [
  "clap",
  "elide-core",
  "ext4-view",
+ "futures",
  "libc",
  "lz4_flex",
  "object_store",

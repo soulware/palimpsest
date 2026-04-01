@@ -184,6 +184,24 @@ enum VolumeCommand {
         /// Volume name
         name: String,
     },
+
+    /// Interact with the remote object store
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// List all named volumes available in the store
+    List,
+
+    /// Download a volume from the store and register it locally
+    Pull {
+        /// Volume name to pull
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -417,6 +435,36 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+
+            VolumeCommand::Remote { command } => {
+                let config = match fetcher::FetchConfig::load(&args.data_dir) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        eprintln!(
+                            "error: no store configured — create fetch.toml or set ELIDE_S3_BUCKET"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("error: loading store config: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                match command {
+                    RemoteCommand::List => {
+                        if let Err(e) = remote_list(&config) {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    RemoteCommand::Pull { name } => {
+                        if let Err(e) = remote_pull(&config, &name, &args.data_dir, &socket_path) {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         },
 
         Command::ServeVolume {
@@ -630,6 +678,189 @@ fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Re
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
 
     println!("{}", vol_dir.display());
+    Ok(())
+}
+
+/// List all named volumes in the remote store.
+///
+/// Performs a single `LIST names/` against the store and prints each name
+/// with its ULID. Does not require a running coordinator.
+fn remote_list(config: &fetcher::FetchConfig) -> std::io::Result<()> {
+    use futures::TryStreamExt;
+    use object_store::ObjectStore;
+    use object_store::path::Path as StorePath;
+
+    let store = config
+        .build_store()
+        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let names_prefix = StorePath::from("names/");
+    let objects: Vec<_> = rt.block_on(async {
+        store
+            .list(Some(&names_prefix))
+            .try_collect()
+            .await
+            .map_err(|e| std::io::Error::other(format!("listing names/: {e}")))
+    })?;
+
+    if objects.is_empty() {
+        println!("(no volumes in store)");
+        return Ok(());
+    }
+
+    for obj in &objects {
+        let name = obj.location.filename().unwrap_or("?");
+        let ulid = rt.block_on(async {
+            let data = store
+                .get(&obj.location)
+                .await
+                .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
+            let bytes = data
+                .bytes()
+                .await
+                .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
+            std::str::from_utf8(&bytes)
+                .map(|s| s.trim().to_owned())
+                .map_err(|e| std::io::Error::other(format!("names/{name} is not valid utf-8: {e}")))
+        })?;
+        println!("{name}  {ulid}");
+    }
+
+    Ok(())
+}
+
+/// Pull a named volume from the remote store and register it locally.
+///
+/// 1. Resolves `names/<name>` → ULID
+/// 2. Downloads `by_id/<ulid>/manifest.toml` and `by_id/<ulid>/volume.pub`
+/// 3. Reconstructs the local directory skeleton under `data_dir/by_id/<ulid>/`
+/// 4. Creates `data_dir/by_name/<name>` symlink
+/// 5. Signals the coordinator to rescan (best-effort)
+///
+/// After this returns, the coordinator's next tick will run `prefetch_indexes`
+/// to download segment index sections, making the volume openable.
+fn remote_pull(
+    config: &fetcher::FetchConfig,
+    name: &str,
+    data_dir: &Path,
+    socket_path: &Path,
+) -> std::io::Result<()> {
+    use object_store::ObjectStore;
+    use object_store::path::Path as StorePath;
+
+    validate_volume_name(name)?;
+
+    let store = config
+        .build_store()
+        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Step 1: resolve name → ULID.
+    let name_key = StorePath::from(format!("names/{name}"));
+    let volume_id = rt.block_on(async {
+        let data = store.get(&name_key).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                std::io::Error::other(format!("volume '{name}' not found in store"))
+            }
+            e => std::io::Error::other(format!("reading names/{name}: {e}")),
+        })?;
+        let bytes = data
+            .bytes()
+            .await
+            .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
+        std::str::from_utf8(&bytes)
+            .map(|s| s.trim().to_owned())
+            .map_err(|e| std::io::Error::other(format!("names/{name}: {e}")))
+    })?;
+
+    // Validate the ULID before using it as a directory name.
+    ulid::Ulid::from_string(&volume_id)
+        .map_err(|e| std::io::Error::other(format!("names/{name} contains invalid ULID: {e}")))?;
+
+    let vol_dir = data_dir.join("by_id").join(&volume_id);
+    if vol_dir.exists() {
+        return Err(std::io::Error::other(format!(
+            "volume already present locally: {volume_id}"
+        )));
+    }
+
+    // Step 2: download manifest.toml and volume.pub.
+    let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
+    let manifest_bytes = rt.block_on(async {
+        let data = store.get(&manifest_key).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => std::io::Error::other(format!(
+                "manifest not found in store for volume '{name}' ({volume_id})"
+            )),
+            e => std::io::Error::other(format!("downloading manifest: {e}")),
+        })?;
+        data.bytes()
+            .await
+            .map_err(|e| std::io::Error::other(format!("reading manifest: {e}")))
+    })?;
+
+    let manifest: toml::Table = toml::from_str(
+        std::str::from_utf8(&manifest_bytes)
+            .map_err(|e| std::io::Error::other(format!("manifest is not valid utf-8: {e}")))?,
+    )
+    .map_err(|e| std::io::Error::other(format!("parsing manifest.toml: {e}")))?;
+
+    let pub_key_bytes = rt.block_on(async {
+        let pub_key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
+        let data = store
+            .get(&pub_key)
+            .await
+            .map_err(|e| std::io::Error::other(format!("downloading volume.pub: {e}")))?;
+        data.bytes()
+            .await
+            .map_err(|e| std::io::Error::other(format!("reading volume.pub: {e}")))
+    })?;
+
+    // Step 3: reconstruct local directory skeleton.
+    std::fs::create_dir_all(&vol_dir)?;
+
+    std::fs::write(vol_dir.join("volume.name"), name)?;
+
+    let size = manifest
+        .get("size")
+        .and_then(|v| v.as_integer())
+        .ok_or_else(|| std::io::Error::other("manifest.toml missing 'size'"))?;
+    std::fs::write(vol_dir.join("volume.size"), size.to_string())?;
+
+    if manifest
+        .get("readonly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        std::fs::write(vol_dir.join("volume.readonly"), "")?;
+    }
+
+    if let Some(origin) = manifest.get("origin").and_then(|v| v.as_str()) {
+        std::fs::write(vol_dir.join("volume.parent"), origin)?;
+    }
+
+    std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
+
+    // Step 4: create by_name symlink.
+    let by_name_dir = data_dir.join("by_name");
+    std::fs::create_dir_all(&by_name_dir)?;
+    let symlink_path = by_name_dir.join(name);
+    if symlink_path.is_symlink() || symlink_path.exists() {
+        // Clean up and fail cleanly.
+        let _ = std::fs::remove_dir_all(&vol_dir);
+        return Err(std::io::Error::other(format!(
+            "volume name already in use locally: {name}"
+        )));
+    }
+    std::os::unix::fs::symlink(format!("../by_id/{volume_id}"), &symlink_path)?;
+
+    println!("pulled {name} ({volume_id})");
+
+    // Step 5: signal coordinator to rescan (best-effort).
+    if coordinator_client::rescan(socket_path).is_err() {
+        eprintln!("warning: coordinator not running; volume will be picked up on next scan");
+    }
+
     Ok(())
 }
 
