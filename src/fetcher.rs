@@ -54,8 +54,13 @@ pub struct FetchConfig {
 }
 
 impl FetchConfig {
-    /// Load from `<vol_dir>/fetch.toml` if present; fall back to env vars.
-    /// Returns `Ok(None)` if neither config file nor env vars are available.
+    /// Load store config from the first source that provides one:
+    ///
+    /// 1. `<vol_dir>/fetch.toml` — explicit per-volume or per-data-dir config
+    /// 2. `ELIDE_S3_BUCKET` env var — S3 bucket, with optional endpoint/region vars
+    /// 3. `./elide_store` — the coordinator's default local store location
+    ///
+    /// Returns `Ok(None)` only if none of the above is present.
     pub fn load(vol_dir: &Path) -> io::Result<Option<Self>> {
         let config_path = vol_dir.join("fetch.toml");
         if config_path.exists() {
@@ -64,13 +69,23 @@ impl FetchConfig {
                 toml::from_str(&s).map_err(|e| io::Error::other(format!("fetch.toml: {e}")))?;
             return Ok(Some(cfg));
         }
-        // Env var fallback
+        // Env var fallback (S3)
         if let Ok(bucket) = std::env::var("ELIDE_S3_BUCKET") {
             return Ok(Some(FetchConfig {
                 bucket: Some(bucket),
                 endpoint: std::env::var("AWS_ENDPOINT_URL").ok(),
                 region: std::env::var("AWS_DEFAULT_REGION").ok(),
                 local_path: None,
+            }));
+        }
+        // Default local store — same default the coordinator uses.
+        let default_store = Path::new("elide_store");
+        if default_store.exists() {
+            return Ok(Some(FetchConfig {
+                bucket: None,
+                endpoint: None,
+                region: None,
+                local_path: Some(default_store.to_string_lossy().into_owned()),
             }));
         }
         Ok(None)

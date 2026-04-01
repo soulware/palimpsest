@@ -113,6 +113,11 @@ pub async fn drain_pending(
     let pending_dir = vol_dir.join("pending");
     let segments_dir = vol_dir.join("segments");
 
+    // Ensure segments/ exists — import_image only creates pending/.
+    tokio::fs::create_dir_all(&segments_dir)
+        .await
+        .with_context(|| format!("creating segments dir: {}", segments_dir.display()))?;
+
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
     upload_volume_metadata(vol_dir, volume_id, store).await;
