@@ -39,10 +39,10 @@ enum Command {
         command: VolumeCommand,
     },
 
-    /// Serve an elide fork over NBD (spawned by coordinator; not for direct use)
+    /// Serve an elide volume over NBD (spawned by coordinator; not for direct use)
     #[command(hide = true)]
     ServeVolume {
-        /// Path to the fork directory
+        /// Path to the volume directory (by_id/<ulid>/)
         fork_dir: PathBuf,
         /// Volume size (e.g. "4G", "512M"). Required on first use;
         /// ignored on subsequent opens (size is stored in <vol-dir>/size).
@@ -138,33 +138,27 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Browse ext4 filesystem contents of a fork
+    /// Browse ext4 filesystem contents of a volume
     Ls {
         /// Volume name
         name: String,
-        /// Name of the fork to inspect (e.g. "default", "base")
-        fork: String,
         /// Path within the ext4 filesystem (default: /)
         #[arg(default_value = "/")]
         path: String,
     },
 
-    /// Write a snapshot marker; the fork stays live
+    /// Write a snapshot marker; the volume stays live
     Snapshot {
         /// Volume name
         name: String,
-        /// Name of the fork to snapshot
-        fork: String,
     },
 
-    /// Create a new named fork branched from the latest snapshot of the source fork
+    /// Create a new volume branched from the latest snapshot of the source volume
     Fork {
-        /// Volume name
-        name: String,
-        /// Name for the new fork
+        /// Name for the new volume
         fork_name: String,
-        /// Source fork to branch from
-        #[arg(long, default_value = "default")]
+        /// Source volume to branch from
+        #[arg(long)]
         from: String,
     },
 
@@ -244,17 +238,12 @@ fn main() {
                 inspect::run(&vol_dir).expect("volume info failed");
             }
 
-            VolumeCommand::Ls { name, fork, path } => {
-                // In the flat layout each fork is its own volume; `name` selects
-                // the volume to browse (the `fork` arg is kept for backwards
-                // compatibility but ignored when `name` already names a volume).
-                let _ = fork;
+            VolumeCommand::Ls { name, path } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
                 ls::run(&vol_dir, &path).expect("volume ls failed");
             }
 
-            VolumeCommand::Snapshot { name, fork } => {
-                let _ = fork;
+            VolumeCommand::Snapshot { name } => {
                 let fork_dir = resolve_volume_dir(&args.data_dir, &name);
                 let by_id_dir = args.data_dir.join("by_id");
                 let mut vol =
@@ -263,15 +252,7 @@ fn main() {
                 println!("{snap_ulid}");
             }
 
-            VolumeCommand::Fork {
-                name,
-                fork_name,
-                from,
-            } => {
-                // In the flat layout, forking creates a new top-level volume.
-                // `from` and `name` both name volumes resolved via by_name/.
-                // `fork_name` is the human name for the new volume.
-                let _ = name; // source volume is now identified by `from`
+            VolumeCommand::Fork { fork_name, from } => {
                 let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
                 let new_vol_ulid = ulid::Ulid::new().to_string();
                 let new_fork_dir = args.data_dir.join("by_id").join(&new_vol_ulid);
