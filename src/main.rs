@@ -7,8 +7,8 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    coordinator_client, extents, fetcher, inspect, inspect_files, ls, nbd, parse_size,
-    resolve_volume_dir, resolve_volume_size, validate_volume_name,
+    coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size, resolve_volume_dir,
+    resolve_volume_size, validate_volume_name,
 };
 
 /// Elide volume management and analysis tools.
@@ -437,7 +437,7 @@ fn main() {
             }
 
             VolumeCommand::Remote { command } => {
-                let config = match fetcher::FetchConfig::load(&args.data_dir) {
+                let config = match elide_fetch::FetchConfig::load(&args.data_dir) {
                     Ok(Some(c)) => c,
                     Ok(None) => {
                         eprintln!(
@@ -479,7 +479,7 @@ fn main() {
             let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
                 .expect("failed to determine volume size");
             let fetch_config =
-                fetcher::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
+                elide_fetch::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
             if readonly {
                 nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port, fetch_config)
                     .expect("readonly NBD server error");
@@ -685,7 +685,7 @@ fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Re
 ///
 /// Performs a single `LIST names/` against the store and prints each name
 /// with its ULID. Does not require a running coordinator.
-fn remote_list(config: &fetcher::FetchConfig) -> std::io::Result<()> {
+fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
     use futures::TryStreamExt;
     use object_store::ObjectStore;
     use object_store::path::Path as StorePath;
@@ -741,7 +741,7 @@ fn remote_list(config: &fetcher::FetchConfig) -> std::io::Result<()> {
 /// After this returns, the coordinator's next tick will run `prefetch_indexes`
 /// to download segment index sections, making the volume openable.
 fn remote_pull(
-    config: &fetcher::FetchConfig,
+    config: &elide_fetch::FetchConfig,
     name: &str,
     data_dir: &Path,
     socket_path: &Path,

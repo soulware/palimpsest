@@ -1,6 +1,6 @@
 // Demand-fetch: pull segments from remote storage on a local cache miss.
 //
-// Config (fetch.toml in the volume directory):
+// Config (fetch.toml in the data directory):
 //
 //   [S3 / S3-compatible]
 //   bucket   = "my-bucket"
@@ -64,13 +64,13 @@ pub struct FetchConfig {
 impl FetchConfig {
     /// Load store config from the first source that provides one:
     ///
-    /// 1. `<vol_dir>/fetch.toml` — explicit per-volume or per-data-dir config
+    /// 1. `<data_dir>/fetch.toml` — explicit per-volume or per-data-dir config
     /// 2. `ELIDE_S3_BUCKET` env var — S3 bucket, with optional endpoint/region vars
     /// 3. `./elide_store` — the coordinator's default local store location
     ///
     /// Returns `Ok(None)` only if none of the above is present.
-    pub fn load(vol_dir: &Path) -> io::Result<Option<Self>> {
-        let config_path = vol_dir.join("fetch.toml");
+    pub fn load(data_dir: &Path) -> io::Result<Option<Self>> {
+        let config_path = data_dir.join("fetch.toml");
         if config_path.exists() {
             let s = std::fs::read_to_string(&config_path)?;
             let cfg: Self =
@@ -138,13 +138,29 @@ pub struct ObjectStoreFetcher {
 impl ObjectStoreFetcher {
     pub fn new(config: &FetchConfig, volume_ids: Vec<String>) -> io::Result<Self> {
         let store = config.build_store()?;
+        Self::from_store(
+            store,
+            volume_ids,
+            config
+                .fetch_batch_bytes
+                .unwrap_or(DEFAULT_FETCH_BATCH_BYTES),
+        )
+    }
+
+    /// Build a fetcher from an already-constructed store.
+    ///
+    /// Used by callers (e.g. the coordinator) that manage the store directly
+    /// rather than going through [`FetchConfig`].
+    pub fn from_store(
+        store: Arc<dyn ObjectStore>,
+        volume_ids: Vec<String>,
+        max_batch_bytes: u64,
+    ) -> io::Result<Self> {
         let rt = Runtime::new().map_err(|e| io::Error::other(format!("tokio runtime: {e}")))?;
         Ok(Self {
             store,
             volume_ids,
-            max_batch_bytes: config
-                .fetch_batch_bytes
-                .unwrap_or(DEFAULT_FETCH_BATCH_BYTES),
+            max_batch_bytes,
             rt,
         })
     }
@@ -452,6 +468,68 @@ pub fn derive_volume_id(dir: &Path) -> io::Result<String> {
 /// from a list of fork directories returned by `Volume::fork_dirs()`.
 pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<String>> {
     fork_dirs.iter().map(|d| derive_volume_id(d)).collect()
+}
+
+// --- ext4 pre-warm ---
+
+/// ext4 superblock magic (little-endian `0xEF53` at byte offset 1080 from disk start).
+const EXT4_MAGIC: u16 = 0xEF53;
+/// Byte offset of the ext4 magic within the first 4 KiB LBA block.
+/// Superblock starts at disk byte 1024; magic field is at superblock offset +56.
+const EXT4_MAGIC_OFFSET: usize = 1080;
+
+/// Pre-warm ext4 structural metadata for a readonly (fetched) volume.
+///
+/// Demand-fetches LBAs 0 and 1 (the first 8 KiB of the disk), which contain:
+///   - The ext4 superblock (at byte offset 1024)
+///   - The block group descriptor table (at block 1 for 4 KiB block ext4)
+///
+/// These are unconditionally required for any ext4 operation. Pre-fetching
+/// them on pull avoids a cold round-trip on first use.
+///
+/// If the volume is not ext4 (magic mismatch), returns `Ok(())` silently.
+/// If the volume is not yet indexed (no `.idx` files), returns `Ok(())` silently.
+pub fn prewarm_ext4_metadata(
+    fork_dir: &Path,
+    by_id_dir: &Path,
+    store: Arc<dyn ObjectStore>,
+    max_batch_bytes: u64,
+) -> io::Result<()> {
+    use elide_core::volume::{ReadonlyVolume, walk_ancestors};
+
+    // Build ancestry chain oldest-first; current fork appended last.
+    let ancestors = walk_ancestors(fork_dir, by_id_dir)?;
+    let mut volume_ids: Vec<String> = ancestors
+        .iter()
+        .map(|l| derive_volume_id(&l.dir))
+        .collect::<io::Result<_>>()?;
+    volume_ids.push(derive_volume_id(fork_dir)?);
+
+    let fetcher = Arc::new(ObjectStoreFetcher::from_store(
+        store,
+        volume_ids,
+        max_batch_bytes,
+    )?);
+
+    let mut vol = ReadonlyVolume::open(fork_dir, by_id_dir)?;
+    vol.set_fetcher(fetcher);
+
+    // LBA 0: 4 KiB block containing the ext4 superblock at byte offset 1024.
+    let block0 = vol.read(0, 1)?;
+
+    if block0.len() < EXT4_MAGIC_OFFSET + 2 {
+        return Ok(()); // volume too small to be ext4
+    }
+    let magic = u16::from_le_bytes([block0[EXT4_MAGIC_OFFSET], block0[EXT4_MAGIC_OFFSET + 1]]);
+    if magic != EXT4_MAGIC {
+        return Ok(()); // not ext4
+    }
+
+    // LBA 1: block group descriptor table (for 4 KiB block ext4).
+    vol.read(1, 1)?;
+
+    tracing::info!("[prewarm] ext4 metadata pre-warmed: {}", fork_dir.display());
+    Ok(())
 }
 
 #[cfg(test)]

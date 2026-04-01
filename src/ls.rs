@@ -15,7 +15,7 @@ use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 use elide_core::segment::SegmentFetcher;
 use elide_core::{extentindex, lbamap, segment, volume, writelog};
 
-use crate::fetcher::{FetchConfig, ObjectStoreFetcher, ancestry_chain};
+use elide_fetch::{FetchConfig, ObjectStoreFetcher, ancestry_chain};
 
 /// Brief summary of a fork's ext4 filesystem, for use in inspect output.
 pub struct FsSummary {

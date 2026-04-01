@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "elide-core", "elide-import", "elide-coordinator"]
+members = [".", "elide-core", "elide-fetch", "elide-import", "elide-coordinator"]
 resolver = "2"
 
 [package]
@@ -16,6 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono         = { version = "0.4", default-features = false, features = ["clock"] }
 clap           = { version = "4", features = ["derive", "env"] }
 elide-core     = { path = "elide-core" }
+elide-fetch    = { path = "elide-fetch" }
 ext4-view      = { version = "0.9", features = ["std"] }
 libc           = "0.2"
 lz4_flex       = "0.11"

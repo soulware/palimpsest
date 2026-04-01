@@ -271,15 +271,39 @@ async fn fork_loop(
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
     if !has_local_segments {
-        match prefetch::prefetch_indexes(&fork_dir, &store).await {
+        let did_fetch = match prefetch::prefetch_indexes(&fork_dir, &store).await {
             Ok(r) if r.fetched > 0 => {
                 info!(
                     "[prefetch {volume_id}{volume_name}] fetched {} index section(s)",
                     r.fetched
                 );
+                true
             }
-            Ok(_) => {}
-            Err(e) => warn!("[prefetch {volume_id}{volume_name}] error: {e:#}"),
+            Ok(_) => false,
+            Err(e) => {
+                warn!("[prefetch {volume_id}{volume_name}] error: {e:#}");
+                false
+            }
+        };
+
+        if did_fetch {
+            let prewarm_dir = fork_dir.clone();
+            let prewarm_store = store.clone();
+            let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
+            match tokio::task::spawn_blocking(move || {
+                elide_fetch::prewarm_ext4_metadata(
+                    &prewarm_dir,
+                    &by_id_dir,
+                    prewarm_store,
+                    elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => info!("[prewarm {volume_id}{volume_name}] ext4 metadata pre-warmed"),
+                Ok(Err(e)) => warn!("[prewarm {volume_id}{volume_name}] {e}"),
+                Err(e) => warn!("[prewarm {volume_id}{volume_name}] task error: {e}"),
+            }
         }
     }
 

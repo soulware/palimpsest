@@ -493,7 +493,7 @@ pub fn run_volume_signed(
     bind: &str,
     port: Option<u16>,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
-    fetch_config: Option<crate::fetcher::FetchConfig>,
+    fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     let Some(port) = port else {
         return run_volume_ipc_only(dir, size_bytes, Some(signer), fetch_config);
@@ -526,7 +526,7 @@ pub fn run_volume_readonly(
     size_bytes: u64,
     bind: &str,
     port: Option<u16>,
-    fetch_config: Option<crate::fetcher::FetchConfig>,
+    fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     let Some(port) = port else {
         return run_volume_ipc_only(dir, size_bytes, None, fetch_config);
@@ -551,8 +551,8 @@ pub fn run_volume_readonly(
     let mut volume = ReadonlyVolume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
-        let volume_ids = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
-        let fetcher = crate::fetcher::ObjectStoreFetcher::new(&config, volume_ids)?;
+        let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, volume_ids)?;
         volume.set_fetcher(std::sync::Arc::new(fetcher));
         println!("[demand-fetch enabled]");
     }
@@ -734,7 +734,7 @@ fn run_volume_ipc_only(
     dir: &Path,
     _size_bytes: u64,
     signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
-    fetch_config: Option<crate::fetcher::FetchConfig>,
+    fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
@@ -745,8 +745,8 @@ fn run_volume_ipc_only(
     };
 
     if let Some(config) = fetch_config {
-        let volume_ids = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
-        let fetcher = crate::fetcher::ObjectStoreFetcher::new(&config, volume_ids)?;
+        let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, volume_ids)?;
         volume.set_fetcher(std::sync::Arc::new(fetcher));
     }
 
@@ -772,7 +772,7 @@ fn serve_volume_listener(
     size_bytes: u64,
     listener: TcpListener,
     signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
-    fetch_config: Option<crate::fetcher::FetchConfig>,
+    fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
@@ -783,8 +783,8 @@ fn serve_volume_listener(
     };
 
     if let Some(config) = fetch_config {
-        let volume_ids = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
-        let fetcher = crate::fetcher::ObjectStoreFetcher::new(&config, volume_ids)?;
+        let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, volume_ids)?;
         volume.set_fetcher(std::sync::Arc::new(fetcher));
         println!("[demand-fetch enabled]");
     }

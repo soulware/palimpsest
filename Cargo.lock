@@ -700,6 +700,7 @@ dependencies = [
  "chrono",
  "clap",
  "elide-core",
+ "elide-fetch",
  "ext4-view",
  "futures",
  "libc",
@@ -726,6 +727,7 @@ dependencies = [
  "chrono",
  "clap",
  "elide-core",
+ "elide-fetch",
  "futures",
  "nix",
  "object_store",
@@ -756,6 +758,23 @@ dependencies = [
  "tempfile",
  "ulid",
  "zstd",
+]
+
+[[package]]
+name = "elide-fetch"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "elide-core",
+ "futures",
+ "object_store",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]

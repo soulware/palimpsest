@@ -1,0 +1,20 @@
+[package]
+name = "elide-fetch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chrono       = { version = "0.4", default-features = false, features = ["clock"] }
+elide-core   = { path = "../elide-core" }
+futures      = "0.3"
+object_store = { version = "0.11", features = ["aws"] }
+serde        = { version = "1", features = ["derive"] }
+tokio        = { version = "1", features = ["rt-multi-thread"] }
+toml         = { version = "0.8", default-features = false, features = ["parse"] }
+tracing      = "0.1"
+ulid         = "1"
+
+[dev-dependencies]
+blake3   = "1"
+tempfile = "3"

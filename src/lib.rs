@@ -4,7 +4,6 @@
 pub mod control;
 pub mod coordinator_client;
 pub mod extents;
-pub mod fetcher;
 pub mod inspect;
 pub mod inspect_files;
 pub mod ls;
