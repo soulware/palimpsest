@@ -1,9 +1,14 @@
 // Volume process supervision.
 //
-// For each fork with a serve.toml, the supervisor spawns `elide serve-volume`
-// and restarts it if it exits. The spawned process is placed in a new session
+// The supervisor spawns `elide serve-volume` for every discovered fork and
+// restarts it if it exits. The spawned process is placed in a new session
 // (setsid) so it is not affected by the coordinator's lifetime — the volume
 // keeps serving if the coordinator is restarted or upgraded.
+//
+// NBD binding:
+//   By default no NBD server is started (IPC-only mode). To expose a fork over
+//   NBD, write the desired port number to `nbd.port` in the fork directory.
+//   The supervisor reads this file at spawn time and passes `--port <n>`.
 //
 // State files written to the fork directory:
 //   volume.pid  — PID of the running volume process; absent when not running
@@ -21,15 +26,14 @@ use tracing::{error, info, warn};
 
 use tokio::process::Command;
 
-use crate::serve_config::ServeConfig;
-
 const PID_FILE: &str = "volume.pid";
+const NBD_PORT_FILE: &str = "nbd.port";
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Supervise a single fork: spawn `elide serve-volume`, restart on exit.
 /// Runs indefinitely; cancel the task to stop supervision.
-pub async fn supervise(fork_dir: PathBuf, serve_config: ServeConfig, elide_bin: PathBuf) {
+pub async fn supervise(fork_dir: PathBuf, elide_bin: PathBuf) {
     let label = fork_dir.display().to_string();
 
     loop {
@@ -54,7 +58,7 @@ pub async fn supervise(fork_dir: PathBuf, serve_config: ServeConfig, elide_bin: 
             remove_pid(&fork_dir);
         }
 
-        match spawn_volume(&fork_dir, &serve_config, &elide_bin) {
+        match spawn_volume(&fork_dir, &elide_bin) {
             Ok(mut child) => {
                 let pid = child.id().unwrap_or(0);
                 info!("[supervisor {label}] started pid {pid}");
@@ -74,23 +78,15 @@ pub async fn supervise(fork_dir: PathBuf, serve_config: ServeConfig, elide_bin: 
     }
 }
 
-fn spawn_volume(
-    fork_dir: &Path,
-    serve_config: &ServeConfig,
-    elide_bin: &Path,
-) -> std::io::Result<tokio::process::Child> {
+fn spawn_volume(fork_dir: &Path, elide_bin: &Path) -> std::io::Result<tokio::process::Child> {
     let mut cmd = Command::new(elide_bin);
-    cmd.arg("serve-volume")
-        .arg(fork_dir)
-        .arg("--bind")
-        .arg(&serve_config.bind);
+    cmd.arg("serve-volume").arg(fork_dir);
 
-    if let Some(secs) = serve_config.auto_flush_secs {
-        cmd.arg("--auto-flush").arg(secs.to_string());
-    }
-
-    if serve_config.readonly.unwrap_or(false) {
-        cmd.arg("--readonly");
+    // If nbd.port exists, pass --port so the volume serves NBD on that port.
+    if let Ok(text) = std::fs::read_to_string(fork_dir.join(NBD_PORT_FILE))
+        && let Ok(port) = text.trim().parse::<u16>()
+    {
+        cmd.arg("--port").arg(port.to_string());
     }
 
     // Place the child in a new session so it is not signalled when the

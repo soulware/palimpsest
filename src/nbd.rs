@@ -485,14 +485,19 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
 /// Segments promoted during this session will be signed with `signer`.
 /// If `fetch_config` is provided, missing segments are fetched from remote
 /// storage on demand and cached in `segments/`.
+/// If `port` is `None`, no NBD server is started — the volume runs for
+/// coordinator IPC only (control socket).
 pub fn run_volume_signed(
     dir: &Path,
     size_bytes: u64,
     bind: &str,
-    port: u16,
+    port: Option<u16>,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
     fetch_config: Option<crate::fetcher::FetchConfig>,
 ) -> io::Result<()> {
+    let Some(port) = port else {
+        return run_volume_ipc_only(dir, size_bytes, Some(signer), fetch_config);
+    };
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
     println!("NBD volume server on {}", addr);
@@ -520,9 +525,12 @@ pub fn run_volume_readonly(
     dir: &Path,
     size_bytes: u64,
     bind: &str,
-    port: u16,
+    port: Option<u16>,
     fetch_config: Option<crate::fetcher::FetchConfig>,
 ) -> io::Result<()> {
+    let Some(port) = port else {
+        return run_volume_ipc_only(dir, size_bytes, None, fetch_config);
+    };
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
     println!("NBD readonly volume server on {}", addr);
@@ -714,6 +722,43 @@ fn serve_readonly_volume_listener(
         }
     }
     Ok(())
+}
+
+/// Open a volume and start the coordinator control socket, but do not bind an
+/// NBD server. Blocks until SIGTERM (or the process is otherwise killed).
+///
+/// Used when the coordinator supervises a volume for IPC purposes only — no
+/// VM is connected and no NBD port is needed.
+fn run_volume_ipc_only(
+    dir: &Path,
+    _size_bytes: u64,
+    signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+    fetch_config: Option<crate::fetcher::FetchConfig>,
+) -> io::Result<()> {
+    install_sigusr1_handler();
+
+    let mut volume = match signer {
+        Some(s) => Volume::open_with_signer(dir, s)?,
+        None => Volume::open(dir)?,
+    };
+
+    if let Some(config) = fetch_config {
+        let forks = crate::fetcher::ancestry_chain(&volume.fork_dirs())?;
+        let fetcher = crate::fetcher::ObjectStoreFetcher::new(&config, forks)?;
+        volume.set_fetcher(std::sync::Arc::new(fetcher));
+    }
+
+    let (_actor, handle) = elide_core::actor::spawn(volume);
+    let _actor_thread = std::thread::Builder::new()
+        .name("volume-actor".into())
+        .spawn(move || _actor.run())
+        .map_err(io::Error::other)?;
+    crate::control::start(dir, handle)?;
+
+    // Block until SIGTERM terminates the process.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// Serve NBD connections on an already-bound listener, looping until the

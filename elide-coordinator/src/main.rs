@@ -13,7 +13,6 @@ mod gc;
 mod import;
 mod inbound;
 mod prefetch;
-mod serve_config;
 mod supervisor;
 mod upload;
 

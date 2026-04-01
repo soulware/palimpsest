@@ -48,11 +48,14 @@ enum Command {
         /// ignored on subsequent opens (size is stored in <vol-dir>/size).
         #[arg(long)]
         size: Option<String>,
-        /// Address to bind (use 0.0.0.0 to allow connections from VMs)
+        /// Address to bind the NBD server (use 0.0.0.0 for VM access).
+        /// Ignored if --port is not set.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-        #[arg(long, default_value_t = 10809)]
-        port: u16,
+        /// Port for the NBD server. If omitted, no NBD server is started
+        /// (volume runs for coordinator IPC only).
+        #[arg(long)]
+        port: Option<u16>,
         /// Serve as a read-only block device
         #[arg(long)]
         readonly: bool,

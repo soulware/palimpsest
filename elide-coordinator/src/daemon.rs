@@ -40,7 +40,6 @@ use crate::control;
 use crate::gc;
 use crate::import;
 use crate::inbound;
-use crate::serve_config;
 use crate::supervisor;
 use crate::upload;
 
@@ -110,22 +109,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     gc_config.clone(),
                 ));
 
-                // Supervise if serve.toml is present.
-                match serve_config::load(&fork_dir) {
-                    Ok(Some(sc)) => {
-                        info!(
-                            "[coordinator] supervising fork: {} (bind {})",
-                            fork_dir.display(),
-                            sc.bind,
-                        );
-                        tasks.spawn(supervisor::supervise(fork_dir, sc, elide_bin.clone()));
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!(
-                        "[coordinator] failed to read serve.toml for {}: {e}",
-                        fork_dir.display()
-                    ),
-                }
+                tasks.spawn(supervisor::supervise(fork_dir, elide_bin.clone()));
             }
         }
 
