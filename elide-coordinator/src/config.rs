@@ -4,9 +4,12 @@
 //
 //   data_dir = "elide_data"   # directory containing volumes; default: ./elide_data
 //
-//   [store]
-//   local_path = "/tmp/elide-store"   # for testing; mutually exclusive with bucket
-//
+//   # [store] section is optional; defaults to a local directory at ./elide_store
+//   # To use a specific local path:
+//   # [store]
+//   # local_path = "/var/lib/elide/store"
+//   #
+//   # To use S3:
 //   # [store]
 //   # bucket   = "my-elide-bucket"
 //   # endpoint = "https://s3.amazonaws.com"  # optional; omit for AWS default
@@ -30,8 +33,6 @@ use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use serde::Deserialize;
 
-use crate::store::StoreConfig;
-
 #[derive(Deserialize)]
 pub struct CoordinatorConfig {
     /// Directory containing volumes. Default: `./elide_data`.
@@ -42,7 +43,8 @@ pub struct CoordinatorConfig {
     /// Defaults to `<data_dir>/control.sock`.
     pub socket_path: Option<PathBuf>,
 
-    /// Object store configuration.
+    /// Object store configuration. Defaults to a local directory at `./elide_store`.
+    #[serde(default)]
     pub store: StoreSection,
 
     /// Drain and scan timing.
@@ -101,6 +103,17 @@ pub struct StoreSection {
     pub region: Option<String>,
 }
 
+impl Default for StoreSection {
+    fn default() -> Self {
+        Self {
+            local_path: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+        }
+    }
+}
+
 impl StoreSection {
     pub fn build(&self) -> Result<Arc<dyn ObjectStore>> {
         if let Some(path) = &self.local_path {
@@ -121,8 +134,13 @@ impl StoreSection {
             }
             Ok(Arc::new(builder.build().context("building S3 client")?))
         } else {
-            // Fall back to environment variables (same as one-shot commands).
-            StoreConfig::from_env()?.build()
+            // Default to a local directory store.
+            let path = PathBuf::from("elide_store");
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating local store dir: {}", path.display()))?;
+            Ok(Arc::new(
+                LocalFileSystem::new_with_prefix(&path).context("building local store")?,
+            ))
         }
     }
 }

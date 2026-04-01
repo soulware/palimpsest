@@ -14,7 +14,6 @@ mod import;
 mod inbound;
 mod prefetch;
 mod serve_config;
-mod store;
 mod supervisor;
 mod upload;
 
