@@ -412,11 +412,20 @@ fn reconcile_by_name(data_dir: &Path) {
     let by_id_dir = data_dir.join("by_id");
     let by_name_dir = data_dir.join("by_name");
 
-    // Remove stale symlinks.
+    // Remove stale symlinks: entries that are symlinks but whose target no
+    // longer exists.  Non-symlink entries (real directories, files) are left
+    // alone and warned about — they indicate unexpected manual changes.
     if let Ok(entries) = std::fs::read_dir(&by_name_dir) {
         for entry in entries.flatten() {
             let link = entry.path();
-            // Check that the symlink target still exists.
+            if !link.is_symlink() {
+                warn!(
+                    "[coordinator] by_name/{} is not a symlink; skipping",
+                    entry.file_name().to_string_lossy()
+                );
+                continue;
+            }
+            // Broken symlink: target no longer exists.
             if !link.exists() {
                 let _ = std::fs::remove_file(&link);
                 info!(
@@ -450,13 +459,15 @@ fn reconcile_by_name(data_dir: &Path) {
             continue;
         }
         let link = by_name_dir.join(name);
-        if !link.exists() {
-            let target = format!("../by_id/{ulid_str}");
-            if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
-                warn!("[coordinator] failed to create by_name/{name} -> {target}: {e}");
-            } else {
-                info!("[coordinator] created by_name/{name} -> {target}");
-            }
+        if link.is_symlink() || link.exists() {
+            // Already present (symlink or unexpected non-symlink); leave it.
+            continue;
+        }
+        let target = format!("../by_id/{ulid_str}");
+        if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
+            warn!("[coordinator] failed to create by_name/{name} -> {target}: {e}");
+        } else {
+            info!("[coordinator] created by_name/{name} -> {target}");
         }
     }
 }

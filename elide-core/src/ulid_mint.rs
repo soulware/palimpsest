@@ -62,9 +62,11 @@ impl UlidMint {
             }
             candidate
         } else {
-            if !self.skewed {
+            // Only warn on genuine regression (clock moved backwards).
+            // Same-millisecond generation is normal and handled silently.
+            if !self.skewed && candidate.timestamp_ms() < self.last.timestamp_ms() {
                 log::warn!(
-                    "ulid clock skew detected: system clock ({}) is at or behind last known ulid ({}); advancing monotonically",
+                    "ulid clock skew detected: system clock ({}) is behind last known ulid ({}); advancing monotonically",
                     candidate.timestamp_ms(),
                     self.last.timestamp_ms(),
                 );

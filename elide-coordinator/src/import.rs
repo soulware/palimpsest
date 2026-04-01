@@ -23,6 +23,22 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 pub const LOCK_FILE: &str = "import.lock";
+
+/// Validate a volume name: non-empty, only `[a-zA-Z0-9._-]`.
+fn validate_volume_name(name: &str) -> std::io::Result<()> {
+    if name.is_empty() {
+        return Err(std::io::Error::other("volume name must not be empty"));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_' && *c != '.')
+    {
+        return Err(std::io::Error::other(format!(
+            "invalid character {c:?} in volume name {name:?}: only [a-zA-Z0-9._-] allowed"
+        )));
+    }
+    Ok(())
+}
 const PID_FILE: &str = "import.pid";
 
 #[derive(Clone, Debug)]
@@ -90,6 +106,8 @@ pub async fn spawn_import(
     elide_import_bin: &Path,
     registry: &ImportRegistry,
 ) -> std::io::Result<String> {
+    validate_volume_name(vol_name)?;
+
     let by_name_dir = data_dir.join("by_name");
     let symlink_path = by_name_dir.join(vol_name);
 

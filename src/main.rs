@@ -265,6 +265,10 @@ fn main() {
             }
 
             VolumeCommand::Fork { fork_name, from } => {
+                if let Err(e) = validate_volume_name(&fork_name) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
                 let by_name_dir = args.data_dir.join("by_name");
                 let symlink_path = by_name_dir.join(&fork_name);
                 if symlink_path.exists() {
@@ -272,6 +276,12 @@ fn main() {
                     std::process::exit(1);
                 }
                 let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
+                if source_fork_dir.join("import.lock").exists() {
+                    eprintln!(
+                        "error: volume '{from}' is still importing; wait for import to complete before forking"
+                    );
+                    std::process::exit(1);
+                }
                 // Take an implicit snapshot of the source so fork branches from "now".
                 // Idempotent if the tip is already snapshotted.
                 if let Err(e) = snapshot_volume(&source_fork_dir, &by_id_dir) {
@@ -582,7 +592,26 @@ fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Volume names must be non-empty and contain only `[a-zA-Z0-9._-]`.
+/// This avoids ambiguity with OCI refs (`:` is the tag separator) and
+/// ensures the name is safe as a filesystem entry under `by_name/`.
+fn validate_volume_name(name: &str) -> std::io::Result<()> {
+    if name.is_empty() {
+        return Err(std::io::Error::other("volume name must not be empty"));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_' && *c != '.')
+    {
+        return Err(std::io::Error::other(format!(
+            "invalid character {c:?} in volume name {name:?}: only [a-zA-Z0-9._-] allowed"
+        )));
+    }
+    Ok(())
+}
+
 fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Result<()> {
+    validate_volume_name(name)?;
     let size_str =
         size.ok_or_else(|| std::io::Error::other("--size is required (e.g. --size 4G)"))?;
     let bytes =
