@@ -283,6 +283,132 @@ impl Ext4Read for VolumeReader {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elide_core::volume::{Volume, fork_volume};
+    use tempfile::TempDir;
+
+    /// Allocate a fresh volume directory under `by_id`.
+    fn new_vol_dir(by_id: &std::path::Path) -> PathBuf {
+        by_id.join(ulid::Ulid::new().to_string())
+    }
+
+    /// Write one block, snapshot (WAL→pending), drop.
+    fn write_and_snapshot(vol_dir: &std::path::Path, by_id: &std::path::Path, lba: u64, byte: u8) {
+        let mut vol = Volume::open(vol_dir, by_id).unwrap();
+        vol.write(lba, &[byte; 4096]).unwrap();
+        vol.snapshot().unwrap();
+    }
+
+    // ── flat volume ───────────────────────────────────────────────────────────
+
+    /// VolumeReader can read blocks from a flat (non-fork) volume's WAL.
+    #[test]
+    fn volume_reader_flat_reads_wal() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = new_vol_dir(tmp.path());
+        let mut vol = Volume::open(&vol_dir, tmp.path()).unwrap();
+        vol.write(0, &[0x42u8; 4096]).unwrap();
+        drop(vol); // WAL remains unflushed
+
+        let reader = VolumeReader::open(&vol_dir).unwrap();
+        assert_eq!(reader.read_block(0).unwrap(), [0x42u8; 4096]);
+        assert_eq!(reader.read_block(1).unwrap(), [0u8; 4096]); // unwritten
+    }
+
+    /// VolumeReader can read blocks that have been promoted to pending/.
+    #[test]
+    fn volume_reader_flat_reads_pending() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = new_vol_dir(tmp.path());
+        write_and_snapshot(&vol_dir, tmp.path(), 0, 0xAA);
+
+        let reader = VolumeReader::open(&vol_dir).unwrap();
+        assert_eq!(reader.read_block(0).unwrap(), [0xAAu8; 4096]);
+    }
+
+    // ── fork via symlink ──────────────────────────────────────────────────────
+
+    /// VolumeReader on a by_name/<name> symlink correctly resolves ancestor
+    /// segments.  This was broken when dir.parent() returned by_name/ instead
+    /// of by_id/.
+    #[test]
+    fn volume_reader_fork_via_symlink_reads_ancestor() {
+        let data_dir = TempDir::new().unwrap();
+        let by_id = data_dir.path().join("by_id");
+        let by_name = data_dir.path().join("by_name");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&by_name).unwrap();
+
+        // Parent: write a known block and snapshot.
+        let parent_dir = new_vol_dir(&by_id);
+        write_and_snapshot(&parent_dir, &by_id, 0, 0xAA);
+
+        // Fork branching off the parent.
+        let fork_dir = new_vol_dir(&by_id);
+        fork_volume(&fork_dir, &parent_dir).unwrap();
+
+        // by_name symlink pointing at the fork.
+        let symlink = by_name.join("my-fork");
+        let rel = format!(
+            "../by_id/{}",
+            fork_dir.file_name().unwrap().to_str().unwrap()
+        );
+        std::os::unix::fs::symlink(&rel, &symlink).unwrap();
+
+        // Open via symlink — must see the ancestor block.
+        let reader = VolumeReader::open(&symlink).unwrap();
+        assert_eq!(
+            reader.read_block(0).unwrap(),
+            [0xAAu8; 4096],
+            "ancestor block must be visible through symlink path"
+        );
+        assert_eq!(reader.read_block(1).unwrap(), [0u8; 4096]);
+    }
+
+    /// A fork's own writes shadow the ancestor's data for the same LBA.
+    #[test]
+    fn volume_reader_fork_shadows_ancestor() {
+        let data_dir = TempDir::new().unwrap();
+        let by_id = data_dir.path().join("by_id");
+        let by_name = data_dir.path().join("by_name");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&by_name).unwrap();
+
+        // Parent: LBA 0 = 0xAA, LBA 1 = 0xBB.
+        let parent_dir = new_vol_dir(&by_id);
+        write_and_snapshot(&parent_dir, &by_id, 0, 0xAA);
+        write_and_snapshot(&parent_dir, &by_id, 1, 0xBB);
+
+        // Fork: overwrite LBA 0 with 0xCC; LBA 1 unchanged.
+        let fork_dir = new_vol_dir(&by_id);
+        fork_volume(&fork_dir, &parent_dir).unwrap();
+        let mut fork_vol = Volume::open(&fork_dir, &by_id).unwrap();
+        fork_vol.write(0, &[0xCCu8; 4096]).unwrap();
+        drop(fork_vol); // WAL remains
+
+        let symlink = by_name.join("shadowed");
+        let rel = format!(
+            "../by_id/{}",
+            fork_dir.file_name().unwrap().to_str().unwrap()
+        );
+        std::os::unix::fs::symlink(&rel, &symlink).unwrap();
+
+        let reader = VolumeReader::open(&symlink).unwrap();
+        assert_eq!(
+            reader.read_block(0).unwrap(),
+            [0xCCu8; 4096],
+            "fork write must shadow ancestor"
+        );
+        assert_eq!(
+            reader.read_block(1).unwrap(),
+            [0xBBu8; 4096],
+            "unshadowed ancestor block must still be visible"
+        );
+    }
+}
+
 fn find_segment_file(search_dirs: &[PathBuf], segment_id: &str) -> io::Result<PathBuf> {
     for dir in search_dirs {
         for subdir in ["wal", "pending", "segments"] {
