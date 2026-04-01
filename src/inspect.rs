@@ -10,6 +10,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use serde::Deserialize;
 
 use elide_core::{segment, writelog};
@@ -81,7 +84,23 @@ struct NodeInfo {
     wal_files: Vec<WalInfo>,
     pending: Vec<SegInfo>,
     segments: Vec<SegInfo>,
+    fetched: Vec<FetchedInfo>,
     children: Vec<NodeInfo>,
+}
+
+struct FetchedInfo {
+    ulid: String,
+    /// Total entries in the index (all kinds).
+    entry_count: usize,
+    /// Entries with body data (non-inline, non-dedup) — the ones that can be fetched.
+    fetchable_count: usize,
+    /// How many fetchable entries have their present bit set.
+    present_count: usize,
+    /// Sum of stored_length for all body entries (apparent body size if fully fetched).
+    body_bytes_total: u64,
+    /// Actual disk blocks occupied by the .body sparse file.
+    body_bytes_fetched: u64,
+    error: Option<String>,
 }
 
 struct WalInfo {
@@ -119,6 +138,7 @@ fn collect_node(dir: &Path, is_root: bool, with_children: bool) -> io::Result<No
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
     let pending = collect_seg_dir(&dir.join("pending"))?;
     let segments = collect_seg_dir(&dir.join("segments"))?;
+    let fetched = collect_fetched_dir(dir)?;
 
     // Children only used in legacy single-node mode; Named Forks lists forks separately.
     let mut children = Vec::new();
@@ -156,6 +176,7 @@ fn collect_node(dir: &Path, is_root: bool, with_children: bool) -> io::Result<No
         wal_files,
         pending,
         segments,
+        fetched,
         children,
     })
 }
@@ -198,6 +219,26 @@ fn print_totals(t: &Totals) {
             "Total: {} entries, {} stored",
             fmt_commas(t.seg_entries as u64),
             fmt_size(t.body_bytes),
+        );
+    }
+    if t.fetched_files > 0 {
+        let pct = if t.fetched_entries > 0 {
+            format!(
+                "{:.1}%",
+                100.0 * t.fetched_present as f64 / t.fetched_entries as f64
+            )
+        } else {
+            "0%".to_owned()
+        };
+        println!(
+            "Fetched cache: {} segment{}  {} entries  {} present ({})  {} on disk / {} total",
+            t.fetched_files,
+            if t.fetched_files == 1 { "" } else { "s" },
+            fmt_commas(t.fetched_entries as u64),
+            fmt_commas(t.fetched_present as u64),
+            pct,
+            fmt_size(t.fetched_body_actual),
+            fmt_size(t.fetched_body_total),
         );
     }
 }
@@ -298,6 +339,92 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
     Ok(infos)
 }
 
+fn collect_fetched_dir(dir: &Path) -> io::Result<Vec<FetchedInfo>> {
+    let fetched_dir = dir.join("fetched");
+    let rd = match fs::read_dir(&fetched_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut idx_paths: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s == "idx")
+                .unwrap_or(false)
+        })
+        .collect();
+    idx_paths.sort();
+
+    let mut infos = Vec::new();
+    for idx_path in idx_paths {
+        let ulid = idx_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_owned();
+        match collect_fetched_file(&fetched_dir, &ulid, &idx_path) {
+            Ok(info) => infos.push(info),
+            Err(e) => infos.push(FetchedInfo {
+                ulid,
+                entry_count: 0,
+                fetchable_count: 0,
+                present_count: 0,
+                body_bytes_total: 0,
+                body_bytes_fetched: 0,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+    Ok(infos)
+}
+
+fn collect_fetched_file(
+    fetched_dir: &Path,
+    ulid: &str,
+    idx_path: &Path,
+) -> io::Result<FetchedInfo> {
+    let (_body_start, entries) = segment::read_segment_index(idx_path)
+        .map_err(|e| io::Error::other(format!("reading index: {e}")))?;
+
+    let fetchable_count = entries
+        .iter()
+        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+        .count();
+    let body_bytes_total: u64 = entries
+        .iter()
+        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+        .map(|e| e.stored_length as u64)
+        .sum();
+
+    // Count set bits in .present — each bit corresponds to one fetchable entry.
+    let present_path = fetched_dir.join(format!("{ulid}.present"));
+    let present_bytes = fs::read(&present_path).unwrap_or_default();
+    let present_count: usize = present_bytes.iter().map(|b| b.count_ones() as usize).sum();
+
+    // Actual disk blocks used by the sparse .body file.
+    let body_path = fetched_dir.join(format!("{ulid}.body"));
+    #[cfg(unix)]
+    let body_bytes_fetched = fs::metadata(&body_path)
+        .map(|m| m.blocks() * 512)
+        .unwrap_or(0);
+    #[cfg(not(unix))]
+    let body_bytes_fetched = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
+
+    Ok(FetchedInfo {
+        ulid: ulid.to_owned(),
+        entry_count: entries.len(),
+        fetchable_count,
+        present_count,
+        body_bytes_total,
+        body_bytes_fetched,
+        error: None,
+    })
+}
+
 // --- totals ---
 
 #[derive(Default)]
@@ -306,6 +433,11 @@ struct Totals {
     body_bytes: u64,
     wal_files: usize,
     wal_records: usize,
+    fetched_files: usize,
+    fetched_entries: usize,
+    fetched_present: usize,
+    fetched_body_actual: u64,
+    fetched_body_total: u64,
 }
 
 fn totals(node: &NodeInfo) -> Totals {
@@ -322,6 +454,13 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
     for s in node.pending.iter().chain(node.segments.iter()) {
         t.seg_entries += s.entry_count;
         t.body_bytes += s.body_bytes;
+    }
+    for f in &node.fetched {
+        t.fetched_files += 1;
+        t.fetched_entries += f.fetchable_count;
+        t.fetched_present += f.present_count;
+        t.fetched_body_actual += f.body_bytes_fetched;
+        t.fetched_body_total += f.body_bytes_total;
     }
     for child in &node.children {
         accumulate(child, t);
@@ -346,6 +485,7 @@ fn print_node(node: &NodeInfo, line_prefix: &str, child_prefix: &str) {
     print_wal_section(&node.wal_files, child_prefix, node.is_live);
     print_seg_section("pending", &node.pending, child_prefix, node.is_live);
     print_seg_section("segments", &node.segments, child_prefix, true);
+    print_fetched_section(&node.fetched, child_prefix);
 
     let n = node.children.len();
     for (i, child) in node.children.iter().enumerate() {
@@ -426,6 +566,38 @@ fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: b
             fmt_size(s.body_bytes),
             s.lba_blocks,
             ref_note,
+        );
+    }
+}
+
+fn print_fetched_section(fetched: &[FetchedInfo], prefix: &str) {
+    if fetched.is_empty() {
+        return;
+    }
+    let plural = if fetched.len() == 1 { "file" } else { "files" };
+    println!("{prefix}fetched/ ({} {plural}):", fetched.len());
+    for f in fetched {
+        let p = format!("{prefix}  ");
+        if let Some(ref e) = f.error {
+            println!("{p}{}  [error: {e}]", f.ulid);
+            continue;
+        }
+        let pct = if f.fetchable_count > 0 {
+            format!(
+                "{:.1}%",
+                100.0 * f.present_count as f64 / f.fetchable_count as f64
+            )
+        } else {
+            "0%".to_owned()
+        };
+        println!(
+            "{p}{}  {} entries  {} present ({})  {} on disk / {} total body",
+            f.ulid,
+            fmt_commas(f.entry_count as u64),
+            fmt_commas(f.present_count as u64),
+            pct,
+            fmt_size(f.body_bytes_fetched),
+            fmt_size(f.body_bytes_total),
         );
     }
 }
