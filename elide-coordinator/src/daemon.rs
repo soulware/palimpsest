@@ -1,9 +1,9 @@
-// Coordinator daemon: watches the configured data directory, discovers forks,
+// Coordinator daemon: watches the configured data directory, discovers volumes,
 // drains pending segments to S3, runs GC, and supervises volume processes.
 //
 // Architecture:
 //   - A root scanner runs every `scan_interval_secs`, walking configured root
-//     directories to find fork directories. Each newly-discovered fork gets:
+//     directories to find volume directories. Each newly-discovered volume gets:
 //       - a fork_loop task: drain + GC, sequential within each tick
 //       - a supervisor task (if `serve.toml` exists): spawns and restarts
 //         `elide serve-volume`
@@ -19,8 +19,9 @@
 // Drain and GC are sequential within each tick so that GC sees all segments
 // uploaded this tick, and concurrent GC rewrites can never race an upload.
 //
-// Fork directory layout expected:
-//   <root>/<volume>/forks/<name>/    — all forks (base, default, and named)
+// Directory layout expected:
+//   <data_dir>/by_id/<ulid>/    — one directory per volume (ULID name = S3 prefix)
+//   <data_dir>/by_name/<name>   — symlinks into by_id/ for human navigation
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,14 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
     std::fs::create_dir_all(data_dir.as_ref())
         .with_context(|| format!("creating data_dir: {}", data_dir.display()))?;
+    std::fs::create_dir_all(data_dir.join("by_id"))
+        .with_context(|| format!("creating by_id dir under {}", data_dir.display()))?;
+    std::fs::create_dir_all(data_dir.join("by_name"))
+        .with_context(|| format!("creating by_name dir under {}", data_dir.display()))?;
+
+    // Reconcile by_name/ against by_id/: remove symlinks whose target no longer
+    // exists, add missing symlinks for volumes that have a volume.name file.
+    reconcile_by_name(&data_dir);
 
     // Clean up any stale import locks left by a previous coordinator run.
     import::cleanup_stale_locks(&config.data_dir);
@@ -91,24 +100,24 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     scan_tick.tick().await;
 
     loop {
-        let forks = discover_forks(&data_dir);
-        for fork_dir in forks {
-            // Skip forks that are being actively imported — they will be picked
+        let volumes = discover_volumes(&data_dir);
+        for vol_dir in volumes {
+            // Skip volumes that are being actively imported — they will be picked
             // up on the next scan pass once the import.lock is removed.
-            if fork_dir.join(import::LOCK_FILE).exists() {
+            if vol_dir.join(import::LOCK_FILE).exists() {
                 continue;
             }
-            if known.insert(fork_dir.clone()) {
-                info!("[coordinator] discovered fork: {}", fork_dir.display());
+            if known.insert(vol_dir.clone()) {
+                info!("[coordinator] discovered volume: {}", vol_dir.display());
 
                 tasks.spawn(fork_loop(
-                    fork_dir.clone(),
+                    vol_dir.clone(),
                     store.clone(),
                     drain_interval,
                     gc_config.clone(),
                 ));
 
-                tasks.spawn(supervisor::supervise(fork_dir, elide_bin.clone()));
+                tasks.spawn(supervisor::supervise(vol_dir, elide_bin.clone()));
             }
         }
 
@@ -126,10 +135,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 // interfere with or restart processes we are about to stop.
                 tasks.abort_all();
 
-                // SIGTERM every volume and import process across all known forks.
+                // SIGTERM every volume and import process across all known volumes.
                 let all_pids: Vec<u32> = known
                     .iter()
-                    .flat_map(|fork_dir| import::terminate_fork_processes(fork_dir))
+                    .flat_map(|vol_dir| import::terminate_fork_processes(vol_dir))
                     .collect();
 
                 if all_pids.is_empty() {
@@ -201,11 +210,11 @@ async fn fork_loop(
     drain_interval: Duration,
     gc_config: crate::config::GcConfig,
 ) {
-    let (volume_id, fork_name) = match upload::derive_names(&fork_dir) {
-        Ok(names) => names,
+    let volume_id = match upload::derive_names(&fork_dir) {
+        Ok(id) => id,
         Err(e) => {
             warn!(
-                "[coordinator] cannot derive names for {}: {e}",
+                "[coordinator] cannot derive volume id for {}: {e}",
                 fork_dir.display()
             );
             return;
@@ -248,7 +257,7 @@ async fn fork_loop(
                 && s.segments_compacted > 0
             {
                 info!(
-                    "[drain {volume_id}/{fork_name}] sweep: {} segment(s), ~{} bytes freed",
+                    "[drain {volume_id}] sweep: {} segment(s), ~{} bytes freed",
                     s.segments_compacted, s.bytes_freed
                 );
             }
@@ -257,7 +266,7 @@ async fn fork_loop(
                 && s.segments_compacted > 0
             {
                 info!(
-                    "[drain {volume_id}/{fork_name}] repack: {} segment(s), ~{} bytes freed",
+                    "[drain {volume_id}] repack: {} segment(s), ~{} bytes freed",
                     s.segments_compacted, s.bytes_freed
                 );
             }
@@ -265,15 +274,15 @@ async fn fork_loop(
 
         // Step 4: drain pending segments to S3.
         if fork_dir.join("pending").exists() {
-            match upload::drain_pending(&fork_dir, &volume_id, &fork_name, &store).await {
+            match upload::drain_pending(&fork_dir, &volume_id, &store).await {
                 Ok(r) if r.uploaded > 0 || r.failed > 0 => {
                     info!(
-                        "[drain {}/{}] {} uploaded, {} failed",
-                        volume_id, fork_name, r.uploaded, r.failed
+                        "[drain {volume_id}] {} uploaded, {} failed",
+                        r.uploaded, r.failed
                     );
                 }
                 Ok(_) => {}
-                Err(e) => warn!("[drain {}/{}] error: {e:#}", volume_id, fork_name),
+                Err(e) => warn!("[drain {volume_id}] error: {e:#}"),
             }
         }
 
@@ -288,21 +297,20 @@ async fn fork_loop(
 
             // Process any handoffs the volume has acknowledged (.applied) before
             // running a new pass, so old segments are removed from the index first.
-            match gc::apply_done_handoffs(&fork_dir, &volume_id, &fork_name, &store).await {
+            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {
                 Ok(0) => {}
-                Ok(n) => info!("[gc {volume_id}/{fork_name}] completed {n} GC handoff(s)"),
-                Err(e) => error!("[gc {volume_id}/{fork_name}] handoff cleanup error: {e:#}"),
+                Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
+                Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
             }
 
             let pruned = gc::cleanup_done_handoffs(&fork_dir, gc::DONE_FILE_TTL);
             if pruned > 0 {
-                info!("[gc {volume_id}/{fork_name}] pruned {pruned} expired .done file(s)");
+                info!("[gc {volume_id}] pruned {pruned} expired .done file(s)");
             }
 
             match gc::gc_fork(
                 &fork_dir,
                 &volume_id,
-                &fork_name,
                 &store,
                 &gc_config,
                 &repack_ulid,
@@ -316,7 +324,7 @@ async fn fork_loop(
                     ..
                 }) => {
                     info!(
-                        "[gc {volume_id}/{fork_name}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
+                        "[gc {volume_id}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
                     );
                 }
                 Ok(gc::GcStats {
@@ -325,7 +333,7 @@ async fn fork_loop(
                     bytes_freed,
                 }) => {
                     info!(
-                        "[gc {volume_id}/{fork_name}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
+                        "[gc {volume_id}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
                     );
                 }
                 Ok(gc::GcStats {
@@ -334,11 +342,11 @@ async fn fork_loop(
                     bytes_freed,
                 }) => {
                     info!(
-                        "[gc {volume_id}/{fork_name}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
+                        "[gc {volume_id}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
                     );
                 }
                 Ok(_) => {}
-                Err(e) => error!("[gc {volume_id}/{fork_name}] error: {e:#}"),
+                Err(e) => error!("[gc {volume_id}] error: {e:#}"),
             }
 
             last_gc = Instant::now();
@@ -346,46 +354,104 @@ async fn fork_loop(
     }
 }
 
-/// Scan the data directory and return all fork directories found.
+/// Scan `<data_dir>/by_id/` and return all writable volume directories.
 ///
-/// A fork directory is any directory that contains a `pending/` or `segments/`
-/// subdirectory. All forks live at:
-///   `<data_dir>/<volume>/forks/<name>/`
-fn discover_forks(data_dir: &Path) -> Vec<PathBuf> {
-    let mut forks = Vec::new();
-    let entries = match std::fs::read_dir(data_dir) {
+/// Skips:
+///   - entries whose name is not a valid ULID
+///   - volumes with a `volume.readonly` marker
+///   - volumes with no `pending/` or `segments/` subdirectory (not yet initialised)
+fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
+    let by_id_dir = data_dir.join("by_id");
+    let mut volumes = Vec::new();
+    let entries = match std::fs::read_dir(&by_id_dir) {
         Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return volumes,
         Err(e) => {
             warn!(
-                "[coordinator] cannot read data_dir {}: {e}",
-                data_dir.display()
+                "[coordinator] cannot read by_id dir {}: {e}",
+                by_id_dir.display()
             );
-            return forks;
+            return volumes;
         }
     };
-    for vol_entry in entries.flatten() {
-        let vol_path = vol_entry.path();
-        if !vol_path.is_dir() {
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
             continue;
         }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if ulid::Ulid::from_string(name).is_err() {
+            continue;
+        }
+        if path.join("volume.readonly").exists() {
+            continue;
+        }
+        if !path.join("pending").exists() && !path.join("segments").exists() {
+            continue;
+        }
+        volumes.push(path);
+    }
+    volumes
+}
 
-        // All forks live under forks/<name>/.
-        let forks_dir = vol_path.join("forks");
-        if let Ok(fork_entries) = std::fs::read_dir(&forks_dir) {
-            for fork_entry in fork_entries.flatten() {
-                let fork_path = fork_entry.path();
-                if fork_path.is_dir() && is_fork_dir(&fork_path) {
-                    forks.push(fork_path);
-                }
+/// Reconcile `<data_dir>/by_name/` against `<data_dir>/by_id/`.
+///
+/// - Removes stale symlinks whose target ULID no longer exists in `by_id/`.
+/// - Adds missing symlinks for volumes that have a `volume.name` file but no
+///   corresponding `by_name/` entry.
+fn reconcile_by_name(data_dir: &Path) {
+    let by_id_dir = data_dir.join("by_id");
+    let by_name_dir = data_dir.join("by_name");
+
+    // Remove stale symlinks.
+    if let Ok(entries) = std::fs::read_dir(&by_name_dir) {
+        for entry in entries.flatten() {
+            let link = entry.path();
+            // Check that the symlink target still exists.
+            if !link.exists() {
+                let _ = std::fs::remove_file(&link);
+                info!(
+                    "[coordinator] removed stale by_name symlink: {}",
+                    link.display()
+                );
             }
         }
     }
-    forks
-}
 
-/// A directory is a fork if it contains `pending/` or `segments/`.
-fn is_fork_dir(path: &Path) -> bool {
-    path.is_dir() && (path.join("pending").exists() || path.join("segments").exists())
+    // Add missing symlinks.
+    let Ok(entries) = std::fs::read_dir(&by_id_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let vol_dir = entry.path();
+        if !vol_dir.is_dir() {
+            continue;
+        }
+        let Some(ulid_str) = vol_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if ulid::Ulid::from_string(ulid_str).is_err() {
+            continue;
+        }
+        let Ok(name) = std::fs::read_to_string(vol_dir.join("volume.name")) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let link = by_name_dir.join(name);
+        if !link.exists() {
+            let target = format!("../by_id/{ulid_str}");
+            if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
+                warn!("[coordinator] failed to create by_name/{name} -> {target}: {e}");
+            } else {
+                info!("[coordinator] created by_name/{name} -> {target}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -398,23 +464,30 @@ mod tests {
     }
 
     #[test]
-    fn discover_forks_under_forks_dir() {
+    fn discover_volumes_scans_by_id() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        // Volume "myvol" with base, default, and a named fork — all under forks/.
-        mk(root, "myvol/forks/base/segments");
-        mk(root, "myvol/forks/default/pending");
-        mk(root, "myvol/forks/vm1/segments");
+        // Valid writable volumes in by_id/.
+        let ulid1 = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid2 = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let ulid3 = "01JQCCCCCCCCCCCCCCCCCCCCCC";
+        mk(root, &format!("by_id/{ulid1}/segments"));
+        mk(root, &format!("by_id/{ulid2}/pending"));
 
-        // Volume "other" with only a bare forks/ dir (no fork subdirs with pending/segments).
-        mk(root, "other/forks");
+        // Readonly volume — must be skipped.
+        mk(root, &format!("by_id/{ulid3}/segments"));
+        std::fs::write(root.join(format!("by_id/{ulid3}/volume.readonly")), "").unwrap();
 
-        // Volume "empty" — just a volume root, no forks.
-        mk(root, "empty");
+        // Non-ULID entry — must be skipped.
+        mk(root, "by_id/not-a-ulid/segments");
 
-        let forks = discover_forks(root);
-        let mut names: Vec<String> = forks
+        // ULID dir with no pending/ or segments/ — not yet initialised, skip.
+        let ulid4 = "01JQDDDDDDDDDDDDDDDDDDDDDDD";
+        mk(root, &format!("by_id/{ulid4}"));
+
+        let volumes = discover_volumes(root);
+        let mut names: Vec<String> = volumes
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
             .collect();
@@ -422,20 +495,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["myvol/forks/base", "myvol/forks/default", "myvol/forks/vm1"]
+            vec![format!("by_id/{ulid1}"), format!("by_id/{ulid2}"),]
         );
-    }
-
-    #[test]
-    fn is_fork_dir_requires_pending_or_segments() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-
-        let fork = root.join("fork");
-        std::fs::create_dir_all(&fork).unwrap();
-        assert!(!is_fork_dir(&fork));
-
-        std::fs::create_dir_all(fork.join("pending")).unwrap();
-        assert!(is_fork_dir(&fork));
     }
 }

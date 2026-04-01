@@ -230,56 +230,52 @@ async fn stream_import(ulid: &str, writer: &mut OwnedWriteHalf, registry: &Impor
 // ── Volume status ─────────────────────────────────────────────────────────────
 
 fn volume_status(volume_name: &str, data_dir: &Path) -> String {
-    let vol_dir = data_dir.join(volume_name);
-    if !vol_dir.is_dir() {
+    // Resolve name via by_name/ symlink → by_id/<ulid>/.
+    let link = data_dir.join("by_name").join(volume_name);
+    if !link.exists() {
         return format!("err volume not found: {volume_name}");
     }
+    // The OS follows the symlink transparently for all path ops below.
+    let vol_dir = link;
 
-    // Check for an active import in forks/base/.
-    let base_fork_dir = vol_dir.join("forks").join("base");
-    if base_fork_dir.join(import::LOCK_FILE).exists() {
-        let ulid = std::fs::read_to_string(base_fork_dir.join(import::LOCK_FILE))
+    // Check for an active import.
+    if vol_dir.join(import::LOCK_FILE).exists() {
+        let ulid = std::fs::read_to_string(vol_dir.join(import::LOCK_FILE))
             .unwrap_or_default()
             .trim()
             .to_owned();
         return format!("ok importing {ulid}");
     }
 
-    let mut running_forks = Vec::new();
-    let forks_dir = vol_dir.join("forks");
-    if let Ok(entries) = std::fs::read_dir(&forks_dir) {
-        for entry in entries.flatten() {
-            let fork_path = entry.path();
-            if !fork_path.is_dir() {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(fork_path.join("volume.pid"))
-                && let Ok(pid) = text.trim().parse::<u32>()
-                && pid_is_alive(pid)
-                && let Some(name) = fork_path.file_name().and_then(|n| n.to_str())
-            {
-                running_forks.push(name.to_owned());
-            }
-        }
+    // Check if a volume process is running.
+    if let Ok(text) = std::fs::read_to_string(vol_dir.join("volume.pid"))
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && pid_is_alive(pid)
+    {
+        return "ok running".to_string();
     }
 
-    if running_forks.is_empty() {
-        "ok stopped".to_string()
-    } else {
-        running_forks.sort();
-        format!("ok running {}", running_forks.join(","))
-    }
+    "ok stopped".to_string()
 }
 
 // ── Volume delete ─────────────────────────────────────────────────────────────
 
 fn delete_volume(volume_name: &str, data_dir: &Path) -> String {
-    let vol_dir = data_dir.join(volume_name);
-    if !vol_dir.is_dir() {
+    let link = data_dir.join("by_name").join(volume_name);
+    if !link.exists() {
         return format!("err volume not found: {volume_name}");
+    }
+
+    // Resolve the symlink to get the actual by_id/<ulid>/ directory.
+    let vol_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
     import::kill_all_for_volume(&vol_dir);
+
+    // Remove the by_name symlink first, then the volume directory.
+    let _ = std::fs::remove_file(&link);
 
     match std::fs::remove_dir_all(&vol_dir) {
         Ok(()) => {

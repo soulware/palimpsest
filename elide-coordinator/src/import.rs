@@ -79,9 +79,10 @@ pub fn new_registry() -> ImportRegistry {
 
 /// Spawn an import process for `vol_name` using OCI image `oci_ref`.
 ///
-/// Creates the fork directory (`<vol_dir>/base`), writes `import.lock` and
-/// `import.pid`, spawns `elide-import`, and registers the job. Returns the
-/// import ULID.
+/// Generates a ULID for the new volume, creates `<data_dir>/by_id/<ulid>/`,
+/// writes `volume.name`, `volume.readonly`, and `import.lock`, then spawns
+/// `elide-import`. On success, creates the `<data_dir>/by_name/<vol_name>`
+/// symlink. Returns the import job ULID.
 pub async fn spawn_import(
     vol_name: &str,
     oci_ref: &str,
@@ -89,38 +90,29 @@ pub async fn spawn_import(
     elide_import_bin: &Path,
     registry: &ImportRegistry,
 ) -> std::io::Result<String> {
-    let vol_dir = data_dir.join(vol_name);
-    let fork_dir = vol_dir.join("forks").join("base");
+    let by_name_dir = data_dir.join("by_name");
+    let symlink_path = by_name_dir.join(vol_name);
 
-    // Reject if a volume process is already running in this fork.
-    if let Ok(text) = std::fs::read_to_string(fork_dir.join("volume.pid"))
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && is_alive(pid)
-    {
+    // Reject if a volume with this name already exists.
+    if symlink_path.exists() {
         return Err(std::io::Error::other(format!(
-            "volume process already running for {vol_name}/base (pid {pid})"
+            "volume already exists: {vol_name}"
         )));
     }
 
-    // Reject if another import is already registered in memory.
-    if fork_dir.join(LOCK_FILE).exists() {
-        let ulid_text = std::fs::read_to_string(fork_dir.join(LOCK_FILE)).unwrap_or_default();
-        let existing = ulid_text.trim().to_owned();
-        if registry.lock().await.contains_key(&existing) {
-            return Err(std::io::Error::other(format!(
-                "import already in progress for {vol_name}: {existing}"
-            )));
-        }
-        // Stale lock — clean up and proceed.
-        warn!("[import] removing stale lock for {vol_name}: {existing}");
-        let _ = std::fs::remove_file(fork_dir.join(LOCK_FILE));
-        let _ = std::fs::remove_file(fork_dir.join(PID_FILE));
-    }
+    // Generate a stable ULID for this volume (= S3 prefix).
+    let vol_ulid = Ulid::new().to_string();
+    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
-    std::fs::create_dir_all(&fork_dir)?;
+    std::fs::create_dir_all(&vol_dir)?;
+    // Write volume.readonly immediately so a crashed import is never supervised
+    // as a writable volume.
+    std::fs::write(vol_dir.join("volume.readonly"), "")?;
+    std::fs::write(vol_dir.join("volume.name"), vol_name)?;
 
-    let ulid = Ulid::new().to_string();
-    std::fs::write(fork_dir.join(LOCK_FILE), &ulid)?;
+    // Write the import lock.
+    let import_ulid = Ulid::new().to_string();
+    std::fs::write(vol_dir.join(LOCK_FILE), &import_ulid)?;
 
     let mut cmd = tokio::process::Command::new(elide_import_bin);
     cmd.arg(&vol_dir)
@@ -150,13 +142,18 @@ pub async fn spawn_import(
     })?;
 
     let pid = child.id().unwrap_or(0);
-    std::fs::write(fork_dir.join(PID_FILE), pid.to_string())?;
+    std::fs::write(vol_dir.join(PID_FILE), pid.to_string())?;
 
-    let job = ImportJob::new(fork_dir.clone(), pid);
-    registry.lock().await.insert(ulid.clone(), job.clone());
+    let job = ImportJob::new(vol_dir.clone(), pid);
+    registry
+        .lock()
+        .await
+        .insert(import_ulid.clone(), job.clone());
 
-    let ulid_clone = ulid.clone();
+    let vol_name_owned = vol_name.to_owned();
+    let import_ulid_clone = import_ulid.clone();
     tokio::spawn(async move {
+        let vol_name = vol_name_owned.as_str();
         // Stream stderr into the job's output buffer.
         if let Some(stderr) = child.stderr.take() {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
@@ -168,47 +165,48 @@ pub async fn spawn_import(
         // Wait for the process to exit.
         let final_state = match child.wait().await {
             Ok(s) if s.success() => {
-                info!("[import {ulid_clone}] done");
+                // Create the by_name symlink now that the import succeeded.
+                let target = format!("../by_id/{vol_ulid}");
+                if let Err(e) = std::os::unix::fs::symlink(&target, &symlink_path) {
+                    warn!("[import {import_ulid_clone}] failed to create by_name/{vol_name}: {e}");
+                }
+                info!("[import {import_ulid_clone}] done");
                 ImportState::Done
             }
             Ok(s) => {
                 let msg = format!("exited with {s}");
-                warn!("[import {ulid_clone}] failed: {msg}");
+                warn!("[import {import_ulid_clone}] failed: {msg}");
                 ImportState::Failed(msg)
             }
             Err(e) => {
                 let msg = format!("wait error: {e}");
-                warn!("[import {ulid_clone}] failed: {msg}");
+                warn!("[import {import_ulid_clone}] failed: {msg}");
                 ImportState::Failed(msg)
             }
         };
 
         job.finish(final_state).await;
-        let _ = std::fs::remove_file(fork_dir.join(LOCK_FILE));
-        let _ = std::fs::remove_file(fork_dir.join(PID_FILE));
+        let _ = std::fs::remove_file(vol_dir.join(LOCK_FILE));
+        let _ = std::fs::remove_file(vol_dir.join(PID_FILE));
     });
 
-    info!("[import {ulid}] started pid {pid} for {vol_name} from {oci_ref}");
-    Ok(ulid)
+    info!("[import {import_ulid}] started pid {pid} for {vol_name} from {oci_ref}");
+    Ok(import_ulid)
 }
 
 /// On coordinator startup, remove stale `import.lock` files.
 ///
 /// A lock is stale if no live process matches `import.pid`. If a process is
-/// found alive, it is sent SIGTERM so the fork is in a clean state for retry.
+/// found alive, it is sent SIGTERM so the volume is in a clean state for retry.
 pub fn cleanup_stale_locks(data_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(data_dir) else {
+    let by_id_dir = data_dir.join("by_id");
+    let Ok(entries) = std::fs::read_dir(&by_id_dir) else {
         return;
     };
-    for vol_entry in entries.flatten() {
-        let vol_path = vol_entry.path();
-        if !vol_path.is_dir() {
-            continue;
-        }
-        if let Ok(fork_entries) = std::fs::read_dir(vol_path.join("forks")) {
-            for fork_entry in fork_entries.flatten() {
-                cleanup_stale_lock_in(&fork_entry.path());
-            }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            cleanup_stale_lock_in(&path);
         }
     }
 }
@@ -292,33 +290,24 @@ pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
     pids
 }
 
-/// Send SIGTERM to all volume and import processes under `vol_dir`, then wait
+/// Send SIGTERM to the volume and import processes in `vol_dir`, then wait
 /// briefly for them to exit. Used by the `delete` operation.
 pub fn kill_all_for_volume(vol_dir: &Path) {
-    // Kill volume processes under forks/ and base/.
-    let fork_dirs: Vec<PathBuf> = std::fs::read_dir(vol_dir.join("forks"))
-        .map(|entries| entries.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-
-    for fork_dir in &fork_dirs {
-        // Kill volume process.
-        if let Ok(text) = std::fs::read_to_string(fork_dir.join("volume.pid"))
-            && let Ok(pid) = text.trim().parse::<u32>()
-            && is_alive(pid)
-        {
-            sigterm(pid);
-            info!(
-                "[import] sent SIGTERM to volume process pid={pid} in {}",
-                fork_dir.display()
-            );
-        }
-        // Kill import process.
-        if kill_import(fork_dir) {
-            info!(
-                "[import] sent SIGTERM to import process in {}",
-                fork_dir.display()
-            );
-        }
+    if let Ok(text) = std::fs::read_to_string(vol_dir.join("volume.pid"))
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && is_alive(pid)
+    {
+        sigterm(pid);
+        info!(
+            "[import] sent SIGTERM to volume process pid={pid} in {}",
+            vol_dir.display()
+        );
+    }
+    if kill_import(vol_dir) {
+        info!(
+            "[import] sent SIGTERM to import process in {}",
+            vol_dir.display()
+        );
     }
 
     // Brief pause to allow processes to exit before we remove the directory.

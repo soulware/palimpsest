@@ -240,20 +240,23 @@ fn main() {
             }
 
             VolumeCommand::Info { name } => {
-                let vol_dir = args.data_dir.join(&name);
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
                 inspect::run(&vol_dir).expect("volume info failed");
             }
 
             VolumeCommand::Ls { name, fork, path } => {
-                let vol_dir = args.data_dir.join(&name);
-                let fork_dir = fork_dir(&vol_dir, &fork);
-                ls::run(&fork_dir, &path).expect("volume ls failed");
+                // In the flat layout each fork is its own volume; `name` selects
+                // the volume to browse (the `fork` arg is kept for backwards
+                // compatibility but ignored when `name` already names a volume).
+                let _ = fork;
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                ls::run(&vol_dir, &path).expect("volume ls failed");
             }
 
             VolumeCommand::Snapshot { name, fork } => {
-                let vol_dir = args.data_dir.join(&name);
-                let fork_dir = fork_dir(&vol_dir, &fork);
-                let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
+                let _ = fork;
+                let fork_dir = resolve_volume_dir(&args.data_dir, &name);
+                let by_id_dir = args.data_dir.join("by_id");
                 let mut vol =
                     volume::Volume::open(&fork_dir, &by_id_dir).expect("failed to open volume");
                 let snap_ulid = vol.snapshot().expect("snapshot failed");
@@ -265,10 +268,23 @@ fn main() {
                 fork_name,
                 from,
             } => {
-                let vol_dir = args.data_dir.join(&name);
-                let source_fork_dir = fork_dir(&vol_dir, &from);
-                let new_fork_dir = fork_dir(&vol_dir, &fork_name);
+                // In the flat layout, forking creates a new top-level volume.
+                // `from` and `name` both name volumes resolved via by_name/.
+                // `fork_name` is the human name for the new volume.
+                let _ = name; // source volume is now identified by `from`
+                let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
+                let new_vol_ulid = ulid::Ulid::new().to_string();
+                let new_fork_dir = args.data_dir.join("by_id").join(&new_vol_ulid);
                 volume::fork_volume(&new_fork_dir, &source_fork_dir).expect("volume fork failed");
+                std::fs::write(new_fork_dir.join("volume.name"), &fork_name)
+                    .expect("failed to write volume.name");
+                let by_name_dir = args.data_dir.join("by_name");
+                std::fs::create_dir_all(&by_name_dir).expect("failed to create by_name dir");
+                std::os::unix::fs::symlink(
+                    format!("../by_id/{new_vol_ulid}"),
+                    by_name_dir.join(&fork_name),
+                )
+                .expect("failed to create by_name symlink");
                 let key = elide_core::signing::generate_keypair(
                     &new_fork_dir,
                     VOLUME_KEY_FILE,
@@ -281,8 +297,8 @@ fn main() {
             }
 
             VolumeCommand::Create { name, size } => {
-                let vol_dir = args.data_dir.join(&name);
-                create_volume(&vol_dir, size.as_deref()).expect("volume create failed");
+                create_volume(&args.data_dir, &name, size.as_deref())
+                    .expect("volume create failed");
                 if coordinator_client::rescan(&socket_path).is_err() {
                     eprintln!(
                         "warning: coordinator not running; volume will be picked up on next scan"
@@ -346,12 +362,11 @@ fn main() {
             readonly,
             force_origin,
         } => {
-            let vol_dir =
-                fork_vol_dir(&fork_dir).expect("fork_dir must be <vol>/base or <vol>/forks/<name>");
-            let size_bytes = resolve_volume_size(vol_dir, size.as_deref())
+            // In the flat layout, fork_dir IS the volume directory.
+            let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
                 .expect("failed to determine volume size");
             let fetch_config =
-                fetcher::FetchConfig::load(vol_dir).expect("failed to load fetch config");
+                fetcher::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
             if readonly {
                 nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port, fetch_config)
                     .expect("readonly NBD server error");
@@ -460,56 +475,39 @@ fn main() {
     }
 }
 
-/// Resolve a fork name to its directory under a volume root.
+/// Resolve a volume name to its directory via `<data_dir>/by_name/<name>`.
 ///
-/// All forks live under `<vol_dir>/forks/<name>`.
-fn fork_dir(vol_dir: &Path, fork: &str) -> PathBuf {
-    vol_dir.join("forks").join(fork)
+/// The path is returned as-is; the OS follows the symlink transparently.
+fn resolve_volume_dir(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir.join("by_name").join(name)
 }
 
 fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
-    let mut volumes: Vec<(String, usize)> = Vec::new();
-    match std::fs::read_dir(data_dir) {
+    let by_name_dir = data_dir.join("by_name");
+    let mut names: Vec<String> = Vec::new();
+    match std::fs::read_dir(&by_name_dir) {
         Ok(entries) => {
             for entry in entries {
                 let entry = entry?;
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                let fork_count = count_forks(&path);
-                volumes.push((name.to_owned(), fork_count));
+                let name = entry.file_name().to_string_lossy().into_owned();
+                names.push(name);
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    volumes.sort_by(|a, b| a.0.cmp(&b.0));
-    if volumes.is_empty() {
+    names.sort();
+    if names.is_empty() {
         println!("no volumes found in {}", data_dir.display());
     } else {
-        for (name, forks) in &volumes {
-            println!("{name}  ({forks} fork(s))");
+        for name in &names {
+            println!("{name}");
         }
     }
     Ok(())
 }
 
-fn count_forks(vol_dir: &Path) -> usize {
-    std::fs::read_dir(vol_dir.join("forks"))
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .count()
-        })
-        .unwrap_or(0)
-}
-
-fn create_volume(vol_dir: &Path, size: Option<&str>) -> std::io::Result<()> {
+fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Result<()> {
     let size_str =
         size.ok_or_else(|| std::io::Error::other("--size is required (e.g. --size 4G)"))?;
     let bytes =
@@ -517,19 +515,30 @@ fn create_volume(vol_dir: &Path, size: Option<&str>) -> std::io::Result<()> {
     if bytes == 0 {
         return Err(std::io::Error::other("volume size must be non-zero"));
     }
-    std::fs::create_dir_all(vol_dir.join("forks"))?;
-    std::fs::create_dir_all(vol_dir.join("forks").join("default").join("pending"))?;
-    std::fs::create_dir_all(vol_dir.join("forks").join("default").join("segments"))?;
+
+    let by_name_dir = data_dir.join("by_name");
+
+    // Enforce local name uniqueness.
+    if by_name_dir.join(name).exists() {
+        return Err(std::io::Error::other(format!(
+            "volume already exists: {name}"
+        )));
+    }
+
+    let vol_ulid = ulid::Ulid::new().to_string();
+    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
+
+    std::fs::create_dir_all(&vol_dir)?;
+    std::fs::write(vol_dir.join("volume.name"), name)?;
+    std::fs::create_dir_all(vol_dir.join("pending"))?;
+    std::fs::create_dir_all(vol_dir.join("segments"))?;
     std::fs::write(vol_dir.join("size"), bytes.to_string())?;
+
+    std::fs::create_dir_all(&by_name_dir)?;
+    std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
+
     println!("{}", vol_dir.display());
     Ok(())
-}
-
-/// Resolve the volume directory from a fork directory.
-///
-/// All forks live at `<vol>/forks/<name>` — two levels up.
-fn fork_vol_dir(fork_dir: &Path) -> Option<&Path> {
-    fork_dir.parent()?.parent()
 }
 
 /// Parse a human-readable size string: plain bytes, or with suffix K/M/G/T (base-2).

@@ -60,17 +60,17 @@ pub async fn prefetch_indexes(
     let mut failed = 0usize;
 
     for layer in &ancestors {
-        let (volume_id, fork_name) = derive_names(&layer.dir)
-            .with_context(|| format!("resolving names for {}", layer.dir.display()))?;
+        let volume_id = derive_names(&layer.dir)
+            .with_context(|| format!("resolving volume id for {}", layer.dir.display()))?;
 
-        println!("scanning {volume_id}/{fork_name}/");
+        println!("scanning {volume_id}/");
 
-        let prefix = StorePath::from(format!("{volume_id}/{fork_name}/"));
+        let prefix = StorePath::from(format!("{volume_id}/"));
         let objects: Vec<_> = store
             .list(Some(&prefix))
             .try_collect()
             .await
-            .with_context(|| format!("listing {volume_id}/{fork_name}"))?;
+            .with_context(|| format!("listing {volume_id}"))?;
 
         for obj in objects {
             let key = &obj.location;

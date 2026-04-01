@@ -1,8 +1,8 @@
 // Inspect a volume directory and print a human-readable summary.
 //
-// In the Named Forks layout, `dir` is the volume directory containing named
-// fork subdirectories (default/, dev/, etc.). Each fork has its own wal/,
-// pending/, segments/, and snapshots/.
+// `dir` is a single volume directory (by_id/<ulid>/ or a by_name/<name>
+// symlink resolving to one). The volume owns its own wal/, pending/,
+// segments/, and snapshots/ directly — there is no forks/ subdirectory.
 //
 // Does not modify any files.
 
@@ -17,13 +17,20 @@ use elide_core::{segment, writelog};
 use crate::ls;
 
 pub fn run(dir: &Path) -> io::Result<()> {
-    let vol_name = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("<unknown>");
+    // Read human-readable name from volume.name if present; fall back to dir name.
+    let vol_name = fs::read_to_string(dir.join("volume.name"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .or_else(|| {
+            dir.file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_owned())
+        })
+        .unwrap_or_else(|| "<unknown>".to_owned());
+
     let size_bytes = read_size(dir)?;
+    let is_readonly = dir.join("volume.readonly").exists();
     let meta = read_meta(dir);
-    let is_readonly = meta.as_ref().is_some_and(|m| m.readonly);
 
     println!("Volume: {vol_name}");
     match size_bytes {
@@ -43,65 +50,23 @@ pub fn run(dir: &Path) -> io::Result<()> {
         let short_digest = digest.get(7..19).unwrap_or(digest);
         println!("Source: {}  (sha256:{})  {}", source, short_digest, arch);
     }
+    if let Some(origin) = read_origin(dir) {
+        println!("Origin: {origin}");
+    }
     println!();
 
-    // Collect all forks from the forks/ subdirectory.
-    let forks_dir = dir.join("forks");
-    let mut fork_dirs: Vec<PathBuf> = match fs::read_dir(&forks_dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    fork_dirs.sort();
+    let node = collect_node(dir, true, false)?;
+    let snap_count = count_snapshots(dir);
+    if snap_count > 0 {
+        println!("{snap_count} snapshot(s)");
+    }
+    print_node(&node, "", "  ");
+    let t = totals(&node);
+    print_totals(&t);
 
-    if fork_dirs.is_empty() {
-        // Legacy: treat dir itself as a single fork node.
-        let node = collect_node(dir, true, true)?;
-        print_node(&node, "", "  ");
-        let t = totals(&node);
-        print_totals(&t);
-    } else {
-        let mut grand_total = Totals::default();
-        let mut fs_summaries: Vec<(String, ls::FsSummary)> = Vec::new();
-        let n = fork_dirs.len();
-        for (i, fork_dir) in fork_dirs.iter().enumerate() {
-            let fork_name = fork_dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-            let last = i + 1 == n;
-            let (connector, child_prefix) = if last {
-                ("└── ", "    ")
-            } else {
-                ("├── ", "│   ")
-            };
-            let node = collect_node(fork_dir, false, false)?;
-            let snap_count = count_snapshots(fork_dir);
-            let state = if node.is_live { "live" } else { "base" };
-            let origin = read_origin(fork_dir);
-            print!("{connector}{fork_name}  [{state}]");
-            if let Some(ref o) = origin {
-                print!("  origin: {o}");
-            }
-            if snap_count > 0 {
-                print!("  {snap_count} snapshot(s)");
-            }
-            println!();
-            print_wal_section(&node.wal_files, child_prefix, node.is_live);
-            print_seg_section("pending", &node.pending, child_prefix, node.is_live);
-            print_seg_section("segments", &node.segments, child_prefix, true);
-            if let Some(summary) = ls::try_fs_summary(fork_dir) {
-                fs_summaries.push((fork_name.to_owned(), summary));
-            }
-            accumulate(&node, &mut grand_total);
-        }
+    if let Some(summary) = ls::try_fs_summary(dir) {
         println!();
-        print_totals(&grand_total);
-        for (fork_name, summary) in &fs_summaries {
-            println!();
-            print_fs_summary(fork_name, summary);
-        }
+        print_fs_summary(&vol_name, &summary);
     }
 
     Ok(())
@@ -480,8 +445,6 @@ fn print_fs_summary(fork_name: &str, summary: &ls::FsSummary) {
 
 #[derive(Deserialize)]
 struct VolumeMeta {
-    #[serde(default)]
-    readonly: bool,
     source: Option<String>,
     digest: Option<String>,
     arch: Option<String>,
@@ -536,12 +499,12 @@ fn fmt_commas(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::volume::Volume;
+    use elide_core::volume::Volume;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_dir() -> PathBuf {
+    fn temp_vol_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!("elide-inspect-test-{}-{}", std::process::id(), n));
@@ -549,54 +512,53 @@ mod tests {
     }
 
     #[test]
-    fn fresh_live_fork() {
-        let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("default");
-        let _vol = Volume::open(&fork_dir).unwrap();
+    fn fresh_live_volume() {
+        let tmp = temp_vol_dir();
+        let by_id_dir = tmp.join("by_id");
+        let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
+        let _vol = Volume::open(&vol_dir, &by_id_dir).unwrap();
 
-        let node = collect_node(&fork_dir, true, false).unwrap();
+        let node = collect_node(&vol_dir, true, false).unwrap();
         assert!(node.is_live);
         assert!(node.is_root);
         assert!(node.children.is_empty());
         assert_eq!(node.wal_files.len(), 1);
         assert_eq!(node.wal_files[0].record_count, 0);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
-    fn after_snapshot_fork_stays_live() {
-        let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("default");
+    fn after_snapshot_volume_stays_live() {
+        let tmp = temp_vol_dir();
+        let by_id_dir = tmp.join("by_id");
+        let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
 
         {
-            let mut vol = Volume::open(&fork_dir).unwrap();
+            let mut vol = Volume::open(&vol_dir, &by_id_dir).unwrap();
             vol.write(0, &vec![0xAAu8; 4096]).unwrap();
             vol.snapshot().unwrap();
         }
 
-        // Fork is still live after snapshot (wal/ still present).
-        let node = collect_node(&fork_dir, true, false).unwrap();
+        let node = collect_node(&vol_dir, true, false).unwrap();
         assert!(node.is_live);
-        // Snapshot flushed the WAL → one segment in pending/.
         assert_eq!(node.pending.len(), 1);
         assert_eq!(node.pending[0].entry_count, 1);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
-    fn readonly_base_fork_shows_not_live() {
-        let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+    fn readonly_volume_shows_not_live() {
+        let tmp = temp_vol_dir();
+        let vol_dir = tmp.join("by_id").join("01JQAAAAAAAAAAAAAAAAAAAAAA");
 
-        // Simulate a readonly base: create segments/ with no wal/.
-        fs::create_dir_all(default_dir.join("segments")).unwrap();
-        fs::create_dir_all(default_dir.join("pending")).unwrap();
+        fs::create_dir_all(vol_dir.join("segments")).unwrap();
+        fs::create_dir_all(vol_dir.join("pending")).unwrap();
 
-        let node = collect_node(&default_dir, true, false).unwrap();
+        let node = collect_node(&vol_dir, true, false).unwrap();
         assert!(!node.is_live);
 
-        fs::remove_dir_all(vol_dir).unwrap();
+        fs::remove_dir_all(tmp).unwrap();
     }
 }

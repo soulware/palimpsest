@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use elide_core::signing::{BASE_KEY_FILE, BASE_ORIGIN_FILE, BASE_PUB_FILE};
+use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_ORIGIN_FILE, VOLUME_PUB_FILE};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -104,12 +104,13 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
         vol_dir.display()
     );
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
-    let key = elide_core::signing::generate_keypair(vol_dir, BASE_KEY_FILE, BASE_PUB_FILE)
-        .context("generate base keypair")?;
-    elide_core::signing::write_origin(vol_dir, &key, BASE_ORIGIN_FILE)
-        .context("write base.origin")?;
-    let signer = elide_core::signing::load_signer(vol_dir, BASE_KEY_FILE)
-        .context("load base signing key")?;
+    std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
+    let key = elide_core::signing::generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
+        .context("generate volume keypair")?;
+    elide_core::signing::write_origin(vol_dir, &key, VOLUME_ORIGIN_FILE)
+        .context("write volume.origin")?;
+    let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
+        .context("load volume signing key")?;
     let mut last_pct = u64::MAX;
     elide_core::import::import_image(ext4_path, vol_dir, Some(&*signer), |done, total| {
         let pct = done * 100 / total;
@@ -194,12 +195,13 @@ async fn run_oci(
     // 7. Import into Elide volume
     eprintln!("Importing into {}...", vol_dir.display());
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
-    let key = elide_core::signing::generate_keypair(vol_dir, BASE_KEY_FILE, BASE_PUB_FILE)
-        .context("generate base keypair")?;
-    elide_core::signing::write_origin(vol_dir, &key, BASE_ORIGIN_FILE)
-        .context("write base.origin")?;
-    let signer = elide_core::signing::load_signer(vol_dir, BASE_KEY_FILE)
-        .context("load base signing key")?;
+    std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
+    let key = elide_core::signing::generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
+        .context("generate volume keypair")?;
+    elide_core::signing::write_origin(vol_dir, &key, VOLUME_ORIGIN_FILE)
+        .context("write volume.origin")?;
+    let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
+        .context("load volume signing key")?;
     let mut last_pct = u64::MAX;
     elide_core::import::import_image(&ext4_path, vol_dir, Some(&*signer), |done, total| {
         let pct = done * 100 / total;

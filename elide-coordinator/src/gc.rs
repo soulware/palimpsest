@@ -134,7 +134,6 @@ impl GcStats {
 pub async fn gc_fork(
     fork_dir: &Path,
     volume_id: &str,
-    fork_name: &str,
     store: &Arc<dyn ObjectStore>,
     config: &GcConfig,
     repack_ulid: &str,
@@ -173,7 +172,6 @@ pub async fn gc_fork(
             &gc_dir,
             fork_dir,
             volume_id,
-            fork_name,
             store,
             repack_ulid,
         )
@@ -210,11 +208,9 @@ pub async fn gc_fork(
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
         let sweep_bytes: u64 = small.iter().map(|s| s.dead_bytes()).sum();
-        compact_segments(
-            small, &gc_dir, fork_dir, volume_id, fork_name, store, sweep_ulid,
-        )
-        .await
-        .context("small-segment sweep")?;
+        compact_segments(small, &gc_dir, fork_dir, volume_id, store, sweep_ulid)
+            .await
+            .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
     } else {
         None
@@ -253,7 +249,6 @@ pub async fn gc_fork(
 pub async fn apply_done_handoffs(
     fork_dir: &Path,
     volume_id: &str,
-    fork_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<usize> {
     let gc_dir = fork_dir.join("gc");
@@ -310,7 +305,7 @@ pub async fn apply_done_handoffs(
         // (e.g. coordinator crashed after delete but before rename); treat as
         // success so the cleanup is idempotent.
         for old_ulid_str in &old_ulids {
-            let key = segment_key(volume_id, fork_name, old_ulid_str)
+            let key = segment_key(volume_id, old_ulid_str)
                 .with_context(|| format!("building key for {old_ulid_str}"))?;
             match store.delete(&key).await {
                 Ok(_) => {}
@@ -537,7 +532,6 @@ async fn compact_segments(
     gc_dir: &Path,
     fork_dir: &Path,
     volume_id: &str,
-    fork_name: &str,
     store: &Arc<dyn ObjectStore>,
     new_ulid_str: &str,
 ) -> Result<()> {
@@ -564,7 +558,7 @@ async fn compact_segments(
         // these segments, so no volume handoff is needed.  Delete old S3
         // objects and local files directly.
         for candidate in &candidates {
-            let key = segment_key(volume_id, fork_name, &candidate.ulid_str)?;
+            let key = segment_key(volume_id, &candidate.ulid_str)?;
             match store.delete(&key).await {
                 Ok(_) => {}
                 Err(object_store::Error::NotFound { .. }) => {}
@@ -622,7 +616,7 @@ async fn compact_segments(
     let new_body_section_start = segment::write_segment(&tmp_path, &mut new_entries, None)
         .context("writing compacted segment")?;
 
-    let key = segment_key(volume_id, fork_name, new_ulid_str)?;
+    let key = segment_key(volume_id, new_ulid_str)?;
     let data = tokio::fs::read(&tmp_path)
         .await
         .context("reading compacted segment for upload")?;
@@ -787,7 +781,7 @@ mod tests {
     async fn done_no_gc_dir() {
         let tmp = TempDir::new().unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 0);
@@ -798,7 +792,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("gc")).unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 0);
@@ -813,7 +807,7 @@ mod tests {
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending"), "").unwrap();
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 0);
@@ -838,7 +832,7 @@ mod tests {
         fs::write(&applied_path, &content).unwrap();
 
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -860,7 +854,7 @@ mod tests {
         let old_ulid = Ulid::from_parts(999, 0).to_string();
 
         let store = make_store();
-        let key = segment_key("vol", "fork", &old_ulid).unwrap();
+        let key = segment_key("vol", &old_ulid).unwrap();
         store
             .put(&key, bytes::Bytes::from("old segment data").into())
             .await
@@ -871,7 +865,7 @@ mod tests {
         let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -896,7 +890,7 @@ mod tests {
         let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -923,7 +917,7 @@ mod tests {
         let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -947,7 +941,7 @@ mod tests {
 
         let store = make_store();
         for ulid_str in [&old_a, &old_b] {
-            let key = segment_key("vol", "fork", ulid_str).unwrap();
+            let key = segment_key("vol", ulid_str).unwrap();
             store
                 .put(&key, bytes::Bytes::from("data").into())
                 .await
@@ -960,12 +954,12 @@ mod tests {
         let content = format!("{h1} {old_a} {new_ulid} 0\n{h2} {old_b} {new_ulid} 4096\n");
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
         for ulid_str in [&old_a, &old_b] {
-            let key = segment_key("vol", "fork", ulid_str).unwrap();
+            let key = segment_key("vol", ulid_str).unwrap();
             assert!(
                 store.get(&key).await.is_err(),
                 "{ulid_str} S3 object should be deleted"
@@ -993,7 +987,7 @@ mod tests {
             fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
         }
 
-        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 3);

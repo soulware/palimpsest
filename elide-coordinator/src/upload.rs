@@ -1,6 +1,6 @@
 // Segment upload: drain all committed segments from pending/ to the object store.
 //
-// Object key format: <volume_id>/<fork_name>/YYYYMMDD/<ulid>
+// Object key format: <volume_ulid>/YYYYMMDD/<ulid>
 //
 // The date is extracted from the ULID timestamp (creation time, not upload time),
 // so keys are stable and deterministic regardless of when drain-pending runs.
@@ -31,79 +31,54 @@ pub struct DrainResult {
     pub failed: usize,
 }
 
-/// Derive `(volume_id, fork_name)` from a fork directory path.
+/// Return the volume ULID from a volume directory path.
 ///
-/// Fork directories are either `<vol-root>/base` (the base fork) or
-/// `<vol-root>/forks/<name>` (named forks). The volume_id is the directory
-/// name of the volume root.
-pub fn derive_names(fork_dir: &Path) -> Result<(String, String)> {
-    let fork_name = fork_dir
+/// In the flat layout every volume lives at `<data_dir>/by_id/<ulid>/`.
+/// The directory name is validated as a ULID.
+pub fn derive_names(vol_dir: &Path) -> Result<String> {
+    let name = vol_dir
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("fork dir has no name: {}", fork_dir.display()))?
-        .to_owned();
-
-    let parent = fork_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("fork dir has no parent: {}", fork_dir.display()))?;
-
-    // Named forks live under forks/; the base fork lives directly under the vol root.
-    let volume_root = if parent.file_name().and_then(|n| n.to_str()) == Some("forks") {
-        parent
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("forks/ dir has no parent"))?
-    } else {
-        parent
-    };
-
-    let volume_id = volume_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("volume root has no name: {}", volume_root.display()))?
-        .to_owned();
-
-    Ok((volume_id, fork_name))
+        .ok_or_else(|| anyhow::anyhow!("vol dir has no name: {}", vol_dir.display()))?;
+    ulid::Ulid::from_string(name)
+        .map(|_| name.to_owned())
+        .map_err(|e| anyhow::anyhow!("vol dir name is not a valid ULID '{name}': {e}"))
 }
 
 /// Build the object store key for a segment.
 ///
-/// Format: `<volume_id>/<fork_name>/YYYYMMDD/<ulid>`
-pub fn segment_key(volume_id: &str, fork_name: &str, ulid_str: &str) -> Result<StorePath> {
+/// Format: `<volume_ulid>/YYYYMMDD/<ulid>`
+pub fn segment_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let ulid: Ulid = ulid_str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
-    Ok(StorePath::from(format!(
-        "{volume_id}/{fork_name}/{date}/{ulid_str}"
-    )))
+    Ok(StorePath::from(format!("{volume_id}/{date}/{ulid_str}")))
 }
 
 /// Upload all committed segments from `pending/` to the object store, moving
-/// each successfully uploaded segment to `segments/`. Also uploads the fork's
-/// public key to `<volume_id>/<fork_name>/fork.pub` so that new hosts can
-/// verify fetched segments (trust-on-first-use).
+/// each successfully uploaded segment to `segments/`. Also uploads the volume's
+/// public key to `<volume_id>/volume.pub` so that new hosts can verify fetched
+/// segments (trust-on-first-use).
 ///
 /// `drain_pending` is a one-shot batch command. The key is re-uploaded on every
 /// invocation (idempotent, 32 bytes). A future persistent watcher will replace
 /// this: it uploads the key once at startup and then streams segments as they
 /// appear in `pending/`, making the per-invocation key upload unnecessary.
 pub async fn drain_pending(
-    fork_dir: &Path,
+    vol_dir: &Path,
     volume_id: &str,
-    fork_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<DrainResult> {
-    let pending_dir = fork_dir.join("pending");
-    let segments_dir = fork_dir.join("segments");
+    let pending_dir = vol_dir.join("pending");
+    let segments_dir = vol_dir.join("segments");
 
-    // Upload the fork public key before segments so that any host that
+    // Upload the volume public key before segments so that any host that
     // demand-fetches a segment immediately after upload can verify it.
-    // For the base fork the key lives at <vol_root>/base.pub; for named forks
-    // it is fork.pub inside the fork directory.
-    let pub_key_path = pub_key_path(fork_dir, fork_name);
+    let pub_key_path = vol_dir.join("volume.pub");
     if pub_key_path.exists()
-        && let Err(e) = upload_pub_key(&pub_key_path, volume_id, fork_name, store).await
+        && let Err(e) = upload_pub_key(&pub_key_path, volume_id, store).await
     {
         warn!("pub key upload failed: {e:#}");
     }
@@ -126,16 +101,7 @@ pub async fn drain_pending(
         let name = name.to_owned();
         let segment_path = entry.path();
 
-        match upload_segment(
-            &segment_path,
-            &name,
-            &segments_dir,
-            volume_id,
-            fork_name,
-            store,
-        )
-        .await
-        {
+        match upload_segment(&segment_path, &name, &segments_dir, volume_id, store).await {
             Ok(()) => uploaded += 1,
             Err(e) => {
                 warn!("upload failed for segment {name}: {e:#}");
@@ -147,32 +113,15 @@ pub async fn drain_pending(
     Ok(DrainResult { uploaded, failed })
 }
 
-/// Return the local path of the fork's public key.
-///
-/// The base fork stores its key at `<vol_root>/base.pub` (sibling of `base/`).
-/// Named forks store it at `<fork_dir>/fork.pub`.
-fn pub_key_path(fork_dir: &Path, fork_name: &str) -> std::path::PathBuf {
-    if fork_name == "base" {
-        // base fork: key is at <vol_root>/base.pub, next to the base/ directory
-        fork_dir
-            .parent()
-            .map(|p| p.join("base.pub"))
-            .unwrap_or_else(|| fork_dir.join("base.pub"))
-    } else {
-        fork_dir.join("fork.pub")
-    }
-}
-
 async fn upload_pub_key(
     pub_key_path: &Path,
     volume_id: &str,
-    fork_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let data = tokio::fs::read(pub_key_path)
         .await
         .with_context(|| format!("reading pub key: {}", pub_key_path.display()))?;
-    let key = StorePath::from(format!("{volume_id}/{fork_name}/fork.pub"));
+    let key = StorePath::from(format!("{volume_id}/volume.pub"));
     store
         .put(&key, Bytes::from(data).into())
         .await
@@ -185,10 +134,9 @@ async fn upload_segment(
     ulid_str: &str,
     segments_dir: &Path,
     volume_id: &str,
-    fork_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let key = segment_key(volume_id, fork_name, ulid_str)?;
+    let key = segment_key(volume_id, ulid_str)?;
 
     let data = tokio::fs::read(path)
         .await
@@ -217,18 +165,17 @@ mod tests {
         Ulid::from_parts(ts_ms, random).to_string()
     }
 
+    const VOL_ULID: &str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+
     #[test]
-    fn derive_names_base_fork() {
-        let (vol, fork) = derive_names(Path::new("/volumes/myvm/base")).unwrap();
-        assert_eq!(vol, "myvm");
-        assert_eq!(fork, "base");
+    fn derive_names_returns_ulid() {
+        let id = derive_names(Path::new(&format!("/data/by_id/{VOL_ULID}"))).unwrap();
+        assert_eq!(id, VOL_ULID);
     }
 
     #[test]
-    fn derive_names_named_fork() {
-        let (vol, fork) = derive_names(Path::new("/volumes/myvm/forks/vm1")).unwrap();
-        assert_eq!(vol, "myvm");
-        assert_eq!(fork, "vm1");
+    fn derive_names_rejects_non_ulid() {
+        assert!(derive_names(Path::new("/data/by_id/not-a-ulid")).is_err());
     }
 
     #[test]
@@ -236,23 +183,22 @@ mod tests {
         let ulid = Ulid::from_parts(1743120000000, 42);
         let ulid_str = ulid.to_string();
 
-        // Derive the expected date the same way the production code does.
         let dt: DateTime<Utc> = ulid.datetime().into();
         let expected_date = dt.format("%Y%m%d").to_string();
 
-        let key = segment_key("myvm", "base", &ulid_str).unwrap();
+        let key = segment_key(VOL_ULID, &ulid_str).unwrap();
         assert_eq!(
             key.as_ref(),
-            format!("myvm/base/{expected_date}/{ulid_str}")
+            format!("{VOL_ULID}/{expected_date}/{ulid_str}")
         );
     }
 
     #[tokio::test]
     async fn drain_pending_uploads_and_commits() {
-        let volume_tmp = TempDir::new().unwrap();
-        let fork_dir = volume_tmp.path().join("myvm").join("base");
-        let pending_dir = fork_dir.join("pending");
-        let segments_dir = fork_dir.join("segments");
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        let pending_dir = vol_dir.join("pending");
+        let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
         std::fs::create_dir_all(&segments_dir).unwrap();
 
@@ -267,27 +213,19 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&fork_dir, "myvm", "base", &store)
-            .await
-            .unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.failed, 0);
 
-        // Segments must have moved out of pending/
         assert!(!pending_dir.join(&ulid1).exists());
         assert!(!pending_dir.join(&ulid2).exists());
-
-        // Segments must be present in segments/
         assert!(segments_dir.join(&ulid1).exists());
         assert!(segments_dir.join(&ulid2).exists());
-
-        // .tmp must be untouched in pending/
         assert!(pending_dir.join(format!("{ulid1}.tmp")).exists());
 
-        // Objects must exist in the store at the expected keys
-        let key1 = segment_key("myvm", "base", &ulid1).unwrap();
-        let key2 = segment_key("myvm", "base", &ulid2).unwrap();
+        let key1 = segment_key(VOL_ULID, &ulid1).unwrap();
+        let key2 = segment_key(VOL_ULID, &ulid2).unwrap();
         store
             .head(&key1)
             .await
@@ -299,61 +237,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_pending_uploads_pub_key_for_base_fork() {
-        let volume_tmp = TempDir::new().unwrap();
-        let fork_dir = volume_tmp.path().join("myvm").join("base");
-        let pending_dir = fork_dir.join("pending");
-        let segments_dir = fork_dir.join("segments");
+    async fn drain_pending_uploads_pub_key() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        let pending_dir = vol_dir.join("pending");
+        let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
         std::fs::create_dir_all(&segments_dir).unwrap();
 
-        // Write a fake base.pub at the volume root (sibling of base/).
-        let vol_root = volume_tmp.path().join("myvm");
         let fake_pub = b"fakepublickey12345678901234567890";
-        std::fs::write(vol_root.join("base.pub"), fake_pub).unwrap();
+        std::fs::write(vol_dir.join("volume.pub"), fake_pub).unwrap();
 
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&fork_dir, "myvm", "base", &store)
-            .await
-            .unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
         assert_eq!(result.uploaded, 0);
         assert_eq!(result.failed, 0);
 
-        // fork.pub must have been uploaded to the expected key
-        let pub_key = StorePath::from("myvm/base/fork.pub");
-        let got = store.get(&pub_key).await.expect("fork.pub not in store");
-        let bytes = got.bytes().await.unwrap();
-        assert_eq!(bytes.as_ref(), fake_pub);
-    }
-
-    #[tokio::test]
-    async fn drain_pending_uploads_pub_key_for_named_fork() {
-        let volume_tmp = TempDir::new().unwrap();
-        let fork_dir = volume_tmp.path().join("myvm").join("forks").join("vm1");
-        let pending_dir = fork_dir.join("pending");
-        let segments_dir = fork_dir.join("segments");
-        std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
-
-        // Write a fake fork.pub inside the fork directory.
-        let fake_pub = b"fakeforkpublickey0123456789012345";
-        std::fs::write(fork_dir.join("fork.pub"), fake_pub).unwrap();
-
-        let store_tmp = TempDir::new().unwrap();
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
-
-        let result = drain_pending(&fork_dir, "myvm", "vm1", &store)
-            .await
-            .unwrap();
-        assert_eq!(result.uploaded, 0);
-        assert_eq!(result.failed, 0);
-
-        let pub_key = StorePath::from("myvm/vm1/fork.pub");
-        let got = store.get(&pub_key).await.expect("fork.pub not in store");
+        let pub_key = StorePath::from(format!("{VOL_ULID}/volume.pub"));
+        let got = store.get(&pub_key).await.expect("volume.pub not in store");
         let bytes = got.bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), fake_pub);
     }
