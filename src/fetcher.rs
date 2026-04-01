@@ -14,7 +14,7 @@
 // AWS_ENDPOINT_URL and AWS_DEFAULT_REGION (optional).
 //
 // Key layout mirrors the coordinator's upload layout:
-//   <volume_id>/<fork_name>/YYYYMMDD/<ulid>
+//   by_id/<volume_id>/YYYYMMDD/<ulid>
 //
 // Fetch sequence per segment miss:
 //   1. Try each fork in the ancestry chain (newest first)
@@ -103,16 +103,20 @@ impl FetchConfig {
 
 pub struct ObjectStoreFetcher {
     store: Arc<dyn ObjectStore>,
-    /// (volume_id, fork_name) pairs, oldest-first. Newest-first search on miss.
-    forks: Vec<(String, String)>,
+    /// Volume ULIDs in the ancestry chain, oldest-first. Searched newest-first on miss.
+    volume_ids: Vec<String>,
     rt: Runtime,
 }
 
 impl ObjectStoreFetcher {
-    pub fn new(config: &FetchConfig, forks: Vec<(String, String)>) -> io::Result<Self> {
+    pub fn new(config: &FetchConfig, volume_ids: Vec<String>) -> io::Result<Self> {
         let store = config.build_store()?;
         let rt = Runtime::new().map_err(|e| io::Error::other(format!("tokio runtime: {e}")))?;
-        Ok(Self { store, forks, rt })
+        Ok(Self {
+            store,
+            volume_ids,
+            rt,
+        })
     }
 }
 
@@ -120,7 +124,7 @@ impl SegmentFetcher for ObjectStoreFetcher {
     fn fetch(&self, segment_id: &str, fetched_dir: &Path) -> io::Result<()> {
         self.rt.block_on(fetch_segment(
             &self.store,
-            &self.forks,
+            &self.volume_ids,
             segment_id,
             fetched_dir,
         ))
@@ -129,13 +133,13 @@ impl SegmentFetcher for ObjectStoreFetcher {
 
 async fn fetch_segment(
     store: &Arc<dyn ObjectStore>,
-    forks: &[(String, String)],
+    volume_ids: &[String],
     segment_id: &str,
     fetched_dir: &Path,
 ) -> io::Result<()> {
-    // Try forks newest-first (reverse of oldest-first slice).
-    for (volume_id, fork_name) in forks.iter().rev() {
-        let key = segment_key(volume_id, fork_name, segment_id)?;
+    // Try volumes newest-first (reverse of oldest-first slice).
+    for volume_id in volume_ids.iter().rev() {
+        let key = segment_key(volume_id, segment_id)?;
         match store.get(&key).await {
             Ok(result) => {
                 let bytes = result
@@ -148,13 +152,13 @@ async fn fetch_segment(
             Err(object_store::Error::NotFound { .. }) => continue,
             Err(e) => {
                 return Err(io::Error::other(format!(
-                    "fetching {segment_id} from {volume_id}/{fork_name}: {e}"
+                    "fetching {segment_id} from by_id/{volume_id}: {e}"
                 )));
             }
         }
     }
     Err(io::Error::other(format!(
-        "segment {segment_id} not found in any fork"
+        "segment {segment_id} not found in any ancestor"
     )))
 }
 
@@ -231,51 +235,37 @@ fn write_fetched(fetched_dir: &Path, segment_id: &str, bytes: &[u8]) -> io::Resu
 }
 
 /// Build the S3 object key for a segment.
-/// Format: `<volume_id>/<fork_name>/YYYYMMDD/<ulid>`
-fn segment_key(volume_id: &str, fork_name: &str, ulid_str: &str) -> io::Result<StorePath> {
+///
+/// Format: `by_id/<volume_id>/YYYYMMDD/<segment_ulid>`
+fn segment_key(volume_id: &str, ulid_str: &str) -> io::Result<StorePath> {
     let ulid: Ulid = ulid_str
         .parse()
         .map_err(|e| io::Error::other(format!("invalid segment id '{ulid_str}': {e}")))?;
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
     Ok(StorePath::from(format!(
-        "{volume_id}/{fork_name}/{date}/{ulid_str}"
+        "by_id/{volume_id}/{date}/{ulid_str}"
     )))
 }
 
-/// Derive `(volume_id, fork_name)` from a fork directory path.
+/// Extract the volume ULID from a fork directory path.
 ///
-/// The fork directory must be either `<vol_root>/base` (base fork) or
-/// `<vol_root>/forks/<name>` (named fork). The volume_id is the last component
-/// of the volume root directory.
-pub fn derive_fork_name(dir: &Path) -> io::Result<(String, String)> {
-    let fork_name = dir
+/// In the flat layout every volume lives at `<data_dir>/by_id/<ulid>/`.
+/// The directory name is validated as a ULID.
+pub fn derive_volume_id(dir: &Path) -> io::Result<String> {
+    let name = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| io::Error::other("fork dir has no name"))?
-        .to_owned();
-    let parent = dir
-        .parent()
-        .ok_or_else(|| io::Error::other("fork dir has no parent"))?;
-    let volume_root = if parent.file_name().and_then(|n| n.to_str()) == Some("forks") {
-        parent
-            .parent()
-            .ok_or_else(|| io::Error::other("forks/ dir has no parent"))?
-    } else {
-        parent
-    };
-    let volume_id = volume_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| io::Error::other("volume root has no name"))?
-        .to_owned();
-    Ok((volume_id, fork_name))
+        .ok_or_else(|| io::Error::other("fork dir has no name"))?;
+    ulid::Ulid::from_string(name)
+        .map(|_| name.to_owned())
+        .map_err(|e| io::Error::other(format!("fork dir name is not a valid ULID '{name}': {e}")))
 }
 
-/// Build the ancestry chain as `(volume_id, fork_name)` pairs (oldest-first)
+/// Build the ancestry chain as a list of volume ULIDs (oldest-first)
 /// from a list of fork directories returned by `Volume::fork_dirs()`.
-pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<(String, String)>> {
-    fork_dirs.iter().map(|d| derive_fork_name(d)).collect()
+pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<String>> {
+    fork_dirs.iter().map(|d| derive_volume_id(d)).collect()
 }
 
 #[cfg(test)]
@@ -355,17 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn derive_fork_name_base_fork() {
-        let (vol, fork) = derive_fork_name(Path::new("/volumes/myvm/base")).unwrap();
-        assert_eq!(vol, "myvm");
-        assert_eq!(fork, "base");
+    fn derive_volume_id_returns_ulid() {
+        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let id = derive_volume_id(Path::new(&format!("/data/by_id/{ulid}"))).unwrap();
+        assert_eq!(id, ulid);
     }
 
     #[test]
-    fn derive_fork_name_named_fork() {
-        let (vol, fork) = derive_fork_name(Path::new("/volumes/myvm/forks/vm1")).unwrap();
-        assert_eq!(vol, "myvm");
-        assert_eq!(fork, "vm1");
+    fn derive_volume_id_rejects_non_ulid() {
+        assert!(derive_volume_id(Path::new("/data/by_id/not-a-ulid")).is_err());
     }
 
     #[test]
@@ -373,15 +361,16 @@ mod tests {
         use chrono::{DateTime, Utc};
         use ulid::Ulid;
 
-        let ulid = Ulid::from_parts(1743120000000, 42);
-        let ulid_str = ulid.to_string();
-        let dt: DateTime<Utc> = ulid.datetime().into();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let seg_ulid = Ulid::from_parts(1743120000000, 42);
+        let seg_str = seg_ulid.to_string();
+        let dt: DateTime<Utc> = seg_ulid.datetime().into();
         let expected_date = dt.format("%Y%m%d").to_string();
 
-        let key = segment_key("myvm", "base", &ulid_str).unwrap();
+        let key = segment_key(vol_ulid, &seg_str).unwrap();
         assert_eq!(
             key.as_ref(),
-            format!("myvm/base/{expected_date}/{ulid_str}")
+            format!("by_id/{vol_ulid}/{expected_date}/{seg_str}")
         );
     }
 }

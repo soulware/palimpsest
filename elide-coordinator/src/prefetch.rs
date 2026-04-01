@@ -9,7 +9,7 @@
 // This is the "warm start" step for a fresh host mounting a forked volume.
 //
 // For each ancestor fork in the rebuild chain:
-//   1. List S3 objects under <volume_id>/<fork_name>/
+//   1. List S3 objects under by_id/<volume_id>/
 //   2. For each ULID that passes the branch-point cutoff and is not already
 //      present in segments/ or fetched/:
 //        a. Range-GET [0..96] to parse the header (determines body_section_start)
@@ -63,14 +63,12 @@ pub async fn prefetch_indexes(
         let volume_id = derive_names(&layer.dir)
             .with_context(|| format!("resolving volume id for {}", layer.dir.display()))?;
 
-        println!("scanning {volume_id}/");
-
-        let prefix = StorePath::from(format!("{volume_id}/"));
+        let prefix = StorePath::from(format!("by_id/{volume_id}/"));
         let objects: Vec<_> = store
             .list(Some(&prefix))
             .try_collect()
             .await
-            .with_context(|| format!("listing {volume_id}"))?;
+            .with_context(|| format!("listing by_id/{volume_id}"))?;
 
         for obj in objects {
             let key = &obj.location;
@@ -183,20 +181,19 @@ mod tests {
 
     use elide_core::segment::{SegmentEntry, write_segment};
 
-    /// Build a test volume with one fork, one segment, snapshot, child fork.
-    /// Upload the parent segment to a local store. Verify prefetch_indexes
-    /// downloads the .idx file for the parent and not the child.
+    /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
+    /// Upload the parent segment to the store at the correct by_id/ prefix.
+    /// Verify prefetch_indexes downloads the .idx file for the parent.
     #[tokio::test]
     async fn prefetch_indexes_downloads_ancestor_idx() {
-        // Volume layout:
-        //   vol/
-        //     forks/
-        //       parent/    ← ancestor fork, has one uploaded segment
-        //       child/     ← live fork, no segments
-        let vol_tmp = TempDir::new().unwrap();
-        let vol_dir = vol_tmp.path().join("myvol");
-        let parent_dir = vol_dir.join("forks").join("parent");
-        let child_dir = vol_dir.join("forks").join("child");
+        // Flat layout under a by_id/ dir (mirrors real data_dir/by_id/).
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
 
         std::fs::create_dir_all(parent_dir.join("segments")).unwrap();
         std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
@@ -206,31 +203,37 @@ mod tests {
         // Write one segment into parent's segments/.
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
-        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
-        write_segment(&parent_dir.join("segments").join(ulid), &mut entries, None).unwrap();
+        write_segment(
+            &parent_dir.join("segments").join(seg_ulid),
+            &mut entries,
+            None,
+        )
+        .unwrap();
 
         // Create a snapshot marker in parent (branch point for child).
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
 
-        // child's volume.parent: forks/parent/snapshots/<snap_ulid>
+        // child's volume.parent: <parent_ulid>/snapshots/<snap_ulid>
         std::fs::write(
             child_dir.join("volume.parent"),
-            format!("forks/parent/snapshots/{snap_ulid}"),
+            format!("{parent_ulid}/snapshots/{snap_ulid}"),
         )
         .unwrap();
 
-        // Set up a local object store and upload the parent segment.
+        // Set up a local object store and upload the parent segment at the
+        // by_id/ key. Use a fixed date since seg_ulid has ts=0.
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
-        let seg_bytes = std::fs::read(parent_dir.join("segments").join(ulid)).unwrap();
-        let key = StorePath::from(format!("myvol/parent/20260101/{ulid}"));
+        let seg_bytes = std::fs::read(parent_dir.join("segments").join(seg_ulid)).unwrap();
+        let key = StorePath::from(format!("by_id/{parent_ulid}/19700101/{seg_ulid}"));
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Delete the local segment to simulate eviction.
-        std::fs::remove_file(parent_dir.join("segments").join(ulid)).unwrap();
+        std::fs::remove_file(parent_dir.join("segments").join(seg_ulid)).unwrap();
 
         // Run prefetch_indexes on the child fork.
         let result = prefetch_indexes(&child_dir, &store).await.unwrap();
@@ -238,7 +241,7 @@ mod tests {
         assert_eq!(result.failed, 0);
 
         // Verify the .idx file was written into parent's fetched/ dir.
-        let idx_path = parent_dir.join("fetched").join(format!("{ulid}.idx"));
+        let idx_path = parent_dir.join("fetched").join(format!("{seg_ulid}.idx"));
         assert!(idx_path.exists(), ".idx file should exist");
 
         // Verify it is parseable as a segment index.
