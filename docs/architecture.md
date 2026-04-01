@@ -247,6 +247,34 @@ The `elide` CLI derives the coordinator socket path from `--data-dir`:
 2. `ELIDE_DATA_DIR` environment variable → `<value>/control.sock`
 3. `./elide_data/control.sock` (default)
 
+## Future: simplified user-facing volume model
+
+The current CLI exposes both the **volume** (directory containing base + forks) and the **fork** (the writable branch) as separate concepts. Most commands take both a volume name and a fork name. This is accurate to the internal layout but unnecessarily exposes implementation detail.
+
+**Target model:** a user-facing *volume* maps directly to a single fork internally. The `base/` import data is an invisible ancestor layer — users never address it. The fork concept disappears from the user-facing vocabulary; what users think of as "volumes" are forks under the hood.
+
+**Multi-VM use case:** today you might create one volume (`ubuntu-22.04`) with multiple named forks (`server-1`, `server-2`). In the target model, `server-1` and `server-2` are themselves named volumes that were cloned from `ubuntu-22.04`. The shared base data is still shared on disk; it's just not visible as a separate addressable object.
+
+**CLI in the target model:**
+
+```
+elide volume import <name> <oci-ref>    create a new volume from an OCI image
+elide volume create <name> [--size N]   create a new empty volume
+elide volume clone <src> <dst>          branch a new volume from the latest snapshot of <src>
+elide volume list                       list all volumes
+elide volume info <name>                show segment counts, WAL size, snapshot history
+elide volume ls <name> [path]           browse ext4 filesystem contents (no fork arg)
+elide volume snapshot <name>            write a snapshot marker
+elide volume status <name>              is the volume process running?
+elide volume delete <name>              stop process and remove volume
+```
+
+`volume clone` replaces `volume fork`. The `fork` argument disappears from all commands — there is at most one active fork per user-visible volume name.
+
+**What changes internally:** the coordinator discovers and supervises forks as it does today. The mapping from user-visible volume name to fork directory is one-to-one: each user volume corresponds to a fork under some parent volume's `forks/` directory (or to a standalone volume's default fork). The `base/` directory of an imported volume would become an internal detail not exposed as a user-addressable volume.
+
+**Migration path:** the current `volume fork` → `volume clone` rename is straightforward. The harder part is deciding what `elide volume list` shows — it should show user volumes (forks), not the internal volume root directories. This requires either a naming convention (`forks/` entries are the user objects) or a marker file. This design work is deferred.
+
 ## Proposed: Coordinator inbound socket
 
 The coordinator listens on `<data-dir>/control.sock` for commands from the `elide` CLI. Volume processes each listen on `<fork-dir>/control.sock` for commands from the coordinator. Same socket name, different directory level — the path encodes what you're talking to.
