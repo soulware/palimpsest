@@ -129,6 +129,17 @@ The readonly volume's `base/` directory lives directly under the volume root (no
 
 **Import lock:** `<fork-dir>/import.lock` (plain text, one line: the import ULID) is present while an import process is running or was interrupted. The coordinator removes it on clean import exit. A stale lock (import process dead) is cleaned up on the next coordinator startup or rescan pass. See *Import process lifecycle* below.
 
+**Stopped marker:** `<fork-dir>/volume.stopped` is written by the coordinator when a volume is explicitly stopped via `volume stop` or `coordinator quiesce`. While present, the supervisor will not start or restart the volume process. Removed by `volume start`. Persists across coordinator restarts — a stopped volume stays stopped until explicitly started.
+
+**Fork process state** (readable from the filesystem without running processes):
+
+| Marker files present | State |
+|---|---|
+| `volume.pid` alive | running — volume process is serving I/O |
+| `volume.stopped` | explicitly stopped — coordinator will not restart |
+| `import.lock` | import in progress or interrupted |
+| none of the above | idle — coordinator will start if `serve.toml` present |
+
 **Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. For forks in `forks/`, `walk_ancestors` follows this chain to the root (`base/`), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
 
 ```
@@ -185,6 +196,34 @@ Regardless of mode, on startup the coordinator:
 
 Re-adoption means the supervisor task polls the existing process until it exits naturally, then restarts it as normal. The volume's WAL and segments are untouched.
 
+### Proposed: Volume stop/start and coordinator quiesce
+
+These operations give explicit control over individual volumes or all volumes while the coordinator keeps running. They are the right tool for planned maintenance, controlled shutdown of a single VM, or draining a host before an upgrade.
+
+**`volume stop <name>`** — stop a single volume:
+1. Send SIGTERM to the volume process (via `volume.pid`)
+2. Write `<fork-dir>/volume.stopped`
+3. Supervisor sees the marker and does not restart
+
+**`volume start <name>`** — start a previously stopped volume:
+1. Remove `<fork-dir>/volume.stopped`
+2. Supervisor picks it up on the next scan and starts the process normally
+
+**`coordinator quiesce`** — stop all running volumes:
+1. For each supervised fork: send SIGTERM, write `volume.stopped`
+2. Coordinator keeps running; drain, GC, and inbound socket remain active
+3. No volumes will be restarted until explicitly started again
+
+**`coordinator resume`** — start all stopped volumes:
+1. For each fork with `volume.stopped`: remove the marker
+2. Supervisor picks them up on the next scan
+
+The `volume.stopped` marker persists across coordinator restarts. A quiesced host stays quiesced even if the coordinator is restarted — this is intentional. Resumption is always an explicit act.
+
+**Foreground Ctrl-C** does not write `volume.stopped`. There is no need — the coordinator is exiting anyway. On next coordinator start, volumes will be started normally (or re-adopted if still running).
+
+**Relationship to `volume delete`:** `delete` does not set `volume.stopped` — it removes the directory entirely. `stop` is the right operation when you want the volume to remain but not serve I/O.
+
 ### IPC is optional
 
 The coordinator skips compaction and GC steps gracefully if `control.sock` is absent (volume not running). Loss of the channel degrades background efficiency but never affects correctness or I/O availability — the volume never blocks on the coordinator.
@@ -240,10 +279,14 @@ Most commands operate directly on the volume directory and require no running co
 | Command | What it does |
 |---|---|
 | `elide volume status <name>` | Is the volume process running? What forks? |
+| `elide volume stop <name>` | Stop the volume process and set `volume.stopped`; coordinator keeps running |
+| `elide volume start <name>` | Clear `volume.stopped`; coordinator restarts the volume |
 | `elide volume delete <name>` | Stop all processes for the volume, then remove its directory |
 | `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import ULID |
 | `elide volume import status <ulid>` | Poll import state: running / done / failed |
 | `elide volume import attach <ulid>` | Stream import output lines until completion |
+| `elide coordinator quiesce` | Stop all volumes (set `volume.stopped` for each); coordinator keeps running |
+| `elide coordinator resume` | Clear `volume.stopped` on all forks; coordinator restarts them |
 
 **Internal (spawned by coordinator; not intended for direct use):**
 
@@ -319,6 +362,17 @@ Three auth tiers apply to this socket:
 |---|---|---|
 | Trigger immediate fork discovery | `rescan` | `ok` |
 | Query volume process state | `status <volume>` | `ok running <device-or-address>` or `ok stopped` |
+
+**Unauthenticated — volume stop/start and quiesce:**
+
+| Operation | Request | Response |
+|---|---|---|
+| Stop a single volume | `stop <volume>` | `ok` |
+| Start a stopped volume | `start <volume>` | `ok` |
+| Stop all volumes | `quiesce` | `ok` |
+| Start all stopped volumes | `resume` | `ok` |
+
+`stop` sends SIGTERM to the volume process and writes `volume.stopped`. `start` removes the marker; the supervisor picks the volume up on the next scan. `quiesce` and `resume` apply the same operations to all supervised forks.
 
 **Unauthenticated — import management:**
 
