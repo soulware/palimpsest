@@ -535,11 +535,11 @@ impl Volume {
                             entry.hash,
                             extentindex::ExtentLocation {
                                 segment_id: new_ulid.clone(),
-                                body_offset: new_bss + entry.stored_offset,
+                                body_offset: entry.stored_offset,
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
                                 entry_idx: None,
-                                body_section_start: None,
+                                body_section_start: Some(new_bss),
                             },
                         );
                     }
@@ -723,11 +723,11 @@ impl Volume {
                         entry.hash,
                         extentindex::ExtentLocation {
                             segment_id: new_ulid.clone(),
-                            body_offset: new_bss + entry.stored_offset,
+                            body_offset: entry.stored_offset,
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
                             entry_idx: None,
-                            body_section_start: None,
+                            body_section_start: Some(new_bss),
                         },
                     );
                 }
@@ -910,11 +910,11 @@ impl Volume {
                         e.hash,
                         extentindex::ExtentLocation {
                             segment_id: new_ulid.to_owned(),
-                            body_offset: body_section_start + e.stored_offset,
+                            body_offset: e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
                             entry_idx: None,
-                            body_section_start: None,
+                            body_section_start: Some(body_section_start),
                         },
                     );
                 }
@@ -971,8 +971,8 @@ impl Volume {
             &mut self.pending_entries,
             self.signer.as_ref(),
         )?;
-        // Update the extent index: replace temporary WAL offsets with absolute
-        // offsets into the committed segment file.
+        // Update the extent index: replace temporary WAL offsets with
+        // body-relative offsets into the committed segment file.
         for entry in &self.pending_entries {
             if entry.is_dedup_ref {
                 continue; // data lives in an ancestor segment; index already correct
@@ -981,11 +981,11 @@ impl Volume {
                 entry.hash,
                 extentindex::ExtentLocation {
                     segment_id: self.wal_ulid.clone(),
-                    body_offset: body_section_start + entry.stored_offset,
+                    body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
                     entry_idx: None,
-                    body_section_start: None,
+                    body_section_start: Some(body_section_start),
                 },
             );
         }
