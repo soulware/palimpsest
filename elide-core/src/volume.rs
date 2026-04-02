@@ -224,19 +224,8 @@ impl Volume {
             }
         }
 
-        // Walk the origin chain to collect ancestor layers, oldest-first.
-        let ancestor_layers = walk_ancestors(base_dir, by_id_dir)?;
-
-        // Build the rebuild chain: ancestor layers (with ULID cutoffs) + current fork.
-        let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
-            .iter()
-            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
-            .chain(std::iter::once((base_dir.to_owned(), None)))
-            .collect();
-
-        // Rebuild the LBA map and extent index from all committed segments.
-        let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
-        let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
+        // Walk the origin chain and rebuild maps from all committed segments.
+        let (ancestor_layers, mut lbamap, mut extent_index) = open_read_state(base_dir, by_id_dir)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -1369,14 +1358,7 @@ impl ReadonlyVolume {
     /// replay the WAL. WAL records from an active writer on the same volume will
     /// not be visible. Intended for the `--readonly` NBD serve path.
     pub fn open(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
-        let ancestor_layers = walk_ancestors(fork_dir, by_id_dir)?;
-        let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
-            .iter()
-            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
-            .chain(std::iter::once((fork_dir.to_owned(), None)))
-            .collect();
-        let lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
-        let extent_index = extentindex::rebuild(&rebuild_chain)?;
+        let (ancestor_layers, lbamap, extent_index) = open_read_state(fork_dir, by_id_dir)?;
         Ok(Self {
             base_dir: fork_dir.to_owned(),
             ancestor_layers,
@@ -1435,6 +1417,26 @@ impl ReadonlyVolume {
 /// Walk the fork ancestry chain and return ancestor layers, oldest-first.
 /// Public so that `ls.rs` and other read-only tools can build the rebuild chain.
 ///
+/// Walk the ancestry chain and rebuild the LBA map and extent index.
+///
+/// This is the common open-time setup shared by `Volume::open` and
+/// `ReadonlyVolume::open`.  Returns the ancestor layers (oldest-first), the
+/// rebuilt LBA map, and the rebuilt extent index.
+fn open_read_state(
+    fork_dir: &Path,
+    by_id_dir: &Path,
+) -> io::Result<(Vec<AncestorLayer>, lbamap::LbaMap, extentindex::ExtentIndex)> {
+    let ancestor_layers = walk_ancestors(fork_dir, by_id_dir)?;
+    let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
+        .iter()
+        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+        .chain(std::iter::once((fork_dir.to_owned(), None)))
+        .collect();
+    let lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
+    let extent_index = extentindex::rebuild(&rebuild_chain)?;
+    Ok((ancestor_layers, lbamap, extent_index))
+}
+
 /// Each layer holds the ancestor fork directory and the branch-point ULID.
 /// Segments with ULID > `branch_ulid` in that ancestor fork were written after
 /// the branch and are excluded when rebuilding the LBA map.
