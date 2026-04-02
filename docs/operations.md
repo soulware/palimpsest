@@ -119,12 +119,7 @@ elide volume evict <vol>
 
 Deletes all evictable segment files from `segments/` to reclaim local disk space. Safe to run on any volume that has S3 backing — evicted segments are demand-fetched on next access.
 
-**Preconditions checked before eviction:**
-
-- `pending/` must be empty (coordinator must have drained all pending segments to S3 first)
-- No `gc/*.pending` handoff may be in flight
-
-If either precondition fails, `evict` returns an error and makes no changes.
+**Eviction always succeeds.** Segments that cannot safely be evicted are skipped silently; the command reports only the count of files actually deleted. `pending/` files are never touched — they have not yet been uploaded to S3 and are not part of `segments/`.
 
 **In-flight GC handoff protection:**
 
