@@ -157,7 +157,7 @@ pub struct Volume {
     /// sequential reads hitting the same segment avoid repeated `open` syscalls.
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
-    file_cache: RefCell<Option<(String, fs::File)>>,
+    file_cache: RefCell<Option<(String, bool, fs::File)>>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -548,7 +548,7 @@ impl Volume {
 
             // Evict the old segment from the file handle cache before deleting it.
             let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _)| id.as_str()) == Some(seg_id.as_str()) {
+            if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(seg_id.as_str()) {
                 *cache = None;
             }
             drop(cache);
@@ -742,7 +742,7 @@ impl Volume {
                 continue; // already replaced atomically above
             }
             let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _)| id.as_str()) == Some(seg_id) {
+            if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(seg_id) {
                 *cache = None;
             }
             drop(cache);
@@ -994,7 +994,7 @@ impl Volume {
         // the body offsets in the extent index point into the new segment file;
         // any cached fd for this ULID would use the old WAL byte layout.
         let mut cache = self.file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
+        if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
             *cache = None;
         }
         Ok(())
@@ -1184,7 +1184,7 @@ pub(crate) fn read_extents(
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<Option<(String, fs::File)>>,
+    file_cache: &RefCell<Option<(String, bool, fs::File)>>,
     find_segment: impl Fn(&str, Option<u64>, Option<u32>) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1212,23 +1212,31 @@ pub(crate) fn read_extents(
         // check the .present bitset — the .body file may exist but the specific
         // entry may not yet be fetched.
         let mut cache = file_cache.borrow_mut();
-        let need_find = cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str())
+        let need_find = cache.as_ref().map(|(id, _, _)| id.as_str()) != Some(segment_id.as_str())
             || entry_idx.is_some();
         if need_find {
             let path = find_segment(&segment_id, body_section_start, entry_idx)?;
-            *cache = Some((segment_id, fs::File::open(path)?));
+            // .body files store body bytes starting at offset 0 (body-relative);
+            // full segment files store them starting at body_section_start.
+            let is_body = path.extension().is_some_and(|e| e == "body");
+            *cache = Some((segment_id, is_body, fs::File::open(path)?));
         }
-        let f = &mut cache
-            .as_mut()
-            .expect("cache was just assigned Some above")
-            .1;
+        let (_, is_body, f) = cache.as_mut().expect("cache was just assigned Some above");
+
+        // body_offset is always body-relative (= stored_offset from the segment index).
+        // For full segment files we must add body_section_start to get the file offset.
+        let file_body_offset = if *is_body {
+            body_offset
+        } else {
+            body_section_start.unwrap_or(0) + body_offset
+        };
 
         let block_count = (er.range_end - er.range_start) as usize;
         let out_start = (er.range_start - lba) as usize * 4096;
         let out_slice = &mut out[out_start..out_start + block_count * 4096];
 
         if compressed {
-            f.seek(SeekFrom::Start(body_offset))?;
+            f.seek(SeekFrom::Start(file_body_offset))?;
             let mut compressed_buf = vec![0u8; body_length as usize];
             f.read_exact(&mut compressed_buf)?;
             let decompressed =
@@ -1241,7 +1249,7 @@ pub(crate) fn read_extents(
             out_slice.copy_from_slice(src_slice);
         } else {
             f.seek(SeekFrom::Start(
-                body_offset + er.payload_block_offset as u64 * 4096,
+                file_body_offset + er.payload_block_offset as u64 * 4096,
             ))?;
             f.read_exact(out_slice)?;
         }
@@ -1347,7 +1355,7 @@ pub struct ReadonlyVolume {
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
-    file_cache: RefCell<Option<(String, fs::File)>>,
+    file_cache: RefCell<Option<(String, bool, fs::File)>>,
     fetcher: Option<BoxFetcher>,
 }
 

@@ -242,11 +242,11 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     entry.hash,
                     ExtentLocation {
                         segment_id: segment_id.clone(),
-                        body_offset: body_section_start + entry.stored_offset,
+                        body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
                         entry_idx: None,
-                        body_section_start: None,
+                        body_section_start: Some(body_section_start),
                     },
                 );
             }
@@ -346,8 +346,9 @@ mod tests {
         let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
-        // body_offset should be absolute (body_section_start + 0).
-        assert_eq!(loc.body_offset, bss + entries[0].stored_offset);
+        // body_offset is body-relative (= stored_offset); body_section_start carries bss.
+        assert_eq!(loc.body_offset, entries[0].stored_offset);
+        assert_eq!(loc.body_section_start, Some(bss));
         assert_eq!(loc.body_length, 4096);
 
         std::fs::remove_dir_all(base).unwrap();
@@ -434,9 +435,10 @@ mod tests {
         }
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
-        // Newer segment's offset wins.
+        // Newer segment's offset wins; body_offset is body-relative.
         let loc = index.lookup(&hash).unwrap();
-        assert_eq!(loc.body_offset, bss2 + stored_offset2);
+        assert_eq!(loc.body_offset, stored_offset2);
+        assert_eq!(loc.body_section_start, Some(bss2));
 
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -484,7 +486,8 @@ mod tests {
         let index = rebuild(&[(ancestor.clone(), None), (live.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
-        assert_eq!(loc.body_offset, bss + stored_offset);
+        assert_eq!(loc.body_offset, stored_offset);
+        assert_eq!(loc.body_section_start, Some(bss));
 
         std::fs::remove_dir_all(ancestor).unwrap();
         std::fs::remove_dir_all(live).unwrap();

@@ -288,7 +288,7 @@ pub struct VolumeHandle {
     config: Arc<VolumeConfig>,
     /// Per-handle file-handle cache.  Never contended: each ublk queue thread
     /// holds its own clone.  `RefCell` is sufficient; `Mutex` is not needed.
-    file_cache: RefCell<Option<(String, fs::File)>>,
+    file_cache: RefCell<Option<(String, bool, fs::File)>>,
     /// Generation of the last snapshot whose extent index offsets were used to
     /// populate `file_cache`.  Compared against `ReadSnapshot::flush_gen` on
     /// every read; if they differ the cache is evicted before proceeding.
