@@ -1015,39 +1015,43 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
         ));
     }
 
-    // Check no GC handoff is in flight.
+    // Check no GC handoff is in flight (.pending), and collect any segments
+    // protected by an acknowledged-but-not-yet-uploaded handoff (.applied).
     //
-    // Both .pending and .applied must block eviction:
-    //   .pending — volume has not yet acknowledged the handoff; the new segment
-    //              may not exist in segments/ yet.
-    //   .applied — volume acknowledged but coordinator has not yet uploaded the
-    //              new segment to S3 or deleted the old ones; evicting the new
-    //              segment now would make those LBAs unreadable.
+    //   .pending — volume has not yet acknowledged the handoff; the replacement
+    //              segment may not exist in segments/ yet, and the old segments
+    //              are still needed for reads.  Block eviction entirely.
+    //   .applied — volume acknowledged; the new segment is in segments/ but the
+    //              coordinator has not yet uploaded it to S3.  Only that specific
+    //              segment must be kept — everything else can be evicted.
     let gc_dir = vol_dir.join("gc");
+    let mut protected: std::collections::HashSet<std::ffi::OsString> =
+        std::collections::HashSet::new();
     if gc_dir.exists() {
         for entry in std::fs::read_dir(&gc_dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".pending") {
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".pending") {
                 return Err(std::io::Error::other(
                     "GC handoff in flight (gc/*.pending exists) — wait for it to complete before evicting",
                 ));
             }
-            if name.ends_with(".applied") {
-                return Err(std::io::Error::other(
-                    "GC handoff not yet uploaded (gc/*.applied exists) — wait for the coordinator to finish before evicting",
-                ));
+            if let Some(ulid_str) = name_str.strip_suffix(".applied") {
+                protected.insert(std::ffi::OsString::from(ulid_str));
             }
         }
     }
 
-    // Delete segment files.
+    // Delete segment files, skipping any whose upload is still in flight.
     let segments_dir = vol_dir.join("segments");
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(&segments_dir) {
         for entry in entries {
             let entry = entry?;
+            if protected.contains(&entry.file_name()) {
+                continue;
+            }
             std::fs::remove_file(entry.path())?;
             count += 1;
         }
@@ -1115,11 +1119,12 @@ mod tests {
     }
 
     #[test]
-    fn evict_blocked_by_gc_applied() {
+    fn evict_skips_applied_segment_evicts_others() {
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
-        // Volume has renamed .pending → .applied: handoff acknowledged but coordinator
-        // has not yet uploaded the new segment or deleted old ones.
+        // Volume has renamed .pending → .applied: the new segment is in segments/
+        // but the coordinator has not yet uploaded it.  Eviction must skip that
+        // specific segment but may still evict all others.
         fs::write(
             vol.join("gc").join("01AAAAAAAAAAAAAAAAAAAAAAA1.applied"),
             b"",
@@ -1127,11 +1132,28 @@ mod tests {
         .unwrap();
         fs::write(
             vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
-            b"seg",
+            b"protected",
         )
         .unwrap();
-        let err = evict_segments(&vol).unwrap_err();
-        assert!(err.to_string().contains("gc/*.applied"), "{err}");
+        fs::write(
+            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA2"),
+            b"evictable",
+        )
+        .unwrap();
+        let n = evict_segments(&vol).unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            vol.join("segments")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA1")
+                .exists(),
+            "protected segment must survive"
+        );
+        assert!(
+            !vol.join("segments")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
+                .exists(),
+            "other segment must be evicted"
+        );
     }
 }
 
