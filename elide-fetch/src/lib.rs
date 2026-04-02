@@ -540,7 +540,8 @@ mod tests {
             SegmentEntry::new_data(h1, 0, 1, 0, data1.clone()),
             SegmentEntry::new_data(h2, 1, 2, 0, data2.clone()),
         ];
-        let bss = write_segment(&seg_path, &mut entries, None).unwrap();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
 
         // Read the full segment bytes and split them via write_fetched.
         let full_bytes = std::fs::read(&seg_path).unwrap();
@@ -619,7 +620,8 @@ mod tests {
             SegmentEntry::new_data(h2, 2, 1, 0, data2.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
-        let bss = write_segment(&seg_path, &mut entries, None).unwrap();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         // Write only the .idx portion — no .body, no .present yet.
@@ -709,7 +711,8 @@ mod tests {
             SegmentEntry::new_data(h1, 1, 1, 0, data1.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
-        let bss = write_segment(&seg_path, &mut entries, None).unwrap();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         std::fs::create_dir_all(&fetched_dir).unwrap();

@@ -78,7 +78,7 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       volume.readonly                 — present = permanently readonly (imported/frozen)
       volume.size                     — volume size in bytes (plain text)
       volume.pub                      — Ed25519 public key (uploaded to S3)
-      volume.key                      — Ed25519 signing key (never uploaded)
+      volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
       manifest.toml                   — name, size, OCI source metadata
       pending/                        — segments awaiting S3 upload (populated by import)
       segments/                       — segments confirmed in S3 (empty until drain completes)
@@ -90,8 +90,9 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       volume.name                     — "server-1"
       volume.size
       volume.parent                   — "01JQAAAAAAA/snapshots/01JQXXXXX"
-      volume.key
+      volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
       volume.pub
+      volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
@@ -127,6 +128,9 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `by_name/` entries are symlinks only — no real directories
 - `volume.name` is present in every volume; single non-empty line
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
+- `volume.pub` present in every volume — readonly volumes have only `volume.pub` (no `volume.key`); `serve-volume` verifies provenance against it on every open, writable or not
+- `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
+- `volume.provenance` present in every volume — hostname + canonical path + Ed25519 signature over both; signed by the private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
 - `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
@@ -771,7 +775,7 @@ This invariant is what makes ULID total-order sufficient for all correctness gua
 - **GC ULID assignment:** `max(inputs).increment()` is safe because any write that occurs *during* compaction comes from the one writer, gets a timestamp from the current wall clock, and is therefore far ahead of the old `max(inputs)` timestamp (which has already passed through the drain pipeline). No locking is required.
 - **Ancestor cutoff:** the branch-point ULID is a stable boundary because the ancestor's writer cannot insert segments retroactively below it.
 
-The single-writer property is enforced by the signing key: only the host holding `volume.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at demand-fetch verification time. See [formats.md](formats.md) — *Volume ownership and signing*.
+The single-writer property is enforced by the signing key: only the host holding `volume.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at segment-open verification time (both local and demand-fetch). See [formats.md](formats.md) — *Fork ownership and signing*.
 
 The ULID monotonicity invariant and crash-recovery correctness are verified by property-based tests using proptest. See [testing.md](testing.md) for the simulation model, the two properties tested, and a concrete bug these tests found and fixed.
 

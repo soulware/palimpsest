@@ -733,16 +733,13 @@ fn serve_readonly_volume_listener(
 fn run_volume_ipc_only(
     dir: &Path,
     _size_bytes: u64,
-    signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+    _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = match signer {
-        Some(s) => Volume::open_with_signer(dir, s, by_id_dir)?,
-        None => Volume::open(dir, by_id_dir)?,
-    };
+    let mut volume = Volume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
@@ -771,16 +768,13 @@ fn serve_volume_listener(
     dir: &Path,
     size_bytes: u64,
     listener: TcpListener,
-    signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+    _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = match signer {
-        Some(s) => Volume::open_with_signer(dir, s, by_id_dir)?,
-        None => Volume::open(dir, by_id_dir)?,
-    };
+    let mut volume = Volume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;

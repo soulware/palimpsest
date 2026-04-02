@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use log::warn;
 
 use crate::segment;
+use crate::signing;
 
 /// Physical location of an extent within a segment file.
 #[derive(Clone)]
@@ -147,6 +148,28 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     .unwrap_or(false)
             });
         }
+        // Process pending/ and segments/ (absolute offsets). These overwrite
+        // any fetched/ entries for the same hashes.
+        let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
+        paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
+        segment::sort_for_rebuild(fork_dir, &mut paths);
+
+        if let Some(cutoff) = branch_ulid {
+            paths.retain(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+        }
+
+        if fetched_paths.is_empty() && paths.is_empty() {
+            continue;
+        }
+
+        // Load the verifying key only when this layer has segments to check.
+        let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
+
         for path in &fetched_paths {
             let segment_id = path
                 .file_stem()
@@ -155,17 +178,18 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             let segment_id = ulid::Ulid::from_string(segment_id)
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .to_string();
-            let (body_section_start, entries) = match segment::read_segment_index(path) {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warn!(
-                        "segment vanished during rebuild (GC race): {}",
-                        path.display()
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            let (body_section_start, entries) =
+                match segment::read_and_verify_segment_index(path, &vk) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        warn!(
+                            "segment vanished during rebuild (GC race): {}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 if entry.is_dedup_ref || entry.is_inline {
                     continue;
@@ -187,21 +211,6 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             }
         }
 
-        // Process pending/ and segments/ (absolute offsets). These overwrite
-        // any fetched/ entries for the same hashes.
-        let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
-        paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
-        segment::sort_for_rebuild(fork_dir, &mut paths);
-
-        if let Some(cutoff) = branch_ulid {
-            paths.retain(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-        }
-
         for path in &paths {
             let segment_id = path
                 .file_name()
@@ -212,17 +221,18 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .to_string();
 
-            let (body_section_start, entries) = match segment::read_segment_index(path) {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warn!(
-                        "segment vanished during rebuild (GC race): {}",
-                        path.display()
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            let (body_section_start, entries) =
+                match segment::read_and_verify_segment_index(path, &vk) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        warn!(
+                            "segment vanished during rebuild (GC race): {}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
             for entry in entries {
                 if entry.is_dedup_ref || entry.is_inline {
@@ -252,6 +262,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
 mod tests {
     use super::*;
     use crate::segment::SegmentEntry;
+    use crate::signing;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -265,6 +276,15 @@ mod tests {
             n
         ));
         p
+    }
+
+    /// Write `volume.pub` into `dir` using an ephemeral keypair.
+    /// Returns the signer so the caller can sign segments with it.
+    fn write_test_pub(dir: &std::path::Path) -> std::sync::Arc<dyn crate::segment::SegmentSigner> {
+        let (signer, vk) = signing::generate_ephemeral_signer();
+        crate::segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), &vk.to_bytes())
+            .unwrap();
+        signer
     }
 
     fn h(b: u8) -> blake3::Hash {
@@ -304,6 +324,7 @@ mod tests {
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
+        let signer = write_test_pub(&base);
 
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
@@ -311,7 +332,7 @@ mod tests {
         let bss = segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
             &mut entries,
-            None,
+            signer.as_ref(),
         )
         .unwrap();
 
@@ -330,6 +351,7 @@ mod tests {
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
+        let signer = write_test_pub(&base);
 
         let ref_hash = h(0xAA);
         let data_hash = blake3::hash(b"real data");
@@ -346,7 +368,7 @@ mod tests {
         segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
             &mut entries,
-            None,
+            signer.as_ref(),
         )
         .unwrap();
 
@@ -364,6 +386,7 @@ mod tests {
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
+        let signer = write_test_pub(&base);
 
         let data = vec![0u8; 4096];
         let hash = blake3::hash(&data);
@@ -374,7 +397,7 @@ mod tests {
             segment::write_segment(
                 &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
-                None,
+                signer.as_ref(),
             )
             .unwrap();
         }
@@ -391,7 +414,7 @@ mod tests {
             bss2 = segment::write_segment(
                 &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
                 &mut entries,
-                None,
+                signer.as_ref(),
             )
             .unwrap();
             stored_offset2 = entries[1].stored_offset;
@@ -420,6 +443,7 @@ mod tests {
         let live = temp_dir();
         std::fs::create_dir_all(ancestor.join("segments")).unwrap();
         std::fs::create_dir_all(live.join("pending")).unwrap();
+        let signer = write_test_pub(&ancestor);
 
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
@@ -432,7 +456,7 @@ mod tests {
             bss = segment::write_segment(
                 &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
-                None,
+                signer.as_ref(),
             )
             .unwrap();
             stored_offset = entries[0].stored_offset;

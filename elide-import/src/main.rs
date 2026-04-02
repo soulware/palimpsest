@@ -112,7 +112,7 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
     let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
         .context("load volume signing key")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(ext4_path, vol_dir, Some(&*signer), |done, total| {
+    elide_core::import::import_image(ext4_path, vol_dir, signer.as_ref(), |done, total| {
         let pct = done * 100 / total;
         if pct != last_pct {
             last_pct = pct;
@@ -203,7 +203,7 @@ async fn run_oci(
     let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
         .context("load volume signing key")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(&ext4_path, vol_dir, Some(&*signer), |done, total| {
+    elide_core::import::import_image(&ext4_path, vol_dir, signer.as_ref(), |done, total| {
         let pct = done * 100 / total;
         if pct != last_pct {
             last_pct = pct;

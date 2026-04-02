@@ -36,6 +36,18 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - This validates the value at the boundary and produces a canonical string if re-serialised (e.g. `Ulid::from_string(s)?.to_string()`, not `s.to_owned()`).
 - The same applies to any structured string: paths, hashes, addresses, IDs.
 
+## Design principles
+
+**No backward compatibility by default.**
+- When a change would break existing on-disk data or behaviour, surface the tradeoff explicitly and discuss it — don't silently add a legacy/optional path to avoid the conversation.
+- The default answer is often "break it": data can be regenerated, tooling can migrate it, and optional paths add permanent complexity.
+- A compatibility path may sometimes be warranted, but it is never free: it adds code complexity, and — critically — it creates execution paths where important operations are skipped, making the system harder to reason about. That cost must be justified explicitly.
+- If backward compatibility is genuinely needed, it should be an explicit, reasoned decision, not a reflex.
+
+**No optional paths for correctness properties.**
+- If a property must hold (e.g. every segment is signed), enforce it unconditionally — no fallback mode, no warn-and-continue.
+- An optional path for a correctness invariant means the invariant doesn't actually hold.
+
 ## Documentation
 
 Design documentation is indexed in `README.md` and lives in `docs/`.

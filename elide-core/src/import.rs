@@ -69,7 +69,7 @@ fn maybe_compress(block: &[u8]) -> Option<Vec<u8>> {
 fn flush_segment(
     segments_dir: &Path,
     entries: &mut Vec<SegmentEntry>,
-    signer: Option<&dyn SegmentSigner>,
+    signer: &dyn SegmentSigner,
 ) -> io::Result<Option<String>> {
     if entries.is_empty() {
         return Ok(None);
@@ -101,7 +101,7 @@ fn flush_segment(
 pub fn import_image(
     image_path: &Path,
     vol_dir: &Path,
-    signer: Option<&dyn SegmentSigner>,
+    signer: &dyn SegmentSigner,
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
     // `vol_dir` may already exist (caller may have created it to write key files
@@ -178,6 +178,7 @@ pub fn import_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -191,6 +192,15 @@ mod tests {
         (tmp, path)
     }
 
+    /// Write `volume.pub` into `dir` using an ephemeral keypair.
+    /// Returns the signer so the caller can sign segments with it.
+    fn setup_vol_pub(dir: &std::path::Path) -> std::sync::Arc<dyn SegmentSigner> {
+        fs::create_dir_all(dir).unwrap();
+        let (signer, vk) = signing::generate_ephemeral_signer();
+        segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), &vk.to_bytes()).unwrap();
+        signer
+    }
+
     #[test]
     fn import_creates_volume_layout() {
         let data_block: [u8; LBA_SIZE] = [0x42u8; LBA_SIZE];
@@ -199,7 +209,8 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("testimport");
-        import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
+        let signer = setup_vol_pub(&vol_dir);
+        import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
 
         // readonly is now in meta.toml (written by caller, not import_image)
         assert!(!vol_dir.join("readonly").exists());
@@ -239,7 +250,8 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("zeroimport");
-        import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
+        let signer = setup_vol_pub(&vol_dir);
+        import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
 
         // All-zero image: no segment files should be written.
         let segs: Vec<_> = fs::read_dir(vol_dir.join("pending")).unwrap().collect();
@@ -254,7 +266,8 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("bad");
-        let err = import_image(&path, &vol_dir, None, |_, _| {}).unwrap_err();
+        let signer = setup_vol_pub(&vol_dir);
+        let err = import_image(&path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("multiple of 4096"));
     }
 
@@ -269,12 +282,13 @@ mod tests {
 
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("readable");
-        import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
+        let signer = setup_vol_pub(&vol_dir);
+        import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
 
-        // Re-open with Volume and verify the blocks.
+        // Re-open with ReadonlyVolume (imported volumes have no volume.key).
         // No ancestors in this test; by_id_dir is unused.
         let by_id = vol_dir.parent().unwrap();
-        let rv = crate::volume::Volume::open(&vol_dir, by_id).unwrap();
+        let rv = crate::volume::ReadonlyVolume::open(&vol_dir, by_id).unwrap();
         let got0 = rv.read(0, 1).unwrap();
         assert_eq!(got0, b0);
         let got1 = rv.read(1, 1).unwrap();
