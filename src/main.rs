@@ -165,6 +165,27 @@ enum VolumeCommand {
         /// Volume size (e.g. "4G", "512M")
         #[arg(long)]
         size: Option<String>,
+        /// Port for the NBD server (exposes the volume over NBD on first start)
+        #[arg(long)]
+        nbd_port: Option<u16>,
+        /// Address to bind the NBD server (default: 127.0.0.1)
+        #[arg(long)]
+        nbd_bind: Option<String>,
+    },
+
+    /// Update configuration for a running volume
+    Update {
+        /// Volume name
+        name: String,
+        /// Change the NBD server port (restarts the volume process)
+        #[arg(long)]
+        nbd_port: Option<u16>,
+        /// Change the NBD bind address (restarts the volume process)
+        #[arg(long)]
+        nbd_bind: Option<String>,
+        /// Disable NBD serving (removes nbd.port and nbd.bind, restarts the volume process)
+        #[arg(long)]
+        no_nbd: bool,
     },
 
     /// Show the running status of a volume
@@ -371,8 +392,15 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Create { name, size } => {
-                if let Err(e) = create_volume(&args.data_dir, &name, size.as_deref()) {
+            VolumeCommand::Create {
+                name,
+                size,
+                nbd_port,
+                nbd_bind,
+            } => {
+                if let Err(e) =
+                    create_volume(&args.data_dir, &name, size.as_deref(), nbd_port, nbd_bind)
+                {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -380,6 +408,19 @@ fn main() {
                     eprintln!(
                         "warning: coordinator unreachable; volume will be picked up on next scan"
                     );
+                }
+            }
+
+            VolumeCommand::Update {
+                name,
+                nbd_port,
+                nbd_bind,
+                no_nbd,
+            } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = update_volume(&vol_dir, nbd_port, nbd_bind, no_nbd) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
                 }
             }
 
@@ -643,7 +684,13 @@ fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Result<()> {
+fn create_volume(
+    data_dir: &Path,
+    name: &str,
+    size: Option<&str>,
+    nbd_port: Option<u16>,
+    nbd_bind: Option<String>,
+) -> std::io::Result<()> {
     validate_volume_name(name)?;
     let size_str =
         size.ok_or_else(|| std::io::Error::other("--size is required (e.g. --size 4G)"))?;
@@ -674,10 +721,73 @@ fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Re
     let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
     elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
 
+    if let Some(port) = nbd_port {
+        std::fs::write(vol_dir.join("nbd.port"), port.to_string())?;
+        if let Some(bind) = nbd_bind {
+            std::fs::write(vol_dir.join("nbd.bind"), bind)?;
+        }
+    }
+
     std::fs::create_dir_all(&by_name_dir)?;
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
 
     println!("{}", vol_dir.display());
+    Ok(())
+}
+
+/// Update configuration for a volume and restart it if running.
+///
+/// Writes or removes nbd.port / nbd.bind, then sends `shutdown` to the volume's
+/// control socket. The supervisor restarts the process, picking up the new config.
+fn update_volume(
+    vol_dir: &Path,
+    nbd_port: Option<u16>,
+    nbd_bind: Option<String>,
+    no_nbd: bool,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    if no_nbd {
+        let _ = std::fs::remove_file(vol_dir.join("nbd.port"));
+        let _ = std::fs::remove_file(vol_dir.join("nbd.bind"));
+    } else {
+        if let Some(port) = nbd_port {
+            std::fs::write(vol_dir.join("nbd.port"), port.to_string())?;
+        }
+        if let Some(bind) = nbd_bind {
+            std::fs::write(vol_dir.join("nbd.bind"), bind)?;
+        }
+    }
+
+    // Restart the volume process so it picks up the new config.
+    let sock = vol_dir.join("control.sock");
+    match UnixStream::connect(&sock) {
+        Ok(mut stream) => {
+            writeln!(stream, "shutdown")?;
+            stream.flush()?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim();
+            if line == "ok" {
+                println!("volume restarting with new config");
+            } else {
+                return Err(std::io::Error::other(format!("shutdown failed: {line}")));
+            }
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            println!("volume not running; config will take effect on next start");
+        }
+        Err(e) => return Err(e),
+    }
+
     Ok(())
 }
 

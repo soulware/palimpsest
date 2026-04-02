@@ -27,6 +27,10 @@
 //   gc_checkpoint
 //     Flush WAL and return two ULIDs for GC output segments.
 //     Returns "ok <repack_ulid> <sweep_ulid>".
+//
+//   shutdown
+//     Flush WAL and exit cleanly.  Returns "ok" then terminates the process.
+//     The supervisor restarts the volume, picking up any updated config files.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -137,6 +141,17 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
                 let _ = writeln!(writer, "err {e}");
             }
         }
+    } else if line == "shutdown" {
+        match handle.flush() {
+            Ok(()) => {
+                let _ = writeln!(writer, "ok");
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+                return;
+            }
+        }
+        std::process::exit(0);
     } else {
         let _ = writeln!(writer, "err unknown op: {line}");
     }
