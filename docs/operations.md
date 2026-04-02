@@ -106,7 +106,7 @@ If `fetch.toml` is absent, the following sources are tried in order:
 
 If none of these are present, demand-fetch is disabled and reads of missing segment bodies fail with "segment not found".
 
-**Current implementation note:** demand-fetch currently downloads the entire segment body in one GET. The `.present` bitset is written with all bits set (full body present). Partial fetching (range-GETs for individual extents) is a future optimisation.
+**Fetch granularity:** demand-fetch issues a range-GET for only the extents needed, not the full segment body. When a specific extent is required, the fetcher scans forward from that entry collecting contiguous, not-yet-present adjacent entries into a batch (up to 256 KiB by default, configurable via `fetch_batch_bytes` in `fetch.toml`). A single range-GET covers the batch; bytes are written into `.body` at the correct offset and the `.present` bitset is updated for all fetched entries. The `.body` file may appear as large as the full segment because it is written as a sparse file at the extent's body offset — only the fetched regions contain actual data.
 
 
 **Next step: automatic eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
