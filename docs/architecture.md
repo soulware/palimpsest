@@ -775,7 +775,17 @@ This invariant is what makes ULID total-order sufficient for all correctness gua
 - **GC ULID assignment:** `max(inputs).increment()` is safe because any write that occurs *during* compaction comes from the one writer, gets a timestamp from the current wall clock, and is therefore far ahead of the old `max(inputs)` timestamp (which has already passed through the drain pipeline). No locking is required.
 - **Ancestor cutoff:** the branch-point ULID is a stable boundary because the ancestor's writer cannot insert segments retroactively below it.
 
-The single-writer property is enforced by the signing key: only the host holding `volume.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at segment-open verification time (both local and demand-fetch). See [formats.md](formats.md) — *Fork ownership and signing*.
+The single-writer property and crash safety are enforced through ULID ordering and signing verification. Only the volume process holding `volume.key` can produce valid segment signatures; any unsigned or incorrectly-signed segment will be rejected at read time.
+
+**Signing trust boundary:** signature verification is enforced on all segments in `pending/` and `segments/`. Every file in those directories was either:
+- Written directly by the volume process itself at WAL promotion time (signed with `volume.key`), or
+- Produced by the coordinator's GC handoff protocol: the coordinator creates compacted segments in `gc/<ulid>` (signed with an ephemeral key), uploads them to S3, and returns a handoff file to the volume. The volume re-signs these segments with `volume.key` before moving them into `segments/`, ensuring `segments/` is always a fully-trusted zone.
+
+This protocol keeps the private key (`volume.key`) on the volume host and prevents the coordinator from forging new data.
+
+**Known gap — demand-fetched segments:** segments in `fetched/` (pulled from S3 on demand) are not currently verified against `volume.pub`. The fetch path uses `read_segment_index` (unverified) rather than `read_and_verify_segment_index`. As a result, a tampered S3 object would not be detected when it enters the local read path. This gap pre-dates the mandatory-signing work; extending verification to the fetch path is deferred and tracked as a known gap. The intended fix is to verify content integrity (hash checks) and re-sign with `volume.key` when a fetched segment is promoted into the local cache.
+
+See [formats.md](formats.md) — *Fork ownership and signing*.
 
 The ULID monotonicity invariant and crash-recovery correctness are verified by property-based tests using proptest. See [testing.md](testing.md) for the simulation model, the two properties tested, and a concrete bug these tests found and fixed.
 
