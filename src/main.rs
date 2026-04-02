@@ -1016,13 +1016,27 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
     }
 
     // Check no GC handoff is in flight.
+    //
+    // Both .pending and .applied must block eviction:
+    //   .pending — volume has not yet acknowledged the handoff; the new segment
+    //              may not exist in segments/ yet.
+    //   .applied — volume acknowledged but coordinator has not yet uploaded the
+    //              new segment to S3 or deleted the old ones; evicting the new
+    //              segment now would make those LBAs unreadable.
     let gc_dir = vol_dir.join("gc");
     if gc_dir.exists() {
         for entry in std::fs::read_dir(&gc_dir)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().ends_with(".pending") {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".pending") {
                 return Err(std::io::Error::other(
                     "GC handoff in flight (gc/*.pending exists) — wait for it to complete before evicting",
+                ));
+            }
+            if name.ends_with(".applied") {
+                return Err(std::io::Error::other(
+                    "GC handoff not yet uploaded (gc/*.applied exists) — wait for the coordinator to finish before evicting",
                 ));
             }
         }
@@ -1039,6 +1053,86 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_vol(tmp: &TempDir) -> std::path::PathBuf {
+        let vol = tmp.path().to_path_buf();
+        fs::create_dir_all(vol.join("pending")).unwrap();
+        fs::create_dir_all(vol.join("segments")).unwrap();
+        fs::create_dir_all(vol.join("gc")).unwrap();
+        vol
+    }
+
+    #[test]
+    fn evict_clean_state_removes_segments() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        fs::write(
+            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
+            b"seg1",
+        )
+        .unwrap();
+        fs::write(
+            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA2"),
+            b"seg2",
+        )
+        .unwrap();
+        let n = evict_segments(&vol).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(fs::read_dir(vol.join("segments")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn evict_blocked_by_pending_dir_nonempty() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        fs::write(
+            vol.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
+            b"wal",
+        )
+        .unwrap();
+        let err = evict_segments(&vol).unwrap_err();
+        assert!(err.to_string().contains("pending/"), "{err}");
+    }
+
+    #[test]
+    fn evict_blocked_by_gc_pending() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        fs::write(
+            vol.join("gc").join("01AAAAAAAAAAAAAAAAAAAAAAA1.pending"),
+            b"",
+        )
+        .unwrap();
+        let err = evict_segments(&vol).unwrap_err();
+        assert!(err.to_string().contains("gc/*.pending"), "{err}");
+    }
+
+    #[test]
+    fn evict_blocked_by_gc_applied() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        // Volume has renamed .pending → .applied: handoff acknowledged but coordinator
+        // has not yet uploaded the new segment or deleted old ones.
+        fs::write(
+            vol.join("gc").join("01AAAAAAAAAAAAAAAAAAAAAAA1.applied"),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
+            b"seg",
+        )
+        .unwrap();
+        let err = evict_segments(&vol).unwrap_err();
+        assert!(err.to_string().contains("gc/*.applied"), "{err}");
+    }
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
