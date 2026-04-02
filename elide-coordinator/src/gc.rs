@@ -47,8 +47,12 @@
 //   - After step 2, before step 3: coordinator re-runs upload + cleanup
 //     (S3 put and 404-on-delete are both idempotent).
 //
-//   All-dead segments bypass the protocol entirely: no extent index entries
-//   reference them, so the coordinator deletes S3 + local files directly.
+//   All-dead segments (no live entries, no extent index references) use a
+//   tombstone handoff: the coordinator writes a .pending file with only
+//   "dead <ulid>" lines.  The volume acknowledges (no-op), writes .applied,
+//   and the coordinator deletes on the next tick.  Direct deletion is unsafe
+//   because the coordinator's liveness view (on-disk .idx files) may lag the
+//   volume's in-memory LBA map.
 //
 // A pass is deferred if any .pending files already exist (at most one
 // outstanding GC result per fork at a time).
@@ -71,6 +75,7 @@ use object_store::ObjectStore;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
+use elide_core::gc::{HandoffLine, format_handoff_file};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::segment::{self, SegmentEntry};
 use elide_core::volume::latest_snapshot;
@@ -288,24 +293,27 @@ pub async fn apply_done_handoffs(
         Ulid::from_string(new_ulid_str)
             .map_err(|e| anyhow::anyhow!("invalid ULID in gc filename '{name}': {e}"))?;
 
-        // Collect the unique old segment ULIDs referenced in the handoff file.
-        // Format: <hash_hex> <old_ulid> <new_ulid> <new_absolute_offset>
+        // Parse the handoff file into typed HandoffLines.
         let content =
             fs::read_to_string(entry.path()).with_context(|| format!("reading {name}"))?;
 
         let mut old_ulids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut is_repack = false;
         for line in content.lines() {
-            let mut parts = line.split_whitespace();
-            parts.next(); // hash
-            if let Some(old_ulid) = parts.next() {
-                old_ulids.insert(old_ulid.to_owned());
+            match elide_core::gc::HandoffLine::parse(line) {
+                Some(elide_core::gc::HandoffLine::Repack { old_ulid, .. }) => {
+                    is_repack = true;
+                    old_ulids.insert(old_ulid.to_string());
+                }
+                Some(elide_core::gc::HandoffLine::Remove { old_ulid, .. }) => {
+                    old_ulids.insert(old_ulid.to_string());
+                }
+                Some(elide_core::gc::HandoffLine::Dead { old_ulid }) => {
+                    old_ulids.insert(old_ulid.to_string());
+                }
+                None => {}
             }
         }
-
-        // Determine whether this is a repack handoff (has 4-field carried lines)
-        // or a removal-only handoff (all 2-field lines, no output segment).
-        // A removal-only handoff has no new segment file; a repack handoff must.
-        let is_repack = content.lines().any(|l| l.split_whitespace().count() >= 4);
 
         // Upload the volume-signed compacted segment to S3.  This happens here
         // rather than in the compact pass so that S3 always receives the version
@@ -612,37 +620,49 @@ async fn compact_segments(
     }
 
     if all_live.is_empty() && all_removed.is_empty() {
-        // All candidates are fully dead and no extent index entries reference
-        // these segments, so no volume handoff is needed.  Delete old S3
-        // objects and local files directly.
+        // All candidates are fully dead: no live extents and no extent index
+        // references.  The coordinator's liveness view is based on on-disk
+        // .idx files; the volume's in-memory LBA map may be ahead (writes
+        // between gc_checkpoint and gc_fork are invisible to the coordinator).
+        // Deleting directly would create a window where the volume reads a
+        // segment the coordinator has already deleted.
+        //
+        // Instead, write a tombstone .pending file so the volume can
+        // acknowledge before the coordinator deletes — the same handoff
+        // protocol used for all other GC operations.
+        fs::create_dir_all(gc_dir).context("creating gc dir")?;
+        let mut handoff_lines = Vec::new();
         for candidate in &candidates {
-            let key = segment_key(volume_id, &candidate.ulid_str)?;
-            match store.delete(&key).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    return Err(anyhow::anyhow!(e)
-                        .context(format!("deleting dead S3 object {}", candidate.ulid_str)));
-                }
-            }
-            let _ = fs::remove_file(&candidate.path);
+            let old_ulid =
+                Ulid::from_string(&candidate.ulid_str).context("parsing candidate ulid")?;
+            handoff_lines.push(HandoffLine::Dead { old_ulid });
         }
+        let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
+        let tmp_path = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
+        fs::write(&tmp_path, format_handoff_file(handoff_lines))
+            .context("writing tombstone handoff")?;
+        fs::rename(&tmp_path, &pending_path).context("committing tombstone handoff")?;
         return Ok(());
     }
 
     if all_live.is_empty() {
         // No live entries to compact, but the extent index still references
         // some hashes in these segments (extent-live, LBA-dead). Write a
-        // handoff file with only removed entries so the volume can clean the
+        // handoff file with only remove entries so the volume can clean the
         // dangling extent index entries before the old files are deleted.
         fs::create_dir_all(gc_dir).context("creating gc dir")?;
-        let mut lines = String::new();
-        for (hash, old_ulid) in &all_removed {
-            lines.push_str(&format!("{hash} {old_ulid}\n"));
+        let mut handoff_lines = Vec::new();
+        for (hash, old_ulid_str) in &all_removed {
+            let old_ulid = Ulid::from_string(old_ulid_str).context("parsing removed ulid")?;
+            handoff_lines.push(HandoffLine::Remove {
+                hash: *hash,
+                old_ulid,
+            });
         }
         let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
         let tmp_path = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
-        fs::write(&tmp_path, lines).context("writing removal-only handoff")?;
+        fs::write(&tmp_path, format_handoff_file(handoff_lines))
+            .context("writing removal-only handoff")?;
         fs::rename(&tmp_path, &pending_path).context("committing removal-only handoff")?;
         return Ok(());
     }
@@ -688,23 +708,30 @@ async fn compact_segments(
         .await
         .context("staging compacted segment in gc/")?;
 
-    // Write the handoff file.
-    // Carried entries (4 fields): <hash> <old_ulid> <new_ulid> <offset>
-    // Removed entries (2 fields): <hash> <old_ulid>
-    let mut lines = String::new();
-    for ((old_ulid, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
+    // Write the handoff file using the typed HandoffLine format.
+    let new_ulid = Ulid::from_string(new_ulid_str).context("parsing new ulid")?;
+    let mut handoff_lines: Vec<HandoffLine> = Vec::new();
+    for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
+        let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
         let new_offset = new_body_section_start + new_entry.stored_offset;
-        lines.push_str(&format!(
-            "{} {} {} {}\n",
-            old_entry.hash, old_ulid, new_ulid_str, new_offset,
-        ));
+        handoff_lines.push(HandoffLine::Repack {
+            hash: old_entry.hash,
+            old_ulid,
+            new_ulid,
+            new_offset,
+        });
     }
-    for (hash, old_ulid) in &all_removed {
-        lines.push_str(&format!("{} {}\n", hash, old_ulid));
+    for (hash, old_ulid_str) in &all_removed {
+        let old_ulid = Ulid::from_string(old_ulid_str).context("parsing removed ulid")?;
+        handoff_lines.push(HandoffLine::Remove {
+            hash: *hash,
+            old_ulid,
+        });
     }
     let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
     let pending_tmp = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
-    fs::write(&pending_tmp, &lines).with_context(|| format!("writing gc result {new_ulid_str}"))?;
+    fs::write(&pending_tmp, format_handoff_file(handoff_lines))
+        .with_context(|| format!("writing gc result {new_ulid_str}"))?;
     fs::rename(&pending_tmp, &pending_path)
         .with_context(|| format!("committing gc result {new_ulid_str}"))?;
 
@@ -732,6 +759,7 @@ fn has_pending_results(gc_dir: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use elide_core::gc::{HandoffLine, format_handoff_file};
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
@@ -879,11 +907,11 @@ mod tests {
         fs::create_dir_all(&gc_dir).unwrap();
         fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
-        let new_ulid = Ulid::from_parts(1000, 1).to_string();
-        let old_ulid = Ulid::from_parts(999, 0).to_string();
+        let new_ulid = Ulid::from_parts(1000, 1);
+        let old_ulid = Ulid::from_parts(999, 0);
+        let hash = blake3::Hash::from_hex("a".repeat(64)).unwrap();
 
-        let hash_hex = "a".repeat(64);
-        let content = format!("{hash_hex} {old_ulid} {new_ulid} 1234\n");
+        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
         let applied_path = gc_dir.join(format!("{new_ulid}.applied"));
         fs::write(&applied_path, &content).unwrap();
 
@@ -906,19 +934,19 @@ mod tests {
         fs::create_dir_all(&gc_dir).unwrap();
         fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
-        let new_ulid = Ulid::from_parts(1000, 1).to_string();
-        let old_ulid = Ulid::from_parts(999, 0).to_string();
+        let new_ulid = Ulid::from_parts(1000, 1);
+        let old_ulid = Ulid::from_parts(999, 0);
 
         let store = make_store();
-        let key = segment_key("vol", &old_ulid).unwrap();
+        let key = segment_key("vol", &old_ulid.to_string()).unwrap();
         store
             .put(&key, bytes::Bytes::from("old segment data").into())
             .await
             .unwrap();
         assert!(store.get(&key).await.is_ok());
 
-        let hash_hex = "b".repeat(64);
-        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        let hash = blake3::Hash::from_hex("b".repeat(64)).unwrap();
+        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
@@ -938,12 +966,12 @@ mod tests {
         fs::create_dir_all(&gc_dir).unwrap();
         fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
-        let new_ulid = Ulid::from_parts(1000, 2).to_string();
-        let old_ulid = Ulid::from_parts(999, 1).to_string();
+        let new_ulid = Ulid::from_parts(1000, 2);
+        let old_ulid = Ulid::from_parts(999, 1);
 
         let store = make_store();
-        let hash_hex = "c".repeat(64);
-        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        let hash = blake3::Hash::from_hex("c".repeat(64)).unwrap();
+        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
@@ -961,16 +989,16 @@ mod tests {
         fs::create_dir_all(&gc_dir).unwrap();
         fs::create_dir_all(&segments_dir).unwrap();
 
-        let new_ulid = Ulid::from_parts(1000, 3).to_string();
-        let old_ulid = Ulid::from_parts(999, 2).to_string();
+        let new_ulid = Ulid::from_parts(1000, 3);
+        let old_ulid = Ulid::from_parts(999, 2);
 
-        let old_local = segments_dir.join(&old_ulid);
+        let old_local = segments_dir.join(old_ulid.to_string());
         fs::write(&old_local, "old local segment").unwrap();
         assert!(old_local.exists());
 
         let store = make_store();
-        let hash_hex = "d".repeat(64);
-        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        let hash = blake3::Hash::from_hex("d".repeat(64)).unwrap();
+        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
@@ -991,38 +1019,47 @@ mod tests {
         fs::create_dir_all(&gc_dir).unwrap();
         fs::create_dir_all(&segments_dir).unwrap();
 
-        let new_ulid = Ulid::from_parts(1000, 4).to_string();
-        let old_a = Ulid::from_parts(998, 0).to_string();
-        let old_b = Ulid::from_parts(999, 0).to_string();
+        let new_ulid = Ulid::from_parts(1000, 4);
+        let old_a = Ulid::from_parts(998, 0);
+        let old_b = Ulid::from_parts(999, 0);
 
         let store = make_store();
-        for ulid_str in [&old_a, &old_b] {
-            let key = segment_key("vol", ulid_str).unwrap();
+        for old in [old_a, old_b] {
+            let key = segment_key("vol", &old.to_string()).unwrap();
             store
                 .put(&key, bytes::Bytes::from("data").into())
                 .await
                 .unwrap();
-            fs::write(segments_dir.join(ulid_str), "data").unwrap();
+            fs::write(segments_dir.join(old.to_string()), "data").unwrap();
         }
 
-        let h1 = "e".repeat(64);
-        let h2 = "f".repeat(64);
-        let content = format!("{h1} {old_a} {new_ulid} 0\n{h2} {old_b} {new_ulid} 4096\n");
+        let h1 = blake3::Hash::from_hex("e".repeat(64)).unwrap();
+        let h2 = blake3::Hash::from_hex("f".repeat(64)).unwrap();
+        let content = format_handoff_file([
+            HandoffLine::Remove {
+                hash: h1,
+                old_ulid: old_a,
+            },
+            HandoffLine::Remove {
+                hash: h2,
+                old_ulid: old_b,
+            },
+        ]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
-        for ulid_str in [&old_a, &old_b] {
-            let key = segment_key("vol", ulid_str).unwrap();
+        for old in [old_a, old_b] {
+            let key = segment_key("vol", &old.to_string()).unwrap();
             assert!(
                 store.get(&key).await.is_err(),
-                "{ulid_str} S3 object should be deleted"
+                "{old} S3 object should be deleted"
             );
             assert!(
-                !segments_dir.join(ulid_str).exists(),
-                "{ulid_str} local file should be removed"
+                !segments_dir.join(old.to_string()).exists(),
+                "{old} local file should be removed"
             );
         }
         assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
@@ -1037,9 +1074,10 @@ mod tests {
 
         let store = make_store();
         for i in 1u64..=3 {
-            let new_ulid = Ulid::from_parts(1000 + i, 0).to_string();
-            let old_ulid = Ulid::from_parts(999 + i, 0).to_string();
-            let content = format!("{} {old_ulid} {new_ulid} 0\n", "a".repeat(64));
+            let new_ulid = Ulid::from_parts(1000 + i, 0);
+            let old_ulid = Ulid::from_parts(999 + i, 0);
+            let hash = blake3::Hash::from_hex("a".repeat(64)).unwrap();
+            let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
             fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
         }
 
@@ -1079,8 +1117,8 @@ mod tests {
 
         let signer = setup_vol_pub(tmp.path());
 
-        let new_ulid = Ulid::from_parts(1000, 10).to_string();
-        let old_ulid = Ulid::from_parts(999, 9).to_string();
+        let new_ulid = Ulid::from_parts(1000, 10);
+        let old_ulid = Ulid::from_parts(999, 9);
 
         // Write a properly volume-signed segment to segments/<new_ulid>.
         let entry = elide_core::segment::SegmentEntry::new_data(
@@ -1091,14 +1129,19 @@ mod tests {
             b"payload".to_vec(),
         );
         elide_core::segment::write_segment(
-            &segments_dir.join(&new_ulid),
+            &segments_dir.join(new_ulid.to_string()),
             &mut vec![entry],
             signer.as_ref(),
         )
         .unwrap();
 
-        let hash_hex = "a".repeat(64);
-        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        let hash = blake3::Hash::from_hex("a".repeat(64)).unwrap();
+        let content = format_handoff_file([HandoffLine::Repack {
+            hash,
+            old_ulid,
+            new_ulid,
+            new_offset: 0,
+        }]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let store = make_store();
@@ -1108,7 +1151,7 @@ mod tests {
         assert_eq!(n, 1);
 
         // Segment should be in S3.
-        let key = segment_key("vol", &new_ulid).unwrap();
+        let key = segment_key("vol", &new_ulid.to_string()).unwrap();
         assert!(store.get(&key).await.is_ok(), "segment should be in S3");
         assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
     }
@@ -1127,11 +1170,11 @@ mod tests {
 
         // …but sign the segment with a different (ephemeral) keypair.
         let (wrong_signer, _) = elide_core::signing::generate_ephemeral_signer();
-        let new_ulid = Ulid::from_parts(1000, 11).to_string();
-        let old_ulid = Ulid::from_parts(999, 10).to_string();
+        let new_ulid = Ulid::from_parts(1000, 11);
+        let old_ulid = Ulid::from_parts(999, 10);
 
         elide_core::segment::write_segment(
-            &segments_dir.join(&new_ulid),
+            &segments_dir.join(new_ulid.to_string()),
             &mut vec![elide_core::segment::SegmentEntry::new_data(
                 blake3::hash(b"payload"),
                 0,
@@ -1143,8 +1186,13 @@ mod tests {
         )
         .unwrap();
 
-        let hash_hex = "b".repeat(64);
-        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        let hash = blake3::Hash::from_hex("b".repeat(64)).unwrap();
+        let content = format_handoff_file([HandoffLine::Repack {
+            hash,
+            old_ulid,
+            new_ulid,
+            new_offset: 0,
+        }]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let store = make_store();
@@ -1157,7 +1205,7 @@ mod tests {
         );
 
         // Segment must NOT be in S3.
-        let key = segment_key("vol", &new_ulid).unwrap();
+        let key = segment_key("vol", &new_ulid.to_string()).unwrap();
         assert!(
             store.get(&key).await.is_err(),
             "bad segment must not be uploaded"
@@ -1324,7 +1372,13 @@ mod tests {
             .unwrap();
 
         // Write the tombstone .applied file (volume has acknowledged).
-        let content = format!("dead {old_ulid}\n");
+        let old_ulid_typed = Ulid::from_string(&old_ulid).unwrap();
+        let content = format!(
+            "{}\n",
+            HandoffLine::Dead {
+                old_ulid: old_ulid_typed
+            }
+        );
         fs::write(gc_dir.join(format!("{handoff_ulid}.applied")), content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)

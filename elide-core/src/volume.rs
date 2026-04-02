@@ -849,18 +849,25 @@ impl Volume {
             // Validate the ULID so we never act on a malformed filename.
             Ulid::from_string(new_ulid).map_err(|e| io::Error::other(e.to_string()))?;
 
-            // Parse the .pending file to learn which old segment each extent
-            // came from.  We only update the extent index if it still points
-            // at the old segment — if a newer write has landed since GC ran,
-            // the current entry is more recent and must not be overwritten.
+            // Parse the .pending file into typed HandoffLines.
+            //
+            // old_ulid_by_hash maps each hash to the old segment it came from
+            // so the extent index can be updated only when it still points at
+            // the old segment.  Dead lines carry no hash — they are a no-op
+            // from the volume's perspective (just an acknowledgment).
             let pending_content = fs::read_to_string(entry.path())?;
             let mut old_ulid_by_hash: HashMap<blake3::Hash, String> = HashMap::new();
+            let mut is_tombstone = false;
             for line in pending_content.lines() {
-                let mut parts = line.split_whitespace();
-                if let (Some(hash_hex), Some(old_ulid)) = (parts.next(), parts.next())
-                    && let Ok(hash) = blake3::Hash::from_hex(hash_hex)
-                {
-                    old_ulid_by_hash.insert(hash, old_ulid.to_owned());
+                match crate::gc::HandoffLine::parse(line) {
+                    Some(crate::gc::HandoffLine::Repack { hash, old_ulid, .. })
+                    | Some(crate::gc::HandoffLine::Remove { hash, old_ulid }) => {
+                        old_ulid_by_hash.insert(hash, old_ulid.to_string());
+                    }
+                    Some(crate::gc::HandoffLine::Dead { .. }) => {
+                        is_tombstone = true;
+                    }
+                    None => {}
                 }
             }
 
@@ -886,17 +893,20 @@ impl Volume {
 
             let segment_exists = segment_path.try_exists()?;
 
-            // If the segment still doesn't exist, we can only process removal-only
-            // handoffs (all 2-field lines).  Handoffs with carried entries
-            // (4-field lines) need the segment for extent index updates —
-            // defer until it's available locally (e.g. fetched from S3).
-            // Empty handoffs (nothing to do) are also deferred.
+            // If the new segment doesn't exist locally, only some handoff
+            // types can proceed without it:
+            //   tombstone — no segment ever exists; just acknowledge.
+            //   removal-only — no segment needed; just clean extent index.
+            //   repack — needs the segment for extent index updates;
+            //            defer until available (e.g. fetched from S3).
             if !segment_exists {
-                let has_removals = !old_ulid_by_hash.is_empty();
-                let has_carried = pending_content
-                    .lines()
-                    .any(|l| l.split_whitespace().count() >= 4);
-                if has_carried || !has_removals {
+                let has_carried = pending_content.lines().any(|l| {
+                    matches!(
+                        crate::gc::HandoffLine::parse(l),
+                        Some(crate::gc::HandoffLine::Repack { .. })
+                    )
+                });
+                if !is_tombstone && (has_carried || old_ulid_by_hash.is_empty()) {
                     continue;
                 }
             }
@@ -3410,17 +3420,23 @@ mod tests {
             segment::write_segment(&tmp_path, &mut entries, ephemeral_signer.as_ref()).unwrap();
         fs::rename(&tmp_path, gc_dir.join(&new_ulid)).unwrap();
 
-        let mut lines = String::new();
-        for e in &entries {
-            if !e.is_dedup_ref {
-                let abs_offset = new_bss + e.stored_offset;
-                lines.push_str(&format!(
-                    "{} {} {} {}\n",
-                    e.hash, old_ulid, new_ulid, abs_offset
-                ));
-            }
-        }
-        fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines).unwrap();
+        let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
+        let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
+        let handoff_lines: Vec<crate::gc::HandoffLine> = entries
+            .iter()
+            .filter(|e| !e.is_dedup_ref)
+            .map(|e| crate::gc::HandoffLine::Repack {
+                hash: e.hash,
+                old_ulid: old_ulid_parsed,
+                new_ulid: new_ulid_parsed,
+                new_offset: new_bss + e.stored_offset,
+            })
+            .collect();
+        fs::write(
+            gc_dir.join(format!("{new_ulid}.pending")),
+            crate::gc::format_handoff_file(handoff_lines),
+        )
+        .unwrap();
 
         new_ulid
     }

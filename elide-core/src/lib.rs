@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod extentindex;
+pub mod gc;
 pub mod import;
 pub mod lbamap;
 pub mod segment;

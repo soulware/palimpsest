@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use elide_core::gc::{HandoffLine, format_handoff_file};
 use elide_core::{extentindex, lbamap, segment, signing};
 use ulid::Ulid;
 
@@ -132,11 +133,17 @@ fn compact_candidates_inner(
 
     if all_entries.is_empty() {
         // Only extent-index removals — no output segment needed.
-        let mut lines = String::new();
-        for (hash, old_ulid) in &removed {
-            lines.push_str(&format!("{} {}\n", hash, old_ulid));
-        }
-        let _ = fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines);
+        let handoff_lines: Vec<HandoffLine> = removed
+            .iter()
+            .map(|(hash, old_ulid)| HandoffLine::Remove {
+                hash: *hash,
+                old_ulid: *old_ulid,
+            })
+            .collect();
+        let _ = fs::write(
+            gc_dir.join(format!("{new_ulid}.pending")),
+            format_handoff_file(handoff_lines),
+        );
         let consumed = candidates.iter().map(|(u, _)| *u).collect();
         let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
         return Some((consumed, new_ulid, to_delete));
@@ -153,20 +160,27 @@ fn compact_candidates_inner(
         };
     fs::rename(&tmp_path, &final_path).ok()?;
 
-    let mut lines = String::new();
-    for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
-        if !e.is_dedup_ref {
-            let abs_offset = new_bss + e.stored_offset;
-            lines.push_str(&format!(
-                "{} {} {} {}\n",
-                e.hash, src_ulid, new_ulid, abs_offset
-            ));
-        }
-    }
+    let mut handoff_lines: Vec<HandoffLine> = all_entries
+        .iter()
+        .zip(source_ulids.iter())
+        .filter(|(e, _)| !e.is_dedup_ref)
+        .map(|(e, src_ulid)| HandoffLine::Repack {
+            hash: e.hash,
+            old_ulid: *src_ulid,
+            new_ulid,
+            new_offset: new_bss + e.stored_offset,
+        })
+        .collect();
     for (hash, old_ulid) in &removed {
-        lines.push_str(&format!("{} {}\n", hash, old_ulid));
+        handoff_lines.push(HandoffLine::Remove {
+            hash: *hash,
+            old_ulid: *old_ulid,
+        });
     }
-    let _ = fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines);
+    let _ = fs::write(
+        gc_dir.join(format!("{new_ulid}.pending")),
+        format_handoff_file(handoff_lines),
+    );
 
     let consumed = candidates.iter().map(|(u, _)| *u).collect();
     let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
