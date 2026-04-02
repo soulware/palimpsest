@@ -1228,4 +1228,118 @@ mod tests {
         assert!(pending.exists());
         assert!(applied.exists());
     }
+
+    // --- tombstone handoff tests ---
+    //
+    // These tests pin the invariant that all-dead segments must go through the
+    // handoff protocol rather than being deleted directly by the coordinator.
+    //
+    // compact_segments_all_dead_writes_tombstone deliberately fails with the
+    // current code (which deletes directly) and must pass after the fix.
+
+    #[tokio::test]
+    async fn compact_segments_all_dead_writes_tombstone() {
+        // Regression test for the all-dead direct-deletion race:
+        // when compact_segments finds no live entries and no removed hashes,
+        // the coordinator's liveness view may lag the volume's in-memory LBA
+        // map.  Deleting the segment directly can corrupt the volume.  Instead,
+        // compact_segments must write a tombstone .pending file and wait for
+        // the volume to acknowledge before deletion.
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        let old_ulid = Ulid::from_parts(999, 20).to_string();
+        let handoff_ulid = Ulid::from_parts(1000, 20).to_string();
+
+        // Create a fake segment file — read_extent_bodies opens the file even
+        // when live_entries is empty, so the path must exist.
+        let old_seg_path = segments_dir.join(&old_ulid);
+        fs::write(&old_seg_path, b"fake dead segment").unwrap();
+
+        let store = make_store();
+        let candidate = SegmentStats {
+            ulid_str: old_ulid.clone(),
+            path: old_seg_path.clone(),
+            file_size: 17,
+            live_bytes: 0,
+            total_body_bytes: 17,
+            live_entries: Vec::new(),
+            removed_hashes: Vec::new(),
+            body_section_start: 0,
+        };
+
+        compact_segments(vec![candidate], &gc_dir, "vol", &store, &handoff_ulid)
+            .await
+            .unwrap();
+
+        // The segment must NOT have been deleted directly — the volume has not
+        // acknowledged the handoff yet so it may still be reading from it.
+        assert!(
+            old_seg_path.exists(),
+            "all-dead segment must not be deleted directly — tombstone handoff required \
+             (coordinator deletion invariant)"
+        );
+
+        // A tombstone .pending file must have been written so the volume can
+        // acknowledge before the coordinator deletes.
+        let pending_path = gc_dir.join(format!("{handoff_ulid}.pending"));
+        assert!(
+            pending_path.exists(),
+            "tombstone .pending file must be written for all-dead segments"
+        );
+        let content = fs::read_to_string(&pending_path).unwrap();
+        assert!(
+            content
+                .lines()
+                .any(|l| l.starts_with("dead ") && l.contains(&old_ulid)),
+            "pending file must contain 'dead <old_ulid>' line; got: {content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_tombstone_applied_deletes_old_no_upload() {
+        // When apply_done_handoffs processes a tombstone .applied file
+        // (written after the volume acknowledges a dead-<ulid> handoff),
+        // it must delete the old local segment and any S3 object, but must
+        // NOT attempt to upload a new segment (there is none).
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        let old_ulid = Ulid::from_parts(999, 21).to_string();
+        let handoff_ulid = Ulid::from_parts(1000, 21).to_string();
+
+        // Place the old segment in both local storage and S3.
+        let old_local = segments_dir.join(&old_ulid);
+        fs::write(&old_local, b"dead segment data").unwrap();
+        let store = make_store();
+        let s3_key = segment_key("vol", &old_ulid).unwrap();
+        store
+            .put(&s3_key, bytes::Bytes::from("dead segment data").into())
+            .await
+            .unwrap();
+
+        // Write the tombstone .applied file (volume has acknowledged).
+        let content = format!("dead {old_ulid}\n");
+        fs::write(gc_dir.join(format!("{handoff_ulid}.applied")), content).unwrap();
+
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 1, "one tombstone handoff should complete");
+        assert!(!old_local.exists(), "old local segment must be deleted");
+        assert!(
+            store.get(&s3_key).await.is_err(),
+            "old S3 object must be deleted"
+        );
+        assert!(
+            gc_dir.join(format!("{handoff_ulid}.done")).exists(),
+            ".done file must be written"
+        );
+    }
 }
