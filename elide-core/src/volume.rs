@@ -614,7 +614,14 @@ impl Volume {
             .transpose()?;
 
         let pending_dir = self.base_dir.join("pending");
-        let seg_paths = segment::collect_segment_files(&pending_dir)?;
+        let mut seg_paths = segment::collect_segment_files(&pending_dir)?;
+        // Sort by filename (ULID) ascending so entries appear oldest-first in
+        // the merged output.  rebuild_segments applies entries in sequence and
+        // the last entry wins for each LBA, so this guarantees the most-recent
+        // write takes precedence even when two candidates both cover the same LBA
+        // with the same data hash (hash-based liveness keeps both alive but
+        // ordering ensures the correct one survives crash+rebuild).
+        seg_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         let mut candidate_paths: Vec<std::path::PathBuf> = Vec::new();
         let mut merged_live: Vec<segment::SegmentEntry> = Vec::new();

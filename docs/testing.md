@@ -398,6 +398,54 @@ locations only.  A dead dedup ref means the LBA has been overwritten, but the
 DATA body for the shared hash is still live (referenced by whichever LBA owns
 the DATA entry).
 
+### Third bug found: `sweep_pending` non-deterministic merge order corrupts LBA after crash
+
+`actor_correctness` found a data-corruption bug where `sweep_pending` produced
+a merged segment with stale LBA data surviving crash+rebuild.  Proptest shrunk
+the failure to this sequence:
+
+```
+Write { lba: 1, seed: 10 }   -- H10 → pending/W_a
+Flush
+Write { lba: 1, seed: 123 }  -- H123; overwrites lba 1
+Write { lba: 2, seed: 235 }
+Flush                         -- pending/W_b: DATA(lba=1, H123), DATA(lba=2, H235)
+Flush                         -- pending/W_c: DATA(lba=0, H206)
+Write { lba: 7, seed: 10 }   -- WAL; H10 is now live again (different LBA)
+SweepPending                  -- merges W_a + W_b + W_c → W_c
+Crash                         -- rebuild: lba 1 returns [10; 4096] not [123; 4096]
+```
+
+**What happened:**
+
+1. After the second `Write { lba: 7, seed: 10 }`, hash H10 is in `live_hashes`
+   (because lba 7 maps to H10).
+2. `sweep_pending` uses hash-based liveness: it classifies segment W_a's
+   `DATA(lba=1, H10)` as **live** because H10 is in `live_hashes`, even though
+   lba 1 was overwritten and no longer maps to H10.
+3. Both the stale entry `DATA(lba=1, H10)` (from W_a) and the correct entry
+   `DATA(lba=1, H123)` (from W_b) end up in `merged_live` and are written into
+   the merged output segment.
+4. `collect_segment_files` returns files in OS/filesystem order, which is not
+   guaranteed to be ULID order.  On this run, W_b's entries were written before
+   W_a's entries in the merged segment.
+5. `rebuild_segments` applies entries in file-sequential order with last-write-wins
+   semantics.  With the stale entry appearing last (`[10; 4096]` after `[123; 4096]`),
+   lba 1 was set to the wrong value.
+
+**Why the tombstone change exposed it:**  the bug predates tombstone support.
+Adding tombstone writes to the simulation helper changed the timing of filesystem
+operations (a `create_dir_all` and a file write per GC pass), which shifted the
+OS `read_dir` ordering just enough that the same proptest regression seeds now
+produced the wrong merge order consistently.  Without the tombstone change the
+same sequences happened to produce a safe ordering on this filesystem.
+
+**Fix:** sort `seg_paths` by filename (ULID) ascending in `sweep_pending` before
+the merge loop.  Since ULIDs encode write order, this guarantees oldest entries
+appear first in `merged_live` and therefore first in the output segment.
+`rebuild_segments` then always applies the most-recent write last — the correct
+last-write-wins result — regardless of how the OS orders `read_dir` results.
+
 ---
 
 ## Concurrent integration test

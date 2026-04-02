@@ -123,13 +123,24 @@ fn compact_candidates_inner(
         }
     }
 
+    let _ = fs::create_dir_all(&gc_dir);
+
     if all_entries.is_empty() && removed.is_empty() {
+        // All candidates were entirely dead.  Write a tombstone .pending so
+        // apply_gc_handoffs exercises the Dead acknowledgment path, matching
+        // the real coordinator's tombstone protocol.
+        let handoff_lines: Vec<HandoffLine> = candidates
+            .iter()
+            .map(|(ulid, _)| HandoffLine::Dead { old_ulid: *ulid })
+            .collect();
+        let _ = fs::write(
+            gc_dir.join(format!("{new_ulid}.pending")),
+            format_handoff_file(handoff_lines),
+        );
         let consumed = candidates.iter().map(|(u, _)| *u).collect();
         let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
         return Some((consumed, new_ulid, to_delete));
     }
-
-    let _ = fs::create_dir_all(&gc_dir);
 
     if all_entries.is_empty() {
         // Only extent-index removals — no output segment needed.
