@@ -73,11 +73,19 @@ impl HandoffLine {
     }
 }
 
+impl IntoIterator for HandoffLine {
+    type Item = HandoffLine;
+    type IntoIter = std::iter::Once<HandoffLine>;
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self)
+    }
+}
+
 /// Serialize `HandoffLine`s into file content (one line each).
 ///
 /// This is the canonical way to write a `.pending` file.  Accepts any
-/// `IntoIterator<Item = HandoffLine>` — pass a `Vec`, an array, or a single
-/// item wrapped in `std::iter::once`.
+/// `IntoIterator<Item = HandoffLine>` — pass a single line, a `Vec`, or an
+/// array.
 ///
 /// Parsing is done line-by-line with `HandoffLine::parse`.
 pub fn format_handoff_file(lines: impl IntoIterator<Item = HandoffLine>) -> String {

@@ -911,7 +911,7 @@ mod tests {
         let old_ulid = Ulid::from_parts(999, 0);
         let hash = blake3::Hash::from_hex("a".repeat(64)).unwrap();
 
-        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
+        let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         let applied_path = gc_dir.join(format!("{new_ulid}.applied"));
         fs::write(&applied_path, &content).unwrap();
 
@@ -946,7 +946,7 @@ mod tests {
         assert!(store.get(&key).await.is_ok());
 
         let hash = blake3::Hash::from_hex("b".repeat(64)).unwrap();
-        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
+        let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
@@ -971,7 +971,7 @@ mod tests {
 
         let store = make_store();
         let hash = blake3::Hash::from_hex("c".repeat(64)).unwrap();
-        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
+        let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
@@ -998,7 +998,7 @@ mod tests {
 
         let store = make_store();
         let hash = blake3::Hash::from_hex("d".repeat(64)).unwrap();
-        let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
+        let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
@@ -1077,7 +1077,7 @@ mod tests {
             let new_ulid = Ulid::from_parts(1000 + i, 0);
             let old_ulid = Ulid::from_parts(999 + i, 0);
             let hash = blake3::Hash::from_hex("a".repeat(64)).unwrap();
-            let content = format_handoff_file([HandoffLine::Remove { hash, old_ulid }]);
+            let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
             fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
         }
 
