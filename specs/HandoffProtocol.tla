@@ -7,22 +7,31 @@
   The coordinator compacts segments and hands the result to the volume via a
   three-step file sequence:
 
-      Step 1 — Coordinator stages the compacted segment and signals the volume:
-        gc/<ulid>          (segment, signed with an ephemeral key)
-        gc/<ulid>.pending  (text file: carried + removed entries; written last
-                            via tmp-rename, so .pending is never visible without
-                            the segment already being present)
+      Step 1 — Coordinator stages the compacted segment (if any) and signals
+               the volume:
+        gc/<ulid>          (segment, signed with an ephemeral key; omitted for
+                            removal-only and tombstone handoffs)
+        gc/<ulid>.pending  (text file: carried + removed + dead entries; written
+                            last via tmp-rename, so .pending is never visible
+                            without the segment already being present when one
+                            is needed)
 
       Step 2 — Volume re-signs and applies:
         a. Re-signs gc/<ulid> with its own key, writes segments/<ulid>, deletes
-           gc/<ulid>.
-        b. Applies extent index patches (carried → "gc", removed → "gone"),
+           gc/<ulid>.  Skipped for removal-only and tombstone handoffs (no
+           staged segment).
+        b. Applies extent index patches (repack → "gc", remove → "gone"),
            with a per-entry guard: skip if a concurrent write has already
            superseded the hash.
-        c. Renames gc/<ulid>.pending → gc/<ulid>.applied.
+        c. For tombstone entries ("dead <old_ulid>"): verifies from the volume's
+           own perspective that no LBA map or extent index entry references the
+           named segment.  This is a no-op in the normal case; its purpose is
+           to provide the volume's acknowledgment before deletion.
+        d. Renames gc/<ulid>.pending → gc/<ulid>.applied.
 
       Step 3 — Coordinator cleans up:
         a. Uploads segments/<ulid> (the volume-signed version) to S3.
+           Skipped for removal-only and tombstone handoffs.
         b. Deletes old S3 objects and old local segment files.
         c. Renames gc/<ulid>.applied → gc/<ulid>.done.
 
@@ -30,9 +39,45 @@
     - Coordinator: Steps 1 and 3
     - Volume:      Step 2
 
-  A handoff file contains two kinds of entries (by hash):
-    - Carried (4-field): extent moved from old segment to GCOutput
-    - Removed (2-field): extent index entry deleted (LBA-dead; no output segment)
+  A handoff file contains three kinds of entries:
+    - Carried (repack): extent moved from old segment to GCOutput
+    - Removed (remove): extent index entry deleted (LBA-dead; no output segment)
+    - Dead (dead):      entire old segment is all-dead; no output segment;
+                        no extent index patches needed.  The volume's role is
+                        purely to acknowledge deletion is safe.
+
+  TOMBSTONE HANDOFFS
+  ------------------
+  A tombstone handoff (Dead # {}, Carried = {}, Removed = {}) arises when the
+  coordinator's liveness analysis determines that a segment has no live extents
+  and no extent index entries at all.  In this case there is nothing to compact
+  or patch — the old segment can simply be deleted.
+
+  The coordinator must NOT delete directly.  Its liveness analysis is based on
+  on-disk index files; the volume's in-memory LBA map may be ahead (writes
+  between the last gc_checkpoint WAL flush and the end of the GC pass are not
+  yet visible on disk).  Direct deletion without the volume's acknowledgment
+  caused a "segment not found" bug in practice when the coordinator wrongly
+  classified a live segment as all-dead.
+
+  The tombstone handoff closes this gap: the coordinator writes a .pending file
+  with only "dead <old_ulid>" lines and waits for the volume to apply it (.applied)
+  before deleting.  The volume confirms from its own state that no references
+  exist — a no-op in the common case — providing the safety acknowledgment.
+
+  COORDINATOR DELETION INVARIANT
+  -------------------------------
+  No segment (local or S3) is ever deleted without the volume's acknowledgment
+  via the handoff protocol.  This invariant is captured by:
+
+    OldOnlyDeletedAfterApplied:
+      The old segment is absent only after the handoff has reached "done".
+      Since "done" is only reachable via "applied", and "applied" requires the
+      volume to have run VolumeFinishApply, the old segment is only deleted
+      after the volume has explicitly acknowledged the handoff.
+
+  This invariant is checked for all three handoff types (repack, removal-only,
+  tombstone) by TLC.
 
   WHY TWO SEGMENT FILES?
   ----------------------
@@ -45,11 +90,18 @@
   WHAT WE CHECK
   -------------
   TLC exhaustively explores every reachable state — including all crash/restart
-  interleavings and concurrent writes — and verifies that the two safety
+  interleavings and concurrent writes — and verifies that the three safety
   invariants hold in all of them:
 
-    NoSegmentNotFound  — the extent index never references a missing segment
-    NoLostData         — segments are only removed when no extent points to them
+    NoSegmentNotFound         — the extent index never references a missing segment
+    NoLostData                — segments are only removed when no extent points to them
+    OldOnlyDeletedAfterApplied — the old segment is absent only after handoff = "done"
+
+  The third invariant directly encodes the coordinator deletion invariant: no
+  deletion without the volume's acknowledgment.  The first two cover correctness
+  of extent index state.  All three apply to all three handoff types; for
+  tombstone handoffs (Carried = {}, Removed = {}) the first two are vacuously
+  true (Hashes = {}) and the third is the binding constraint.
 
   HOW TO READ THIS
   ----------------
@@ -62,16 +114,31 @@
     - Spec: Init ∧ □[Next]_vars  (always, Next fires or no variable changes)
 
   TLC checks that every state reachable from Init satisfies the INVARIANTS.
+
+  INSTANTIATION EXAMPLES
+  ----------------------
+  Standard repack handoff (carried + removed):
+    Carried <- {h1, h2},  Removed <- {h3},  Dead <- FALSE
+
+  Removal-only handoff (no output segment):
+    Carried <- {},         Removed <- {h1},  Dead <- FALSE
+
+  Tombstone handoff (all-dead segment, no hashes):
+    Carried <- {},         Removed <- {},    Dead <- TRUE
 *)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
-  Carried,   \* set of hashes whose extents are moved to GCOutput (4-field entries)
-  Removed    \* set of hashes whose extent entries are deleted   (2-field entries)
+  Carried,   \* set of hashes whose extents are moved to GCOutput (repack entries)
+  Removed,   \* set of hashes whose extent entries are deleted    (remove entries)
+  Dead       \* TRUE iff this is a tombstone handoff (dead entry; Carried = Removed = {})
+             \* For standard handoffs instantiate with FALSE.
+             \* For tombstone handoffs instantiate with TRUE; Carried and Removed must be {}.
 
-\* The two sets must be disjoint; at least one must be non-empty.
+\* Pairwise disjoint; at least one must contribute to the handoff.
 ASSUME Carried \cap Removed = {}
-ASSUME Carried \cup Removed # {}
+ASSUME Dead => (Carried = {} /\ Removed = {})
+ASSUME Carried \cup Removed # {} \/ Dead
 
 VARIABLES
   handoff,       \* state of the gc/<ulid>.{pending,applied,done} marker file
@@ -85,8 +152,10 @@ VARIABLES
                  \*   "gc"   — updated to point to GCOutput   (Carried hashes only)
                  \*   "gone" — entry removed from extent index (Removed hashes only)
                  \*   "new"  — a concurrent write superseded this entry
+                 \* For tombstone handoffs Hashes = {} so this map is empty.
 
-  old_present,   \* TRUE iff the old (input) segment file is still present
+  old_present,   \* TRUE iff the old (input) segment file is still present.
+                 \* For tombstone handoffs this is the all-dead segment being deleted.
   gc_seg_present, \* TRUE iff gc/<ulid> (ephemeral-signed staged segment) is present
   new_seg_present, \* TRUE iff segments/<ulid> (volume-signed GC output) is present
   coord_up,      \* TRUE iff the coordinator is currently running
@@ -134,7 +203,12 @@ Init ==
   always finds both files together when it sees .pending.
 
   Removal-only handoffs (Carried = {}) produce no staged segment; gc_seg_present
-  stays FALSE and the volume applies only the 2-field removal entries.
+  stays FALSE and the volume applies only the remove entries.
+
+  Tombstone handoffs (Dead = TRUE, Carried = {}, Removed = {}) also produce no
+  staged segment.  The .pending file contains only "dead <old_ulid>" lines.
+  The volume applies the tombstone (a no-op from its perspective) to provide
+  its acknowledgment that deletion is safe.
 *)
 CoordWritePending ==
   /\ coord_up
@@ -145,14 +219,19 @@ CoordWritePending ==
 
 (*
   Step 3: Coordinator sees .applied.  Uploads segments/<ulid> (the volume-signed
-  version) to S3, deletes old S3 objects and old local segment files, then
-  renames .applied → .done.  Modelled as one atomic step because each S3 DELETE
-  is idempotent (404 = success), so a crash mid-cleanup is safe: on restart the
-  coordinator retries from .applied and the net effect is the same.
+  version) to S3 if a new segment was produced, deletes old S3 objects and old
+  local segment files, then renames .applied → .done.  Modelled as one atomic
+  step because each S3 DELETE is idempotent (404 = success), so a crash
+  mid-cleanup is safe: on restart the coordinator retries from .applied and the
+  net effect is the same.
 
   By the time handoff = "applied" the volume has processed every entry
   (VolumeFinishApply's precondition guarantees it), so no extent points to
   "old" any more.  It is safe to remove the old segment.
+
+  For tombstone handoffs the volume's apply was a no-op (no extent patches),
+  but the .applied marker still serves as the acknowledgment that the volume
+  has confirmed no live references exist from its perspective.
 
   S3 upload state is not modelled (no S3 variable); the upload happens before
   deletion and is safe to retry.  new_seg_present stays TRUE — extents in the
@@ -199,6 +278,9 @@ CoordRestart ==
   to fire again only if gc_seg_present is still TRUE.  After a crash-and-restart
   where segments/<ulid> already exists, the volume will find gc/<ulid> still
   present (gc_seg_present = TRUE) and re-sign idempotently, then proceed.
+
+  For removal-only and tombstone handoffs gc_seg_present = FALSE throughout, so
+  VolumeReSigns never fires — correctly, as there is no staged segment to re-sign.
 *)
 VolumeReSigns ==
   /\ vol_up
@@ -219,7 +301,7 @@ VolumeReSigns ==
   output could overwrite a newer write's extent index entry.
 
   Precondition new_seg_present: the volume needs the re-signed segment in
-  segments/ before it can apply carried entries.  Removal-only entries
+  segments/ before it can apply carried entries.  Removal entries
   (Removed) do not need this.
 *)
 VolumeApplyCarried(h) ==
@@ -257,6 +339,13 @@ VolumeApplyRemoved(h) ==
       (or Carried = {}, so no staged segment was written).  This ensures
       segments/<ulid> is always the canonical location before signalling the
       coordinator to clean up old files.
+
+  For tombstone handoffs (Dead = TRUE, Carried = {}, Removed = {}):
+    - Both universals are vacuously true (Hashes = {})
+    - gc_seg_present = FALSE throughout (no staged segment)
+    - VolumeFinishApply fires immediately after CoordWritePending
+    - This models the volume's acknowledgment: it has checked its own state
+      and confirmed deletion is safe
 
   If the volume crashes before this rename, the .pending file is still there
   on restart: the volume re-applies from scratch.  Per-entry application is
@@ -303,6 +392,12 @@ VolumeRestart ==
   We do not model superseding "gone" or "new" — those hashes are no longer
   owned by the old segment and a further write is out of scope for this
   protocol.
+
+  For tombstone handoffs Hashes = {} so NewerWrite never fires.  This is
+  correct: if the coordinator's liveness analysis said a segment is all-dead,
+  there are no hashes in Carried or Removed to write to.  The tombstone
+  protocol does not need to handle concurrent writes to those hashes because
+  there are none.
 *)
 NewerWrite(h) ==
   /\ extent[h] \in {"old", "gc"}
@@ -354,6 +449,9 @@ Next ==
   The \E-quantified actions get fairness at the existential level: if any
   hash can make progress, some hash will.  This is sufficient for all
   entries to be eventually processed.
+
+  For tombstone handoffs (Hashes = {}) the \E-quantified fairness conditions
+  are vacuously satisfied; progress is driven by VolumeFinishApply alone.
 *)
 Spec ==
   /\ Init
@@ -384,6 +482,9 @@ Spec ==
 
   gc_seg_present (the ephemeral staged segment in gc/) is never referenced by
   any extent entry; it is only a staging area for the re-signing step.
+
+  For tombstone handoffs Hashes = {} so both quantifiers are vacuously true.
+  The binding safety invariant for tombstones is OldOnlyDeletedAfterApplied.
 *)
 NoSegmentNotFound ==
   /\ \A h \in Hashes  : extent[h] = "old"  => old_present
@@ -395,10 +496,37 @@ NoSegmentNotFound ==
 
   The ephemeral gc_seg_present segment is excluded: it is never referenced by
   any extent entry, so its presence or absence does not affect index safety.
+
+  For tombstone handoffs Hashes = {} so both quantifiers are vacuously true.
 *)
 NoLostData ==
   /\ (~old_present     => \A h \in Hashes  : extent[h] # "old")
   /\ (~new_seg_present => \A h \in Carried : extent[h] # "gc")
+
+(*
+  Coordinator deletion invariant: the old segment (including an all-dead
+  tombstone segment) is absent only after the handoff has fully completed.
+
+  Since handoff = "done" is only reachable via handoff = "applied", and
+  "applied" requires the volume to have run VolumeFinishApply, this invariant
+  encodes:
+
+    "The coordinator never deletes a segment without the volume's
+     acknowledgment via the handoff protocol."
+
+  This is the invariant that the previous all-dead direct deletion path
+  violated: it set old_present = FALSE (by deleting the local file) without
+  going through the handoff protocol, which is equivalent to transitioning
+  old_present to FALSE while handoff is still "absent" — a state this
+  invariant forbids.
+
+  This invariant applies to all three handoff types.  For tombstone handoffs
+  it is the primary binding constraint (NoSegmentNotFound and NoLostData are
+  vacuously true).  For repack and removal-only handoffs it provides an
+  additional explicit guarantee on top of those two.
+*)
+OldOnlyDeletedAfterApplied ==
+  ~old_present => handoff = "done"
 
 \* ---------------------------------------------------------------------------
 \* Liveness property
