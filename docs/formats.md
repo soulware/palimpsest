@@ -475,7 +475,7 @@ Each fork has exactly one owner: the host that holds its private key. This is a 
 
 The single-owner property is also a correctness invariant for ULID-ordered rebuild and GC: because only one process writes new segments into a fork directory, ULID timestamps form an unambiguous total order over the write history with no risk of a second writer injecting segments at an arbitrary position in the sequence. See [architecture.md](architecture.md) — *Single-writer invariant*.
 
-**This is not a key management system.** Elide generates an Ed25519 keypair when a fork is created and stores both files in the fork directory. There is no key escrow, rotation, revocation, or HSM integration. The guarantee is simple: a client without the private key cannot produce a valid segment signature for that fork. If `fork.key` is copied to another host, that host becomes an equally valid signer — the single-owner property then depends entirely on the operator keeping the key on one machine.
+**This is not a key management system.** Elide generates an Ed25519 keypair when a writable volume is created and stores the private key in `volume.key`. There is no key escrow, rotation, revocation, or HSM integration. The guarantee is simple: a client without the private key cannot produce a valid segment signature for that volume. If `volume.key` is copied to another host, that host becomes an equally valid signer — the single-owner property then depends entirely on the operator keeping the key on one machine.
 
 The practical value is narrow but real: it catches the common misconfiguration case where a coordinator is pointed at the wrong fork, and it provides per-segment integrity at demand-fetch time. It does not replace proper access control on the S3 bucket.
 
@@ -483,51 +483,64 @@ The practical value is narrow but real: it catches the common misconfiguration c
 
 ### Key files
 
-Every volume root has a key pair. Forks and the imported base each use a different filename prefix so they are visually distinct:
+All volumes use a flat layout with fixed filenames directly in the volume directory. Readonly (imported) volumes have a public key only; writable (forked) volumes have both:
 
 ```
-<vol_dir>/base.key              — Ed25519 private key for the base import (32 bytes; never uploaded)
-<vol_dir>/base.pub              — Ed25519 public key for the base import (32 bytes; uploaded to S3)
-<vol_dir>/base.origin           — hostname + canonical path + signature (local sanity check only)
-
-<vol_dir>/forks/<name>/fork.key    — Ed25519 private key for this fork (32 bytes; never uploaded)
-<vol_dir>/forks/<name>/fork.pub    — Ed25519 public key for this fork (32 bytes; uploaded to S3)
-<vol_dir>/forks/<name>/fork.origin — hostname + canonical path + signature (local sanity check only)
+<vol_dir>/volume.pub        — Ed25519 public key (32 bytes; uploaded to S3; present on all volumes)
+<vol_dir>/volume.provenance — hostname + canonical path + Ed25519 signature (local only; present on all volumes)
+<vol_dir>/volume.key        — Ed25519 private key (32 bytes; never uploaded; absent on readonly volumes)
 ```
 
-S3 locations of public keys:
+S3 location of the public key:
 ```
-<volume_id>/base/base.pub
-<volume_id>/forks/<fork_name>/fork.pub
+by_id/<volume-ulid>/volume.pub
 ```
 
-The `*.origin` files are local-only and never uploaded. They record the hostname and canonical directory path at creation time, signed by the private key, as a cheap sanity check that catches accidental directory copies or coordinator misconfiguration. The `--force-origin` flag on `serve-volume` bypasses this check after an intentional move.
+**Readonly volumes have no private key.** `elide-import` generates an ephemeral keypair in memory, uses it to sign all segments and the provenance file, writes `volume.pub` and `volume.provenance` to disk, then discards the private key. `volume.key` is never written. Since a readonly volume can never accept new writes, the private key has no use after import completes.
 
-The S3 copies of `*.pub` are a convenience for hosts that need to verify ancestor segments they do not own. They are not authoritative — if S3 credentials are compromised an attacker could overwrite them. Locally-pinned public keys (see Verification below) are more trustworthy.
+**`volume.provenance`** records the hostname and canonical directory path at creation or import time, signed by the private key (or ephemeral key for imports). It is local-only and never uploaded. `serve-volume` verifies this file against `volume.pub` on every open — readonly and writable alike — as a sanity check that catches accidental directory copies or coordinator misconfiguration. The `--force-origin` flag bypasses this check after an intentional move.
+
+The S3 copy of `volume.pub` enables a pulling host to verify ancestor segments it does not own. It is not authoritative — a compromised S3 bucket could substitute a different key. Locally-pinned public keys (see Verification below) are more trustworthy.
 
 ### Signing
 
-Every segment is signed by its fork's private key at **promotion time** — when the WAL is promoted to `pending/<ulid>`. The segment file is complete and signed before it leaves the host.
+Every segment is signed. There are no unsigned segments.
+
+**Writable volumes:** signed by the volume's persistent private key (`volume.key`) at **promotion time** — when the WAL is promoted to `pending/<ulid>`. The segment file is complete and signed before it leaves the host.
+
+**Imported readonly volumes:** signed by an ephemeral private key generated in memory by `elide-import`. The key is created before the first segment is written, so all import segments carry a valid signature. The key is discarded after import; `volume.key` is never written to disk.
 
 **Signing input:** `BLAKE3(header[0..32] || index_section_bytes)`
 
 The first 32 bytes of the header (all fields except the 64-byte signature field) are hashed together with the raw bytes of the index section. The signature field at `header[32..96]` is not included — it holds the output.
 
-Signing at promotion rather than upload means every copy of the segment (`pending/`, `segments/`, S3) carries the same signature. The coordinator uploads the file unchanged; no re-signing step.
+Signing at promotion/import rather than upload means every copy of the segment (`pending/`, `segments/`, S3) carries the same signature. The coordinator uploads files unchanged; no re-signing step.
 
 Because the private key never leaves the host, **all segment writes for a fork — including GC-compacted and S3-repacked segments — happen on the fork's host**. GC always produces new segments (new ULIDs) rather than modifying existing ones; signed segments are read-only once written.
 
 The coordinator does not hold fork private keys. For S3 repacking, the coordinator acts as an orchestrator: it identifies which extents to consolidate and describes the desired layout, but delegates the actual segment creation and signing to the elide instance that owns the fork. The elide instance writes, signs, and either returns or directly uploads the new segment. This keeps the private key exclusively on the host and allows the elide instance to validate proposed content before signing it.
 
-**Imported base segments** are signed by `base.key`, generated by `elide-import` at import time. The signing key is created before the first segment is written, so all base segments carry a valid signature. At demand-fetch time a host verifies base segments against the locally-pinned `base.pub`, just as it verifies fork segments against `fork.pub`.
-
 ### Verification
+
+Signature verification happens at **two points**:
+
+**1. Local segment open (LBA map rebuild)**
+
+Every time a volume is opened — by `Volume::open`, `ReadonlyVolume::open`, or either `serve-volume` path — all local segments are read to rebuild the LBA map. Each segment index is verified against `volume.pub` before its entries are accepted into the map:
+
+```
+verify Ed25519(sig, BLAKE3(header[0..32] || index_bytes), volume.pub)
+```
+
+A segment with an invalid or missing signature causes the open to fail hard (`InvalidData`). There is no skip or warn path. The only valid open states are: signature present and correct, or segment absent.
+
+**2. Demand-fetch from S3**
 
 Verification at demand-fetch time requires only the header and index section — the same bytes retrieved in an index-only fetch (`GET [0, inline_offset)`):
 
-1. Verify `sig` against `BLAKE3(header[0..32] || index_bytes)` using the fork's public key — confirms the index was written by the keyholder
+1. Verify `sig` against `BLAKE3(header[0..32] || index_bytes)` using the volume's locally-pinned public key — confirms the index was written by the keyholder
 2. On each subsequent byte-range fetch from the body: verify `BLAKE3(fetched_bytes) == entry.hash` against the signed index — confirms the body bytes are what the keyholder wrote
 
 A segment with a missing, malformed, or invalid signature is rejected: not cached, not served.
 
-**Public key trust:** verification uses a locally-pinned copy of the public key, not the S3 copy. For the live fork this is `forks/<name>/fork.pub` on disk. For ancestor forks (segments written by a parent fork that this host does not own), the public key is fetched from S3 once and pinned locally before demand-fetch is enabled for that ancestor. Trust-on-first-use from S3 is a known limitation — it is weaker than out-of-band key distribution but sufficient for the misconfiguration-detection use case.
+**Public key trust:** both verification paths use the locally-pinned `volume.pub` from disk. For ancestor volumes (segments written by a parent that this host does not own), the public key is fetched from S3 once and pinned locally before demand-fetch is enabled for that ancestor. Trust-on-first-use from S3 is a known limitation — it is weaker than out-of-band key distribution but sufficient for the misconfiguration-detection use case.

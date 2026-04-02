@@ -201,6 +201,7 @@ mod tests {
     use tempfile::TempDir;
 
     use elide_core::segment::{SegmentEntry, write_segment};
+    use elide_core::signing::generate_ephemeral_signer;
 
     /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
     /// Upload the parent segment to the store at the correct by_id/ prefix.
@@ -226,10 +227,11 @@ mod tests {
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let (signer, _) = generate_ephemeral_signer();
         write_segment(
             &parent_dir.join("segments").join(seg_ulid),
             &mut entries,
-            None,
+            signer.as_ref(),
         )
         .unwrap();
 
@@ -291,10 +293,11 @@ mod tests {
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let (signer, _) = generate_ephemeral_signer();
         write_segment(
             &root_dir.join("segments").join(seg_ulid),
             &mut entries,
-            None,
+            signer.as_ref(),
         )
         .unwrap();
 

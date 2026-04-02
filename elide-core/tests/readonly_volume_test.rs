@@ -31,6 +31,7 @@ fn readonly_unwritten_lba_returns_zeros() {
 fn readonly_sees_flushed_pending_not_wal() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // LBA 0: flushed to pending/ — should be visible.
@@ -54,6 +55,7 @@ fn readonly_sees_flushed_pending_not_wal() {
 fn readonly_sees_drained_segments() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     for lba in 0u64..4 {
@@ -74,6 +76,7 @@ fn readonly_sees_drained_segments() {
 fn readonly_sees_data_after_gc() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     for lba in 0u64..4 {
@@ -113,6 +116,7 @@ fn readonly_sees_data_after_gc() {
 fn readonly_returns_latest_flushed_value() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     vol.write(0, &[0x11; 4096]).unwrap();
@@ -138,6 +142,7 @@ fn readonly_fork_sees_ancestor_pending() {
     let by_id = dir.path();
 
     let parent_dir: PathBuf = by_id.join(Ulid::new().to_string());
+    common::write_test_keypair(&parent_dir);
     let mut parent = Volume::open(&parent_dir, by_id).unwrap();
     parent.write(0, &[0xAAu8; 4096]).unwrap();
     parent.flush_wal().unwrap(); // → pending/
@@ -160,6 +165,7 @@ fn readonly_fork_shadows_ancestor() {
 
     // Parent: LBA 0 = 0xAA, LBA 1 = 0xBB.
     let parent_dir: PathBuf = by_id.join(Ulid::new().to_string());
+    common::write_test_keypair(&parent_dir);
     let mut parent = Volume::open(&parent_dir, by_id).unwrap();
     parent.write(0, &[0xAAu8; 4096]).unwrap();
     parent.write(1, &[0xBBu8; 4096]).unwrap();
@@ -197,6 +203,7 @@ fn readonly_two_level_fork_chain() {
 
     // Grandparent: LBA 0 = 0xAA.
     let gp_dir: PathBuf = by_id.join(Ulid::new().to_string());
+    common::write_test_keypair(&gp_dir);
     let mut gp = Volume::open(&gp_dir, by_id).unwrap();
     gp.write(0, &[0xAAu8; 4096]).unwrap();
     gp.flush_wal().unwrap();

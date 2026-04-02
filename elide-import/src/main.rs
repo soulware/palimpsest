@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
+use elide_core::signing::{VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -105,14 +105,16 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
     );
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
-    let key = elide_core::signing::generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
-        .context("generate volume keypair")?;
-    elide_core::signing::write_origin(vol_dir, &key, VOLUME_PROVENANCE_FILE)
-        .context("write volume.provenance")?;
-    let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
-        .context("load volume signing key")?;
+    // Readonly volumes must not have a private key on disk — use an ephemeral
+    // keypair that signs segments during import but is never persisted.
+    let signer = elide_core::signing::setup_readonly_identity(
+        vol_dir,
+        VOLUME_PUB_FILE,
+        VOLUME_PROVENANCE_FILE,
+    )
+    .context("setup volume identity")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(ext4_path, vol_dir, Some(&*signer), |done, total| {
+    elide_core::import::import_image(ext4_path, vol_dir, signer.as_ref(), |done, total| {
         let pct = done * 100 / total;
         if pct != last_pct {
             last_pct = pct;
@@ -196,14 +198,16 @@ async fn run_oci(
     eprintln!("Importing into {}...", vol_dir.display());
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
-    let key = elide_core::signing::generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
-        .context("generate volume keypair")?;
-    elide_core::signing::write_origin(vol_dir, &key, VOLUME_PROVENANCE_FILE)
-        .context("write volume.provenance")?;
-    let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
-        .context("load volume signing key")?;
+    // Readonly volumes must not have a private key on disk — use an ephemeral
+    // keypair that signs segments during import but is never persisted.
+    let signer = elide_core::signing::setup_readonly_identity(
+        vol_dir,
+        VOLUME_PUB_FILE,
+        VOLUME_PROVENANCE_FILE,
+    )
+    .context("setup volume identity")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(&ext4_path, vol_dir, Some(&*signer), |done, total| {
+    elide_core::import::import_image(&ext4_path, vol_dir, signer.as_ref(), |done, total| {
         let pct = done * 100 / total;
         if pct != last_pct {
             last_pct = pct;

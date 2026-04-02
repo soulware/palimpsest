@@ -733,16 +733,13 @@ fn serve_readonly_volume_listener(
 fn run_volume_ipc_only(
     dir: &Path,
     _size_bytes: u64,
-    signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+    _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = match signer {
-        Some(s) => Volume::open_with_signer(dir, s, by_id_dir)?,
-        None => Volume::open(dir, by_id_dir)?,
-    };
+    let mut volume = Volume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
@@ -771,16 +768,13 @@ fn serve_volume_listener(
     dir: &Path,
     size_bytes: u64,
     listener: TcpListener,
-    signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
+    _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = match signer {
-        Some(s) => Volume::open_with_signer(dir, s, by_id_dir)?,
-        None => Volume::open(dir, by_id_dir)?,
-    };
+    let mut volume = Volume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
@@ -1027,6 +1021,13 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!("elide-nbd-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&p).unwrap();
+        elide_core::signing::generate_keypair(
+            &p,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
         p
     }
 
@@ -1350,6 +1351,13 @@ mod tests {
     fn readonly_nbd_read_returns_data() {
         let dir = temp_dir();
         let fork_dir = dir.join("default");
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        elide_core::signing::generate_keypair(
+            &fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
 
         let data: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
 

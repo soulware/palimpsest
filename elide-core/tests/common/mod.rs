@@ -10,8 +10,22 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use elide_core::{extentindex, lbamap, segment};
+use elide_core::{extentindex, lbamap, segment, signing};
 use ulid::Ulid;
+
+/// Create `dir` and write a fresh Ed25519 keypair into it.
+///
+/// Required before `Volume::open` in tests that construct their own directories
+/// (rather than using a `tempfile::TempDir` that already has keys).
+pub fn write_test_keypair(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    elide_core::signing::generate_keypair(
+        dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+}
 
 /// Move all committed segments from pending/ to segments/.
 /// Simulates `drain-pending` (upload + rename) without touching an object store.
@@ -65,7 +79,13 @@ fn compact_candidates_inner(
         return None;
     }
 
-    let segments_dir = fork_dir.join("segments");
+    let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE).ok()?;
+
+    // The coordinator uses an ephemeral signer — it doesn't have the volume's
+    // private key.  The volume re-signs the output segment with its own key
+    // inside apply_gc_handoffs, so the signature here is discarded.
+    let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
+
     let gc_dir = fork_dir.join("gc");
 
     let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
@@ -74,7 +94,7 @@ fn compact_candidates_inner(
 
     for (ulid, path) in &candidates {
         let seg_id = ulid.to_string();
-        let Ok((bss, mut entries)) = segment::read_segment_index(path) else {
+        let Ok((bss, mut entries)) = segment::read_and_verify_segment_index(path, &vk) else {
             continue;
         };
         if segment::read_extent_bodies(path, bss, &mut entries).is_err() {
@@ -122,12 +142,15 @@ fn compact_candidates_inner(
         return Some((consumed, new_ulid, to_delete));
     }
 
-    let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
-    let final_path = segments_dir.join(new_ulid.to_string());
-    let new_bss = match segment::write_segment(&tmp_path, &mut all_entries, None) {
-        Ok(bss) => bss,
-        Err(_) => return None,
-    };
+    // Write the compacted segment to gc/<ulid> — the volume re-signs it when
+    // applying the handoff, at which point it moves to segments/<ulid>.
+    let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+    let final_path = gc_dir.join(new_ulid.to_string());
+    let new_bss =
+        match segment::write_segment(&tmp_path, &mut all_entries, ephemeral_signer.as_ref()) {
+            Ok(bss) => bss,
+            Err(_) => return None,
+        };
     fs::rename(&tmp_path, &final_path).ok()?;
 
     let mut lines = String::new();

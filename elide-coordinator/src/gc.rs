@@ -28,20 +28,24 @@
 //
 // Handoff protocol (crash-safe, filesystem-only coordination):
 //
-//   1. Coordinator writes gc/<new-ulid>.pending (via tmp + rename for atomicity)
-//      — one line per moved extent:
+//   1. Coordinator writes the compacted segment to gc/<new-ulid> (signed with
+//      an ephemeral key — coordinator does not hold the volume's private key),
+//      then writes gc/<new-ulid>.pending (via tmp + rename for atomicity):
 //        <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_offset>
 //
-//   2. Volume reads the new segment's index, applies extent index patches on
-//      its idle tick, renames gc/<new-ulid>.pending → gc/<new-ulid>.applied.
+//   2. Volume re-signs gc/<new-ulid> with its own key, moves it to
+//      segments/<new-ulid>, applies extent index patches, renames
+//      gc/<new-ulid>.pending → gc/<new-ulid>.applied.
 //
-//   3. Coordinator (next GC tick) sees .applied, deletes old S3 objects and
-//      old local segment files from segments/, renames → gc/<new-ulid>.done.
+//   3. Coordinator (next GC tick) sees .applied: uploads segments/<new-ulid>
+//      (the volume-signed version) to S3, deletes old S3 objects and old local
+//      segment files, renames → gc/<new-ulid>.done.
 //
 //   Crash at any step:
 //   - Before step 1 completes: no .pending file; coordinator retries next tick.
 //   - After step 1, before step 2: volume re-applies on next idle tick (idempotent).
-//   - After step 2, before step 3: coordinator re-runs cleanup (S3 404 = success).
+//   - After step 2, before step 3: coordinator re-runs upload + cleanup
+//     (S3 put and 404-on-delete are both idempotent).
 //
 //   All-dead segments bypass the protocol entirely: no extent index entries
 //   reference them, so the coordinator deletes S3 + local files directly.
@@ -149,6 +153,10 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .context("loading volume verifying key")?;
+
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
@@ -158,7 +166,7 @@ pub async fn gc_fork(
         .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
         .transpose()?;
 
-    let mut all_stats = collect_stats(fork_dir, &index, &live_hashes, &lbamap, floor)
+    let mut all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
 
     // Repack: density pass — extract the single least-dense segment.
@@ -167,16 +175,9 @@ pub async fn gc_fork(
     let ran_repack = if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.remove(pos);
         repack_bytes = candidate.dead_bytes();
-        compact_segments(
-            vec![candidate],
-            &gc_dir,
-            fork_dir,
-            volume_id,
-            store,
-            repack_ulid,
-        )
-        .await
-        .context("density compaction")?;
+        compact_segments(vec![candidate], &gc_dir, volume_id, store, repack_ulid)
+            .await
+            .context("density compaction")?;
         true
     } else {
         false
@@ -208,7 +209,7 @@ pub async fn gc_fork(
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
         let sweep_bytes: u64 = small.iter().map(|s| s.dead_bytes()).sum();
-        compact_segments(small, &gc_dir, fork_dir, volume_id, store, sweep_ulid)
+        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid)
             .await
             .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
@@ -299,6 +300,40 @@ pub async fn apply_done_handoffs(
             if let Some(old_ulid) = parts.next() {
                 old_ulids.insert(old_ulid.to_owned());
             }
+        }
+
+        // Upload the volume-signed compacted segment to S3.  This happens here
+        // rather than in the compact pass so that S3 always receives the version
+        // that the volume has re-signed with its own key.  The put is idempotent:
+        // if the coordinator crashes and retries, the same bytes are written again.
+        let new_seg_path = segments_dir.join(new_ulid_str);
+        if new_seg_path
+            .try_exists()
+            .context("checking new segment path")?
+        {
+            // Verify the volume's signature before uploading.  This catches any
+            // case where the volume failed to sign correctly — we refuse to
+            // propagate a bad segment to S3.  Load volume.pub here rather than
+            // at the top of the function so that removal-only handoffs (where
+            // no segment file is written) do not require volume.pub to exist.
+            let vk = elide_core::signing::load_verifying_key(
+                fork_dir,
+                elide_core::signing::VOLUME_PUB_FILE,
+            )
+            .context("loading volume verifying key")?;
+            segment::read_and_verify_segment_index(&new_seg_path, &vk).with_context(|| {
+                format!("signature verification failed for compacted segment {new_ulid_str}")
+            })?;
+
+            let key = segment_key(volume_id, new_ulid_str)
+                .with_context(|| format!("building key for {new_ulid_str}"))?;
+            let data = tokio::fs::read(&new_seg_path)
+                .await
+                .with_context(|| format!("reading compacted segment {new_ulid_str}"))?;
+            store
+                .put(&key, Bytes::from(data).into())
+                .await
+                .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
         }
 
         // Delete old S3 objects.  A 404 means the object is already gone
@@ -435,6 +470,7 @@ impl SegmentStats {
 /// lower ULID than an older GC output) override stale GC-output entries.
 fn collect_stats(
     fork_dir: &Path,
+    vk: &elide_core::signing::VerifyingKey,
     index: &ExtentIndex,
     live_hashes: &HashSet<blake3::Hash>,
     lba_map: &LbaMap,
@@ -459,7 +495,7 @@ fn collect_stats(
         }
 
         let file_size = fs::metadata(&path)?.len();
-        let (body_section_start, entries) = segment::read_segment_index(&path)?;
+        let (body_section_start, entries) = segment::read_and_verify_segment_index(&path, vk)?;
 
         let mut live_bytes: u64 = 0;
         let mut total_body_bytes: u64 = 0;
@@ -526,11 +562,10 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 }
 
 /// Read live extent bodies from each candidate, write a compacted segment,
-/// upload it to S3, and write the gc/*.pending handoff file.
+/// stage it in gc/, and write the gc/*.pending handoff file.
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
-    fork_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     new_ulid_str: &str,
@@ -590,9 +625,7 @@ async fn compact_segments(
     }
 
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
-    let segments_dir = fork_dir.join("segments");
-    // Write to a temp file first; rename into segments/ only after S3 upload
-    // succeeds, so the invariant "segments/ ↔ in S3" is never violated.
+    // Write to a tmp file first; rename into gc/ for staging.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
 
     let mut new_entries: Vec<SegmentEntry> = all_live
@@ -612,25 +645,25 @@ async fn compact_segments(
         })
         .collect();
 
-    // TODO: sign compacted segment with the fork's key.
-    let new_body_section_start = segment::write_segment(&tmp_path, &mut new_entries, None)
-        .context("writing compacted segment")?;
+    // The coordinator does not hold the volume's private key, so it signs the
+    // compacted segment with an ephemeral key.  The volume re-signs it with its
+    // own key inside apply_gc_handoffs, at which point the file moves from gc/
+    // into segments/.  This ensures segments/ always contains only volume-signed
+    // files and extentindex::rebuild never needs to skip verification for
+    // in-transit coordinator output.
+    let (ephemeral_signer, _) = elide_core::signing::generate_ephemeral_signer();
+    let new_body_section_start =
+        segment::write_segment(&tmp_path, &mut new_entries, ephemeral_signer.as_ref())
+            .context("writing compacted segment")?;
 
-    let key = segment_key(volume_id, new_ulid_str)?;
-    let data = tokio::fs::read(&tmp_path)
-        .await
-        .context("reading compacted segment for upload")?;
-    store
-        .put(&key, Bytes::from(data).into())
-        .await
-        .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
-
-    // Upload confirmed: move into segments/ so the volume can read it locally
-    // without a demand-fetch, and so extentindex::rebuild picks it up on restart.
-    let final_path = segments_dir.join(new_ulid_str);
+    // Stage in gc/<ulid> so apply_gc_handoffs can re-sign it and move it into
+    // segments/.  S3 upload happens in apply_done_handoffs, after the volume
+    // has re-signed the segment, so that S3 always receives the volume-signed
+    // version rather than the ephemeral-signed coordinator output.
+    let final_path = gc_dir.join(new_ulid_str);
     tokio::fs::rename(&tmp_path, &final_path)
         .await
-        .context("moving compacted segment into segments/")?;
+        .context("staging compacted segment in gc/")?;
 
     // Write the handoff file.
     // Carried entries (4 fields): <hash> <old_ulid> <new_ulid> <offset>
@@ -996,6 +1029,115 @@ mod tests {
             let name = name.to_str().unwrap();
             assert!(name.ends_with(".done"), "expected .done, got {name}");
         }
+    }
+
+    /// Write `volume.pub` into `dir` using an ephemeral keypair.
+    /// Returns the signer so the caller can sign segments with it.
+    fn setup_vol_pub(dir: &Path) -> Arc<dyn elide_core::segment::SegmentSigner> {
+        fs::create_dir_all(dir).unwrap();
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        fs::write(
+            dir.join(elide_core::signing::VOLUME_PUB_FILE),
+            vk.to_bytes(),
+        )
+        .unwrap();
+        signer
+    }
+
+    #[tokio::test]
+    async fn done_verifies_signature_before_upload() {
+        // A correctly-signed segment must be uploaded to S3 successfully.
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        let signer = setup_vol_pub(tmp.path());
+
+        let new_ulid = Ulid::from_parts(1000, 10).to_string();
+        let old_ulid = Ulid::from_parts(999, 9).to_string();
+
+        // Write a properly volume-signed segment to segments/<new_ulid>.
+        let entry = elide_core::segment::SegmentEntry::new_data(
+            blake3::hash(b"payload"),
+            0,
+            1,
+            0,
+            b"payload".to_vec(),
+        );
+        elide_core::segment::write_segment(
+            &segments_dir.join(&new_ulid),
+            &mut vec![entry],
+            signer.as_ref(),
+        )
+        .unwrap();
+
+        let hash_hex = "a".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let store = make_store();
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Segment should be in S3.
+        let key = segment_key("vol", &new_ulid).unwrap();
+        assert!(store.get(&key).await.is_ok(), "segment should be in S3");
+        assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
+    }
+
+    #[tokio::test]
+    async fn done_rejects_wrong_key_segment() {
+        // A segment signed with the wrong key must not be uploaded.
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        // Set up volume.pub with one keypair…
+        setup_vol_pub(tmp.path());
+
+        // …but sign the segment with a different (ephemeral) keypair.
+        let (wrong_signer, _) = elide_core::signing::generate_ephemeral_signer();
+        let new_ulid = Ulid::from_parts(1000, 11).to_string();
+        let old_ulid = Ulid::from_parts(999, 10).to_string();
+
+        elide_core::segment::write_segment(
+            &segments_dir.join(&new_ulid),
+            &mut vec![elide_core::segment::SegmentEntry::new_data(
+                blake3::hash(b"payload"),
+                0,
+                1,
+                0,
+                b"payload".to_vec(),
+            )],
+            wrong_signer.as_ref(),
+        )
+        .unwrap();
+
+        let hash_hex = "b".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let store = make_store();
+        let err = apply_done_handoffs(tmp.path(), "vol", &store)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "expected signature error, got: {err}"
+        );
+
+        // Segment must NOT be in S3.
+        let key = segment_key("vol", &new_ulid).unwrap();
+        assert!(
+            store.get(&key).await.is_err(),
+            "bad segment must not be uploaded"
+        );
     }
 
     // --- cleanup_done_handoffs tests ---

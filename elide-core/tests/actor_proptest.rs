@@ -102,6 +102,13 @@ proptest! {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
 
+        // Write a keypair so Volume::open can load volume.key.
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        ).unwrap();
+
         let vol = Volume::open(fork_dir, fork_dir).unwrap();
         let (actor, mut handle) = spawn(vol);
         let mut actor_thread = Some(

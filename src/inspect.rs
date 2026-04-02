@@ -693,6 +693,13 @@ mod tests {
         let tmp = temp_vol_dir();
         let by_id_dir = tmp.join("by_id");
         let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
+        fs::create_dir_all(&vol_dir).unwrap();
+        elide_core::signing::generate_keypair(
+            &vol_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
         let _vol = Volume::open(&vol_dir, &by_id_dir).unwrap();
 
         let node = collect_node(&vol_dir, true, false).unwrap();
@@ -710,6 +717,13 @@ mod tests {
         let tmp = temp_vol_dir();
         let by_id_dir = tmp.join("by_id");
         let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
+        fs::create_dir_all(&vol_dir).unwrap();
+        elide_core::signing::generate_keypair(
+            &vol_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
 
         {
             let mut vol = Volume::open(&vol_dir, &by_id_dir).unwrap();

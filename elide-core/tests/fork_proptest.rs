@@ -89,6 +89,9 @@ proptest! {
         let base_dir: PathBuf = by_id.join(base_ulid);
         let child_dir: PathBuf = by_id.join(child_ulid);
 
+        // Write keypair into base_dir so Volume::open can load volume.key.
+        common::write_test_keypair(&base_dir);
+
         let mut base = Volume::open(&base_dir, &by_id).unwrap();
         let mut base_oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 

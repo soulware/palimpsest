@@ -78,7 +78,7 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       volume.readonly                 — present = permanently readonly (imported/frozen)
       volume.size                     — volume size in bytes (plain text)
       volume.pub                      — Ed25519 public key (uploaded to S3)
-      volume.key                      — Ed25519 signing key (never uploaded)
+      volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
       manifest.toml                   — name, size, OCI source metadata
       pending/                        — segments awaiting S3 upload (populated by import)
       segments/                       — segments confirmed in S3 (empty until drain completes)
@@ -90,8 +90,9 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       volume.name                     — "server-1"
       volume.size
       volume.parent                   — "01JQAAAAAAA/snapshots/01JQXXXXX"
-      volume.key
+      volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
       volume.pub
+      volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
@@ -127,6 +128,9 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `by_name/` entries are symlinks only — no real directories
 - `volume.name` is present in every volume; single non-empty line
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
+- `volume.pub` present in every volume — readonly volumes have only `volume.pub` (no `volume.key`); `serve-volume` verifies provenance against it on every open, writable or not
+- `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
+- `volume.provenance` present in every volume — hostname + canonical path + Ed25519 signature over both; signed by the private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
 - `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
@@ -763,7 +767,7 @@ The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fr
 
 ### Single-writer invariant
 
-**Each volume directory has exactly one process that writes new segments into it.** The volume process that holds `volume.key` is the sole writer of `pending/` and `segments/` for that volume. The coordinator writes only to `gc/` and promotes results into `segments/` after S3 confirmation. Crucially, it derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
+**Each volume directory has exactly one process that writes new segments into it.** The volume process that holds `volume.key` is the sole writer of `pending/` and `segments/` for that volume. The coordinator writes only to `gc/` (staging area for compacted segments); the volume re-signs coordinator output and promotes it into `segments/`. Crucially, the coordinator derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
 
 This invariant is what makes ULID total-order sufficient for all correctness guarantees in rebuild, GC, and ancestor cutoff:
 
@@ -771,7 +775,17 @@ This invariant is what makes ULID total-order sufficient for all correctness gua
 - **GC ULID assignment:** `max(inputs).increment()` is safe because any write that occurs *during* compaction comes from the one writer, gets a timestamp from the current wall clock, and is therefore far ahead of the old `max(inputs)` timestamp (which has already passed through the drain pipeline). No locking is required.
 - **Ancestor cutoff:** the branch-point ULID is a stable boundary because the ancestor's writer cannot insert segments retroactively below it.
 
-The single-writer property is enforced by the signing key: only the host holding `volume.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at demand-fetch verification time. See [formats.md](formats.md) — *Volume ownership and signing*.
+The single-writer property and crash safety are enforced through ULID ordering and signing verification. Only the volume process holding `volume.key` can produce valid segment signatures; any unsigned or incorrectly-signed segment will be rejected at read time.
+
+**Signing trust boundary:** signature verification is enforced on all segments in `pending/` and `segments/`. Every file in those directories was either:
+- Written directly by the volume process itself at WAL promotion time (signed with `volume.key`), or
+- Produced by the coordinator's GC handoff protocol: the coordinator creates compacted segments in `gc/<ulid>` (signed with an ephemeral key) and writes a `gc/<ulid>.pending` handoff file. The volume re-signs `gc/<ulid>` with `volume.key` and moves it into `segments/` before applying extent index patches. Only after the volume signals completion (`.applied`) does the coordinator upload the volume-signed segment to S3 and delete old files. This ensures `segments/` is always a fully-trusted zone and S3 always receives the volume-signed version.
+
+This protocol keeps the private key (`volume.key`) on the volume host and prevents the coordinator from forging new data.
+
+**Known gap — demand-fetched segments:** segments in `fetched/` (pulled from S3 on demand) are not currently verified against `volume.pub`. The fetch path uses `read_segment_index` (unverified) rather than `read_and_verify_segment_index`. As a result, a tampered S3 object would not be detected when it enters the local read path. This gap pre-dates the mandatory-signing work; extending verification to the fetch path is deferred and tracked as a known gap. The intended fix is to verify content integrity (hash checks) and re-sign with `volume.key` when a fetched segment is promoted into the local cache.
+
+See [formats.md](formats.md) — *Fork ownership and signing*.
 
 The ULID monotonicity invariant and crash-recovery correctness are verified by property-based tests using proptest. See [testing.md](testing.md) for the simulation model, the two properties tested, and a concrete bug these tests found and fixed.
 
@@ -815,9 +829,9 @@ Background promotes that fail (I/O error, disk full) are logged and do not crash
 
 **Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
 
-The volume actor processes `gc/*.pending` files on its idle tick. For each file it reads the compacted segment's index to get authoritative `body_offset`, `body_length`, and `compressed` values (the handoff file records the new absolute offset but omits length and compression flag), updates the in-memory extent index (updating carried entries, removing LBA-dead entries), and renames the file to `.applied`. Removal-only handoffs (all 2-field lines, no output segment) are applied immediately without waiting for the segment to be present. Handoffs with carried entries (4-field lines) are deferred until `segments/<new-ulid>` is available locally. No `flush_gen` bump is needed — GC moves data between segment files only, so body offsets remain absolute and the fd cache's existing segment-id mismatch detection handles eviction naturally when reads switch from the old segment to the new one. The update is idempotent: if the process is killed before the rename, the handoff is re-applied on the next idle tick with identical extent index results.
+The volume actor processes `gc/*.pending` files on its idle tick. For each file it first re-signs the staged segment: reads `gc/<ulid>` (ephemeral-signed by the coordinator), writes a volume-signed copy to `segments/<ulid>`, then deletes `gc/<ulid>`. Only after re-signing does it read the compacted segment's index to get authoritative `body_offset`, `body_length`, and `compressed` values (the handoff file records the new absolute offset but omits length and compression flag), update the in-memory extent index (updating carried entries, removing LBA-dead entries), and rename the file to `.applied`. Removal-only handoffs (all 2-field lines, no output segment) skip the re-sign step and are applied immediately. The re-sign step is idempotent: if the process is killed after writing `segments/<ulid>` but before deleting `gc/<ulid>`, both files are present on restart and the volume re-signs (overwriting `segments/<ulid>` with identical content) before proceeding. If the process is killed before the final rename, the handoff is re-applied on the next idle tick with identical results. No `flush_gen` bump is needed — GC moves data between segment files only, so body offsets remain absolute and the fd cache's existing segment-id mismatch detection handles eviction naturally when reads switch from the old segment to the new one.
 
-The coordinator processes `gc/*.applied` files at the start of each GC tick. For each `.applied` file it parses the old segment ULIDs from the handoff content, deletes the corresponding S3 objects, removes the old local segment files from `segments/`, and renames the file to `.done`. S3 404 on delete is treated as success (idempotent across coordinator crashes). The `.done` files are retained for a 7-day window (useful for post-mortem: which segments were compacted and when) and then deleted by a TTL cleanup pass that runs each tick.
+The coordinator processes `gc/*.applied` files at the start of each GC tick. For each `.applied` file it parses the new and old segment ULIDs from the handoff content, uploads `segments/<new-ulid>` (the volume-signed segment) to S3, deletes the corresponding old S3 objects, removes the old local segment files from `segments/`, and renames the file to `.done`. S3 404 on delete is treated as success (idempotent across coordinator crashes). The `.done` files are retained for a 7-day window (useful for post-mortem: which segments were compacted and when) and then deleted by a TTL cleanup pass that runs each tick.
 
 **Ownership of local `segments/` deletion:** the coordinator — not the volume — deletes local segment files from `segments/`. This follows from the credential split: the coordinator owns all S3 mutations, and `segments/` files are local caches of S3 objects the coordinator uploaded. The volume never deletes from `segments/`; if it needs data after the coordinator has removed a local cache file, it demand-fetches from S3.
 

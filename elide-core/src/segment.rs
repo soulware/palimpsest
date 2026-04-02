@@ -14,7 +14,7 @@
 //   16..20 inline_length u32 le; 0 if no inline data
 //   20..28 body_length   u64 le
 //   28..32 delta_length  u32 le; 0 for locally-stored files
-//   32..96 signature     Ed25519 sig over BLAKE3(header[0..32] || index_bytes); zeros if unsigned
+//   32..96 signature     Ed25519 sig over BLAKE3(header[0..32] || index_bytes)
 //
 // Index entry format:
 //   hash       (32 bytes) BLAKE3 extent hash
@@ -44,6 +44,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use ed25519_dalek::{Signature, VerifyingKey};
 
 // --- constants ---
 
@@ -205,9 +207,8 @@ impl SegmentEntry {
 /// body, and fsyncs before returning. `path` should be the `.tmp` path; the
 /// caller renames it to the final name after this returns.
 ///
-/// If `signer` is provided the segment is signed: the 64-byte Ed25519
-/// signature over `BLAKE3(header[0..32] || index_bytes)` is written at
-/// `header[32..96]`. Without a signer the signature field is all zeros.
+/// The segment is signed: the 64-byte Ed25519 signature over
+/// `BLAKE3(header[0..32] || index_bytes)` is written at `header[32..96]`.
 ///
 /// Returns `body_section_start` (the absolute byte offset of the body section
 /// in the file). Callers use this to convert body entries' `stored_offset` to
@@ -215,7 +216,7 @@ impl SegmentEntry {
 pub fn write_segment(
     path: &Path,
     entries: &mut [SegmentEntry],
-    signer: Option<&dyn SegmentSigner>,
+    signer: &dyn SegmentSigner,
 ) -> io::Result<u64> {
     let (index_length, inline_length, body_length) = assign_offsets(entries);
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
@@ -235,13 +236,11 @@ pub fn write_segment(
     );
 
     // Compute signature: BLAKE3(header[0..32] || index_bytes), then sign.
-    let signature: [u8; 64] = if let Some(s) = signer {
+    let signature: [u8; 64] = {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&header_fields);
         hasher.update(&index_buf);
-        s.sign(hasher.finalize().as_bytes())
-    } else {
-        [0u8; 64]
+        signer.sign(hasher.finalize().as_bytes())
     };
 
     let file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -343,16 +342,71 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
 
 // --- read ---
 
-/// Read the index section of a segment file.
+/// Parse a segment index without verifying the signature.
 ///
-/// Reads only `[0, body_section_start)` — header + index section. Does not
-/// read inline data, body, or delta.
+/// Returns `(body_section_start, entries)`.
+///
+/// Use this only in the fetch path, where the caller needs entry offsets to
+/// compute range-GET parameters. Security is enforced at `Volume::open` time by
+/// `extentindex::rebuild`, which calls `read_and_verify_segment_index` for every
+/// entry it admits into the live index.
+pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>)> {
+    let (body_section_start, index_buf, entry_count, _h) = read_segment_header(path)?;
+    let entries = parse_index_section(&index_buf, entry_count)?;
+    Ok((body_section_start, entries))
+}
+
+/// Read and verify a segment index.
 ///
 /// Returns `(body_section_start, entries)`.
 /// `body_section_start` is the absolute byte offset of the body section in the
 /// file. Callers use it to convert body entries' `stored_offset` to absolute
 /// file offsets: `body_section_start + entry.stored_offset`.
-pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>)> {
+///
+/// Verifies the Ed25519 signature at `header[32..96]` against
+/// `BLAKE3(header[0..32] || index_bytes)` using `verifying_key`.
+/// Returns `InvalidData` if the signature is missing (all zeros) or invalid.
+pub fn read_and_verify_segment_index(
+    path: &Path,
+    verifying_key: &VerifyingKey,
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
+    let (body_section_start, index_buf, entry_count, h) = read_segment_header(path)?;
+
+    let sig_bytes: [u8; 64] = h[32..96].try_into().expect("slice is exactly 64 bytes");
+
+    // Reject unsigned segments (all-zero signature field).
+    if sig_bytes == [0u8; 64] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("segment {} is unsigned", path.display()),
+        ));
+    }
+
+    // Verify: Ed25519(sig, BLAKE3(header[0..32] || index_bytes)).
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&h[..32]);
+    hasher.update(&index_buf);
+    let hash = hasher.finalize();
+
+    let signature = Signature::from_bytes(&sig_bytes);
+    verifying_key
+        .verify_strict(hash.as_bytes(), &signature)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("segment {} has invalid signature", path.display()),
+            )
+        })?;
+
+    let entries = parse_index_section(&index_buf, entry_count)?;
+    Ok((body_section_start, entries))
+}
+
+/// Read the segment header and index bytes from disk.
+///
+/// Returns `(body_section_start, index_buf, entry_count, header)`.
+/// The header is the raw 96-byte header array (32 fields + 64 signature bytes).
+fn read_segment_header(path: &Path) -> io::Result<(u64, Vec<u8>, u32, [u8; HEADER_LEN as usize])> {
     let mut f = fs::File::open(path)?;
 
     // Header is 96 bytes: 32 bytes of fields + 64 bytes of signature.
@@ -371,18 +425,13 @@ pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let entry_count = u32::from_le_bytes(read_fixed(&h, &mut pos)?);
     let index_length = u32::from_le_bytes(read_fixed(&h, &mut pos)?);
     let inline_length = u32::from_le_bytes(read_fixed(&h, &mut pos)?);
-    let _body_length = u64::from_le_bytes(read_fixed::<8>(&h, &mut pos)?);
-    let _delta_length = u32::from_le_bytes(read_fixed(&h, &mut pos)?);
-    // Signature field bytes[32..96] — not parsed here; available for verification
-    // via read_and_verify_segment_index when a SegmentSigner/verifier is present.
 
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
     let mut index_buf = vec![0u8; index_length as usize];
     f.read_exact(&mut index_buf)?;
 
-    let entries = parse_index_section(&index_buf, entry_count)?;
-    Ok((body_section_start, entries))
+    Ok((body_section_start, index_buf, entry_count, h))
 }
 
 fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentEntry>> {
@@ -470,7 +519,7 @@ pub fn promote(
     ulid: &str,
     pending_dir: &Path,
     entries: &mut [SegmentEntry],
-    signer: Option<&dyn SegmentSigner>,
+    signer: &dyn SegmentSigner,
 ) -> io::Result<u64> {
     let tmp_path = pending_dir.join(format!("{ulid}.tmp"));
     let final_path = pending_dir.join(ulid);
@@ -725,6 +774,11 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    /// Generate a fresh Ed25519 keypair for use in tests.
+    fn test_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {
+        crate::signing::generate_ephemeral_signer()
+    }
+
     fn temp_path(suffix: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
@@ -751,13 +805,14 @@ mod tests {
     #[test]
     fn roundtrip_single_data_entry() {
         let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
         let data = vec![0x42u8; 4096];
         let hash = blake3::hash(&data);
 
         let mut entries = vec![SegmentEntry::new_data(hash, 10, 1, 0, data.clone())];
-        let bss = write_segment(&path, &mut entries, None).unwrap();
+        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
-        let (bss2, read_entries) = read_segment_index(&path).unwrap();
+        let (bss2, read_entries) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(bss, bss2);
         assert_eq!(read_entries.len(), 1);
 
@@ -777,6 +832,7 @@ mod tests {
     #[test]
     fn roundtrip_multiple_entries() {
         let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
 
         let mut entries: Vec<SegmentEntry> = (0..4u64)
             .map(|i| {
@@ -786,9 +842,9 @@ mod tests {
             })
             .collect();
 
-        write_segment(&path, &mut entries, None).unwrap();
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
-        let (_, read_back) = read_segment_index(&path).unwrap();
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 4);
 
         // stored_offsets should be consecutive multiples of 4096.
@@ -804,12 +860,13 @@ mod tests {
     #[test]
     fn roundtrip_dedup_ref_entry() {
         let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
         let hash = blake3::hash(b"existing extent");
 
         let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3)];
-        write_segment(&path, &mut entries, None).unwrap();
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
-        let (_, read_back) = read_segment_index(&path).unwrap();
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
 
         let e = &read_back[0];
@@ -826,6 +883,7 @@ mod tests {
     #[test]
     fn roundtrip_mixed_data_and_ref() {
         let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
 
         let data = vec![0xABu8; 8192];
         let data_hash = blake3::hash(&data);
@@ -837,9 +895,9 @@ mod tests {
             SegmentEntry::new_data(blake3::hash(b"x"), 10, 1, 0, b"x".repeat(4096).to_vec()),
         ];
 
-        write_segment(&path, &mut entries, None).unwrap();
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
-        let (_, read_back) = read_segment_index(&path).unwrap();
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 3);
 
         assert!(!read_back[0].is_dedup_ref);
@@ -858,13 +916,14 @@ mod tests {
     #[test]
     fn roundtrip_compressed_entry() {
         let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
         let data = vec![0xCDu8; 2048]; // "compressed" payload
         let hash = blake3::hash(&data);
 
         let mut entries = vec![SegmentEntry::new_data(hash, 20, 1, FLAG_COMPRESSED, data)];
-        write_segment(&path, &mut entries, None).unwrap();
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
-        let (_, read_back) = read_segment_index(&path).unwrap();
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
         assert!(read_back[0].compressed);
         assert_eq!(read_back[0].stored_length, 2048);
@@ -878,6 +937,7 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom};
 
         let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
         let data1 = vec![0x11u8; 4096];
         let data2 = vec![0x22u8; 4096];
         let h1 = blake3::hash(&data1);
@@ -888,9 +948,9 @@ mod tests {
             SegmentEntry::new_data(h2, 1, 1, 0, data2.clone()),
         ];
 
-        let bss = write_segment(&path, &mut entries, None).unwrap();
+        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
-        let (bss2, index) = read_segment_index(&path).unwrap();
+        let (bss2, index) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(bss, bss2);
 
         let mut f = fs::File::open(&path).unwrap();
@@ -913,11 +973,12 @@ mod tests {
     #[test]
     fn bad_magic_returns_error() {
         let path = temp_path(".seg");
+        let (_, vk) = test_signer();
         // File must be at least HEADER_LEN (96) bytes for the magic check to be reached.
         let mut buf = [0u8; HEADER_LEN as usize];
         buf[..8].copy_from_slice(b"BADMAGIC");
         fs::write(&path, buf).unwrap();
-        let err = read_segment_index(&path).unwrap_err();
+        let err = read_and_verify_segment_index(&path, &vk).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_file(&path).unwrap();
     }
@@ -942,8 +1003,16 @@ mod tests {
             wl.fsync().unwrap();
         }
 
+        let (signer, vk) = test_signer();
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, payload.to_vec())];
-        let bss = promote(&wal_path, ulid, &base.join("pending"), &mut entries, None).unwrap();
+        let bss = promote(
+            &wal_path,
+            ulid,
+            &base.join("pending"),
+            &mut entries,
+            signer.as_ref(),
+        )
+        .unwrap();
 
         // WAL must be gone.
         assert!(!wal_path.exists(), "WAL should be deleted after promotion");
@@ -957,7 +1026,7 @@ mod tests {
         );
 
         // Segment must be readable and entries match.
-        let (bss2, read_back) = read_segment_index(&seg_path).unwrap();
+        let (bss2, read_back) = read_and_verify_segment_index(&seg_path, &vk).unwrap();
         assert_eq!(bss, bss2);
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].hash, hash);
@@ -1142,14 +1211,15 @@ mod tests {
         let data = vec![0xAAu8; 4096];
         let hash = blake3::hash(&data);
         let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let (signer, vk) = test_signer();
         let path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
-        write_segment(&path, &mut entries, None).unwrap();
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
         assert_eq!(read_entry_count(&path).unwrap(), 1);
 
         // Also works on a .idx file (same header format).
         let full_bytes = fs::read(&path).unwrap();
-        let (bss, _) = read_segment_index(&path).unwrap();
+        let (bss, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         let idx_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA.idx");
         fs::write(&idx_path, &full_bytes[..bss as usize]).unwrap();
         assert_eq!(read_entry_count(&idx_path).unwrap(), 1);

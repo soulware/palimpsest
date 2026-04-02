@@ -158,10 +158,13 @@ pub struct Volume {
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
     file_cache: RefCell<Option<(String, fs::File)>>,
-    /// Optional signer for segment promotion. When set, every segment written
-    /// by this volume (at WAL promotion and compaction) is signed with the
-    /// fork's private key. See `segment::SegmentSigner`.
-    signer: Option<Arc<dyn segment::SegmentSigner>>,
+    /// Signer for segment promotion. Every segment written by this volume
+    /// (at WAL promotion and compaction) is signed with the fork's private key.
+    /// See `segment::SegmentSigner`.
+    signer: Arc<dyn segment::SegmentSigner>,
+    /// Verifying key derived from `volume.key` at open time. Used to verify
+    /// segment signatures when reading during compaction and GC.
+    verifying_key: ed25519_dalek::VerifyingKey,
     /// Optional fetcher for demand-fetch on segment cache miss. When set,
     /// `find_segment_file` fetches missing segments from remote storage and
     /// caches them in `segments/`. See `segment::SegmentFetcher`.
@@ -180,27 +183,25 @@ impl Volume {
     /// Rebuilds the LBA map from all committed segments across the ancestry chain
     /// (following `volume.parent` files), then recovers or creates the WAL.
     ///
-    /// Segments written by this volume will be unsigned. Use `open_with_signer`
-    /// when the volume's private key is available.
+    /// Loads the signing key from `volume.key` in `base_dir`. Fails hard if the key
+    /// is absent — every writable volume must have a signing key. Fork from a snapshot
+    /// to create a new writable volume with a fresh keypair.
     pub fn open(base_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
-        Self::open_impl(base_dir, None, by_id_dir)
-    }
-
-    /// Open (or create) a volume, signing every promoted segment with `signer`.
-    ///
-    /// Same as `open` but attaches a `SegmentSigner` so that each WAL promotion
-    /// and compaction output is signed with the volume's private key.
-    pub fn open_with_signer(
-        base_dir: &Path,
-        signer: Arc<dyn segment::SegmentSigner>,
-        by_id_dir: &Path,
-    ) -> io::Result<Self> {
-        Self::open_impl(base_dir, Some(signer), by_id_dir)
+        let (signer, verifying_key) =
+            crate::signing::load_keypair(base_dir, crate::signing::VOLUME_KEY_FILE).map_err(
+                |e| {
+                    io::Error::other(format!(
+                        "{e}; fork from a snapshot to create a writable volume"
+                    ))
+                },
+            )?;
+        Self::open_impl(base_dir, signer, verifying_key, by_id_dir)
     }
 
     fn open_impl(
         base_dir: &Path,
-        signer: Option<Arc<dyn segment::SegmentSigner>>,
+        signer: Arc<dyn segment::SegmentSigner>,
+        verifying_key: ed25519_dalek::VerifyingKey,
         by_id_dir: &Path,
     ) -> io::Result<Self> {
         let wal_dir = base_dir.join("wal");
@@ -324,6 +325,7 @@ impl Volume {
             last_segment_ulid,
             file_cache: RefCell::new(None),
             signer,
+            verifying_key,
             fetcher: None,
             mint,
         })
@@ -466,11 +468,12 @@ impl Volume {
 
             let seg_id = seg_id.to_string();
 
-            let (body_section_start, mut entries) = match segment::read_segment_index(&seg_path) {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            };
+            let (body_section_start, mut entries) =
+                match segment::read_and_verify_segment_index(&seg_path, &self.verifying_key) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
 
             // Dedup-refs have no body bytes; only count DATA entries.
             let total_bytes: u64 = entries
@@ -532,7 +535,7 @@ impl Volume {
                 let final_path = pending_dir.join(&new_ulid);
                 // write_segment reassigns stored_offset in live_entries to new positions.
                 let new_bss =
-                    segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_deref())?;
+                    segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_ref())?;
                 fs::rename(&tmp_path, &final_path)?;
                 segment::fsync_dir(&final_path)?;
                 stats.new_segments += 1;
@@ -617,7 +620,8 @@ impl Volume {
             }
 
             let file_size = fs::metadata(seg_path)?.len();
-            let (body_section_start, mut entries) = segment::read_segment_index(seg_path)?;
+            let (body_section_start, mut entries) =
+                segment::read_and_verify_segment_index(seg_path, &self.verifying_key)?;
 
             let has_dead = entries
                 .iter()
@@ -719,7 +723,7 @@ impl Volume {
             let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
             let final_path = pending_dir.join(&new_ulid);
             let new_bss =
-                segment::write_segment(&tmp_path, &mut merged_live, self.signer.as_deref())?;
+                segment::write_segment(&tmp_path, &mut merged_live, self.signer.as_ref())?;
             fs::rename(&tmp_path, &final_path)?;
             segment::fsync_dir(&final_path)?;
             stats.new_segments += 1;
@@ -776,19 +780,21 @@ impl Volume {
 
     /// Apply any pending GC handoff files written by the coordinator.
     ///
-    /// The coordinator writes `gc/<new-ulid>.pending` after compacting segments
-    /// in `segments/` and uploading the result to S3.  Each file signals that
-    /// `segments/<new-ulid>` is complete and ready to be used.
+    /// The coordinator writes the compacted segment to `gc/<new-ulid>` (staged,
+    /// signed with an ephemeral key) and then writes `gc/<new-ulid>.pending`.
+    /// This method re-signs `gc/<new-ulid>` with the volume's own key, moves it
+    /// into `segments/`, updates the in-memory extent index, and renames the
+    /// handoff file to `gc/<new-ulid>.applied`.  The coordinator monitors
+    /// `.applied` files and uses them as the signal to delete the superseded S3
+    /// objects and old local segment files.
     ///
-    /// For each `.pending` file this method reads the compacted segment's index
-    /// to obtain authoritative `body_offset`, `body_length`, and `compressed`
-    /// values, updates the in-memory extent index, and renames the file to
-    /// `gc/<new-ulid>.applied`.  The coordinator monitors `.applied` files and
-    /// uses them as the signal to delete the superseded S3 objects.
+    /// The re-signing step ensures that `segments/` always contains only
+    /// volume-signed files, so `extentindex::rebuild` never needs to skip
+    /// signature verification for in-transit coordinator output.
     ///
-    /// Idempotent and crash-safe: if the process is killed after updating the
-    /// extent index but before the rename, the `.pending` file remains and the
-    /// update is re-applied on the next call with identical results.
+    /// Idempotent and crash-safe: if the process is killed after writing
+    /// `segments/<new-ulid>` but before deleting `gc/<new-ulid>`, the re-sign
+    /// runs again on the next call and overwrites with identical content.
     ///
     /// Returns the number of handoff files applied.  Returns `Ok(0)` if the
     /// `gc/` directory does not exist yet (coordinator has not run).
@@ -845,10 +851,29 @@ impl Volume {
                 }
             }
 
+            // The coordinator stages its output in gc/<ulid> (unsigned, signed
+            // with an ephemeral key).  Re-sign it with the volume's key and
+            // move it into segments/ so that segments/ always contains only
+            // volume-signed files and extentindex::rebuild never needs to skip
+            // verification for in-transit segments.
+            //
+            // This step is idempotent: if we crash after writing segments/<ulid>
+            // but before deleting gc/<ulid>, we re-sign on the next call and
+            // overwrite segments/<ulid> with identical content.
+            let gc_seg_path = gc_dir.join(new_ulid);
             let segment_path = segments_dir.join(new_ulid);
+            if gc_seg_path.try_exists()? {
+                let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
+                segment::read_extent_bodies(&gc_seg_path, bss, &mut entries)?;
+                let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
+                segment::write_segment(&tmp_path, &mut entries, self.signer.as_ref())?;
+                fs::rename(&tmp_path, &segment_path)?;
+                fs::remove_file(&gc_seg_path)?;
+            }
+
             let segment_exists = segment_path.try_exists()?;
 
-            // If the segment doesn't exist, we can only process removal-only
+            // If the segment still doesn't exist, we can only process removal-only
             // handoffs (all 2-field lines).  Handoffs with carried entries
             // (4-field lines) need the segment for extent index updates —
             // defer until it's available locally (e.g. fetched from S3).
@@ -868,9 +893,10 @@ impl Volume {
             let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
 
             if segment_exists {
-                // Read the compacted segment's index for authoritative
-                // body_offset, body_length, and compressed values.
-                let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
+                // Read the (now volume-signed) compacted segment's index for
+                // authoritative body_offset, body_length, and compressed values.
+                let (body_section_start, entries) =
+                    segment::read_and_verify_segment_index(&segment_path, &self.verifying_key)?;
 
                 for e in &entries {
                     if e.is_dedup_ref {
@@ -954,7 +980,7 @@ impl Volume {
             &self.wal_ulid,
             &self.base_dir.join("pending"),
             &mut self.pending_entries,
-            self.signer.as_deref(),
+            self.signer.as_ref(),
         )?;
         // Update the extent index: replace temporary WAL offsets with absolute
         // offsets into the committed segment file.
@@ -1517,6 +1543,14 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
     let origin = format!("{source_ulid}/snapshots/{branch_ulid}");
     segment::write_file_atomic(&new_fork_dir.join("volume.parent"), origin.as_bytes())?;
 
+    // Generate a fresh keypair for the new fork. Every writable volume must have
+    // a signing key; the fork gets its own identity independent of its parent.
+    crate::signing::generate_keypair(
+        new_fork_dir,
+        crate::signing::VOLUME_KEY_FILE,
+        crate::signing::VOLUME_PUB_FILE,
+    )?;
+
     Ok(())
 }
 
@@ -1643,9 +1677,32 @@ mod tests {
         p
     }
 
+    /// Generate a keypair and write `volume.key` + `volume.pub` into `dir`.
+    ///
+    /// Must be called before `Volume::open` in any test that creates a volume.
+    fn write_test_keypair(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        crate::signing::generate_keypair(
+            dir,
+            crate::signing::VOLUME_KEY_FILE,
+            crate::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+    }
+
+    /// Create a temp dir and pre-populate it with a test keypair.
+    ///
+    /// Use in place of `temp_dir()` whenever the dir will be passed directly
+    /// to `Volume::open`.
+    fn keyed_temp_dir() -> PathBuf {
+        let dir = temp_dir();
+        write_test_keypair(&dir);
+        dir
+    }
+
     #[test]
     fn open_creates_directories() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let _ = Volume::open(&base, &base).unwrap();
         assert!(base.join("wal").is_dir());
         assert!(base.join("pending").is_dir());
@@ -1655,7 +1712,7 @@ mod tests {
 
     #[test]
     fn open_is_idempotent() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let _ = Volume::open(&base, &base).unwrap();
         // Second open on the same dir should succeed (dirs already exist).
         let _ = Volume::open(&base, &base).unwrap();
@@ -1664,7 +1721,7 @@ mod tests {
 
     #[test]
     fn write_single_block() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(0, &vec![0x42u8; 4096]).unwrap();
         vol.fsync().unwrap();
@@ -1674,7 +1731,7 @@ mod tests {
 
     #[test]
     fn write_multi_block_extent() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         // Write 8 LBAs (32 KiB) as a single call.
         vol.write(10, &vec![0xabu8; 8 * 4096]).unwrap();
@@ -1684,7 +1741,7 @@ mod tests {
 
     #[test]
     fn write_rejects_empty() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         let err = vol.write(0, &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -1693,7 +1750,7 @@ mod tests {
 
     #[test]
     fn write_rejects_misaligned() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         let err = vol.write(0, &[0u8; 1000]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -1702,7 +1759,7 @@ mod tests {
 
     #[test]
     fn write_sets_needs_promote_after_threshold() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         // Write 33 × 1 MiB of incompressible data to exceed FLUSH_THRESHOLD (32 MiB).
@@ -1750,7 +1807,7 @@ mod tests {
 
     #[test]
     fn recovery_rebuilds_lbamap() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         // Write two blocks, fsync, then drop (simulates clean shutdown before promotion).
         {
@@ -1769,7 +1826,7 @@ mod tests {
 
     #[test]
     fn read_unwritten_returns_zeros() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let vol = Volume::open(&base, &base).unwrap();
         let data = vol.read(0, 4).unwrap();
         assert_eq!(data.len(), 4 * 4096);
@@ -1779,7 +1836,7 @@ mod tests {
 
     #[test]
     fn read_written_data_same_session() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let payload = vec![0x42u8; 4096];
@@ -1798,7 +1855,7 @@ mod tests {
 
     #[test]
     fn read_multi_block_extent() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         // Write 4 blocks with distinct fill bytes so we can verify each block.
@@ -1820,7 +1877,7 @@ mod tests {
 
     #[test]
     fn read_after_promote() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let payload = vec![0x55u8; 4096];
@@ -1836,7 +1893,7 @@ mod tests {
 
     #[test]
     fn read_after_reopen() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         let payload = vec![0x77u8; 4096];
         {
@@ -1860,7 +1917,7 @@ mod tests {
     /// recover_wal must translate between them before calling new_data().
     #[test]
     fn compressed_entry_survives_recover_and_promote() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         // Write compressible data (zeros compress very well).
         let payload = vec![0u8; 4096];
@@ -1899,7 +1956,7 @@ mod tests {
     fn recovery_after_promotion() {
         // Write enough to trigger a promotion, drop, reopen — the LBA map must
         // be rebuilt from both pending/ segments and the remaining WAL.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         {
             let mut vol = Volume::open(&base, &base).unwrap();
@@ -1922,7 +1979,7 @@ mod tests {
         // Write to the WAL, drop (simulating a crash), reopen (WAL recovery),
         // promote, then reopen again — verifies that pending_entries is correctly
         // rebuilt from the recovered WAL so the segment contains the pre-crash writes.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         // Phase 1: write two blocks, fsync, drop.
         {
@@ -1958,7 +2015,7 @@ mod tests {
         // Simulate a crash between the segment rename and the WAL delete:
         // both wal/<ulid> and pending/<ulid> exist. On reopen, the WAL must
         // be silently discarded and data read from the committed segment.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         // Phase 1: write two blocks and promote so a segment lands in pending/.
         let ulid;
@@ -2021,7 +2078,7 @@ mod tests {
         // a subsequent Volume::open() reads the correct data from the segment.
         // This covers the common path: crash after a guest fsync, before the
         // coordinator uploads the segment to S3.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         let payload_a = vec![0xAAu8; 4096];
         let payload_b = vec![0xBBu8; 4096];
@@ -2049,7 +2106,7 @@ mod tests {
         // (crash between write_segment and rename — the rename never committed)
         // is removed by Volume::open() and does not affect recovery.
         // The WAL is intact as a fallback and is replayed normally.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         let payload = vec![0xCCu8; 4096];
         {
@@ -2079,7 +2136,7 @@ mod tests {
     fn repack_noop_when_all_live() {
         // Write two blocks, promote, compact — nothing should be compacted
         // since all data is still referenced.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
@@ -2101,7 +2158,7 @@ mod tests {
     fn repack_reclaims_overwritten_extent() {
         // Write block A, promote, overwrite block A with B, promote.
         // First segment now has a dead extent; compaction should reclaim it.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let original = vec![0x11u8; 4096];
@@ -2132,7 +2189,7 @@ mod tests {
     fn repack_reads_back_correctly_after_reopen() {
         // Verify that the compacted segment is a valid segment that survives
         // a volume reopen (LBA map rebuild + extent index rebuild).
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         {
             let mut vol = Volume::open(&base, &base).unwrap();
@@ -2153,7 +2210,7 @@ mod tests {
     fn repack_partial_segment() {
         // Segment has two extents; one is overwritten (dead), one is live.
         // Compaction should rewrite the segment keeping only the live extent.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap(); // will be overwritten
@@ -2179,7 +2236,7 @@ mod tests {
     fn repack_respects_min_live_ratio() {
         // With a strict ratio (1.0), any dead byte triggers compaction.
         // With a lenient ratio (0.0), nothing is ever compacted.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2202,7 +2259,7 @@ mod tests {
     fn repack_does_not_touch_pre_snapshot_segments() {
         // Write and overwrite a block, then snapshot. The dead segment is
         // pre-snapshot and must not be compacted — it is frozen by the floor.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2229,7 +2286,7 @@ mod tests {
     #[test]
     fn repack_only_touches_post_snapshot_segments() {
         // Pre-snapshot dead segment: frozen. Post-snapshot dead segment: compactable.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         // Pre-snapshot: write and overwrite LBA 0.
@@ -2264,7 +2321,7 @@ mod tests {
     fn repack_does_not_touch_segments() {
         // Simulate an uploaded segment by moving it from pending/ to segments/.
         // repack() must not touch it even if its extents are dead.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2306,7 +2363,7 @@ mod tests {
         // rewrite it. Rewriting a single all-live small segment is a no-op that
         // only wastes IO — merging only makes sense when >=2 segments combine or
         // dead space is reclaimed.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
@@ -2325,7 +2382,7 @@ mod tests {
     fn sweep_pending_removes_dead_extents() {
         // Write LBA 0, promote, overwrite LBA 0, promote.
         // sweep_pending should remove the dead extent from the first segment.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2348,7 +2405,7 @@ mod tests {
     fn sweep_pending_only_scans_pending_not_segments() {
         // Upload a segment (simulate by writing to segments/ directly via promote
         // then moving to segments/). sweep_pending must not touch it.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
@@ -2385,7 +2442,7 @@ mod tests {
     #[test]
     fn sweep_pending_respects_snapshot_floor() {
         // Segments at or below the snapshot ULID must not be touched.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         // Write and promote before snapshot.
@@ -2412,7 +2469,7 @@ mod tests {
     fn sweep_pending_merges_multiple_small_segments() {
         // Three separate promotes → three small pending segments.
         // sweep_pending should merge them into one.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0xaau8; 4096]).unwrap();
@@ -2481,7 +2538,7 @@ mod tests {
     #[test]
     fn read_incompressible_data() {
         // High-entropy data must not be compressed, and must read back correctly.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let payload = high_entropy_block(0x5A);
@@ -2499,7 +2556,7 @@ mod tests {
     #[test]
     fn compressed_and_uncompressed_extents_coexist() {
         // Write one compressible and one incompressible extent; both must read back correctly.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let compressible = vec![0xCCu8; 4096];
@@ -2520,7 +2577,7 @@ mod tests {
     fn dedup_write_same_data_same_lba() {
         // Writing identical data to the same LBA twice: second write is a dedup hit.
         // The LBA map must have exactly one entry, reads must return the correct data.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let data = vec![0x42u8; 4096];
@@ -2537,7 +2594,7 @@ mod tests {
     fn dedup_write_same_data_different_lba() {
         // Identical data written to two different LBAs: second write is a dedup hit.
         // Both LBA entries exist in the map; reads return the correct data from both.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let data = vec![0x77u8; 4096];
@@ -2555,7 +2612,7 @@ mod tests {
     fn dedup_ref_survives_promote_and_reopen() {
         // Write data, promote so it lands in pending/, then write the same data
         // to a new LBA (dedup REF in WAL). Reopen and verify both LBAs read back.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         {
             let mut vol = Volume::open(&base, &base).unwrap();
@@ -2579,7 +2636,7 @@ mod tests {
     fn dedup_ref_in_segment_survives_reopen() {
         // Write data, promote, write same data (REF in WAL), promote again so
         // the REF lands in a segment. Reopen and verify reads still work.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
 
         {
             let mut vol = Volume::open(&base, &base).unwrap();
@@ -2707,6 +2764,7 @@ mod tests {
         let by_id = temp_dir();
         let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&default_dir);
 
         // Write data into the root volume and promote to a segment.
         let data = vec![0xABu8; 4096];
@@ -2733,6 +2791,7 @@ mod tests {
         let by_id = temp_dir();
         let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&default_dir);
         let ancestor_data = vec![0xAAu8; 4096];
         let child_data = vec![0xBBu8; 4096];
 
@@ -2763,20 +2822,18 @@ mod tests {
 
     #[test]
     fn double_open_same_fork_fails() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let _vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         // Second open on the same live fork must fail (lock already held).
         assert!(Volume::open(&fork_dir, &fork_dir).is_err());
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     // --- snapshot() tests ---
 
     #[test]
     fn snapshot_writes_marker_and_stays_live() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let data = vec![0xAAu8; 4096];
 
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
@@ -2799,13 +2856,12 @@ mod tests {
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), new_data);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
     fn snapshot_ulid_matches_last_segment_ulid() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
         let snap_ulid = vol.snapshot().unwrap().to_string();
@@ -2819,13 +2875,12 @@ mod tests {
         let seg_name = pending_files[0].file_name().into_string().unwrap();
         assert_eq!(snap_ulid, seg_name);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
     fn snapshot_empty_wal_no_segment_written() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         // No writes — WAL is empty.
         vol.snapshot().unwrap();
@@ -2834,13 +2889,12 @@ mod tests {
         let pending: Vec<_> = fs::read_dir(fork_dir.join("pending")).unwrap().collect();
         assert!(pending.is_empty());
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
     fn snapshot_idempotent_when_no_new_data() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
 
@@ -2853,13 +2907,12 @@ mod tests {
         let snaps: Vec<_> = fs::read_dir(fork_dir.join("snapshots")).unwrap().collect();
         assert_eq!(snaps.len(), 1);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
     fn snapshot_not_idempotent_after_new_write() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
 
@@ -2873,15 +2926,14 @@ mod tests {
         let snaps: Vec<_> = fs::read_dir(fork_dir.join("snapshots")).unwrap().collect();
         assert_eq!(snaps.len(), 2);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
     fn snapshot_idempotent_after_auto_promoted_data_already_snapshotted() {
         // Data promoted via FLUSH_THRESHOLD (pending_entries empty at snapshot
         // time) but that segment was already covered by a prior snapshot.
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
         vol.promote_for_test().unwrap(); // lands in pending/ with wal_ulid_1
@@ -2890,13 +2942,12 @@ mod tests {
         let ulid2 = vol.snapshot().unwrap();
         assert_eq!(ulid1, ulid2);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
     fn snapshot_lock_held_after_snapshot() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
         vol.snapshot().unwrap();
 
@@ -2907,7 +2958,7 @@ mod tests {
         // After drop, a fresh open succeeds.
         assert!(Volume::open(&fork_dir, &fork_dir).is_ok());
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     // --- fork_volume tests ---
@@ -2919,6 +2970,7 @@ mod tests {
         let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         let default_dir = by_id.join(root_ulid);
         let fork_dir = by_id.join(child_ulid);
+        write_test_keypair(&default_dir);
 
         // snapshot default to give it a branch point.
         let mut vol = Volume::open(&default_dir, &by_id).unwrap();
@@ -2957,6 +3009,7 @@ mod tests {
         let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         let default_dir = by_id.join(root_ulid);
         let fork_dir = by_id.join(child_ulid);
+        write_test_keypair(&default_dir);
 
         let data_snap1 = vec![0x11u8; 4096];
         let data_snap2 = vec![0x22u8; 4096];
@@ -2998,6 +3051,7 @@ mod tests {
         let default_dir = by_id.join(root_ulid);
         let mid_dir = by_id.join(mid_ulid);
         let leaf_dir = by_id.join(leaf_ulid);
+        write_test_keypair(&default_dir);
 
         let data_root = vec![0xAAu8; 4096];
         let data_mid = vec![0xBBu8; 4096];
@@ -3057,6 +3111,7 @@ mod tests {
         let by_id = temp_dir();
         let root_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&root_dir);
         let mut vol = Volume::open(&root_dir, &by_id).unwrap();
         vol.snapshot().unwrap();
         drop(vol);
@@ -3072,8 +3127,7 @@ mod tests {
 
     #[test]
     fn two_snapshots_data_readable_after_reopen() {
-        let base = temp_dir();
-        let fork_dir = base.join("base");
+        let fork_dir = keyed_temp_dir();
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 4096];
 
@@ -3090,7 +3144,7 @@ mod tests {
         assert_eq!(vol.read(0, 1).unwrap(), data_a);
         assert_eq!(vol.read(1, 1).unwrap(), data_b);
 
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(fork_dir).unwrap();
     }
 
     #[test]
@@ -3098,6 +3152,7 @@ mod tests {
         let by_id = temp_dir();
         let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&default_dir);
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 4096];
 
@@ -3135,6 +3190,7 @@ mod tests {
         let by_id = temp_dir();
         let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&default_dir);
 
         let pre_branch = vec![0xAAu8; 4096];
         let post_branch = vec![0xBBu8; 4096];
@@ -3177,6 +3233,7 @@ mod tests {
         let by_id = temp_dir();
         let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&default_dir);
 
         let original = vec![0xAAu8; 4096];
         let overwrite = vec![0xBBu8; 4096];
@@ -3222,6 +3279,7 @@ mod tests {
     fn readonly_volume_reads_committed_segment() {
         let vol_dir = temp_dir();
         let fork_dir = vol_dir.join("base");
+        write_test_keypair(&fork_dir);
 
         let data = vec![0xCCu8; 4096];
 
@@ -3247,6 +3305,7 @@ mod tests {
         let by_id = temp_dir();
         let default_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&default_dir);
 
         let ancestor_data = vec![0xDDu8; 4096];
 
@@ -3269,6 +3328,7 @@ mod tests {
     fn readonly_volume_does_not_see_wal_records() {
         let vol_dir = temp_dir();
         let fork_dir = vol_dir.join("base");
+        write_test_keypair(&fork_dir);
 
         let committed = vec![0xEEu8; 4096];
         let in_wal = vec![0xFFu8; 4096];
@@ -3297,28 +3357,32 @@ mod tests {
     //   new segment + writes gc/*.pending → volume applies handoff.
 
     /// Simulate one coordinator GC pass: read the given segment, write a
-    /// compacted copy with the given ULID (from gc_checkpoint) into segments/,
-    /// and write gc/<new>.pending.  Does NOT delete the old segment — tests
-    /// that need to verify post-cleanup reads do so explicitly.
+    /// compacted copy to gc/<new_ulid> (signed with an ephemeral key, as the
+    /// real coordinator would), and write gc/<new>.pending.
+    ///
+    /// The volume re-signs the staged segment when apply_gc_handoffs is called.
+    /// Does NOT delete the old segment.
     fn simulate_coord_gc(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
-        use crate::segment;
+        use crate::{segment, signing};
 
         let segments_dir = fork_dir.join("segments");
         let old_path = segments_dir.join(old_ulid);
-        let (old_bss, mut entries) = segment::read_segment_index(&old_path).unwrap();
+        let (old_bss, mut entries) =
+            segment::read_and_verify_segment_index(&old_path, &vol.verifying_key).unwrap();
         segment::read_extent_bodies(&old_path, old_bss, &mut entries).unwrap();
 
         let new_ulid = vol.gc_checkpoint().unwrap();
 
-        let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
-        let new_bss = segment::write_segment(&tmp_path, &mut entries, None).unwrap();
-        fs::rename(&tmp_path, segments_dir.join(&new_ulid)).unwrap();
-
-        // Write the handoff file.  Our apply_gc_handoffs reads the segment
-        // index directly, so the content is informational only — but write
-        // the correct format so the file is realistic.
         let gc_dir = fork_dir.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
+
+        // Coordinator uses an ephemeral signer; the volume re-signs on handoff.
+        let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
+        let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+        let new_bss =
+            segment::write_segment(&tmp_path, &mut entries, ephemeral_signer.as_ref()).unwrap();
+        fs::rename(&tmp_path, gc_dir.join(&new_ulid)).unwrap();
+
         let mut lines = String::new();
         for e in &entries {
             if !e.is_dedup_ref {
@@ -3336,7 +3400,7 @@ mod tests {
 
     #[test]
     fn gc_handoff_applies_and_renames() {
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let data = vec![0x42u8; 4096];
@@ -3380,7 +3444,7 @@ mod tests {
         // gc/*.pending exists but segments/<new_ulid> has not yet been fetched
         // locally.  apply_gc_handoffs must skip the file and return Ok(0) so
         // the next idle tick retries when the segment is available.
-        let base = temp_dir();
+        let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let gc_dir = base.join("gc");
@@ -3403,11 +3467,15 @@ mod tests {
     #[test]
     fn gc_handoff_idempotent_after_crash() {
         // Simulate a crash between coordinator writing .pending and the volume
-        // processing it.  After reopen, the extent index is rebuilt from
-        // segments/ (which includes the new compacted segment), so reads are
-        // correct before the handoff is applied.  Calling apply_gc_handoffs
-        // then renames .pending → .applied.
-        let base = temp_dir();
+        // processing it.  The coordinator-staged segment is in gc/<new_ulid>;
+        // the old segment remains in segments/ until apply_gc_handoffs renames
+        // .pending → .applied (signalling the coordinator it is safe to delete).
+        //
+        // After reopen, the extent index is rebuilt from segments/ (old segment
+        // still present), so reads are correct before the handoff is applied.
+        // apply_gc_handoffs re-signs gc/<new_ulid> into segments/, updates the
+        // extent index, and renames .pending → .applied.
+        let base = keyed_temp_dir();
 
         let old_ulid;
         let new_ulid;
@@ -3430,23 +3498,20 @@ mod tests {
             old_ulid = filename.to_str().unwrap().to_owned();
             fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
 
-            // Coordinator GC: new segment + .pending written.
+            // Coordinator GC: staged segment in gc/<new_ulid> + .pending written.
+            // Old segment intentionally NOT deleted — coordinator waits for .applied.
             new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
-
-            // Coordinator deletes old local segment (data is in new segment +
-            // S3; volume hasn't processed the handoff yet).
-            fs::remove_file(segments_dir.join(&old_ulid)).unwrap();
 
             // "Crash" — drop the volume before apply_gc_handoffs runs.
         }
 
-        // Reopen: rebuild scans segments/ and finds <new_ulid>.  Reads work
-        // even though the in-memory extent index from before the crash pointed
-        // at the now-deleted old segment.
+        // Reopen: rebuild scans segments/ and finds the old segment.  Reads
+        // work even though the coordinator has already produced a replacement.
         let mut vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
-        // Now apply the pending handoff — must succeed and rename the file.
+        // Apply the pending handoff: re-signs gc/<new_ulid> into segments/,
+        // updates extent index, renames .pending → .applied.
         let count = vol.apply_gc_handoffs().unwrap();
         assert_eq!(count, 1);
 
@@ -3454,7 +3519,87 @@ mod tests {
         assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
         assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
 
-        // Reads still correct after the handoff.
+        // Coordinator now sees .applied and deletes the old segment.
+        fs::remove_file(base.join("segments").join(&old_ulid)).unwrap();
+
+        // Reads still correct after the handoff and old-segment deletion.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_handoff_idempotent_after_partial_resign() {
+        // Simulate a crash between the re-sign write and the gc/<ulid> deletion:
+        // both gc/<new_ulid> (staged) and segments/<new_ulid> (re-signed) are
+        // present when apply_gc_handoffs is called a second time.
+        //
+        // The re-sign step must be idempotent: it overwrites segments/<new_ulid>
+        // with identical content, then deletes gc/<new_ulid>, and the handoff
+        // completes normally.
+        let base = keyed_temp_dir();
+
+        let old_ulid;
+        let new_ulid;
+        let data = vec![0xCDu8; 4096];
+
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+
+            let pending_dir = base.join("pending");
+            let segments_dir = base.join("segments");
+            let entry = fs::read_dir(&pending_dir)
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap();
+            let filename = entry.file_name();
+            old_ulid = filename.to_str().unwrap().to_owned();
+            fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+
+            new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
+        }
+
+        // Simulate a partial apply_gc_handoffs: re-sign gc/<new_ulid> into
+        // segments/<new_ulid> but leave gc/<new_ulid> in place (as if the
+        // process crashed before remove_file completed).
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.apply_gc_handoffs().unwrap();
+            // .applied now exists — handoff fully applied.
+        }
+
+        // Restore the crash state: rename .applied back to .pending and
+        // recreate gc/<new_ulid> from segments/<new_ulid> to simulate the
+        // partial-apply crash window.
+        let gc_dir = base.join("gc");
+        let segments_dir = base.join("segments");
+        fs::rename(
+            gc_dir.join(format!("{new_ulid}.applied")),
+            gc_dir.join(format!("{new_ulid}.pending")),
+        )
+        .unwrap();
+        // Re-create gc/<new_ulid> as a copy of the re-signed segment, mimicking
+        // the state after write but before delete.
+        fs::copy(segments_dir.join(&new_ulid), gc_dir.join(&new_ulid)).unwrap();
+
+        // Now apply_gc_handoffs must succeed: it detects gc/<new_ulid>, re-signs
+        // (idempotently overwrites segments/<new_ulid>), deletes gc/<new_ulid>,
+        // and renames .pending → .applied.
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+
+        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
+        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
+        assert!(
+            !gc_dir.join(&new_ulid).exists(),
+            "gc/<ulid> must be deleted after re-sign"
+        );
+
+        // Data still correct.
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();

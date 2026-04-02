@@ -22,7 +22,8 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+pub use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use rand_core::OsRng;
 
 use crate::segment::SegmentSigner;
@@ -62,14 +63,63 @@ pub fn generate_keypair(dir: &Path, key_file: &str, pub_file: &str) -> io::Resul
 
 /// Load an Ed25519 signing key from `dir/<key_file>` and return a `SegmentSigner`.
 pub fn load_signer(dir: &Path, key_file: &str) -> io::Result<Arc<dyn SegmentSigner>> {
+    let (signer, _) = load_keypair(dir, key_file)?;
+    Ok(signer)
+}
+
+/// Load an Ed25519 signing key and derive its verifying key.
+///
+/// Returns `(signer, verifying_key)`. The verifying key is derived directly
+/// from the signing key — no separate `volume.pub` read is needed.
+pub fn load_keypair(
+    dir: &Path,
+    key_file: &str,
+) -> io::Result<(Arc<dyn SegmentSigner>, VerifyingKey)> {
     let bytes = std::fs::read(dir.join(key_file))
         .map_err(|e| io::Error::other(format!("{key_file} not readable: {e}")))?;
     let arr: [u8; 32] = bytes
         .try_into()
         .map_err(|_| io::Error::other(format!("{key_file} wrong length (expected 32 bytes)")))?;
-    Ok(Arc::new(Ed25519Signer {
-        key: SigningKey::from_bytes(&arr),
-    }))
+    let key = SigningKey::from_bytes(&arr);
+    let verifying_key = key.verifying_key();
+    Ok((Arc::new(Ed25519Signer { key }), verifying_key))
+}
+
+/// Load an Ed25519 verifying key from `dir/<pub_file>`.
+pub fn load_verifying_key(dir: &Path, pub_file: &str) -> io::Result<VerifyingKey> {
+    let bytes = std::fs::read(dir.join(pub_file))
+        .map_err(|e| io::Error::other(format!("{pub_file} not readable: {e}")))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| io::Error::other(format!("{pub_file} wrong length (expected 32 bytes)")))?;
+    VerifyingKey::from_bytes(&arr).map_err(|e| io::Error::other(format!("{pub_file} invalid: {e}")))
+}
+
+/// Generate an ephemeral Ed25519 keypair in memory.
+///
+/// Returns `(signer, verifying_key)`. Nothing is written to disk.
+pub fn generate_ephemeral_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {
+    let key = SigningKey::generate(&mut OsRng);
+    let verifying_key = key.verifying_key();
+    (Arc::new(Ed25519Signer { key }), verifying_key)
+}
+
+/// Set up a readonly volume's identity and return a signer for segment writing.
+///
+/// Generates an ephemeral Ed25519 keypair, writes `volume.pub` and
+/// `volume.provenance`, and returns the signer.  The private key is never
+/// written to disk — readonly volumes (e.g. OCI imports) have no use for
+/// it after the one-time write.  `extentindex::rebuild` verifies segments
+/// using the persisted `volume.pub`.
+pub fn setup_readonly_identity(
+    dir: &Path,
+    pub_file: &str,
+    provenance_file: &str,
+) -> io::Result<Arc<dyn SegmentSigner>> {
+    let key = SigningKey::generate(&mut OsRng);
+    crate::segment::write_file_atomic(&dir.join(pub_file), &key.verifying_key().to_bytes())?;
+    write_origin(dir, &key, provenance_file)?;
+    Ok(Arc::new(Ed25519Signer { key }))
 }
 
 // --- origin files ---

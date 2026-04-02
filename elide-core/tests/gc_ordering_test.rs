@@ -27,6 +27,7 @@ mod common;
 fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Seed batch 1 — LBAs 0-3 = 0xAA — drain to segments/.
@@ -97,6 +98,7 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
 fn gc_output_loses_to_live_write_applied_after_gc() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Seed batch 1 — LBAs 0-3 = 0xAA.

@@ -256,17 +256,15 @@ The coordinator rebuilds from on-disk files only — in-memory WAL entries are n
 
 **Output placement and the `segments/` invariant:**
 
-`segments/` files are trusted to be in S3. The coordinator maintains this invariant by writing the compacted segment atomically:
+`segments/` files are always signed with `volume.key`. The coordinator does not hold the volume's private key, so it cannot write directly to `segments/`. Instead it stages the compacted segment in `gc/` using an ephemeral key, and the volume re-signs it before moving it into `segments/`:
 
-1. Write to `gc/<new-ulid>.tmp`
-2. Upload to S3 — confirm success
-3. Rename `gc/<new-ulid>.tmp` → `segments/<new-ulid>`
+1. Coordinator writes `gc/<new-ulid>` (ephemeral-signed segment, via tmp-rename)
+2. Coordinator writes `gc/<new-ulid>.pending` (handoff entries, via tmp-rename); both files are now visible
+3. Volume re-signs `gc/<new-ulid>` with `volume.key`, writes `segments/<new-ulid>`, deletes `gc/<new-ulid>`
+4. Volume applies extent index patches and renames `gc/<new-ulid>.pending` → `gc/<new-ulid>.applied`
+5. Coordinator uploads `segments/<new-ulid>` (volume-signed) to S3, deletes old files, renames to `.done`
 
-Only after step 3 is the file visible in `segments/`. A crash between steps 1 and 3 leaves an orphaned `.tmp` file in `gc/`; the file never appears in `segments/` and the invariant is never violated.
-
-Writing to `segments/` (not `pending/`) is correct for two reasons:
-- `pending/` signals "not yet in S3; please upload" — the opposite of what is true here
-- `segments/` files are in the evictable cache tier; since the segment is confirmed in S3, it belongs there
+Only after step 3 is the file visible in `segments/`, and it is always volume-signed. A crash at any step leaves recoverable file state: `gc/<new-ulid>` and/or `.pending` remain present and are re-processed on the next tick.
 
 **Output ULID assignment:** the compacted segment is assigned `max(input ULIDs).increment()` — one step ahead of the newest input in the total ULID order. This gives three properties:
 
@@ -305,13 +303,14 @@ A handoff file containing only 2-field lines is a *removal-only handoff*. It has
 **GC handoff protocol:**
 
 1. Coordinator calls `gc_checkpoint` → flushes WAL, receives `(repack_ulid, sweep_ulid)` minted by the volume
-2. Coordinator compacts input segments using the appropriate ULID (`repack_ulid` for density repack, `sweep_ulid` for sweep), writes `gc/<result-ulid>.pending`, moves compacted segment (if any) to `segments/<new-ulid>`
+2. Coordinator compacts input segments using the appropriate ULID (`repack_ulid` for density repack, `sweep_ulid` for sweep), stages the compacted segment (if any) in `gc/<result-ulid>` (signed with an ephemeral key), then writes `gc/<result-ulid>.pending` (handoff entries)
 3. Volume applies in idle arm:
+   - Re-signs `gc/<result-ulid>` with `volume.key`, writes `segments/<result-ulid>`, deletes `gc/<result-ulid>`
    - For each 4-field entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer write — stale coordinator snapshot)
    - For each 2-field entry: if extent index still points to `old_segment_ulid` for this hash, remove the entry (LBA has been overwritten; the reference is dangling)
-   - Removal-only handoffs (all 2-field lines) are applied immediately — no output segment is needed. Handoffs with 4-field entries wait until `segments/<new-ulid>` is present locally (may require a demand-fetch)
+   - Removal-only handoffs (all 2-field lines) are applied immediately — no output segment or re-signing needed. Handoffs with 4-field entries complete the re-sign step before applying carried entries
    - Rename `gc/<result-ulid>.pending` → `gc/<result-ulid>.applied`
-4. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, removes old local `segments/<old-ulid>` files, renames to `gc/<result-ulid>.done`
+4. Coordinator (on next poll): sees `.applied`, uploads `segments/<result-ulid>` (volume-signed) to S3, deletes old S3 objects, removes old local `segments/<old-ulid>` files, renames to `gc/<result-ulid>.done`
 5. Coordinator (periodic cleanup): deletes `gc/*.done` files older than 7 days
 
 Old local `segments/<old-ulid>` files are left in place until step 4. They remain readable by the volume until then; after deletion reads route to the new segment via the patched extent index (for carried entries) or fail-fast on dangling references that have been cleaned (for removed entries).

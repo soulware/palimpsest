@@ -372,9 +372,25 @@ mod tests {
     use elide_core::volume::{Volume, fork_volume};
     use tempfile::TempDir;
 
-    /// Allocate a fresh volume directory under `by_id`.
-    fn new_vol_dir(by_id: &std::path::Path) -> PathBuf {
+    /// Allocate a fresh volume directory path under `by_id` (does not create it).
+    /// Use this when the dir will be created by `fork_volume`, which generates
+    /// its own keypair.
+    fn new_vol_path(by_id: &std::path::Path) -> PathBuf {
         by_id.join(ulid::Ulid::new().to_string())
+    }
+
+    /// Allocate a fresh volume directory under `by_id`, create it, and write a
+    /// keypair so `Volume::open` can load `volume.key`.
+    fn new_vol_dir(by_id: &std::path::Path) -> PathBuf {
+        let dir = new_vol_path(by_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        elide_core::signing::generate_keypair(
+            &dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        dir
     }
 
     /// Write one block, snapshot (WAL→pending), drop.
@@ -429,7 +445,7 @@ mod tests {
         write_and_snapshot(&parent_dir, &by_id, 0, 0xAA);
 
         // Fork branching off the parent.
-        let fork_dir = new_vol_dir(&by_id);
+        let fork_dir = new_vol_path(&by_id);
         fork_volume(&fork_dir, &parent_dir).unwrap();
 
         // by_name symlink pointing at the fork.
@@ -549,7 +565,7 @@ mod tests {
         write_and_snapshot(&parent_dir, &by_id, 1, 0xBB);
 
         // Fork: overwrite LBA 0 with 0xCC; LBA 1 unchanged.
-        let fork_dir = new_vol_dir(&by_id);
+        let fork_dir = new_vol_path(&by_id);
         fork_volume(&fork_dir, &parent_dir).unwrap();
         let mut fork_vol = Volume::open(&fork_dir, &by_id).unwrap();
         fork_vol.write(0, &[0xCCu8; 4096]).unwrap();
