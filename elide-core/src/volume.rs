@@ -829,8 +829,8 @@ impl Volume {
             .filter(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|s| s.ends_with(".pending"))
-                    .unwrap_or(false)
+                    .and_then(crate::gc::GcHandoff::from_filename)
+                    .is_some_and(|h| matches!(h.state, crate::gc::GcHandoffState::Pending))
             })
             .collect();
 
@@ -849,12 +849,9 @@ impl Volume {
             let name = filename
                 .to_str()
                 .ok_or_else(|| io::Error::other("gc filename is not valid UTF-8"))?;
-            let new_ulid = name
-                .strip_suffix(".pending")
-                .ok_or_else(|| io::Error::other("expected .pending suffix"))?;
-
-            // Validate the ULID so we never act on a malformed filename.
-            Ulid::from_string(new_ulid).map_err(|e| io::Error::other(e.to_string()))?;
+            let handoff = crate::gc::GcHandoff::from_filename(name)
+                .ok_or_else(|| io::Error::other(format!("invalid gc filename: {name}")))?;
+            let new_ulid = handoff.ulid.to_string();
 
             // Parse the .pending file into typed HandoffLines.
             //
@@ -887,8 +884,8 @@ impl Volume {
             // This step is idempotent: if we crash after writing segments/<ulid>
             // but before deleting gc/<ulid>, we re-sign on the next call and
             // overwrite segments/<ulid> with identical content.
-            let gc_seg_path = gc_dir.join(new_ulid);
-            let segment_path = segments_dir.join(new_ulid);
+            let gc_seg_path = gc_dir.join(&new_ulid);
+            let segment_path = segments_dir.join(&new_ulid);
             if gc_seg_path.try_exists()? {
                 let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
                 segment::read_extent_bodies(&gc_seg_path, bss, &mut entries)?;
@@ -981,7 +978,11 @@ impl Volume {
 
             // Rename to .applied — signals the coordinator it is safe to delete
             // superseded S3 objects.
-            let applied_path = gc_dir.join(format!("{new_ulid}.applied"));
+            let applied_path = gc_dir.join(
+                handoff
+                    .with_state(crate::gc::GcHandoffState::Applied)
+                    .filename(),
+            );
             fs::rename(entry.path(), &applied_path)?;
 
             count += 1;

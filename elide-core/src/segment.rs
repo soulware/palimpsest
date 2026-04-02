@@ -749,9 +749,14 @@ pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
 /// `gc_checkpoint`) ensures the GC output sorts before any subsequent
 /// write without needing special classification.
 fn is_gc_output(gc_dir: &Path, segment_name: &str) -> bool {
-    [".pending", ".applied"]
+    use crate::gc::GcHandoffState;
+    [GcHandoffState::Pending, GcHandoffState::Applied]
         .iter()
-        .any(|suffix| gc_dir.join(format!("{segment_name}{suffix}")).exists())
+        .any(|state| {
+            gc_dir
+                .join(format!("{segment_name}.{}", state.suffix()))
+                .exists()
+        })
 }
 
 // --- slice read helpers ---

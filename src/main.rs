@@ -1033,21 +1033,28 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
             let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.ends_with(".pending") {
-                // Parse the handoff to find which old segments are still needed.
-                let content = std::fs::read_to_string(entry.path())?;
-                for line in content.lines() {
-                    if let Some(hl) = elide_core::gc::HandoffLine::parse(line) {
-                        let old_ulid = match hl {
-                            elide_core::gc::HandoffLine::Repack { old_ulid, .. } => old_ulid,
-                            elide_core::gc::HandoffLine::Remove { old_ulid, .. } => old_ulid,
-                            elide_core::gc::HandoffLine::Dead { old_ulid } => old_ulid,
-                        };
-                        protected.insert(std::ffi::OsString::from(old_ulid.to_string()));
+            let Some(handoff) = elide_core::gc::GcHandoff::from_filename(&name_str) else {
+                continue;
+            };
+            match handoff.state {
+                elide_core::gc::GcHandoffState::Pending => {
+                    // Parse the handoff to find which old segments are still needed.
+                    let content = std::fs::read_to_string(entry.path())?;
+                    for line in content.lines() {
+                        if let Some(hl) = elide_core::gc::HandoffLine::parse(line) {
+                            let old_ulid = match hl {
+                                elide_core::gc::HandoffLine::Repack { old_ulid, .. } => old_ulid,
+                                elide_core::gc::HandoffLine::Remove { old_ulid, .. } => old_ulid,
+                                elide_core::gc::HandoffLine::Dead { old_ulid } => old_ulid,
+                            };
+                            protected.insert(std::ffi::OsString::from(old_ulid.to_string()));
+                        }
                     }
                 }
-            } else if let Some(ulid_str) = name_str.strip_suffix(".applied") {
-                protected.insert(std::ffi::OsString::from(ulid_str));
+                elide_core::gc::GcHandoffState::Applied => {
+                    protected.insert(std::ffi::OsString::from(handoff.ulid.to_string()));
+                }
+                elide_core::gc::GcHandoffState::Done => {} // inert, no protection needed
             }
         }
     }

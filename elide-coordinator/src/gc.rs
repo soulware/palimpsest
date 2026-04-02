@@ -268,7 +268,8 @@ pub async fn apply_done_handoffs(
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|n| n.ends_with(".applied"))
+                .and_then(elide_core::gc::GcHandoff::from_filename)
+                .is_some_and(|h| matches!(h.state, elide_core::gc::GcHandoffState::Applied))
         })
         .collect();
 
@@ -285,13 +286,9 @@ pub async fn apply_done_handoffs(
         let name = filename
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("gc filename is not valid UTF-8"))?;
-        let new_ulid_str = name
-            .strip_suffix(".applied")
-            .ok_or_else(|| anyhow::anyhow!("expected .applied suffix"))?;
-
-        // Validate the ULID.
-        Ulid::from_string(new_ulid_str)
-            .map_err(|e| anyhow::anyhow!("invalid ULID in gc filename '{name}': {e}"))?;
+        let handoff = elide_core::gc::GcHandoff::from_filename(name)
+            .ok_or_else(|| anyhow::anyhow!("invalid gc filename: {name}"))?;
+        let new_ulid_str = handoff.ulid.to_string();
 
         // Parse the handoff file into typed HandoffLines.
         let content =
@@ -319,7 +316,7 @@ pub async fn apply_done_handoffs(
         // rather than in the compact pass so that S3 always receives the version
         // that the volume has re-signed with its own key.  The put is idempotent:
         // if the coordinator crashes and retries, the same bytes are written again.
-        let new_seg_path = segments_dir.join(new_ulid_str);
+        let new_seg_path = segments_dir.join(&new_ulid_str);
         let seg_exists = new_seg_path
             .try_exists()
             .context("checking new segment path")?;
@@ -350,7 +347,7 @@ pub async fn apply_done_handoffs(
                 format!("signature verification failed for compacted segment {new_ulid_str}")
             })?;
 
-            let key = segment_key(volume_id, new_ulid_str)
+            let key = segment_key(volume_id, &new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
             let data = tokio::fs::read(&new_seg_path)
                 .await
@@ -386,7 +383,11 @@ pub async fn apply_done_handoffs(
         }
 
         // Rename .applied → .done.
-        let done_path = gc_dir.join(format!("{new_ulid_str}.done"));
+        let done_path = gc_dir.join(
+            handoff
+                .with_state(elide_core::gc::GcHandoffState::Done)
+                .filename(),
+        );
         fs::rename(entry.path(), &done_path)
             .with_context(|| format!("renaming {name} to .done"))?;
 
@@ -423,7 +424,9 @@ pub fn cleanup_done_handoffs(fork_dir: &Path, ttl: Duration) -> usize {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if !name_str.ends_with(".done") {
+        if !elide_core::gc::GcHandoff::from_filename(name_str)
+            .is_some_and(|h| matches!(h.state, elide_core::gc::GcHandoffState::Done))
+        {
             continue;
         }
         let mtime = match entry.metadata().and_then(|m| m.modified()) {
@@ -597,8 +600,8 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
+    _volume_id: &str,
+    _store: &Arc<dyn ObjectStore>,
     new_ulid_str: &str,
 ) -> Result<()> {
     // Read live extent bodies from local segment files.
@@ -748,7 +751,8 @@ fn has_pending_results(gc_dir: &Path) -> Result<bool> {
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|n| n.ends_with(".pending"))
+            .and_then(elide_core::gc::GcHandoff::from_filename)
+            .is_some_and(|h| matches!(h.state, elide_core::gc::GcHandoffState::Pending))
         {
             return Ok(true);
         }

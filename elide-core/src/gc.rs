@@ -24,6 +24,77 @@ use std::fmt;
 
 use ulid::Ulid;
 
+/// The lifecycle state of a GC handoff file in `gc/`.
+///
+/// Files progress through this sequence:
+///
+///   `gc/<ulid>.pending`  — coordinator staged the compacted segment; volume
+///                          has not yet applied the handoff.
+///   `gc/<ulid>.applied`  — volume applied the handoff (re-signed segment,
+///                          updated extent index); coordinator has not yet
+///                          uploaded the new segment to S3 or deleted old ones.
+///   `gc/<ulid>.done`     — coordinator completed upload and cleanup; file is
+///                          kept for `DONE_FILE_TTL` for post-mortem debugging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GcHandoffState {
+    Pending,
+    Applied,
+    Done,
+}
+
+impl GcHandoffState {
+    /// The filename suffix for this state (without leading dot).
+    pub fn suffix(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Applied => "applied",
+            Self::Done => "done",
+        }
+    }
+
+    fn from_suffix(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "applied" => Some(Self::Applied),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
+}
+
+/// A parsed GC handoff filename: a ULID plus its current lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcHandoff {
+    pub ulid: Ulid,
+    pub state: GcHandoffState,
+}
+
+impl GcHandoff {
+    /// Parse a gc/ directory entry filename into a `GcHandoff`.
+    ///
+    /// Returns `None` for bare segment files (no recognised suffix) and any
+    /// name whose ULID stem is invalid.
+    pub fn from_filename(name: &str) -> Option<Self> {
+        let (stem, suffix) = name.rsplit_once('.')?;
+        let state = GcHandoffState::from_suffix(suffix)?;
+        let ulid = Ulid::from_string(stem).ok()?;
+        Some(Self { ulid, state })
+    }
+
+    /// Reconstruct the filename for this handoff in its current state.
+    pub fn filename(&self) -> String {
+        format!("{}.{}", self.ulid, self.state.suffix())
+    }
+
+    /// Return a new `GcHandoff` with the same ULID in `state`.
+    pub fn with_state(self, state: GcHandoffState) -> Self {
+        Self {
+            ulid: self.ulid,
+            state,
+        }
+    }
+}
+
 /// One line from a GC handoff (.pending) file.
 #[derive(Debug, PartialEq)]
 pub enum HandoffLine {
