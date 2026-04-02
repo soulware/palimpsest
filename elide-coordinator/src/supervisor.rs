@@ -28,6 +28,7 @@ use tokio::process::Command;
 
 const PID_FILE: &str = "volume.pid";
 const NBD_PORT_FILE: &str = "nbd.port";
+const NBD_BIND_FILE: &str = "nbd.bind";
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// A process that exits within this many seconds is considered a fast failure.
@@ -101,6 +102,14 @@ fn spawn_volume(fork_dir: &Path, elide_bin: &Path) -> std::io::Result<tokio::pro
         && let Ok(port) = text.trim().parse::<u16>()
     {
         cmd.arg("--port").arg(port.to_string());
+
+        // If nbd.bind exists, pass --bind to override the default 127.0.0.1.
+        if let Ok(addr) = std::fs::read_to_string(fork_dir.join(NBD_BIND_FILE)) {
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                cmd.arg("--bind").arg(addr);
+            }
+        }
     }
 
     // Place the child in a new session so it is not signalled when the
