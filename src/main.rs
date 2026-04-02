@@ -1015,15 +1015,16 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
         ));
     }
 
-    // Check no GC handoff is in flight (.pending), and collect any segments
-    // protected by an acknowledged-but-not-yet-uploaded handoff (.applied).
+    // Collect segments that must be kept despite eviction:
     //
-    //   .pending — volume has not yet acknowledged the handoff; the replacement
-    //              segment may not exist in segments/ yet, and the old segments
-    //              are still needed for reads.  Block eviction entirely.
-    //   .applied — volume acknowledged; the new segment is in segments/ but the
-    //              coordinator has not yet uploaded it to S3.  Only that specific
-    //              segment must be kept — everything else can be evicted.
+    //   .pending — handoff in flight; old input segments are still needed for
+    //              reads (extent index still points at them).  Parse each
+    //              .pending file and protect all referenced old_ulids.
+    //   .applied — handoff acknowledged; new segment is in segments/ but the
+    //              coordinator has not yet uploaded it to S3.  Protect the
+    //              new segment (named by the .applied filename stem).
+    //
+    // Everything else in segments/ can be evicted.
     let gc_dir = vol_dir.join("gc");
     let mut protected: std::collections::HashSet<std::ffi::OsString> =
         std::collections::HashSet::new();
@@ -1033,11 +1034,19 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".pending") {
-                return Err(std::io::Error::other(
-                    "GC handoff in flight (gc/*.pending exists) — wait for it to complete before evicting",
-                ));
-            }
-            if let Some(ulid_str) = name_str.strip_suffix(".applied") {
+                // Parse the handoff to find which old segments are still needed.
+                let content = std::fs::read_to_string(entry.path())?;
+                for line in content.lines() {
+                    if let Some(hl) = elide_core::gc::HandoffLine::parse(line) {
+                        let old_ulid = match hl {
+                            elide_core::gc::HandoffLine::Repack { old_ulid, .. } => old_ulid,
+                            elide_core::gc::HandoffLine::Remove { old_ulid, .. } => old_ulid,
+                            elide_core::gc::HandoffLine::Dead { old_ulid } => old_ulid,
+                        };
+                        protected.insert(std::ffi::OsString::from(old_ulid.to_string()));
+                    }
+                }
+            } else if let Some(ulid_str) = name_str.strip_suffix(".applied") {
                 protected.insert(std::ffi::OsString::from(ulid_str));
             }
         }
@@ -1106,16 +1115,54 @@ mod tests {
     }
 
     #[test]
-    fn evict_blocked_by_gc_pending() {
+    fn evict_skips_pending_old_segments_evicts_others() {
+        use elide_core::gc::{HandoffLine, format_handoff_file};
+        use ulid::Ulid;
+
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
+
+        let old1 = Ulid::from_parts(1, 1);
+        let old2 = Ulid::from_parts(1, 2);
+        let new_ulid = Ulid::from_parts(2, 1);
+        let other = Ulid::from_parts(3, 1);
+
+        // .pending referencing old1 (repack) and old2 (dead).
+        let handoff = format_handoff_file([
+            HandoffLine::Repack {
+                hash: blake3::hash(b"x"),
+                old_ulid: old1,
+                new_ulid,
+                new_offset: 0,
+            },
+            HandoffLine::Dead { old_ulid: old2 },
+        ]);
         fs::write(
-            vol.join("gc").join("01AAAAAAAAAAAAAAAAAAAAAAA1.pending"),
-            b"",
+            vol.join("gc").join(format!("{new_ulid}.pending")),
+            handoff.as_bytes(),
         )
         .unwrap();
-        let err = evict_segments(&vol).unwrap_err();
-        assert!(err.to_string().contains("gc/*.pending"), "{err}");
+
+        // old1 and old2 are in segments/ — must be protected.
+        // other is unrelated — must be evicted.
+        fs::write(vol.join("segments").join(old1.to_string()), b"old1").unwrap();
+        fs::write(vol.join("segments").join(old2.to_string()), b"old2").unwrap();
+        fs::write(vol.join("segments").join(other.to_string()), b"other").unwrap();
+
+        let n = evict_segments(&vol).unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            vol.join("segments").join(old1.to_string()).exists(),
+            "old1 must survive"
+        );
+        assert!(
+            vol.join("segments").join(old2.to_string()).exists(),
+            "old2 must survive"
+        );
+        assert!(
+            !vol.join("segments").join(other.to_string()).exists(),
+            "other must be evicted"
+        );
     }
 
     #[test]
