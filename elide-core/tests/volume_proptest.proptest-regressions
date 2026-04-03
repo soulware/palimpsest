@@ -7,3 +7,4 @@
 cc 1dd23abe03107b0e6cc808d65d6d57ba0f18e3886dda6a5c46adf0db5baa16f7 # shrinks to ops = [Write { lba: 0, seed: 0 }]
 cc 24eb0f9f9c3856d98e0f2738817062394fe26ef54fef98d119e82d6c00f80e72 # shrinks to ops = [Write { lba: 0, seed: 0 }]
 cc 3fe2cf4a290533bcb8439ea9c36b9664745630b6520954d3b45714269aa84a4f # shrinks to ops = [Write { lba: 0, seed: 0 }]
+cc 0b70a68defc822dc8759c4407c4f0518a31cb91fde68ad2a99db2f3f57c6771b # shrinks to ops = [Write { lba: 0, seed: 0 }, CoordGcLocal { n: 2 }]
