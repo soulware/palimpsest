@@ -17,9 +17,9 @@
                             is needed)
 
       Step 2 — Volume re-signs and applies:
-        a. Re-signs gc/<ulid> with its own key, writes segments/<ulid>, deletes
-           gc/<ulid>.  Skipped for removal-only and tombstone handoffs (no
-           staged segment).
+        a. Re-signs gc/<ulid> in-place with its own key (tmp-rename within gc/).
+           The body stays in gc/ — it is NOT moved to segments/ here.
+           Skipped for removal-only and tombstone handoffs (no staged segment).
         b. Applies extent index patches (repack → "gc", remove → "gone"),
            with a per-entry guard: skip if a concurrent write has already
            superseded the hash.
@@ -30,10 +30,15 @@
         d. Renames gc/<ulid>.pending → gc/<ulid>.applied.
 
       Step 3 — Coordinator cleans up:
-        a. Uploads segments/<ulid> (the volume-signed version) to S3.
+        a. Uploads gc/<ulid> (now volume-signed) to S3.
            Skipped for removal-only and tombstone handoffs.
-        b. Deletes old S3 objects and old local segment files.
-        c. Renames gc/<ulid>.applied → gc/<ulid>.done.
+        b. Writes index/<ulid>.idx (S3-confirmation marker).
+           Skipped for removal-only and tombstone handoffs.
+        c. Moves gc/<ulid> → segments/<ulid>.  This is the point at which
+           segments/ reflects that the segment is S3-confirmed.
+           Skipped for removal-only and tombstone handoffs.
+        d. Deletes old S3 objects and old local segment files.
+        e. Renames gc/<ulid>.applied → gc/<ulid>.done.
 
   Two independent actors drive the transitions:
     - Coordinator: Steps 1 and 3
@@ -79,13 +84,17 @@
   This invariant is checked for all three handoff types (repack, removal-only,
   tombstone) by TLC.
 
-  WHY TWO SEGMENT FILES?
-  ----------------------
+  WHY RE-SIGN IN-PLACE IN GC/?
+  ----------------------------
   The coordinator does not hold the volume's private signing key.  It stages
   the compacted segment in gc/ using an ephemeral key.  The volume re-signs
-  it with its own key before moving it into segments/, so that segments/ always
-  contains only volume-signed data.  extentindex::rebuild therefore never needs
-  to special-case in-transit coordinator output.
+  it in-place within gc/; the coordinator then uploads and moves it to segments/.
+  segments/ therefore contains only volume-signed, S3-confirmed bodies.
+
+  The re-sign-in-place design (vs. the earlier move-to-segments/ approach)
+  enforces the invariant "segments/ present ↔ S3-confirmed" structurally:
+  the coordinator is the sole writer of segments/, and writes there only after
+  upload.  This eliminates the need for eviction to inspect in-flight GC state.
 
   WHAT WE CHECK
   -------------
@@ -154,14 +163,19 @@ VARIABLES
                  \*   "new"  — a concurrent write superseded this entry
                  \* For tombstone handoffs Hashes = {} so this map is empty.
 
-  old_present,   \* TRUE iff the old (input) segment file is still present.
-                 \* For tombstone handoffs this is the all-dead segment being deleted.
-  gc_seg_present, \* TRUE iff gc/<ulid> (ephemeral-signed staged segment) is present
-  new_seg_present, \* TRUE iff segments/<ulid> (volume-signed GC output) is present
+  old_present,    \* TRUE iff the old (input) segment file is still present.
+                  \* For tombstone handoffs this is the all-dead segment being deleted.
+  gc_seg_present, \* TRUE iff gc/<ulid> body is present (coordinator- or volume-signed).
+                  \* Set FALSE only when the coordinator moves it to segments/ in Step 3c.
+  gc_seg_signed,  \* TRUE iff the gc/<ulid> body has been re-signed by the volume.
+                  \* FALSE until VolumeReSigns fires; stays TRUE until gc_seg_present = FALSE.
+                  \* Extent index entries pointing at "gc" are only readable once this is TRUE.
+  new_seg_present, \* TRUE iff segments/<ulid> (volume-signed, S3-confirmed) is present.
+                   \* Set only by CoordApplyDone (the gc/ → segments/ move).
   coord_up,      \* TRUE iff the coordinator is currently running
   vol_up         \* TRUE iff the volume is currently running
 
-vars == <<handoff, extent, old_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
+vars == <<handoff, extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Type correctness (checked as an invariant, useful for debugging the model)
@@ -170,26 +184,28 @@ vars == <<handoff, extent, old_present, gc_seg_present, new_seg_present, coord_u
 Hashes == Carried \cup Removed
 
 TypeOK ==
-  /\ handoff         \in {"absent", "pending", "applied", "done"}
-  /\ extent          \in [Hashes -> {"old", "gc", "gone", "new"}]
-  /\ old_present     \in BOOLEAN
-  /\ gc_seg_present  \in BOOLEAN
-  /\ new_seg_present \in BOOLEAN
-  /\ coord_up        \in BOOLEAN
-  /\ vol_up          \in BOOLEAN
+  /\ handoff          \in {"absent", "pending", "applied", "done"}
+  /\ extent           \in [Hashes -> {"old", "gc", "gone", "new"}]
+  /\ old_present      \in BOOLEAN
+  /\ gc_seg_present   \in BOOLEAN
+  /\ gc_seg_signed    \in BOOLEAN
+  /\ new_seg_present  \in BOOLEAN
+  /\ coord_up         \in BOOLEAN
+  /\ vol_up           \in BOOLEAN
 
 \* ---------------------------------------------------------------------------
 \* Initial state
 \* ---------------------------------------------------------------------------
 
 Init ==
-  /\ handoff         = "absent"
-  /\ extent          = [h \in Hashes |-> "old"]   \* all entries pre-GC
-  /\ old_present     = TRUE                         \* old segment exists
-  /\ gc_seg_present  = FALSE                        \* staged segment not yet written
-  /\ new_seg_present = FALSE                        \* GC output not yet in segments/
-  /\ coord_up        = TRUE
-  /\ vol_up          = TRUE
+  /\ handoff          = "absent"
+  /\ extent           = [h \in Hashes |-> "old"]   \* all entries pre-GC
+  /\ old_present      = TRUE                        \* old segment exists
+  /\ gc_seg_present   = FALSE                       \* staged segment not yet written
+  /\ gc_seg_signed    = FALSE                       \* not yet re-signed by volume
+  /\ new_seg_present  = FALSE                       \* GC output not yet in segments/
+  /\ coord_up         = TRUE
+  /\ vol_up           = TRUE
 
 \* ---------------------------------------------------------------------------
 \* Coordinator actions
@@ -215,15 +231,15 @@ CoordWritePending ==
   /\ handoff = "absent"
   /\ handoff'         = "pending"
   /\ gc_seg_present'  = (Carried # {})   \* staged segment written iff there are carried entries
-  /\ UNCHANGED <<extent, old_present, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 (*
-  Step 3: Coordinator sees .applied.  Uploads segments/<ulid> (the volume-signed
-  version) to S3 if a new segment was produced, deletes old S3 objects and old
-  local segment files, then renames .applied → .done.  Modelled as one atomic
-  step because each S3 DELETE is idempotent (404 = success), so a crash
-  mid-cleanup is safe: on restart the coordinator retries from .applied and the
-  net effect is the same.
+  Step 3: Coordinator sees .applied.  Uploads gc/<ulid> (now volume-signed) to
+  S3 if a new segment was produced, writes index/<ulid>.idx, moves gc/<ulid>
+  → segments/<ulid>, deletes old S3 objects and old local segment files, then
+  renames .applied → .done.  Modelled as one atomic step because each S3 DELETE
+  is idempotent (404 = success), so a crash mid-cleanup is safe: on restart the
+  coordinator retries from .applied and the net effect is the same.
 
   By the time handoff = "applied" the volume has processed every entry
   (VolumeFinishApply's precondition guarantees it), so no extent points to
@@ -234,50 +250,54 @@ CoordWritePending ==
   has confirmed no live references exist from its perspective.
 
   S3 upload state is not modelled (no S3 variable); the upload happens before
-  deletion and is safe to retry.  new_seg_present stays TRUE — extents in the
-  "gc" state still point to segments/<ulid>, which persists locally beyond the
-  scope of this protocol.
+  the move and is safe to retry.
+
+  The gc/ → segments/ move (step 3c) is what sets new_seg_present.  Until this
+  step, extents in the "gc" state reference a body still in gc/ (accessible via
+  the read-path gc/ fallback when segments/<ulid> is absent).  After this step,
+  the body is in segments/ and the normal read path applies.
 *)
 CoordApplyDone ==
   /\ coord_up
   /\ handoff = "applied"
-  /\ handoff'     = "done"
-  /\ old_present' = FALSE
-  /\ UNCHANGED <<extent, gc_seg_present, new_seg_present, coord_up, vol_up>>
+  /\ handoff'          = "done"
+  /\ old_present'      = FALSE
+  /\ gc_seg_present'   = FALSE          \* gc/ body moved to segments/
+  /\ gc_seg_signed'    = FALSE          \* reset: body no longer in gc/
+  /\ new_seg_present'  = (Carried # {}) \* segments/<ulid> written iff a body was produced
+  /\ UNCHANGED <<extent, coord_up, vol_up>>
 
 CoordCrash ==
   /\ coord_up
   /\ coord_up' = FALSE
-  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, new_seg_present, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, vol_up>>
 
 \* On restart the coordinator re-reads gc/ and resumes at whatever state the
 \* file is in.  No state reset is needed because the file state is persistent.
 CoordRestart ==
   /\ ~coord_up
   /\ coord_up' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, new_seg_present, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Volume actions
 \* ---------------------------------------------------------------------------
 
 (*
-  Step 2a: Volume re-signs the staged segment.
+  Step 2a: Volume re-signs the staged segment in-place.
 
-  The volume reads gc/<ulid> (ephemeral-signed), writes a volume-signed copy to
-  segments/<ulid>, then deletes gc/<ulid>.  Modelled as one atomic step.
+  The volume reads gc/<ulid> (ephemeral-signed), writes a volume-signed copy
+  back to gc/<ulid> (via gc/<ulid>.tmp then rename).  The body stays in gc/ —
+  it is NOT moved to segments/ here.  Modelled as one atomic step.
 
   This must happen before any carried entry can be applied: VolumeApplyCarried
-  requires new_seg_present (the volume-signed output) rather than gc_seg_present
-  (the ephemeral coordinator output).
+  requires gc_seg_signed (the volume-signed gc/ body) rather than merely
+  gc_seg_present (which is TRUE even for the ephemeral coordinator output).
 
-  Idempotency: if the volume crashes after writing segments/<ulid> but before
-  deleting gc/<ulid>, both files are present on restart.  The next call
-  re-signs, overwriting segments/<ulid> with identical content (idempotent),
-  and deletes gc/<ulid>.  In the model this is captured by allowing VolumeReSigns
-  to fire again only if gc_seg_present is still TRUE.  After a crash-and-restart
-  where segments/<ulid> already exists, the volume will find gc/<ulid> still
-  present (gc_seg_present = TRUE) and re-sign idempotently, then proceed.
+  Idempotency: re-signing is a pure function of the input content; if the volume
+  crashes mid-rename and retries, the output is identical.  In the model this is
+  captured by allowing VolumeReSigns to fire again only if gc_seg_present is
+  still TRUE and gc_seg_signed is FALSE.
 
   For removal-only and tombstone handoffs gc_seg_present = FALSE throughout, so
   VolumeReSigns never fires — correctly, as there is no staged segment to re-sign.
@@ -286,9 +306,9 @@ VolumeReSigns ==
   /\ vol_up
   /\ handoff = "pending"
   /\ gc_seg_present              \* staged segment must be present
-  /\ gc_seg_present'  = FALSE    \* gc/<ulid> deleted after re-sign
-  /\ new_seg_present' = TRUE     \* segments/<ulid> written
-  /\ UNCHANGED <<handoff, extent, old_present, coord_up, vol_up>>
+  /\ ~gc_seg_signed              \* not yet re-signed (idempotency guard)
+  /\ gc_seg_signed'   = TRUE     \* body in gc/ is now volume-signed
+  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
 
 (*
   Step 2b: Volume applies one carried entry from the handoff.
@@ -300,18 +320,19 @@ VolumeReSigns ==
   This guard is the central correctness mechanism.  Without it a stale GC
   output could overwrite a newer write's extent index entry.
 
-  Precondition new_seg_present: the volume needs the re-signed segment in
-  segments/ before it can apply carried entries.  Removal entries
+  Precondition gc_seg_signed: the volume needs the re-signed body in gc/ before
+  it can apply carried entries.  The re-signed body is in gc/ (not segments/);
+  the coordinator will move it to segments/ in Step 3c.  Removal entries
   (Removed) do not need this.
 *)
 VolumeApplyCarried(h) ==
   /\ vol_up
   /\ handoff = "pending"
   /\ h \in Carried
-  /\ new_seg_present             \* re-signed segment must be in segments/
+  /\ gc_seg_signed               \* re-signed body must be in gc/
   /\ extent[h] = "old"           \* guard: skip if superseded by a concurrent write
   /\ extent' = [extent EXCEPT ![h] = "gc"]
-  /\ UNCHANGED <<handoff, old_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 (*
   Step 2b (removal): Volume applies one removed entry from the handoff.
@@ -326,19 +347,20 @@ VolumeApplyRemoved(h) ==
   /\ h \in Removed
   /\ extent[h] = "old"           \* guard: skip if superseded
   /\ extent' = [extent EXCEPT ![h] = "gone"]
-  /\ UNCHANGED <<handoff, old_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 (*
-  Step 2c: Volume has visited every entry (applied or skipped due to guard) and
+  Step 2d: Volume has visited every entry (applied or skipped due to guard) and
   atomically renames gc/<ulid>.pending → gc/<ulid>.applied.
 
   Preconditions:
     - Every carried entry is now "gc" (applied) or "new" (guard fired, skipped)
     - Every removed entry is now "gone" (applied) or "new" (guard fired, skipped)
-    - gc_seg_present = FALSE: the staged segment has been consumed by VolumeReSigns
-      (or Carried = {}, so no staged segment was written).  This ensures
-      segments/<ulid> is always the canonical location before signalling the
-      coordinator to clean up old files.
+    - ~gc_seg_present \/ gc_seg_signed: if a staged segment was written
+      (gc_seg_present = TRUE), it must have been re-signed by the volume
+      (gc_seg_signed = TRUE) before signalling the coordinator.  This ensures
+      the body in gc/ is volume-signed before Step 3 begins.
+      (For Carried = {} no staged segment exists; gc_seg_present = FALSE always.)
 
   For tombstone handoffs (Dead = TRUE, Carried = {}, Removed = {}):
     - Both universals are vacuously true (Hashes = {})
@@ -355,21 +377,21 @@ VolumeApplyRemoved(h) ==
 VolumeFinishApply ==
   /\ vol_up
   /\ handoff = "pending"
-  /\ ~gc_seg_present             \* re-signing complete (or Carried = {} → always FALSE)
+  /\ ~gc_seg_present \/ gc_seg_signed  \* re-signing complete (or Carried = {})
   /\ \A h \in Carried : extent[h] \in {"gc",   "new"}
   /\ \A h \in Removed : extent[h] \in {"gone", "new"}
   /\ handoff' = "applied"
-  /\ UNCHANGED <<extent, old_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 VolumeCrash ==
   /\ vol_up
   /\ vol_up' = FALSE
-  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, new_seg_present, coord_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
 
 VolumeRestart ==
   /\ ~vol_up
   /\ vol_up' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, new_seg_present, coord_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
 
 \* ---------------------------------------------------------------------------
 \* Environment: concurrent writes
@@ -402,7 +424,7 @@ VolumeRestart ==
 NewerWrite(h) ==
   /\ extent[h] \in {"old", "gc"}
   /\ extent' = [extent EXCEPT ![h] = "new"]
-  /\ UNCHANGED <<handoff, old_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Specification
@@ -475,33 +497,44 @@ Spec ==
   NoSegmentNotFound at some earlier point.
 
   - extent = "old"  references the original input segment (old_present)
-  - extent = "gc"   references the volume-signed GC output (new_seg_present)
+  - extent = "gc"   references the GC output body, which may be in two places:
+                      * gc/ (volume-signed, during the .applied window):
+                        gc_seg_present /\ gc_seg_signed
+                      * segments/ (after coordinator moves it in Step 3c):
+                        new_seg_present
+                    The body must be in at least one of these locations.
   - extent = "gone" means the entry was deleted from the index (no reference)
   - extent = "new"  means a write's segment is in use (always present by
                     assumption — writes land in pending/ which is local)
 
-  gc_seg_present (the ephemeral staged segment in gc/) is never referenced by
-  any extent entry; it is only a staging area for the re-signing step.
+  gc_seg_present without gc_seg_signed (the ephemeral coordinator-signed body)
+  is never referenced by any extent entry; it is only present before VolumeReSigns.
 
   For tombstone handoffs Hashes = {} so both quantifiers are vacuously true.
   The binding safety invariant for tombstones is OldOnlyDeletedAfterApplied.
 *)
 NoSegmentNotFound ==
-  /\ \A h \in Hashes  : extent[h] = "old"  => old_present
-  /\ \A h \in Carried : extent[h] = "gc"   => new_seg_present
+  /\ \A h \in Hashes  : extent[h] = "old" => old_present
+  /\ \A h \in Carried : extent[h] = "gc"  =>
+       (gc_seg_present /\ gc_seg_signed) \/ new_seg_present
 
 (*
   Segments are only removed when nothing in the extent index points to them
   any more.  Equivalently: if a segment is absent, no extent references it.
 
-  The ephemeral gc_seg_present segment is excluded: it is never referenced by
-  any extent entry, so its presence or absence does not affect index safety.
+  For "gc" entries: the body may be in gc/ OR segments/.  NoLostData requires
+  that if BOTH are absent, no extent still points there.
+
+  The ephemeral coordinator-signed gc_seg_present (before VolumeReSigns) is
+  never referenced by any extent entry, so its presence or absence does not
+  affect index safety.
 
   For tombstone handoffs Hashes = {} so both quantifiers are vacuously true.
 *)
 NoLostData ==
-  /\ (~old_present     => \A h \in Hashes  : extent[h] # "old")
-  /\ (~new_seg_present => \A h \in Carried : extent[h] # "gc")
+  /\ (~old_present => \A h \in Hashes : extent[h] # "old")
+  /\ (\A h \in Carried :
+        ~((gc_seg_present /\ gc_seg_signed) \/ new_seg_present) => extent[h] # "gc")
 
 (*
   Coordinator deletion invariant: the old segment (including an all-dead
@@ -527,6 +560,23 @@ NoLostData ==
 *)
 OldOnlyDeletedAfterApplied ==
   ~old_present => handoff = "done"
+
+(*
+  segments/ invariant: new_seg_present (the GC output body is in segments/)
+  implies the body in gc/ is gone and the handoff has reached "done".
+
+  This encodes the structural enforcement of "segments/ present ↔ S3-confirmed":
+  new_seg_present is only set TRUE by CoordApplyDone, which fires only when
+  handoff = "applied" — i.e. after the volume has acknowledged and the
+  coordinator has completed upload.  Once in segments/, gc/ no longer has the
+  body (gc_seg_present = FALSE).
+
+  This invariant is trivially true in the old design (new_seg_present was set
+  by VolumeReSigns before upload).  Here it verifies that the new design
+  correctly ties segments/ presence to coordinator completion.
+*)
+SegmentsOnlyAfterUpload ==
+  new_seg_present => (~gc_seg_present /\ handoff = "done")
 
 \* ---------------------------------------------------------------------------
 \* Liveness property
