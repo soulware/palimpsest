@@ -312,27 +312,40 @@ pub async fn apply_done_handoffs(
             }
         }
 
-        // Upload the volume-signed compacted segment to S3.  This happens here
-        // rather than in the compact pass so that S3 always receives the version
-        // that the volume has re-signed with its own key.  The put is idempotent:
-        // if the coordinator crashes and retries, the same bytes are written again.
-        let new_seg_path = segments_dir.join(&new_ulid_str);
-        let seg_exists = new_seg_path
+        // The volume re-signs the compacted segment in-place within gc/.  The
+        // coordinator uploads it from there, writes index/<ulid>.idx, then moves
+        // gc/<ulid> → segments/<ulid>.  The segments/ move is the last step so
+        // that segments/ only ever contains S3-confirmed bodies.
+        //
+        // Idempotency: if the coordinator crashes after the move (gc/<ulid> is
+        // gone), the body is already in segments/ and seg_body_path reflects that.
+        let gc_body = gc_dir.join(&new_ulid_str);
+        let seg_body = segments_dir.join(&new_ulid_str);
+        // Body is in gc/ until the move; after a crash it may already be in segments/.
+        let seg_body_path = if gc_body.try_exists().context("checking gc body path")? {
+            Some(gc_body.clone())
+        } else if seg_body
             .try_exists()
-            .context("checking new segment path")?;
+            .context("checking segment body path")?
+        {
+            Some(seg_body.clone())
+        } else {
+            None
+        };
+        let seg_exists = seg_body_path.is_some();
 
         if is_repack && !seg_exists {
-            // The volume creates segments/<new-ulid> before renaming the handoff
-            // to .applied, so a missing segment here is always a bug.  Abort
-            // rather than silently deleting the old segments without uploading
-            // the replacement — that would cause permanent data loss.
+            // The volume re-signs gc/<new-ulid> before renaming the handoff to
+            // .applied, so a missing body here is always a bug.  Abort rather
+            // than silently deleting the old segments without uploading the
+            // replacement — that would cause permanent data loss.
             return Err(anyhow::anyhow!(
-                "compacted segment {new_ulid_str} missing from segments/ for repack handoff \
+                "compacted segment {new_ulid_str} missing from gc/ for repack handoff \
                  — refusing to delete old segments before upload"
             ));
         }
 
-        if seg_exists {
+        if let Some(ref body_path) = seg_body_path {
             // Verify the volume's signature before uploading.  This catches any
             // case where the volume failed to sign correctly — we refuse to
             // propagate a bad segment to S3.  Load volume.pub here rather than
@@ -343,19 +356,37 @@ pub async fn apply_done_handoffs(
                 elide_core::signing::VOLUME_PUB_FILE,
             )
             .context("loading volume verifying key")?;
-            segment::read_and_verify_segment_index(&new_seg_path, &vk).with_context(|| {
+            segment::read_and_verify_segment_index(body_path, &vk).with_context(|| {
                 format!("signature verification failed for compacted segment {new_ulid_str}")
             })?;
 
             let key = segment_key(volume_id, &new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
-            let data = tokio::fs::read(&new_seg_path)
+            let data = tokio::fs::read(body_path)
                 .await
                 .with_context(|| format!("reading compacted segment {new_ulid_str}"))?;
             store
                 .put(&key, Bytes::from(data).into())
                 .await
                 .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
+
+            // Write index/<new_ulid>.idx — the S3-confirmation marker.  Must
+            // happen before the gc/ → segments/ move so that the invariant
+            // "index present ↔ segments present ↔ S3-confirmed" holds.
+            let index_dir = fork_dir.join("index");
+            fs::create_dir_all(&index_dir)
+                .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
+            let idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
+            elide_core::segment::extract_idx(body_path, &idx_path)
+                .with_context(|| format!("writing index/{new_ulid_str}.idx"))?;
+
+            // Move gc/<new-ulid> → segments/<new-ulid>.  This is the final
+            // confirmation step: segments/ now reflects S3 availability.
+            // Skip if already in segments/ (crash recovery: prior attempt completed the move).
+            if gc_body.try_exists().context("checking gc body for move")? {
+                fs::rename(&gc_body, &seg_body)
+                    .with_context(|| format!("moving gc/{new_ulid_str} to segments/"))?;
+            }
         }
 
         // Delete old S3 objects.  A 404 means the object is already gone
@@ -1112,7 +1143,8 @@ mod tests {
 
     #[tokio::test]
     async fn done_verifies_signature_before_upload() {
-        // A correctly-signed segment must be uploaded to S3 successfully.
+        // A correctly-signed segment in gc/ must be uploaded to S3 and moved
+        // to segments/ successfully.
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         let segments_dir = tmp.path().join("segments");
@@ -1124,7 +1156,8 @@ mod tests {
         let new_ulid = Ulid::from_parts(1000, 10);
         let old_ulid = Ulid::from_parts(999, 9);
 
-        // Write a properly volume-signed segment to segments/<new_ulid>.
+        // Write a properly volume-signed segment to gc/<new_ulid> (volume has re-signed
+        // in-place; coordinator will upload from here and then move to segments/).
         let entry = elide_core::segment::SegmentEntry::new_data(
             blake3::hash(b"payload"),
             0,
@@ -1133,7 +1166,7 @@ mod tests {
             b"payload".to_vec(),
         );
         elide_core::segment::write_segment(
-            &segments_dir.join(new_ulid.to_string()),
+            &gc_dir.join(new_ulid.to_string()),
             &mut vec![entry],
             signer.as_ref(),
         )
@@ -1154,9 +1187,17 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
 
-        // Segment should be in S3.
+        // Segment should be in S3 and moved from gc/ to segments/.
         let key = segment_key("vol", &new_ulid.to_string()).unwrap();
         assert!(store.get(&key).await.is_ok(), "segment should be in S3");
+        assert!(
+            segments_dir.join(new_ulid.to_string()).exists(),
+            "segment should be in segments/"
+        );
+        assert!(
+            !gc_dir.join(new_ulid.to_string()).exists(),
+            "gc body should be gone after move"
+        );
         assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
     }
 
@@ -1178,7 +1219,7 @@ mod tests {
         let old_ulid = Ulid::from_parts(999, 10);
 
         elide_core::segment::write_segment(
-            &segments_dir.join(new_ulid.to_string()),
+            &gc_dir.join(new_ulid.to_string()),
             &mut vec![elide_core::segment::SegmentEntry::new_data(
                 blake3::hash(b"payload"),
                 0,

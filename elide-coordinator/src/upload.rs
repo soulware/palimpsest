@@ -12,7 +12,8 @@
 //   1. Read pending/<ulid> into memory
 //   2. PUT to object store at the derived key
 //   3. On success: rename pending/<ulid> → segments/<ulid>
-//   4. On failure: leave in pending/, record error, continue
+//   4. Write index/<ulid>.idx (header+index section) — confirms S3 availability
+//   5. On failure: leave in pending/, record error, continue
 
 use std::path::Path;
 
@@ -113,6 +114,7 @@ pub async fn drain_pending(
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
     let segments_dir = vol_dir.join("segments");
+    let index_dir = vol_dir.join("index");
 
     // Ensure segments/ exists — import_image only creates pending/.
     tokio::fs::create_dir_all(&segments_dir)
@@ -141,7 +143,16 @@ pub async fn drain_pending(
         let name = name.to_owned();
         let segment_path = entry.path();
 
-        match upload_segment(&segment_path, &name, &segments_dir, volume_id, store).await {
+        match upload_segment(
+            &segment_path,
+            &name,
+            &segments_dir,
+            &index_dir,
+            volume_id,
+            store,
+        )
+        .await
+        {
             Ok(()) => uploaded += 1,
             Err(e) => {
                 warn!("upload failed for segment {name}: {e:#}");
@@ -272,6 +283,7 @@ async fn upload_segment(
     path: &Path,
     ulid_str: &str,
     segments_dir: &Path,
+    index_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
@@ -290,6 +302,15 @@ async fn upload_segment(
     tokio::fs::rename(path, &dest)
         .await
         .with_context(|| format!("committing segment {ulid_str} to segments/"))?;
+
+    // Write index/<ulid>.idx after confirmed S3 upload. This is the signal
+    // that the segment is S3-backed and local body bytes are no longer needed
+    // for LBA map correctness. Idempotent: skipped if .idx already exists.
+    std::fs::create_dir_all(index_dir)
+        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
+    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+    elide_core::segment::extract_idx(&dest, &idx_path)
+        .with_context(|| format!("writing index/{ulid_str}.idx"))?;
 
     Ok(())
 }
@@ -349,19 +370,47 @@ mod tests {
 
     #[tokio::test]
     async fn drain_pending_uploads_and_commits() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::signing::generate_ephemeral_signer;
+
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
         let segments_dir = vol_dir.join("segments");
+        let index_dir = vol_dir.join("index");
         std::fs::create_dir_all(&pending_dir).unwrap();
         std::fs::create_dir_all(&segments_dir).unwrap();
         std::fs::write(vol_dir.join("volume.name"), "test-vol").unwrap();
         std::fs::write(vol_dir.join("volume.size"), "4096").unwrap();
 
+        let (signer, _) = generate_ephemeral_signer();
+
         let ulid1 = make_ulid(1743120000000, 1);
         let ulid2 = make_ulid(1743120000000, 2);
-        std::fs::write(pending_dir.join(&ulid1), b"segment data 1").unwrap();
-        std::fs::write(pending_dir.join(&ulid2), b"segment data 2").unwrap();
+
+        // Write real segments — extract_idx requires valid segment format.
+        let data1 = vec![0xABu8; 4096];
+        let h1 = blake3::hash(&data1);
+        let mut entries1 = vec![SegmentEntry::new_data(
+            h1,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data1,
+        )];
+        write_segment(&pending_dir.join(&ulid1), &mut entries1, signer.as_ref()).unwrap();
+
+        let data2 = vec![0xCDu8; 4096];
+        let h2 = blake3::hash(&data2);
+        let mut entries2 = vec![SegmentEntry::new_data(
+            h2,
+            1,
+            1,
+            SegmentFlags::empty(),
+            data2,
+        )];
+        write_segment(&pending_dir.join(&ulid2), &mut entries2, signer.as_ref()).unwrap();
+
         // .tmp files must be left in place
         std::fs::write(pending_dir.join(format!("{ulid1}.tmp")), b"incomplete").unwrap();
 
@@ -379,6 +428,10 @@ mod tests {
         assert!(segments_dir.join(&ulid1).exists());
         assert!(segments_dir.join(&ulid2).exists());
         assert!(pending_dir.join(format!("{ulid1}.tmp")).exists());
+
+        // index/*.idx must be written after confirmed upload.
+        assert!(index_dir.join(format!("{ulid1}.idx")).exists());
+        assert!(index_dir.join(format!("{ulid2}.idx")).exists());
 
         let key1 = segment_key(VOL_ULID, &ulid1).unwrap();
         let key2 = segment_key(VOL_ULID, &ulid2).unwrap();

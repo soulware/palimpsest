@@ -1,9 +1,9 @@
 // Human-readable inspection of elide binary file formats.
 //
 // inspect-segment <path>
-//   Prints the header and index entries of a segment file or a fetched .idx
+//   Prints the header and index entries of a segment file or a cached .idx
 //   file. Works on both: full segments (pending/, segments/) and index-only
-//   files (fetched/*.idx). Flags each data entry as OK or OVERFLOW relative
+//   files (cache/*.idx). Flags each data entry as OK or OVERFLOW relative
 //   to the body file on disk (if present).
 //
 // inspect-wal <path>

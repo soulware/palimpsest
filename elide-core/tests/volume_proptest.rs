@@ -25,7 +25,7 @@ mod common;
 
 // --- simulation helpers ---
 
-/// Collect every ULID-named file across wal/, pending/, and segments/.
+/// Collect every ULID-named file across wal/, pending/, segments/, and index/*.idx.
 fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     let mut result = std::collections::BTreeSet::new();
     for subdir in ["wal", "pending", "segments"] {
@@ -34,6 +34,18 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     if let Ok(u) = Ulid::from_string(name) {
+                        result.insert(u);
+                    }
+                }
+            }
+        }
+    }
+    // Include index/*.idx stems so ULID monotonicity assertions cover demand-fetched segments.
+    if let Ok(entries) = fs::read_dir(fork_dir.join("index")) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(stem) = name.strip_suffix(".idx") {
+                    if let Ok(u) = Ulid::from_string(stem) {
                         result.insert(u);
                     }
                 }
@@ -77,6 +89,13 @@ enum SimOp {
     ReadUnwritten,
     /// Take a snapshot; segments at or below the returned ULID are frozen.
     Snapshot,
+    /// Write a single block directly to cache/ in the three-file format
+    /// (bypassing the WAL), simulating a demand-fetch result from S3.
+    ///
+    /// LBAs are offset by 16 (range 16–23) to stay disjoint from Write (0–7)
+    /// and ReadUnwritten (64).  The oracle is updated immediately because after
+    /// any subsequent Crash the rebuilt volume will serve this data from cache/.
+    PopulateFetched { lba: u8, seed: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -91,6 +110,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::Crash),
         Just(SimOp::ReadUnwritten),
         Just(SimOp::Snapshot),
+        (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::PopulateFetched { lba, seed }),
     ]
 }
 
@@ -369,6 +389,19 @@ proptest! {
                         snapshot_floor = Some(u);
                     }
                 }
+                SimOp::PopulateFetched { lba, seed } => {
+                    // gc_checkpoint flushes the WAL (may create a pending segment) then
+                    // mints a fresh ULID for the cache file.  Both must be > max_before.
+                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    common::populate_cache(fork_dir, ulid, 16 + *lba as u64, *seed);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            *u > max_before,
+                            "PopulateFetched produced out-of-order ULID: {u} <= {max_before}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -466,6 +499,16 @@ proptest! {
                     // Snapshot does not change readable data; no oracle update.
                     let _ = vol.snapshot();
                 }
+                SimOp::PopulateFetched { lba, seed } => {
+                    // Write directly to cache/ (simulates a demand-fetch from S3).
+                    // LBA is offset by 16 so it never overlaps with Write (0–7).
+                    // The latest PopulateFetched for an LBA wins on rebuild (highest
+                    // ULID applied last), so always overwrite the oracle entry.
+                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let actual_lba = 16 + *lba as u64;
+                    common::populate_cache(fork_dir, ulid, actual_lba, *seed);
+                    oracle.insert(actual_lba, [*seed; 4096]);
+                }
             }
         }
     }
@@ -555,6 +598,12 @@ proptest! {
                 }
                 SimOp::Snapshot => {
                     let _ = vol.snapshot();
+                }
+                SimOp::PopulateFetched { lba, seed } => {
+                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let actual_lba = 16 + *lba as u64;
+                    common::populate_cache(fork_dir, ulid, actual_lba, *seed);
+                    oracle.insert(actual_lba, [*seed; 4096]);
                 }
             }
         }

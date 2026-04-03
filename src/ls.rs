@@ -167,8 +167,10 @@ struct VolumeReader {
     /// Demand-fetcher: downloads a segment body from the object store on a miss.
     /// `None` if no store is configured (local-only volumes always have their bodies).
     fetcher: Option<Box<dyn SegmentFetcher>>,
-    /// Directory where demand-fetched `.body` files are written (`<fork>/fetched/`).
-    primary_fetched_dir: PathBuf,
+    /// Directory where coordinator-written `.idx` files live (`<fork>/index/`).
+    primary_index_dir: PathBuf,
+    /// Directory where demand-fetched `.body` files are written (`<fork>/cache/`).
+    primary_cache_dir: PathBuf,
 }
 
 impl VolumeReader {
@@ -238,7 +240,8 @@ impl VolumeReader {
 
         // Try to configure demand-fetch from the object store.
         // search_dirs is newest-first; ancestry_chain expects oldest-first.
-        let primary_fetched_dir = dir.join("fetched");
+        let primary_index_dir = dir.join("index");
+        let primary_cache_dir = dir.join("cache");
         let data_dir = by_id_dir.parent().unwrap_or(by_id_dir);
         let fetcher: Option<Box<dyn SegmentFetcher>> =
             FetchConfig::load(data_dir).ok().flatten().and_then(|cfg| {
@@ -254,17 +257,19 @@ impl VolumeReader {
             lbamap,
             extent_index,
             fetcher,
-            primary_fetched_dir,
+            primary_index_dir,
+            primary_cache_dir,
         })
     }
 
-    /// Find the `fetched/` directory that holds the `.idx` file for `segment_id`.
-    /// Returns `None` if not found in any search dir (fall back to primary).
-    fn find_fetched_dir(&self, segment_id: &str) -> Option<PathBuf> {
+    /// Find the `(index_dir, body_dir)` pair for `segment_id` by locating its
+    /// `.idx` file in one of the search dirs' `index/` subdirectories.
+    /// Returns `None` if not found in any search dir (fall back to primary dirs).
+    fn find_dirs_for_segment(&self, segment_id: &str) -> Option<(PathBuf, PathBuf)> {
         for dir in &self.search_dirs {
-            let idx = dir.join("fetched").join(format!("{segment_id}.idx"));
+            let idx = dir.join("index").join(format!("{segment_id}.idx"));
             if idx.exists() {
-                return Some(dir.join("fetched"));
+                return Some((dir.join("index"), dir.join("cache")));
             }
         }
         None
@@ -279,21 +284,29 @@ impl VolumeReader {
         };
         let loc = loc.clone();
 
-        // Per-extent demand-fetch for fetched entries (have entry_idx and body_section_start).
+        // Per-extent demand-fetch for cached entries (have entry_idx and body_section_start).
         if let Some(entry_idx) = loc.entry_idx {
-            let fetched_dir = self
-                .find_fetched_dir(&loc.segment_id)
-                .unwrap_or_else(|| self.primary_fetched_dir.clone());
-            let present_path = fetched_dir.join(format!("{}.present", loc.segment_id));
+            let (index_dir, body_dir) =
+                self.find_dirs_for_segment(&loc.segment_id)
+                    .unwrap_or_else(|| {
+                        (
+                            self.primary_index_dir.clone(),
+                            self.primary_cache_dir.clone(),
+                        )
+                    });
+            let present_path = body_dir.join(format!("{}.present", loc.segment_id));
             if !segment::check_present_bit(&present_path, entry_idx)? {
                 match &self.fetcher {
                     Some(fetcher) => fetcher.fetch_extent(
                         &loc.segment_id,
-                        &fetched_dir,
-                        loc.body_section_start,
-                        loc.body_offset,
-                        loc.body_length,
-                        entry_idx,
+                        &index_dir,
+                        &body_dir,
+                        &segment::ExtentFetch {
+                            body_section_start: loc.body_section_start,
+                            body_offset: loc.body_offset,
+                            body_length: loc.body_length,
+                            entry_idx,
+                        },
                     )?,
                     None => {
                         return Err(io::Error::other(format!(
@@ -312,7 +325,11 @@ impl VolumeReader {
                 // that was evicted). Download the whole body.
                 match &self.fetcher {
                     Some(fetcher) => {
-                        fetcher.fetch(&loc.segment_id, &self.primary_fetched_dir)?;
+                        fetcher.fetch(
+                            &loc.segment_id,
+                            &self.primary_index_dir,
+                            &self.primary_cache_dir,
+                        )?;
                         find_segment_file(&self.search_dirs, &loc.segment_id)?
                     }
                     None => {
@@ -524,10 +541,11 @@ mod tests {
         rt.block_on(store.put(&key, seg_bytes.clone().into()))
             .unwrap();
         std::fs::remove_file(&seg_path).unwrap();
-        let fetched_dir = vol_dir.join("fetched");
-        std::fs::create_dir_all(&fetched_dir).unwrap();
+        let index_dir = vol_dir.join("index");
+        let cache_dir = vol_dir.join("cache");
+        std::fs::create_dir_all(&index_dir).unwrap();
         std::fs::write(
-            fetched_dir.join(format!("{seg_id}.idx")),
+            index_dir.join(format!("{seg_id}.idx")),
             &seg_bytes[..bss as usize],
         )
         .unwrap();
@@ -538,16 +556,16 @@ mod tests {
         let block = reader.read_block(0).unwrap();
         assert_eq!(
             block, [0xABu8; 4096],
-            "fetched block must match written data"
+            "demand-fetched block must match written data"
         );
 
-        // .body and .present must have been created by the demand-fetch.
+        // .body and .present must have been created by the demand-fetch in cache/.
         assert!(
-            fetched_dir.join(format!("{seg_id}.body")).exists(),
+            cache_dir.join(format!("{seg_id}.body")).exists(),
             ".body should be created"
         );
         assert!(
-            fetched_dir.join(format!("{seg_id}.present")).exists(),
+            cache_dir.join(format!("{seg_id}.present")).exists(),
             ".present should be created"
         );
     }
@@ -604,8 +622,8 @@ fn find_segment_file(search_dirs: &[PathBuf], segment_id: &str) -> io::Result<Pa
         }
         // Check for a demand-fetched body file. The `.body` file contains only
         // the body section, and ExtentLocation.body_offset is body-relative for
-        // fetched entries, so seeking to body_offset in this file is correct.
-        let body = dir.join("fetched").join(format!("{segment_id}.body"));
+        // cached entries, so seeking to body_offset in this file is correct.
+        let body = dir.join("cache").join(format!("{segment_id}.body"));
         if body.exists() {
             return Ok(body);
         }

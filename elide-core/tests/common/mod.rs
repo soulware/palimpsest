@@ -43,6 +43,50 @@ pub fn drain_local(fork_dir: &Path) {
     }
 }
 
+/// Write a single-entry segment directly to `index/<ulid>.idx` +
+/// `cache/<ulid>.{body,present}`, bypassing the WAL.
+///
+/// Simulates a `SegmentFetcher::fetch` result — a segment downloaded from S3 into
+/// the local demand-fetch cache.  `lba` is the block address; `seed` fills the
+/// 4096-byte block.
+///
+/// `.idx` goes to `index/` (coordinator-written, permanent LBA index).
+/// `.body` and `.present` go to `cache/` (volume-managed body cache).
+///
+/// Signed with the volume's own key because `rebuild_segments` verifies `.idx`
+/// signatures against `volume.pub`.
+pub fn populate_cache(fork_dir: &Path, ulid: Ulid, lba: u64, seed: u8) {
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    let _ = fs::create_dir_all(&index_dir);
+    let _ = fs::create_dir_all(&cache_dir);
+
+    let signer = signing::load_signer(fork_dir, signing::VOLUME_KEY_FILE).unwrap();
+    let data = vec![seed; 4096];
+    let hash = blake3::hash(&data);
+    let mut entries = vec![segment::SegmentEntry::new_data(
+        hash,
+        lba,
+        1,
+        segment::SegmentFlags::empty(),
+        data,
+    )];
+
+    // Write a complete segment to a temp file, then split into the two-directory format.
+    let tmp = cache_dir.join(format!("{ulid}.tmp"));
+    let bss = segment::write_segment(&tmp, &mut entries, signer.as_ref()).unwrap();
+    let bytes = fs::read(&tmp).unwrap();
+    fs::remove_file(&tmp).unwrap();
+
+    let s = ulid.to_string();
+    // .idx → index/ (coordinator-written LBA index; verified by rebuild_segments)
+    fs::write(index_dir.join(format!("{s}.idx")), &bytes[..bss as usize]).unwrap();
+    // .body → cache/ (body section; body-relative offsets; byte 0 = first body byte)
+    fs::write(cache_dir.join(format!("{s}.body")), &bytes[bss as usize..]).unwrap();
+    // .present → cache/ (all entries present; 1 entry, bit 0 set)
+    segment::set_present_bit(&cache_dir.join(format!("{s}.present")), 0, 1).unwrap();
+}
+
 /// Sort-for-rebuild ordering: GC outputs (.pending/.applied handoff present)
 /// come first (lower priority); regular segments come last (higher priority).
 /// Within each group, sort by ULID ascending.

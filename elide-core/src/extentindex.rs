@@ -14,7 +14,7 @@
 //   - For promoted entries (pending/ or segments/): body_offset == stored_offset;
 //     body_section_start is the absolute file offset of the body section.
 //     The actual file seek position is body_section_start + body_offset.
-//   - For fetched entries (.body files): body_section_start == 0 and
+//   - For cached entries (.body files): body_section_start == 0 and
 //     body_offset is the body-relative offset (file starts at body section byte 0).
 //
 // Rebuild on startup:
@@ -45,11 +45,11 @@ pub struct ExtentLocation {
     /// True if the payload is lz4-compressed.
     pub compressed: bool,
     /// Position of this entry in the segment's raw index (0-based).
-    /// `Some` for entries rebuilt from `fetched/*.idx`; `None` for full segments.
+    /// `Some` for entries rebuilt from `cache/*.idx`; `None` for full segments.
     /// Used to check and update the `.present` bitset for per-extent fetching.
     pub entry_idx: Option<u32>,
     /// Absolute offset of the body section within the full segment file.
-    /// 0 for WAL entries and `.body` fetched files (both start at byte 0 of
+    /// 0 for WAL entries and `.body` cache files (both start at byte 0 of
     /// the body data). Non-zero for entries in `pending/` or `segments/` files.
     /// The actual seek position for a read is `body_section_start + body_offset`.
     /// Also used to compute the store range-GET start for per-extent fetching.
@@ -135,13 +135,13 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Process fetched/*.idx first (body-relative offsets). pending/ and
+        // Process index/*.idx first (body-relative offsets). pending/ and
         // segments/ are processed after, so their absolute-offset entries win
         // when the same segment is present in both places.
-        let mut fetched_paths = segment::collect_fetched_idx_files(&fork_dir.join("fetched"))?;
-        fetched_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+        let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
+        cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
         if let Some(cutoff) = branch_ulid {
-            fetched_paths.retain(|p| {
+            cache_paths.retain(|p| {
                 p.file_stem()
                     .and_then(|n| n.to_str())
                     .map(|n| n <= cutoff.as_str())
@@ -149,9 +149,12 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             });
         }
         // Process pending/ and segments/ (absolute offsets). These overwrite
-        // any fetched/ entries for the same hashes.
+        // any cache/ entries for the same hashes.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
+        // Include GC handoff bodies in .applied state (volume-signed, in gc/
+        // awaiting coordinator upload to S3).  Lower priority than segments/.
+        paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {
@@ -163,18 +166,18 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             });
         }
 
-        if fetched_paths.is_empty() && paths.is_empty() {
+        if cache_paths.is_empty() && paths.is_empty() {
             continue;
         }
 
         // Load the verifying key only when this layer has segments to check.
         let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
 
-        for path in &fetched_paths {
+        for path in &cache_paths {
             let segment_id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad fetched idx filename"))?;
+                .ok_or_else(|| io::Error::other("bad cache idx filename"))?;
             let segment_id = ulid::Ulid::from_string(segment_id)
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .to_string();

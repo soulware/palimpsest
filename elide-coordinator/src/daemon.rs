@@ -440,10 +440,10 @@ async fn fork_loop(
 ///   - entries whose name is not a valid ULID
 ///   - volumes with no `pending/` or `segments/` subdirectory (not yet initialised)
 ///   - readonly volumes that are fully indexed: either `segments/` is non-empty
-///     (drain completed) or `fetched/` is non-empty (prefetch completed)
+///     (drain completed) or `index/` is non-empty (prefetch completed)
 ///
 /// Readonly volumes with `pending/` are included for drain. Readonly volumes
-/// with empty `segments/` and no `fetched/` are included for prefetch (pulled
+/// with empty `segments/` and no `index/` are included for prefetch (pulled
 /// from the store but not yet indexed locally).
 fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
     let by_id_dir = data_dir.join("by_id");
@@ -476,7 +476,7 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
             continue;
         }
         // Skip readonly volumes that are already fully indexed locally —
-        // either segments/ is non-empty (drain completed) or fetched/ is
+        // either segments/ is non-empty (drain completed) or index/ is
         // non-empty (prefetch completed). Include volumes with pending/ (need
         // drain) or with both empty (pulled but not yet prefetched).
         if path.join("volume.readonly").exists() && !has_pending {
@@ -486,7 +486,7 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
                     .map(|mut d| d.next().is_some())
                     .unwrap_or(false)
             };
-            if dir_non_empty("segments") || dir_non_empty("fetched") {
+            if dir_non_empty("segments") || dir_non_empty("index") {
                 continue;
             }
         }
@@ -621,20 +621,20 @@ mod tests {
         .unwrap();
         std::fs::write(root.join(format!("by_id/{ulid3}/volume.readonly")), "").unwrap();
 
-        // Readonly volume with non-empty fetched/ — prefetch done, must be skipped.
+        // Readonly volume with non-empty index/ — prefetch done, must be skipped.
         let ulid6 = "01JQFFFFFFFFFFFFFFFFFFFFFF";
         mk(root, &format!("by_id/{ulid6}/segments"));
-        mk(root, &format!("by_id/{ulid6}/fetched"));
+        mk(root, &format!("by_id/{ulid6}/index"));
         std::fs::write(
             root.join(format!(
-                "by_id/{ulid6}/fetched/01JQAAAAAAAAAAAAAAAAAAAAA1.idx"
+                "by_id/{ulid6}/index/01JQAAAAAAAAAAAAAAAAAAAAA1.idx"
             )),
             "",
         )
         .unwrap();
         std::fs::write(root.join(format!("by_id/{ulid6}/volume.readonly")), "").unwrap();
 
-        // Readonly volume with empty segments/ and no fetched/ — pulled, needs prefetch.
+        // Readonly volume with empty segments/ and no cache/ — pulled, needs prefetch.
         let ulid5 = "01JQEEEEEEEEEEEEEEEEEEEEEE";
         mk(root, &format!("by_id/{ulid5}/segments"));
         std::fs::write(root.join(format!("by_id/{ulid5}/volume.readonly")), "").unwrap();

@@ -108,19 +108,19 @@ When the write log reaches the 32MB threshold (or on an explicit flush), the bac
 wal/<ULID>              — WAL file (active or awaiting promotion)
 pending/<ULID>          — segment file committed locally, S3 upload pending
 segments/<ULID>         — segment file confirmed uploaded to S3 (evictable)
-fetched/<ULID>.idx      — header + index + inline fetched from S3 (always present first)
-fetched/<ULID>.body     — sparse body file; body-relative byte offsets
-fetched/<ULID>.present  — presence bitset; one bit per index entry
+index/<ULID>.idx        — header + index + inline fetched from S3 (always present first)
+cache/<ULID>.body       — sparse body file; body-relative byte offsets
+cache/<ULID>.present    — presence bitset; one bit per index entry
 ```
 
-The first three directories correspond to the write-path lifecycle; `fetched/` is the fetch-path cache:
+The first three directories correspond to the write-path lifecycle; `index/` and `cache/` are the fetch-path cache:
 
 ```
 wal/<ULID>  →  pending/<ULID>  →  segments/<ULID>   (write path)
 
                      S3
                       ↓
-               fetched/<ULID>.*  →  segments/<ULID>   (fetch path, when fully populated)
+     index/<ULID>.idx + cache/<ULID>.*  →  segments/<ULID>   (fetch path, when fully populated)
 ```
 
 Both `pending/` and `segments/` hold segment files in the same format (header + index + inline + body). The distinction is upload state, not file format. Locally-stored segment files have `delta_length = 0` in the header; the coordinator appends the delta body when computing deltas at S3 upload time, producing the final S3 object.
@@ -171,9 +171,9 @@ The two strategies are not mutually exclusive: sparse can be applied first (skip
 - `wal/` — replay (truncate partial tail if needed) and promote
 - `pending/` — read header + index section for LBA map rebuild; queue S3 upload
 - `segments/` — read header + index section for LBA map rebuild
-- `fetched/*.idx` — read header + index section for LBA map rebuild (same as `segments/`, just a different path to the same data)
+- `index/*.idx` — read header + index section for LBA map rebuild (same as `segments/`, just a different path to the same data)
 
-Then scan ancestor nodes' `segments/` and `fetched/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
+Then scan ancestor nodes' `segments/` and `index/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
 
 ---
 
@@ -393,13 +393,13 @@ Snapshot indexes are consolidated index-section views written at snapshot time, 
 
 ---
 
-## Fetched Segment Format
+## Cache Segment Format
 
-Segments fetched from S3 are **inherently partial**: a newly-arrived segment has its header and index available immediately, but body bytes arrive on demand as specific extents are read. The locally-written format cannot represent this state — a file in `pending/` or `segments/` is always complete by construction (written atomically via tmp→rename). Fetched segments live in a separate `fetched/` directory and use a three-file representation.
+Segments fetched from S3 are **inherently partial**: a newly-arrived segment has its header and index available immediately, but body bytes arrive on demand as specific extents are read. The locally-written format cannot represent this state — a file in `pending/` or `segments/` is always complete by construction (written atomically via tmp→rename). Cached segments live in `index/` (for the `.idx` file) and `cache/` (for `.body` and `.present`) and use a three-file representation.
 
 ### Format comparison
 
-| Property | Locally-written (`pending/` · `segments/`) | Fetched (`fetched/`) |
+| Property | Locally-written (`pending/` · `segments/`) | Cached (`index/` + `cache/`) |
 |---|---|---|
 | File count | 1 per segment | 3 per segment (`.idx`, `.body`, `.present`) |
 | Completeness | Always complete (atomic tmp→rename) | Partial; body populated incrementally |
@@ -409,7 +409,7 @@ Segments fetched from S3 are **inherently partial**: a newly-arrived segment has
 | Presence tracking | N/A — always 100% present | `.present` bitset; one bit per index entry |
 | Signature location | `header[32..96]` in the single file | `header[32..96]` in `.idx`; verified before any body fetch |
 | Eviction unit | Full file | Full triplet (`.idx` + `.body` + `.present`) |
-| Promotion | `pending/` → `segments/` (after upload) | `fetched/` → `segments/` (when `.present` is fully set) |
+| Promotion | `pending/` → `segments/` (after upload) | `cache/` → `segments/` (when `.present` is fully set) |
 
 ### File details
 
@@ -444,27 +444,27 @@ The bitset is written atomically per extent: write the bytes to `.body`, fsync (
 For a read that hits a missing body extent:
 
 ```
-1. Check segments/<ulid>          — complete file; serve directly if present
-2. Check fetched/<ulid>.present   — check bit N for this extent
-   - Set → read from fetched/<ulid>.body at entry.body_offset
+1. Check segments/<ulid>         — complete file; serve directly if present
+2. Check cache/<ulid>.present    — check bit N for this extent
+   - Set → read from cache/<ulid>.body at entry.body_offset
    - Unset → proceed to step 3
-3. Verify signature in fetched/<ulid>.idx (if not already verified this session)
+3. Verify signature in index/<ulid>.idx (if not already verified this session)
 4. Issue byte-range GET to S3: [body_section_start + entry.body_offset,
                                 body_section_start + entry.body_offset + entry.body_length)
    - If a delta option is available and its source_hash is in the local extent index:
      fetch delta bytes instead; apply against local source; write materialised result
-5. Write bytes to fetched/<ulid>.body at entry.body_offset
-6. Set bit N in fetched/<ulid>.present
-7. Serve from fetched/<ulid>.body
+5. Write bytes to cache/<ulid>.body at entry.body_offset
+6. Set bit N in cache/<ulid>.present
+7. Serve from cache/<ulid>.body
 ```
 
 Coalescing: before issuing GETs, collect all absent extents required for the current read and merge adjacent or nearby `(body_offset, body_length)` ranges into a minimal set of byte-range requests. This is the same coalescing described in the warm-start retrieval strategy.
 
 ### Promotion to `segments/`
 
-When all bits in `.present` are set (accounting for implicitly-present REF and INLINE entries), the three fetched files can be collapsed into a single complete segment file and moved to `segments/`. This is a background operation — identical in character to GC — and does not need to block reads. The read path checks `segments/<ulid>` before `fetched/<ulid>.*`, so once promotion completes all subsequent reads use the simpler path.
+When all bits in `.present` are set (accounting for implicitly-present REF and INLINE entries), the three cache files can be collapsed into a single complete segment file and moved to `segments/`. This is a background operation — identical in character to GC — and does not need to block reads. The read path checks `segments/<ulid>` before `cache/<ulid>.*`, so once promotion completes all subsequent reads use the simpler path.
 
-Promotion reconstructs the complete file by concatenating: `.idx` bytes + body bytes read sequentially from `.body`. The resulting file is identical in format to a locally-written segment (body-relative offsets in the index match file-relative offsets once the header and index sections are prepended). After the rename to `segments/<ulid>` succeeds, the three fetched files are deleted.
+Promotion reconstructs the complete file by concatenating: `.idx` bytes + body bytes read sequentially from `.body`. The resulting file is identical in format to a locally-written segment (body-relative offsets in the index match file-relative offsets once the header and index sections are prepended). After the rename to `segments/<ulid>` succeeds, the three cache files are deleted.
 
 ---
 

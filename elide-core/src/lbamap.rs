@@ -272,11 +272,11 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
     let mut map = LbaMap::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Include fetched/*.idx so evicted segments are still visible in the map.
-        let mut fetched_paths = segment::collect_fetched_idx_files(&fork_dir.join("fetched"))?;
-        fetched_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+        // Include index/*.idx so evicted/remote segments are still visible in the map.
+        let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
+        cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
         if let Some(cutoff) = branch_ulid {
-            fetched_paths.retain(|p| {
+            cache_paths.retain(|p| {
                 p.file_stem()
                     .and_then(|n| n.to_str())
                     .map(|n| n <= cutoff.as_str())
@@ -286,6 +286,10 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
 
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
+        // Include GC handoff bodies in .applied state (volume-signed, in gc/
+        // awaiting coordinator upload to S3).  These are treated as lower-priority
+        // GC outputs by sort_for_rebuild; the old input segments in segments/ win.
+        paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {
@@ -297,14 +301,14 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             });
         }
 
-        if fetched_paths.is_empty() && paths.is_empty() {
+        if cache_paths.is_empty() && paths.is_empty() {
             continue;
         }
 
         // Load the verifying key only when this layer has segments to check.
         let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
 
-        for path in &fetched_paths {
+        for path in &cache_paths {
             let (_bss, entries) = match segment::read_and_verify_segment_index(path, &vk) {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {

@@ -167,32 +167,32 @@ impl ObjectStoreFetcher {
 }
 
 impl SegmentFetcher for ObjectStoreFetcher {
-    fn fetch(&self, segment_id: &str, fetched_dir: &Path) -> io::Result<()> {
+    fn fetch(&self, segment_id: &str, index_dir: &Path, body_dir: &Path) -> io::Result<()> {
         self.rt.block_on(fetch_segment(
             &self.store,
             &self.volume_ids,
             segment_id,
-            fetched_dir,
+            index_dir,
+            body_dir,
         ))
     }
 
     fn fetch_extent(
         &self,
         segment_id: &str,
-        fetched_dir: &Path,
-        body_section_start: u64,
-        _body_offset: u64,
-        _body_length: u32,
-        entry_idx: u32,
+        index_dir: &Path,
+        body_dir: &Path,
+        extent: &segment::ExtentFetch,
     ) -> io::Result<()> {
         self.rt.block_on(fetch_one_extent(
             &self.store,
             &self.volume_ids,
             segment_id,
-            fetched_dir,
+            index_dir,
+            body_dir,
             &ExtentFetchParams {
-                body_section_start,
-                entry_idx,
+                body_section_start: extent.body_section_start,
+                entry_idx: extent.entry_idx,
                 max_batch_bytes: self.max_batch_bytes,
             },
         ))
@@ -203,7 +203,8 @@ async fn fetch_segment(
     store: &Arc<dyn ObjectStore>,
     volume_ids: &[String],
     segment_id: &str,
-    fetched_dir: &Path,
+    index_dir: &Path,
+    body_dir: &Path,
 ) -> io::Result<()> {
     // Try volumes newest-first (reverse of oldest-first slice).
     for volume_id in volume_ids.iter().rev() {
@@ -214,7 +215,7 @@ async fn fetch_segment(
                     .bytes()
                     .await
                     .map_err(|e| io::Error::other(format!("reading {segment_id}: {e}")))?;
-                write_fetched(fetched_dir, segment_id, &bytes)?;
+                write_cache(index_dir, body_dir, segment_id, &bytes)?;
                 return Ok(());
             }
             Err(object_store::Error::NotFound { .. }) => continue,
@@ -241,11 +242,12 @@ async fn fetch_one_extent(
     store: &Arc<dyn ObjectStore>,
     volume_ids: &[String],
     segment_id: &str,
-    fetched_dir: &Path,
+    index_dir: &Path,
+    body_dir: &Path,
     extent: &ExtentFetchParams,
 ) -> io::Result<()> {
-    let idx_path = fetched_dir.join(format!("{segment_id}.idx"));
-    let present_path = fetched_dir.join(format!("{segment_id}.present"));
+    let idx_path = index_dir.join(format!("{segment_id}.idx"));
+    let present_path = body_dir.join(format!("{segment_id}.present"));
 
     // Read the full index so we can scan ahead for adjacent absent entries.
     let (_, entries) = segment::read_segment_index(&idx_path)?;
@@ -309,10 +311,10 @@ async fn fetch_one_extent(
         let key = segment_key(volume_id, segment_id)?;
         match store.get_range(&key, range_start..range_end).await {
             Ok(bytes) => {
-                std::fs::create_dir_all(fetched_dir)?;
+                std::fs::create_dir_all(body_dir)?;
 
                 // Write the contiguous batch into .body at the batch start offset.
-                let body_path = fetched_dir.join(format!("{segment_id}.body"));
+                let body_path = body_dir.join(format!("{segment_id}.body"));
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -375,16 +377,21 @@ async fn fetch_one_extent(
 const SEGMENT_HEADER_LEN: usize = 96;
 const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x02";
 
-/// Write the three-file fetched format into `fetched_dir`:
-///   `<segment_id>.idx`     — header + index + inline bytes `[0, body_section_start)`
-///   `<segment_id>.body`    — body bytes (body-relative; byte 0 = first body byte)
-///   `<segment_id>.present` — packed bitset, one bit per index entry; all bits set
+/// Write the three-file cache format:
+///   `<index_dir>/<segment_id>.idx`    — header + index + inline bytes `[0, body_section_start)`
+///   `<body_dir>/<segment_id>.body`    — body bytes (body-relative; byte 0 = first body byte)
+///   `<body_dir>/<segment_id>.present` — packed bitset, one bit per index entry; all bits set
 ///
 /// All three files are written via tmp + rename. Commit order: `.idx` first
 /// (enables rebuild on the next restart), then `.body` (enables reads), then
 /// `.present`. A crash after `.idx` but before `.body` leaves an orphan `.idx`
 /// which is harmless — it will be re-fetched on the next access.
-fn write_fetched(fetched_dir: &Path, segment_id: &str, bytes: &[u8]) -> io::Result<()> {
+fn write_cache(
+    index_dir: &Path,
+    body_dir: &Path,
+    segment_id: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
     if bytes.len() < SEGMENT_HEADER_LEN {
         return Err(io::Error::other(format!(
             "segment {segment_id}: too short to parse header ({} bytes)",
@@ -411,27 +418,25 @@ fn write_fetched(fetched_dir: &Path, segment_id: &str, bytes: &[u8]) -> io::Resu
     let idx_bytes = &bytes[..body_section_start];
     let body_bytes = &bytes[body_section_start..];
 
-    // Presence bitset: all bits set (full body fetched in this initial implementation).
+    // Presence bitset: all bits set (full body cached in this initial implementation).
     let bitset_len = (entry_count as usize).div_ceil(8);
     let present_bytes = vec![0xFFu8; bitset_len];
 
-    std::fs::create_dir_all(fetched_dir)?;
+    std::fs::create_dir_all(index_dir)?;
+    std::fs::create_dir_all(body_dir)?;
 
-    let idx_tmp = fetched_dir.join(format!("{segment_id}.idx.tmp"));
-    let body_tmp = fetched_dir.join(format!("{segment_id}.body.tmp"));
-    let present_tmp = fetched_dir.join(format!("{segment_id}.present.tmp"));
+    let idx_tmp = index_dir.join(format!("{segment_id}.idx.tmp"));
+    let body_tmp = body_dir.join(format!("{segment_id}.body.tmp"));
+    let present_tmp = body_dir.join(format!("{segment_id}.present.tmp"));
 
     std::fs::write(&idx_tmp, idx_bytes)?;
     std::fs::write(&body_tmp, body_bytes)?;
     std::fs::write(&present_tmp, &present_bytes)?;
 
     // Commit: idx first (enables index rebuild), then body (enables reads), then present.
-    std::fs::rename(&idx_tmp, fetched_dir.join(format!("{segment_id}.idx")))?;
-    std::fs::rename(&body_tmp, fetched_dir.join(format!("{segment_id}.body")))?;
-    std::fs::rename(
-        &present_tmp,
-        fetched_dir.join(format!("{segment_id}.present")),
-    )?;
+    std::fs::rename(&idx_tmp, index_dir.join(format!("{segment_id}.idx")))?;
+    std::fs::rename(&body_tmp, body_dir.join(format!("{segment_id}.body")))?;
+    std::fs::rename(&present_tmp, body_dir.join(format!("{segment_id}.present")))?;
 
     Ok(())
 }
@@ -472,10 +477,10 @@ pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<String>> {
 
 // --- volume pre-warm ---
 
-/// Pre-warm the start of a readonly (fetched) volume.
+/// Pre-warm the start of a readonly (cached) volume.
 ///
 /// Demand-fetches LBAs 0 and 1 (the first 8 KiB of the disk) into the local
-/// fetched cache. These blocks are almost universally accessed on first use
+/// cache. These blocks are almost universally accessed on first use
 /// regardless of filesystem type, so pre-fetching them on pull avoids cold
 /// round-trips.
 ///
@@ -515,13 +520,12 @@ pub fn prewarm_volume_start(
 mod tests {
     use super::*;
 
-    /// Build a minimal segment file in memory and verify that `write_fetched`
+    /// Build a minimal segment file in memory and verify that `write_cache`
     /// produces well-formed `.idx`, `.body`, and `.present` files.
     #[test]
-    fn write_fetched_splits_correctly() {
+    fn write_cache_splits_correctly() {
         use elide_core::segment::{
-            SegmentEntry, SegmentFlags, collect_fetched_idx_files, read_segment_index,
-            write_segment,
+            SegmentEntry, SegmentFlags, collect_idx_files, read_segment_index, write_segment,
         };
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -544,14 +548,15 @@ mod tests {
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
 
-        // Read the full segment bytes and split them via write_fetched.
+        // Read the full segment bytes and split them via write_cache.
         let full_bytes = std::fs::read(&seg_path).unwrap();
-        let fetched_dir = dir.join("fetched");
+        let index_dir = dir.join("index");
+        let cache_dir = dir.join("cache");
         let segment_id = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        write_fetched(&fetched_dir, segment_id, &full_bytes).unwrap();
+        write_cache(&index_dir, &cache_dir, segment_id, &full_bytes).unwrap();
 
         // Check .idx file: should be parseable and match the original index.
-        let idx_path = fetched_dir.join(format!("{segment_id}.idx"));
+        let idx_path = index_dir.join(format!("{segment_id}.idx"));
         let (bss2, idx_entries) = read_segment_index(&idx_path).unwrap();
         assert_eq!(bss, bss2, "body_section_start must match");
         assert_eq!(idx_entries.len(), 2);
@@ -563,7 +568,7 @@ mod tests {
         assert_eq!(idx_entries[1].stored_length, 8192);
 
         // Check .body file: should contain the body bytes (body-relative).
-        let body_path = fetched_dir.join(format!("{segment_id}.body"));
+        let body_path = cache_dir.join(format!("{segment_id}.body"));
         let body_bytes = std::fs::read(&body_path).unwrap();
         assert_eq!(
             body_bytes.len(),
@@ -576,13 +581,13 @@ mod tests {
         assert_eq!(&body_bytes[4096..], data2.as_slice());
 
         // Check .present file: 2 entries → ceil(2/8) = 1 byte, all bits set.
-        let present_path = fetched_dir.join(format!("{segment_id}.present"));
+        let present_path = cache_dir.join(format!("{segment_id}.present"));
         let present_bytes = std::fs::read(&present_path).unwrap();
         assert_eq!(present_bytes.len(), 1);
         assert_eq!(present_bytes[0], 0xFF);
 
-        // Check that collect_fetched_idx_files finds the .idx file.
-        let found = collect_fetched_idx_files(&fetched_dir).unwrap();
+        // Check that collect_idx_files finds the .idx file in index/.
+        let found = collect_idx_files(&index_dir).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].file_stem().unwrap(), segment_id);
 
@@ -602,7 +607,8 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store_dir = TempDir::new().unwrap();
-        let fetched_dir = tmp.path().join("fetched");
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
 
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
@@ -625,10 +631,10 @@ mod tests {
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
-        // Write only the .idx portion — no .body, no .present yet.
-        std::fs::create_dir_all(&fetched_dir).unwrap();
+        // Write only the .idx portion to index/ — no .body, no .present yet.
+        std::fs::create_dir_all(&index_dir).unwrap();
         std::fs::write(
-            fetched_dir.join(format!("{seg_id}.idx")),
+            index_dir.join(format!("{seg_id}.idx")),
             &full_bytes[..bss as usize],
         )
         .unwrap();
@@ -655,16 +661,19 @@ mod tests {
         fetcher
             .fetch_extent(
                 &seg_id,
-                &fetched_dir,
-                bss,
-                entries[0].stored_offset,
-                entries[0].stored_length,
-                0,
+                &index_dir,
+                &cache_dir,
+                &segment::ExtentFetch {
+                    body_section_start: bss,
+                    body_offset: entries[0].stored_offset,
+                    body_length: entries[0].stored_length,
+                    entry_idx: 0,
+                },
             )
             .unwrap();
 
         // All three entries' bytes must be in .body.
-        let body_bytes = std::fs::read(fetched_dir.join(format!("{seg_id}.body"))).unwrap();
+        let body_bytes = std::fs::read(cache_dir.join(format!("{seg_id}.body"))).unwrap();
         let off0 = entries[0].stored_offset as usize;
         let off1 = entries[1].stored_offset as usize;
         let off2 = entries[2].stored_offset as usize;
@@ -673,7 +682,7 @@ mod tests {
         assert_eq!(&body_bytes[off2..off2 + 4096], data2.as_slice());
 
         // All three .present bits must be set.
-        let present_path = fetched_dir.join(format!("{seg_id}.present"));
+        let present_path = cache_dir.join(format!("{seg_id}.present"));
         assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
         assert!(check_present_bit(&present_path, 1).unwrap(), "bit 1 set");
         assert!(check_present_bit(&present_path, 2).unwrap(), "bit 2 set");
@@ -691,7 +700,8 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store_dir = TempDir::new().unwrap();
-        let fetched_dir = tmp.path().join("fetched");
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
 
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
@@ -716,15 +726,16 @@ mod tests {
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
-        std::fs::create_dir_all(&fetched_dir).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
         std::fs::write(
-            fetched_dir.join(format!("{seg_id}.idx")),
+            index_dir.join(format!("{seg_id}.idx")),
             &full_bytes[..bss as usize],
         )
         .unwrap();
 
         // Pre-mark entry 1 as present so coalescing stops before it.
-        elide_core::segment::set_present_bit(&fetched_dir.join(format!("{seg_id}.present")), 1, 2)
+        elide_core::segment::set_present_bit(&cache_dir.join(format!("{seg_id}.present")), 1, 2)
             .unwrap();
 
         let store: Arc<dyn ObjectStore> =
@@ -747,21 +758,24 @@ mod tests {
         fetcher
             .fetch_extent(
                 &seg_id,
-                &fetched_dir,
-                bss,
-                entries[0].stored_offset,
-                entries[0].stored_length,
-                0,
+                &index_dir,
+                &cache_dir,
+                &segment::ExtentFetch {
+                    body_section_start: bss,
+                    body_offset: entries[0].stored_offset,
+                    body_length: entries[0].stored_length,
+                    entry_idx: 0,
+                },
             )
             .unwrap();
 
         // Entry 0's bytes must be in .body.
-        let body_bytes = std::fs::read(fetched_dir.join(format!("{seg_id}.body"))).unwrap();
+        let body_bytes = std::fs::read(cache_dir.join(format!("{seg_id}.body"))).unwrap();
         let off0 = entries[0].stored_offset as usize;
         assert_eq!(&body_bytes[off0..off0 + 4096], data0.as_slice());
 
         // Bit 0 now set (just fetched); bit 1 still set (was pre-set, not overwritten).
-        let present_path = fetched_dir.join(format!("{seg_id}.present"));
+        let present_path = cache_dir.join(format!("{seg_id}.present"));
         assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
         assert!(
             check_present_bit(&present_path, 1).unwrap(),
