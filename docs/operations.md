@@ -130,18 +130,13 @@ Evict does not block on `gc/*.applied` or `gc/*.done` files — those states ind
 
 All other files in `segments/` are deleted. The protected segments are skipped silently and remain on disk.
 
-**Known bug — evict does not write `.idx` before deleting.**  `Volume::open`
-rebuilds the LBA map from `pending/`, `segments/`, and `fetched/*.idx`.  If
-evict deletes a segment without first writing its header+index section to
-`fetched/<ulid>.idx`, that segment's LBAs are absent from the rebuilt map after
-a crash.  Reads for those LBAs return zeros rather than triggering a
-demand-fetch.
-
-The fix is for `evict` to atomically write `fetched/<ulid>.idx` (header+index
-bytes `[0, body_section_start)`) and an all-zero `fetched/<ulid>.present`
-bitset before deleting `segments/<ulid>`.  With those files in place, the LBA
-map survives a restart and missing body bytes fall through to the
-`SegmentFetcher` as intended.
+**Crash safety — evict writes `.idx` before deleting.**  Before removing
+`segments/<ulid>`, evict copies the header+index section (bytes
+`[0, body_section_start)`) to `fetched/<ulid>.idx`.  This preserves the LBA
+map entry across a crash+reopen: `Volume::open` rebuilds the map from
+`fetched/*.idx`, and subsequent reads for the evicted body fall through to the
+`SegmentFetcher` as intended.  The write is idempotent — if `.idx` already
+exists (e.g. from a previous partial evict run), it is left unchanged.
 
 **Open question — evicting `fetched/` body data.**  Once the `.idx` bug is
 fixed, `evict` could also reclaim space used by previously demand-fetched body

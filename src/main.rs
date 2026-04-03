@@ -1049,8 +1049,12 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
         }
     }
 
-    // Delete segment files, skipping any whose upload is still in flight.
+    // For each evictable segment: write fetched/<ulid>.idx (header+index bytes)
+    // before deleting the body, so the LBA map survives a crash+reopen.
+    // Skips the .idx write if it already exists (idempotent — safe to re-run).
     let segments_dir = vol_dir.join("segments");
+    let fetched_dir = vol_dir.join("fetched");
+    std::fs::create_dir_all(&fetched_dir)?;
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(&segments_dir) {
         for entry in entries {
@@ -1058,6 +1062,9 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
             if protected.contains(&entry.file_name()) {
                 continue;
             }
+            let seg_name = entry.file_name();
+            let idx_path = fetched_dir.join(format!("{}.idx", seg_name.to_string_lossy()));
+            elide_core::segment::extract_idx(&entry.path(), &idx_path)?;
             std::fs::remove_file(entry.path())?;
             count += 1;
         }
@@ -1079,23 +1086,48 @@ mod tests {
         vol
     }
 
+    /// Write a minimal valid segment to `<vol>/<subdir>/<name>`.
+    ///
+    /// Evictable segments must have parseable headers so `extract_idx` can
+    /// copy the header+index section to `fetched/` before deletion.
+    fn write_seg(vol: &std::path::Path, subdir: &str, name: &str) {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::signing::generate_ephemeral_signer;
+        let path = vol.join(subdir).join(name);
+        let hash = blake3::hash(name.as_bytes());
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            vec![0u8; 4096],
+        )];
+        let (signer, _) = generate_ephemeral_signer();
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+    }
+
     #[test]
     fn evict_clean_state_removes_segments() {
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
-        fs::write(
-            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
-            b"seg1",
-        )
-        .unwrap();
-        fs::write(
-            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA2"),
-            b"seg2",
-        )
-        .unwrap();
+        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA1");
+        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
+
         let n = evict_segments(&vol).unwrap();
+
         assert_eq!(n, 2);
         assert_eq!(fs::read_dir(vol.join("segments")).unwrap().count(), 0);
+        // .idx files must be written to fetched/ so the LBA map survives a crash.
+        assert!(
+            vol.join("fetched")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA1.idx")
+                .exists()
+        );
+        assert!(
+            vol.join("fetched")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx")
+                .exists()
+        );
     }
 
     #[test]
@@ -1109,12 +1141,10 @@ mod tests {
             b"wal",
         )
         .unwrap();
-        fs::write(
-            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA2"),
-            b"seg",
-        )
-        .unwrap();
+        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
+
         let n = evict_segments(&vol).unwrap();
+
         assert_eq!(n, 1);
         assert!(
             vol.join("pending")
@@ -1124,6 +1154,11 @@ mod tests {
         assert!(
             !vol.join("segments")
                 .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
+                .exists()
+        );
+        assert!(
+            vol.join("fetched")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx")
                 .exists()
         );
     }
@@ -1157,13 +1192,15 @@ mod tests {
         )
         .unwrap();
 
-        // old1 and old2 are in segments/ — must be protected.
-        // other is unrelated — must be evicted.
+        // old1 and old2 are protected — fake content is fine (extract_idx is
+        // never called for protected segments).
+        // other is unrelated and must be evicted — needs a valid segment header.
         fs::write(vol.join("segments").join(old1.to_string()), b"old1").unwrap();
         fs::write(vol.join("segments").join(old2.to_string()), b"old2").unwrap();
-        fs::write(vol.join("segments").join(other.to_string()), b"other").unwrap();
+        write_seg(&vol, "segments", &other.to_string());
 
         let n = evict_segments(&vol).unwrap();
+
         assert_eq!(n, 1);
         assert!(
             vol.join("segments").join(old1.to_string()).exists(),
@@ -1176,6 +1213,10 @@ mod tests {
         assert!(
             !vol.join("segments").join(other.to_string()).exists(),
             "other must be evicted"
+        );
+        assert!(
+            vol.join("fetched").join(format!("{other}.idx")).exists(),
+            "other .idx must exist"
         );
     }
 
@@ -1191,17 +1232,16 @@ mod tests {
             b"",
         )
         .unwrap();
+        // protected segment — fake content OK (extract_idx skipped for it)
         fs::write(
             vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
             b"protected",
         )
         .unwrap();
-        fs::write(
-            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA2"),
-            b"evictable",
-        )
-        .unwrap();
+        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
+
         let n = evict_segments(&vol).unwrap();
+
         assert_eq!(n, 1);
         assert!(
             vol.join("segments")
@@ -1214,6 +1254,12 @@ mod tests {
                 .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
                 .exists(),
             "other segment must be evicted"
+        );
+        assert!(
+            vol.join("fetched")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx")
+                .exists(),
+            ".idx must be written for evicted segment"
         );
     }
 }

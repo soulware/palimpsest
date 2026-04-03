@@ -603,6 +603,32 @@ pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
 /// no extension). Excludes `.tmp` files (incomplete promotions).
 ///
 /// Used by `lbamap` and `extentindex` during startup rebuild.
+/// Copy the header+index section (bytes `[0, body_section_start)`) from a full
+/// segment file into an `.idx` file in the fetched three-file format.
+///
+/// Does nothing if `idx_path` already exists — the operation is idempotent and
+/// safe to call on a segment that was previously evicted or partially processed.
+///
+/// Written atomically via `.tmp` + rename.  The resulting `.idx` is identical
+/// to what a `SegmentFetcher` would write, so `rebuild_segments` and
+/// `extentindex::rebuild` treat it exactly like a demand-fetched index.
+pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
+    if idx_path.exists() {
+        return Ok(());
+    }
+    let (body_section_start, _, _, header) = read_segment_header(segment_path)?;
+    let index_inline_len = body_section_start as usize - HEADER_LEN as usize;
+    let mut f = fs::File::open(segment_path)?;
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(HEADER_LEN))?;
+    let mut index_inline = vec![0u8; index_inline_len];
+    f.read_exact(&mut index_inline)?;
+    let mut buf = Vec::with_capacity(body_section_start as usize);
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(&index_inline);
+    write_file_atomic(idx_path, &buf)
+}
+
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
