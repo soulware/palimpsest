@@ -558,6 +558,76 @@ coordinator are invisible to the current proptest design.
   volume, and asserts correct reads.  This is the only path that exercises the
   code that was actually broken.
 
+## Coordinator GC proptest (`elide-coordinator/tests/gc_proptest.rs`)
+
+A second proptest suite lives in the coordinator crate and calls the **real**
+`gc_fork()` + `apply_gc_handoffs()` + `apply_done_handoffs()` path.  This
+closes the structural gap where `elide-core`'s simulation could be correct while
+the production coordinator had a bug (as happened with the fourth bug above).
+
+`GcSweep` flushes the WAL first (matching what `gc_checkpoint()` does in
+production), then runs the full coordinator round-trip, then asserts every oracle
+LBA reads back its last-written value.
+
+### Bugs found by the coordinator proptest
+
+The suite is currently **`#[ignore]`** while two bugs it uncovered are being
+investigated.
+
+#### Bug A: DEDUP_REF-only segments never deleted after GC
+
+When GC compacts a set of segments that includes one containing **only**
+DEDUP_REF entries (no DATA entries), `compact_segments` generates no handoff
+line that names that segment as an `old_ulid`.  `apply_done_handoffs` collects
+`old_ulids` exclusively from Repack/Remove/Dead lines, so it never learns to
+delete the DEDUP_REF-only segment.
+
+The segment persists in `segments/` indefinitely.  On the next GC sweep it is
+picked up again as a candidate, its DEDUP_REF entries are merged into the new
+output a second time, and the GC output segment contains duplicate LBA entries.
+Over successive sweeps the duplicate entries accumulate.  At some point the
+lbamap rebuild applies a DEDUP_REF from the stale copy (which points to a DATA
+entry in a segment that has since been deleted), and reads for that LBA return
+wrong data.
+
+Minimal reproducer:
+```
+[DedupWrite(3,5,0), GcSweep, Write(0,0), Flush, DrainLocal,
+ DedupWrite(3,6,1), Write(3,2), GcSweep, DrainLocal, GcSweep]
+```
+After the third GcSweep, lba 5 reads `[0;4096]` (H0) instead of `[0;4096]`
+— actually the values are the same here, but lba 6 reads zeros instead of
+`[1;4096]`.
+
+**Fix direction**: `compact_segments` must emit a handoff line (e.g. a `Dead`
+line or a dedicated `Consumed` marker) for every input segment, not only those
+that contribute DATA entries to the output, so `apply_done_handoffs` can delete
+all consumed segments.
+
+#### Bug B: GC liveness view excludes unflushed WAL writes (window between checkpoint and apply)
+
+`gc_fork` rebuilds liveness from on-disk state (`segments/` + `pending/`).  It
+does not see writes that are in the volume's WAL buffer but not yet flushed to a
+segment.  The `GcSweep` flush before `gc_fork` closes most of this gap, but a
+narrower window remains in production: between `gc_checkpoint()` and
+`apply_gc_handoffs()`, the volume may process new writes.  If a new write uses
+the same content as a hash that GC just marked dead (emitting a DEDUP_REF
+because the hash is still in the extent index), and `apply_gc_handoffs` then
+removes that hash from the extent index (because the on-disk extent index still
+points to the old segment), reads for that LBA return zeros.
+
+The guard in `apply_gc_handoffs` (`loc.segment_id == old_ulid`) correctly
+protects DATA overwrites (which update the extent index, changing the
+`segment_id`), but **DEDUP_REF writes do not update the extent index**, so the
+guard does not fire and the hash is incorrectly removed.
+
+**Fix direction**: in `apply_gc_handoffs`, before removing a hash H from the
+extent index, check `self.lbamap.live_hashes().contains(&hash)`.  If H is still
+referenced by any LBA, do not remove it — and do not write the `.applied` file
+for this handoff until H's data has been re-promoted into a new segment (or
+until a future GC tick, at which point the volume's flushed state will correctly
+reflect H as live and the coordinator will not attempt to remove it again).
+
 ---
 
 ## Concurrent integration test
