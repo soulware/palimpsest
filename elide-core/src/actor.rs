@@ -250,13 +250,7 @@ impl VolumeActor {
                             if result.is_ok() {
                                 self.publish_snapshot();
                             }
-                            let pair = result.map(|_| {
-                                let u1 = ulid::Ulid::new().to_string();
-                                std::thread::sleep(std::time::Duration::from_millis(2));
-                                let u2 = ulid::Ulid::new().to_string();
-                                (u1, u2)
-                            });
-                            let _ = reply.send(pair);
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Snapshot { reply } => {
                             let result = self.volume.snapshot().map(|u| u.to_string());

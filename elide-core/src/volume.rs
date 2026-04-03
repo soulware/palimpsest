@@ -792,15 +792,23 @@ impl Volume {
     ///
     /// Flushes any in-flight WAL data to `pending/` so that the coordinator's
     /// extent index rebuild sees all committed writes, then mints and returns
-    /// a fresh ULID for the GC output segment.  Because the flush happens
-    /// before the mint, the returned ULID is guaranteed to sort after every
-    /// segment that existed at checkpoint time, and any write that arrives
-    /// after this call gets a WAL ULID strictly greater than the returned
-    /// value.  This establishes a clean ordering boundary: GC output (named
-    /// with this ULID) sorts before all future writes on rebuild.
-    pub fn gc_checkpoint(&mut self) -> io::Result<String> {
+    /// two fresh ULIDs for the GC output segments (repack and sweep).  Because
+    /// the flush happens before both mints, both returned ULIDs are guaranteed
+    /// to sort after every segment that existed at checkpoint time, and any
+    /// write that arrives after this call gets a WAL ULID strictly greater than
+    /// either returned value.  This establishes a clean ordering boundary: GC
+    /// outputs (named with these ULIDs) sort before all future writes on rebuild.
+    ///
+    /// Both ULIDs come from the volume's own monotonic mint, so they integrate
+    /// correctly with the volume's ULID ordering — no external clock calls.
+    pub fn gc_checkpoint(&mut self) -> io::Result<(String, String)> {
         self.flush_wal()?;
-        Ok(self.mint.next().to_string())
+        let u1 = self.mint.next().to_string();
+        // 2ms gap ensures distinct timestamps so the two ULIDs are strictly
+        // ordered by time, not just by the random bits.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let u2 = self.mint.next().to_string();
+        Ok((u1, u2))
     }
 
     /// Apply any pending GC handoff files written by the coordinator.
@@ -3446,7 +3454,7 @@ mod tests {
             segment::read_and_verify_segment_index(&old_path, &vol.verifying_key).unwrap();
         segment::read_extent_bodies(&old_path, old_bss, &mut entries).unwrap();
 
-        let new_ulid = vol.gc_checkpoint().unwrap();
+        let (new_ulid, _) = vol.gc_checkpoint().unwrap();
 
         let gc_dir = fork_dir.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();

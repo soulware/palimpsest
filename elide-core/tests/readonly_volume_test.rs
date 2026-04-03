@@ -91,7 +91,8 @@ fn readonly_sees_data_after_gc() {
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+    let (gc_ulid_str, _) = vol.gc_checkpoint().unwrap();
+    let gc_ulid = Ulid::from_string(&gc_ulid_str).unwrap();
     let (_, _, to_delete) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)
         .expect("GC should compact the two segments");
     vol.apply_gc_handoffs().unwrap();

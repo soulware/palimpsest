@@ -147,11 +147,12 @@ proptest! {
                 ActorOp::CoordGcLocal { n } => {
                     // Checkpoint: flush WAL and obtain a ULID for the GC
                     // output, matching the real coordinator's gc_checkpoint.
-                    let (repack_ulid, _) = handle
-                        .gc_checkpoint()
-                        .unwrap_or_else(|_| (ulid::Ulid::new().to_string(), String::new()));
-                    let gc_ulid = ulid::Ulid::from_string(&repack_ulid)
-                        .unwrap_or_else(|_| ulid::Ulid::new());
+                    let Ok((repack_ulid, _)) = handle.gc_checkpoint() else {
+                        continue;
+                    };
+                    let Ok(gc_ulid) = ulid::Ulid::from_string(&repack_ulid) else {
+                        continue;
+                    };
                     // Simulate one coordinator GC pass (writes gc/*.pending).
                     // Returns paths to delete — we hold them until after the
                     // handoff is applied, matching the real coordinator's ordering.

@@ -45,7 +45,8 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
     common::drain_local(&fork_dir);
 
     // Take GC checkpoint (flushes WAL, advances mint).
-    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+    let (gc_ulid_str, _) = vol.gc_checkpoint().unwrap();
+    let gc_ulid = Ulid::from_string(&gc_ulid_str).unwrap();
 
     // Live overwrite of LBAs 0-3 *before* GC runs.
     for lba in 0u64..4 {
@@ -117,7 +118,8 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
 
     // GC checkpoint then GC pass — no overwrites yet so GC output contains
     // 0xAA for LBAs 0-3 and 0xBB for LBAs 4-7.
-    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+    let (gc_ulid_str, _) = vol.gc_checkpoint().unwrap();
+    let gc_ulid = Ulid::from_string(&gc_ulid_str).unwrap();
     let (_, _, to_delete) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)
         .expect("GC should compact the two seeded segments");
 

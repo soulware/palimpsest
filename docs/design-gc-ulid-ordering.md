@@ -2,7 +2,7 @@
 
 Status: **resolved** (extent index guard + per-entry tracking committed;
 gc_checkpoint closes rebuild-time ordering gap; removal-only handoffs handle
-LBA-dead extent cleanup)
+LBA-dead extent cleanup; actor GcCheckpoint handler fixed to use volume mint)
 
 Date: 2026-03-30
 
@@ -109,6 +109,42 @@ entry came from — required for the extent index guard (bug 1) to work.
 
 **Status:** committed (07828b2).
 
+### 4. Actor GcCheckpoint handler used system clock instead of volume mint
+
+The actor's `GcCheckpoint` message handler called `volume.gc_checkpoint()` to
+flush the WAL (correct), but then **discarded the returned ULID** and generated
+u1 and u2 via `ulid::Ulid::new()` — the system clock, independent of the
+volume's monotonic mint:
+
+```rust
+// Broken code (before fix):
+let result = self.volume.gc_checkpoint();  // flushes WAL, returns ULID G
+let pair = result.map(|_| {               // G is silently discarded
+    let u1 = ulid::Ulid::new().to_string(); // system clock — unrelated to mint
+    std::thread::sleep(Duration::from_millis(2));
+    let u2 = ulid::Ulid::new().to_string(); // system clock — unrelated to mint
+    (u1, u2)
+});
+```
+
+The volume mint after the flush is at G.  The next WAL segment uses
+`self.mint.next()` = G+1.  But u1 and u2 are from the system clock and can
+land above G+1 (they almost always do — they are generated *after* G+1 in
+wall-clock time).  On rebuild the GC compact (named u2) sorts after the WAL
+segment (G+1) and wins, serving stale data.
+
+This is what caused the observed failure: after `volume evict` + coordinator
+restart, LBA 0 mapped to the GC compact's stale zeros rather than the correct
+superblock written by the subsequent WAL flush.
+
+**Fix:** `volume.gc_checkpoint()` now returns `(String, String)` — flush WAL
+once, then two successive `self.mint.next()` calls (2ms apart for distinct
+timestamps).  The actor passes the pair through unchanged.  The mint advances
+past both ULIDs, guaranteeing all subsequent WAL segments sort above both GC
+outputs.
+
+**Status:** committed (a9d0488).
+
 ## Additional findings
 
 ### Atomic `.pending` write
@@ -177,3 +213,4 @@ S3 404 on delete is treated as success (idempotent across coordinator crashes).
 | LBA-level liveness filtering | Done | b3f9244 + 23fd569 |
 | Removal-only handoffs (LBA-dead cleanup) | Done | 2d0a6ce |
 | Dedup-ref liveness in all compaction paths | Done | d71b084 |
+| Actor GcCheckpoint used system clock not volume mint (bug 4) | Done | a9d0488 |

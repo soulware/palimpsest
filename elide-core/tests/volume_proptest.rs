@@ -322,7 +322,28 @@ proptest! {
                     // DrainLocal only renames files; no new ULIDs are created.
                 }
                 SimOp::CoordGcLocal { n } => {
-                    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (gc_ulid_str, gc_ulid2_str) = vol.gc_checkpoint().unwrap();
+                    let gc_ulid = Ulid::from_string(&gc_ulid_str).unwrap();
+                    let gc_ulid2 = Ulid::from_string(&gc_ulid2_str).unwrap();
+                    // Core invariant: the volume mint must have advanced past both
+                    // GC ULIDs, so the next WAL flush produces a segment that sorts
+                    // above them.  This is the property the pre-fix bug violated —
+                    // the actor used Ulid::new() (system clock) instead of the
+                    // volume's mint, so WAL segments could sort below GC outputs.
+                    //
+                    // Diff against post-checkpoint state (not ulids_before) so that
+                    // W_new — the WAL opened inside gc_checkpoint with ULID between
+                    // W_old and u1 — is excluded.  Only the WAL opened by *this*
+                    // flush_wal (W_new2, which must be > u2) appears in the diff.
+                    let ulids_after_checkpoint = all_segment_ulids(fork_dir);
+                    vol.flush_wal().unwrap();
+                    let after_flush = all_segment_ulids(fork_dir);
+                    for u in after_flush.difference(&ulids_after_checkpoint) {
+                        prop_assert!(
+                            *u > gc_ulid2,
+                            "WAL segment after gc_checkpoint sorts below GC output: {u} ≤ {gc_ulid2}"
+                        );
+                    }
                     let to_delete = if let Some((consumed, produced, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -344,8 +365,20 @@ proptest! {
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
-                    let repack_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
-                    let sweep_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (repack_ulid_str, sweep_ulid_str) = vol.gc_checkpoint().unwrap();
+                    let repack_ulid = Ulid::from_string(&repack_ulid_str).unwrap();
+                    let sweep_ulid = Ulid::from_string(&sweep_ulid_str).unwrap();
+                    // Same mint-advancement invariant as CoordGcLocal — diff against
+                    // post-checkpoint state so only W_new2 (> sweep_ulid) appears.
+                    let ulids_after_checkpoint = all_segment_ulids(fork_dir);
+                    vol.flush_wal().unwrap();
+                    let after_flush = all_segment_ulids(fork_dir);
+                    for u in after_flush.difference(&ulids_after_checkpoint) {
+                        prop_assert!(
+                            *u > sweep_ulid,
+                            "WAL segment after gc_checkpoint sorts below GC output: {u} ≤ {sweep_ulid}"
+                        );
+                    }
                     let mut to_delete: Vec<std::path::PathBuf> = vec![];
                     if let Some(((r_consumed, r_produced, r_paths), (s_consumed, s_produced, s_paths))) =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
@@ -391,8 +424,10 @@ proptest! {
                 }
                 SimOp::PopulateFetched { lba, seed } => {
                     // gc_checkpoint flushes the WAL (may create a pending segment) then
-                    // mints a fresh ULID for the cache file.  Both must be > max_before.
-                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    // mints two fresh ULIDs; we use the first for the cache file.  All
+                    // new ULIDs must be > max_before.
+                    let (ulid_str, _) = vol.gc_checkpoint().unwrap();
+                    let ulid = Ulid::from_string(&ulid_str).unwrap();
                     common::populate_cache(fork_dir, ulid, 16 + *lba as u64, *seed);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
@@ -441,7 +476,8 @@ proptest! {
                     common::drain_local(fork_dir);
                 }
                 SimOp::CoordGcLocal { n } => {
-                    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (gc_ulid_str, _) = vol.gc_checkpoint().unwrap();
+                    let gc_ulid = Ulid::from_string(&gc_ulid_str).unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -458,8 +494,9 @@ proptest! {
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
-                    let repack_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
-                    let sweep_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (repack_ulid_str, sweep_ulid_str) = vol.gc_checkpoint().unwrap();
+                    let repack_ulid = Ulid::from_string(&repack_ulid_str).unwrap();
+                    let sweep_ulid = Ulid::from_string(&sweep_ulid_str).unwrap();
                     let mut to_delete: Vec<std::path::PathBuf> = vec![];
                     if let Some(((_, _, r_paths), (_, _, s_paths))) =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
@@ -504,7 +541,8 @@ proptest! {
                     // LBA is offset by 16 so it never overlaps with Write (0–7).
                     // The latest PopulateFetched for an LBA wins on rebuild (highest
                     // ULID applied last), so always overwrite the oracle entry.
-                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (ulid_str, _) = vol.gc_checkpoint().unwrap();
+                    let ulid = Ulid::from_string(&ulid_str).unwrap();
                     let actual_lba = 16 + *lba as u64;
                     common::populate_cache(fork_dir, ulid, actual_lba, *seed);
                     oracle.insert(actual_lba, [*seed; 4096]);
@@ -547,7 +585,8 @@ proptest! {
                     common::drain_local(fork_dir);
                 }
                 SimOp::CoordGcLocal { n } => {
-                    let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (gc_ulid_str, _) = vol.gc_checkpoint().unwrap();
+                    let gc_ulid = Ulid::from_string(&gc_ulid_str).unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -561,8 +600,9 @@ proptest! {
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
-                    let repack_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
-                    let sweep_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (repack_ulid_str, sweep_ulid_str) = vol.gc_checkpoint().unwrap();
+                    let repack_ulid = Ulid::from_string(&repack_ulid_str).unwrap();
+                    let sweep_ulid = Ulid::from_string(&sweep_ulid_str).unwrap();
                     let mut to_delete: Vec<std::path::PathBuf> = vec![];
                     if let Some(((_, _, r_paths), (_, _, s_paths))) =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
@@ -600,7 +640,8 @@ proptest! {
                     let _ = vol.snapshot();
                 }
                 SimOp::PopulateFetched { lba, seed } => {
-                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let (ulid_str, _) = vol.gc_checkpoint().unwrap();
+                    let ulid = Ulid::from_string(&ulid_str).unwrap();
                     let actual_lba = 16 + *lba as u64;
                     common::populate_cache(fork_dir, ulid, actual_lba, *seed);
                     oracle.insert(actual_lba, [*seed; 4096]);
