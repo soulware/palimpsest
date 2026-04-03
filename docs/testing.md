@@ -225,6 +225,33 @@ passes would explore cases the fixed tests cannot, particularly: GC running afte
 the `ReadonlyVolume` was opened (the `ReadonlyVolume` has no `apply_gc_handoffs`
 path, so its extent index may reference a deleted segment on the next read).
 
+**`fetched/` directory entirely absent from the simulation model.**  The
+demand-fetch path — where segment data lives in `fetched/<id>.body` rather
+than `pending/` or `segments/` — is never exercised by any SimOp.  Three
+concrete gaps follow from this:
+
+1. *Read-path precedence is untested.*  `find_segment_in_dirs` checks
+   `wal/ → pending/ → segments/ → fetched/` in that order.  The `fetched/`
+   branch is dead code from the proptest's perspective.
+
+2. *`pending/` shadowing `fetched/` is untested.*  A write to an LBA whose
+   most recent segment lives in `fetched/` should be served from `pending/`
+   after the write; the stale fetched body is never consulted.  This requires
+   a segment that was demand-fetched (data only in `fetched/`) followed by a
+   `vol.write()` to the same LBA.
+
+3. *Partial-fetch presence-bit gate is untested.*  An entry whose extent has
+   not yet been fetched (`.present` bit clear) must fall through to the
+   `SegmentFetcher`; one whose bit is set must be served from the body file.
+   Neither path is triggered.
+
+Closing these gaps requires a `NoopFetcher` / `FileFetcher` test
+implementation of `SegmentFetcher`, plus a `PopulateFetched { lba, seed }`
+SimOp that writes a segment directly into the three-file fetched format
+(`<id>.idx`, `<id>.body`, `<id>.present`) bypassing the WAL.  The
+`all_segment_ulids` helper also needs to scan `fetched/` so that ULID
+monotonicity assertions see demand-fetched segments.
+
 **WAL truncated-tail recovery not triggered by proptest.**  `recover_wal()`
 truncates any partial tail record and replays the rest.  The `Crash` SimOp always
 drops a clean `Volume` (full records only), so the truncation branch is never
