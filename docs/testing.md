@@ -1,13 +1,44 @@
 # Testing
 
+## Test file conventions
+
+Each crate's `tests/` directory uses a two-suffix convention to separate test
+types:
+
+| Suffix | Purpose |
+|--------|---------|
+| `*_proptest.rs` | Proptest suites — random operation sequences, shrinking, regression seeds |
+| `*_test.rs` | Deterministic tests — fixed sequences, regression reproductions, scenario tests |
+
+Current inventory:
+
+```
+elide-core/tests/
+  volume_proptest.rs      proptest: crash-recovery oracle + ULID monotonicity
+  fork_proptest.rs        proptest: fork ancestry isolation oracle
+  actor_proptest.rs       proptest: actor-layer read-your-writes oracle
+  fork_test.rs            deterministic: fork ancestry fixed scenarios
+  gc_ordering_test.rs     deterministic: GC interleaving fixed scenarios
+  gc_index_test.rs        deterministic: GC index rebuild scenarios
+  readonly_volume_test.rs deterministic: ReadonlyVolume fixed scenarios
+  evict_test.rs           deterministic: segment eviction scenarios
+  concurrent_test.rs      deterministic: concurrent GC + reader ordering
+
+elide-coordinator/tests/
+  gc_proptest.rs          proptest: coordinator GC oracle (segment cleanup + data)
+  gc_test.rs              deterministic: coordinator GC regression reproductions
+```
+
+The split is enforced by naming, not by any framework mechanism.  When adding a
+new test file, pick the right suffix and add it to the inventory above.
+
 ## Property-based tests
 
 The correctness of the volume's crash-recovery model is verified with
 property-based tests using [proptest](https://proptest-rs.github.io/proptest/).
 The main suite lives in `elide-core/tests/volume_proptest.rs`; fork ancestry
-isolation is in `elide-core/tests/fork_proptest.rs`; deterministic integration
-tests for GC ordering and `ReadonlyVolume` live in `gc_ordering_test.rs` and
-`readonly_volume_test.rs` respectively.
+isolation is in `elide-core/tests/fork_proptest.rs`; coordinator GC correctness
+is in `elide-coordinator/tests/gc_proptest.rs`.
 
 Proptest generates random sequences of operations, runs them against the real
 volume implementation, and checks invariants after each relevant step.  When a
@@ -150,9 +181,71 @@ To add a new operation:
   visible? If yes, update the oracle.  Does it produce new segment files?  If
   yes, add a ULID ordering assertion.
 
-To increase confidence after a bug fix, add the minimal failing sequence as a
-deterministic regression test in `elide-core/src/volume.rs` before verifying
-that the proptest also passes.
+### Materializing proptest failures as deterministic tests
+
+When proptest finds a failure, the shrunk minimal sequence is the starting
+point for understanding the bug — not the end point.  The workflow is:
+
+1. **Reproduce** the shrunk sequence manually to confirm the failure mode.
+2. **Diagnose** the root cause.  Write it down as a comment before writing any
+   code.  If the root cause is not yet clear, keep tracing before touching the
+   implementation.
+3. **Write a named `#[test]`** that encodes the minimal sequence as a
+   deterministic test, with a comment block explaining the bug scenario, the
+   invariant violated, and what the fix does.  This test should *fail* on the
+   unfixed code and *pass* after the fix — confirming the fix is targeted.
+4. **Fix the bug**, verifying the deterministic test passes.
+5. **Re-run the full proptest** to confirm the original seed no longer fails and
+   no regressions were introduced.
+
+The deterministic test belongs in the same file as the proptest (or the nearest
+crate-level integration test file), not buried in unit tests.  Name it after
+the bug, not the mechanism: `gc_handoff_bug_b_dedup_ref_after_checkpoint` is
+more useful than `test_remove_hash_guard`.
+
+**Why both a deterministic test AND a proptest seed?**
+
+The proptest regression seed and the deterministic test serve different
+purposes and are not substitutes for each other:
+
+| | Proptest seed | Deterministic test |
+|---|---|---|
+| Replay the exact failure | ✓ | ✓ (explicit) |
+| Documents *why* the bug occurred | ✗ | ✓ |
+| Survives proptest version upgrades | fragile | ✓ |
+| Readable by a future contributor | ✗ | ✓ |
+| Drives design discussion before fix | ✗ | ✓ |
+
+The deterministic test is also a forcing function for understanding: you cannot
+write it without being able to state the bug mechanism precisely.  If you find
+yourself unable to write the test, that is a signal to keep diagnosing before
+fixing.
+
+**When to write a deterministic test:**
+
+Not every proptest failure warrants one.  Good candidates:
+
+- Bugs with a concurrency or ordering window that is hard to see from a seed
+  alone (e.g. "write between checkpoint and apply").
+- Bugs where the fix involves a non-obvious invariant that future readers
+  should understand without re-deriving it.
+- Any bug where the diagnosis required significant analysis — the analysis is
+  too valuable to leave only in a commit message.
+
+Simple data-shape bugs (off-by-one, missing branch) are usually fine with just
+the seed.
+
+**The test as a design surface:**
+
+Writing the deterministic test before the fix often surfaces design questions
+that are better resolved before code is written:
+
+- Is the fix in the right layer? (volume vs coordinator vs handoff protocol)
+- Does the fix handle all variants of the scenario?
+- Is there a simpler invariant that covers the case more broadly?
+
+Discuss these questions at the test-writing stage, not after the fix is
+already in place.
 
 ### Proptest regression files
 
@@ -224,9 +317,13 @@ mixed live/dead partial-extent accounting errors in `sweep_pending` and `repack`
 two LBAs hold identical data.  With the current `lba: 0..8, seed: any::<u8>()`
 strategy the dedup path may or may not be reached on any given run.  The
 corruption bug fixed in `sweep_pending` (dead DEDUP_REF incorrectly evicting a
-live DATA extent) was found by chance rather than by design.  A `DedupWrite`
-SimOp that explicitly writes the same seed to two different LBAs would guarantee
-the dedup and dead-REF paths are exercised on every run.
+live DATA extent) was found by chance rather than by design.  A second bug —
+the coordinator GC compactor converting live DEDUP_REF entries into DATA entries
+with `stored_length=0`, corrupting the extent index on rebuild — was missed
+entirely by proptest for the same reason and was only found in production (see
+"Fourth bug found" below).  A `DedupWrite` SimOp that explicitly writes the same
+seed to two different LBAs would guarantee the dedup and dead-REF paths are
+exercised on every run.
 
 **Actor `Snapshot` op absent.**  `VolumeHandle::snapshot()` sends a
 `VolumeRequest::Snapshot` through the actor channel, which flushes the WAL,
@@ -485,6 +582,144 @@ the merge loop.  Since ULIDs encode write order, this guarantees oldest entries
 appear first in `merged_live` and therefore first in the output segment.
 `rebuild_segments` then always applies the most-recent write last — the correct
 last-write-wins result — regardless of how the OS orders `read_dir` results.
+
+### Fourth bug found: GC compactor converts DEDUP_REF entries to DATA with stored_length=0
+
+Observed as a reproducible EIO ("failed to fill whole buffer") on the first NBD
+read after coordinator stop/restart, at a fixed byte offset (1 MB = LBA 256).
+The diagnostic log added to `read_extents` identified the failure:
+
+```
+read_extents failed: lba=256 segment=01KNANEFZZ8D3BTJFJXJ5EQ3D7 is_body=false
+  bss=15486 body_offset=801 body_length=0 payload_block_offset=14
+  file_body_offset=16287 read_len=4096 file_size=23803
+```
+
+`body_length=0` in the extent index for a non-DEDUP_REF entry is the invariant
+violation.  The seek target was `16287 + 14 × 4096 = 73631`, far past
+`file_size=23803`.
+
+**What happened:**
+
+1. A segment S1 contains `DATA(lba=242, H, lba_length=14)` and, from a
+   deduplicated write, `DEDUP_REF(lba=0, H, lba_length=...)` (same hash, no body
+   bytes in S1 for the REF).
+2. GC selects S1 as a compaction candidate.  In `compact_candidates_inner`, each
+   entry is tested for LBA-liveness: the DEDUP_REF is LBA-live, so it is pushed
+   into `live_entries`.
+3. `read_extent_bodies` skips DEDUP_REF entries (they have no body); their `data`
+   field stays as `Vec::new()`.
+4. The map over `live_entries` calls `SegmentEntry::new_data(...,
+   std::mem::take(&mut e.data))` for every entry, including the DEDUP_REF.
+   `new_data` sets `stored_length = data.len() = 0`.
+5. The GC output segment is written with a DATA entry at `stored_offset=801,
+   stored_length=0` for hash H — a zero-length body record that looks valid to
+   the parser.
+6. On restart, `extentindex::rebuild` sees this entry as a non-DEDUP_REF DATA
+   entry (it is flagged as DATA in the output segment) and inserts it into the
+   extent index with `body_length=0`.
+7. A read of LBA 256 (14 blocks into the extent starting at LBA 242) seeks to
+   `bss + 801 + 14 × 4096 = 73631` — past EOF → EIO.
+
+**Fix** (`elide-coordinator/src/gc.rs`): in the `new_entries` map, check
+`e.is_dedup_ref` and emit `SegmentEntry::new_dedup_ref` instead of `new_data`.
+This preserves the LBA→hash mapping in the output segment without fabricating a
+zero-length body.  DEDUP_REF entries are also skipped when building the handoff
+file — no `Repack` line is needed because the extent index still correctly points
+at the ancestor segment that holds the actual body bytes.
+
+**Why proptest missed it:**  two independent gaps.
+
+First, the documented "Dedup path not reliably triggered" gap: DEDUP_REF entries
+are only written when two LBAs contain identical data, which the current strategy
+only reaches by chance.
+
+Second, and more fundamentally: the proptest's `simulate_coord_gc_local` in
+`elide-core/tests/common/mod.rs` is a **separate reimplementation** of GC
+compaction that already handled DEDUP_REF entries correctly — it was never
+broken.  Even if dedup writes had fired reliably on every run, the proptest
+oracle would always have passed, because the oracle runs the test helper, not the
+real coordinator code in `elide-coordinator/src/gc.rs`.  Bugs in the real
+coordinator are invisible to the current proptest design.
+
+**What would close both gaps:**
+
+- A `DedupWrite` SimOp (writing the same seed to two different LBAs) to
+  guarantee DEDUP_REF entries appear in segments on every run.
+- A deterministic regression test in `elide-coordinator` that calls the real
+  `compact_candidates_inner` with DEDUP_REF inputs, drops and reopens the
+  volume, and asserts correct reads.  This is the only path that exercises the
+  code that was actually broken.
+
+## Coordinator GC proptest (`elide-coordinator/tests/gc_proptest.rs`)
+
+A second proptest suite lives in the coordinator crate and calls the **real**
+`gc_fork()` + `apply_gc_handoffs()` + `apply_done_handoffs()` path.  This
+closes the structural gap where `elide-core`'s simulation could be correct while
+the production coordinator had a bug (as happened with the fourth bug above).
+
+`GcSweep` flushes the WAL first (matching what `gc_checkpoint()` does in
+production), then runs the full coordinator round-trip, then asserts every oracle
+LBA reads back its last-written value.
+
+### Bugs found by the coordinator proptest
+
+The suite is currently **`#[ignore]`** while two bugs it uncovered are being
+investigated.
+
+#### Bug A: DEDUP_REF-only segments never deleted after GC
+
+When GC compacts a set of segments that includes one containing **only**
+DEDUP_REF entries (no DATA entries), `compact_segments` generates no handoff
+line that names that segment as an `old_ulid`.  `apply_done_handoffs` collects
+`old_ulids` exclusively from Repack/Remove/Dead lines, so it never learns to
+delete the DEDUP_REF-only segment.
+
+The segment persists in `segments/` indefinitely.  On the next GC sweep it is
+picked up again as a candidate, its DEDUP_REF entries are merged into the new
+output a second time, and the GC output segment contains duplicate LBA entries.
+Over successive sweeps the duplicate entries accumulate.  At some point the
+lbamap rebuild applies a DEDUP_REF from the stale copy (which points to a DATA
+entry in a segment that has since been deleted), and reads for that LBA return
+wrong data.
+
+Minimal reproducer:
+```
+[DedupWrite(3,5,0), GcSweep, Write(0,0), Flush, DrainLocal,
+ DedupWrite(3,6,1), Write(3,2), GcSweep, DrainLocal, GcSweep]
+```
+After the third GcSweep, lba 5 reads `[0;4096]` (H0) instead of `[0;4096]`
+— actually the values are the same here, but lba 6 reads zeros instead of
+`[1;4096]`.
+
+**Fix direction**: `compact_segments` must emit a handoff line (e.g. a `Dead`
+line or a dedicated `Consumed` marker) for every input segment, not only those
+that contribute DATA entries to the output, so `apply_done_handoffs` can delete
+all consumed segments.
+
+#### Bug B: GC liveness view excludes unflushed WAL writes (window between checkpoint and apply)
+
+`gc_fork` rebuilds liveness from on-disk state (`segments/` + `pending/`).  It
+does not see writes that are in the volume's WAL buffer but not yet flushed to a
+segment.  The `GcSweep` flush before `gc_fork` closes most of this gap, but a
+narrower window remains in production: between `gc_checkpoint()` and
+`apply_gc_handoffs()`, the volume may process new writes.  If a new write uses
+the same content as a hash that GC just marked dead (emitting a DEDUP_REF
+because the hash is still in the extent index), and `apply_gc_handoffs` then
+removes that hash from the extent index (because the on-disk extent index still
+points to the old segment), reads for that LBA return zeros.
+
+The guard in `apply_gc_handoffs` (`loc.segment_id == old_ulid`) correctly
+protects DATA overwrites (which update the extent index, changing the
+`segment_id`), but **DEDUP_REF writes do not update the extent index**, so the
+guard does not fire and the hash is incorrectly removed.
+
+**Fix direction**: in `apply_gc_handoffs`, before removing a hash H from the
+extent index, check `self.lbamap.live_hashes().contains(&hash)`.  If H is still
+referenced by any LBA, do not remove it — and do not write the `.applied` file
+for this handoff until H's data has been re-promoted into a new segment (or
+until a future GC tick, at which point the volume's flushed state will correctly
+reflect H as live and the coordinator will not attempt to remove it again).
 
 ---
 

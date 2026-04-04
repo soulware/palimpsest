@@ -722,6 +722,7 @@ name = "elide-coordinator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "bytes",
  "chrono",
@@ -731,6 +732,7 @@ dependencies = [
  "futures",
  "nix",
  "object_store",
+ "proptest",
  "serde",
  "tempfile",
  "tokio",

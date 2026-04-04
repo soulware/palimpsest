@@ -158,6 +158,30 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
+    // Precondition: pending/ must be empty (or contain only segments with
+    // ULID > sweep_ulid) when gc_fork runs.  The coordinator tick enforces
+    // this by completing drain_pending (step 4) before calling gc_checkpoint
+    // and gc_fork (step 5).  A pre-existing pending segment with ULID <=
+    // sweep_ulid would sort below the GC output on crash-recovery rebuild,
+    // causing the GC output to win for shared LBAs and return stale data.
+    debug_assert!(
+        {
+            let sweep = Ulid::from_string(sweep_ulid).unwrap_or(ulid::Ulid::nil());
+            elide_core::segment::collect_segment_files(&fork_dir.join("pending"))
+                .unwrap_or_default()
+                .iter()
+                .all(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| Ulid::from_string(n).ok())
+                        .map(|u| u > sweep)
+                        .unwrap_or(true)
+                })
+        },
+        "gc_fork called with pending segments at or below sweep_ulid; \
+         drain_pending must complete before GC runs"
+    );
+
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
@@ -279,6 +303,7 @@ pub async fn apply_done_handoffs(
 
     applied.sort_by_key(|e| e.file_name());
     let segments_dir = fork_dir.join("segments");
+    let index_dir = fork_dir.join("index");
     let mut count = 0;
 
     for entry in &applied {
@@ -372,8 +397,7 @@ pub async fn apply_done_handoffs(
 
             // Write index/<new_ulid>.idx — the S3-confirmation marker.  Must
             // happen before the gc/ → segments/ move so that the invariant
-            // "index present ↔ segments present ↔ S3-confirmed" holds.
-            let index_dir = fork_dir.join("index");
+            // "index/<ulid>.idx present ↔ segment in S3" holds.
             fs::create_dir_all(&index_dir)
                 .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
             let idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
@@ -387,6 +411,30 @@ pub async fn apply_done_handoffs(
                 fs::rename(&gc_body, &seg_body)
                     .with_context(|| format!("moving gc/{new_ulid_str} to segments/"))?;
             }
+        }
+
+        // Delete index/<old>.idx for each old input segment before deleting the
+        // S3 objects.  Ordering is critical: the invariant
+        //   index/<ulid>.idx present  ↔  segment guaranteed to be in S3
+        // means the .idx must be removed first.  If the coordinator crashes
+        // between here and the S3 deletes below, the .idx is gone but the S3
+        // object remains — a transient space overhead, not corruption.  On
+        // restart the coordinator retries from .applied; the .idx deletes are
+        // idempotent (already-absent files are silently skipped).
+        //
+        // Without this step, evicting segments/ and restarting leaves dangling
+        // .idx files that rebuild_segments includes in the extent index, mapping
+        // hashes to segments absent from both disk and S3 — causing "not found
+        // in any ancestor" read errors on every access to those LBAs.
+        for old_ulid_str in &old_ulids {
+            let _ = fs::remove_file(index_dir.join(format!("{old_ulid_str}.idx")));
+        }
+
+        // Delete old local segment bodies from segments/ before deleting from
+        // S3, preserving the invariant: local body present ↔ S3 present.
+        // Best-effort: files may already be evicted or absent.
+        for old_ulid_str in &old_ulids {
+            let _ = fs::remove_file(segments_dir.join(old_ulid_str));
         }
 
         // Delete old S3 objects.  A 404 means the object is already gone
@@ -404,13 +452,6 @@ pub async fn apply_done_handoffs(
                     );
                 }
             }
-        }
-
-        // Delete old local segment files from segments/ (best-effort: the
-        // files may already be evicted or absent if the volume has not cached
-        // them locally).
-        for old_ulid_str in &old_ulids {
-            let _ = fs::remove_file(segments_dir.join(old_ulid_str));
         }
 
         // Rename .applied → .done.
@@ -708,17 +749,26 @@ async fn compact_segments(
     let mut new_entries: Vec<SegmentEntry> = all_live
         .iter_mut()
         .map(|(_, e)| {
-            SegmentEntry::new_data(
-                e.hash,
-                e.start_lba,
-                e.lba_length,
-                if e.compressed {
-                    segment::SegmentFlags::COMPRESSED
-                } else {
-                    segment::SegmentFlags::empty()
-                },
-                std::mem::take(&mut e.data),
-            )
+            if e.is_dedup_ref {
+                // Dedup-ref entries have no body in the source segment; the
+                // actual extent data lives in an ancestor segment that is NOT
+                // being compacted.  Preserve as a dedup-ref in the output so
+                // the LBA→hash mapping is kept, without fabricating a DATA
+                // entry with stored_length=0 (which corrupts the extent index).
+                SegmentEntry::new_dedup_ref(e.hash, e.start_lba, e.lba_length)
+            } else {
+                SegmentEntry::new_data(
+                    e.hash,
+                    e.start_lba,
+                    e.lba_length,
+                    if e.compressed {
+                        segment::SegmentFlags::COMPRESSED
+                    } else {
+                        segment::SegmentFlags::empty()
+                    },
+                    std::mem::take(&mut e.data),
+                )
+            }
         })
         .collect();
 
@@ -745,7 +795,19 @@ async fn compact_segments(
     // Write the handoff file using the typed HandoffLine format.
     let new_ulid = Ulid::from_string(new_ulid_str).context("parsing new ulid")?;
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
+    // Track which candidate ULIDs get at least one Repack or Remove line.
+    // Any candidate not covered had only DEDUP_REF live entries; it needs a
+    // Dead line so apply_done_handoffs deletes the old segment file.
+    let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
+        if new_entry.is_dedup_ref {
+            // Dedup-ref entries have no body in the new segment; the extent
+            // index still points at the ancestor segment that holds the data.
+            // No Repack line is needed — apply_gc_handoffs must not update
+            // the extent index for these hashes.
+            continue;
+        }
+        covered_ulids.insert(old_ulid_str.as_str());
         let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
         let new_offset = new_body_section_start + new_entry.stored_offset;
         handoff_lines.push(HandoffLine::Repack {
@@ -756,11 +818,23 @@ async fn compact_segments(
         });
     }
     for (hash, old_ulid_str) in &all_removed {
+        covered_ulids.insert(old_ulid_str.as_str());
         let old_ulid = Ulid::from_string(old_ulid_str).context("parsing removed ulid")?;
         handoff_lines.push(HandoffLine::Remove {
             hash: *hash,
             old_ulid,
         });
+    }
+    // Candidates whose ULID has no Repack or Remove line contributed only
+    // DEDUP_REF live entries.  Their entries are already carried into the new
+    // output segment above, so it is safe to delete the old files.  Emit a
+    // Dead line for each so apply_done_handoffs knows to delete them.
+    for candidate in &candidates {
+        if !covered_ulids.contains(candidate.ulid_str.as_str()) {
+            let old_ulid =
+                Ulid::from_string(&candidate.ulid_str).context("parsing candidate ulid")?;
+            handoff_lines.push(HandoffLine::Dead { old_ulid });
+        }
     }
     let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
     let pending_tmp = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
@@ -1439,6 +1513,119 @@ mod tests {
         assert!(
             gc_dir.join(format!("{handoff_ulid}.done")).exists(),
             ".done file must be written"
+        );
+    }
+
+    // --- DEDUP_REF regression test ---
+
+    /// Regression: GC compactor must preserve DEDUP_REF entries from source
+    /// segments as DEDUP_REF in the output, not convert them to DATA with
+    /// stored_length=0.
+    ///
+    /// Bug: `compact_candidates_inner` called `SegmentEntry::new_data(...,
+    /// Vec::new())` for every live entry including dedup-refs.
+    /// `read_extent_bodies` skips dedup-refs so their `data` field stays
+    /// `Vec::new()`, and `new_data` then set `stored_length = 0`.  On rebuild
+    /// after restart, `extentindex::rebuild` inserted this zero-length DATA
+    /// entry for the hash, corrupting the extent index.  Subsequent reads
+    /// sought to `bss + body_offset + payload_block_offset * 4096` — past EOF
+    /// of the actual segment — and returned EIO.
+    ///
+    /// Sequence that triggers the bug:
+    ///   1. Write content H to lba 0 → flush → drain: segment S1 DATA(lba=0, H)
+    ///   2. Write content H to lba 1 → flush → drain: segment S2 DEDUP_REF(lba=1, H)
+    ///   3. GC compacts S1 + S2: lba 1's DEDUP_REF was mis-converted to DATA(len=0)
+    ///   4. Crash + reopen: extent index holds zero-length DATA entry for H
+    ///   5. Read lba 0 or lba 1 → EIO
+    #[tokio::test]
+    async fn gc_dedup_ref_preserved_across_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Set up volume keypair (needed by Volume::open and apply_done_handoffs).
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+
+        let content = [0xAAu8; 4096];
+
+        // Step 1: write [0xAA; 4096] to lba 0, flush, drain.
+        // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
+        vol.write(0, &content).unwrap();
+        vol.flush_wal().unwrap();
+        let segments_dir = dir.join("segments");
+        fs::create_dir_all(&segments_dir).unwrap();
+        for e in fs::read_dir(dir.join("pending")).unwrap().flatten() {
+            fs::rename(e.path(), segments_dir.join(e.file_name())).unwrap();
+        }
+
+        // Step 2: write the same content to lba 1, flush, drain.
+        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2.
+        vol.write(1, &content).unwrap();
+        vol.flush_wal().unwrap();
+        for e in fs::read_dir(dir.join("pending")).unwrap().flatten() {
+            fs::rename(e.path(), segments_dir.join(e.file_name())).unwrap();
+        }
+
+        drop(vol);
+
+        // Step 3: run the real coordinator GC.
+        // small_segment_bytes=u64::MAX: all segments qualify as "small" for sweep.
+        // density_threshold=0.0: all segments pass the density check.
+        // Both S1 and S2 should be swept together (small.len() >= 2).
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            small_segment_bytes: u64::MAX,
+            interval_secs: 0,
+        };
+        let sweep_ulid = Ulid::new().to_string();
+        let repack_ulid = Ulid::new().to_string();
+        let stats = gc_fork(dir, "test-vol", &store, &config, &repack_ulid, &sweep_ulid)
+            .await
+            .unwrap();
+        assert!(
+            stats.candidates >= 2,
+            "GC should have compacted at least 2 segments (S1 + S2), got {}",
+            stats.candidates
+        );
+
+        // Step 4: volume applies the handoff — re-signs the GC segment and
+        // updates the in-memory extent index.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        let applied = vol.apply_gc_handoffs().unwrap();
+        assert!(applied > 0, "GC handoff should have been applied");
+        drop(vol);
+
+        // Step 5: coordinator completes the handoff — uploads to S3, moves
+        // gc/<new> → segments/<new>, deletes old segment files, renames
+        // .applied → .done.
+        let done = apply_done_handoffs(dir, "test-vol", &store).await.unwrap();
+        assert!(
+            done > 0,
+            "apply_done_handoffs should have processed the handoff"
+        );
+
+        // Step 6: crash + reopen — rebuild lbamap and extent index from disk.
+        // Before the fix, extentindex::rebuild inserted a zero-length DATA entry
+        // for H_aa (from the mis-converted DEDUP_REF in the GC output), causing
+        // reads to seek past EOF with EIO.
+        let vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+
+        assert_eq!(
+            vol.read(0, 1).unwrap().as_slice(),
+            &content,
+            "lba 0 must read back [0xAA; 4096] after GC + crash + reopen"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap().as_slice(),
+            &content,
+            "lba 1 must read back [0xAA; 4096] after GC + crash + reopen"
         );
     }
 }

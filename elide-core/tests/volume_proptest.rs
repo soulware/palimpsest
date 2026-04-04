@@ -96,6 +96,11 @@ enum SimOp {
     /// and ReadUnwritten (64).  The oracle is updated immediately because after
     /// any subsequent Crash the rebuilt volume will serve this data from cache/.
     PopulateFetched { lba: u8, seed: u8 },
+    /// Write [seed; 4096] to lba_a, then [seed; 4096] to lba_b.
+    /// Because both writes carry identical data, lba_b's WAL entry is a
+    /// DEDUP_REF pointing at lba_a's segment.  Guarantees the dedup and
+    /// dead-REF paths are exercised on every run that includes this op.
+    DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -111,6 +116,11 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::ReadUnwritten),
         Just(SimOp::Snapshot),
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::PopulateFetched { lba, seed }),
+        (0u8..4, 4u8..8, any::<u8>()).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
+            lba_a,
+            lba_b,
+            seed
+        }),
     ]
 }
 
@@ -437,6 +447,11 @@ proptest! {
                         );
                     }
                 }
+                SimOp::DedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.write(*lba_b as u64, &data);
+                }
             }
         }
     }
@@ -547,6 +562,13 @@ proptest! {
                     common::populate_cache(fork_dir, ulid, actual_lba, *seed);
                     oracle.insert(actual_lba, [*seed; 4096]);
                 }
+                SimOp::DedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.write(*lba_b as u64, &data);
+                    oracle.insert(*lba_a as u64, data);
+                    oracle.insert(*lba_b as u64, data);
+                }
             }
         }
     }
@@ -645,6 +667,13 @@ proptest! {
                     let actual_lba = 16 + *lba as u64;
                     common::populate_cache(fork_dir, ulid, actual_lba, *seed);
                     oracle.insert(actual_lba, [*seed; 4096]);
+                }
+                SimOp::DedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.write(*lba_b as u64, &data);
+                    oracle.insert(*lba_a as u64, data);
+                    oracle.insert(*lba_b as u64, data);
                 }
             }
         }

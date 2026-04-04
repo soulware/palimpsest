@@ -350,11 +350,23 @@ The `increment()` overflow case (all 80 random bits set) is effectively unreacha
 
 **At most one outstanding GC pass per fork:** the coordinator defers a new pass if any `gc/*.pending` files exist. This prevents accumulating multiple overlapping handoffs before the volume has applied the first.
 
-**`gc_checkpoint`:** before running a GC pass, the coordinator calls `gc_checkpoint` on the volume via `control.sock`. This flushes the volume's WAL (ensuring all in-flight writes are in `pending/` where the coordinator can see them), then mints two ULIDs 2ms apart using the volume's own clock, and returns them as `(repack_ulid, sweep_ulid)`. The coordinator uses `repack_ulid` as the output ULID for any density-repack pass and `sweep_ulid` for any sweep pass in the same GC tick. Two ULIDs are returned in a single round trip so the coordinator can run both strategies in one tick without a second IPC call. The 2ms gap ensures they are distinct even on systems where `Ulid::new()` has millisecond resolution.
+**`gc_checkpoint`:** before running a GC pass, the coordinator calls `gc_checkpoint` on the volume via `control.sock`. The volume mints three ULIDs from its monotonic clock — `u_repack`, `u_sweep`, and `u_wal` — flushes the current WAL to `pending/` under the name `u_wal`, and opens a fresh WAL. The coordinator receives `(u_repack, u_sweep)` and uses `u_repack` as the output ULID for any density-repack pass and `u_sweep` for any sweep pass in the same GC tick. Two ULIDs are returned in a single round trip so the coordinator can run both strategies in one tick without a second IPC call.
 
-Because the WAL was flushed before minting, no in-flight WAL segment can have a ULID above either returned value — both GC outputs are guaranteed to sort before any subsequent write. This closes the rebuild-time ordering race described in the design notes.
+**Why three ULIDs, minted first — the pre-mint pattern.**
 
-ULIDs are always minted by the volume process, never by the coordinator. This is deliberate: generating them on the coordinator would be unsafe if the coordinator's clock is ahead of the volume's, as the GC output ULID could then exceed a future write's ULID and corrupt rebuild ordering. By sourcing both ULIDs from the volume's clock, clock skew between hosts is not a concern.
+The monotonic mint is a logical clock. Pulling all three identifiers from it *before* any I/O encodes the required ordering constraint in advance:
+
+```
+u_repack < u_sweep < u_wal < new_wal_ulid
+```
+
+The I/O steps then execute in the pre-determined logical order without requiring any coordination after the fact. This is a general technique: when several operations must be strictly ordered but execute at different times or on different systems, pre-minting their identifiers from a single monotonic source establishes the ordering before anything runs.
+
+Without pre-minting `u_wal`, the WAL segment flushed at checkpoint time carries the WAL's *existing* ULID — assigned when the WAL was opened, before the GC ULIDs were minted. That ULID is lower than `u_sweep`. After the segment is drained from `pending/` to `segments/`, crash-recovery rebuild applies segments in ULID order: the GC output (higher ULID) overwrites the WAL segment (lower ULID) for any shared LBAs, returning stale data.
+
+When the WAL is empty at checkpoint time, the WAL file is deleted and `u_wal` is unused (no segment produced). The fresh WAL opened after minting carries a ULID > `u_sweep`, so subsequent writes are always ordered correctly.
+
+ULIDs are always minted by the volume process, never by the coordinator. This is deliberate: generating them on the coordinator would be unsafe if the coordinator's clock is ahead of the volume's, as the GC output ULID could then exceed a future write's ULID and corrupt rebuild ordering. By sourcing all ULIDs from the volume's clock, coordinator clock skew cannot affect segment ordering.
 
 **GC result file format (`gc/<result-ulid>.pending`):**
 
