@@ -790,25 +790,53 @@ impl Volume {
 
     /// Establish a consistent checkpoint for coordinator GC.
     ///
-    /// Flushes any in-flight WAL data to `pending/` so that the coordinator's
-    /// extent index rebuild sees all committed writes, then mints and returns
-    /// two fresh ULIDs for the GC output segments (repack and sweep).  Because
-    /// the flush happens before both mints, both returned ULIDs are guaranteed
-    /// to sort after every segment that existed at checkpoint time, and any
-    /// write that arrives after this call gets a WAL ULID strictly greater than
-    /// either returned value.  This establishes a clean ordering boundary: GC
-    /// outputs (named with these ULIDs) sort before all future writes on rebuild.
+    /// Mints three ULIDs from the volume's monotonic clock — `u_repack`,
+    /// `u_sweep`, and `u_wal` — in that order, then flushes the current WAL to
+    /// `pending/` under the name `u_wal` (not the WAL's existing ULID), and
+    /// opens a fresh WAL with ULID > `u_wal`.  Returns `(u_repack, u_sweep)` to
+    /// the coordinator.
     ///
-    /// Both ULIDs come from the volume's own monotonic mint, so they integrate
-    /// correctly with the volume's ULID ordering — no external clock calls.
+    /// **Why three ULIDs, minted first.**
+    ///
+    /// The monotonic mint is a logical clock.  Pulling all three identifiers
+    /// from it *before* any I/O encodes the relative ordering of operations in
+    /// advance: `u_repack < u_sweep < u_wal < new_wal`.  The I/O steps then
+    /// execute in the pre-determined logical order without requiring any
+    /// coordination after the fact.
+    ///
+    /// Without pre-minting `u_wal`, the WAL segment flushed by this call would
+    /// carry the WAL's *existing* ULID (assigned when the WAL was opened,
+    /// before the GC ULIDs were minted).  That ULID is lower than `u_sweep`, so
+    /// after the segment is drained to `segments/`, crash-recovery rebuild would
+    /// apply the GC output *after* the WAL segment and return stale data.
+    ///
+    /// When the WAL is empty, the WAL file is deleted and `u_wal` is not used
+    /// (no segment is produced), so the empty-WAL case is also safe: the fresh
+    /// WAL opened after minting carries a ULID > `u_sweep`.
+    ///
+    /// All ULIDs come from the volume's own monotonic mint, never from an
+    /// external clock — coordinator clock skew cannot corrupt ULID ordering.
     pub fn gc_checkpoint(&mut self) -> io::Result<(String, String)> {
-        self.flush_wal()?;
-        let u1 = self.mint.next().to_string();
-        // 2ms gap ensures distinct timestamps so the two ULIDs are strictly
-        // ordered by time, not just by the random bits.
+        // Mint all three ULIDs before any I/O.  The ordering constraint —
+        // u_repack < u_sweep < u_wal < new_wal — is established here, before
+        // the flush or the new WAL open.
+        let u_repack = self.mint.next().to_string();
+        // 2ms gap ensures distinct timestamps so the ULIDs are strictly ordered
+        // by time, not just by the random bits.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let u2 = self.mint.next().to_string();
-        Ok((u1, u2))
+        let u_sweep = self.mint.next().to_string();
+        let u_wal = self.mint.next().to_string();
+        // Flush the current WAL to pending/ under u_wal.  If the WAL is empty,
+        // the file is deleted and u_wal is unused (no segment produced).
+        self.flush_wal_to_pending_as(&u_wal)?;
+        // Open a new WAL with ULID > u_wal.
+        let (wal, wal_ulid, wal_path, pending_entries) =
+            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
+        self.wal = wal;
+        self.wal_ulid = wal_ulid;
+        self.wal_path = wal_path;
+        self.pending_entries = pending_entries;
+        Ok((u_repack, u_sweep))
     }
 
     /// Apply any pending GC handoff files written by the coordinator.
@@ -1062,16 +1090,30 @@ impl Volume {
     ///
     /// Does NOT open a new WAL — the caller is responsible for that.
     fn flush_wal_to_pending(&mut self) -> io::Result<()> {
+        let ulid = self.wal_ulid.clone();
+        self.flush_wal_to_pending_as(&ulid)
+    }
+
+    /// Like `flush_wal_to_pending`, but names the output segment `segment_ulid`
+    /// rather than the WAL's own ULID.
+    ///
+    /// Used by `gc_checkpoint` to give the flushed WAL segment a ULID that has
+    /// been pre-minted above the GC output ULIDs, so that the pending segment
+    /// sorts correctly above GC outputs on crash-recovery rebuild.
+    ///
+    /// The WAL file itself retains its original name (the WAL ULID) — only the
+    /// output segment in `pending/` receives `segment_ulid`.
+    fn flush_wal_to_pending_as(&mut self, segment_ulid: &str) -> io::Result<()> {
         self.wal.fsync()?;
         if self.pending_entries.is_empty() {
             fs::remove_file(&self.wal_path)?;
             return Ok(());
         }
         self.has_new_segments = true;
-        self.last_segment_ulid = Some(self.wal_ulid.clone());
+        self.last_segment_ulid = Some(segment_ulid.to_owned());
         let body_section_start = segment::promote(
             &self.wal_path,
-            &self.wal_ulid,
+            segment_ulid,
             &self.base_dir.join("pending"),
             &mut self.pending_entries,
             self.signer.as_ref(),
@@ -1085,7 +1127,7 @@ impl Volume {
             Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
                 extentindex::ExtentLocation {
-                    segment_id: self.wal_ulid.clone(),
+                    segment_id: segment_ulid.to_owned(),
                     body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
@@ -1098,6 +1140,8 @@ impl Volume {
         // Evict the promoted WAL from the file handle cache.  After promotion
         // the body offsets in the extent index point into the new segment file;
         // any cached fd for this ULID would use the old WAL byte layout.
+        // The cache key is the WAL's original ULID (the file that was deleted),
+        // not segment_ulid — the cache is keyed by the path that was open.
         let mut cache = self.file_cache.borrow_mut();
         if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
             *cache = None;

@@ -28,6 +28,27 @@
 //            the GC output sorts after and wins, returning stale data.
 //            Fixed by always opening a new WAL after minting in gc_checkpoint.
 //            Covered by: gc_checkpoint_ulid_ordering_crash_recovery (below)
+//
+//   Bug D — gc_checkpoint flushes a non-empty WAL to pending/ under the WAL's
+//            existing ULID before minting the GC output ULIDs.  The WAL's ULID
+//            was assigned when the WAL was opened (before the mint), so the
+//            resulting pending segment has ULID < GC output ULIDs.  When that
+//            segment is drained to segments/ and crash-recovery rebuild runs,
+//            the GC output (higher ULID) wins for the affected LBAs, returning
+//            stale data.
+//            Fixed by minting all three ULIDs (repack, sweep, pending-segment)
+//            before flushing, so the flushed WAL segment gets a ULID > sweep.
+//            Covered by: gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery (below)
+//
+//   Note: a structurally similar scenario exists — segments already in pending/
+//         *before* gc_checkpoint is called also have ULIDs below the GC output
+//         and would cause the same crash-recovery ordering problem if drained
+//         after GC.  This is not a code bug: the coordinator tick always drains
+//         pending/ to segments/ (Upload, step 4) before running GC (step 5), so
+//         by the time gc_fork compacts segments/, every previously-pending
+//         segment is already an input.  The proptest enforces this invariant by
+//         draining pending/ inside GcSweep (before gc_checkpoint) rather than
+//         as a separate op.
 
 use std::fs;
 use std::sync::Arc;
@@ -292,6 +313,114 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     // returning D1 (stale) for lba=0.
     // With the fix: the WAL opened after gc_checkpoint has ULID > u_sweep, so
     // W3 sorts above the GC output and D2 (correct) is returned.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let got = vol.read(0, 1).expect("read lba=0 after crash");
+    assert_eq!(
+        got.as_slice(),
+        &d2,
+        "lba=0 should return D2 (latest write) after crash, not D1 (stale GC output)"
+    );
+}
+
+/// Regression test for Bug D: gc_checkpoint flushes a non-empty WAL to
+/// pending/ under the WAL's existing ULID, which was assigned before the GC
+/// output ULIDs were minted.  The resulting pending segment has ULID < GC
+/// output ULIDs.  After the segment is drained to segments/ and the volume
+/// crashes, rebuild processes segments in ULID order: the GC output (higher
+/// ULID) applies last and wins for the affected LBAs, returning stale data.
+///
+/// Sequence:
+///
+///   1. Write D0 to lba=0, flush → W1 in pending/.
+///   2. Write D1 to lba=0, flush → W2 in pending/.  H0 is now dead.
+///   3. Drain pending/ → segments/ = {W1, W2}.
+///   4. Write D2 to lba=0.  WAL is non-empty — do NOT flush.
+///   5. gc_checkpoint: BUG D — flushes WAL under its existing ULID (assigned
+///      before minting), so the pending segment has old_wal_ulid < u_sweep.
+///      gc_fork compacts W1+W2 → output u_sweep (H1 live, H0 dead).
+///      apply_gc_handoffs + apply_done_handoffs.
+///   6. Drain pending/ → segments/ = {u_sweep, old_wal_ulid}.
+///      old_wal_ulid < u_sweep: GC output sorts last and wins for lba=0.
+///   7. Crash — drop Volume and reopen from disk.
+///
+/// Without the fix: rebuild applies old_wal_ulid first (lba=0→D2), then
+/// u_sweep (lba=0→D1), so u_sweep wins → D1 (stale).
+/// With the fix (pre-mint u_wal): the WAL is flushed under u_wal > u_sweep,
+/// so it sorts after the GC output and wins → D2 (correct).
+#[test]
+fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    fs::create_dir_all(fork_dir.join("segments")).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    let d0 = [11u8; 4096];
+    let d1 = [22u8; 4096];
+    let d2 = [33u8; 4096];
+
+    // Steps 1-2: write D0 then D1 to lba=0 so H0 is dead and H1 is live.
+    vol.write(0, &d0).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(0, &d1).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Step 3: drain pending/ → segments/.
+    drain_pending(fork_dir);
+
+    // Step 4: write D2 to lba=0.  WAL is now non-empty.
+    // Intentionally NOT flushed — gc_checkpoint must flush it.
+    vol.write(0, &d2).unwrap();
+
+    // Step 5: gc_checkpoint with a non-empty WAL.
+    //
+    // BUG D is created here without the fix: gc_checkpoint calls
+    // flush_wal_to_pending(), which writes the WAL segment under its existing
+    // ULID (assigned when the WAL was opened, before the GC output ULIDs are
+    // minted).  After minting u_repack < u_sweep, the flushed segment has
+    // old_wal_ulid < u_sweep.  Any subsequent drain puts both in segments/
+    // with inverted ordering; on crash-recovery rebuild u_sweep wins → D1.
+    //
+    // With the fix: gc_checkpoint pre-mints u_repack < u_sweep < u_wal, then
+    // flushes the WAL under u_wal.  After drain and crash, u_wal > u_sweep so
+    // the WAL segment wins → D2.
+    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+
+    rt.block_on(gc_fork(
+        fork_dir,
+        "test-vol",
+        &store,
+        &gc_config,
+        &repack_ulid,
+        &sweep_ulid,
+    ))
+    .unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
+        .unwrap();
+
+    // Step 6: drain pending/ — the WAL segment flushed by gc_checkpoint lands
+    // in segments/ alongside the GC output.
+    drain_pending(fork_dir);
+
+    // Step 7: crash — drop Volume and reopen from disk.
     drop(vol);
     let vol = Volume::open(fork_dir, fork_dir).unwrap();
 

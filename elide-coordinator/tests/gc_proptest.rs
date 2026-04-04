@@ -35,9 +35,15 @@ enum SimOp {
     DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
     /// Flush the WAL to a pending/ segment.
     Flush,
-    /// Move all pending/ segments to segments/ (simulates S3 drain).
-    DrainLocal,
     /// Run the full real coordinator GC round-trip, then assert the oracle.
+    ///
+    /// Mirrors the coordinator tick order: drain pending/ → segments/ first
+    /// (Upload, step 4), then gc_checkpoint + gc_fork + apply (GC, step 5).
+    /// This ordering is an invariant of the production coordinator — GC always
+    /// runs after pending/ is empty — and is enforced here to keep the model
+    /// faithful.  Generating GcSweep before a drain would exercise a sequence
+    /// the coordinator never produces and masks a structurally distinct bug
+    /// (pre-existing pending segments with ULIDs below the GC output ULID).
     GcSweep,
 }
 
@@ -50,7 +56,6 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             seed
         }),
         Just(SimOp::Flush),
-        Just(SimOp::DrainLocal),
         Just(SimOp::GcSweep),
     ]
 }
@@ -114,7 +119,9 @@ proptest! {
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
                 }
-                SimOp::DrainLocal => {
+                SimOp::GcSweep => {
+                    // Drain pending/ → segments/ before gc_checkpoint, mirroring
+                    // the coordinator tick (Upload before GC).
                     let pending_dir = fork_dir.join("pending");
                     if let Ok(entries) = fs::read_dir(&pending_dir) {
                         for entry in entries.flatten() {
@@ -124,8 +131,7 @@ proptest! {
                             );
                         }
                     }
-                }
-                SimOp::GcSweep => {
+
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
                     let segs_before: usize = fs::read_dir(&segments_dir)
@@ -211,7 +217,9 @@ proptest! {
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
                 }
-                SimOp::DrainLocal => {
+                SimOp::GcSweep => {
+                    // Drain pending/ → segments/ before gc_checkpoint, mirroring
+                    // the coordinator tick (Upload before GC).
                     let pending_dir = fork_dir.join("pending");
                     let segments_dir = fork_dir.join("segments");
                     if let Ok(entries) = fs::read_dir(&pending_dir) {
@@ -222,12 +230,11 @@ proptest! {
                             );
                         }
                     }
-                }
-                SimOp::GcSweep => {
-                    // gc_checkpoint flushes the WAL and returns two ULIDs from
-                    // the volume's own mint.  Using these (not Ulid::new()) is
-                    // critical: the mint advances past both ULIDs so all future
-                    // WAL segments sort above the GC outputs on rebuild.
+
+                    // gc_checkpoint flushes the WAL under a pre-minted ULID
+                    // (u_wal > u_sweep) and returns (u_repack, u_sweep) from
+                    // the volume's own mint, so future WAL segments always sort
+                    // above GC outputs on rebuild.
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
                     // Step 1: real GC compaction (no-ops if nothing to compact).

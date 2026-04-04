@@ -4,9 +4,3 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-#
-# NOTE: the gc_oracle test is currently #[ignore] while bug B is being fixed
-# (see docs/testing.md).  Seeds are preserved here for when it is re-enabled.
-cc a2499f98fdb5997651bd4716edfd3f71c1c7abf72a8702a075f53f3348fda92d # shrinks to ops = [DedupWrite { lba_a: 3, lba_b: 5, seed: 0 }, Flush, Write { lba: 0, seed: 0 }, Flush, DrainLocal, Write { lba: 3, seed: 1 }, Flush, GcSweep, DrainLocal, GcSweep]
-cc 1e0d59e0fa314502dfae9337d84839525282e849f9bf4eaace887f5939061ab0 # shrinks to ops = [Write { lba: 0, seed: 193 }, DedupWrite { lba_a: 0, lba_b: 4, seed: 0 }, Flush, Write { lba: 0, seed: 0 }, Flush, DedupWrite { lba_a: 0, lba_b: 4, seed: 193 }, DrainLocal, GcSweep]
-cc 4edacc85432bb386115625cffea10af3e23cc9d3c9e5b0c8ab584a2103d8b78b # shrinks to ops = [DedupWrite { lba_a: 3, lba_b: 5, seed: 0 }, GcSweep, Write { lba: 0, seed: 0 }, Flush, DrainLocal, DedupWrite { lba_a: 3, lba_b: 6, seed: 1 }, Write { lba: 3, seed: 2 }, GcSweep, DrainLocal, GcSweep]
