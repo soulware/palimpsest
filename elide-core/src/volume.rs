@@ -102,6 +102,12 @@ const FLUSH_THRESHOLD: u64 = 32 * 1024 * 1024;
 /// `u32::MAX` rounded down to a 4 KiB boundary.
 const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
 
+/// Sentinel hash used in the LBA map and segment entries to represent an
+/// explicitly-zeroed LBA range. All-zero bytes cannot be a valid BLAKE3 output
+/// for any non-trivial input; finding a preimage would require breaking 256-bit
+/// hash preimage resistance.
+pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
+
 /// Results from a single compaction run.
 #[derive(Debug, Default)]
 pub struct CompactionStats {
@@ -403,28 +409,31 @@ impl Volume {
         Ok(())
     }
 
+    /// Zero `lba_count` blocks starting at `lba`.
+    ///
+    /// Appends a single ZERO WAL record covering the entire range — no hashing,
+    /// no data payload, no chunking. The LBA map entry uses `ZERO_HASH` as a
+    /// sentinel, which the read path recognises and short-circuits to return
+    /// zeros without any extent index lookup.
+    ///
+    /// Zero extents explicitly override ancestor data: a ZERO_HASH entry in the
+    /// LBA map masks any data at those LBAs in ancestor segments, unlike an
+    /// unwritten LBA range which falls through to the ancestor.
+    pub fn write_zeroes(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        self.wal.append_zero(start_lba, lba_count)?;
+        Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH);
+        self.pending_entries
+            .push(segment::SegmentEntry::new_zero(start_lba, lba_count));
+        Ok(())
+    }
+
     /// Trim (discard) `lba_count` blocks starting at `lba`.
     ///
-    /// Writes zeros to the given range using the normal write path so the
-    /// operation is crash-safe and benefits from dedup (all-zero extents share
-    /// the same hash).  This mirrors the lsvd reference implementation's
-    /// `ZeroBlocks` approach: TRIM is modelled as write-zeros, not as a map
-    /// deletion.
-    ///
-    /// Large ranges are chunked at `TRIM_CHUNK_LBAS` to stay within the segment
-    /// body-length limit.
+    /// Implemented via `write_zeroes` — a single zero-extent WAL record with no
+    /// data payload. The whole-volume TRIM issued by `mkfs.ext4` becomes one
+    /// ~40-byte record regardless of volume size.
     pub fn trim(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
-        const TRIM_CHUNK_LBAS: u32 = 1024; // 4 MB per chunk
-        let zeros = vec![0u8; TRIM_CHUNK_LBAS as usize * 4096];
-        let mut remaining = lba_count;
-        let mut lba = start_lba;
-        while remaining > 0 {
-            let chunk = remaining.min(TRIM_CHUNK_LBAS);
-            self.write(lba, &zeros[..chunk as usize * 4096])?;
-            lba += chunk as u64;
-            remaining -= chunk;
-        }
-        Ok(())
+        self.write_zeroes(start_lba, lba_count)
     }
 
     /// Read `lba_count` blocks (4096 bytes each) starting at `lba`.
@@ -492,10 +501,10 @@ impl Volume {
                     Err(e) => return Err(e),
                 };
 
-            // Dedup-refs have no body bytes; only count DATA entries.
+            // Dedup-refs and zero extents have no body bytes; only count DATA entries.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| !e.is_dedup_ref)
+                .filter(|e| !e.is_dedup_ref && !e.is_zero_extent)
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -505,7 +514,7 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| !e.is_dedup_ref && live.contains(&e.hash))
+                .filter(|e| !e.is_dedup_ref && !e.is_zero_extent && live.contains(&e.hash))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -515,6 +524,10 @@ impl Volume {
 
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
                 entries.drain(..).partition(|e| {
+                    if e.is_zero_extent {
+                        // Live if the LBA still maps to ZERO_HASH; dead if overwritten.
+                        return self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH);
+                    }
                     if e.is_dedup_ref {
                         return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
                     }
@@ -559,7 +572,7 @@ impl Volume {
                 stats.new_segments += 1;
 
                 for entry in &live_entries {
-                    if !entry.is_dedup_ref {
+                    if !entry.is_dedup_ref && !entry.is_zero_extent {
                         Arc::make_mut(&mut self.extent_index).insert(
                             entry.hash,
                             extentindex::ExtentLocation {
@@ -1382,6 +1395,11 @@ pub(crate) fn read_extents(
 
     let mut out = vec![0u8; lba_count as usize * 4096];
     for er in lbamap.extents_in_range(lba, lba + lba_count as u64) {
+        // Zero extents: output buffer is already zeroed; nothing to fetch.
+        if er.hash == ZERO_HASH {
+            continue;
+        }
+
         // Extract owned copies so the borrow of extent_index ends before
         // we mutate file_cache.
         let (segment_id, body_offset, body_length, compressed, body_section_start, entry_idx) = {
@@ -1862,6 +1880,13 @@ fn recover_wal(
                     hash, start_lba, lba_length,
                 ));
             }
+            writelog::LogRecord::Zero {
+                start_lba,
+                lba_length,
+            } => {
+                lbamap.insert(start_lba, lba_length, ZERO_HASH);
+                pending_entries.push(segment::SegmentEntry::new_zero(start_lba, lba_length));
+            }
         }
     }
 
@@ -2058,6 +2083,113 @@ mod tests {
         assert_eq!(data.len(), 4 * 4096);
         assert!(data.iter().all(|&b| b == 0));
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn write_zeroes_reads_back_as_zeros() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Write real data, then zero it out.
+        vol.write(0, &vec![0xabu8; 4096]).unwrap();
+        vol.write_zeroes(0, 4).unwrap();
+
+        let result = vol.read(0, 4).unwrap();
+        assert_eq!(result.len(), 4 * 4096);
+        assert!(result.iter().all(|&b| b == 0));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn write_zeroes_no_data_in_segment() {
+        // After write_zeroes + promote, the segment has a zero entry with no body bytes.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write_zeroes(0, 16).unwrap();
+        vol.flush_wal().unwrap();
+
+        let seg_path = segment::collect_segment_files(&base.join("pending"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("expected one pending segment");
+
+        let (_, entries) = segment::read_segment_index(&seg_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert!(e.is_zero_extent);
+        assert_eq!(e.stored_length, 0);
+        assert_eq!(e.start_lba, 0);
+        assert_eq!(e.lba_length, 16);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn write_after_zeroes_overrides() {
+        // Data written after write_zeroes should be readable.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write_zeroes(0, 4).unwrap();
+        let payload = vec![0x77u8; 4096];
+        vol.write(0, &payload).unwrap();
+
+        let result = vol.read(0, 1).unwrap();
+        assert_eq!(result, payload);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn write_zeroes_survives_wal_recovery() {
+        let base = keyed_temp_dir();
+
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.write_zeroes(5, 8).unwrap();
+            vol.fsync().unwrap();
+            // Drop without promoting — WAL remains.
+        }
+
+        // Reopen: WAL is replayed; zeroed range should read as zeros.
+        let vol = Volume::open(&base, &base).unwrap();
+        let result = vol.read(5, 8).unwrap();
+        assert!(result.iter().all(|&b| b == 0));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn write_zeroes_masks_ancestor_data() {
+        // An explicit zero in the child masks ancestor data at those LBAs.
+        let by_id = temp_dir();
+        let ancestor_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        write_test_keypair(&ancestor_dir);
+
+        // Write data in ancestor, promote, snapshot.
+        {
+            let mut vol = Volume::open(&ancestor_dir, &by_id).unwrap();
+            vol.write(0, &vec![0xbbu8; 4096]).unwrap();
+            vol.promote_for_test().unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        // Fork and zero the LBA in the child.
+        fork_volume(&child_dir, &ancestor_dir).unwrap();
+        let mut child_vol = Volume::open(&child_dir, &by_id).unwrap();
+        child_vol.write_zeroes(0, 1).unwrap();
+
+        let result = child_vol.read(0, 1).unwrap();
+        assert!(
+            result.iter().all(|&b| b == 0),
+            "zero extent should mask ancestor data"
+        );
+
+        fs::remove_dir_all(by_id).unwrap();
     }
 
     #[test]

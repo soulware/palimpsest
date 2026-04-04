@@ -47,12 +47,14 @@ const NBD_CMD_WRITE: u16 = 1;
 const NBD_CMD_DISC: u16 = 2;
 const NBD_CMD_FLUSH: u16 = 3;
 const NBD_CMD_TRIM: u16 = 4;
+const NBD_CMD_WRITE_ZEROES: u16 = 6;
 
 // Transmission flags
 const NBD_FLAG_HAS_FLAGS: u16 = 1;
 const NBD_FLAG_READ_ONLY: u16 = 2;
 const NBD_FLAG_SEND_FLUSH: u16 = 4;
 const NBD_FLAG_SEND_TRIM: u16 = 32;
+const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 64;
 
 // COW granularity — 4KB blocks
 const COW_BLOCK: u64 = 4096;
@@ -825,7 +827,8 @@ fn handle_volume_connection(
 
     let _client_flags = read_u32(&mut s)?;
 
-    let tx_flags: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM;
+    let tx_flags: u16 =
+        NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES;
 
     // Options loop
     loop {
@@ -969,18 +972,21 @@ fn handle_volume_connection(
                 }
             },
 
-            NBD_CMD_TRIM => {
+            NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
                 // Round inward to fully-covered 4096-byte blocks.
-                // Sub-block-aligned TRIM ranges are no-ops (the filesystem
-                // will rewrite those LBAs before reading them anyway).
+                // Sub-block-aligned ranges are no-ops (the filesystem will
+                // rewrite those LBAs before reading them anyway).
                 let start_lba = offset.div_ceil(4096);
                 let end_lba = (offset + length as u64) / 4096;
                 if end_lba > start_lba {
                     let lba_count = (end_lba - start_lba) as u32;
-                    match volume.trim(start_lba, lba_count) {
+                    match volume.write_zeroes(start_lba, lba_count) {
                         Ok(()) => tx_reply(&mut s, 0, handle)?,
                         Err(e) => {
-                            error!("[trim error offset={} len={}: {}]", offset, length, e);
+                            error!(
+                                "[write-zeroes error cmd={} offset={} len={}: {}]",
+                                cmd, offset, length, e
+                            );
                             tx_reply(&mut s, 5, handle)?; // EIO
                         }
                     }

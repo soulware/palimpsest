@@ -141,7 +141,7 @@ pub struct ExtentFetch {
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
 pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
-/// Size of a DEDUP_REF index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
+/// Size of a DEDUP_REF or ZERO index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
 const IDX_ENTRY_REF_LEN: u32 = 45;
 /// Size of a DATA index entry: above + stored_offset(8) + stored_length(4).
 const IDX_ENTRY_DATA_LEN: u32 = 57;
@@ -168,6 +168,8 @@ bitflags! {
         const COMPRESSED = 0x04;
         /// Extent data lives in an ancestor segment; no bytes in this segment's body.
         const DEDUP_REF  = 0x08;
+        /// Zero extent; hash field is ZERO_HASH; no bytes in this segment's body; reads as zeros.
+        const ZERO       = 0x10;
     }
 }
 
@@ -188,6 +190,8 @@ pub struct SegmentEntry {
     pub compressed: bool,
     /// True for dedup references (FLAG_DEDUP_REF). No bytes in this segment.
     pub is_dedup_ref: bool,
+    /// True for zero extents (FLAG_ZERO). No bytes in this segment; reads return zeros.
+    pub is_zero_extent: bool,
     /// True if extent bytes are in the inline section rather than the body.
     pub is_inline: bool,
     /// Section-relative byte offset. For body entries: offset within the body
@@ -223,6 +227,7 @@ impl SegmentEntry {
             lba_length,
             compressed: flags.contains(SegmentFlags::COMPRESSED),
             is_dedup_ref: false,
+            is_zero_extent: false,
             is_inline,
             stored_offset: 0, // filled by write_segment
             stored_length,
@@ -238,6 +243,23 @@ impl SegmentEntry {
             lba_length,
             compressed: false,
             is_dedup_ref: true,
+            is_zero_extent: false,
+            is_inline: false,
+            stored_offset: 0,
+            stored_length: 0,
+            data: Vec::new(),
+        }
+    }
+
+    /// Create a ZERO entry (no data payload — LBA range reads as zeros).
+    pub fn new_zero(start_lba: u64, lba_length: u32) -> Self {
+        Self {
+            hash: blake3::Hash::from_bytes([0u8; 32]),
+            start_lba,
+            lba_length,
+            compressed: false,
+            is_dedup_ref: false,
+            is_zero_extent: true,
             is_inline: false,
             stored_offset: 0,
             stored_length: 0,
@@ -306,7 +328,7 @@ pub fn write_segment(
     }
     // Body section: DATA extents only, raw bytes, no framing.
     for entry in entries.iter() {
-        if !entry.is_dedup_ref && !entry.is_inline {
+        if !entry.is_dedup_ref && !entry.is_zero_extent && !entry.is_inline {
             w.write_all(&entry.data)?;
         }
     }
@@ -325,7 +347,7 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
     let mut body_cursor: u64 = 0;
 
     for entry in entries.iter_mut() {
-        index_length += if entry.is_dedup_ref {
+        index_length += if entry.is_dedup_ref || entry.is_zero_extent {
             IDX_ENTRY_REF_LEN
         } else {
             IDX_ENTRY_DATA_LEN
@@ -334,7 +356,7 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
         if entry.is_inline {
             entry.stored_offset = inline_cursor;
             inline_cursor += entry.stored_length as u64;
-        } else if !entry.is_dedup_ref {
+        } else if !entry.is_dedup_ref && !entry.is_zero_extent {
             entry.stored_offset = body_cursor;
             body_cursor += entry.stored_length as u64;
         }
@@ -354,13 +376,16 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     if e.is_dedup_ref {
         flags |= SegmentFlags::DEDUP_REF;
     }
+    if e.is_zero_extent {
+        flags |= SegmentFlags::ZERO;
+    }
 
     w.write_all(e.hash.as_bytes())?;
     w.write_all(&e.start_lba.to_le_bytes())?;
     w.write_all(&e.lba_length.to_le_bytes())?;
     w.write_all(&[flags.bits()])?;
 
-    if !e.is_dedup_ref {
+    if !e.is_dedup_ref && !e.is_zero_extent {
         // Both inline and body entries store offset + length (in their respective sections).
         w.write_all(&e.stored_offset.to_le_bytes())?;
         w.write_all(&e.stored_length.to_le_bytes())?;
@@ -472,10 +497,11 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
         let flags = SegmentFlags::from_bits_retain(read_u8(data, &mut pos)?);
 
         let is_dedup_ref = flags.contains(SegmentFlags::DEDUP_REF);
+        let is_zero_extent = flags.contains(SegmentFlags::ZERO);
         let is_inline = flags.contains(SegmentFlags::INLINE);
         let compressed = flags.contains(SegmentFlags::COMPRESSED);
 
-        let (stored_offset, stored_length) = if is_dedup_ref {
+        let (stored_offset, stored_length) = if is_dedup_ref || is_zero_extent {
             (0u64, 0u32)
         } else {
             let off = u64::from_le_bytes(read_fixed(data, &mut pos)?);
@@ -489,6 +515,7 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
             lba_length,
             compressed,
             is_dedup_ref,
+            is_zero_extent,
             is_inline,
             stored_offset,
             stored_length,
@@ -516,7 +543,7 @@ pub fn read_extent_bodies(
     use std::io::{Read, Seek, SeekFrom};
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
-        if entry.is_dedup_ref || entry.is_inline {
+        if entry.is_dedup_ref || entry.is_zero_extent || entry.is_inline {
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;

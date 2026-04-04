@@ -38,14 +38,25 @@ enum PreOp {
 
 #[derive(Debug, Clone)]
 enum PostOp {
-    BaseWrite { lba: u8, seed: u8 },
+    BaseWrite {
+        lba: u8,
+        seed: u8,
+    },
     BaseFlush,
     BaseDrain,
-    ChildWrite { lba: u8, seed: u8 },
+    ChildWrite {
+        lba: u8,
+        seed: u8,
+    },
     ChildFlush,
     ChildDrain,
     ChildCrash,
     BaseCrash,
+    /// Zero an LBA in the child. Verifies that after ChildCrash the child
+    /// reads zeros even if the ancestor had data at that LBA.
+    ChildWriteZeroes {
+        lba: u8,
+    },
 }
 
 // --- strategies ---
@@ -72,6 +83,7 @@ fn arb_post_ops() -> impl Strategy<Value = Vec<PostOp>> {
             Just(PostOp::ChildDrain),
             Just(PostOp::ChildCrash),
             Just(PostOp::BaseCrash),
+            (0u8..8).prop_map(|lba| PostOp::ChildWriteZeroes { lba }),
         ],
         1..30,
     )
@@ -191,6 +203,14 @@ proptest! {
                             lba
                         );
                     }
+                }
+                PostOp::ChildWriteZeroes { lba } => {
+                    let _ = child.write_zeroes(*lba as u64, 1);
+                    // Record zeros in child_oracle — masks any ancestor data.
+                    child_oracle.insert(*lba as u64, [0u8; 4096]);
+                    // If this LBA was previously in the "must be zero" set from a
+                    // post-branch base write, the child now owns it explicitly.
+                    post_branch_base_lbas.remove(&(*lba as u64));
                 }
             }
         }

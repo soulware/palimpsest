@@ -201,7 +201,7 @@ impl VolumeActor {
                             lba_count,
                             reply,
                         } => {
-                            let result = self.volume.trim(start_lba, lba_count);
+                            let result = self.volume.write_zeroes(start_lba, lba_count);
                             if result.is_ok() {
                                 let (lbamap, extent_index) = self.volume.snapshot_maps();
                                 self.snapshot.store(Arc::new(ReadSnapshot {
@@ -354,11 +354,11 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Trim (discard) `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
+    /// Zero `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
     ///
-    /// Internally writes zeros to the given range so the operation is crash-safe
-    /// and appears in the segment history.  See [`Volume::trim`] for details.
-    pub fn trim(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+    /// Writes a single zero-extent WAL record — no hashing, no data payload.
+    /// See [`Volume::write_zeroes`] for details.
+    pub fn write_zeroes(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::Trim {
@@ -370,6 +370,11 @@ impl VolumeHandle {
         reply_rx
             .recv()
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Trim (discard) `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
+    pub fn trim(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        self.write_zeroes(start_lba, lba_count)
     }
 
     /// Flush the WAL to a pending segment.  Blocks until the actor replies.
