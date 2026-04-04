@@ -1,13 +1,44 @@
 # Testing
 
+## Test file conventions
+
+Each crate's `tests/` directory uses a two-suffix convention to separate test
+types:
+
+| Suffix | Purpose |
+|--------|---------|
+| `*_proptest.rs` | Proptest suites — random operation sequences, shrinking, regression seeds |
+| `*_test.rs` | Deterministic tests — fixed sequences, regression reproductions, scenario tests |
+
+Current inventory:
+
+```
+elide-core/tests/
+  volume_proptest.rs      proptest: crash-recovery oracle + ULID monotonicity
+  fork_proptest.rs        proptest: fork ancestry isolation oracle
+  actor_proptest.rs       proptest: actor-layer read-your-writes oracle
+  fork_test.rs            deterministic: fork ancestry fixed scenarios
+  gc_ordering_test.rs     deterministic: GC interleaving fixed scenarios
+  gc_index_test.rs        deterministic: GC index rebuild scenarios
+  readonly_volume_test.rs deterministic: ReadonlyVolume fixed scenarios
+  evict_test.rs           deterministic: segment eviction scenarios
+  concurrent_test.rs      deterministic: concurrent GC + reader ordering
+
+elide-coordinator/tests/
+  gc_proptest.rs          proptest: coordinator GC oracle (segment cleanup + data)
+  gc_test.rs              deterministic: coordinator GC regression reproductions
+```
+
+The split is enforced by naming, not by any framework mechanism.  When adding a
+new test file, pick the right suffix and add it to the inventory above.
+
 ## Property-based tests
 
 The correctness of the volume's crash-recovery model is verified with
 property-based tests using [proptest](https://proptest-rs.github.io/proptest/).
 The main suite lives in `elide-core/tests/volume_proptest.rs`; fork ancestry
-isolation is in `elide-core/tests/fork_proptest.rs`; deterministic integration
-tests for GC ordering and `ReadonlyVolume` live in `gc_ordering_test.rs` and
-`readonly_volume_test.rs` respectively.
+isolation is in `elide-core/tests/fork_proptest.rs`; coordinator GC correctness
+is in `elide-coordinator/tests/gc_proptest.rs`.
 
 Proptest generates random sequences of operations, runs them against the real
 volume implementation, and checks invariants after each relevant step.  When a
@@ -150,9 +181,71 @@ To add a new operation:
   visible? If yes, update the oracle.  Does it produce new segment files?  If
   yes, add a ULID ordering assertion.
 
-To increase confidence after a bug fix, add the minimal failing sequence as a
-deterministic regression test in `elide-core/src/volume.rs` before verifying
-that the proptest also passes.
+### Materializing proptest failures as deterministic tests
+
+When proptest finds a failure, the shrunk minimal sequence is the starting
+point for understanding the bug — not the end point.  The workflow is:
+
+1. **Reproduce** the shrunk sequence manually to confirm the failure mode.
+2. **Diagnose** the root cause.  Write it down as a comment before writing any
+   code.  If the root cause is not yet clear, keep tracing before touching the
+   implementation.
+3. **Write a named `#[test]`** that encodes the minimal sequence as a
+   deterministic test, with a comment block explaining the bug scenario, the
+   invariant violated, and what the fix does.  This test should *fail* on the
+   unfixed code and *pass* after the fix — confirming the fix is targeted.
+4. **Fix the bug**, verifying the deterministic test passes.
+5. **Re-run the full proptest** to confirm the original seed no longer fails and
+   no regressions were introduced.
+
+The deterministic test belongs in the same file as the proptest (or the nearest
+crate-level integration test file), not buried in unit tests.  Name it after
+the bug, not the mechanism: `gc_handoff_bug_b_dedup_ref_after_checkpoint` is
+more useful than `test_remove_hash_guard`.
+
+**Why both a deterministic test AND a proptest seed?**
+
+The proptest regression seed and the deterministic test serve different
+purposes and are not substitutes for each other:
+
+| | Proptest seed | Deterministic test |
+|---|---|---|
+| Replay the exact failure | ✓ | ✓ (explicit) |
+| Documents *why* the bug occurred | ✗ | ✓ |
+| Survives proptest version upgrades | fragile | ✓ |
+| Readable by a future contributor | ✗ | ✓ |
+| Drives design discussion before fix | ✗ | ✓ |
+
+The deterministic test is also a forcing function for understanding: you cannot
+write it without being able to state the bug mechanism precisely.  If you find
+yourself unable to write the test, that is a signal to keep diagnosing before
+fixing.
+
+**When to write a deterministic test:**
+
+Not every proptest failure warrants one.  Good candidates:
+
+- Bugs with a concurrency or ordering window that is hard to see from a seed
+  alone (e.g. "write between checkpoint and apply").
+- Bugs where the fix involves a non-obvious invariant that future readers
+  should understand without re-deriving it.
+- Any bug where the diagnosis required significant analysis — the analysis is
+  too valuable to leave only in a commit message.
+
+Simple data-shape bugs (off-by-one, missing branch) are usually fine with just
+the seed.
+
+**The test as a design surface:**
+
+Writing the deterministic test before the fix often surfaces design questions
+that are better resolved before code is written:
+
+- Is the fix in the right layer? (volume vs coordinator vs handoff protocol)
+- Does the fix handle all variants of the scenario?
+- Is there a simpler invariant that covers the case more broadly?
+
+Discuss these questions at the test-writing stage, not after the fix is
+already in place.
 
 ### Proptest regression files
 

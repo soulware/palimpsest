@@ -25,7 +25,6 @@ use elide_core::volume::Volume;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
-use ulid::Ulid;
 
 #[derive(Debug, Clone)]
 enum SimOp {
@@ -127,14 +126,11 @@ proptest! {
                     }
                 }
                 SimOp::GcSweep => {
-                    let _ = vol.flush_wal();
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
                     let segs_before: usize = fs::read_dir(&segments_dir)
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
-
-                    let sweep_ulid = Ulid::new().to_string();
-                    let repack_ulid = Ulid::new().to_string();
 
                     let gc_stats = rt.block_on(gc_fork(
                         fork_dir,
@@ -167,12 +163,7 @@ proptest! {
 
     /// GC oracle: after any sequence of writes + GC sweeps, every LBA that
     /// has ever been written reads back its last-written value.
-    ///
-    /// Currently ignored while a production bug it uncovered is being fixed.
-    /// See "Bugs found by the coordinator proptest" in docs/testing.md:
-    ///   Bug B — GC liveness view excludes unflushed WAL writes
     #[test]
-    #[ignore = "known bug B in apply_gc_handoffs — see docs/testing.md"]
     fn gc_oracle(ops in arb_sim_ops()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
@@ -233,15 +224,11 @@ proptest! {
                     }
                 }
                 SimOp::GcSweep => {
-                    // Flush the WAL before gc_fork, matching what gc_checkpoint()
-                    // does in production.  Without this, gc_fork's on-disk liveness
-                    // view diverges from the volume's in-memory lbamap: hashes that
-                    // are dead on disk but live in the WAL get incorrectly removed
-                    // from the extent index by apply_gc_handoffs.
-                    let _ = vol.flush_wal();
-
-                    let sweep_ulid = Ulid::new().to_string();
-                    let repack_ulid = Ulid::new().to_string();
+                    // gc_checkpoint flushes the WAL and returns two ULIDs from
+                    // the volume's own mint.  Using these (not Ulid::new()) is
+                    // critical: the mint advances past both ULIDs so all future
+                    // WAL segments sort above the GC outputs on rebuild.
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
                     // Step 1: real GC compaction (no-ops if nothing to compact).
                     let _ = rt.block_on(gc_fork(

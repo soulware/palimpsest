@@ -925,23 +925,69 @@ impl Volume {
                 }
             }
 
-            // Track which hashes are in the GC output so we can identify
-            // removed entries below.
+            // Read the (now volume-signed) compacted segment's index.  This
+            // is done once and reused for both the carried_hashes scan and the
+            // extent index update, avoiding a second signature verification.
+            let segment_index: Option<(u64, Vec<segment::SegmentEntry>)> = if segment_exists {
+                Some(segment::read_and_verify_segment_index(
+                    &gc_seg_path,
+                    &self.verifying_key,
+                )?)
+            } else {
+                None
+            };
+
+            // First pass: build carried_hashes WITHOUT touching the extent
+            // index.  We must know the full set before the Bug B check below,
+            // because the check must run before any extent index mutations —
+            // if we cancel mid-apply the index would be left in a partially
+            // updated state.
             let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
+            if let Some((_, ref entries)) = segment_index {
+                for e in entries {
+                    if !e.is_dedup_ref {
+                        carried_hashes.insert(e.hash);
+                    }
+                }
+            }
 
-            if segment_exists {
-                // Read the (now volume-signed) compacted segment's index for
-                // authoritative body_offset, body_length, and compressed values.
-                // The body is still in gc/ — the coordinator will move it to
-                // segments/ after upload.
-                let (body_section_start, entries) =
-                    segment::read_and_verify_segment_index(&gc_seg_path, &self.verifying_key)?;
+            // Bug B: a DEDUP_REF written after gc_checkpoint makes a hash H
+            // live again in the LBA map, but the coordinator's liveness view
+            // (built at gc_fork time) did not see it.  H is therefore absent
+            // from carried_hashes, yet deleting the old segment would
+            // permanently lose H's data — the extent index entry for H still
+            // points to the old segment, which apply_done_handoffs would
+            // delete.
+            //
+            // Detection: any hash in old_ulid_by_hash that is (a) not
+            // carried into the GC output and (b) still referenced by an LBA.
+            //
+            // Resolution: cancel this GC pass by deleting the .pending file
+            // (and the stale body if present) so gc_fork can re-run with
+            // current liveness data on the next tick.  The old segment
+            // remains until the corrected GC pass handles it safely.
+            //
+            // This check MUST precede any extent index mutations (second pass
+            // below) so there is nothing to undo if we cancel.
+            let live = self.lbamap.live_hashes();
+            let stale_liveness = old_ulid_by_hash
+                .keys()
+                .any(|hash| !carried_hashes.contains(hash) && live.contains(hash));
+            if stale_liveness {
+                let _ = fs::remove_file(entry.path()); // .pending
+                if gc_seg_path.try_exists()? {
+                    let _ = fs::remove_file(&gc_seg_path); // body
+                }
+                continue;
+            }
 
+            // Second pass: apply extent index updates for carried hashes.
+            // Safe to mutate the index now — stale_liveness was clear above.
+            if let Some((body_section_start, ref entries)) = segment_index {
                 for (i, e) in entries.iter().enumerate() {
                     if e.is_dedup_ref {
                         continue;
                     }
-                    carried_hashes.insert(e.hash);
                     // Only update if the extent index still points at the old
                     // segment that GC consumed.  If a newer write has
                     // superseded it, the current entry is more recent and must
@@ -977,6 +1023,11 @@ impl Volume {
             // be deleted.
             for (hash, old_ulid) in &old_ulid_by_hash {
                 if carried_hashes.contains(hash) {
+                    continue;
+                }
+                // Defense-in-depth: stale_liveness above ensures no live hash
+                // reaches this point, but guard here as well.
+                if live.contains(hash) {
                     continue;
                 }
                 if self
