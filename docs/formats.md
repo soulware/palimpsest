@@ -12,6 +12,8 @@ A single append-only file per in-progress segment, living at `wal/<ULID>`. One f
 
 **Magic header:** `ELIDWAL\x01` (8 bytes)
 
+**ZERO_HASH sentinel:** `[0x00; 32]` — 32 zero bytes. This is a reserved constant used in WAL and segment entries to represent a zero extent (see below). It is safe as a sentinel because finding a BLAKE3 preimage that produces all-zero output is computationally infeasible; no real extent hash will ever equal it.
+
 **Record types:**
 
 *DATA record* — a new extent with its payload:
@@ -32,9 +34,20 @@ lba_length  (u32 varint)
 flags       (u8)          FLAG_DEDUP_REF set; no further fields
 ```
 
+*ZERO record* — a zero extent; no data payload, maps an LBA range to zeros:
+```
+hash        (32 bytes)    ZERO_HASH ([0x00; 32])
+start_lba   (u64 varint)
+lba_length  (u32 varint)
+flags       (u8)          FLAG_ZERO set; no further fields
+```
+
+Zero extents differ from unwritten regions in one important way: an unwritten LBA range in a descendant falls through to the ancestor layer during LBA map reconstruction. A zero extent explicitly overrides the ancestor — any ancestor data at those LBAs is masked.
+
 **Flag bits:**
 - `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
 - `0x02` `FLAG_DEDUP_REF` — REF record; no data payload
+- `0x04` `FLAG_ZERO` — ZERO record; no data payload; hash field is ZERO_HASH
 
 **Flag namespace note:** WAL flag bits and segment index flag bits are **distinct namespaces with different values**. When promoting WAL records to segment entries, `recover_wal` must translate between them:
 
@@ -42,10 +55,11 @@ flags       (u8)          FLAG_DEDUP_REF set; no further fields
 |---|---|---|
 | `FLAG_COMPRESSED` | `0x01` | `0x04` |
 | `FLAG_DEDUP_REF` | `0x02` | `0x08` |
+| `FLAG_ZERO`      | `0x04` | `0x10` |
 
 The segment format also has `FLAG_INLINE` (`0x01`) and `FLAG_HAS_DELTAS` (`0x02`), which have no WAL equivalents. Never copy a WAL `flags` byte directly into a segment index entry.
 
-The hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the LBA map without re-reading or re-hashing the data.
+For DATA and REF records, the hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the LBA map without re-reading or re-hashing the data. ZERO records carry ZERO_HASH as a fixed sentinel — no hash computation is performed.
 
 ### Pre-log coalescing
 
@@ -59,7 +73,7 @@ write arrives → in-memory coalescing buffer
                count limit or fsync
                         │
                         ▼
-               hash → local dedup check → append_data / append_ref → bufio (OS buffer)
+               hash → local dedup check → append_data / append_ref / append_zero → bufio (OS buffer)
                         │
                     guest fsync
                         │
@@ -220,6 +234,7 @@ delta_offset  = 96 + index_length + inline_length + body_length
 - `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
 - `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
 - `0x08` `FLAG_DEDUP_REF` — extent data lives in an ancestor segment; no body in this segment
+- `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
@@ -239,7 +254,10 @@ For each extent:
   if FLAG_DEDUP_REF:
     (no body fields — data located via extent index lookup on hash)
 
-  if !FLAG_DEDUP_REF and !FLAG_INLINE:
+  if FLAG_ZERO:
+    (no body fields — hash is ZERO_HASH; reads return lba_length × 4096 zero bytes)
+
+  if !FLAG_DEDUP_REF and !FLAG_ZERO and !FLAG_INLINE:
     body_offset (8 bytes)   — byte offset within full body section (u64 le)
     body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
 
@@ -263,6 +281,8 @@ For each extent:
 `lba_length × 4096` always gives the uncompressed extent size. `body_length` / `inline_length` gives the stored (possibly compressed) size.
 
 **FLAG_DEDUP_REF entries** carry only the LBA mapping, sufficient for LBA map reconstruction at startup. The extent data is located via the extent index (`hash → ULID + body_offset`), populated from ancestor segment files at startup.
+
+**FLAG_ZERO entries** carry only the LBA mapping with ZERO_HASH. No extent index lookup is performed for these entries — the read path returns zeros directly. Zero entries must be present in the segment index (and in the serialised manifest) to correctly mask ancestor data; they are never omitted even though they have no body bytes.
 
 **FLAG_INLINE extents** store their full data in the inline section. Particularly effective for the boot path: small config files, scripts, and locale data appear frequently during boot and are naturally small. A warm-start client that fetches `[0, body_offset)` gets all inline extents with no further requests.
 
@@ -434,6 +454,7 @@ A packed bitset with one bit per index entry (entry N → bit N). Size: `ceil(en
 Entries that have no body bytes never need fetching and can be treated as implicitly present:
 - `FLAG_DEDUP_REF` — data lives in an ancestor segment; no bytes in this segment's body
 - `FLAG_INLINE` — data is in the inline section of `.idx`; no body fetch needed
+- `FLAG_ZERO` — zero extent; no bytes in this segment's body; reads return zeros directly
 
 All other entries (standard DATA entries with body bytes) start with their bit unset and are set when the extent is fetched and written to `.body`.
 

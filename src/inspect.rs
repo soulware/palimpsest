@@ -264,6 +264,7 @@ fn collect_wal_dir(dir: &Path) -> io::Result<Vec<WalInfo>> {
                         .map(|r| match r {
                             writelog::LogRecord::Data { lba_length, .. } => *lba_length as u64,
                             writelog::LogRecord::Ref { lba_length, .. } => *lba_length as u64,
+                            writelog::LogRecord::Zero { lba_length, .. } => *lba_length as u64,
                         })
                         .sum();
                     WalInfo {

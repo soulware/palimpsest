@@ -234,6 +234,12 @@ impl VolumeReader {
                         // Data lives in a segment already covered by rebuild above.
                         lbamap.insert(start_lba, lba_length, hash);
                     }
+                    writelog::LogRecord::Zero {
+                        start_lba,
+                        lba_length,
+                    } => {
+                        lbamap.insert(start_lba, lba_length, elide_core::volume::ZERO_HASH);
+                    }
                 }
             }
         }

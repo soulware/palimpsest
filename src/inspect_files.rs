@@ -198,6 +198,18 @@ pub fn inspect_wal(path: &Path) -> std::io::Result<()> {
                     "-",
                 );
             }
+            writelog::LogRecord::Zero {
+                start_lba,
+                lba_length,
+            } => {
+                println!(
+                    "{:<6}  {:<14}  {:>10}  {:>8}  -",
+                    "zero",
+                    format!("[{}+{})", start_lba, lba_length),
+                    "-",
+                    "-",
+                );
+            }
         }
     }
 

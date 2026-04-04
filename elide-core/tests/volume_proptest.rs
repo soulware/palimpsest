@@ -101,6 +101,13 @@ enum SimOp {
     /// DEDUP_REF pointing at lba_a's segment.  Guarantees the dedup and
     /// dead-REF paths are exercised on every run that includes this op.
     DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
+    /// Zero a single LBA.
+    ///
+    /// LBAs are in range 8..16 to stay disjoint from Write (0..8),
+    /// PopulateFetched (16..23), and ReadUnwritten (64). The oracle is
+    /// updated immediately with zeros; a subsequent Crash verifies the
+    /// zero survives WAL recovery and rebuild.
+    WriteZeroes { lba: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -121,6 +128,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_b,
             seed
         }),
+        (8u8..16).prop_map(|lba| SimOp::WriteZeroes { lba }),
     ]
 }
 
@@ -452,6 +460,11 @@ proptest! {
                     let _ = vol.write(*lba_a as u64, &data);
                     let _ = vol.write(*lba_b as u64, &data);
                 }
+                SimOp::WriteZeroes { lba } => {
+                    // write_zeroes appends to the WAL in-place; no new ULID file
+                    // is created, so no ULID ordering assertion is needed here.
+                    let _ = vol.write_zeroes(*lba as u64, 1);
+                }
             }
         }
     }
@@ -569,6 +582,11 @@ proptest! {
                     oracle.insert(*lba_a as u64, data);
                     oracle.insert(*lba_b as u64, data);
                 }
+                SimOp::WriteZeroes { lba } => {
+                    let _ = vol.write_zeroes(*lba as u64, 1);
+                    // Oracle records zeros; a subsequent Crash asserts they survive rebuild.
+                    oracle.insert(*lba as u64, [0u8; 4096]);
+                }
             }
         }
     }
@@ -674,6 +692,10 @@ proptest! {
                     let _ = vol.write(*lba_b as u64, &data);
                     oracle.insert(*lba_a as u64, data);
                     oracle.insert(*lba_b as u64, data);
+                }
+                SimOp::WriteZeroes { lba } => {
+                    let _ = vol.write_zeroes(*lba as u64, 1);
+                    oracle.insert(*lba as u64, [0u8; 4096]);
                 }
             }
         }

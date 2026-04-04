@@ -22,6 +22,12 @@
 //   start_lba   (u64 varint)
 //   lba_length  (u32 varint)
 //   flags       (u8)          FLAG_DEDUP_REF set; no further fields
+//
+// Record layout (ZERO, FLAG_ZERO set):
+//   hash        (32 bytes)    ZERO_HASH ([0x00; 32])
+//   start_lba   (u64 varint)
+//   lba_length  (u32 varint)
+//   flags       (u8)          FLAG_ZERO set; no further fields
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -43,6 +49,8 @@ bitflags! {
         const COMPRESSED = 0x01;
         /// No data payload; this LBA range maps to an existing extent identified by hash.
         const DEDUP_REF  = 0x02;
+        /// No data payload; this LBA range reads as zeros. Hash field is ZERO_HASH.
+        const ZERO       = 0x04;
     }
 }
 
@@ -68,6 +76,10 @@ pub enum LogRecord {
     },
     Ref {
         hash: blake3::Hash,
+        start_lba: u64,
+        lba_length: u32,
+    },
+    Zero {
         start_lba: u64,
         lba_length: u32,
     },
@@ -150,6 +162,20 @@ impl WriteLog {
         push_varint(&mut rec, start_lba);
         push_varint32(&mut rec, lba_length);
         rec.push(WalFlags::DEDUP_REF.bits());
+
+        self.write_all_bytes(&rec)
+    }
+
+    /// Append a zero-extent record. No data payload is written.
+    ///
+    /// The entire LBA range will read back as zeros. A single record can cover
+    /// the full volume — there is no chunking needed since there is no data body.
+    pub fn append_zero(&mut self, start_lba: u64, lba_length: u32) -> io::Result<()> {
+        let mut rec = Vec::with_capacity(32 + 10 + 5 + 1);
+        rec.extend_from_slice(&[0u8; 32]); // ZERO_HASH sentinel
+        push_varint(&mut rec, start_lba);
+        push_varint32(&mut rec, lba_length);
+        rec.push(WalFlags::ZERO.bits());
 
         self.write_all_bytes(&rec)
     }
@@ -248,6 +274,13 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     if flags.contains(WalFlags::DEDUP_REF) {
         return Ok(LogRecord::Ref {
             hash,
+            start_lba,
+            lba_length,
+        });
+    }
+
+    if flags.contains(WalFlags::ZERO) {
+        return Ok(LogRecord::Zero {
             start_lba,
             lba_length,
         });
@@ -565,6 +598,32 @@ mod tests {
 
         let err = scan(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn roundtrip_zero_record() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+
+        let mut wl = WriteLog::create(&path).unwrap();
+        wl.append_zero(256, 1024).unwrap();
+        wl.fsync().unwrap();
+        drop(wl);
+
+        let (records, _) = scan(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            LogRecord::Zero {
+                start_lba,
+                lba_length,
+            } => {
+                assert_eq!(*start_lba, 256);
+                assert_eq!(*lba_length, 1024);
+            }
+            _ => panic!("expected Zero record"),
+        }
 
         std::fs::remove_file(&path).unwrap();
     }

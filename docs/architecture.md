@@ -620,6 +620,8 @@ The kernel page cache sits above the block device and handles most hot reads. Th
 
 The **LBA map** is the live in-memory data structure mapping logical block addresses to content. It is a sorted structure (B-tree or equivalent) keyed by `start_LBA`, where each entry holds `(start_lba, lba_length, extent_hash)`. It is updated on every write (new entries added, existing entries trimmed or replaced for overwrites) and is the authoritative source for read path lookups.
 
+LBA ranges that have never been written are absent from the map and read as zeros. LBA ranges that have been explicitly zeroed (via TRIM or WRITE_ZEROES) are present in the map with the reserved `ZERO_HASH` sentinel (`[0x00; 32]`). The distinction matters for ancestry: an absent range falls through to the ancestor layer; a `ZERO_HASH` entry explicitly masks it. The read path checks for `ZERO_HASH` before doing any extent index lookup and returns zeros immediately.
+
 **Contrast with lab47/lsvd:** the reference implementation calls this `lba2pba` and maps `LBA → segment+offset` (physical location). GC repacking must update it for every moved extent. Palimpsest maps `LBA → hash` — the logical layer. Physical location (`hash → segment+offset`) is a separate extent index. This two-level indirection means GC repacking updates only the extent index; the LBA map is never rewritten for GC.
 
 **Layer merging:** a live volume's LBA map is the union of its own data and all ancestor layers. At startup, layers are merged oldest-first (root ancestor first, live node last), so later writes shadow earlier ones. This is the same model as the lsvd `lowers` array, encoded in the directory tree.
@@ -662,7 +664,7 @@ When persisted, the format is a binary flat file:
 | 4      | 4    | length     | extent length in 4KB blocks (u32 le) |
 | 12     | 32   | hash       | BLAKE3 extent hash                   |
 
-One entry per extent. Unwritten LBA ranges have no entry (implicitly zero).
+One entry per extent. Unwritten LBA ranges have no entry (implicitly zero). Explicitly zeroed LBA ranges appear as normal 44-byte entries with `ZERO_HASH` as the hash field — these are required to mask ancestor data in the ancestry walk and must be serialised even though they carry no body bytes.
 
 **Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the live LBA map, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised. The directory ancestry is the authoritative parent chain; `parent_id` in the manifest is a convenience field for S3 contexts where directory structure is not available.
 
@@ -840,8 +842,8 @@ Background promotes that fail (I/O error, disk full) are logged and do not crash
 | `NBD_CMD_WRITE` | 1 | Implemented | writes to WAL via actor |
 | `NBD_CMD_DISC` | 2 | Implemented | clean shutdown |
 | `NBD_CMD_FLUSH` | 3 | Implemented | promotes WAL to pending segment |
-| `NBD_CMD_TRIM` | 4 | Implemented | write-zeros path; see note below |
-| `NBD_CMD_WRITE_ZEROES` | 6 | Not implemented | see note below |
+| `NBD_CMD_TRIM` | 4 | Implemented | zero-extent path; see note below |
+| `NBD_CMD_WRITE_ZEROES` | 6 | Implemented | zero-extent path; same as TRIM |
 | `NBD_CMD_BLOCK_STATUS` | 7 | Not implemented | allows clients to query allocated vs sparse regions |
 | `NBD_CMD_RESIZE` | 8 | Not implemented | live resize; not needed without dynamic sizing |
 
@@ -853,15 +855,23 @@ Transmission flags advertised in the server's handshake:
 | `NBD_FLAG_SEND_FLUSH` | Advertised | client may send `NBD_CMD_FLUSH` |
 | `NBD_FLAG_READ_ONLY` | Advertised (conditional) | set when `--readonly` is passed |
 | `NBD_FLAG_SEND_TRIM` | Advertised | client may send `NBD_CMD_TRIM` |
-| `NBD_FLAG_SEND_WRITE_ZEROES` | Not advertised | `NBD_CMD_WRITE_ZEROES` not implemented |
+| `NBD_FLAG_SEND_WRITE_ZEROES` | Advertised | client may send `NBD_CMD_WRITE_ZEROES` |
 | `NBD_FLAG_SEND_FUA` | Not advertised | force-unit-access per write not implemented |
 | `NBD_FLAG_CAN_MULTI_CONN` | Not advertised | single connection only |
 
 Protocol options not negotiated during the option haggling phase: `NBD_OPT_STRUCTURED_REPLY`, `NBD_OPT_STARTTLS`.
 
-**TRIM and space reclamation:** `NBD_CMD_TRIM` is implemented as a write-zeros operation, mirroring the lsvd reference implementation's `ZeroBlocks` approach. When a filesystem (e.g. ext4) frees blocks, it issues TRIM for those LBAs; the volume writes zero-filled extents for the freed range via the normal write path. This is crash-safe, benefits from dedup (all-zero blocks share one hash), and makes those LBAs GC-eligible as soon as the zeros displace the old live data in the LBA map. Sub-block-aligned TRIM ranges are rounded inward to fully-covered 4096-byte blocks (ext4 only TRIMs on block boundaries in practice, so this edge case is theoretical).
+**TRIM and WRITE_ZEROES — zero-extent path:** `NBD_CMD_TRIM` and `NBD_CMD_WRITE_ZEROES` are both implemented via zero extents (see [formats.md](formats.md) — *ZERO record*). When a filesystem (e.g. ext4) frees blocks, it issues TRIM; `NBD_CMD_WRITE_ZEROES` is the write-command equivalent that explicitly requires the range to read back as zeros. Both routes to the same `Volume::write_zeroes()` call, which appends a single ZERO WAL record covering the entire range and inserts a `ZERO_HASH` entry into the LBA map.
 
-**`NBD_CMD_WRITE_ZEROES` (not yet implemented):** this command has the same effect as TRIM — zero a range — but it is a write command, not a discard command: the filesystem explicitly wants the range to read back as zeros after the operation. The correct implementation is the same write-zeros path already used for TRIM. The difference from TRIM is that `WRITE_ZEROES` requires the zeros to be durable; our write-zeros approach already satisfies this since it goes through the normal WAL path. Adding `WRITE_ZEROES` is a small extension: handle the command code (6), advertise `NBD_FLAG_SEND_WRITE_ZEROES`, and route to the same zero-fill logic. The `NO_HOLE` flag in `WRITE_ZEROES` requests (which asks the server not to punch a hole but to store actual zeros) is automatically satisfied by our write-zeros approach.
+Zero extents have no data payload — no hashing, no compression, no body bytes. A whole-device TRIM on a 20 GB volume writes a single ~40-byte WAL record. This is a significant improvement over the earlier approach of writing actual zero-filled extents via the normal write path (which required hashing the full volume worth of zero bytes).
+
+Zero extents in the LBA map explicitly override ancestor data: if a descendant volume trims a range that had data in the ancestor, the zero entry masks it — the read path returns zeros for that range without falling through to the ancestor. This is the key semantic difference from an unwritten LBA range.
+
+The read path checks `hash == ZERO_HASH` before doing any extent index lookup; if the LBA maps to ZERO_HASH, `lba_length × 4096` zero bytes are returned directly.
+
+Sub-block-aligned TRIM and WRITE_ZEROES ranges are rounded inward to fully-covered 4096-byte blocks (ext4 only operates on block boundaries in practice, so this edge case is theoretical). The `NO_HOLE` flag in `WRITE_ZEROES` requests — which asks the server not to punch a hole but to store durable zeros — is satisfied by design: zero extents are WAL-durable and read back as zeros unconditionally.
+
+**GC and zero extents:** zero entries have no body bytes, so they contribute 0 to a segment's stored-data size. However, they carry semantic weight: a live zero entry masks ancestor data. GC cannot use hash-based liveness for zero entries (ZERO_HASH is shared across all zero extents). Instead, a zero entry at `[X, X+N)` is live if the current LBA map maps any part of that range to ZERO_HASH; if it has been fully overwritten with real data, the zero entry is dead and is dropped during compaction. GC may also merge adjacent zero entries into a single entry to reduce index size.
 
 **Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
 
