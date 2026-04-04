@@ -64,11 +64,18 @@ The `object_store` crate is used for all store access, providing a uniform inter
 1. Read `pending/<ulid>` into memory
 2. PUT to object store at key `by_id/<volume_ulid>/YYYYMMDD/<segment_ulid>`
 3. On first drain: also PUT `by_id/<volume_ulid>/manifest.toml`, `by_id/<volume_ulid>/volume.pub`, and `names/<volume_name>` (idempotent; same content on every retry)
-4. On success: rename `pending/<ulid>` → `segments/<ulid>` (atomic commit)
-5. Write `index/<ulid>.idx` — header+index section of the just-renamed segment (S3-confirmation marker)
+4. Write `index/<ulid>.idx` — header+index section extracted from `pending/<ulid>` (S3-confirmation marker; written **before** rename)
+5. On success: rename `pending/<ulid>` → `segments/<ulid>` (atomic local commit)
 6. On failure at any step: leave in `pending/`, record error, continue with remaining segments
 
-The rename in step 4 is the local commit point. Step 5 writes the `index/` entry that marks this segment as S3-confirmed and allows safe eviction of the body. If the coordinator crashes between steps 4 and 5, `segments/<ulid>` exists but `index/<ulid>.idx` does not — the next drain tick retries (PUT is idempotent, rename is a no-op on an existing file, and `extract_idx` is re-run). No explicit ledger is needed.
+**Ordering invariant: `.idx` is written before rename.**  Steps 4 and 5 must happen in this order to ensure every file ever present in `segments/` has a corresponding `index/<ulid>.idx`.  This is the precondition for safe eviction: once a body is evicted from `segments/`, the only path back is `index/<ulid>.idx` → demand-fetch from S3.
+
+The crash recovery argument depends on this order:
+- Crash before step 4: file still in `pending/`, drain retries on next start ✓
+- Crash between steps 4 and 5: `.idx` written, file still in `pending/`, drain retries rename on next start (PUT and `extract_idx` are idempotent) ✓
+- Crash after step 5: both `.idx` and `segments/<ulid>` exist ✓
+
+If `.idx` were written **after** the rename (the previous incorrect ordering), a crash between rename and `.idx` write would leave `segments/<ulid>` stranded without `.idx`.  Drain only scans `pending/` for work, so it would never retry the `.idx` write.  A subsequent `volume evict` would then delete the body, making the data permanently inaccessible even though S3 still holds it.
 
 **Drain loop sequencing:** the coordinator's per-fork drain loop (`fork_loop`) runs the following steps sequentially on each tick:
 
@@ -129,7 +136,7 @@ Deletes all evictable segment files from `segments/` to reclaim local disk space
 
 Because `segments/<ulid>` is present only after confirmed S3 upload, every file in `segments/` is safe to evict (subject to the `index/<ulid>.idx` check below). In-progress GC handoffs keep their new output body in `gc/` until the coordinator completes the upload and moves it to `segments/` — evict never touches `gc/`.
 
-**Crash safety.**  Every file in `segments/` is structurally guaranteed to be S3-confirmed — the coordinator is the only process that moves bodies there, and does so only after upload and `index/` write.  Evict therefore has nothing special to do: it simply deletes the body file and the LBA map remains intact via `index/<ulid>.idx`.  After a crash+reopen, `Volume::open` rebuilds the LBA map from `index/*.idx`, and subsequent reads fall through to the `SegmentFetcher` for body bytes.
+**Crash safety.**  Every file in `segments/` is structurally guaranteed to be S3-confirmed — the coordinator is the only process that moves bodies there, and does so only after upload and `.idx` write (see Upload commit sequence above).  Evict therefore skips any `segments/<ulid>` body that has no corresponding `index/<ulid>.idx`; such a body cannot have been fully committed.  After a crash+reopen, `Volume::open` rebuilds the LBA map from `index/*.idx`, and subsequent reads fall through to the `SegmentFetcher` for body bytes.
 
 **S3 dependency after eviction.**  Before eviction, `segments/<ulid>` is
 redundant with S3 — that is why it is safe to delete.  After eviction,

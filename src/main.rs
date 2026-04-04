@@ -1037,10 +1037,25 @@ fn remote_pull(
 /// and `gc/` are never touched.
 fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
     let segments_dir = vol_dir.join("segments");
+    let index_dir = vol_dir.join("index");
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(&segments_dir) {
         for entry in entries {
-            std::fs::remove_file(entry?.path())?;
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(ulid_str) = name.to_str() else {
+                continue;
+            };
+            // Only evict bodies that have a corresponding index entry.
+            // A segment in segments/ without index/<ulid>.idx has not had its
+            // .idx written yet (drain crashed between rename and .idx write under
+            // the old ordering, or the .idx write itself failed). Evicting such
+            // a body would make the segment unreadable with no recovery path.
+            let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+            if !idx_path.try_exists()? {
+                continue;
+            }
+            std::fs::remove_file(entry.path())?;
             count += 1;
         }
     }
@@ -1149,20 +1164,28 @@ mod tests {
     fn evict_clean_state_removes_segments() {
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+
         write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA1");
         write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
+        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA1.idx"), b"idx").unwrap();
+        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx"), b"idx").unwrap();
 
         let n = evict_segments(&vol).unwrap();
 
         assert_eq!(n, 2);
         assert_eq!(fs::read_dir(vol.join("segments")).unwrap().count(), 0);
-        // index/*.idx is written by the coordinator after S3 upload, not by evict.
+        // index/*.idx entries survive eviction — they are the LBA map source.
     }
 
     #[test]
     fn evict_proceeds_with_pending_dir_nonempty() {
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+
         // pending/ has an unuploaded segment — evict should still proceed on
         // segments/ (those are S3-confirmed) and leave pending/ untouched.
         fs::write(
@@ -1171,6 +1194,7 @@ mod tests {
         )
         .unwrap();
         write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
+        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx"), b"idx").unwrap();
 
         let n = evict_segments(&vol).unwrap();
 
@@ -1189,13 +1213,16 @@ mod tests {
 
     #[test]
     fn evict_segments_deletes_all_in_segments_dir() {
-        // All files in segments/ are S3-confirmed by structural invariant; evict
-        // needs no GC protection logic and deletes everything unconditionally.
+        // All S3-confirmed segments (those with index/*.idx) are safe to evict.
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
 
         write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA1");
         write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
+        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA1.idx"), b"idx").unwrap();
+        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx"), b"idx").unwrap();
         // Even if a .pending GC handoff exists, those old inputs are already in
         // segments/ and are safe to evict — the .applied body is in gc/, not segments/.
         fs::write(
@@ -1216,6 +1243,36 @@ mod tests {
             !vol.join("segments")
                 .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn evict_segments_skips_segment_without_idx() {
+        // A segment in segments/ without a corresponding index/<ulid>.idx has not
+        // been S3-confirmed. Evicting it would make it permanently unreadable.
+        // evict_segments must skip such bodies and only count the confirmed one.
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+
+        let confirmed = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        let unconfirmed = "01AAAAAAAAAAAAAAAAAAAAAAA2";
+        write_seg(&vol, "segments", confirmed);
+        write_seg(&vol, "segments", unconfirmed);
+        // Only confirmed has an .idx entry.
+        fs::write(index_dir.join(format!("{confirmed}.idx")), b"idx").unwrap();
+
+        let n = evict_segments(&vol).unwrap();
+
+        assert_eq!(n, 1, "only the S3-confirmed segment should be evicted");
+        assert!(
+            !vol.join("segments").join(confirmed).exists(),
+            "confirmed segment should be removed"
+        );
+        assert!(
+            vol.join("segments").join(unconfirmed).exists(),
+            "unconfirmed segment must be preserved"
         );
     }
 

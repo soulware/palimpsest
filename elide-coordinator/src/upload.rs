@@ -11,9 +11,20 @@
 // Upload commit sequence per segment:
 //   1. Read pending/<ulid> into memory
 //   2. PUT to object store at the derived key
-//   3. On success: rename pending/<ulid> → segments/<ulid>
-//   4. Write index/<ulid>.idx (header+index section) — confirms S3 availability
+//   3. Write index/<ulid>.idx (header+index section) while file is still in pending/
+//   4. On success: rename pending/<ulid> → segments/<ulid>
 //   5. On failure: leave in pending/, record error, continue
+//
+// Crash safety:
+//   - Crash before step 3: file stays in pending/ with no .idx; drain retries from step 2.
+//   - Crash between steps 3 and 4: file in pending/ with .idx written; drain retries rename
+//     (idempotent) and skips .idx (already exists).
+//   - Crash after step 4: file in segments/ with .idx; segment is fully committed.
+//
+// Ordering invariant: .idx is written before rename. This means any segment body
+// that appears in segments/ is guaranteed to have a corresponding index/<ulid>.idx,
+// which in turn guarantees S3 availability. evict_segments relies on this invariant
+// to safely skip any body without an .idx.
 
 use std::path::Path;
 
@@ -298,19 +309,20 @@ async fn upload_segment(
         .await
         .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
 
+    // Write .idx before rename. Reading from path (still in pending/) so that
+    // a crash between .idx write and rename leaves the file in pending/ with
+    // its .idx — drain will retry the rename on the next tick. If the .idx
+    // already exists (crash-recovery retry), extract_idx is idempotent.
+    std::fs::create_dir_all(index_dir)
+        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
+    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+    elide_core::segment::extract_idx(path, &idx_path)
+        .with_context(|| format!("writing index/{ulid_str}.idx"))?;
+
     let dest = segments_dir.join(ulid_str);
     tokio::fs::rename(path, &dest)
         .await
         .with_context(|| format!("committing segment {ulid_str} to segments/"))?;
-
-    // Write index/<ulid>.idx after confirmed S3 upload. This is the signal
-    // that the segment is S3-backed and local body bytes are no longer needed
-    // for LBA map correctness. Idempotent: skipped if .idx already exists.
-    std::fs::create_dir_all(index_dir)
-        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
-    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-    elide_core::segment::extract_idx(&dest, &idx_path)
-        .with_context(|| format!("writing index/{ulid_str}.idx"))?;
 
     Ok(())
 }
