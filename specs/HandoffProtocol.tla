@@ -131,10 +131,42 @@
   the coordinator is the sole writer of segments/, and writes there only after
   upload.  This eliminates the need for eviction to inspect in-flight GC state.
 
+  RESTART-SAFETY INVARIANT (Bug E)
+  ---------------------------------
+  After a volume restart, the in-memory extent index is rebuilt from on-disk
+  .idx files.  If index/<old>.idx is still present (old_idx_present = TRUE),
+  sort_for_rebuild gives the old segment priority over gc/ bodies, so the
+  extent index reverts to pointing at the old segment ("old").  The coordinator
+  must not proceed with CoordCleanupIdx (which deletes the old segment) until
+  the volume has re-applied any .applied handoff and updated its extent index
+  to point to the new GC output.
+
+  This is modelled by:
+
+    1. VolumeRestart now resets extent[h] based on the on-disk .idx state:
+         extent[h] = "old" if old_idx_present (old .idx present → old wins)
+         extent[h] = "gc"  if ~old_idx_present ∧ h ∈ Carried (new .idx present)
+         extent[h] = "gone" if ~old_idx_present ∧ h ∈ Removed (removal in effect)
+         extent[h] = "new"  if a concurrent write superseded (always preserved)
+
+    2. VolumeApplyApplied(h): fires when vol_up ∧ handoff = "applied" ∧
+         extent[h] = "old".  Re-applies the handoff entry (idempotent via the
+         still_at_old guard), updating extent[h] to "gc" or "gone".
+
+    3. CoordCleanupIdx gains a guard: ∀ h ∈ Hashes : extent[h] ≠ "old".
+         The coordinator (in production: via apply_gc_handoffs IPC before
+         apply_done_handoffs) must wait until the volume has re-applied before
+         deleting old segments.
+
+  Without these changes, TLC would find a counterexample:
+    VolumeFinishApply → VolumeCrash → VolumeRestart (extent reset to "old")
+    → CoordCleanupIdx → CoordApplyDone (old_present = FALSE)
+    → NoSegmentNotFound violated: extent[h] = "old" ∧ ~old_present.
+
   WHAT WE CHECK
   -------------
   TLC exhaustively explores every reachable state — including all crash/restart
-  interleavings and concurrent writes — and verifies that the four safety
+  interleavings and concurrent writes — and verifies that the five safety
   invariants hold in all of them:
 
     NoSegmentNotFound             — the extent index never references a missing segment
@@ -143,10 +175,12 @@
     OldIdxOnlyPresentWhenSegmentPresent
                                   — index/<old>.idx is absent whenever the old S3 object
                                     is absent; no dangling index entries after GC cleanup
+    SegmentsOnlyAfterUpload       — segments/<new> is populated only after volume
+                                    acknowledgment (handoff ∈ {"applied", "done"})
 
-  The fourth invariant directly encodes the index file ordering fix: by gating
-  CoordApplyDone (S3 deletion) on ~old_idx_present (already deleted), TLC verifies
-  that no reachable state has old_idx_present = TRUE while old_present = FALSE.
+  The restart-safety modelling ensures TLC explores the Bug E scenario:
+  extent index reverts to "old" on restart → VolumeApplyApplied must fire →
+  CoordCleanupIdx can only proceed once all extents are updated.
 
   HOW TO READ THIS
   ----------------
@@ -302,11 +336,19 @@ CoordWritePending ==
   Precondition old_idx_present: this action is only needed while the old .idx
   has not yet been removed.  Once old_idx_present = FALSE the coordinator
   proceeds to CoordApplyDone.
+
+  Precondition ∀ h ∈ Hashes : extent[h] ≠ "old": the coordinator must not
+  delete the old segment until the volume's extent index no longer references
+  it.  In production the coordinator calls apply_gc_handoffs IPC before
+  apply_done_handoffs; this guard models that synchronisation point.  Without
+  it, a volume restart (which resets extent to "old") followed immediately by
+  CoordCleanupIdx → CoordApplyDone would violate NoSegmentNotFound.
 *)
 CoordCleanupIdx ==
   /\ coord_up
   /\ handoff = "applied"
   /\ old_idx_present                       \* guard: .idx not yet removed
+  /\ \A h \in Hashes : extent[h] # "old"  \* guard: volume extent index up-to-date
   /\ old_idx_present'  = FALSE             \* delete index/<old>.idx (Step 3d)
   /\ gc_seg_present'   = FALSE             \* gc/ body moved to segments/ (Step 3c)
   /\ gc_seg_signed'    = FALSE             \* body no longer in gc/
@@ -323,8 +365,9 @@ CoordCleanupIdx ==
   is gone.
 
   After this action old_present = FALSE and handoff = "done".  The old segment
-  no longer exists anywhere; no extent entry points to "old" (VolumeFinishApply
-  guarantees all entries are "gc", "gone", or "new" before .applied is written).
+  no longer exists anywhere; no extent entry points to "old" (CoordCleanupIdx
+  is gated on ∀ h : extent[h] ≠ "old", and VolumeApplyApplied handles the
+  restart path where extent was reset to "old" by VolumeRestart).
 
   For tombstone handoffs (Carried = {}, Removed = {}) all Hashes = {} so no
   extent entries exist; old_present = FALSE is the only state change.
@@ -465,10 +508,61 @@ VolumeCrash ==
   /\ vol_up' = FALSE
   /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
 
+(*
+  On restart the volume rebuilds its in-memory extent index from on-disk .idx
+  files.  The rebuild priority is: gc/ bodies first (lower priority), then
+  segments/ (higher priority, wins).  index/*.idx files are consulted to find
+  which segment owns each hash.
+
+  If old_idx_present = TRUE: index/<old>.idx is on disk → the old segment wins
+  the rebuild → extent[h] reverts to "old" (as if VolumeApplyCarried never ran).
+  If old_idx_present = FALSE: CoordCleanupIdx has already removed the old .idx
+  and (for repack handoffs) written index/<new>.idx and moved the body to
+  segments/.  The new segment wins the rebuild:
+    - Carried hashes: extent[h] = "gc" (pointing at the new GC output)
+    - Removed hashes: extent[h] = "gone" (removal was already in effect)
+
+  Concurrent-write entries ("new") survive restart: the write that created
+  "new" is in a WAL or segment file that persists on disk.
+
+  This models the Bug E class: after restart, if old_idx_present = TRUE,
+  the extent index is stale.  The volume must re-apply any .applied handoffs
+  (VolumeApplyApplied) before the coordinator can proceed with CoordCleanupIdx.
+*)
 VolumeRestart ==
   /\ ~vol_up
   /\ vol_up' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
+  /\ extent' = [h \in Hashes |->
+                  IF extent[h] = "new" THEN "new"
+                  ELSE IF old_idx_present THEN "old"
+                  ELSE IF h \in Carried    THEN "gc"
+                  ELSE                         "gone"]
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
+
+(*
+  Step 2 (re-apply, restart path): Volume re-applies a single carried or
+  removed entry from a .applied handoff file.
+
+  This fires when the volume restarts and finds a .applied handoff: the extent
+  index has been rebuilt to "old" (from .idx files), but the handoff has already
+  been committed.  The volume re-applies the entry idempotently using the same
+  still_at_old guard as VolumeApplyCarried / VolumeApplyRemoved.
+
+  No re-signing or rename is needed: the body is already volume-signed (done
+  before the .pending → .applied rename in the original session), and the file
+  is already .applied.
+
+  In production this is triggered by apply_gc_handoffs processing .applied files,
+  which the coordinator calls (via IPC) before apply_done_handoffs on every GC
+  tick (including the first tick after restart).
+*)
+VolumeApplyApplied(h) ==
+  /\ vol_up
+  /\ handoff = "applied"
+  /\ h \in Hashes
+  /\ extent[h] = "old"
+  /\ extent' = [extent EXCEPT ![h] = IF h \in Carried THEN "gc" ELSE "gone"]
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Environment: concurrent writes
@@ -519,6 +613,7 @@ Next ==
   \/ VolumeFinishApply
   \/ VolumeCrash
   \/ VolumeRestart
+  \/ \E h \in Hashes  : VolumeApplyApplied(h)
   \/ \E h \in Hashes  : NewerWrite(h)
 
 (*
@@ -536,7 +631,7 @@ Next ==
   fire", which is exactly what we want for restart.
 
   SF_vars(progress): Progress actions (WritePending, CleanupIdx, ApplyDone,
-  ReSigns, Apply*, Finish) require the actor to be UP.  A crash can interrupt
+  ReSigns, Apply*, ApplyApplied, Finish) require the actor to be UP.  A crash can interrupt
   them at any moment, so they are never continuously enabled in a trace with
   unbounded crashes.  Weak fairness would never fire.  Strong fairness fires
   whenever an action is enabled *infinitely often* — even intermittently.
@@ -565,6 +660,7 @@ Spec ==
   /\ SF_vars(\E h \in Carried : VolumeApplyCarried(h))
   /\ SF_vars(\E h \in Removed : VolumeApplyRemoved(h))
   /\ SF_vars(VolumeFinishApply)
+  /\ SF_vars(\E h \in Hashes  : VolumeApplyApplied(h))
 
 \* ---------------------------------------------------------------------------
 \* Safety invariants
