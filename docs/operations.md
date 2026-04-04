@@ -424,7 +424,14 @@ Each handoff file in `gc/` progresses through three states, represented by the t
 
 Old local `segments/<old-ulid>` files are left in place until step 4. They remain readable by the volume until then; after deletion reads route to the new segment via the patched extent index (for carried entries) or fail-fast on dangling references that have been cleaned (for removed entries).
 
-This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read on next tick and the appropriate step retried. No data is lost.
+**Restart safety invariant:** The volume's in-memory extent index must reflect any committed GC handoff *before* `apply_done_handoffs` deletes the old segment.  In the steady state the actor's idle tick handles this (calls `apply_gc_handoffs` every 10 seconds, well before the next GC tick at ~35 seconds).  After a restart the extent index is rebuilt from on-disk `.idx` files, which still point to old segments because their `.idx` files are present until `apply_done_handoffs` removes them.  To close this gap:
+
+1. `apply_gc_handoffs` processes both `.pending` *and* `.applied` handoff files.  For `.applied` files it re-applies the extent index updates (using the same `still_at_old` idempotency check) without re-signing or renaming — the `.applied` state means the decision is already committed.
+2. The coordinator daemon calls `apply_gc_handoffs` (IPC) immediately before `apply_done_handoffs` on every GC tick.  This guarantees the volume's extent index is consistent before old segments are deleted, regardless of restart timing.
+
+In the common case (no restart) the IPC call is a fast no-op — `apply_gc_handoffs` scans `gc/` for `.pending`/`.applied` files and returns 0 immediately if none exist.
+
+**Crash-safety:** if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read on next tick and the appropriate step retried. No data is lost.
 
 **Coordinator deletion invariant — no segment is ever deleted without the volume's acknowledgment:**
 

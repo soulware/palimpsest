@@ -405,6 +405,22 @@ async fn fork_loop(
                 continue;
             };
 
+            // Ensure the volume's in-memory extent index reflects any committed
+            // (.applied) GC handoffs before we delete the old segments.  This is
+            // the restart-safety guard: after a restart the volume rebuilds its
+            // extent index from .idx files (which still point to old segments),
+            // so apply_gc_handoffs must run before apply_done_handoffs removes
+            // those segments.  In the steady state (no restart) the actor's
+            // idle tick has already called apply_gc_handoffs; this call is a
+            // fast no-op (returns 0) in that case.
+            let handoffs_applied = control::apply_gc_handoffs(&fork_dir).await;
+            if handoffs_applied > 0 {
+                info!(
+                    "[gc {volume_id}] re-applied {handoffs_applied} GC handoff(s) \
+                     after restart"
+                );
+            }
+
             // Process any handoffs the volume has acknowledged (.applied) before
             // running a new pass, so old segments are removed from the index first.
             match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {

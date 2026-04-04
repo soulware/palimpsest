@@ -28,6 +28,10 @@
 //     Flush WAL and return two ULIDs for GC output segments.
 //     Returns "ok <repack_ulid> <sweep_ulid>".
 //
+//   apply_gc_handoffs
+//     Apply any pending or applied GC handoffs (updates in-memory extent index).
+//     Returns "ok <n>" where n is the number of handoffs processed.
+//
 //   shutdown
 //     Flush WAL and exit cleanly.  Returns "ok" then terminates the process.
 //     The supervisor restarts the volume, picking up any updated config files.
@@ -136,6 +140,15 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
         match handle.gc_checkpoint() {
             Ok((u1, u2)) => {
                 let _ = writeln!(writer, "ok {u1} {u2}");
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        }
+    } else if line == "apply_gc_handoffs" {
+        match handle.apply_gc_handoffs() {
+            Ok(n) => {
+                let _ = writeln!(writer, "ok {n}");
             }
             Err(e) => {
                 let _ = writeln!(writer, "err {e}");

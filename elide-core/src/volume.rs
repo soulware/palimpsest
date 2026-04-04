@@ -853,11 +853,23 @@ impl Volume {
     /// volume-signed files, so `extentindex::rebuild` never needs to skip
     /// signature verification for in-transit coordinator output.
     ///
-    /// Idempotent and crash-safe: if the process is killed after writing
-    /// `segments/<new-ulid>` but before deleting `gc/<new-ulid>`, the re-sign
-    /// runs again on the next call and overwrites with identical content.
+    /// Apply GC handoff files from `gc/`, covering both `.pending` and `.applied` states.
     ///
-    /// Returns the number of handoff files applied.  Returns `Ok(0)` if the
+    /// **`.pending` handoffs** (normal path):
+    /// Re-signs the coordinator-staged segment body with the volume key, applies
+    /// extent index updates, then renames the file to `.applied` to signal the
+    /// coordinator that it is safe to delete the old segments.
+    ///
+    /// **`.applied` handoffs** (restart-safety path):
+    /// Re-applies extent index updates without re-signing or renaming.  This is
+    /// necessary after a process restart: `Volume::open` rebuilds the extent index
+    /// from on-disk `.idx` files, which still point to the old segment (old `.idx`
+    /// is present until `apply_done_handoffs` deletes it).  A `.applied` handoff
+    /// represents a committed GC decision — the extent index must reflect it before
+    /// `apply_done_handoffs` deletes the old segment.  The `still_at_old` check
+    /// makes this re-application idempotent.
+    ///
+    /// Returns the number of handoff files processed.  Returns `Ok(0)` if the
     /// `gc/` directory does not exist yet (coordinator has not run).
     pub fn apply_gc_handoffs(&mut self) -> io::Result<usize> {
         let gc_dir = self.base_dir.join("gc");
@@ -871,7 +883,12 @@ impl Volume {
                 e.file_name()
                     .to_str()
                     .and_then(crate::gc::GcHandoff::from_filename)
-                    .is_some_and(|h| matches!(h.state, crate::gc::GcHandoffState::Pending))
+                    .is_some_and(|h| {
+                        matches!(
+                            h.state,
+                            crate::gc::GcHandoffState::Pending | crate::gc::GcHandoffState::Applied
+                        )
+                    })
             })
             .collect();
 
@@ -892,8 +909,9 @@ impl Volume {
             let handoff = crate::gc::GcHandoff::from_filename(name)
                 .ok_or_else(|| io::Error::other(format!("invalid gc filename: {name}")))?;
             let new_ulid = handoff.ulid.to_string();
+            let is_already_applied = matches!(handoff.state, crate::gc::GcHandoffState::Applied);
 
-            // Parse the .pending file into typed HandoffLines.
+            // Parse the .pending / .applied file into typed HandoffLines.
             //
             // old_ulid_by_hash maps each hash to the old segment it came from
             // so the extent index can be updated only when it still points at
@@ -925,7 +943,9 @@ impl Volume {
             // Idempotency: re-signing is a pure function of the segment content;
             // if we crash mid-rename and retry, the output is identical.
             let gc_seg_path = gc_dir.join(&new_ulid);
-            if gc_seg_path.try_exists()? {
+            // .pending handoffs: re-sign the coordinator-staged body with the volume key.
+            // .applied handoffs: already volume-signed; skip re-signing.
+            if !is_already_applied && gc_seg_path.try_exists()? {
                 let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
                 segment::read_extent_bodies(&gc_seg_path, bss, &mut entries)?;
                 let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
@@ -933,7 +953,21 @@ impl Volume {
                 fs::rename(&tmp_path, &gc_seg_path)?;
             }
 
-            let segment_exists = gc_seg_path.try_exists()?;
+            // Locate the body: normally in gc/; after a restart with a partial
+            // apply_done_handoffs run, it may have already been moved to segments/.
+            let body_path: Option<std::path::PathBuf> = if gc_seg_path.try_exists()? {
+                Some(gc_seg_path.clone())
+            } else if is_already_applied {
+                let seg_path = self.base_dir.join("segments").join(&new_ulid);
+                if seg_path.try_exists()? {
+                    Some(seg_path)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let segment_exists = body_path.is_some();
 
             // If the new segment doesn't exist locally, only some handoff
             // types can proceed without it:
@@ -956,14 +990,15 @@ impl Volume {
             // Read the (now volume-signed) compacted segment's index.  This
             // is done once and reused for both the carried_hashes scan and the
             // extent index update, avoiding a second signature verification.
-            let segment_index: Option<(u64, Vec<segment::SegmentEntry>)> = if segment_exists {
-                Some(segment::read_and_verify_segment_index(
-                    &gc_seg_path,
-                    &self.verifying_key,
-                )?)
-            } else {
-                None
-            };
+            let segment_index: Option<(u64, Vec<segment::SegmentEntry>)> =
+                if let Some(ref bp) = body_path {
+                    Some(segment::read_and_verify_segment_index(
+                        bp,
+                        &self.verifying_key,
+                    )?)
+                } else {
+                    None
+                };
 
             // First pass: build carried_hashes WITHOUT touching the extent
             // index.  We must know the full set before the Bug B check below,
@@ -997,16 +1032,24 @@ impl Volume {
             //
             // This check MUST precede any extent index mutations (second pass
             // below) so there is nothing to undo if we cancel.
+            //
+            // For .applied handoffs: skip this check.  The stale-liveness
+            // detection already ran (and passed) before the .applied marker
+            // was created.  Re-running it after a restart would incorrectly
+            // cancel a committed handoff — the .applied state means the volume
+            // already acknowledged that deleting the old segment is safe.
             let live = self.lbamap.live_hashes();
-            let stale_liveness = old_ulid_by_hash
-                .keys()
-                .any(|hash| !carried_hashes.contains(hash) && live.contains(hash));
-            if stale_liveness {
-                let _ = fs::remove_file(entry.path()); // .pending
-                if gc_seg_path.try_exists()? {
-                    let _ = fs::remove_file(&gc_seg_path); // body
+            if !is_already_applied {
+                let stale_liveness = old_ulid_by_hash
+                    .keys()
+                    .any(|hash| !carried_hashes.contains(hash) && live.contains(hash));
+                if stale_liveness {
+                    let _ = fs::remove_file(entry.path()); // .pending
+                    if gc_seg_path.try_exists()? {
+                        let _ = fs::remove_file(&gc_seg_path); // body
+                    }
+                    continue;
                 }
-                continue;
             }
 
             // Second pass: apply extent index updates for carried hashes.
@@ -1067,14 +1110,17 @@ impl Volume {
                 }
             }
 
-            // Rename to .applied — signals the coordinator it is safe to delete
-            // superseded S3 objects.
-            let applied_path = gc_dir.join(
-                handoff
-                    .with_state(crate::gc::GcHandoffState::Applied)
-                    .filename(),
-            );
-            fs::rename(entry.path(), &applied_path)?;
+            // For .pending handoffs: rename to .applied — signals the coordinator
+            // it is safe to delete superseded S3 objects.
+            // For .applied handoffs: already in the correct state; no rename needed.
+            if !is_already_applied {
+                let applied_path = gc_dir.join(
+                    handoff
+                        .with_state(crate::gc::GcHandoffState::Applied)
+                        .filename(),
+                );
+                fs::rename(entry.path(), &applied_path)?;
+            }
 
             count += 1;
         }

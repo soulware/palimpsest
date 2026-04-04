@@ -40,6 +40,21 @@
 //            before flushing, so the flushed WAL segment gets a ULID > sweep.
 //            Covered by: gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery (below)
 //
+//   Bug E — GC restart-safety gap: apply_gc_handoffs only processed .pending
+//            files, not .applied files.  After a coordinator/volume restart the
+//            volume rebuilds its extent index from .idx files (pointing to old
+//            segments).  If apply_done_handoffs then deletes the old segment
+//            before apply_gc_handoffs has re-applied the .applied handoff, the
+//            extent index becomes stale and all reads for the affected hashes
+//            fail with "segment not found".
+//            Fixed by:
+//              1. apply_gc_handoffs now also processes .applied files (re-applies
+//                 extent index updates idempotently, skips re-signing/rename).
+//              2. The coordinator daemon calls apply_gc_handoffs (IPC) immediately
+//                 before apply_done_handoffs on every GC tick, guaranteeing the
+//                 volume's extent index is consistent before old segments are deleted.
+//            Covered by: gc_restart_safety_applied_handoff (below)
+//
 //   Note: a structurally similar scenario exists — segments already in pending/
 //         *before* gc_checkpoint is called also have ULIDs below the GC output
 //         and would cause the same crash-recovery ordering problem if drained
@@ -155,12 +170,21 @@ fn make_gc_config() -> GcConfig {
     }
 }
 
+/// Move all files from pending/ → segments/, writing index/<ulid>.idx before
+/// each rename so the invariant "index/<ulid>.idx present → segment in S3" is
+/// upheld (mirroring what upload::drain_pending does in production).
 fn drain_pending(fork_dir: &std::path::Path) {
     let pending_dir = fork_dir.join("pending");
     let segments_dir = fork_dir.join("segments");
+    let index_dir = fork_dir.join("index");
+    fs::create_dir_all(&index_dir).unwrap();
     if let Ok(entries) = fs::read_dir(&pending_dir) {
         for entry in entries.flatten() {
-            let _ = fs::rename(entry.path(), segments_dir.join(entry.file_name()));
+            let name = entry.file_name();
+            let src = entry.path();
+            let idx_path = index_dir.join(format!("{}.idx", name.to_string_lossy()));
+            let _ = elide_core::segment::extract_idx(&src, &idx_path);
+            let _ = fs::rename(src, segments_dir.join(name));
         }
     }
 }
@@ -639,4 +663,124 @@ fn drain_failure_skips_gc_and_data_survives() {
     assert_eq!(got0.as_slice(), &d1, "lba=0 should return D1 after GC");
     let got1 = vol.read(1, 1).expect("read lba=1 after recovery");
     assert_eq!(got1.as_slice(), &d0, "lba=1 should return D0 after GC");
+}
+
+/// Regression test for Bug E: GC restart-safety gap.
+///
+/// `apply_gc_handoffs` previously only processed `.pending` files.  After a
+/// coordinator/volume restart the volume rebuilds its extent index from on-disk
+/// `.idx` files, which still point to the old segment (the old `.idx` is present
+/// until `apply_done_handoffs` deletes it).  When `apply_done_handoffs` then
+/// deletes the old segment, reads fail with "segment not found" because the
+/// extent index was never updated to point to the new GC output.
+///
+/// Sequence that exposes the bug:
+///
+///   1. Write D0 to lba=0 and D1 to lba=1, flush, drain → old segment S1.
+///   2. Overwrite lba=0 with D2, flush, drain → old segment S2.
+///   3. gc_checkpoint + gc_fork → gc/<new>.pending (S1 and S2 compacted).
+///   4. vol.apply_gc_handoffs() → gc/<new>.applied; extent index updated to
+///      point to new segment in this Volume instance.
+///   5. [RESTART] — drop Volume and reopen.  Extent index rebuilt from
+///      index/*.idx (old segments S1, S2 still have .idx files).
+///      apply_gc_handoffs() returns 0 (only saw .pending, not .applied).
+///   6. apply_done_handoffs() — deletes S1, S2 (bodies and .idx files),
+///      moves gc/<new> → segments/<new>.
+///   7. Without fix: reads fail — extent index → S1 → deleted → "not found".
+///      With fix: apply_gc_handoffs re-applies the .applied handoff → extent
+///      index → new segment → reads succeed.
+#[test]
+fn gc_restart_safety_applied_handoff() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    fs::create_dir_all(fork_dir.join("segments")).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    let d0 = [11u8; 4096];
+    let d1 = [22u8; 4096];
+    let d2 = [33u8; 4096];
+
+    // Step 1: write D0 to lba=0 and D1 to lba=1, flush, drain.
+    vol.write(0, &d0).unwrap();
+    vol.write(1, &d1).unwrap();
+    vol.flush_wal().unwrap();
+    drain_pending(fork_dir);
+
+    // Step 2: overwrite lba=0 with D2, flush, drain.  D0's hash is now dead.
+    vol.write(0, &d2).unwrap();
+    vol.flush_wal().unwrap();
+    drain_pending(fork_dir);
+
+    // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork compacts the two
+    // input segments into one GC output in gc/<new>.pending.
+    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+    rt.block_on(gc_fork(
+        fork_dir,
+        "test-vol",
+        &store,
+        &gc_config,
+        &repack_ulid,
+        &sweep_ulid,
+    ))
+    .unwrap();
+
+    // Step 4: apply_gc_handoffs — re-signs gc/<new>, updates extent index in
+    // THIS Volume instance to point to the new segment, renames .pending →
+    // .applied.  The old segments still exist on disk at this point.
+    let applied = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(applied, 1, "one handoff should be applied");
+
+    // Step 5: simulate coordinator/volume restart — drop the volume and reopen.
+    // Volume::open rebuilds the extent index from index/*.idx files; the old
+    // segments still have their .idx files so the extent index points to the
+    // OLD segment ULIDs.  The .applied handoff file exists but apply_gc_handoffs
+    // previously returned 0 (only processed .pending files).
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Step 6 (the fix): call apply_gc_handoffs on the reopened volume.  With
+    // the fix it detects the .applied file and re-applies the extent index
+    // update (idempotently, without re-signing or renaming).
+    let re_applied = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(
+        re_applied, 1,
+        "apply_gc_handoffs must re-apply the .applied handoff after restart \
+         (Bug E: previously returned 0 here)"
+    );
+
+    // Step 7: apply_done_handoffs — deletes old segment bodies and .idx files,
+    // moves gc/<new> → segments/<new>.  Safe because the extent index now
+    // points to the new segment.
+    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
+        .unwrap();
+
+    // All LBAs must read their last-written values.
+    let got0 = vol
+        .read(0, 1)
+        .expect("read lba=0 after restart + GC cleanup");
+    assert_eq!(
+        got0.as_slice(),
+        &d2,
+        "lba=0 should return D2 after restart (Bug E: previously returned segment not found)"
+    );
+    let got1 = vol
+        .read(1, 1)
+        .expect("read lba=1 after restart + GC cleanup");
+    assert_eq!(got1.as_slice(), &d1, "lba=1 should return D1 after restart");
 }

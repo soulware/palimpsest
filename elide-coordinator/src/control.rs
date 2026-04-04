@@ -13,6 +13,7 @@
 //   sweep_pending              →  "ok <segs> <bytes> <extents>"
 //   repack <min_live_ratio>    →  "ok <segs> <bytes> <extents>"
 //   gc_checkpoint              →  "ok <repack_ulid> <sweep_ulid>"
+//   apply_gc_handoffs          →  "ok <n>"
 //
 // If the socket is absent (volume not running), all functions return None and
 // log a warning.  Callers decide whether to abort or proceed without the op.
@@ -73,6 +74,27 @@ pub async fn gc_checkpoint(fork_dir: &Path) -> Option<(String, String)> {
         return None;
     }
     Some((u1, u2))
+}
+
+/// Apply pending/applied GC handoffs on the volume process for `fork_dir`.
+///
+/// Called by the coordinator before `apply_done_handoffs` to ensure the
+/// volume's in-memory extent index reflects all committed GC decisions.  This
+/// is critical for restart safety: after a restart the volume rebuilds its
+/// extent index from on-disk `.idx` files (which still point to old segments),
+/// so `.applied` handoffs from a previous session must be re-applied before old
+/// segments are deleted.
+///
+/// Returns the number of handoffs processed.  Returns 0 if the socket is
+/// absent or the call fails (non-fatal: the next idle tick will retry).
+pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
+    match call(fork_dir, "apply_gc_handoffs").await {
+        Some(resp) => resp
+            .strip_prefix("ok ")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0),
+        None => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
