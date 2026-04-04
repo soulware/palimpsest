@@ -664,62 +664,90 @@ LBA reads back its last-written value.
 
 ### Bugs found by the coordinator proptest
 
-The suite is currently **`#[ignore]`** while two bugs it uncovered are being
-investigated.
+The proptest suite is active (not ignored).  All bugs it has uncovered are
+fixed; each has a named deterministic regression test in `gc_test.rs` and is
+described below for historical context.
 
-#### Bug A: DEDUP_REF-only segments never deleted after GC
+#### Bug A: DEDUP_REF-only segments never deleted after GC ✓ Fixed
 
-When GC compacts a set of segments that includes one containing **only**
-DEDUP_REF entries (no DATA entries), `compact_segments` generates no handoff
-line that names that segment as an `old_ulid`.  `apply_done_handoffs` collects
-`old_ulids` exclusively from Repack/Remove/Dead lines, so it never learns to
-delete the DEDUP_REF-only segment.
+When GC compacted a set of segments that included one containing **only**
+DEDUP_REF entries (no DATA entries), `compact_segments` generated no handoff
+line naming that segment as an `old_ulid`.  `apply_done_handoffs` collected
+`old_ulids` exclusively from Repack/Remove/Dead lines, so it never deleted the
+DEDUP_REF-only segment.  Over successive sweeps, duplicate DEDUP_REF entries
+accumulated and eventually caused read corruption.
 
-The segment persists in `segments/` indefinitely.  On the next GC sweep it is
-picked up again as a candidate, its DEDUP_REF entries are merged into the new
-output a second time, and the GC output segment contains duplicate LBA entries.
-Over successive sweeps the duplicate entries accumulate.  At some point the
-lbamap rebuild applies a DEDUP_REF from the stale copy (which points to a DATA
-entry in a segment that has since been deleted), and reads for that LBA return
-wrong data.
+**Fix**: `compact_segments` now emits a `Dead` handoff line for every consumed
+input segment not covered by a Repack or Remove line, so `apply_done_handoffs`
+deletes all consumed segments.
 
-Minimal reproducer:
-```
-[DedupWrite(3,5,0), GcSweep, Write(0,0), Flush, DrainLocal,
- DedupWrite(3,6,1), Write(3,2), GcSweep, DrainLocal, GcSweep]
-```
-After the third GcSweep, lba 5 reads `[0;4096]` (H0) instead of `[0;4096]`
-— actually the values are the same here, but lba 6 reads zeros instead of
-`[1;4096]`.
+**Coverage**: `gc_proptest::gc_segment_cleanup` (proptest, 256 cases).
 
-**Fix direction**: `compact_segments` must emit a handoff line (e.g. a `Dead`
-line or a dedicated `Consumed` marker) for every input segment, not only those
-that contribute DATA entries to the output, so `apply_done_handoffs` can delete
-all consumed segments.
+#### Bug B: GC liveness view excludes unflushed WAL writes ✓ Fixed
 
-#### Bug B: GC liveness view excludes unflushed WAL writes (window between checkpoint and apply)
+`gc_fork` rebuilds liveness from on-disk state.  Between `gc_checkpoint()` and
+`apply_gc_handoffs()`, the volume could receive a write that used the same
+content as a hash GC just marked dead (emitting a DEDUP_REF because the hash
+was still in the extent index).  `apply_gc_handoffs` then removed that hash from
+the extent index — the guard (`loc.segment_id == old_ulid`) did not fire because
+DEDUP_REF writes do not update the extent index — causing reads for that LBA to
+return zeros.
 
-`gc_fork` rebuilds liveness from on-disk state (`segments/` + `pending/`).  It
-does not see writes that are in the volume's WAL buffer but not yet flushed to a
-segment.  The `GcSweep` flush before `gc_fork` closes most of this gap, but a
-narrower window remains in production: between `gc_checkpoint()` and
-`apply_gc_handoffs()`, the volume may process new writes.  If a new write uses
-the same content as a hash that GC just marked dead (emitting a DEDUP_REF
-because the hash is still in the extent index), and `apply_gc_handoffs` then
-removes that hash from the extent index (because the on-disk extent index still
-points to the old segment), reads for that LBA return zeros.
+**Fix**: in `apply_gc_handoffs`, before any extent index mutations, check
+`self.lbamap.live_hashes()` for each hash not carried into the GC output.  If
+any such hash is still live, cancel the GC pass (delete `.pending` and body) so
+`gc_fork` can re-run with current liveness data on the next tick.
 
-The guard in `apply_gc_handoffs` (`loc.segment_id == old_ulid`) correctly
-protects DATA overwrites (which update the extent index, changing the
-`segment_id`), but **DEDUP_REF writes do not update the extent index**, so the
-guard does not fire and the hash is incorrectly removed.
+**Coverage**: `gc_test::gc_handoff_bug_b_dedup_ref_after_checkpoint`.
 
-**Fix direction**: in `apply_gc_handoffs`, before removing a hash H from the
-extent index, check `self.lbamap.live_hashes().contains(&hash)`.  If H is still
-referenced by any LBA, do not remove it — and do not write the `.applied` file
-for this handoff until H's data has been re-promoted into a new segment (or
-until a future GC tick, at which point the volume's flushed state will correctly
-reflect H as live and the coordinator will not attempt to remove it again).
+#### Bug C: gc_checkpoint mints ULIDs before opening a new WAL ✓ Fixed
+
+When the WAL was empty at checkpoint time, `flush_wal` was a no-op, so the
+active WAL retained its original ULID — which was below the freshly-minted GC
+output ULIDs.  A subsequent WAL flush produced a segment that sorted below the
+GC output on crash-recovery rebuild, so the GC output won for the affected LBAs,
+returning stale data.
+
+**Fix**: `gc_checkpoint` always opens a new WAL after minting, so the next WAL
+segment's ULID is guaranteed above the GC output ULIDs.
+
+**Coverage**: `gc_test::gc_checkpoint_ulid_ordering_crash_recovery`.
+
+#### Bug D: gc_checkpoint flushed non-empty WAL under the old ULID ✓ Fixed
+
+When the WAL was non-empty at checkpoint time, `gc_checkpoint` flushed it to
+`pending/` under the WAL's existing ULID (assigned when the WAL was opened,
+before GC output ULIDs were minted).  That pending segment therefore had a ULID
+below the GC output ULIDs.  After drain and a crash, crash-recovery rebuild
+applied the GC output last (higher ULID wins), returning stale data.
+
+**Fix**: `gc_checkpoint` pre-mints three ULIDs (`u_repack`, `u_sweep`, `u_wal`)
+before any I/O, then flushes the WAL under `u_wal`.  The WAL segment therefore
+always sorts above GC output segments on rebuild.
+
+**Coverage**: `gc_test::gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery`.
+
+#### Bug E: GC restart-safety gap — extent index stale after restart ✓ Fixed
+
+`apply_gc_handoffs` only processed `.pending` files.  After a
+coordinator/volume restart, `Volume::open` rebuilds the extent index from
+on-disk `.idx` files (which still point to old segments because their `.idx`
+files persist until `apply_done_handoffs` removes them).  When
+`apply_done_handoffs` then deleted the old segment, the in-memory extent index
+was stale, causing reads to fail with "segment not found".  Observed in practice
+as filesystem corruption after `fstrim` + coordinator restart.
+
+**Fix** (two parts):
+1. `apply_gc_handoffs` now also processes `.applied` files — re-applies extent
+   index updates idempotently (same `still_at_old` check), skipping re-signing
+   and rename since those steps already happened.
+2. The coordinator daemon calls `apply_gc_handoffs` IPC before
+   `apply_done_handoffs` on every GC tick, ensuring the volume's extent index is
+   consistent before old segments are deleted regardless of restart timing.
+
+**Coverage**: `gc_test::gc_restart_safety_applied_handoff` (deterministic);
+`gc_proptest` `Restart` SimOp (proptest, exercises `GcSweep → Restart →
+GcSweep` sequences).
 
 ---
 
