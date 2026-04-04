@@ -820,10 +820,10 @@ impl Volume {
         // Mint all three ULIDs before any I/O.  The ordering constraint —
         // u_repack < u_sweep < u_wal < new_wal — is established here, before
         // the flush or the new WAL open.
+        // Mint all three ULIDs in sequence.  UlidMint guarantees strict
+        // monotonicity even within the same millisecond (increments random bits),
+        // so no sleep is needed — u_repack < u_sweep < u_wal is always satisfied.
         let u_repack = self.mint.next().to_string();
-        // 2ms gap ensures distinct timestamps so the ULIDs are strictly ordered
-        // by time, not just by the random bits.
-        std::thread::sleep(std::time::Duration::from_millis(2));
         let u_sweep = self.mint.next().to_string();
         let u_wal = self.mint.next().to_string();
         // Flush the current WAL to pending/ under u_wal.  If the WAL is empty,
