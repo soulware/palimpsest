@@ -20,7 +20,7 @@ use std::fs;
 use std::sync::Arc;
 
 use elide_coordinator::config::GcConfig;
-use elide_coordinator::gc::{apply_done_handoffs, gc_fork};
+use elide_coordinator::gc::{GcStrategy, apply_done_handoffs, gc_fork};
 use elide_core::volume::Volume;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -63,15 +63,116 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
+    /// Segment cleanup: after GC runs, every consumed input segment must be
+    /// deleted from segments/.
+    ///
+    /// With test config (density_threshold=0.0, small_segment_bytes=MAX), the
+    /// sweep pass always compacts ALL segments into one when ≥2 exist.  After
+    /// apply_done_handoffs, segments/ must contain ≤1 file.
+    ///
+    /// Catches Bug A: DEDUP_REF-only segments were never deleted because
+    /// compact_segments emitted no handoff line for them.
+    #[test]
+    fn gc_segment_cleanup(ops in arb_sim_ops()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+        fs::create_dir_all(fork_dir.join("segments")).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let gc_config = GcConfig {
+            density_threshold: 0.0,
+            small_segment_bytes: u64::MAX,
+            interval_secs: 0,
+        };
+
+        let segments_dir = fork_dir.join("segments");
+
+        for op in &ops {
+            match op {
+                SimOp::Write { lba, seed } => {
+                    let _ = vol.write(*lba as u64, &[*seed; 4096]);
+                }
+                SimOp::DedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.write(*lba_b as u64, &data);
+                }
+                SimOp::Flush => {
+                    let _ = vol.flush_wal();
+                }
+                SimOp::DrainLocal => {
+                    let pending_dir = fork_dir.join("pending");
+                    if let Ok(entries) = fs::read_dir(&pending_dir) {
+                        for entry in entries.flatten() {
+                            let _ = fs::rename(
+                                entry.path(),
+                                segments_dir.join(entry.file_name()),
+                            );
+                        }
+                    }
+                }
+                SimOp::GcSweep => {
+                    let _ = vol.flush_wal();
+
+                    let segs_before: usize = fs::read_dir(&segments_dir)
+                        .map(|d| d.flatten().count())
+                        .unwrap_or(0);
+
+                    let sweep_ulid = Ulid::new().to_string();
+                    let repack_ulid = Ulid::new().to_string();
+
+                    let gc_stats = rt.block_on(gc_fork(
+                        fork_dir,
+                        "test-vol",
+                        &store,
+                        &gc_config,
+                        &repack_ulid,
+                        &sweep_ulid,
+                    ));
+                    let _ = vol.apply_gc_handoffs();
+                    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+
+                    if let Ok(stats) = gc_stats {
+                        if stats.strategy != GcStrategy::None {
+                            let segs_after: usize = fs::read_dir(&segments_dir)
+                                .map(|d| d.flatten().count())
+                                .unwrap_or(0);
+                            prop_assert!(
+                                segs_after <= 1,
+                                "after GcSweep on {} segments, {} remain in segments/ (expected ≤1)",
+                                segs_before,
+                                segs_after
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// GC oracle: after any sequence of writes + GC sweeps, every LBA that
     /// has ever been written reads back its last-written value.
     ///
-    /// Currently ignored while two production bugs it uncovered are being
-    /// fixed.  See "Bugs found by the coordinator proptest" in docs/testing.md:
-    ///   Bug A — DEDUP_REF-only segments never deleted after GC
+    /// Currently ignored while a production bug it uncovered is being fixed.
+    /// See "Bugs found by the coordinator proptest" in docs/testing.md:
     ///   Bug B — GC liveness view excludes unflushed WAL writes
     #[test]
-    #[ignore = "known bugs A+B in gc_fork/apply_done_handoffs — see docs/testing.md"]
+    #[ignore = "known bug B in apply_gc_handoffs — see docs/testing.md"]
     fn gc_oracle(ops in arb_sim_ops()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();

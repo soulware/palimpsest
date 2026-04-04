@@ -771,6 +771,10 @@ async fn compact_segments(
     // Write the handoff file using the typed HandoffLine format.
     let new_ulid = Ulid::from_string(new_ulid_str).context("parsing new ulid")?;
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
+    // Track which candidate ULIDs get at least one Repack or Remove line.
+    // Any candidate not covered had only DEDUP_REF live entries; it needs a
+    // Dead line so apply_done_handoffs deletes the old segment file.
+    let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
         if new_entry.is_dedup_ref {
             // Dedup-ref entries have no body in the new segment; the extent
@@ -779,6 +783,7 @@ async fn compact_segments(
             // the extent index for these hashes.
             continue;
         }
+        covered_ulids.insert(old_ulid_str.as_str());
         let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
         let new_offset = new_body_section_start + new_entry.stored_offset;
         handoff_lines.push(HandoffLine::Repack {
@@ -789,11 +794,23 @@ async fn compact_segments(
         });
     }
     for (hash, old_ulid_str) in &all_removed {
+        covered_ulids.insert(old_ulid_str.as_str());
         let old_ulid = Ulid::from_string(old_ulid_str).context("parsing removed ulid")?;
         handoff_lines.push(HandoffLine::Remove {
             hash: *hash,
             old_ulid,
         });
+    }
+    // Candidates whose ULID has no Repack or Remove line contributed only
+    // DEDUP_REF live entries.  Their entries are already carried into the new
+    // output segment above, so it is safe to delete the old files.  Emit a
+    // Dead line for each so apply_done_handoffs knows to delete them.
+    for candidate in &candidates {
+        if !covered_ulids.contains(candidate.ulid_str.as_str()) {
+            let old_ulid =
+                Ulid::from_string(&candidate.ulid_str).context("parsing candidate ulid")?;
+            handoff_lines.push(HandoffLine::Dead { old_ulid });
+        }
     }
     let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
     let pending_tmp = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
