@@ -352,21 +352,52 @@ async fn fork_loop(
         }
 
         // Step 4: drain pending segments to S3.
+        //
+        // ORDERING INVARIANT: step 4 must fully succeed before step 5 (GC)
+        // runs.  gc_checkpoint mints GC output ULIDs from the volume's
+        // monotonic clock; any segment already in pending/ at that moment has
+        // a ULID below the GC output.  If such a segment is later drained to
+        // segments/, crash-recovery rebuild gives the GC output incorrect
+        // priority for the shared LBAs, returning stale data.  Skipping GC
+        // when drain has failures enforces the invariant and defers the GC
+        // pass to the next tick, by which time the pending segments will
+        // either have drained successfully or the operator will have been
+        // alerted by the repeated error logs.
+        let mut drain_ok = true;
         if fork_dir.join("pending").exists() {
             match upload::drain_pending(&fork_dir, &volume_id, &store).await {
-                Ok(r) if r.uploaded > 0 || r.failed > 0 => {
-                    info!(
-                        "[drain {volume_id}] {} uploaded, {} failed",
-                        r.uploaded, r.failed
+                Ok(r) if r.failed > 0 => {
+                    error!(
+                        "[drain {volume_id}] {} segment(s) failed to upload; \
+                         skipping GC this tick to preserve ULID ordering invariant",
+                        r.failed
                     );
+                    drain_ok = false;
+                }
+                Ok(r) if r.uploaded > 0 => {
+                    info!("[drain {volume_id}] {} uploaded", r.uploaded);
                 }
                 Ok(_) => {}
-                Err(e) => warn!("[drain {volume_id}] error: {e:#}"),
+                Err(e) => {
+                    error!(
+                        "[drain {volume_id}] drain error: {e:#}; \
+                         skipping GC this tick to preserve ULID ordering invariant"
+                    );
+                    drain_ok = false;
+                }
             }
         }
 
         // Step 5: GC pass (rate-limited to gc_interval).
         if last_gc.elapsed() >= gc_interval {
+            if !drain_ok {
+                // Drain did not complete cleanly.  Defer GC to the next tick
+                // so that pending/ is empty before GC output ULIDs are minted.
+                // last_gc is intentionally NOT reset — the GC interval keeps
+                // ticking so the pass runs as soon as drain recovers.
+                continue;
+            }
+
             // Get two GC output ULIDs from the volume (flushes WAL as a side
             // effect).  If the volume is unreachable, skip GC for this tick.
             let Some((repack_ulid, sweep_ulid)) = control::gc_checkpoint(&fork_dir).await else {

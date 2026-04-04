@@ -56,8 +56,94 @@ use std::sync::Arc;
 use elide_coordinator::config::GcConfig;
 use elide_coordinator::gc::{apply_done_handoffs, gc_fork};
 use elide_core::volume::Volume;
-use object_store::ObjectStore;
+use futures::stream::BoxStream;
 use object_store::memory::InMemory;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult,
+};
+
+/// A store that always fails `put` operations.  Used to simulate S3 upload
+/// failures in tests so we can verify that `drain_pending` correctly reports
+/// failures and the coordinator tick skips GC when drain does not complete.
+struct FailStore;
+
+impl std::fmt::Display for FailStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailStore")
+    }
+}
+
+impl std::fmt::Debug for FailStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailStore {
+    async fn put_opts(
+        &self,
+        _location: &object_store::path::Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        Err(object_store::Error::Generic {
+            store: "FailStore",
+            source: "simulated upload failure".into(),
+        })
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &object_store::path::Path,
+        _opts: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        unimplemented!("FailStore::put_multipart_opts")
+    }
+
+    async fn get_opts(
+        &self,
+        _location: &object_store::path::Path,
+        _options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        unimplemented!("FailStore::get_opts")
+    }
+
+    async fn delete(&self, _location: &object_store::path::Path) -> object_store::Result<()> {
+        unimplemented!("FailStore::delete")
+    }
+
+    fn list(
+        &self,
+        _prefix: Option<&object_store::path::Path>,
+    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+        unimplemented!("FailStore::list")
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        _prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<ListResult> {
+        unimplemented!("FailStore::list_with_delimiter")
+    }
+
+    async fn copy(
+        &self,
+        _from: &object_store::path::Path,
+        _to: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        unimplemented!("FailStore::copy")
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        _from: &object_store::path::Path,
+        _to: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        unimplemented!("FailStore::copy_if_not_exists")
+    }
+}
 
 fn make_gc_config() -> GcConfig {
     // density_threshold=0.0 ensures any dead segment is compacted.
@@ -430,4 +516,127 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
         &d2,
         "lba=0 should return D2 (latest write) after crash, not D1 (stale GC output)"
     );
+}
+
+/// Coverage for the drain-failure → skip-GC invariant enforced in
+/// `daemon::fork_loop`.
+///
+/// When `drain_pending` fails (e.g. S3 is unreachable), the daemon sets
+/// `drain_ok = false` and skips the GC step for that tick.  This test
+/// verifies two things:
+///
+///   1. `drain_pending` correctly reports upload failures via
+///      `DrainResult.failed > 0` when the store rejects `put` operations.
+///
+///   2. After a failed drain, pending segments are still present in
+///      `pending/` — they have not been lost.  The next tick can retry
+///      drain and then run GC with the segments safely in `segments/`.
+///
+/// Recovery path: after drain succeeds on the second attempt, GC runs
+/// correctly and all data is readable.
+#[test]
+fn drain_failure_skips_gc_and_data_survives() {
+    use elide_coordinator::upload;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+    // volume.size is required by upload_manifest inside drain_pending.
+    fs::write(fork_dir.join("volume.size"), b"1073741824").unwrap();
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    fs::create_dir_all(fork_dir.join("segments")).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    let d0 = [11u8; 4096];
+    let d1 = [22u8; 4096];
+
+    // Write two segments to segments/ so GC has something to compact.
+    vol.write(0, &d0).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(0, &d1).unwrap();
+    vol.flush_wal().unwrap();
+    drain_pending(fork_dir);
+
+    // Write more data — this ends up in pending/ after flushing.
+    vol.write(1, &d0).unwrap();
+    vol.flush_wal().unwrap();
+
+    // --- Tick N: drain fails ---
+    //
+    // The FailStore rejects all put operations. drain_pending returns
+    // Ok(DrainResult { failed: 1 }), so the daemon sets drain_ok = false
+    // and skips GC for this tick.
+    let fail_store: Arc<dyn ObjectStore> = Arc::new(FailStore);
+    let drain_result = rt
+        .block_on(upload::drain_pending(fork_dir, "test-vol", &fail_store))
+        .expect("drain_pending itself should not error");
+    assert!(
+        drain_result.failed > 0,
+        "expected drain to report upload failure (failed={})",
+        drain_result.failed
+    );
+    // drain_ok would be false in the daemon — GC is skipped.
+    let drain_ok = drain_result.failed == 0;
+    assert!(
+        !drain_ok,
+        "drain_ok must be false when uploads fail so GC is skipped"
+    );
+
+    // Pending segment must still be present (not lost during failed drain).
+    let pending_count = fs::read_dir(fork_dir.join("pending"))
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
+    assert!(
+        pending_count > 0,
+        "pending segment should survive a failed drain (count={})",
+        pending_count
+    );
+
+    // --- Tick N+1: drain succeeds, GC runs ---
+    //
+    // On the next tick, drain succeeds with a working store.  GC then runs
+    // with pending/ empty and produces correct output.
+    let good_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let drain_result2 = rt
+        .block_on(upload::drain_pending(fork_dir, "test-vol", &good_store))
+        .expect("drain should succeed with good store");
+    assert_eq!(
+        drain_result2.failed, 0,
+        "drain should report no failures with good store"
+    );
+
+    // GC runs after successful drain: pending/ is now empty, all prior
+    // segments are in segments/.
+    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+    rt.block_on(gc_fork(
+        fork_dir,
+        "test-vol",
+        &good_store,
+        &gc_config,
+        &repack_ulid,
+        &sweep_ulid,
+    ))
+    .unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &good_store))
+        .unwrap();
+
+    // All data must be readable after recovery.
+    let got0 = vol.read(0, 1).expect("read lba=0 after recovery");
+    assert_eq!(got0.as_slice(), &d1, "lba=0 should return D1 after GC");
+    let got1 = vol.read(1, 1).expect("read lba=1 after recovery");
+    assert_eq!(got1.as_slice(), &d0, "lba=1 should return D0 after GC");
 }

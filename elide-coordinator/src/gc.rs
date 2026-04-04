@@ -158,6 +158,30 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
+    // Precondition: pending/ must be empty (or contain only segments with
+    // ULID > sweep_ulid) when gc_fork runs.  The coordinator tick enforces
+    // this by completing drain_pending (step 4) before calling gc_checkpoint
+    // and gc_fork (step 5).  A pre-existing pending segment with ULID <=
+    // sweep_ulid would sort below the GC output on crash-recovery rebuild,
+    // causing the GC output to win for shared LBAs and return stale data.
+    debug_assert!(
+        {
+            let sweep = Ulid::from_string(sweep_ulid).unwrap_or(ulid::Ulid::nil());
+            elide_core::segment::collect_segment_files(&fork_dir.join("pending"))
+                .unwrap_or_default()
+                .iter()
+                .all(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| Ulid::from_string(n).ok())
+                        .map(|u| u > sweep)
+                        .unwrap_or(true)
+                })
+        },
+        "gc_fork called with pending segments at or below sweep_ulid; \
+         drain_pending must complete before GC runs"
+    );
+
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
