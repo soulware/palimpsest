@@ -29,6 +29,7 @@ use tokio::process::Command;
 const PID_FILE: &str = "volume.pid";
 const NBD_PORT_FILE: &str = "nbd.port";
 const NBD_BIND_FILE: &str = "nbd.bind";
+const NBD_SOCKET_FILE: &str = "nbd.socket";
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// A process that exits within this many seconds is considered a fast failure.
@@ -97,8 +98,13 @@ fn spawn_volume(fork_dir: &Path, elide_bin: &Path) -> std::io::Result<tokio::pro
     let mut cmd = Command::new(elide_bin);
     cmd.arg("serve-volume").arg(fork_dir);
 
-    // If nbd.port exists, pass --port so the volume serves NBD on that port.
-    if let Ok(text) = std::fs::read_to_string(fork_dir.join(NBD_PORT_FILE))
+    // nbd.socket takes precedence over nbd.port/nbd.bind.
+    if let Ok(path) = std::fs::read_to_string(fork_dir.join(NBD_SOCKET_FILE)) {
+        let path = path.trim();
+        if !path.is_empty() {
+            cmd.arg("--socket").arg(path);
+        }
+    } else if let Ok(text) = std::fs::read_to_string(fork_dir.join(NBD_PORT_FILE))
         && let Ok(port) = text.trim().parse::<u16>()
     {
         cmd.arg("--port").arg(port.to_string());
