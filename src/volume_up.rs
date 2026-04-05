@@ -159,20 +159,26 @@ pub fn run_volume_daemon(vol_dir: &Path, mountpoint: &Path, format: bool) -> io:
     }
 
     // 5. Probe for a filesystem; format if needed.
+    //
+    // --format means "initialise if blank" — it is safe to pass on every
+    // invocation. It will never reformat a device that already has data.
     let has_fs = probe_ext4(&nbd_dev)?;
-    if !has_fs {
-        let do_format = format || {
-            // SAFETY: isatty checks fd 0 (stdin).
-            let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-            on_tty && ask_format(&nbd_dev)?
-        };
-        if do_format {
+    match (has_fs, format) {
+        (true, true) => {
+            eprintln!(
+                "note: filesystem already present on {}; skipping format",
+                nbd_dev.display()
+            );
+        }
+        (true, false) => {}
+        (false, true) => {
             if let Err(e) = run_mkfs(&nbd_dev) {
                 disconnect_nbd(&nbd_dev);
                 serve_child.kill().ok();
                 return Err(e);
             }
-        } else {
+        }
+        (false, false) => {
             disconnect_nbd(&nbd_dev);
             serve_child.kill().ok();
             return Err(io::Error::other(
@@ -248,20 +254,6 @@ fn probe_ext4(device: &Path) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-/// Ask the user interactively whether to format the device.
-fn ask_format(device: &Path) -> io::Result<bool> {
-    eprint!(
-        "no filesystem on {}. Format with ext4? [y/N] ",
-        device.display()
-    );
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 fn run_mkfs(device: &Path) -> io::Result<()> {
