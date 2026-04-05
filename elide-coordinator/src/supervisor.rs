@@ -95,15 +95,22 @@ fn spawn_volume(fork_dir: &Path, elide_bin: &Path) -> std::io::Result<tokio::pro
     let mut cmd = Command::new(elide_bin);
     cmd.arg("serve-volume").arg(fork_dir);
 
-    if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) {
-        if let Some(nbd) = cfg.nbd {
-            if let Some(socket) = nbd.socket {
-                cmd.arg("--socket").arg(socket);
-            } else if let Some(port) = nbd.port {
-                cmd.arg("--port").arg(port.to_string());
-                if let Some(bind) = nbd.bind {
-                    cmd.arg("--bind").arg(bind);
-                }
+    if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir)
+        && let Some(nbd) = cfg.nbd
+    {
+        if let Some(socket) = nbd.socket {
+            // Resolve relative paths against the volume directory so that
+            // "./nbd.sock" means <vol_dir>/nbd.sock regardless of cwd.
+            let socket = if socket.is_absolute() {
+                socket
+            } else {
+                fork_dir.join(socket)
+            };
+            cmd.arg("--socket").arg(socket);
+        } else if let Some(port) = nbd.port {
+            cmd.arg("--port").arg(port.to_string());
+            if let Some(bind) = nbd.bind {
+                cmd.arg("--bind").arg(bind);
             }
         }
     }
