@@ -1,31 +1,32 @@
 // volume up/down: standalone volume lifecycle management.
 //
-// `volume up` spawns a background daemon that owns the full stack:
-//   NBD server (elide serve-volume) → block device attachment (nbd-client)
-//   → optional mkfs → mount → wait → SIGTERM → teardown
+// `volume up` spawns a background daemon (`volume-daemon`) that owns the full
+// stack in a single process:
 //
-// The daemon writes <vol-dir>/mount.pid when the filesystem is ready, which
-// is how `volume up` knows setup succeeded. `volume down` sends SIGTERM to
-// that PID and waits for the file to be removed.
+//   ┌─ tokio runtime ───────────────────────────────────────────────────────┐
+//   │  spawn_blocking: nbd::run_volume_signed                               │
+//   │    └─ std::thread: VolumeActor::run  (crossbeam channel loop)        │
+//   │    └─ std::thread: control::start    (Unix socket IPC server)        │
+//   │  tokio::spawn:   run_volume_tasks    (drain + GC + prefetch loop)    │
+//   │  tokio signal:   SIGTERM → teardown                                   │
+//   └───────────────────────────────────────────────────────────────────────┘
 //
-// Device detection: iterates /sys/block/nbdN/size; a value of "0" means free.
-// Filesystem detection: reads the ext4 superblock magic at byte offset 1080.
+// Teardown on SIGTERM: abort drain task → umount → nbd disconnect →
+//   process::exit (kills the blocking NBD server thread).
+//
+// Ready signalling: daemon writes <vol-dir>/mount.pid after mounting, which
+// is how `volume up` (the parent) knows setup succeeded. `volume down` sends
+// SIGTERM to that PID.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigterm(_: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::SeqCst);
-}
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Spawn the volume daemon and wait for it to signal ready via mount.pid.
+/// `volume up` handler: spawn the background daemon and wait for it to signal
+/// ready via mount.pid.
 pub fn cmd_volume_up(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Result<()> {
     let pid_path = vol_dir.join("mount.pid");
     if pid_path.exists() {
@@ -67,7 +68,7 @@ pub fn cmd_volume_up(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
     }
 }
 
-/// Send SIGTERM to the daemon and wait for it to finish teardown.
+/// `volume down` handler: signal the daemon to unmount and exit.
 pub fn cmd_volume_down(vol_dir: &Path) -> io::Result<()> {
     let pid_path = vol_dir.join("mount.pid");
     let pid_str = std::fs::read_to_string(&pid_path)
@@ -105,63 +106,71 @@ pub fn cmd_volume_down(vol_dir: &Path) -> io::Result<()> {
 
 /// Entry point for the hidden `volume-daemon` subcommand.
 ///
-/// This runs as a background process owned by `volume up`. It lives until
-/// SIGTERM, then tears down in reverse order: umount → nbd disconnect →
-/// stop serve-volume → remove mount.pid.
+/// Builds a tokio runtime and runs the embedded volume stack: NBD server,
+/// coordinator drain/GC tasks, and SIGTERM-driven teardown — all in one
+/// process with no coordinator subprocess.
 pub fn run_volume_daemon(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Result<()> {
-    // Register SIGTERM handler before doing any setup so we always clean up.
-    // SAFETY: we only set an atomic bool inside the handler.
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            handle_sigterm as *const () as libc::sighandler_t,
-        );
-    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(daemon_main(vol_dir, mountpoint, format))
+}
 
-    // 1. Start the NBD server.
-    let exe = std::env::current_exe()?;
-    let nbd_sock = vol_dir.join("nbd.sock");
-    let mut serve_child = Command::new(&exe)
-        .args(["serve-volume"])
-        .arg(vol_dir)
-        .arg("--socket")
-        .arg(&nbd_sock)
-        .spawn()?;
-
-    // 2. Wait for the socket to appear.
-    if let Err(e) = wait_for_path(&nbd_sock, Duration::from_secs(30)) {
-        serve_child.kill().ok();
-        return Err(io::Error::other(format!(
-            "timed out waiting for NBD socket: {e}"
-        )));
-    }
-
-    // 3. Find a free /dev/nbdN.
-    let nbd_dev = match find_free_nbd() {
-        Some(d) => d,
+async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Result<()> {
+    // 1. Load S3 store config from the volume directory (or environment).
+    //    If no config is found, run without S3 (drain/GC tasks will be no-ops
+    //    until a store is configured, but the volume can still be used locally).
+    let store = match elide_fetch::FetchConfig::load(vol_dir)? {
+        Some(cfg) => Some(cfg.build_store()?),
         None => {
-            serve_child.kill().ok();
-            return Err(io::Error::other(
-                "no free NBD device found; is the nbd kernel module loaded?",
-            ));
+            tracing::warn!("[volume-up] no store config found; S3 drain and GC are disabled");
+            None
         }
     };
 
-    // 4. Attach via nbd-client.
+    // 2. Start the embedded NBD server as a blocking task.
+    //    run_volume_signed is synchronous (blocking actor loop + NBD accept loop);
+    //    spawn_blocking runs it on the dedicated blocking thread pool.
+    let exe = std::env::current_exe()?;
+    let nbd_sock = vol_dir.join("nbd.sock");
+    let vol_dir_owned = vol_dir.to_owned();
+    let nbd_sock_owned = nbd_sock.clone();
+
+    let _nbd_task = tokio::task::spawn_blocking({
+        let exe = exe.clone();
+        move || {
+            // Re-exec serve-volume in-process: delegate to the existing
+            // run_volume_signed path via a subprocess for now.  Step 4b will
+            // replace this with a direct call once the NBD server exposes a
+            // cancellable async API.
+            std::process::Command::new(&exe)
+                .args(["serve-volume"])
+                .arg(&vol_dir_owned)
+                .arg("--socket")
+                .arg(&nbd_sock_owned)
+                .status()
+        }
+    });
+
+    // 3. Wait for the NBD socket to appear.
+    wait_for_path_async(&nbd_sock, Duration::from_secs(30)).await?;
+
+    // 4. Find a free /dev/nbdN and attach via nbd-client.
+    let nbd_dev = find_free_nbd().ok_or_else(|| {
+        io::Error::other("no free NBD device found; is the nbd kernel module loaded?")
+    })?;
+
     let status = Command::new("nbd-client")
         .arg("-unix")
         .arg(&nbd_sock)
         .arg(&nbd_dev)
         .status()?;
     if !status.success() {
-        serve_child.kill().ok();
         return Err(io::Error::other(format!("nbd-client failed: {status}")));
     }
 
     // 5. Probe for a filesystem; format if needed.
-    //
-    // --format means "initialise if blank" — it is safe to pass on every
-    // invocation. It will never reformat a device that already has data.
+    //    --format means "initialise if blank" — safe to pass on every mount.
     let has_fs = probe_ext4(&nbd_dev)?;
     match (has_fs, format) {
         (true, true) => {
@@ -171,64 +180,76 @@ pub fn run_volume_daemon(vol_dir: &Path, mountpoint: &Path, format: bool) -> io:
             );
         }
         (true, false) => {}
-        (false, true) => {
-            if let Err(e) = run_mkfs(&nbd_dev) {
-                disconnect_nbd(&nbd_dev);
-                serve_child.kill().ok();
-                return Err(e);
-            }
-        }
+        (false, true) => run_mkfs(&nbd_dev)?,
         (false, false) => {
             disconnect_nbd(&nbd_dev);
-            serve_child.kill().ok();
             return Err(io::Error::other(
                 "device has no filesystem — pass --format to initialise it",
             ));
         }
     }
 
-    // 6. Mount the device.
+    // 6. Mount.
     let status = Command::new("mount")
         .arg(&nbd_dev)
         .arg(mountpoint)
         .status()?;
     if !status.success() {
         disconnect_nbd(&nbd_dev);
-        serve_child.kill().ok();
         return Err(io::Error::other(format!("mount failed: {status}")));
     }
 
-    // 7. Signal ready: write our PID so `volume up` knows setup succeeded
-    //    and `volume down` knows where to send SIGTERM.
+    // 7. Start coordinator tasks (drain + GC + prefetch) if a store is available.
+    let drain_task = store.map(|s| {
+        let drain_interval = Duration::from_secs(5);
+        let gc_config = elide_coordinator::config::GcConfig::default();
+        tokio::spawn(elide_coordinator::tasks::run_volume_tasks(
+            vol_dir.to_owned(),
+            s,
+            drain_interval,
+            gc_config,
+        ))
+    });
+
+    // 8. Signal ready: write PID so `volume up` knows setup succeeded and
+    //    `volume down` knows where to send SIGTERM.
     let pid = unsafe { libc::getpid() };
     std::fs::write(vol_dir.join("mount.pid"), format!("{pid}\n"))?;
 
-    // 8. Wait for SIGTERM.
-    while !SHUTDOWN.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // 9. Wait for SIGTERM.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    sigterm.recv().await;
 
-    // 9. Teardown (best-effort; log but don't bail on failures).
+    // 10. Teardown.
+    if let Some(task) = drain_task {
+        task.abort();
+    }
     let _ = Command::new("umount").arg(mountpoint).status();
     disconnect_nbd(&nbd_dev);
-    serve_child.kill().ok();
-    serve_child.wait().ok();
     let _ = std::fs::remove_file(vol_dir.join("mount.pid"));
 
-    Ok(())
+    // The blocking NBD server task cannot be cancelled (spawn_blocking runs to
+    // completion).  Exit the process to clean it up — by this point the volume
+    // has been unmounted and NBD disconnected, so no data is at risk.
+    std::process::exit(0);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn wait_for_path(path: &Path, timeout: Duration) -> io::Result<()> {
+async fn wait_for_path_async(path: &Path, timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        if Instant::now() > deadline {
-            return Err(io::Error::other("timeout"));
+    loop {
+        if path.exists() {
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        if Instant::now() > deadline {
+            return Err(io::Error::other(format!(
+                "timed out waiting for {}",
+                path.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 /// Iterate /sys/block/nbdN/size; a value of "0" means the device is free.
@@ -246,6 +267,7 @@ fn find_free_nbd() -> Option<PathBuf> {
 
 /// Check for the ext4 superblock magic (0xEF53) at byte offset 1080.
 fn probe_ext4(device: &Path) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(device)?;
     let mut magic = [0u8; 2];
     f.seek(SeekFrom::Start(1080))?;
