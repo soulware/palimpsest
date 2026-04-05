@@ -202,11 +202,8 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Manage OCI imports
-    Import {
-        #[command(subcommand)]
-        command: ImportCommand,
-    },
+    /// Import an OCI image into a new readonly volume (sync by default)
+    Import(ImportArgs),
 
     /// Evict locally cached data so it is demand-fetched on next read
     ///
@@ -257,26 +254,38 @@ enum RemoteCommand {
     },
 }
 
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct ImportArgs {
+    #[command(subcommand)]
+    command: Option<ImportSubcommand>,
+
+    /// Volume name to create
+    name: Option<String>,
+
+    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag)
+    oci_ref: Option<String>,
+
+    /// Create a fork with this name immediately after the import completes
+    #[arg(long, conflicts_with = "detach")]
+    fork: Option<String>,
+
+    /// Start the import in the background and return immediately
+    #[arg(long)]
+    detach: bool,
+}
+
 #[derive(Subcommand)]
-enum ImportCommand {
-    /// Pull an OCI image into a new volume (coordinator-spawned; returns immediately with a ULID)
-    Start {
-        /// Volume name to create
-        name: String,
-        /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag)
-        oci_ref: String,
-    },
-
-    /// Poll the state of a running or completed import
+enum ImportSubcommand {
+    /// Show the state of a running or completed import
     Status {
-        /// Import ULID (returned by `import start`)
-        ulid: String,
+        /// Volume name
+        name: String,
     },
-
-    /// Stream output from a running or completed import
+    /// Stream output from a running import
     Attach {
-        /// Import ULID (returned by `import start`)
-        ulid: String,
+        /// Volume name
+        name: String,
     },
 }
 
@@ -343,91 +352,11 @@ fn main() {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
-                let by_name_dir = args.data_dir.join("by_name");
-                let symlink_path = by_name_dir.join(&fork_name);
-                if symlink_path.exists() {
-                    eprintln!("error: volume already exists: {fork_name}");
-                    std::process::exit(1);
-                }
-                let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
-                if source_fork_dir.join("import.lock").exists() {
-                    eprintln!(
-                        "error: volume '{from}' is still importing; wait for import to complete before forking"
-                    );
-                    std::process::exit(1);
-                }
-                // Take an implicit snapshot of the source so fork branches from "now".
-                // Idempotent if the tip is already snapshotted.
-                if let Err(e) = snapshot_volume(&source_fork_dir, &by_id_dir) {
-                    eprintln!("error: failed to snapshot source volume: {e}");
-                    std::process::exit(1);
-                }
-                let new_vol_ulid = ulid::Ulid::new().to_string();
-                let new_fork_dir = args.data_dir.join("by_id").join(&new_vol_ulid);
-                if let Err(e) = volume::fork_volume(&new_fork_dir, &source_fork_dir) {
+                if let Err(e) =
+                    create_fork(&args.data_dir, &fork_name, &from, &socket_path, &by_id_dir)
+                {
                     eprintln!("error: {e}");
                     std::process::exit(1);
-                }
-                // Copy volume.size from source so the coordinator can serve the fork.
-                match std::fs::read(source_fork_dir.join("volume.size")) {
-                    Err(e) => {
-                        let _ = std::fs::remove_dir_all(&new_fork_dir);
-                        eprintln!(
-                            "error: source volume has no volume.size (import may not have completed): {e}"
-                        );
-                        std::process::exit(1);
-                    }
-                    Ok(size) => {
-                        if let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size) {
-                            let _ = std::fs::remove_dir_all(&new_fork_dir);
-                            eprintln!("error: failed to copy volume.size: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                if let Err(e) = std::fs::write(new_fork_dir.join("volume.name"), &fork_name) {
-                    let _ = std::fs::remove_dir_all(&new_fork_dir);
-                    eprintln!("error: failed to write volume.name: {e}");
-                    std::process::exit(1);
-                }
-                if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
-                    let _ = std::fs::remove_dir_all(&new_fork_dir);
-                    eprintln!("error: failed to create by_name dir: {e}");
-                    std::process::exit(1);
-                }
-                if let Err(e) =
-                    std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path)
-                {
-                    let _ = std::fs::remove_dir_all(&new_fork_dir);
-                    eprintln!("error: failed to create by_name symlink: {e}");
-                    std::process::exit(1);
-                }
-                let key = match elide_core::signing::generate_keypair(
-                    &new_fork_dir,
-                    VOLUME_KEY_FILE,
-                    VOLUME_PUB_FILE,
-                ) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&symlink_path);
-                        let _ = std::fs::remove_dir_all(&new_fork_dir);
-                        eprintln!("error: failed to generate fork keypair: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                if let Err(e) =
-                    elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_PROVENANCE_FILE)
-                {
-                    let _ = std::fs::remove_file(&symlink_path);
-                    let _ = std::fs::remove_dir_all(&new_fork_dir);
-                    eprintln!("error: failed to write volume.provenance: {e}");
-                    std::process::exit(1);
-                }
-                println!("{}", new_fork_dir.display());
-                if coordinator_client::rescan(&socket_path).is_err() {
-                    eprintln!(
-                        "warning: coordinator unreachable; volume will be picked up on next scan"
-                    );
                 }
             }
 
@@ -476,35 +405,75 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Import { command } => match command {
-                ImportCommand::Start { name, oci_ref } => {
-                    match coordinator_client::import_start(&socket_path, &name, &oci_ref) {
-                        Ok(ulid) => println!("{ulid}"),
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                ImportCommand::Status { ulid } => {
-                    let resp = coordinator_client::import_status(&socket_path, &ulid)
+            VolumeCommand::Import(import_args) => match import_args.command {
+                Some(ImportSubcommand::Status { name }) => {
+                    let resp = coordinator_client::import_status_by_name(&socket_path, &name)
                         .unwrap_or_else(|e| format!("err {e}"));
                     match resp.split_once(' ') {
-                        Some(("ok", state)) => println!("{ulid}: {state}"),
+                        Some(("ok", state)) => println!("{name}: {state}"),
                         Some(("err", msg)) => {
-                            eprintln!("{ulid}: {msg}");
+                            eprintln!("{name}: {msg}");
                             std::process::exit(1);
                         }
-                        _ => println!("{ulid}: {resp}"),
+                        _ => println!("{name}: {resp}"),
                     }
                 }
-                ImportCommand::Attach { ulid } => {
+                Some(ImportSubcommand::Attach { name }) => {
                     let mut stdout = std::io::stdout();
                     if let Err(e) =
-                        coordinator_client::import_attach(&socket_path, &ulid, &mut stdout)
+                        coordinator_client::import_attach_by_name(&socket_path, &name, &mut stdout)
                     {
                         eprintln!("import failed: {e}");
                         std::process::exit(1);
+                    }
+                }
+                None => {
+                    let (name, oci_ref) = match (import_args.name, import_args.oci_ref) {
+                        (Some(n), Some(r)) => (n, r),
+                        _ => {
+                            eprintln!(
+                                "error: usage: elide volume import <name> <oci_ref> [--fork <name>] [--detach]"
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = validate_volume_name(&name) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    if let Err(e) = coordinator_client::import_start(&socket_path, &name, &oci_ref)
+                    {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    if import_args.detach {
+                        eprintln!("Import started for '{name}'.");
+                        eprintln!("  elide volume import attach {name}   # stream output");
+                        eprintln!("  elide volume import status {name}   # check state");
+                    } else {
+                        // Sync: stream output and wait for completion.
+                        let mut stdout = std::io::stdout();
+                        if let Err(e) = coordinator_client::import_attach_by_name(
+                            &socket_path,
+                            &name,
+                            &mut stdout,
+                        ) {
+                            eprintln!("import failed: {e}");
+                            std::process::exit(1);
+                        }
+                        // Optionally create a fork immediately after import.
+                        if let Some(fork_name) = import_args.fork
+                            && let Err(e) = create_fork(
+                                &args.data_dir,
+                                &fork_name,
+                                &name,
+                                &socket_path,
+                                &by_id_dir,
+                            )
+                        {
+                            eprintln!("error creating fork '{fork_name}': {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             },
@@ -824,6 +793,104 @@ fn create_volume(
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
 
     println!("{}", vol_dir.display());
+    Ok(())
+}
+
+/// Create a new volume forked from the latest snapshot of `from_name`.
+///
+/// Takes an implicit snapshot of the source, creates a new `by_id/<ulid>/`
+/// directory, writes the fork keypair and provenance, creates the `by_name/`
+/// symlink, and signals the coordinator to rescan.
+fn create_fork(
+    data_dir: &Path,
+    fork_name: &str,
+    from_name: &str,
+    socket_path: &Path,
+    by_id_dir: &Path,
+) -> std::io::Result<()> {
+    validate_volume_name(fork_name)?;
+
+    let by_name_dir = data_dir.join("by_name");
+    let symlink_path = by_name_dir.join(fork_name);
+    if symlink_path.exists() {
+        return Err(std::io::Error::other(format!(
+            "volume already exists: {fork_name}"
+        )));
+    }
+
+    let source_fork_dir = resolve_volume_dir(data_dir, from_name);
+    if source_fork_dir.join("import.lock").exists() {
+        return Err(std::io::Error::other(format!(
+            "volume '{from_name}' is still importing; wait for import to complete before forking"
+        )));
+    }
+
+    // Take an implicit snapshot so the fork branches from "now".
+    // Idempotent if the tip is already snapshotted.
+    snapshot_volume(&source_fork_dir, by_id_dir)?;
+
+    let new_vol_ulid = ulid::Ulid::new().to_string();
+    let new_fork_dir = data_dir.join("by_id").join(&new_vol_ulid);
+
+    let cleanup = |new_fork_dir: &Path, symlink_path: &Path| {
+        let _ = std::fs::remove_file(symlink_path);
+        let _ = std::fs::remove_dir_all(new_fork_dir);
+    };
+
+    volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
+
+    let size = std::fs::read(source_fork_dir.join("volume.size")).map_err(|e| {
+        cleanup(&new_fork_dir, &symlink_path);
+        std::io::Error::other(format!(
+            "source volume has no volume.size (import may not have completed): {e}"
+        ))
+    })?;
+    if let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size) {
+        cleanup(&new_fork_dir, &symlink_path);
+        return Err(std::io::Error::other(format!(
+            "failed to copy volume.size: {e}"
+        )));
+    }
+
+    if let Err(e) = std::fs::write(new_fork_dir.join("volume.name"), fork_name) {
+        cleanup(&new_fork_dir, &symlink_path);
+        return Err(std::io::Error::other(format!(
+            "failed to write volume.name: {e}"
+        )));
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
+        cleanup(&new_fork_dir, &symlink_path);
+        return Err(std::io::Error::other(format!(
+            "failed to create by_name dir: {e}"
+        )));
+    }
+
+    if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
+        cleanup(&new_fork_dir, &symlink_path);
+        return Err(std::io::Error::other(format!(
+            "failed to create by_name symlink: {e}"
+        )));
+    }
+
+    let key =
+        elide_core::signing::generate_keypair(&new_fork_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
+            .map_err(|e| {
+                cleanup(&new_fork_dir, &symlink_path);
+                std::io::Error::other(format!("failed to generate fork keypair: {e}"))
+            })?;
+
+    elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_PROVENANCE_FILE).map_err(
+        |e| {
+            cleanup(&new_fork_dir, &symlink_path);
+            std::io::Error::other(format!("failed to write volume.provenance: {e}"))
+        },
+    )?;
+
+    println!("{}", new_fork_dir.display());
+    if coordinator_client::rescan(socket_path).is_err() {
+        eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
+    }
     Ok(())
 }
 

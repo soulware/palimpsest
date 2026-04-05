@@ -19,10 +19,8 @@ pub fn resolve_volume_dir(data_dir: &Path, name: &str) -> PathBuf {
     data_dir.join("by_name").join(name)
 }
 
-/// Volume names must be non-empty and contain only `[a-zA-Z0-9._-]`.
-///
-/// This avoids ambiguity with OCI refs (`:` is the tag separator) and ensures
-/// the name is safe as a filesystem entry under `by_name/`.
+/// Volume names must be non-empty, contain only `[a-zA-Z0-9._-]`, and not
+/// be reserved by the `import` subcommand (`status`, `attach`).
 pub fn validate_volume_name(name: &str) -> io::Result<()> {
     if name.is_empty() {
         return Err(io::Error::other("volume name must not be empty"));
@@ -34,6 +32,9 @@ pub fn validate_volume_name(name: &str) -> io::Result<()> {
         return Err(io::Error::other(format!(
             "invalid character {c:?} in volume name {name:?}: only [a-zA-Z0-9._-] allowed"
         )));
+    }
+    if matches!(name, "status" | "attach") {
+        return Err(io::Error::other(format!("'{name}' is a reserved name")));
     }
     Ok(())
 }
@@ -113,6 +114,17 @@ mod tests {
     #[test]
     fn slash_rejected() {
         assert!(validate_volume_name("foo/bar").is_err());
+    }
+
+    #[test]
+    fn reserved_names_rejected() {
+        for name in &["status", "attach"] {
+            let err = validate_volume_name(name).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved"),
+                "expected 'reserved' in error for {name:?}, got: {err}"
+            );
+        }
     }
 
     // ── parse_size ────────────────────────────────────────────────────────────

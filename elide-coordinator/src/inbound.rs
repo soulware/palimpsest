@@ -5,12 +5,12 @@
 // Exception: `import attach` streams multiple response lines until done.
 //
 // Unauthenticated operations (any caller):
-//   rescan              — trigger an immediate fork discovery pass
-//   status <volume>     — report running state of a named volume
-//   import <name> <ref> — spawn an OCI import; returns ULID
-//   import status <id>  — poll import state (running / done / failed)
-//   import attach <id>  — stream import output until completion
-//   delete <volume>     — stop all processes and remove the volume directory
+//   rescan                — trigger an immediate fork discovery pass
+//   status <volume>       — report running state of a named volume
+//   import <name> <ref>   — spawn an OCI import
+//   import status <name>  — poll import state by volume name (running / done / failed)
+//   import attach <name>  — stream import output by volume name until completion
+//   delete <volume>       — stop all processes and remove the volume directory
 //
 // Volume-process operations (macaroon required — not yet implemented):
 //   register <volume> <fork>   — mint a per-fork macaroon (PID-bound)
@@ -83,8 +83,8 @@ async fn handle(
 
     // `import attach` is the one streaming operation — it keeps the connection
     // open and writes lines until the import completes.
-    if let Some(ulid) = line.strip_prefix("import attach ") {
-        stream_import(ulid.trim(), &mut writer, &registry).await;
+    if let Some(name) = line.strip_prefix("import attach ") {
+        stream_import_by_name(name.trim(), &data_dir, &mut writer, &registry).await;
         return;
     }
 
@@ -129,9 +129,9 @@ async fn dispatch(
             match sub {
                 "status" => {
                     if sub_args.is_empty() {
-                        return "err usage: import status <ulid>".to_string();
+                        return "err usage: import status <name>".to_string();
                     }
-                    import_status(sub_args, registry).await
+                    import_status_by_name(sub_args, data_dir, registry).await
                 }
                 _ => {
                     // `import <name> <oci-ref>`: sub = name, sub_args = oci-ref
@@ -172,10 +172,30 @@ async fn start_import(
     }
 }
 
-async fn import_status(ulid: &str, registry: &ImportRegistry) -> String {
-    let job = registry.lock().await.get(ulid).cloned();
+/// Resolve a volume name to its import ULID via `import.lock`, if present.
+fn import_ulid_for_volume(name: &str, data_dir: &Path) -> Option<String> {
+    let lock_path = data_dir.join("by_name").join(name).join(import::LOCK_FILE);
+    std::fs::read_to_string(lock_path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+async fn import_status_by_name(name: &str, data_dir: &Path, registry: &ImportRegistry) -> String {
+    let vol_dir = data_dir.join("by_name").join(name);
+    if !vol_dir.exists() {
+        return format!("err volume not found: {name}");
+    }
+    let Some(ulid) = import_ulid_for_volume(name, data_dir) else {
+        // No active import lock — if volume is readonly the import completed.
+        if vol_dir.join("volume.readonly").exists() {
+            return "ok done".to_string();
+        }
+        return format!("err no active import for: {name}");
+    };
+    let job = registry.lock().await.get(&ulid).cloned();
     match job {
-        None => format!("err unknown import: {ulid}"),
+        // import.lock exists but not in registry (coordinator restarted mid-import)
+        None => "ok running".to_string(),
         Some(job) => match job.state().await {
             ImportState::Running => "ok running".to_string(),
             ImportState::Done => "ok done".to_string(),
@@ -186,11 +206,37 @@ async fn import_status(ulid: &str, registry: &ImportRegistry) -> String {
 
 /// Stream buffered and live import output to `writer`, closing with a terminal
 /// `ok done` or `err failed: <msg>` line when the import completes.
-async fn stream_import(ulid: &str, writer: &mut OwnedWriteHalf, registry: &ImportRegistry) {
-    let job = registry.lock().await.get(ulid).cloned();
-    let Some(job) = job else {
+async fn stream_import_by_name(
+    name: &str,
+    data_dir: &Path,
+    writer: &mut OwnedWriteHalf,
+    registry: &ImportRegistry,
+) {
+    let vol_dir = data_dir.join("by_name").join(name);
+    if !vol_dir.exists() {
         let _ = writer
-            .write_all(format!("err unknown import: {ulid}\n").as_bytes())
+            .write_all(format!("err volume not found: {name}\n").as_bytes())
+            .await;
+        return;
+    }
+    let Some(ulid) = import_ulid_for_volume(name, data_dir) else {
+        // No active import — if volume is readonly the import already completed.
+        if vol_dir.join("volume.readonly").exists() {
+            let _ = writer.write_all(b"ok done\n").await;
+        } else {
+            let _ = writer
+                .write_all(format!("err no active import for: {name}\n").as_bytes())
+                .await;
+        }
+        return;
+    };
+
+    let job = registry.lock().await.get(&ulid).cloned();
+    let Some(job) = job else {
+        // import.lock exists but not in registry (coordinator restarted mid-import).
+        // We can't stream output we never buffered; just report running.
+        let _ = writer
+            .write_all(b"err import output unavailable (coordinator restarted)\n")
             .await;
         return;
     };

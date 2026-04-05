@@ -3,7 +3,7 @@
 // Connects to coordinator.sock, sends one command, reads one response line.
 // A new connection is made per call — the protocol is request-response-close.
 //
-// Exception: `import_attach` reads multiple lines until a terminal line.
+// Exception: `import_attach_by_name` reads multiple lines until a terminal line.
 
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
@@ -41,35 +41,39 @@ pub fn status(socket_path: &Path, volume: &str) -> io::Result<String> {
 }
 
 /// Ask the coordinator to start an OCI import.
-/// Returns the import ULID on success.
-pub fn import_start(socket_path: &Path, name: &str, oci_ref: &str) -> io::Result<String> {
+/// Returns the import ULID on success (internal; callers use the volume name).
+pub fn import_start(socket_path: &Path, name: &str, oci_ref: &str) -> io::Result<()> {
     let resp = call(socket_path, &format!("import {name} {oci_ref}"))?;
     match resp.split_once(' ') {
-        Some(("ok", ulid)) => Ok(ulid.to_owned()),
+        Some(("ok", _ulid)) => Ok(()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
         _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
     }
 }
 
-/// Poll the state of an import job.
-/// Returns the raw response (`ok running`, `ok done`, `err failed: ...`).
-pub fn import_status(socket_path: &Path, ulid: &str) -> io::Result<String> {
-    call(socket_path, &format!("import status {ulid}"))
+/// Poll the state of an import job by volume name.
+/// Returns the raw state string (`running`, `done`, or an error).
+pub fn import_status_by_name(socket_path: &Path, name: &str) -> io::Result<String> {
+    call(socket_path, &format!("import status {name}"))
 }
 
-/// Stream import output to `out` until the import completes.
+/// Stream import output to `out` until the import completes, identified by volume name.
 ///
 /// Reads lines from the coordinator until a terminal `ok done` or `err ...`
 /// line is received. Each output line is written to `out`. Returns Ok(()) on
 /// success, Err on import failure or I/O error.
-pub fn import_attach(socket_path: &Path, ulid: &str, out: &mut dyn Write) -> io::Result<()> {
+pub fn import_attach_by_name(
+    socket_path: &Path,
+    name: &str,
+    out: &mut dyn Write,
+) -> io::Result<()> {
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         io::Error::other(format!(
             "coordinator not running ({}): {e}",
             socket_path.display()
         ))
     })?;
-    writeln!(stream, "import attach {ulid}")?;
+    writeln!(stream, "import attach {name}")?;
     stream.flush()?;
     stream.shutdown(std::net::Shutdown::Write)?;
 
