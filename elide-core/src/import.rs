@@ -166,11 +166,10 @@ pub fn import_image(
     let snap_ulid = last_segment_ulid.unwrap_or_else(|| Ulid::new().to_string());
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
-    // Volume-root size marker (readonly is written by the caller in meta.toml).
-    segment::write_file_atomic(
-        &vol_dir.join("volume.size"),
-        image_size.to_string().as_bytes(),
-    )?;
+    // Write size into volume.toml (read-modify-write to preserve name if already set).
+    let mut cfg = crate::config::VolumeConfig::read(vol_dir)?;
+    cfg.size = Some(image_size);
+    cfg.write(vol_dir)?;
 
     Ok(())
 }

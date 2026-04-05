@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod config;
 pub mod extentindex;
 pub mod gc;
 pub mod import;

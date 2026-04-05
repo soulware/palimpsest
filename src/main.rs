@@ -821,14 +821,25 @@ fn create_volume(
     let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
     elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
 
-    if let Some(path) = nbd_socket {
-        std::fs::write(vol_dir.join("nbd.socket"), path.to_string_lossy().as_ref())?;
-    } else if let Some(port) = nbd_port {
-        std::fs::write(vol_dir.join("nbd.port"), port.to_string())?;
-        if let Some(bind) = nbd_bind {
-            std::fs::write(vol_dir.join("nbd.bind"), bind)?;
-        }
+    let nbd = if let Some(path) = nbd_socket {
+        Some(elide_core::config::NbdConfig {
+            socket: Some(path),
+            ..Default::default()
+        })
+    } else {
+        nbd_port.map(|port| elide_core::config::NbdConfig {
+            port: Some(port),
+            bind: nbd_bind,
+            ..Default::default()
+        })
+    };
+
+    elide_core::config::VolumeConfig {
+        name: Some(name.to_owned()),
+        size: Some(bytes),
+        nbd,
     }
+    .write(&vol_dir)?;
 
     std::fs::create_dir_all(&by_name_dir)?;
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
@@ -880,23 +891,24 @@ fn create_fork(
 
     volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
 
-    let size = std::fs::read(source_fork_dir.join("volume.size")).map_err(|e| {
+    let src_cfg = elide_core::config::VolumeConfig::read(&source_fork_dir).map_err(|e| {
         cleanup(&new_fork_dir, &symlink_path);
-        std::io::Error::other(format!(
-            "source volume has no volume.size (import may not have completed): {e}"
-        ))
+        std::io::Error::other(format!("failed to read source volume config: {e}"))
     })?;
-    if let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size) {
+    let size = src_cfg.size.ok_or_else(|| {
         cleanup(&new_fork_dir, &symlink_path);
-        return Err(std::io::Error::other(format!(
-            "failed to copy volume.size: {e}"
-        )));
+        std::io::Error::other("source volume has no size (import may not have completed)")
+    })?;
+    if let Err(e) = (elide_core::config::VolumeConfig {
+        name: Some(fork_name.to_owned()),
+        size: Some(size),
+        nbd: None,
     }
-
-    if let Err(e) = std::fs::write(new_fork_dir.join("volume.name"), fork_name) {
+    .write(&new_fork_dir))
+    {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(std::io::Error::other(format!(
-            "failed to write volume.name: {e}"
+            "failed to write volume config: {e}"
         )));
     }
 
@@ -950,23 +962,25 @@ fn update_volume(
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
 
+    let mut cfg = elide_core::config::VolumeConfig::read(vol_dir)?;
     if no_nbd {
-        let _ = std::fs::remove_file(vol_dir.join("nbd.port"));
-        let _ = std::fs::remove_file(vol_dir.join("nbd.bind"));
-        let _ = std::fs::remove_file(vol_dir.join("nbd.socket"));
+        cfg.nbd = None;
     } else if let Some(path) = nbd_socket {
-        // Switch to Unix socket mode: remove TCP config, write socket path.
-        let _ = std::fs::remove_file(vol_dir.join("nbd.port"));
-        let _ = std::fs::remove_file(vol_dir.join("nbd.bind"));
-        std::fs::write(vol_dir.join("nbd.socket"), path.to_string_lossy().as_ref())?;
-    } else {
+        cfg.nbd = Some(elide_core::config::NbdConfig {
+            socket: Some(path),
+            ..Default::default()
+        });
+    } else if nbd_port.is_some() || nbd_bind.is_some() {
+        let existing = cfg.nbd.get_or_insert_with(Default::default);
         if let Some(port) = nbd_port {
-            std::fs::write(vol_dir.join("nbd.port"), port.to_string())?;
+            existing.port = Some(port);
+            existing.socket = None; // switching to TCP clears socket
         }
         if let Some(bind) = nbd_bind {
-            std::fs::write(vol_dir.join("nbd.bind"), bind)?;
+            existing.bind = Some(bind);
         }
     }
+    cfg.write(vol_dir)?;
 
     // Restart the volume process so it picks up the new config.
     let sock = vol_dir.join("control.sock");
@@ -1137,13 +1151,17 @@ fn remote_pull(
     // Step 3: reconstruct local directory skeleton.
     std::fs::create_dir_all(&vol_dir)?;
 
-    std::fs::write(vol_dir.join("volume.name"), name)?;
-
     let size = manifest
         .get("size")
         .and_then(|v| v.as_integer())
         .ok_or_else(|| std::io::Error::other("manifest.toml missing 'size'"))?;
-    std::fs::write(vol_dir.join("volume.size"), size.to_string())?;
+
+    elide_core::config::VolumeConfig {
+        name: Some(name.to_owned()),
+        size: Some(size as u64),
+        nbd: None,
+    }
+    .write(&vol_dir)?;
 
     if manifest
         .get("readonly")

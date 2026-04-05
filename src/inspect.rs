@@ -20,18 +20,16 @@ use elide_core::{segment, writelog};
 use crate::ls;
 
 pub fn run(dir: &Path) -> io::Result<()> {
-    // Read human-readable name from volume.name if present; fall back to dir name.
-    let vol_name = fs::read_to_string(dir.join("volume.name"))
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .or_else(|| {
-            dir.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_owned())
-        })
-        .unwrap_or_else(|| "<unknown>".to_owned());
+    let cfg = elide_core::config::VolumeConfig::read(dir)?;
 
-    let size_bytes = read_size(dir)?;
+    let vol_name = cfg
+        .name
+        .as_deref()
+        .or_else(|| dir.file_name().and_then(|s| s.to_str()))
+        .unwrap_or("<unknown>")
+        .to_owned();
+
+    let size_bytes = cfg.size;
     let is_readonly = dir.join("volume.readonly").exists();
     let meta = read_meta(dir);
 
@@ -629,20 +627,6 @@ struct VolumeMeta {
 fn read_meta(dir: &Path) -> Option<VolumeMeta> {
     let content = fs::read_to_string(dir.join("meta.toml")).ok()?;
     toml::from_str(&content).ok()
-}
-
-fn read_size(dir: &Path) -> io::Result<Option<u64>> {
-    match fs::read_to_string(dir.join("volume.size")) {
-        Ok(s) => {
-            let b = s
-                .trim()
-                .parse::<u64>()
-                .map_err(|e| io::Error::other(format!("bad size file: {e}")))?;
-            Ok(Some(b))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 fn fmt_size(bytes: u64) -> String {
