@@ -590,13 +590,10 @@ fn reconcile_by_name(data_dir: &Path) {
         if ulid::Ulid::from_string(ulid_str).is_err() {
             continue;
         }
-        let Ok(name) = std::fs::read_to_string(vol_dir.join("volume.name")) else {
+        let Some(name) = read_volume_name(&vol_dir) else {
             continue;
         };
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
+        let name = name.as_str();
         let link = by_name_dir.join(name);
         if link.is_symlink() || link.exists() {
             // Already present (symlink or unexpected non-symlink); leave it.
@@ -611,14 +608,14 @@ fn reconcile_by_name(data_dir: &Path) {
     }
 }
 
-/// Read the volume name from `<fork_dir>/volume.name`, if present and non-empty.
+/// Read the volume name from `volume.toml`, if present and non-empty.
 fn read_volume_name(fork_dir: &Path) -> Option<String> {
-    let s = std::fs::read_to_string(fork_dir.join("volume.name")).ok()?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+    let cfg = elide_core::config::VolumeConfig::read(fork_dir).ok()?;
+    let name = cfg.name?;
+    if name.trim().is_empty() {
         None
     } else {
-        Some(trimmed.to_owned())
+        Some(name)
     }
 }
 

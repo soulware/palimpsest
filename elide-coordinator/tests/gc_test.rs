@@ -571,8 +571,14 @@ fn drain_failure_skips_gc_and_data_survives() {
         elide_core::signing::VOLUME_PUB_FILE,
     )
     .unwrap();
-    // volume.size is required by upload_manifest inside drain_pending.
-    fs::write(fork_dir.join("volume.size"), b"1073741824").unwrap();
+    // volume.toml (with size) is required by upload_manifest inside drain_pending.
+    elide_core::config::VolumeConfig {
+        name: Some("test-vol".into()),
+        size: Some(1073741824),
+        ..Default::default()
+    }
+    .write(fork_dir)
+    .unwrap();
 
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
     fs::create_dir_all(fork_dir.join("segments")).unwrap();

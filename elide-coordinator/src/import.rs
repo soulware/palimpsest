@@ -129,7 +129,13 @@ pub async fn spawn_import(
     // Write volume.readonly immediately so a crashed import is never supervised
     // as a writable volume.
     std::fs::write(vol_dir.join("volume.readonly"), "")?;
-    std::fs::write(vol_dir.join("volume.name"), vol_name)?;
+    // Write the name into volume.toml (size is added later by elide-core once
+    // the import completes).
+    elide_core::config::VolumeConfig {
+        name: Some(vol_name.to_owned()),
+        ..Default::default()
+    }
+    .write(&vol_dir)?;
 
     // Write the import lock.
     let import_ulid = Ulid::new().to_string();
