@@ -846,13 +846,8 @@ fn create_volume(
     let by_name_path = by_name_dir.join(name);
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &by_name_path)?;
 
-    println!(
-        "{}",
-        by_name_path
-            .canonicalize()
-            .unwrap_or(by_name_path)
-            .display()
-    );
+    println!("{}", by_name_path.display());
+    println!("{}", vol_dir.display());
     Ok(())
 }
 
