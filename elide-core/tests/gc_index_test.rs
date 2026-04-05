@@ -69,8 +69,7 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     }
 
     // Obtain GC checkpoint ULIDs from the volume (as the coordinator would).
-    let (new_ulid_str, _) = vol.gc_checkpoint().unwrap();
-    let new_ulid = Ulid::from_string(&new_ulid_str).unwrap();
+    let (new_ulid, _) = vol.gc_checkpoint().unwrap();
 
     // Run GC compaction — produces `gc/<new>.pending`.
     let (consumed_ulids, produced_ulid, paths_to_delete) =
@@ -184,8 +183,7 @@ fn gc_cleanup_without_idx_deletion_leaves_dangling_idx() {
         extract_idx(&seg_path, &idx_path).unwrap();
     }
 
-    let (new_ulid_str, _) = vol.gc_checkpoint().unwrap();
-    let new_ulid = Ulid::from_string(&new_ulid_str).unwrap();
+    let (new_ulid, _) = vol.gc_checkpoint().unwrap();
     let (consumed_ulids, produced_ulid, paths_to_delete) =
         common::simulate_coord_gc_local(&fork_dir, new_ulid, 2).unwrap();
     assert_eq!(produced_ulid, new_ulid);

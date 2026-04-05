@@ -247,8 +247,8 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         "test-vol",
         &store,
         &gc_config,
-        &repack_ulid,
-        &sweep_ulid,
+        repack_ulid,
+        sweep_ulid,
     ))
     .unwrap();
 
@@ -295,8 +295,8 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         "test-vol",
         &store,
         &gc_config,
-        &repack_ulid2,
-        &sweep_ulid2,
+        repack_ulid2,
+        sweep_ulid2,
     ))
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
@@ -401,8 +401,8 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
         "test-vol",
         &store,
         &gc_config,
-        &repack_ulid,
-        &sweep_ulid,
+        repack_ulid,
+        sweep_ulid,
     ))
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
@@ -518,8 +518,8 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
         "test-vol",
         &store,
         &gc_config,
-        &repack_ulid,
-        &sweep_ulid,
+        repack_ulid,
+        sweep_ulid,
     ))
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
@@ -650,8 +650,8 @@ fn drain_failure_skips_gc_and_data_survives() {
         "test-vol",
         &good_store,
         &gc_config,
-        &repack_ulid,
-        &sweep_ulid,
+        repack_ulid,
+        sweep_ulid,
     ))
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
@@ -735,8 +735,8 @@ fn gc_restart_safety_applied_handoff() {
         "test-vol",
         &store,
         &gc_config,
-        &repack_ulid,
-        &sweep_ulid,
+        repack_ulid,
+        sweep_ulid,
     ))
     .unwrap();
 

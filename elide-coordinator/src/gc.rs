@@ -145,8 +145,8 @@ pub async fn gc_fork(
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     config: &GcConfig,
-    repack_ulid: &str,
-    sweep_ulid: &str,
+    repack_ulid: Ulid,
+    sweep_ulid: Ulid,
 ) -> Result<GcStats> {
     let segments_dir = fork_dir.join("segments");
     if !segments_dir.exists() {
@@ -165,19 +165,16 @@ pub async fn gc_fork(
     // sweep_ulid would sort below the GC output on crash-recovery rebuild,
     // causing the GC output to win for shared LBAs and return stale data.
     debug_assert!(
-        {
-            let sweep = Ulid::from_string(sweep_ulid).unwrap_or(ulid::Ulid::nil());
-            elide_core::segment::collect_segment_files(&fork_dir.join("pending"))
-                .unwrap_or_default()
-                .iter()
-                .all(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .and_then(|n| Ulid::from_string(n).ok())
-                        .map(|u| u > sweep)
-                        .unwrap_or(true)
-                })
-        },
+        elide_core::segment::collect_segment_files(&fork_dir.join("pending"))
+            .unwrap_or_default()
+            .iter()
+            .all(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| Ulid::from_string(n).ok())
+                    .map(|u| u > sweep_ulid)
+                    .unwrap_or(true)
+            }),
         "gc_fork called with pending segments at or below sweep_ulid; \
          drain_pending must complete before GC runs"
     );
@@ -685,8 +682,9 @@ async fn compact_segments(
     gc_dir: &Path,
     _volume_id: &str,
     _store: &Arc<dyn ObjectStore>,
-    new_ulid_str: &str,
+    new_ulid: Ulid,
 ) -> Result<()> {
+    let new_ulid_str = new_ulid.to_string();
     // Read live extent bodies from local segment files.
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
     let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
@@ -802,13 +800,12 @@ async fn compact_segments(
     // segments/.  S3 upload happens in apply_done_handoffs, after the volume
     // has re-signed the segment, so that S3 always receives the volume-signed
     // version rather than the ephemeral-signed coordinator output.
-    let final_path = gc_dir.join(new_ulid_str);
+    let final_path = gc_dir.join(&new_ulid_str);
     tokio::fs::rename(&tmp_path, &final_path)
         .await
         .context("staging compacted segment in gc/")?;
 
     // Write the handoff file using the typed HandoffLine format.
-    let new_ulid = Ulid::from_string(new_ulid_str).context("parsing new ulid")?;
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
     // Track which candidate ULIDs get at least one Repack or Remove line.
     // Any candidate not covered had only DEDUP_REF live entries; it needs a
@@ -1433,7 +1430,7 @@ mod tests {
         fs::create_dir_all(&segments_dir).unwrap();
 
         let old_ulid = Ulid::from_parts(999, 20).to_string();
-        let handoff_ulid = Ulid::from_parts(1000, 20).to_string();
+        let handoff_ulid = Ulid::from_parts(1000, 20);
 
         // Create a fake segment file — read_extent_bodies opens the file even
         // when live_entries is empty, so the path must exist.
@@ -1452,7 +1449,7 @@ mod tests {
             body_section_start: 0,
         };
 
-        compact_segments(vec![candidate], &gc_dir, "vol", &store, &handoff_ulid)
+        compact_segments(vec![candidate], &gc_dir, "vol", &store, handoff_ulid)
             .await
             .unwrap();
 
@@ -1599,9 +1596,9 @@ mod tests {
             small_segment_bytes: u64::MAX,
             interval_secs: 0,
         };
-        let sweep_ulid = Ulid::new().to_string();
-        let repack_ulid = Ulid::new().to_string();
-        let stats = gc_fork(dir, "test-vol", &store, &config, &repack_ulid, &sweep_ulid)
+        let sweep_ulid = Ulid::new();
+        let repack_ulid = Ulid::new();
+        let stats = gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
             .await
             .unwrap();
         assert!(

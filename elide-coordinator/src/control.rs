@@ -24,6 +24,7 @@ use elide_core::volume::CompactionStats;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::warn;
+use ulid::Ulid;
 
 /// Flush the volume WAL.  Returns `true` on success.
 /// Returns `false` and logs a warning if the socket is absent or the call fails.
@@ -60,20 +61,22 @@ pub async fn repack(fork_dir: &Path, min_live_ratio: f64) -> Option<CompactionSt
 /// Returns `Some((repack_ulid, sweep_ulid))` on success.
 /// Returns `None` and logs a warning if the socket is absent (volume not
 /// running) or if the call fails for any reason.
-pub async fn gc_checkpoint(fork_dir: &Path) -> Option<(String, String)> {
+pub async fn gc_checkpoint(fork_dir: &Path) -> Option<(Ulid, Ulid)> {
     let response = call(fork_dir, "gc_checkpoint").await?;
     let rest = response.strip_prefix("ok ")?;
     let mut parts = rest.splitn(2, ' ');
-    let u1 = parts.next()?.trim().to_owned();
-    let u2 = parts.next()?.trim().to_owned();
-    if u1.is_empty() || u2.is_empty() {
-        warn!(
-            "[control] gc_checkpoint for {} returned malformed response",
-            fork_dir.display()
-        );
-        return None;
+    let u1 = parts.next()?.trim();
+    let u2 = parts.next()?.trim();
+    match (Ulid::from_string(u1), Ulid::from_string(u2)) {
+        (Ok(u1), Ok(u2)) => Some((u1, u2)),
+        _ => {
+            warn!(
+                "[control] gc_checkpoint for {} returned malformed response",
+                fork_dir.display()
+            );
+            None
+        }
     }
-    Some((u1, u2))
 }
 
 /// Apply pending/applied GC handoffs on the volume process for `fork_dir`.

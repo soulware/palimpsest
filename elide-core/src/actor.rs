@@ -26,6 +26,8 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, bounded, tick};
 use log::warn;
 
+use ulid::Ulid;
+
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
@@ -104,7 +106,7 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<CompactionStats>>,
     },
     GcCheckpoint {
-        reply: Sender<io::Result<(String, String)>>,
+        reply: Sender<io::Result<(Ulid, Ulid)>>,
     },
     Snapshot {
         reply: Sender<io::Result<String>>,
@@ -464,7 +466,7 @@ impl VolumeHandle {
     /// GC output segments (repack and sweep).  The two ULIDs are generated 2ms
     /// apart on the volume side so they are strictly ordered and have distinct
     /// timestamps.  Blocks until the actor replies.
-    pub fn gc_checkpoint(&self) -> io::Result<(String, String)> {
+    pub fn gc_checkpoint(&self) -> io::Result<(Ulid, Ulid)> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })

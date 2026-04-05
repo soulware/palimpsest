@@ -439,8 +439,8 @@ async fn fork_loop(
                 &volume_id,
                 &store,
                 &gc_config,
-                &repack_ulid,
-                &sweep_ulid,
+                repack_ulid,
+                sweep_ulid,
             )
             .await
             {

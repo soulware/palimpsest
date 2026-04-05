@@ -829,7 +829,7 @@ impl Volume {
     ///
     /// All ULIDs come from the volume's own monotonic mint, never from an
     /// external clock — coordinator clock skew cannot corrupt ULID ordering.
-    pub fn gc_checkpoint(&mut self) -> io::Result<(String, String)> {
+    pub fn gc_checkpoint(&mut self) -> io::Result<(Ulid, Ulid)> {
         // Mint all four ULIDs before any I/O.  The ordering constraint —
         // u_repack < u_sweep < u_flush < u_wal — is established here, before
         // any flush or WAL rotation.  UlidMint guarantees strict monotonicity
@@ -848,7 +848,7 @@ impl Volume {
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
         self.pending_entries = pending_entries;
-        Ok((u_repack.to_string(), u_sweep.to_string()))
+        Ok((u_repack, u_sweep))
     }
 
     /// Apply any pending GC handoff files written by the coordinator.
@@ -3729,36 +3729,36 @@ mod tests {
         segment::read_extent_bodies(&old_path, old_bss, &mut entries).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
+        let new_ulid_str = new_ulid.to_string();
 
         let gc_dir = fork_dir.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
 
         // Coordinator uses an ephemeral signer; the volume re-signs on handoff.
         let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
-        let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+        let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
         let new_bss =
             segment::write_segment(&tmp_path, &mut entries, ephemeral_signer.as_ref()).unwrap();
-        fs::rename(&tmp_path, gc_dir.join(&new_ulid)).unwrap();
+        fs::rename(&tmp_path, gc_dir.join(&new_ulid_str)).unwrap();
 
         let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
-        let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
         let handoff_lines: Vec<HandoffLine> = entries
             .iter()
             .filter(|e| !e.is_dedup_ref)
             .map(|e| HandoffLine::Repack {
                 hash: e.hash,
                 old_ulid: old_ulid_parsed,
-                new_ulid: new_ulid_parsed,
+                new_ulid,
                 new_offset: new_bss + e.stored_offset,
             })
             .collect();
         fs::write(
-            gc_dir.join(format!("{new_ulid}.pending")),
+            gc_dir.join(format!("{new_ulid_str}.pending")),
             crate::gc::format_handoff_file(handoff_lines),
         )
         .unwrap();
 
-        new_ulid
+        new_ulid_str
     }
 
     #[test]

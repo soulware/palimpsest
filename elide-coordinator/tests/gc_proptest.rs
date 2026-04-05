@@ -161,8 +161,8 @@ proptest! {
                         "test-vol",
                         &store,
                         &gc_config,
-                        &repack_ulid,
-                        &sweep_ulid,
+                        repack_ulid,
+                        sweep_ulid,
                     ));
                     let _ = vol.apply_gc_handoffs();
                     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
@@ -277,8 +277,8 @@ proptest! {
                         "test-vol",
                         &store,
                         &gc_config,
-                        &repack_ulid,
-                        &sweep_ulid,
+                        repack_ulid,
+                        sweep_ulid,
                     ));
 
                     // Step 2: volume re-signs GC output, updates extent index.
