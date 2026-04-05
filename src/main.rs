@@ -452,6 +452,18 @@ fn main() {
                         eprintln!("  elide volume import status {name}   # check state");
                     } else {
                         // Sync: stream output and wait for completion.
+                        // Install a Ctrl-C handler so the user gets a clear
+                        // message if they interrupt: the import keeps running
+                        // in the background and can be re-attached later.
+                        let name_for_ctrlc = name.clone();
+                        ctrlc::set_handler(move || {
+                            eprintln!("\nImport still running in background.");
+                            eprintln!("  elide volume import attach {name_for_ctrlc}");
+                            eprintln!("  elide volume import status {name_for_ctrlc}");
+                            std::process::exit(130);
+                        })
+                        .ok();
+
                         let mut stdout = std::io::stdout();
                         if let Err(e) = coordinator_client::import_attach_by_name(
                             &socket_path,
@@ -702,14 +714,13 @@ enum ListFilter {
 
 fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     let by_name_dir = data_dir.join("by_name");
-    let mut names: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, bool)> = Vec::new(); // (name, importing)
     match std::fs::read_dir(&by_name_dir) {
-        Ok(entries) => {
-            for entry in entries {
+        Ok(dir_entries) => {
+            for entry in dir_entries {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                // Resolve symlink to get the actual volume dir, then check for
-                // volume.readonly marker.
+                // Resolve symlink to get the actual volume dir.
                 let vol_dir = std::fs::read_link(entry.path())
                     .ok()
                     .map(|target| {
@@ -727,19 +738,24 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
                     ListFilter::Writable => !is_readonly,
                 };
                 if include {
-                    names.push(name);
+                    let importing = vol_dir.join("import.lock").exists();
+                    entries.push((name, importing));
                 }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    names.sort();
-    if names.is_empty() {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    if entries.is_empty() {
         println!("no volumes found in {}", data_dir.display());
     } else {
-        for name in &names {
-            println!("{name}");
+        for (name, importing) in &entries {
+            if *importing {
+                println!("{name}  (importing)");
+            } else {
+                println!("{name}");
+            }
         }
     }
     Ok(())

@@ -15,6 +15,7 @@ tracing-log        = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono         = { version = "0.4", default-features = false, features = ["clock"] }
 clap           = { version = "4", features = ["derive", "env"] }
+ctrlc          = "3"
 elide-core     = { path = "elide-core" }
 elide-fetch    = { path = "elide-fetch" }
 ext4-view      = { version = "0.9", features = ["std"] }

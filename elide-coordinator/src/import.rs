@@ -124,6 +124,7 @@ pub async fn spawn_import(
     let vol_ulid = Ulid::new().to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
+    std::fs::create_dir_all(&by_name_dir)?;
     std::fs::create_dir_all(&vol_dir)?;
     // Write volume.readonly immediately so a crashed import is never supervised
     // as a writable volume.
@@ -133,6 +134,10 @@ pub async fn spawn_import(
     // Write the import lock.
     let import_ulid = Ulid::new().to_string();
     std::fs::write(vol_dir.join(LOCK_FILE), &import_ulid)?;
+
+    // Create the by_name symlink immediately so `import status/attach` can
+    // resolve the volume before the import completes. Removed on failure.
+    std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &symlink_path)?;
 
     let mut cmd = tokio::process::Command::new(elide_import_bin);
     cmd.arg(&vol_dir)
@@ -170,10 +175,8 @@ pub async fn spawn_import(
         .await
         .insert(import_ulid.clone(), job.clone());
 
-    let vol_name_owned = vol_name.to_owned();
     let import_ulid_clone = import_ulid.clone();
     tokio::spawn(async move {
-        let vol_name = vol_name_owned.as_str();
         // Stream stderr into the job's output buffer.
         if let Some(stderr) = child.stderr.take() {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
@@ -185,22 +188,21 @@ pub async fn spawn_import(
         // Wait for the process to exit.
         let final_state = match child.wait().await {
             Ok(s) if s.success() => {
-                // Create the by_name symlink now that the import succeeded.
-                let target = format!("../by_id/{vol_ulid}");
-                if let Err(e) = std::os::unix::fs::symlink(&target, &symlink_path) {
-                    warn!("[import {import_ulid_clone}] failed to create by_name/{vol_name}: {e}");
-                }
                 info!("[import {import_ulid_clone}] done");
                 ImportState::Done
             }
             Ok(s) => {
                 let msg = format!("exited with {s}");
                 warn!("[import {import_ulid_clone}] failed: {msg}");
+                // Remove the by_name symlink so the name is not reserved by a
+                // failed import (the vol_dir is left for post-mortem inspection).
+                let _ = std::fs::remove_file(&symlink_path);
                 ImportState::Failed(msg)
             }
             Err(e) => {
                 let msg = format!("wait error: {e}");
                 warn!("[import {import_ulid_clone}] failed: {msg}");
+                let _ = std::fs::remove_file(&symlink_path);
                 ImportState::Failed(msg)
             }
         };
