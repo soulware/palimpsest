@@ -18,7 +18,9 @@ fn call(socket_path: &Path, cmd: &str) -> io::Result<String> {
     })?;
     writeln!(stream, "{cmd}")?;
     stream.flush()?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    // Ignore ENOTCONN: the coordinator may have already closed its end by the
+    // time we shut down our write half, which is harmless.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut reader = io::BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
