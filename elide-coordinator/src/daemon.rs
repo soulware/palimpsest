@@ -321,13 +321,10 @@ fn reconcile_by_name(data_dir: &Path) {
         if ulid::Ulid::from_string(ulid_str).is_err() {
             continue;
         }
-        let Ok(name) = std::fs::read_to_string(vol_dir.join("volume.name")) else {
+        let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir) else {
             continue;
         };
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
+        let name = name.as_str();
         let link = by_name_dir.join(name);
         if link.is_symlink() || link.exists() {
             // Already present (symlink or unexpected non-symlink); leave it.

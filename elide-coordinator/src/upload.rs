@@ -213,15 +213,17 @@ async fn upload_manifest(
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let name = tokio::fs::read_to_string(vol_dir.join("volume.name"))
-        .await
-        .context("reading volume.name")?;
-    let name = name.trim();
-
-    let size_str = tokio::fs::read_to_string(vol_dir.join("volume.size"))
-        .await
-        .context("reading volume.size")?;
-    let size: u64 = size_str.trim().parse().context("parsing volume.size")?;
+    let cfg = elide_core::config::VolumeConfig::read(vol_dir).context("reading volume.toml")?;
+    let name = cfg
+        .name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("volume.toml missing name"))?
+        .trim()
+        .to_owned();
+    let name = name.as_str();
+    let size = cfg
+        .size
+        .ok_or_else(|| anyhow::anyhow!("volume.toml missing size"))?;
 
     let readonly = vol_dir.join("volume.readonly").exists();
 
@@ -392,8 +394,13 @@ mod tests {
         let index_dir = vol_dir.join("index");
         std::fs::create_dir_all(&pending_dir).unwrap();
         std::fs::create_dir_all(&segments_dir).unwrap();
-        std::fs::write(vol_dir.join("volume.name"), "test-vol").unwrap();
-        std::fs::write(vol_dir.join("volume.size"), "4096").unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("test-vol".into()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
 
         let (signer, _) = generate_ephemeral_signer();
 
@@ -465,8 +472,13 @@ mod tests {
         let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
         std::fs::create_dir_all(&segments_dir).unwrap();
-        std::fs::write(vol_dir.join("volume.name"), "test-vol").unwrap();
-        std::fs::write(vol_dir.join("volume.size"), "4096").unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("test-vol".into()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
 
         let fake_pub = b"fakepublickey12345678901234567890";
         std::fs::write(vol_dir.join("volume.pub"), fake_pub).unwrap();
@@ -493,8 +505,13 @@ mod tests {
         let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
         std::fs::create_dir_all(&segments_dir).unwrap();
-        std::fs::write(vol_dir.join("volume.name"), "my-vol").unwrap();
-        std::fs::write(vol_dir.join("volume.size"), "8192").unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("my-vol".into()),
+            size: Some(8192),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
 
         let store_tmp = TempDir::new().unwrap();

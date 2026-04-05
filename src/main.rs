@@ -52,6 +52,9 @@ enum Command {
         /// (volume runs for coordinator IPC only).
         #[arg(long)]
         port: Option<u16>,
+        /// Unix socket path for the NBD server. Mutually exclusive with --port.
+        #[arg(long, conflicts_with = "port")]
+        socket: Option<PathBuf>,
         /// Serve as a read-only block device (auto-detected for imported bases;
         /// use this flag to explicitly serve a writable volume read-only)
         #[arg(long)]
@@ -174,11 +177,15 @@ enum VolumeCommand {
         #[arg(long)]
         size: Option<String>,
         /// Port for the NBD server (exposes the volume over NBD on first start)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "nbd_socket")]
         nbd_port: Option<u16>,
         /// Address to bind the NBD server (default: 127.0.0.1)
         #[arg(long)]
         nbd_bind: Option<String>,
+        /// Unix socket path for the NBD server. Omit the path to use the
+        /// default (nbd.sock inside the volume directory).
+        #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
+        nbd_socket: Option<PathBuf>,
     },
 
     /// Update configuration for a running volume
@@ -186,12 +193,17 @@ enum VolumeCommand {
         /// Volume name
         name: String,
         /// Change the NBD server port (restarts the volume process)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "nbd_socket")]
         nbd_port: Option<u16>,
         /// Change the NBD bind address (restarts the volume process)
         #[arg(long)]
         nbd_bind: Option<String>,
-        /// Disable NBD serving (removes nbd.port and nbd.bind, restarts the volume process)
+        /// Set or change the Unix socket path for the NBD server. Omit the
+        /// path to use the default (nbd.sock inside the volume directory).
+        /// Restarts the volume process.
+        #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
+        nbd_socket: Option<PathBuf>,
+        /// Disable NBD serving (removes nbd.port, nbd.bind, nbd.socket; restarts the volume process)
         #[arg(long)]
         no_nbd: bool,
     },
@@ -365,10 +377,16 @@ fn main() {
                 size,
                 nbd_port,
                 nbd_bind,
+                nbd_socket,
             } => {
-                if let Err(e) =
-                    create_volume(&args.data_dir, &name, size.as_deref(), nbd_port, nbd_bind)
-                {
+                if let Err(e) = create_volume(
+                    &args.data_dir,
+                    &name,
+                    size.as_deref(),
+                    nbd_port,
+                    nbd_bind,
+                    nbd_socket,
+                ) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -383,10 +401,11 @@ fn main() {
                 name,
                 nbd_port,
                 nbd_bind,
+                nbd_socket,
                 no_nbd,
             } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                if let Err(e) = update_volume(&vol_dir, nbd_port, nbd_bind, no_nbd) {
+                if let Err(e) = update_volume(&vol_dir, nbd_port, nbd_bind, nbd_socket, no_nbd) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -558,6 +577,7 @@ fn main() {
             size,
             bind,
             port,
+            socket,
             readonly,
             force_origin,
         } => {
@@ -566,10 +586,15 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 elide_fetch::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
+            let nbd_bind = if let Some(path) = socket {
+                Some(nbd::NbdBind::Unix(path))
+            } else {
+                port.map(|p| nbd::NbdBind::Tcp { bind, port: p })
+            };
             // Serve as readonly if explicitly requested or if the volume.readonly
             // marker is present (imported bases have no private key on disk).
             if readonly || fork_dir.join("volume.readonly").exists() {
-                nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port, fetch_config)
+                nbd::run_volume_readonly(&fork_dir, size_bytes, nbd_bind, fetch_config)
                     .expect("readonly NBD server error");
             } else {
                 std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
@@ -601,7 +626,7 @@ fn main() {
                     elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
                         .expect("failed to load volume signing key")
                 };
-                nbd::run_volume_signed(&fork_dir, size_bytes, &bind, port, signer, fetch_config)
+                nbd::run_volume_signed(&fork_dir, size_bytes, nbd_bind, signer, fetch_config)
                     .expect("volume NBD server error");
             }
         }
@@ -767,6 +792,7 @@ fn create_volume(
     size: Option<&str>,
     nbd_port: Option<u16>,
     nbd_bind: Option<String>,
+    nbd_socket: Option<PathBuf>,
 ) -> std::io::Result<()> {
     validate_volume_name(name)?;
     let size_str =
@@ -790,24 +816,37 @@ fn create_volume(
     let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
     std::fs::create_dir_all(&vol_dir)?;
-    std::fs::write(vol_dir.join("volume.name"), name)?;
     std::fs::create_dir_all(vol_dir.join("pending"))?;
     std::fs::create_dir_all(vol_dir.join("segments"))?;
-    std::fs::write(vol_dir.join("volume.size"), bytes.to_string())?;
 
     let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
     elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
 
-    if let Some(port) = nbd_port {
-        std::fs::write(vol_dir.join("nbd.port"), port.to_string())?;
-        if let Some(bind) = nbd_bind {
-            std::fs::write(vol_dir.join("nbd.bind"), bind)?;
-        }
+    let nbd = if let Some(path) = nbd_socket {
+        Some(elide_core::config::NbdConfig {
+            socket: Some(path),
+            ..Default::default()
+        })
+    } else {
+        nbd_port.map(|port| elide_core::config::NbdConfig {
+            port: Some(port),
+            bind: nbd_bind,
+            ..Default::default()
+        })
+    };
+
+    elide_core::config::VolumeConfig {
+        name: Some(name.to_owned()),
+        size: Some(bytes),
+        nbd,
     }
+    .write(&vol_dir)?;
 
     std::fs::create_dir_all(&by_name_dir)?;
-    std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
+    let by_name_path = by_name_dir.join(name);
+    std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &by_name_path)?;
 
+    println!("{}", by_name_path.display());
     println!("{}", vol_dir.display());
     Ok(())
 }
@@ -855,23 +894,24 @@ fn create_fork(
 
     volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
 
-    let size = std::fs::read(source_fork_dir.join("volume.size")).map_err(|e| {
+    let src_cfg = elide_core::config::VolumeConfig::read(&source_fork_dir).map_err(|e| {
         cleanup(&new_fork_dir, &symlink_path);
-        std::io::Error::other(format!(
-            "source volume has no volume.size (import may not have completed): {e}"
-        ))
+        std::io::Error::other(format!("failed to read source volume config: {e}"))
     })?;
-    if let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size) {
+    let size = src_cfg.size.ok_or_else(|| {
         cleanup(&new_fork_dir, &symlink_path);
-        return Err(std::io::Error::other(format!(
-            "failed to copy volume.size: {e}"
-        )));
+        std::io::Error::other("source volume has no size (import may not have completed)")
+    })?;
+    if let Err(e) = (elide_core::config::VolumeConfig {
+        name: Some(fork_name.to_owned()),
+        size: Some(size),
+        nbd: None,
     }
-
-    if let Err(e) = std::fs::write(new_fork_dir.join("volume.name"), fork_name) {
+    .write(&new_fork_dir))
+    {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(std::io::Error::other(format!(
-            "failed to write volume.name: {e}"
+            "failed to write volume config: {e}"
         )));
     }
 
@@ -912,28 +952,38 @@ fn create_fork(
 
 /// Update configuration for a volume and restart it if running.
 ///
-/// Writes or removes nbd.port / nbd.bind, then sends `shutdown` to the volume's
-/// control socket. The supervisor restarts the process, picking up the new config.
+/// Writes or removes nbd.port / nbd.bind / nbd.socket, then sends `shutdown`
+/// to the volume's control socket. The supervisor restarts the process, picking
+/// up the new config.
 fn update_volume(
     vol_dir: &Path,
     nbd_port: Option<u16>,
     nbd_bind: Option<String>,
+    nbd_socket: Option<PathBuf>,
     no_nbd: bool,
 ) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
 
+    let mut cfg = elide_core::config::VolumeConfig::read(vol_dir)?;
     if no_nbd {
-        let _ = std::fs::remove_file(vol_dir.join("nbd.port"));
-        let _ = std::fs::remove_file(vol_dir.join("nbd.bind"));
-    } else {
+        cfg.nbd = None;
+    } else if let Some(path) = nbd_socket {
+        cfg.nbd = Some(elide_core::config::NbdConfig {
+            socket: Some(path),
+            ..Default::default()
+        });
+    } else if nbd_port.is_some() || nbd_bind.is_some() {
+        let existing = cfg.nbd.get_or_insert_with(Default::default);
         if let Some(port) = nbd_port {
-            std::fs::write(vol_dir.join("nbd.port"), port.to_string())?;
+            existing.port = Some(port);
+            existing.socket = None; // switching to TCP clears socket
         }
         if let Some(bind) = nbd_bind {
-            std::fs::write(vol_dir.join("nbd.bind"), bind)?;
+            existing.bind = Some(bind);
         }
     }
+    cfg.write(vol_dir)?;
 
     // Restart the volume process so it picks up the new config.
     let sock = vol_dir.join("control.sock");
@@ -1104,13 +1154,17 @@ fn remote_pull(
     // Step 3: reconstruct local directory skeleton.
     std::fs::create_dir_all(&vol_dir)?;
 
-    std::fs::write(vol_dir.join("volume.name"), name)?;
-
     let size = manifest
         .get("size")
         .and_then(|v| v.as_integer())
         .ok_or_else(|| std::io::Error::other("manifest.toml missing 'size'"))?;
-    std::fs::write(vol_dir.join("volume.size"), size.to_string())?;
+
+    elide_core::config::VolumeConfig {
+        name: Some(name.to_owned()),
+        size: Some(size as u64),
+        nbd: None,
+    }
+    .write(&vol_dir)?;
 
     if manifest
         .get("readonly")

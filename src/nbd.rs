@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -58,6 +59,39 @@ const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 64;
 
 // COW granularity — 4KB blocks
 const COW_BLOCK: u64 = 4096;
+
+/// How to expose the NBD server.
+pub enum NbdBind {
+    /// Listen on a TCP socket.
+    Tcp { bind: String, port: u16 },
+    /// Listen on a Unix domain socket at the given path.
+    Unix(PathBuf),
+}
+
+/// Combined Read + Write bound for use as a trait object.
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Listener abstraction over TCP and Unix domain sockets.
+enum NbdListener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+impl NbdListener {
+    fn accept(&self) -> io::Result<(Box<dyn ReadWrite>, String)> {
+        match self {
+            NbdListener::Tcp(l) => {
+                let (stream, addr) = l.accept()?;
+                Ok((Box::new(stream), addr.to_string()))
+            }
+            NbdListener::Unix(l) => {
+                let (stream, _) = l.accept()?;
+                Ok((Box::new(stream), "unix".to_string()))
+            }
+        }
+    }
+}
 
 // Global flag set by SIGUSR1 handler
 static PRINT_STATS: AtomicBool = AtomicBool::new(false);
@@ -481,7 +515,7 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener, None, None)
+    serve_volume_listener(dir, size_bytes, NbdListener::Tcp(listener), None, None)
 }
 
 /// Serve a fork over NBD with a signing key attached.
@@ -489,33 +523,52 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
 /// Segments promoted during this session will be signed with `signer`.
 /// If `fetch_config` is provided, missing segments are fetched from remote
 /// storage on demand and cached in `segments/`.
-/// If `port` is `None`, no NBD server is started — the volume runs for
+/// If `nbd` is `None`, no NBD server is started — the volume runs for
 /// coordinator IPC only (control socket).
 pub fn run_volume_signed(
     dir: &Path,
     size_bytes: u64,
-    bind: &str,
-    port: Option<u16>,
+    nbd: Option<NbdBind>,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
-    let Some(port) = port else {
+    let Some(nbd) = nbd else {
         return run_volume_ipc_only(dir, size_bytes, Some(signer), fetch_config);
     };
-    let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
-    let addr = listener.local_addr()?;
-    println!("NBD volume server on {}", addr);
-    println!(
-        "Volume: {} ({:.1} MB)",
-        dir.display(),
-        size_bytes as f64 / (1024.0 * 1024.0)
-    );
-    println!(
-        "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
-        addr.ip(),
-        addr.port()
-    );
-    println!("Waiting for connection...\n");
+    let listener = match nbd {
+        NbdBind::Tcp { bind, port } => {
+            let l = TcpListener::bind(format!("{}:{}", bind, port))?;
+            let addr = l.local_addr()?;
+            println!("NBD volume server on {}", addr);
+            println!(
+                "Volume: {} ({:.1} MB)",
+                dir.display(),
+                size_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                addr.ip(),
+                addr.port()
+            );
+            println!("Waiting for connection...\n");
+            NbdListener::Tcp(l)
+        }
+        NbdBind::Unix(path) => {
+            let _ = std::fs::remove_file(&path);
+            let l = UnixListener::bind(&path)?;
+            println!(
+                "NBD volume server on {} ({:.1} MB)",
+                path.display(),
+                size_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "Connect with: sudo nbd-client -u {} -N export /dev/nbdX",
+                path.display()
+            );
+            println!("Waiting for connection...\n");
+            NbdListener::Unix(l)
+        }
+    };
     serve_volume_listener(dir, size_bytes, listener, Some(signer), fetch_config)
 }
 
@@ -528,53 +581,51 @@ pub fn run_volume_signed(
 pub fn run_volume_readonly(
     dir: &Path,
     size_bytes: u64,
-    bind: &str,
-    port: Option<u16>,
+    nbd: Option<NbdBind>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
-    let Some(port) = port else {
+    let Some(nbd) = nbd else {
         return run_volume_ipc_only(dir, size_bytes, None, fetch_config);
     };
-    let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
-    let addr = listener.local_addr()?;
-    println!("NBD readonly volume server on {}", addr);
-    println!(
-        "Volume: {} ({:.1} MB)  [read-only]",
-        dir.display(),
-        size_bytes as f64 / (1024.0 * 1024.0)
-    );
-    println!(
-        "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
-        addr.ip(),
-        addr.port()
-    );
-    println!("Waiting for connection...\n");
-
-    install_sigusr1_handler();
-    let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = ReadonlyVolume::open(dir, by_id_dir)?;
-
-    if let Some(config) = fetch_config {
-        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, &volume.fork_dirs())?;
-        volume.set_fetcher(std::sync::Arc::new(fetcher));
-        println!("[demand-fetch enabled]");
-    }
-
-    for stream in listener.incoming() {
-        let stream = stream?;
-        println!("[connected: {}]", stream.peer_addr()?);
-        let result = handle_readonly_connection(stream, &volume, size_bytes);
-        match result {
-            Ok(()) => println!("[disconnected]"),
-            Err(e) => warn!("[connection error: {}]", e),
+    let listener = match nbd {
+        NbdBind::Tcp { bind, port } => {
+            let l = TcpListener::bind(format!("{}:{}", bind, port))?;
+            let addr = l.local_addr()?;
+            println!("NBD readonly volume server on {}", addr);
+            println!(
+                "Volume: {} ({:.1} MB)  [read-only]",
+                dir.display(),
+                size_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                addr.ip(),
+                addr.port()
+            );
+            println!("Waiting for connection...\n");
+            NbdListener::Tcp(l)
         }
-        println!("Waiting for connection...\n");
-    }
-    Ok(())
+        NbdBind::Unix(path) => {
+            let _ = std::fs::remove_file(&path);
+            let l = UnixListener::bind(&path)?;
+            println!(
+                "NBD readonly volume server on {} ({:.1} MB)  [read-only]",
+                path.display(),
+                size_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "Connect with: sudo nbd-client -u {} -N export /dev/nbdX",
+                path.display()
+            );
+            println!("Waiting for connection...\n");
+            NbdListener::Unix(l)
+        }
+    };
+    serve_readonly_volume_listener(dir, size_bytes, listener, fetch_config)
 }
 
 fn handle_readonly_connection(
-    mut s: TcpStream,
+    mut s: impl Read + Write,
     volume: &ReadonlyVolume,
     volume_size: u64,
 ) -> io::Result<()> {
@@ -643,18 +694,9 @@ fn handle_readonly_connection(
     }
 
     let mut reads: u64 = 0;
-    s.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
     loop {
-        let magic = match read_u32(&mut s) {
-            Ok(m) => m,
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
+        let magic = read_u32(&mut s)?;
         if magic != NBD_REQUEST_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -714,22 +756,32 @@ fn handle_readonly_connection(
 /// Readonly variant of `serve_volume_listener`. Opens the fork with
 /// `ReadonlyVolume` (no WAL, no lock) and serves it read-only.
 /// Separated from `run_volume_readonly` so tests can bind port 0.
-#[cfg(test)]
 fn serve_readonly_volume_listener(
     dir: &Path,
     size_bytes: u64,
-    listener: TcpListener,
+    listener: NbdListener,
+    fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
+    install_sigusr1_handler();
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let volume = ReadonlyVolume::open(dir, by_id_dir)?;
-    for stream in listener.incoming() {
-        let stream = stream?;
-        let result = handle_readonly_connection(stream, &volume, size_bytes);
-        if let Err(e) = result {
-            warn!("[readonly connection error: {}]", e);
-        }
+    let mut volume = ReadonlyVolume::open(dir, by_id_dir)?;
+
+    if let Some(config) = fetch_config {
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, &volume.fork_dirs())?;
+        volume.set_fetcher(std::sync::Arc::new(fetcher));
+        println!("[demand-fetch enabled]");
     }
-    Ok(())
+
+    loop {
+        let (stream, peer) = listener.accept()?;
+        println!("[connected: {}]", peer);
+        let result = handle_readonly_connection(stream, &volume, size_bytes);
+        match result {
+            Ok(()) => println!("[disconnected]"),
+            Err(e) => warn!("[connection error: {}]", e),
+        }
+        println!("Waiting for connection...\n");
+    }
 }
 
 /// Open a volume and start the coordinator control socket, but do not bind an
@@ -773,7 +825,7 @@ fn run_volume_ipc_only(
 fn serve_volume_listener(
     dir: &Path,
     size_bytes: u64,
-    listener: TcpListener,
+    listener: NbdListener,
     _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<elide_fetch::FetchConfig>,
 ) -> io::Result<()> {
@@ -795,9 +847,9 @@ fn serve_volume_listener(
         .map_err(io::Error::other)?;
     crate::control::start(dir, handle.clone())?;
 
-    for stream in listener.incoming() {
-        let stream = stream?;
-        println!("[connected: {}]", stream.peer_addr()?);
+    loop {
+        let (stream, peer) = listener.accept()?;
+        println!("[connected: {}]", peer);
 
         let result = handle_volume_connection(stream, &handle, size_bytes);
 
@@ -808,12 +860,10 @@ fn serve_volume_listener(
 
         println!("Waiting for connection...\n");
     }
-
-    Ok(())
 }
 
 fn handle_volume_connection(
-    mut s: TcpStream,
+    mut s: impl Read + Write,
     volume: &elide_core::actor::VolumeHandle,
     volume_size: u64,
 ) -> io::Result<()> {
@@ -1003,7 +1053,7 @@ fn handle_volume_connection(
 
 // --- Wire helpers ---
 
-fn opt_reply(s: &mut TcpStream, option: u32, reply_type: u32, data: &[u8]) -> io::Result<()> {
+fn opt_reply(s: &mut impl Write, option: u32, reply_type: u32, data: &[u8]) -> io::Result<()> {
     s.write_all(&NBD_OPTS_REPLY_MAGIC.to_be_bytes())?;
     s.write_all(&option.to_be_bytes())?;
     s.write_all(&reply_type.to_be_bytes())?;
@@ -1012,26 +1062,26 @@ fn opt_reply(s: &mut TcpStream, option: u32, reply_type: u32, data: &[u8]) -> io
     Ok(())
 }
 
-fn tx_reply(s: &mut TcpStream, error: u32, handle: u64) -> io::Result<()> {
+fn tx_reply(s: &mut impl Write, error: u32, handle: u64) -> io::Result<()> {
     s.write_all(&NBD_REPLY_MAGIC.to_be_bytes())?;
     s.write_all(&error.to_be_bytes())?;
     s.write_all(&handle.to_be_bytes())?;
     Ok(())
 }
 
-fn read_u16(s: &mut TcpStream) -> io::Result<u16> {
+fn read_u16(s: &mut impl Read) -> io::Result<u16> {
     let mut b = [0u8; 2];
     s.read_exact(&mut b)?;
     Ok(u16::from_be_bytes(b))
 }
 
-fn read_u32(s: &mut TcpStream) -> io::Result<u32> {
+fn read_u32(s: &mut impl Read) -> io::Result<u32> {
     let mut b = [0u8; 4];
     s.read_exact(&mut b)?;
     Ok(u32::from_be_bytes(b))
 }
 
-fn read_u64(s: &mut TcpStream) -> io::Result<u64> {
+fn read_u64(s: &mut impl Read) -> io::Result<u64> {
     let mut b = [0u8; 8];
     s.read_exact(&mut b)?;
     Ok(u64::from_be_bytes(b))
@@ -1068,7 +1118,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, listener, None, None).ok();
+            serve_volume_listener(&dir, size_bytes, NbdListener::Tcp(listener), None, None).ok();
         });
         port
     }
@@ -1220,7 +1270,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_readonly_volume_listener(&dir, size_bytes, listener).ok();
+            serve_readonly_volume_listener(&dir, size_bytes, NbdListener::Tcp(listener), None).ok();
         });
         port
     }

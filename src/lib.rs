@@ -62,26 +62,24 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     Ok(n << shift)
 }
 
-/// Read the volume size from `<dir>/volume.size`, or create it from `size_arg` if absent.
+/// Read the volume size from `volume.toml`, or create it from `size_arg` if absent.
 pub fn resolve_volume_size(dir: &Path, size_arg: Option<&str>) -> io::Result<u64> {
-    let size_file = dir.join("volume.size");
-    if size_file.exists() {
-        let s = std::fs::read_to_string(&size_file)?;
-        s.trim()
-            .parse::<u64>()
-            .map_err(|e| io::Error::other(format!("bad size file: {e}")))
-    } else {
-        let s = size_arg.ok_or_else(|| {
-            io::Error::other("volume size required on first use: pass --size (e.g. --size 4G)")
-        })?;
-        let bytes = parse_size(s).map_err(|e| io::Error::other(format!("bad --size: {e}")))?;
-        if bytes == 0 {
-            return Err(io::Error::other("volume size must be non-zero"));
-        }
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(&size_file, bytes.to_string())?;
-        Ok(bytes)
+    let cfg = elide_core::config::VolumeConfig::read(dir)?;
+    if let Some(size) = cfg.size {
+        return Ok(size);
     }
+    let s = size_arg.ok_or_else(|| {
+        io::Error::other("volume size required on first use: pass --size (e.g. --size 4G)")
+    })?;
+    let bytes = parse_size(s).map_err(|e| io::Error::other(format!("bad --size: {e}")))?;
+    if bytes == 0 {
+        return Err(io::Error::other("volume size must be non-zero"));
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut updated = cfg;
+    updated.size = Some(bytes);
+    updated.write(dir)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
