@@ -1,5 +1,4 @@
 // Prefetch segment index files from S3.
-#![allow(dead_code)]
 //
 // Before a forked volume can be opened on a host that has no local segments for
 // its ancestors, the index sections (.idx files) must be downloaded so that
