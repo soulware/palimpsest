@@ -135,6 +135,69 @@ module in the hot path.
 This requires implementing the vhost-user-blk backend protocol in Elide — a
 meaningful piece of work, but a natural fit alongside ublk.
 
+## In-VM (self-contained)
+
+A hosted VM — a cloud instance, a dev machine, a CI runner — already has a
+local filesystem and can run arbitrary userspace processes. Elide can run
+entirely inside such a VM, with no hypervisor cooperation and no host-side
+tooling. The VM self-serves its own volumes: creating them, writing to them,
+forking snapshots, and uploading segments to S3 for durability.
+
+```
+┌─ VM ──────────────────────────────────────────┐
+│  elide coordinator + volume serve             │
+│         ↓  unix socket NBD (now)              │
+│         ↓  ublk (target)                      │
+│  /dev/nbd0 or /dev/ublkb0                     │
+│         ↓                                     │
+│  mkfs / mount → workload reads & writes       │
+│         ↓                                     │
+│  segments on VM local disk                    │
+│         ↓  (when S3 is wired up)              │
+│  upload to S3 → durable across VM restarts    │
+└───────────────────────────────────────────────┘
+```
+
+**Current path (NBD unix socket):**
+```
+elide volume serve --nbd-socket ./vol/nbd.sock
+nbd-client -unix ./vol/nbd.sock /dev/nbd0
+mount /dev/nbd0 /mnt/data
+```
+Requires the `nbd` kernel module. Present in most general-purpose Linux
+kernels; may be absent in stripped-down microVM images.
+
+**Target path (ublk):**
+
+ublk replaces `nbd-client` with a direct io_uring block device. No kernel
+module required beyond the ublk driver (Linux 5.19+). Elide spawns the ublk
+device itself; `/dev/ublkb0` appears as a regular block device. The in-VM case
+is identical to the host-side case — ublk work done for any target immediately
+benefits this one.
+
+**What this unlocks:**
+
+- **Durable scratch volumes.** VM instance storage is ephemeral; S3-backed Elide
+  volumes survive VM termination and can be re-attached to a replacement instance.
+- **Cheap snapshots.** Fork a volume before a risky operation; roll back by
+  discarding the fork. No filesystem-level snapshot support required from the
+  hypervisor.
+- **Multi-volume isolation.** Multiple independent volumes inside one VM, each
+  with its own write history and fork tree, without needing multiple block
+  devices from the hypervisor.
+- **Self-service from inside the VM.** No host-side agent, no privileged
+  sidecar, no hypervisor API. The workload manages its own storage lifecycle via
+  the coordinator.
+
+**Constraints:**
+
+- Requires `nbd` kernel module (today) or Linux 5.19+ (ublk target).
+- `CAP_SYS_ADMIN` is needed to attach the block device (`nbd-client` or ublk).
+  This is standard for any block-device operation and is available to root
+  inside most VMs.
+- The coordinator and volume serve run as persistent processes in the VM; a
+  process supervisor (systemd, s6) is recommended for production use.
+
 ## Kubernetes (deferred)
 
 CSI (Container Storage Interface) is the standard for Kubernetes storage. A CSI
@@ -170,9 +233,9 @@ Linux 5.19+ kernel for ublk.
 
 | Step | Work | Unblocks |
 |---|---|---|
-| 1 | Unix socket NBD (`--nbd-socket`) | Local testing, Firecracker rootfs without port allocation |
+| 1 | Unix socket NBD (`--nbd-socket`) | Local testing, Firecracker rootfs without port allocation, in-VM self-contained |
 | 2 | Coordinator network API | Docker volume plugin, Firecracker orchestration, CSI |
-| 3 | ublk backend | All targets — lower latency, no nbd-client process |
+| 3 | ublk backend | All targets — lower latency, no nbd-client process; in-VM path: no nbd module required |
 | 4 | Firecracker integration | Firecracker rootfs + data volumes via hotplug |
 | 5 | Docker volume plugin | Docker data volumes with lifecycle management |
 | 6 | Cloud Hypervisor / vhost-user-blk | CH data volumes, shortest I/O path |
