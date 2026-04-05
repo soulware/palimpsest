@@ -15,7 +15,7 @@ use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 use elide_core::segment::SegmentFetcher;
 use elide_core::{extentindex, lbamap, segment, volume, writelog};
 
-use elide_fetch::{FetchConfig, ObjectStoreFetcher, ancestry_chain};
+use elide_fetch::{FetchConfig, ObjectStoreFetcher};
 
 /// Brief summary of a fork's ext4 filesystem, for use in inspect output.
 pub struct FsSummary {
@@ -252,8 +252,7 @@ impl VolumeReader {
         let fetcher: Option<Box<dyn SegmentFetcher>> =
             FetchConfig::load(data_dir).ok().flatten().and_then(|cfg| {
                 let fork_dirs: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
-                let volume_ids = ancestry_chain(&fork_dirs).ok()?;
-                ObjectStoreFetcher::new(&cfg, volume_ids)
+                ObjectStoreFetcher::new(&cfg, &fork_dirs)
                     .ok()
                     .map(|f| Box::new(f) as Box<dyn SegmentFetcher>)
             });

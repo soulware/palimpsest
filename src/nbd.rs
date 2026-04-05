@@ -555,8 +555,7 @@ pub fn run_volume_readonly(
     let mut volume = ReadonlyVolume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
-        let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
-        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, volume_ids)?;
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, &volume.fork_dirs())?;
         volume.set_fetcher(std::sync::Arc::new(fetcher));
         println!("[demand-fetch enabled]");
     }
@@ -750,8 +749,7 @@ fn run_volume_ipc_only(
     let mut volume = Volume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
-        let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
-        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, volume_ids)?;
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, &volume.fork_dirs())?;
         volume.set_fetcher(std::sync::Arc::new(fetcher));
     }
 
@@ -785,8 +783,7 @@ fn serve_volume_listener(
     let mut volume = Volume::open(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
-        let volume_ids = elide_fetch::ancestry_chain(&volume.fork_dirs())?;
-        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, volume_ids)?;
+        let fetcher = elide_fetch::ObjectStoreFetcher::new(&config, &volume.fork_dirs())?;
         volume.set_fetcher(std::sync::Arc::new(fetcher));
         println!("[demand-fetch enabled]");
     }

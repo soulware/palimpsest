@@ -395,14 +395,74 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
 
 // --- read ---
 
+/// Verify the Ed25519 signature of a segment from raw bytes.
+///
+/// Checks `header[32..96]` against `BLAKE3(header[0..32] || index_bytes)`.
+/// Returns `InvalidData` if the signature is missing (all zeros) or invalid.
+///
+/// Used by the fetch path to verify segments against the volume's public key
+/// before writing them to the local cache.
+pub fn verify_segment_bytes(
+    bytes: &[u8],
+    segment_id: &str,
+    verifying_key: &VerifyingKey,
+) -> io::Result<()> {
+    if bytes.len() < HEADER_LEN as usize {
+        return Err(io::Error::other(format!(
+            "segment {segment_id}: too short to verify ({} bytes)",
+            bytes.len()
+        )));
+    }
+    let raw = &bytes[..HEADER_LEN as usize];
+    let h = SegmentHeader::read_from_bytes(raw)
+        .map_err(|_| io::Error::other("segment header size mismatch"))?;
+
+    if h.magic != *MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("segment {segment_id}: bad magic"),
+        ));
+    }
+
+    let index_length = h.index_length.get() as usize;
+    let index_end = HEADER_LEN as usize + index_length;
+    if bytes.len() < index_end {
+        return Err(io::Error::other(format!(
+            "segment {segment_id}: truncated before end of index section"
+        )));
+    }
+    let index_buf = &bytes[HEADER_LEN as usize..index_end];
+
+    if h.signature == [0u8; 64] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("segment {segment_id} is unsigned"),
+        ));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&raw[..32]);
+    hasher.update(index_buf);
+    let hash = hasher.finalize();
+
+    let signature = Signature::from_bytes(&h.signature);
+    verifying_key
+        .verify_strict(hash.as_bytes(), &signature)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("segment {segment_id} has invalid signature"),
+            )
+        })
+}
+
 /// Parse a segment index without verifying the signature.
 ///
 /// Returns `(body_section_start, entries)`.
 ///
-/// Use this only in the fetch path, where the caller needs entry offsets to
-/// compute range-GET parameters. Security is enforced at `Volume::open` time by
-/// `extentindex::rebuild`, which calls `read_and_verify_segment_index` for every
-/// entry it admits into the live index.
+/// Used when reading a cached `.idx` file in the extent-fetch path, where the
+/// index was already verified by `verify_segment_bytes` when it was first cached.
+/// For full-segment reads, use `read_and_verify_segment_index` instead.
 pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let (body_section_start, index_buf, entry_count, _h) = read_segment_header(path)?;
     let entries = parse_index_section(&index_buf, entry_count)?;

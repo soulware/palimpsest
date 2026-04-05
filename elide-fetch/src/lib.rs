@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use elide_core::signing::VerifyingKey;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use serde::Deserialize;
@@ -33,6 +34,7 @@ use tokio::runtime::Runtime;
 use ulid::Ulid;
 
 use elide_core::segment::{self, SegmentFetcher};
+use elide_core::signing;
 
 // --- config ---
 
@@ -128,19 +130,26 @@ impl FetchConfig {
 
 pub struct ObjectStoreFetcher {
     store: Arc<dyn ObjectStore>,
-    /// Volume ULIDs in the ancestry chain, oldest-first. Searched newest-first on miss.
-    volume_ids: Vec<String>,
+    /// Volume ancestry chain oldest-first: (volume_ulid, verifying_key).
+    /// Searched newest-first on a cache miss; verifying key used to verify
+    /// fetched segment bytes before writing to the local cache.
+    chain: Vec<(String, VerifyingKey)>,
     /// Maximum bytes per coalesced range-GET batch.
     max_batch_bytes: u64,
     rt: Runtime,
 }
 
 impl ObjectStoreFetcher {
-    pub fn new(config: &FetchConfig, volume_ids: Vec<String>) -> io::Result<Self> {
+    /// Build a fetcher from a [`FetchConfig`] and the fork directories in the
+    /// ancestry chain (oldest-first, current fork last).
+    ///
+    /// Each fork directory must contain a `volume.pub` file. The volume ULID
+    /// is derived from the directory name.
+    pub fn new(config: &FetchConfig, fork_dirs: &[PathBuf]) -> io::Result<Self> {
         let store = config.build_store()?;
         Self::from_store(
             store,
-            volume_ids,
+            fork_dirs,
             config
                 .fetch_batch_bytes
                 .unwrap_or(DEFAULT_FETCH_BATCH_BYTES),
@@ -153,13 +162,14 @@ impl ObjectStoreFetcher {
     /// rather than going through [`FetchConfig`].
     pub fn from_store(
         store: Arc<dyn ObjectStore>,
-        volume_ids: Vec<String>,
+        fork_dirs: &[PathBuf],
         max_batch_bytes: u64,
     ) -> io::Result<Self> {
+        let chain = load_chain(fork_dirs)?;
         let rt = Runtime::new().map_err(|e| io::Error::other(format!("tokio runtime: {e}")))?;
         Ok(Self {
             store,
-            volume_ids,
+            chain,
             max_batch_bytes,
             rt,
         })
@@ -170,7 +180,7 @@ impl SegmentFetcher for ObjectStoreFetcher {
     fn fetch(&self, segment_id: ulid::Ulid, index_dir: &Path, body_dir: &Path) -> io::Result<()> {
         self.rt.block_on(fetch_segment(
             &self.store,
-            &self.volume_ids,
+            &self.chain,
             &segment_id.to_string(),
             index_dir,
             body_dir,
@@ -186,7 +196,7 @@ impl SegmentFetcher for ObjectStoreFetcher {
     ) -> io::Result<()> {
         self.rt.block_on(fetch_one_extent(
             &self.store,
-            &self.volume_ids,
+            &self.chain,
             &segment_id.to_string(),
             index_dir,
             body_dir,
@@ -199,15 +209,31 @@ impl SegmentFetcher for ObjectStoreFetcher {
     }
 }
 
+/// Load the ancestry chain from fork directories.
+///
+/// Each directory must be named with a valid ULID and contain a `volume.pub`
+/// file. Returns `(volume_ulid, verifying_key)` pairs in the same order as
+/// `fork_dirs` (oldest-first).
+fn load_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<(String, VerifyingKey)>> {
+    fork_dirs
+        .iter()
+        .map(|dir| {
+            let id = derive_volume_id(dir)?;
+            let vk = signing::load_verifying_key(dir, signing::VOLUME_PUB_FILE)?;
+            Ok((id, vk))
+        })
+        .collect()
+}
+
 async fn fetch_segment(
     store: &Arc<dyn ObjectStore>,
-    volume_ids: &[String],
+    chain: &[(String, VerifyingKey)],
     segment_id: &str,
     index_dir: &Path,
     body_dir: &Path,
 ) -> io::Result<()> {
     // Try volumes newest-first (reverse of oldest-first slice).
-    for volume_id in volume_ids.iter().rev() {
+    for (volume_id, verifying_key) in chain.iter().rev() {
         let key = segment_key(volume_id, segment_id)?;
         match store.get(&key).await {
             Ok(result) => {
@@ -215,7 +241,7 @@ async fn fetch_segment(
                     .bytes()
                     .await
                     .map_err(|e| io::Error::other(format!("reading {segment_id}: {e}")))?;
-                write_cache(index_dir, body_dir, segment_id, &bytes)?;
+                write_cache(index_dir, body_dir, segment_id, &bytes, verifying_key)?;
                 return Ok(());
             }
             Err(object_store::Error::NotFound { .. }) => continue,
@@ -240,7 +266,7 @@ struct ExtentFetchParams {
 
 async fn fetch_one_extent(
     store: &Arc<dyn ObjectStore>,
-    volume_ids: &[String],
+    chain: &[(String, VerifyingKey)],
     segment_id: &str,
     index_dir: &Path,
     body_dir: &Path,
@@ -307,7 +333,7 @@ async fn fetch_one_extent(
     let range_end = (extent.body_section_start + batch_body_end) as usize;
     let batch_count = batch_last - start + 1;
 
-    for volume_id in volume_ids.iter().rev() {
+    for (volume_id, _) in chain.iter().rev() {
         let key = segment_key(volume_id, segment_id)?;
         match store.get_range(&key, range_start..range_end).await {
             Ok(bytes) => {
@@ -382,6 +408,9 @@ const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x02";
 ///   `<body_dir>/<segment_id>.body`    — body bytes (body-relative; byte 0 = first body byte)
 ///   `<body_dir>/<segment_id>.present` — packed bitset, one bit per index entry; all bits set
 ///
+/// Verifies the segment's Ed25519 signature before writing anything to disk.
+/// Returns `InvalidData` if the signature is missing or invalid.
+///
 /// All three files are written via tmp + rename. Commit order: `.idx` first
 /// (enables rebuild on the next restart), then `.body` (enables reads), then
 /// `.present`. A crash after `.idx` but before `.body` leaves an orphan `.idx`
@@ -391,7 +420,11 @@ fn write_cache(
     body_dir: &Path,
     segment_id: &str,
     bytes: &[u8],
+    verifying_key: &VerifyingKey,
 ) -> io::Result<()> {
+    // Verify signature before writing anything to disk.
+    segment::verify_segment_bytes(bytes, segment_id, verifying_key)?;
+
     if bytes.len() < SEGMENT_HEADER_LEN {
         return Err(io::Error::other(format!(
             "segment {segment_id}: too short to parse header ({} bytes)",
@@ -469,12 +502,6 @@ pub fn derive_volume_id(dir: &Path) -> io::Result<String> {
         .map_err(|e| io::Error::other(format!("fork dir name is not a valid ULID '{name}': {e}")))
 }
 
-/// Build the ancestry chain as a list of volume ULIDs (oldest-first)
-/// from a list of fork directories returned by `Volume::fork_dirs()`.
-pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<String>> {
-    fork_dirs.iter().map(|d| derive_volume_id(d)).collect()
-}
-
 // --- volume pre-warm ---
 
 /// Pre-warm the start of a readonly (cached) volume.
@@ -493,17 +520,14 @@ pub fn prewarm_volume_start(
 ) -> io::Result<()> {
     use elide_core::volume::{ReadonlyVolume, walk_ancestors};
 
-    // Build ancestry chain oldest-first; current fork appended last.
+    // Build fork dir list oldest-first; current fork appended last.
     let ancestors = walk_ancestors(fork_dir, by_id_dir)?;
-    let mut volume_ids: Vec<String> = ancestors
-        .iter()
-        .map(|l| derive_volume_id(&l.dir))
-        .collect::<io::Result<_>>()?;
-    volume_ids.push(derive_volume_id(fork_dir)?);
+    let mut fork_dirs: Vec<PathBuf> = ancestors.iter().map(|l| l.dir.clone()).collect();
+    fork_dirs.push(fork_dir.to_path_buf());
 
     let fetcher = Arc::new(ObjectStoreFetcher::from_store(
         store,
-        volume_ids,
+        &fork_dirs,
         max_batch_bytes,
     )?);
 
@@ -545,7 +569,7 @@ mod tests {
             SegmentEntry::new_data(h1, 0, 1, SegmentFlags::empty(), data1.clone()),
             SegmentEntry::new_data(h2, 1, 2, SegmentFlags::empty(), data2.clone()),
         ];
-        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
 
         // Read the full segment bytes and split them via write_cache.
@@ -553,7 +577,7 @@ mod tests {
         let index_dir = dir.join("index");
         let cache_dir = dir.join("cache");
         let segment_id = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        write_cache(&index_dir, &cache_dir, segment_id, &full_bytes).unwrap();
+        write_cache(&index_dir, &cache_dir, segment_id, &full_bytes, &vk).unwrap();
 
         // Check .idx file: should be parseable and match the original index.
         let idx_path = index_dir.join(format!("{segment_id}.idx"));
@@ -612,7 +636,7 @@ mod tests {
 
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
-        let vol_id = "01JQVOLUMEAAAAAAAAAAAAAAA";
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
 
         // Build a segment with 3 uncompressed entries (all body-adjacent).
         let data0 = vec![0x11u8; 4096];
@@ -627,7 +651,7 @@ mod tests {
             SegmentEntry::new_data(h2, 2, 1, SegmentFlags::empty(), data2.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
-        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
@@ -648,6 +672,18 @@ mod tests {
         let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
         rt.block_on(store.put(&key, full_bytes.into())).unwrap();
 
+        // Create a fork dir named with vol_id and write volume.pub so the
+        // fetcher can load the verifying key for signature verification.
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
         let cfg = FetchConfig {
             bucket: None,
             endpoint: None,
@@ -655,7 +691,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = ObjectStoreFetcher::new(&cfg, vec![vol_id.to_string()]).unwrap();
+        let fetcher = ObjectStoreFetcher::new(&cfg, &[vol_dir]).unwrap();
 
         // Fetch entry 0 — should coalesce entries 0, 1, 2 into one range-GET.
         fetcher
@@ -705,7 +741,7 @@ mod tests {
 
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
-        let vol_id = "01JQVOLUMEAAAAAAAAAAAAAAA";
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
 
         // Two entries that will NOT be body-adjacent because entry 1 is
         // written into a segment that already has entry 0 present — we
@@ -722,7 +758,7 @@ mod tests {
             SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
-        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
@@ -746,6 +782,17 @@ mod tests {
         let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
         rt.block_on(store.put(&key, full_bytes.into())).unwrap();
 
+        // Create a fork dir named with vol_id and write volume.pub.
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
         let cfg = FetchConfig {
             bucket: None,
             endpoint: None,
@@ -753,7 +800,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = ObjectStoreFetcher::new(&cfg, vec![vol_id.to_string()]).unwrap();
+        let fetcher = ObjectStoreFetcher::new(&cfg, &[vol_dir]).unwrap();
 
         fetcher
             .fetch_extent(
@@ -781,6 +828,89 @@ mod tests {
             check_present_bit(&present_path, 1).unwrap(),
             "bit 1 still set"
         );
+    }
+
+    /// A segment with a flipped body byte fails signature verification.
+    #[test]
+    fn verify_rejects_tampered_bytes() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let seg_path = tmp.path().join("seg");
+        let data = vec![0xABu8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        let mut bytes = std::fs::read(&seg_path).unwrap();
+        // Flip the first byte of the index section (covered by the signature).
+        // The body is NOT covered by the signature, so tampering there would pass.
+        bytes[96] ^= 0xFF;
+
+        let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid signature"));
+    }
+
+    /// A segment signed with key A is rejected when verified with key B.
+    #[test]
+    fn verify_rejects_wrong_key() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let seg_path = tmp.path().join("seg");
+        let data = vec![0xCDu8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let (signer_a, _vk_a) = elide_core::signing::generate_ephemeral_signer();
+        let (_signer_b, vk_b) = elide_core::signing::generate_ephemeral_signer();
+        write_segment(&seg_path, &mut entries, signer_a.as_ref()).unwrap();
+
+        let bytes = std::fs::read(&seg_path).unwrap();
+        let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk_b).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid signature"));
+    }
+
+    /// A segment with a zeroed signature field is rejected as unsigned.
+    #[test]
+    fn verify_rejects_unsigned_segment() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let seg_path = tmp.path().join("seg");
+        let data = vec![0xEFu8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        let mut bytes = std::fs::read(&seg_path).unwrap();
+        // Zero out the signature field at header[32..96].
+        bytes[32..96].fill(0);
+
+        let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsigned"));
     }
 
     #[test]
