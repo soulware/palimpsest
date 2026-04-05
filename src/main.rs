@@ -182,8 +182,9 @@ enum VolumeCommand {
         /// Address to bind the NBD server (default: 127.0.0.1)
         #[arg(long)]
         nbd_bind: Option<String>,
-        /// Unix socket path for the NBD server
-        #[arg(long, conflicts_with = "nbd_port")]
+        /// Unix socket path for the NBD server. Omit the path to use the
+        /// default (nbd.sock inside the volume directory).
+        #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
     },
 
@@ -197,8 +198,10 @@ enum VolumeCommand {
         /// Change the NBD bind address (restarts the volume process)
         #[arg(long)]
         nbd_bind: Option<String>,
-        /// Set or change the Unix socket path for the NBD server (restarts the volume process)
-        #[arg(long, conflicts_with = "nbd_port")]
+        /// Set or change the Unix socket path for the NBD server. Omit the
+        /// path to use the default (nbd.sock inside the volume directory).
+        /// Restarts the volume process.
+        #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
         /// Disable NBD serving (removes nbd.port, nbd.bind, nbd.socket; restarts the volume process)
         #[arg(long)]
