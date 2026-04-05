@@ -201,6 +201,33 @@ elide volume remote pull ubuntu-22.04       # reconstruct skeleton + trigger pre
 elide volume ls ubuntu-22.04                # readable; first access demand-fetches bodies
 ```
 
+## Post-import workflows
+
+An imported volume is readonly — its segments are signed with an ephemeral key and a snapshot marker is written as a branch point. From here there are two paths depending on how you want to handle writes:
+
+**Option 1 — External write layer.** Serve the readonly base directly and let the compute layer handle writes outside Elide. The base is served read-only; an external CoW mechanism (at the hypervisor or guest level) overlays writes on top. Reads that miss the write layer fall through to Elide's demand-fetch path.
+
+- Writes are opaque to Elide — no dedup, compression, GC, or snapshotting on the write layer
+- Simple setup; the base image is never modified
+- Good fit for ephemeral or disposable workloads
+
+**Option 2 — Elide-managed writable fork.** Create a fork of the imported base. The fork is a new writable volume whose read path falls through to the base's segments. Serve the fork; the compute layer sees a single read-write device.
+
+- All writes go through Elide's content-addressed store: dedup, compression, GC, and snapshots apply to the write layer
+- The fork can itself be snapshotted and forked further
+- Good fit for long-lived VMs and workflows where the write history matters
+
+```
+# Option 1: serve the base readonly
+elide volume serve --readonly ubuntu-22.04
+
+# Option 2: create a writable fork and serve that
+elide volume fork ubuntu-22.04 ubuntu-22.04-vm1
+elide volume serve ubuntu-22.04-vm1
+```
+
+The two options are not mutually exclusive — you can have multiple forks of the same base alongside external-overlay users of the same readonly base.
+
 ## Disaster recovery
 
 ### Disk loss on a live volume
