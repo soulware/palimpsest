@@ -14,6 +14,7 @@
 //   repack <min_live_ratio>    →  "ok <segs> <bytes> <extents>"
 //   gc_checkpoint              →  "ok <repack_ulid> <sweep_ulid>"
 //   apply_gc_handoffs          →  "ok <n>"
+//   promote <ulid>             →  "ok"
 //
 // If the socket is absent (volume not running), all functions return None and
 // log a warning.  Callers decide whether to abort or proceed without the op.
@@ -97,6 +98,29 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0),
         None => 0,
+    }
+}
+
+/// Promote a segment to the volume's local cache after confirmed S3 upload.
+///
+/// Sends `promote <ulid>` to the volume's control socket.  The volume copies
+/// the segment body to `cache/<ulid>.body`, writes `cache/<ulid>.present`, and
+/// (on the drain path) deletes `pending/<ulid>`.
+///
+/// Returns `true` on success.  Returns `false` if the socket is absent (volume
+/// not running) or the call fails.  The coordinator retries on the next tick.
+pub async fn promote_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
+    let req = format!("promote {ulid}");
+    match call(fork_dir, &req).await {
+        Some(resp) if resp.trim() == "ok" => true,
+        Some(resp) => {
+            warn!(
+                "[control] promote {ulid} for {} returned unexpected response: {resp:?}",
+                fork_dir.display()
+            );
+            false
+        }
+        None => false,
     }
 }
 

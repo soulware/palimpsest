@@ -1,3 +1,5 @@
+mod volume_up;
+
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -101,6 +103,18 @@ enum Command {
     /// Measure sparse-strategy savings within changed files
     #[command(hide = true)]
     SparseAnalysis { image1: String, image2: String },
+
+    /// Background daemon for `volume up` (not for direct use)
+    #[command(hide = true, name = "volume-daemon")]
+    VolumeDaemon {
+        /// Path to the volume directory (by_id/<ulid>/)
+        vol_dir: PathBuf,
+        /// Path to mount the filesystem
+        mountpoint: PathBuf,
+        /// Format with ext4 if no filesystem is detected (skips prompt)
+        #[arg(long)]
+        format: bool,
+    },
 
     /// Extract kernel and initrd from an ext4 image's /boot directory
     #[command(hide = true)]
@@ -243,6 +257,29 @@ enum VolumeCommand {
 
     /// Stop all processes for a volume and remove its directory
     Delete {
+        /// Volume name
+        name: String,
+    },
+
+    /// Mount a volume as a block device and make its filesystem available.
+    ///
+    /// Starts an embedded NBD server, attaches /dev/nbdN, and mounts at the
+    /// given path. On first use (blank device) you will be prompted to format;
+    /// pass --format to skip the prompt. Runs a background daemon that owns
+    /// the full lifecycle; use `volume down` to unmount cleanly.
+    Up {
+        /// Volume name
+        name: String,
+        /// Path to mount the filesystem
+        #[arg(default_value = "/mnt")]
+        mountpoint: PathBuf,
+        /// Format the device with ext4 if no filesystem is detected (no prompt)
+        #[arg(long)]
+        format: bool,
+    },
+
+    /// Unmount a volume previously started with `volume up`.
+    Down {
         /// Volume name
         name: String,
     },
@@ -541,6 +578,26 @@ fn main() {
                 }
             }
 
+            VolumeCommand::Up {
+                name,
+                mountpoint,
+                format,
+            } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = volume_up::cmd_volume_up(&vol_dir, &mountpoint, format) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
+            VolumeCommand::Down { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = volume_up::cmd_volume_down(&vol_dir) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
             VolumeCommand::Remote { command } => {
                 let config = match elide_fetch::FetchConfig::load(&args.data_dir) {
                     Ok(Some(c)) => c,
@@ -571,6 +628,17 @@ fn main() {
                 }
             }
         },
+
+        Command::VolumeDaemon {
+            vol_dir,
+            mountpoint,
+            format,
+        } => {
+            if let Err(e) = volume_up::run_volume_daemon(&vol_dir, &mountpoint, format) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
 
         Command::ServeVolume {
             fork_dir,

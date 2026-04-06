@@ -6,15 +6,15 @@
 //     forks, supervises volume processes, drains pending segments to S3, and
 //     runs segment GC. Configuration comes from coordinator.toml.
 
-mod config;
-mod control;
+// Binary-only modules (process supervision, IPC, import jobs).
 mod daemon;
-mod gc;
 mod import;
 mod inbound;
-mod prefetch;
 mod supervisor;
-mod upload;
+
+// Re-use the library's shared modules so types are identical across the
+// lib and bin compilation units.
+use elide_coordinator::config;
 
 use std::path::PathBuf;
 use std::process;

@@ -11,20 +11,23 @@
 // Upload commit sequence per segment:
 //   1. Read pending/<ulid> into memory
 //   2. PUT to object store at the derived key
-//   3. Write index/<ulid>.idx (header+index section) while file is still in pending/
-//   4. On success: rename pending/<ulid> → segments/<ulid>
-//   5. On failure: leave in pending/, record error, continue
+//   3. IPC → volume: "promote <ulid>"
+//      Volume copies pending/<ulid> → cache/<ulid>.body, writes cache/<ulid>.present,
+//      and deletes pending/<ulid>.
+//   4. On failure at any step: leave pending/<ulid> in place, record error, continue.
+//      If volume is not running: leave pending/ in place, retry next tick.
 //
 // Crash safety:
-//   - Crash before step 3: file stays in pending/ with no .idx; drain retries from step 2.
-//   - Crash between steps 3 and 4: file in pending/ with .idx written; drain retries rename
-//     (idempotent) and skips .idx (already exists).
-//   - Crash after step 4: file in segments/ with .idx; segment is fully committed.
+//   - Crash before step 3: pending/<ulid> still exists; drain re-uploads (idempotent
+//     S3 PUT) and re-sends promote on next tick.
+//   - Crash after step 3: pending/<ulid> is gone (volume deleted it); done.
 //
-// Ordering invariant: .idx is written before rename. This means any segment body
-// that appears in segments/ is guaranteed to have a corresponding index/<ulid>.idx,
-// which in turn guarantees S3 availability. evict_segments relies on this invariant
-// to safely skip any body without an .idx.
+// Note: index/<ulid>.idx is written by the volume at WAL flush time (before upload),
+// so it already exists when drain runs. The coordinator never writes index/.
+//
+// Ordering invariant: pending/<ulid> absent ↔ segment confirmed in S3. The volume
+// deletes pending/<ulid> only after receiving the promote IPC, which the coordinator
+// sends only after a confirmed S3 upload.
 
 use std::path::Path;
 
@@ -112,9 +115,9 @@ struct ManifestSource<'a> {
     arch: &'a str,
 }
 
-/// Upload all committed segments from `pending/` to the object store, moving
-/// each successfully uploaded segment to `segments/`. Also uploads the volume's
-/// public key and manifest so that new hosts can bootstrap the volume.
+/// Upload all committed segments from `pending/` to the object store, then
+/// send promote IPC to the volume for each uploaded segment. Also uploads the
+/// volume's public key and manifest so that new hosts can bootstrap the volume.
 ///
 /// `drain_pending` is a one-shot batch command. Metadata (pub key, manifest,
 /// name entry) is re-uploaded on every invocation — all are idempotent and tiny.
@@ -124,13 +127,6 @@ pub async fn drain_pending(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
-    let segments_dir = vol_dir.join("segments");
-    let index_dir = vol_dir.join("index");
-
-    // Ensure segments/ exists — import_image only creates pending/.
-    tokio::fs::create_dir_all(&segments_dir)
-        .await
-        .with_context(|| format!("creating segments dir: {}", segments_dir.display()))?;
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
@@ -151,20 +147,25 @@ pub async fn drain_pending(
         if name.ends_with(".tmp") {
             continue;
         }
-        let name = name.to_owned();
+        let ulid = match ulid::Ulid::from_string(name) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
         let segment_path = entry.path();
 
-        match upload_segment(
-            &segment_path,
-            &name,
-            &segments_dir,
-            &index_dir,
-            volume_id,
-            store,
-        )
-        .await
-        {
-            Ok(()) => uploaded += 1,
+        match upload_segment(&segment_path, name, volume_id, store).await {
+            Ok(()) => {
+                // Segment confirmed in S3; promote IPC tells the volume to cache
+                // the body and delete pending/<ulid>.
+                if crate::control::promote_segment(vol_dir, ulid).await {
+                    uploaded += 1;
+                } else {
+                    // Volume not running; pending/<ulid> stays in place.
+                    // The coordinator retries on the next drain tick.
+                    warn!("promote {name}: volume not running; will retry next tick");
+                    failed += 1;
+                }
+            }
             Err(e) => {
                 warn!("upload failed for segment {name}: {e:#}");
                 failed += 1;
@@ -295,8 +296,6 @@ pub async fn upload_snapshot(
 async fn upload_segment(
     path: &Path,
     ulid_str: &str,
-    segments_dir: &Path,
-    index_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
@@ -311,21 +310,6 @@ async fn upload_segment(
         .await
         .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
 
-    // Write .idx before rename. Reading from path (still in pending/) so that
-    // a crash between .idx write and rename leaves the file in pending/ with
-    // its .idx — drain will retry the rename on the next tick. If the .idx
-    // already exists (crash-recovery retry), extract_idx is idempotent.
-    std::fs::create_dir_all(index_dir)
-        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
-    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-    elide_core::segment::extract_idx(path, &idx_path)
-        .with_context(|| format!("writing index/{ulid_str}.idx"))?;
-
-    let dest = segments_dir.join(ulid_str);
-    tokio::fs::rename(path, &dest)
-        .await
-        .with_context(|| format!("committing segment {ulid_str} to segments/"))?;
-
     Ok(())
 }
 
@@ -334,6 +318,53 @@ mod tests {
     use super::*;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
+
+    struct MockSocket(tokio::task::JoinHandle<()>);
+    impl Drop for MockSocket {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// Spawn a mock volume control socket at `<fork_dir>/control.sock`.
+    ///
+    /// Responds "ok" to any command. For "promote <ulid>" also performs the
+    /// volume's promote behaviour: copies the segment body from pending/ into
+    /// cache/ and deletes the pending/ file (drain path).
+    async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+        let socket_path = fork_dir.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let dir = fork_dir.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let (r, mut w) = tokio::io::split(stream);
+                    let mut buf = BufReader::new(r);
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line).await;
+                    let line = line.trim().to_owned();
+                    if let Some(ulid_str) = line.strip_prefix("promote ") {
+                        let ulid_str = ulid_str.to_owned();
+                        let src = dir.join("pending").join(&ulid_str);
+                        if src.exists() {
+                            let cache = dir.join("cache");
+                            std::fs::create_dir_all(&cache).ok();
+                            let body = cache.join(format!("{ulid_str}.body"));
+                            let present = cache.join(format!("{ulid_str}.present"));
+                            elide_core::segment::promote_to_cache(&src, &body, &present).ok();
+                            std::fs::remove_file(&src).ok();
+                        }
+                    }
+                    w.write_all(b"ok\n").await.ok();
+                });
+            }
+        });
+        MockSocket(handle)
+    }
 
     fn make_ulid(ts_ms: u64, random: u128) -> String {
         Ulid::from_parts(ts_ms, random).to_string()
@@ -390,10 +421,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
-        let segments_dir = vol_dir.join("segments");
-        let index_dir = vol_dir.join("index");
+        let cache_dir = vol_dir.join("cache");
         std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
             size: Some(4096),
@@ -407,7 +436,6 @@ mod tests {
         let ulid1 = make_ulid(1743120000000, 1);
         let ulid2 = make_ulid(1743120000000, 2);
 
-        // Write real segments — extract_idx requires valid segment format.
         let data1 = vec![0xABu8; 4096];
         let h1 = blake3::hash(&data1);
         let mut entries1 = vec![SegmentEntry::new_data(
@@ -430,8 +458,11 @@ mod tests {
         )];
         write_segment(&pending_dir.join(&ulid2), &mut entries2, signer.as_ref()).unwrap();
 
-        // .tmp files must be left in place
+        // .tmp files must be left in place.
         std::fs::write(pending_dir.join(format!("{ulid1}.tmp")), b"incomplete").unwrap();
+
+        // Mock volume socket: responds "ok" to promote and copies pending → cache.
+        let _mock = spawn_mock_socket(vol_dir.clone()).await;
 
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
@@ -442,15 +473,16 @@ mod tests {
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.failed, 0);
 
+        // pending/ entries are removed by the volume after promote IPC (mocked here).
         assert!(!pending_dir.join(&ulid1).exists());
         assert!(!pending_dir.join(&ulid2).exists());
-        assert!(segments_dir.join(&ulid1).exists());
-        assert!(segments_dir.join(&ulid2).exists());
         assert!(pending_dir.join(format!("{ulid1}.tmp")).exists());
 
-        // index/*.idx must be written after confirmed upload.
-        assert!(index_dir.join(format!("{ulid1}.idx")).exists());
-        assert!(index_dir.join(format!("{ulid2}.idx")).exists());
+        // cache/ body + present files are written by the mock volume promote handler.
+        assert!(cache_dir.join(format!("{ulid1}.body")).exists());
+        assert!(cache_dir.join(format!("{ulid1}.present")).exists());
+        assert!(cache_dir.join(format!("{ulid2}.body")).exists());
+        assert!(cache_dir.join(format!("{ulid2}.present")).exists());
 
         let key1 = segment_key(VOL_ULID, &ulid1).unwrap();
         let key2 = segment_key(VOL_ULID, &ulid2).unwrap();
@@ -469,9 +501,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
-        let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
             size: Some(4096),
@@ -502,9 +532,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
-        let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("my-vol".into()),
             size: Some(8192),

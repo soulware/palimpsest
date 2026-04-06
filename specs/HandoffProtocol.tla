@@ -18,7 +18,7 @@
 
       Step 2 — Volume re-signs and applies:
         a. Re-signs gc/<ulid> in-place with its own key (tmp-rename within gc/).
-           The body stays in gc/ — it is NOT moved to segments/ here.
+           The body stays in gc/ — it is NOT moved to cache/ here.
            Skipped for removal-only and tombstone handoffs (no staged segment).
         b. Applies extent index patches (repack → "gc", remove → "gone"),
            with a per-entry guard: skip if a concurrent write has already
@@ -27,35 +27,31 @@
            own perspective that no LBA map or extent index entry references the
            named segment.  This is a no-op in the normal case; its purpose is
            to provide the volume's acknowledgment before deletion.
-        d. Renames gc/<ulid>.pending → gc/<ulid>.applied.
+        d. Deletes index/<old>.idx for each consumed input segment.
+           ORDERING INVARIANT: index/<old>.idx is deleted here, as part of Step 2,
+           BEFORE the old S3 object is deleted in Step 3 Part B.  This upholds:
+             index/<ulid>.idx present  ↔  segment guaranteed to be in S3
+        e. Renames gc/<ulid>.pending → gc/<ulid>.applied.
 
       Step 3 — Coordinator cleans up (two sub-steps, ordered):
 
-        Step 3 Part A — Upload new segment and remove old index:
+        Step 3 Part A — Upload new segment and populate local cache:
         a. Uploads gc/<ulid> (now volume-signed) to S3.
            Skipped for removal-only and tombstone handoffs.
-        b. Writes index/<ulid>.idx (S3-confirmation marker for new segment).
+        b. IPC → volume: "promote <ulid>".
+           Volume copies gc/<ulid> body → cache/<ulid>.body, writes all-present
+           cache/<ulid>.present, and responds ok.
            Skipped for removal-only and tombstone handoffs.
-        c. Moves gc/<ulid> → segments/<ulid>.
+        c. Coordinator deletes gc/<ulid>.
            Skipped for removal-only and tombstone handoffs.
-        d. Deletes index/<old>.idx for each old input segment.
-           ORDERING INVARIANT: index/<old>.idx is deleted here, BEFORE the old
-           S3 object is deleted in Part B.  This upholds the invariant:
-             index/<ulid>.idx present  ↔  segment guaranteed to be in S3
-           If the coordinator crashes between Part A and Part B, the .idx is
-           gone but the S3 object remains — a transient space overhead, not
-           corruption.  On restart the coordinator retries from .applied;
-           Part A is idempotent (S3 put is idempotent; .idx write is
-           idempotent; gc/ → segments/ skips if gc/ is already gone).
-        e. Deletes old local segment bodies from segments/.
 
         Step 3 Part B — Delete old S3 objects and finalise:
-        f. Deletes old S3 objects.  A 404 means already gone; treat as success.
-        g. Renames gc/<ulid>.applied → gc/<ulid>.done.
+        d. Deletes old S3 objects.  A 404 means already gone; treat as success.
+        e. Renames gc/<ulid>.applied → gc/<ulid>.done.
 
         BUG HISTORY: an earlier implementation combined Part A and Part B into a
         single atomic cleanup that deleted old S3 objects but did NOT delete
-        index/<old>.idx.  After eviction (segments/ emptied) and coordinator
+        index/<old>.idx.  After eviction (cache/ emptied) and coordinator
         restart, rebuild_segments included the stale .idx in the extent index,
         mapping hashes to a segment absent from both disk and S3, causing
         "segment not found in any ancestor" read errors on every access.
@@ -114,10 +110,10 @@
       old_idx_present => old_present
       i.e. the old index file may only exist while the old S3 object exists.
 
-  This invariant is maintained by deleting index/<old>.idx (Step 3d) BEFORE
-  deleting the old S3 object (Step 3f).  Modelled by splitting CoordApplyDone
-  into CoordCleanupIdx (Part A) and CoordApplyDone (Part B), with Part B
-  gated on ~old_idx_present.
+  This invariant is maintained by the volume deleting index/<old>.idx in
+  VolumeFinishApply (Step 2d) BEFORE the coordinator deletes the old S3
+  object in CoordApplyDone (Step 3 Part B).  CoordApplyDone is gated on
+  ~old_idx_present, enforcing this ordering in all interleavings.
 
   WHY RE-SIGN IN-PLACE IN GC/?
   ----------------------------
@@ -131,37 +127,30 @@
   the coordinator is the sole writer of segments/, and writes there only after
   upload.  This eliminates the need for eviction to inspect in-flight GC state.
 
-  RESTART-SAFETY INVARIANT (Bug E)
-  ---------------------------------
+  RESTART-SAFETY NOTE (formerly Bug E)
+  -------------------------------------
   After a volume restart, the in-memory extent index is rebuilt from on-disk
-  .idx files.  If index/<old>.idx is still present (old_idx_present = TRUE),
-  sort_for_rebuild gives the old segment priority over gc/ bodies, so the
-  extent index reverts to pointing at the old segment ("old").  The coordinator
-  must not proceed with CoordCleanupIdx (which deletes the old segment) until
-  the volume has re-applied any .applied handoff and updated its extent index
-  to point to the new GC output.
+  .idx files.  In the new design this is structurally safe without any extra
+  coordinator guard:
 
-  This is modelled by:
+    - VolumeFinishApply deletes index/<old>.idx (sets old_idx_present = FALSE)
+      BEFORE renaming .pending → .applied.
+    - Therefore: when handoff = "applied", old_idx_present is always FALSE.
+    - VolumeRestart with old_idx_present = FALSE sets extent[h] = "gc" for
+      carried hashes (not "old"), so the extent index is already correct
+      after restart — no re-application step is needed.
 
-    1. VolumeRestart now resets extent[h] based on the on-disk .idx state:
-         extent[h] = "old" if old_idx_present (old .idx present → old wins)
-         extent[h] = "gc"  if ~old_idx_present ∧ h ∈ Carried (new .idx present)
-         extent[h] = "gone" if ~old_idx_present ∧ h ∈ Removed (removal in effect)
-         extent[h] = "new"  if a concurrent write superseded (always preserved)
+  VolumeRestart still models the rebuild correctly:
+    extent[h] = "old" if old_idx_present (crash during .pending phase, before
+                         VolumeFinishApply completes)
+    extent[h] = "gc"  if ~old_idx_present ∧ h ∈ Carried
+    extent[h] = "gone" if ~old_idx_present ∧ h ∈ Removed
+    extent[h] = "new"  if a concurrent write superseded (always preserved)
 
-    2. VolumeApplyApplied(h): fires when vol_up ∧ handoff = "applied" ∧
-         extent[h] = "old".  Re-applies the handoff entry (idempotent via the
-         still_at_old guard), updating extent[h] to "gc" or "gone".
-
-    3. CoordCleanupIdx gains a guard: ∀ h ∈ Hashes : extent[h] ≠ "old".
-         The coordinator (in production: via apply_gc_handoffs IPC before
-         apply_done_handoffs) must wait until the volume has re-applied before
-         deleting old segments.
-
-  Without these changes, TLC would find a counterexample:
-    VolumeFinishApply → VolumeCrash → VolumeRestart (extent reset to "old")
-    → CoordCleanupIdx → CoordApplyDone (old_present = FALSE)
-    → NoSegmentNotFound violated: extent[h] = "old" ∧ ~old_present.
+  The old VolumeApplyApplied action (re-apply .applied entries after restart)
+  and the CoordCleanupIdx guard (∀ h : extent[h] ≠ "old") are no longer needed:
+  old_idx_present is always FALSE by the time the coordinator sees .applied, so
+  VolumeRestart can never set extent[h] = "old" in that state.
 
   WHAT WE CHECK
   -------------
@@ -175,12 +164,13 @@
     OldIdxOnlyPresentWhenSegmentPresent
                                   — index/<old>.idx is absent whenever the old S3 object
                                     is absent; no dangling index entries after GC cleanup
-    SegmentsOnlyAfterUpload       — segments/<new> is populated only after volume
+    CacheOnlyAfterUpload          — cache/<new> is populated only after volume
                                     acknowledgment (handoff ∈ {"applied", "done"})
 
-  The restart-safety modelling ensures TLC explores the Bug E scenario:
-  extent index reverts to "old" on restart → VolumeApplyApplied must fire →
-  CoordCleanupIdx can only proceed once all extents are updated.
+  The restart-safety modelling ensures TLC explores crash scenarios during the
+  .pending phase (where old_idx_present may still be TRUE and extent can revert
+  to "old"), verifying that VolumeFinishApply always completes the idx deletion
+  and handoff rename atomically before the coordinator proceeds.
 
   HOW TO READ THIS
   ----------------
@@ -240,19 +230,23 @@ VARIABLES
   old_idx_present, \* TRUE iff index/<old>.idx exists on disk.
                    \* Invariant: old_idx_present => old_present
                    \* (the .idx file may only exist while the S3 object exists).
-                   \* Set FALSE by CoordCleanupIdx (Step 3 Part A, before S3 deletion).
+                   \* Set FALSE by VolumeFinishApply (before .applied rename).
 
   gc_seg_present, \* TRUE iff gc/<ulid> body is present (coordinator- or volume-signed).
-                  \* Set FALSE only when the coordinator moves it to segments/ in Step 3c.
+                  \* Set FALSE by CoordPromote (Step 3 Part A) after promote IPC succeeds.
   gc_seg_signed,  \* TRUE iff the gc/<ulid> body has been re-signed by the volume.
                   \* FALSE until VolumeReSigns fires; stays TRUE until gc_seg_present = FALSE.
                   \* Extent index entries pointing at "gc" are only readable once this is TRUE.
-  new_seg_present, \* TRUE iff segments/<ulid> (volume-signed, S3-confirmed) is present.
-                   \* Set by CoordCleanupIdx (Step 3 Part A, gc/ → segments/ move).
+  gc_s3_uploaded, \* TRUE iff coordinator has confirmed gc/<ulid> is uploaded to S3.
+                  \* Set TRUE by CoordUploadGc.  Reset to FALSE on coordinator crash (no
+                  \* durable local record; coordinator re-uploads idempotently on restart).
+                  \* Only relevant when Carried # {} (repack handoffs); stays FALSE otherwise.
+  new_seg_present, \* TRUE iff cache/<ulid>.body (volume-written, S3-confirmed) is present.
+                   \* Set TRUE by CoordPromote (after volume responds to promote IPC).
   coord_up,       \* TRUE iff the coordinator is currently running
   vol_up          \* TRUE iff the volume is currently running
 
-vars == <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+vars == <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Type correctness (checked as an invariant, useful for debugging the model)
@@ -267,6 +261,7 @@ TypeOK ==
   /\ old_idx_present  \in BOOLEAN
   /\ gc_seg_present   \in BOOLEAN
   /\ gc_seg_signed    \in BOOLEAN
+  /\ gc_s3_uploaded   \in BOOLEAN
   /\ new_seg_present  \in BOOLEAN
   /\ coord_up         \in BOOLEAN
   /\ vol_up           \in BOOLEAN
@@ -282,7 +277,8 @@ Init ==
   /\ old_idx_present  = TRUE                        \* index/<old>.idx exists (S3-confirmed)
   /\ gc_seg_present   = FALSE                       \* staged segment not yet written
   /\ gc_seg_signed    = FALSE                       \* not yet re-signed by volume
-  /\ new_seg_present  = FALSE                       \* GC output not yet in segments/
+  /\ gc_s3_uploaded   = FALSE                       \* gc body not yet uploaded to S3
+  /\ new_seg_present  = FALSE                       \* cache/<new>.body not yet written
   /\ coord_up         = TRUE
   /\ vol_up           = TRUE
 
@@ -310,50 +306,56 @@ CoordWritePending ==
   /\ handoff = "absent"
   /\ handoff'         = "pending"
   /\ gc_seg_present'  = (Carried # {})   \* staged segment written iff there are carried entries
-  /\ UNCHANGED <<extent, old_present, old_idx_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_present, old_idx_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 (*
-  Step 3 Part A: Coordinator sees .applied and performs the upload-and-local-cleanup
-  phase.  This action:
-    a. Uploads gc/<ulid> (now volume-signed) to S3 (not modelled as a variable;
-       the upload is idempotent and safe to retry).
-    b. Writes index/<new>.idx (S3-confirmation marker for the new segment; not
-       modelled separately — new_seg_present serves as the confirmation signal).
-    c. Moves gc/<ulid> → segments/<ulid> (sets new_seg_present; clears gc_seg_present
-       and gc_seg_signed). Skipped for removal-only and tombstone handoffs (Carried = {}).
-    d. Deletes index/<old>.idx for each old input segment (sets old_idx_present = FALSE).
-       This MUST happen before the old S3 object is deleted (Step 3 Part B) to
-       uphold the invariant old_idx_present => old_present.
-    e. Deletes old local segment bodies from segments/ (subsumed into this step;
-       no separate variable since local bodies follow S3 presence).
+  Step 3 Part A-1: Coordinator uploads gc/<ulid> (volume-signed) to S3.
 
-  Modelled as one atomic step: each sub-step is idempotent, so a crash here is
-  safe — the coordinator retries from .applied and the net effect is the same.
-  Specifically: if the coordinator crashes after (c) but before (d), gc/ is
-  gone and segments/ has the new body; on restart the gc/ → segments/ move is
-  skipped (gc/ absent) and (d) completes.
+  Fires when the coordinator is up and the gc body is present and volume-signed.
+  The upload is idempotent; gc_s3_uploaded = TRUE is the durable confirmation.
 
-  Precondition old_idx_present: this action is only needed while the old .idx
-  has not yet been removed.  Once old_idx_present = FALSE the coordinator
-  proceeds to CoordApplyDone.
+  No vol_up requirement: S3 upload does not involve the volume.
 
-  Precondition ∀ h ∈ Hashes : extent[h] ≠ "old": the coordinator must not
-  delete the old segment until the volume's extent index no longer references
-  it.  In production the coordinator calls apply_gc_handoffs IPC before
-  apply_done_handoffs; this guard models that synchronisation point.  Without
-  it, a volume restart (which resets extent to "old") followed immediately by
-  CoordCleanupIdx → CoordApplyDone would violate NoSegmentNotFound.
+  Skipped for removal-only and tombstone handoffs (gc_seg_present stays FALSE).
 *)
-CoordCleanupIdx ==
+CoordUploadGc ==
   /\ coord_up
   /\ handoff = "applied"
-  /\ old_idx_present                       \* guard: .idx not yet removed
-  /\ \A h \in Hashes : extent[h] # "old"  \* guard: volume extent index up-to-date
-  /\ old_idx_present'  = FALSE             \* delete index/<old>.idx (Step 3d)
-  /\ gc_seg_present'   = FALSE             \* gc/ body moved to segments/ (Step 3c)
-  /\ gc_seg_signed'    = FALSE             \* body no longer in gc/
-  /\ new_seg_present'  = (Carried # {})    \* segments/<new> present iff body was produced
-  /\ UNCHANGED <<handoff, extent, old_present, coord_up, vol_up>>
+  /\ gc_seg_present /\ gc_seg_signed  \* body must be present and volume-signed
+  /\ ~gc_s3_uploaded                  \* idempotency guard
+  /\ gc_s3_uploaded'  = TRUE
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+
+(*
+  Step 3 Part A-2: Coordinator calls promote IPC; volume responds by writing
+  cache/<ulid>.body and cache/<ulid>.present; coordinator then deletes gc/<ulid>.
+
+  Requires vol_up: the promote IPC round-trip requires the volume to be running.
+  If the volume is down, this action is blocked; the coordinator retries on the
+  next GC tick once the volume is back.  gc_seg_present stays TRUE during this
+  window (gc/<ulid> is not deleted until promote succeeds).
+
+  Modelled as one atomic step (promote + gc deletion): once promote returns ok,
+  the coordinator immediately deletes gc/<ulid>.  A crash before promote (while
+  vol_up = FALSE or between ticks) simply leaves the window open; gc_s3_uploaded
+  stays TRUE so CoordUploadGc does not re-run, and CoordPromote retries.
+
+  A coordinator crash resets gc_s3_uploaded = FALSE (see CoordCrash), so on
+  restart CoordUploadGc re-runs the idempotent S3 upload before CoordPromote.
+
+  Skipped for removal-only and tombstone handoffs (Carried = {}; no gc body).
+*)
+CoordPromote ==
+  /\ coord_up
+  /\ vol_up              \* promote IPC requires volume to be running
+  /\ handoff = "applied"
+  /\ gc_s3_uploaded      \* S3 upload must be confirmed first
+  /\ Carried # {}        \* repack handoffs only; removal-only/tombstone have no body
+  /\ ~new_seg_present    \* idempotency guard
+  /\ new_seg_present'    = TRUE   \* volume writes cache/<new>.body + .present
+  /\ gc_seg_present'     = FALSE  \* coordinator deletes gc/<ulid>
+  /\ gc_seg_signed'      = FALSE
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_s3_uploaded, coord_up, vol_up>>
 
 (*
   Step 3 Part B: Coordinator deletes old S3 objects and finalises the handoff.
@@ -365,15 +367,15 @@ CoordCleanupIdx ==
   is gone.
 
   After this action old_present = FALSE and handoff = "done".  The old segment
-  no longer exists anywhere; no extent entry points to "old" (CoordCleanupIdx
-  is gated on ∀ h : extent[h] ≠ "old", and VolumeApplyApplied handles the
-  restart path where extent was reset to "old" by VolumeRestart).
+  no longer exists anywhere; no extent entry points to "old" (VolumeFinishApply
+  applied all entries atomically before the .applied rename, and VolumeRestart
+  uses old_idx_present to reconstruct extent correctly after a crash).
 
   For tombstone handoffs (Carried = {}, Removed = {}) all Hashes = {} so no
   extent entries exist; old_present = FALSE is the only state change.
 
-  S3 upload state is not modelled (no S3 variable); the upload happened in
-  CoordCleanupIdx and is safe to retry.
+  S3 upload (CoordUploadGc) and cache promotion (CoordPromote) happened in
+  Step 3 Part A and are idempotent on coordinator restart.
 
   A 404 on the old S3 delete means the object is already gone (e.g. coordinator
   crashed after delete but before rename); treated as success so the step is
@@ -385,11 +387,12 @@ CoordApplyDone ==
   /\ ~old_idx_present                      \* ordering: .idx must be gone first
   /\ handoff'          = "done"
   /\ old_present'      = FALSE             \* old S3 object deleted (Step 3f)
-  /\ UNCHANGED <<extent, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 CoordCrash ==
   /\ coord_up
-  /\ coord_up' = FALSE
+  /\ coord_up'        = FALSE
+  /\ gc_s3_uploaded'  = FALSE   \* no durable local record; re-upload idempotently on restart
   /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, vol_up>>
 
 \* On restart the coordinator re-reads gc/ and resumes at whatever state the
@@ -397,7 +400,7 @@ CoordCrash ==
 CoordRestart ==
   /\ ~coord_up
   /\ coord_up' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Volume actions
@@ -428,7 +431,7 @@ VolumeReSigns ==
   /\ gc_seg_present              \* staged segment must be present
   /\ ~gc_seg_signed              \* not yet re-signed (idempotency guard)
   /\ gc_seg_signed'   = TRUE     \* body in gc/ is now volume-signed
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 (*
   Step 2b: Volume applies one carried entry from the handoff.
@@ -452,7 +455,7 @@ VolumeApplyCarried(h) ==
   /\ gc_seg_signed               \* re-signed body must be in gc/
   /\ extent[h] = "old"           \* guard: skip if superseded by a concurrent write
   /\ extent' = [extent EXCEPT ![h] = "gc"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 (*
   Step 2b (removal): Volume applies one removed entry from the handoff.
@@ -467,46 +470,59 @@ VolumeApplyRemoved(h) ==
   /\ h \in Removed
   /\ extent[h] = "old"           \* guard: skip if superseded
   /\ extent' = [extent EXCEPT ![h] = "gone"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 (*
-  Step 2d: Volume has visited every entry (applied or skipped due to guard) and
-  atomically renames gc/<ulid>.pending → gc/<ulid>.applied.
+  Step 2d+e: Volume has visited every entry (applied or skipped due to guard),
+  deletes index/<old>.idx for each consumed input, and atomically renames
+  gc/<ulid>.pending → gc/<ulid>.applied.
 
-  Preconditions:
-    - Every carried entry is now "gc" (applied) or "new" (guard fired, skipped)
-    - Every removed entry is now "gone" (applied) or "new" (guard fired, skipped)
-    - ~gc_seg_present \/ gc_seg_signed: if a staged segment was written
-      (gc_seg_present = TRUE), it must have been re-signed by the volume
-      (gc_seg_signed = TRUE) before signalling the coordinator.  This ensures
-      the body in gc/ is volume-signed before Step 3 begins.
-      (For Carried = {} no staged segment exists; gc_seg_present = FALSE always.)
+  Precondition: ~gc_seg_present \/ gc_seg_signed: if a staged segment was written
+  (gc_seg_present = TRUE), it must have been re-signed by the volume
+  (gc_seg_signed = TRUE) before signalling the coordinator.  This ensures
+  the body in gc/ is volume-signed before Step 3 begins.
+  (For Carried = {} no staged segment exists; gc_seg_present = FALSE always.)
+
+  This action atomically applies any remaining "old" entries (the per-entry
+  guard: skip if already "gc"/"gone"/"new") AND renames .pending → .applied AND
+  deletes index/<old>.idx.  In the implementation apply_gc_handoffs() does all
+  of this in a single function call; a crash anywhere restarts the whole call
+  idempotently.  Modelling it as one atomic TLA+ step is the correct abstraction:
+  per-entry partial progress (VolumeApplyCarried / VolumeApplyRemoved) is still
+  explored for safety, but the rename+idx-delete is never split from the last
+  entry update, preventing the adversary from crashing between the last apply
+  and the rename.
+
+  old_idx_present' = FALSE: the volume deletes index/<old>.idx here, before the
+  .applied rename.  This ensures that when the coordinator sees .applied, the old
+  .idx is already gone and extent[h] will never revert to "old" after a restart.
+  This is the structural fix for the Bug E class: by the time the coordinator
+  can act on .applied, the restart-safety condition is already guaranteed on disk.
 
   For tombstone handoffs (Dead = TRUE, Carried = {}, Removed = {}):
-    - Both universals are vacuously true (Hashes = {})
+    - Hashes = {}; the extent update is a no-op
     - gc_seg_present = FALSE throughout (no staged segment)
     - VolumeFinishApply fires immediately after CoordWritePending
     - This models the volume's acknowledgment: it has checked its own state
       and confirmed deletion is safe
-
-  If the volume crashes before this rename, the .pending file is still there
-  on restart: the volume re-applies from scratch.  Per-entry application is
-  idempotent because the guard (extent[h] = "old") does not fire for entries
-  already set to "gc" or "gone" in a previous partial run.
 *)
 VolumeFinishApply ==
   /\ vol_up
   /\ handoff = "pending"
   /\ ~gc_seg_present \/ gc_seg_signed  \* re-signing complete (or Carried = {})
-  /\ \A h \in Carried : extent[h] \in {"gc",   "new"}
-  /\ \A h \in Removed : extent[h] \in {"gone", "new"}
-  /\ handoff' = "applied"
-  /\ UNCHANGED <<extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  \* Apply any remaining "old" entries atomically (idempotent: "gc"/"gone"/"new" unchanged).
+  /\ extent'        = [h \in Hashes |->
+                         IF extent[h] = "old"
+                         THEN IF h \in Carried THEN "gc" ELSE "gone"
+                         ELSE extent[h]]
+  /\ handoff'          = "applied"
+  /\ old_idx_present'  = FALSE          \* delete index/<old>.idx before .applied rename
+  /\ UNCHANGED <<old_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 VolumeCrash ==
   /\ vol_up
   /\ vol_up' = FALSE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up>>
 
 (*
   On restart the volume rebuilds its in-memory extent index from on-disk .idx
@@ -516,9 +532,9 @@ VolumeCrash ==
 
   If old_idx_present = TRUE: index/<old>.idx is on disk → the old segment wins
   the rebuild → extent[h] reverts to "old" (as if VolumeApplyCarried never ran).
-  If old_idx_present = FALSE: CoordCleanupIdx has already removed the old .idx
-  and (for repack handoffs) written index/<new>.idx and moved the body to
-  segments/.  The new segment wins the rebuild:
+  If old_idx_present = FALSE: VolumeFinishApply has already removed the old .idx
+  and (for repack handoffs) the coordinator has written index/<new>.idx and
+  uploaded the body to S3.  The new segment wins the rebuild:
     - Carried hashes: extent[h] = "gc" (pointing at the new GC output)
     - Removed hashes: extent[h] = "gone" (removal was already in effect)
 
@@ -526,8 +542,9 @@ VolumeCrash ==
   "new" is in a WAL or segment file that persists on disk.
 
   This models the Bug E class: after restart, if old_idx_present = TRUE,
-  the extent index is stale.  The volume must re-apply any .applied handoffs
-  (VolumeApplyApplied) before the coordinator can proceed with CoordCleanupIdx.
+  the extent index is stale.  The volume must run VolumeFinishApply to apply
+  the .pending handoff and clear old_idx_present before the coordinator can
+  proceed with CoordUploadGc / CoordPromote / CoordApplyDone.
 *)
 VolumeRestart ==
   /\ ~vol_up
@@ -537,32 +554,18 @@ VolumeRestart ==
                   ELSE IF old_idx_present THEN "old"
                   ELSE IF h \in Carried    THEN "gc"
                   ELSE                         "gone"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up>>
 
 (*
-  Step 2 (re-apply, restart path): Volume re-applies a single carried or
-  removed entry from a .applied handoff file.
-
-  This fires when the volume restarts and finds a .applied handoff: the extent
-  index has been rebuilt to "old" (from .idx files), but the handoff has already
-  been committed.  The volume re-applies the entry idempotently using the same
-  still_at_old guard as VolumeApplyCarried / VolumeApplyRemoved.
-
-  No re-signing or rename is needed: the body is already volume-signed (done
-  before the .pending → .applied rename in the original session), and the file
-  is already .applied.
-
-  In production this is triggered by apply_gc_handoffs processing .applied files,
-  which the coordinator calls (via IPC) before apply_done_handoffs on every GC
-  tick (including the first tick after restart).
+  VolumeApplyApplied (REMOVED): in the previous design the volume could restart
+  after VolumeFinishApply with old_idx_present = TRUE still on disk, causing
+  VolumeRestart to reset extent[h] = "old".  VolumeApplyApplied re-applied
+  .applied entries to recover.  In the new design VolumeFinishApply clears
+  old_idx_present before the .applied rename, so VolumeRestart always sets
+  extent[h] = "gc" (not "old") when handoff = "applied".  The action's
+  precondition extent[h] = "old" is never satisfiable in that state; the
+  action is structurally dead and has been removed.
 *)
-VolumeApplyApplied(h) ==
-  /\ vol_up
-  /\ handoff = "applied"
-  /\ h \in Hashes
-  /\ extent[h] = "old"
-  /\ extent' = [extent EXCEPT ![h] = IF h \in Carried THEN "gc" ELSE "gone"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Environment: concurrent writes
@@ -595,7 +598,7 @@ VolumeApplyApplied(h) ==
 NewerWrite(h) ==
   /\ extent[h] \in {"old", "gc"}
   /\ extent' = [extent EXCEPT ![h] = "new"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Specification
@@ -603,7 +606,8 @@ NewerWrite(h) ==
 
 Next ==
   \/ CoordWritePending
-  \/ CoordCleanupIdx
+  \/ CoordUploadGc
+  \/ CoordPromote
   \/ CoordApplyDone
   \/ CoordCrash
   \/ CoordRestart
@@ -613,7 +617,6 @@ Next ==
   \/ VolumeFinishApply
   \/ VolumeCrash
   \/ VolumeRestart
-  \/ \E h \in Hashes  : VolumeApplyApplied(h)
   \/ \E h \in Hashes  : NewerWrite(h)
 
 (*
@@ -630,8 +633,8 @@ Next ==
   fairness is sufficient — it says "if continuously enabled, eventually
   fire", which is exactly what we want for restart.
 
-  SF_vars(progress): Progress actions (WritePending, CleanupIdx, ApplyDone,
-  ReSigns, Apply*, ApplyApplied, Finish) require the actor to be UP.  A crash can interrupt
+  SF_vars(progress): Progress actions (WritePending, UploadGc, Promote,
+  ApplyDone, ReSigns, Apply*, Finish) require the actor to be UP.  A crash can interrupt
   them at any moment, so they are never continuously enabled in a trace with
   unbounded crashes.  Weak fairness would never fire.  Strong fairness fires
   whenever an action is enabled *infinitely often* — even intermittently.
@@ -645,22 +648,36 @@ Next ==
   hash can make progress, some hash will.  This is sufficient for all
   entries to be eventually processed.
 
-  For tombstone handoffs (Hashes = {}) the \E-quantified fairness conditions
-  are vacuously satisfied; progress is driven by VolumeFinishApply alone.
+  Liveness for VolumeApplyCarried / VolumeApplyRemoved / VolumeFinishApply:
+
+  VolumeFinishApply now atomically applies any remaining "old" entries and
+  renames .pending → .applied.  It is enabled on every restart where
+  handoff = "pending" and the gc body is signed (or Carried = {}).  With
+  SF_vars(VolumeFinishApply) the system is guaranteed to eventually reach
+  .applied in some crash-free step: crashes keep vol_up = FALSE temporarily,
+  but WF_vars(VolumeRestart) brings it back, and SF_vars(VolumeFinishApply)
+  then forces the commit.
+
+  VolumeApplyCarried and VolumeApplyRemoved retain \E-quantified fairness for
+  safety exploration (partial-application states are still reachable by TLC),
+  but liveness no longer depends on them — VolumeFinishApply subsumes them.
+
+  For tombstone handoffs (Hashes = {}) all \E-quantified conditions are
+  vacuously satisfied; progress is driven by VolumeFinishApply alone.
 *)
 Spec ==
   /\ Init
   /\ [][Next]_vars
   /\ WF_vars(CoordRestart)
   /\ SF_vars(CoordWritePending)
-  /\ SF_vars(CoordCleanupIdx)
+  /\ SF_vars(CoordUploadGc)
+  /\ SF_vars(CoordPromote)
   /\ SF_vars(CoordApplyDone)
   /\ WF_vars(VolumeRestart)
   /\ SF_vars(VolumeReSigns)
   /\ SF_vars(\E h \in Carried : VolumeApplyCarried(h))
   /\ SF_vars(\E h \in Removed : VolumeApplyRemoved(h))
   /\ SF_vars(VolumeFinishApply)
-  /\ SF_vars(\E h \in Hashes  : VolumeApplyApplied(h))
 
 \* ---------------------------------------------------------------------------
 \* Safety invariants
@@ -675,7 +692,7 @@ Spec ==
   - extent = "gc"   references the GC output body, which may be in two places:
                       * gc/ (volume-signed, during the .applied window):
                         gc_seg_present /\ gc_seg_signed
-                      * segments/ (after coordinator moves it in Step 3c):
+                      * cache/ (after coordinator calls promote in Step 3b):
                         new_seg_present
                     The body must be in at least one of these locations.
   - extent = "gone" means the entry was deleted from the index (no reference)
@@ -742,36 +759,33 @@ OldOnlyDeletedAfterApplied ==
 
   This invariant encodes the fix for the "segment not found in any ancestor"
   bug: an earlier implementation deleted old S3 objects without first removing
-  index/<old>.idx.  After eviction (segments/ emptied) and coordinator restart,
+  index/<old>.idx.  After eviction (cache/ emptied) and coordinator restart,
   rebuild_segments included the stale .idx in the extent index, mapping hashes
   to a segment absent from both disk and S3.
 
-  The fix: CoordCleanupIdx sets old_idx_present = FALSE (Step 3d) before
-  CoordApplyDone sets old_present = FALSE (Step 3f).  CoordApplyDone is gated
-  on ~old_idx_present, enforcing this ordering in all interleavings.
+  The fix: VolumeFinishApply sets old_idx_present = FALSE (Step 2d) before
+  CoordApplyDone sets old_present = FALSE (Step 3 Part B).  CoordApplyDone is
+  gated on ~old_idx_present, enforcing this ordering in all interleavings.
 
   TLC verifies that no reachable state violates this invariant, including
-  all crash-and-restart interleavings between CoordCleanupIdx and CoordApplyDone.
+  all crash-and-restart interleavings between VolumeFinishApply and CoordApplyDone.
 *)
 OldIdxOnlyPresentWhenSegmentPresent ==
   old_idx_present => old_present
 
 (*
-  segments/ invariant: new_seg_present (the GC output body is in segments/)
+  cache/ invariant: new_seg_present (the GC output body is in cache/)
   implies the body in gc/ is gone and the handoff has reached at least "applied".
 
-  new_seg_present is set by CoordCleanupIdx, which fires only when
-  handoff = "applied" — i.e. after the volume has acknowledged and the
-  coordinator has completed upload.  Once in segments/, gc/ no longer has the
-  body (gc_seg_present = FALSE).
+  new_seg_present is set by CoordPromote (promote IPC to the volume), which
+  requires handoff = "applied" and gc_s3_uploaded — i.e. after the volume has
+  acknowledged and the coordinator has confirmed the S3 upload.  Once in
+  cache/, gc/ no longer has the body (gc_seg_present = FALSE).
 
-  Note: the previous version of this invariant required handoff = "done", but
-  with the split of CoordApplyDone into CoordCleanupIdx + CoordApplyDone,
-  new_seg_present is set during "applied" (before "done").  The weakened form
-  handoff \in {"applied", "done"} is still meaningful: it verifies that
-  segments/<new> is only populated after the volume's acknowledgment.
+  The invariant verifies that cache/<new> is only populated after the volume's
+  acknowledgment (handoff = "applied") and after the S3 upload is confirmed.
 *)
-SegmentsOnlyAfterUpload ==
+CacheOnlyAfterUpload ==
   new_seg_present => (~gc_seg_present /\ handoff \in {"applied", "done"})
 
 \* ---------------------------------------------------------------------------

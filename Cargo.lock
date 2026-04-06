@@ -732,6 +732,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctrlc",
+ "elide-coordinator",
  "elide-core",
  "elide-fetch",
  "ext4-view",

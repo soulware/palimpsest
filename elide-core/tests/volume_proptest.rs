@@ -112,7 +112,13 @@ enum SimOp {
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
     prop_oneof![
-        (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
+        // Write and DedupWrite use seeds 0..=127 (bit 7 clear).
+        // PopulateFetched effective seeds are always 128..=255 (bit 7 set).
+        // This partitions the hash space so that populate_cache data can never
+        // collide with data written through the volume's write path, mirroring
+        // the production invariant that the fetcher only caches data that was
+        // previously written through the volume (and thus already indexed).
+        (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
         Just(SimOp::Flush),
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
@@ -123,7 +129,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::ReadUnwritten),
         Just(SimOp::Snapshot),
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::PopulateFetched { lba, seed }),
-        (0u8..4, 4u8..8, any::<u8>()).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
+        (0u8..4, 4u8..8, 0u8..128u8).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
             lba_a,
             lba_b,
             seed
@@ -139,10 +145,10 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
 /// Two segments drained to `segments/` — CoordGcLocal has material to compact.
 fn two_segment_prefix() -> Vec<SimOp> {
     vec![
-        SimOp::Write { lba: 0, seed: 0xAA },
+        SimOp::Write { lba: 0, seed: 0x0A },
         SimOp::Flush,
         SimOp::DrainLocal,
-        SimOp::Write { lba: 1, seed: 0xBB },
+        SimOp::Write { lba: 1, seed: 0x0B },
         SimOp::Flush,
         SimOp::DrainLocal,
     ]
@@ -198,16 +204,16 @@ fn multi_segment_prefix() -> Vec<SimOp> {
 /// CoordGcLocalBoth can fire: S1 → repack, S2+S3+S4 → sweep.
 fn repack_and_sweep_prefix() -> Vec<SimOp> {
     vec![
-        SimOp::Write { lba: 0, seed: 0xAA },
+        SimOp::Write { lba: 0, seed: 0x14 },
         SimOp::Flush,
         SimOp::DrainLocal,
-        SimOp::Write { lba: 0, seed: 0xBB }, // overwrites LBA 0 — S1 becomes stale
+        SimOp::Write { lba: 0, seed: 0x15 }, // overwrites LBA 0 — S1 becomes stale
         SimOp::Flush,
         SimOp::DrainLocal,
-        SimOp::Write { lba: 1, seed: 0xCC },
+        SimOp::Write { lba: 1, seed: 0x16 },
         SimOp::Flush,
         SimOp::DrainLocal,
-        SimOp::Write { lba: 2, seed: 0xDD },
+        SimOp::Write { lba: 2, seed: 0x17 },
         SimOp::Flush,
         SimOp::DrainLocal,
     ]
@@ -217,10 +223,10 @@ fn repack_and_sweep_prefix() -> Vec<SimOp> {
 /// rebuild from a volume that already has GC history.
 fn post_gc_prefix() -> Vec<SimOp> {
     vec![
-        SimOp::Write { lba: 0, seed: 0x88 },
+        SimOp::Write { lba: 0, seed: 0x28 },
         SimOp::Flush,
         SimOp::DrainLocal,
-        SimOp::Write { lba: 1, seed: 0x99 },
+        SimOp::Write { lba: 1, seed: 0x29 },
         SimOp::Flush,
         SimOp::DrainLocal,
         SimOp::CoordGcLocal { n: 2 },
@@ -374,10 +380,14 @@ proptest! {
                     };
                     // Apply any pending gc handoffs (from this pass or a
                     // pre-crash pass) through the volume's handoff path.
-                    let _ = vol.apply_gc_handoffs();
-                    // Delete old segment files only after the handoff is applied.
-                    for path in &to_delete {
-                        let _ = std::fs::remove_file(path);
+                    // Only delete consumed segment files when the handoff was
+                    // actually applied (returned > 0).  If Bug B cancelled the
+                    // GC, the consumed files must survive for the next tick.
+                    let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                    if applied > 0 {
+                        for path in &to_delete {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
@@ -393,7 +403,6 @@ proptest! {
                             "WAL segment after gc_checkpoint sorts below GC output: {u} ≤ {sweep_ulid}"
                         );
                     }
-                    let mut to_delete: Vec<std::path::PathBuf> = vec![];
                     if let Some(((r_consumed, r_produced, r_paths), (s_consumed, s_produced, s_paths))) =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
                     {
@@ -407,12 +416,19 @@ proptest! {
                             s_produced > s_max,
                             "coord_gc_both sweep produced {s_produced} ≤ consumed max {s_max}"
                         );
-                        to_delete.extend(r_paths);
-                        to_delete.extend(s_paths);
-                    }
-                    let _ = vol.apply_gc_handoffs();
-                    for path in &to_delete {
-                        let _ = std::fs::remove_file(path);
+                        // Delete each pass's input paths only if that specific
+                        // pass was applied.  Bug B may cancel one pass while the
+                        // other succeeds; checking applied > 0 on the combined
+                        // count would incorrectly delete the cancelled pass's
+                        // inputs, breaking subsequent reads and crash+rebuild.
+                        let gc_dir = fork_dir.join("gc");
+                        let _ = vol.apply_gc_handoffs().unwrap_or(0);
+                        if gc_dir.join(format!("{}.applied", r_produced)).exists() {
+                            for path in &r_paths { let _ = std::fs::remove_file(path); }
+                        }
+                        if gc_dir.join(format!("{}.applied", s_produced)).exists() {
+                            for path in &s_paths { let _ = std::fs::remove_file(path); }
+                        }
                     }
                 }
                 SimOp::Crash => {
@@ -440,8 +456,13 @@ proptest! {
                     // gc_checkpoint flushes the WAL (may create a pending segment) then
                     // mints two fresh ULIDs; we use the first for the cache file.  All
                     // new ULIDs must be > max_before.
+                    //
+                    // effective_seed always has bit 7 set (128..=255) so it never
+                    // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
+                    // Bits 6-4 encode lba (0..7), bits 3-0 vary within the lba slot.
+                    let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
                     let (ulid, _) = vol.gc_checkpoint().unwrap();
-                    common::populate_cache(fork_dir, ulid, 16 + *lba as u64, *seed);
+                    common::populate_cache(fork_dir, ulid, 16 + *lba as u64, effective_seed);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -509,24 +530,29 @@ proptest! {
                     };
                     // Apply handoffs before deleting consumed segments — mirrors
                     // the real coordinator protocol (volume acknowledges first,
-                    // then coordinator deletes).
-                    let _ = vol.apply_gc_handoffs();
-                    for path in &to_delete {
-                        let _ = std::fs::remove_file(path);
+                    // then coordinator deletes).  Only delete when the handoff was
+                    // applied (returned > 0); Bug B cancellation leaves consumed
+                    // files in place for the next GC tick.
+                    let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                    if applied > 0 {
+                        for path in &to_delete {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
-                    let mut to_delete: Vec<std::path::PathBuf> = vec![];
-                    if let Some(((_, _, r_paths), (_, _, s_paths))) =
-                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
-                    {
-                        to_delete.extend(r_paths);
-                        to_delete.extend(s_paths);
-                    }
-                    let _ = vol.apply_gc_handoffs();
-                    for path in &to_delete {
-                        let _ = std::fs::remove_file(path);
+                    let gc_result =
+                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
+                    let _ = vol.apply_gc_handoffs().unwrap_or(0);
+                    let gc_dir = fork_dir.join("gc");
+                    if let Some(((_, r_produced, r_paths), (_, s_produced, s_paths))) = gc_result {
+                        if gc_dir.join(format!("{r_produced}.applied")).exists() {
+                            for path in &r_paths { let _ = std::fs::remove_file(path); }
+                        }
+                        if gc_dir.join(format!("{s_produced}.applied")).exists() {
+                            for path in &s_paths { let _ = std::fs::remove_file(path); }
+                        }
                     }
                 }
                 SimOp::Crash => {
@@ -557,14 +583,25 @@ proptest! {
                     let _ = vol.snapshot();
                 }
                 SimOp::PopulateFetched { lba, seed } => {
-                    // Write directly to cache/ (simulates a demand-fetch from S3).
-                    // LBA is offset by 16 so it never overlaps with Write (0–7).
-                    // The latest PopulateFetched for an LBA wins on rebuild (highest
-                    // ULID applied last), so always overwrite the oracle entry.
-                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    // Simulate a demand-fetch from S3: write one segment directly to
+                    // index/ + cache/, bypassing the WAL.
+                    //
+                    // In production, index/*.idx is written by the coordinator once
+                    // after S3 upload and is never duplicated.  A re-fetch of an
+                    // evicted segment only rewrites the cache/ body, not index/.
+                    // Creating two index entries for the same LBA is therefore an
+                    // invalid production state — skip if this LBA is already populated.
                     let actual_lba = 16 + *lba as u64;
-                    common::populate_cache(fork_dir, ulid, actual_lba, *seed);
-                    oracle.insert(actual_lba, [*seed; 4096]);
+                    if oracle.contains_key(&actual_lba) {
+                        continue;
+                    }
+                    // effective_seed always has bit 7 set (128..=255) so it never
+                    // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
+                    // Bits 6-4 encode lba (0..7), bits 3-0 vary within the lba slot.
+                    let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
+                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
+                    oracle.insert(actual_lba, [effective_seed; 4096]);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -624,23 +661,26 @@ proptest! {
                     } else {
                         vec![]
                     };
-                    let _ = vol.apply_gc_handoffs();
-                    for path in &to_delete {
-                        let _ = std::fs::remove_file(path);
+                    let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                    if applied > 0 {
+                        for path in &to_delete {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
-                    let mut to_delete: Vec<std::path::PathBuf> = vec![];
-                    if let Some(((_, _, r_paths), (_, _, s_paths))) =
-                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
-                    {
-                        to_delete.extend(r_paths);
-                        to_delete.extend(s_paths);
-                    }
-                    let _ = vol.apply_gc_handoffs();
-                    for path in &to_delete {
-                        let _ = std::fs::remove_file(path);
+                    let gc_result =
+                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
+                    let _ = vol.apply_gc_handoffs().unwrap_or(0);
+                    let gc_dir = fork_dir.join("gc");
+                    if let Some(((_, r_produced, r_paths), (_, s_produced, s_paths))) = gc_result {
+                        if gc_dir.join(format!("{r_produced}.applied")).exists() {
+                            for path in &r_paths { let _ = std::fs::remove_file(path); }
+                        }
+                        if gc_dir.join(format!("{s_produced}.applied")).exists() {
+                            for path in &s_paths { let _ = std::fs::remove_file(path); }
+                        }
                     }
                 }
                 SimOp::Crash => {
@@ -668,10 +708,17 @@ proptest! {
                     let _ = vol.snapshot();
                 }
                 SimOp::PopulateFetched { lba, seed } => {
-                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    // Skip if already populated — see crash_recovery_oracle for rationale.
                     let actual_lba = 16 + *lba as u64;
-                    common::populate_cache(fork_dir, ulid, actual_lba, *seed);
-                    oracle.insert(actual_lba, [*seed; 4096]);
+                    if oracle.contains_key(&actual_lba) {
+                        continue;
+                    }
+                    // effective_seed always has bit 7 set (128..=255) so it never
+                    // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
+                    let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
+                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
+                    oracle.insert(actual_lba, [effective_seed; 4096]);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];

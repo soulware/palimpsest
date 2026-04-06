@@ -16,15 +16,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono         = { version = "0.4", default-features = false, features = ["clock"] }
 clap           = { version = "4", features = ["derive", "env"] }
 ctrlc          = "3"
-elide-core     = { path = "elide-core" }
-elide-fetch    = { path = "elide-fetch" }
+elide-core        = { path = "elide-core" }
+elide-coordinator = { path = "elide-coordinator" }
+elide-fetch       = { path = "elide-fetch" }
 ext4-view      = { version = "0.9", features = ["std"] }
 libc           = "0.2"
 lz4_flex       = "0.11"
 futures        = "0.3"
 object_store   = { version = "0.11", features = ["aws"] }
 serde          = { version = "1", features = ["derive"] }
-tokio          = { version = "1", features = ["rt-multi-thread"] }
+tokio          = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 toml           = { version = "0.8", default-features = false, features = ["parse", "display"] }
 ulid           = "1"
 zstd           = "0.13"

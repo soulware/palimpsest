@@ -28,18 +28,48 @@ pub fn write_test_keypair(dir: &Path) {
     .unwrap();
 }
 
-/// Move all committed segments from pending/ to segments/.
-/// Simulates `drain-pending` (upload + rename) without touching an object store.
+/// Promote all committed segments from pending/ to index/ + cache/.
+/// Simulates `drain-pending` (upload + local cache promotion) without touching an object store.
 pub fn drain_local(fork_dir: &Path) {
+    const HEADER_LEN: usize = 96;
     let pending = fork_dir.join("pending");
-    let segments = fork_dir.join("segments");
-    if let Ok(entries) = fs::read_dir(&pending) {
-        for entry in entries.flatten() {
-            let name_str = entry.file_name().to_string_lossy().into_owned();
-            if !name_str.ends_with(".tmp") {
-                let _ = fs::rename(entry.path(), segments.join(&name_str));
-            }
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    let _ = fs::create_dir_all(&index_dir);
+    let _ = fs::create_dir_all(&cache_dir);
+    let Ok(entries) = fs::read_dir(&pending) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(ulid_str) = name.to_str() else {
+            continue;
+        };
+        if ulid_str.ends_with(".tmp") {
+            continue;
         }
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        if data.len() < HEADER_LEN {
+            continue;
+        }
+        let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let bss = HEADER_LEN + index_length as usize + inline_length as usize;
+        if data.len() < bss {
+            continue;
+        }
+        let _ = fs::write(index_dir.join(format!("{ulid_str}.idx")), &data[..bss]);
+        let _ = fs::write(cache_dir.join(format!("{ulid_str}.body")), &data[bss..]);
+        let bitset_len = (entry_count as usize).div_ceil(8);
+        let _ = fs::write(
+            cache_dir.join(format!("{ulid_str}.present")),
+            vec![0xFFu8; bitset_len],
+        );
+        let _ = fs::remove_file(&path);
     }
 }
 
@@ -138,10 +168,23 @@ fn compact_candidates_inner(
     let mut removed: Vec<(blake3::Hash, Ulid)> = Vec::new();
 
     for (ulid, path) in &candidates {
-        let Ok((bss, mut entries)) = segment::read_and_verify_segment_index(path, &vk) else {
+        let Ok((bss_header, mut entries)) = segment::read_and_verify_segment_index(path, &vk)
+        else {
             continue;
         };
-        if segment::read_extent_bodies(path, bss, &mut entries).is_err() {
+        // For .idx files (committed segments), bodies are in cache/<ulid>.body at offset 0.
+        // For full segment files (pending/, gc/), bodies are in the same file at bss_header.
+        let is_idx = path.extension().is_some_and(|e| e == "idx");
+        let (body_path, bss) = if is_idx {
+            let ulid_str = ulid.to_string();
+            (
+                fork_dir.join("cache").join(format!("{ulid_str}.body")),
+                0u64,
+            )
+        } else {
+            (path.clone(), bss_header)
+        };
+        if segment::read_extent_bodies(&body_path, bss, &mut entries).is_err() {
             continue;
         }
         for entry in entries.drain(..) {
@@ -241,12 +284,12 @@ fn compact_candidates_inner(
     Some((consumed, new_ulid, to_delete))
 }
 
-/// Simulate one coordinator GC pass on `segments/` without an object store.
+/// Simulate one coordinator GC pass on committed segments without an object store.
 ///
-/// Picks the `n_candidates` lowest-priority segments (sort_for_rebuild order),
-/// compacts their entries, writes a new segment with the given `new_ulid`
-/// (obtained from `gc_checkpoint` which flushes the volume's WAL first), and
-/// writes `gc/<new_ulid>.pending`.
+/// Picks the `n_candidates` lowest-priority segments (sort_for_rebuild order)
+/// from `index/*.idx`, compacts their entries, writes a new segment with the
+/// given `new_ulid` (obtained from `gc_checkpoint` which flushes the volume's
+/// WAL first), and writes `gc/<new_ulid>.pending`.
 ///
 /// The input segment files are **not** deleted inline.  The caller receives
 /// the consumed paths and is responsible for deleting them — after calling
@@ -261,15 +304,15 @@ pub fn simulate_coord_gc_local(
     new_ulid: Ulid,
     n_candidates: usize,
 ) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
-    let segments_dir = fork_dir.join("segments");
+    let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
 
-    let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
-    let mut candidates: Vec<(Ulid, PathBuf)> = seg_files
+    let idx_files = segment::collect_idx_files(&index_dir).ok()?;
+    let mut candidates: Vec<(Ulid, PathBuf)> = idx_files
         .iter()
         .filter_map(|p| {
-            let name = p.file_name()?.to_str()?;
-            let ulid = Ulid::from_string(name).ok()?;
+            let stem = p.file_stem()?.to_str()?;
+            let ulid = Ulid::from_string(stem).ok()?;
             Some((ulid, p.clone()))
         })
         .collect();
@@ -298,13 +341,13 @@ pub fn simulate_coord_gc_local(
 
 /// Simulate coordinator GC running both repack and sweep in one tick.
 ///
-/// Requires ≥ 3 segments in `segments/`: the first (lowest-priority) segment
-/// is the repack candidate; the remaining segments are the sweep candidates.
-/// Both passes share a single liveness snapshot (lba_map + extent_index
-/// rebuilt once before either pass runs), which matches the real coordinator's
-/// behaviour: `gc_fork` calls `collect_stats` once, removes the repack
-/// candidate with `all_stats.remove(pos)`, and sweeps the remainder — neither
-/// pass rebuilds liveness data mid-tick.
+/// Requires ≥ 3 committed segments in `index/`: the first (lowest-priority)
+/// segment is the repack candidate; the remaining segments are the sweep
+/// candidates.  Both passes share a single liveness snapshot (lba_map +
+/// extent_index rebuilt once before either pass runs), which matches the real
+/// coordinator's behaviour: `gc_fork` calls `collect_stats` once, removes the
+/// repack candidate with `all_stats.remove(pos)`, and sweeps the remainder —
+/// neither pass rebuilds liveness data mid-tick.
 ///
 /// Note: the real coordinator splits candidates by density threshold; this
 /// simulation splits by position (first → repack, rest → sweep).  That
@@ -322,15 +365,15 @@ pub fn simulate_coord_gc_both_local(
     (Vec<Ulid>, Ulid, Vec<PathBuf>),
     (Vec<Ulid>, Ulid, Vec<PathBuf>),
 )> {
-    let segments_dir = fork_dir.join("segments");
+    let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
 
-    let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
-    let mut all_candidates: Vec<(Ulid, PathBuf)> = seg_files
+    let idx_files = segment::collect_idx_files(&index_dir).ok()?;
+    let mut all_candidates: Vec<(Ulid, PathBuf)> = idx_files
         .iter()
         .filter_map(|p| {
-            let name = p.file_name()?.to_str()?;
-            let ulid = Ulid::from_string(name).ok()?;
+            let stem = p.file_stem()?.to_str()?;
+            let ulid = Ulid::from_string(stem).ok()?;
             Some((ulid, p.clone()))
         })
         .collect();

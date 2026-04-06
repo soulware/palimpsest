@@ -6,21 +6,21 @@
 //
 // A location names the segment file and the body-relative byte offset where
 // the payload starts. At read time the file is located by checking each
-// storage directory in order (wal/ → pending/ → segments/).
+// storage directory in order (wal/ → pending/ → cache/).
 //
 // Body offsets are always body-relative (= stored_offset from the segment index):
 //   - For WAL entries (not yet promoted): body_section_start == 0 and
 //     body_offset is the absolute WAL file offset (WAL has no header prefix).
-//   - For promoted entries (pending/ or segments/): body_offset == stored_offset;
+//   - For promoted entries (pending/): body_offset == stored_offset;
 //     body_section_start is the absolute file offset of the body section.
 //     The actual file seek position is body_section_start + body_offset.
 //   - For cached entries (.body files): body_section_start == 0 and
 //     body_offset is the body-relative offset (file starts at body section byte 0).
 //
 // Rebuild on startup:
-//   extentindex::rebuild(base_dir) scans pending/ and segments/ for committed
-//   segment files and reads their index sections. Volume::open() then inserts
-//   WAL Data records on top via recover_wal().
+//   extentindex::rebuild scans pending/ for not-yet-uploaded segment files and
+//   index/*.idx for uploaded segments. Volume::open() then inserts WAL Data
+//   records on top via recover_wal().
 
 use std::collections::HashMap;
 use std::io;
@@ -35,7 +35,7 @@ use crate::signing;
 /// Physical location of an extent within a segment file.
 #[derive(Clone)]
 pub struct ExtentLocation {
-    /// ULID of the segment (filename in wal/, pending/, or segments/).
+    /// ULID of the segment (filename in wal/, pending/, gc/, or index/).
     pub segment_id: Ulid,
     /// Body-relative byte offset of the start of the payload (= `stored_offset`
     /// from the segment index). For WAL entries, equals the absolute WAL file
@@ -51,7 +51,7 @@ pub struct ExtentLocation {
     pub entry_idx: Option<u32>,
     /// Absolute offset of the body section within the full segment file.
     /// 0 for WAL entries and `.body` cache files (both start at byte 0 of
-    /// the body data). Non-zero for entries in `pending/` or `segments/` files.
+    /// the body data). Non-zero for entries in `pending/` or `gc/*.applied` files.
     /// The actual seek position for a read is `body_section_start + body_offset`.
     /// Also used to compute the store range-GET start for per-extent fetching.
     pub body_section_start: u64,
@@ -107,22 +107,11 @@ impl Default for ExtentIndex {
 
 /// Rebuild the extent index from all committed segments across an ancestor chain.
 ///
-/// `node_chain` is ordered oldest-first (root ancestor first, live node last).
-/// Each node's `pending/` and `segments/` are scanned in ULID order. Later
-/// entries for the same hash overwrite earlier ones (same segment ULID is
-/// globally unique, so this only matters across layers for moved extents after
-/// GC repacking).
-///
-/// Inline entries and dedup-ref entries are skipped:
-/// - Inline entries: read path not yet implemented (INLINE_THRESHOLD = 0).
-/// - Dedup-ref entries: no body in this segment; the hash is already indexed
-///   from the ancestor segment that holds the actual data.
-///
 /// Rebuild the extent index from all committed segments across a fork ancestry chain.
 ///
 /// `layers` is ordered oldest-first (root ancestor first, live fork last).
 /// Each element is `(fork_dir, branch_ulid)`:
-/// - `fork_dir`: the fork directory containing `pending/` and `segments/`.
+/// - `fork_dir`: the fork directory containing `pending/`, `index/`, and `cache/`.
 /// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
 ///   are included. `None` means include all segments (used for the live fork).
 ///
@@ -136,9 +125,10 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Process index/*.idx first (body-relative offsets). pending/ and
-        // segments/ are processed after, so their absolute-offset entries win
-        // when the same segment is present in both places.
+        // Process index/*.idx first (body-relative offsets). pending/ is
+        // processed after, so its absolute-offset entries win when the same
+        // segment is present in both index/ and pending/ (e.g. coordinator
+        // crash between writing index/ and deleting pending/).
         let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
         cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
         if let Some(cutoff) = branch_ulid {
@@ -149,12 +139,12 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     .unwrap_or(false)
             });
         }
-        // Process pending/ and segments/ (absolute offsets). These overwrite
-        // any cache/ entries for the same hashes.
+        // Process pending/ (absolute offsets). These overwrite any index/ entries
+        // for the same hashes, since pending/ segments are not yet uploaded and
+        // have full local bodies with known body_section_start.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
-        paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
         // Include GC handoff bodies in .applied state (volume-signed, in gc/
-        // awaiting coordinator upload to S3).  Lower priority than segments/.
+        // awaiting coordinator upload to S3).  Lower priority than pending/.
         paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
@@ -461,14 +451,14 @@ mod tests {
     fn rebuild_indexes_ancestor_segments() {
         let ancestor = temp_dir();
         let live = temp_dir();
-        std::fs::create_dir_all(ancestor.join("segments")).unwrap();
+        std::fs::create_dir_all(ancestor.join("pending")).unwrap();
         std::fs::create_dir_all(live.join("pending")).unwrap();
         let signer = write_test_pub(&ancestor);
 
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
 
-        // Hash lives in ancestor segments/.
+        // Hash lives in ancestor pending/ (simulating an uploaded segment still cached locally).
         let bss;
         let stored_offset;
         {
@@ -480,7 +470,7 @@ mod tests {
                 data,
             )];
             bss = segment::write_segment(
-                &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &ancestor.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
                 signer.as_ref(),
             )

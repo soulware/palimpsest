@@ -3,7 +3,8 @@
 // Directory layout:
 //   <base>/wal/       — active write-ahead log (at most one file at a time)
 //   <base>/pending/   — promoted segments awaiting S3 upload
-//   <base>/segments/  — segments confirmed uploaded to S3 (evictable)
+//   <base>/index/     — coordinator-written LBA index files (*.idx); permanent; never evicted
+//   <base>/cache/     — coordinator-written body cache (*.body, *.present); evictable
 //   <base>/gc/        — coordinator GC handoff files (*.pending → *.applied → *.done)
 //
 // Write path:
@@ -15,7 +16,7 @@
 // Read path:
 //   1. lbamap.lookup(lba) → (hash, block_offset)
 //   2. extent_index.lookup(hash) → ExtentLocation (segment_id, body_offset, body_length)
-//   3. find_segment_file (wal/ → pending/ → segments/) → open file, seek, read
+//   3. find_segment_file (wal/ → pending/ → gc/*.applied → cache/<id>.body) → open file, seek, read
 //
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
@@ -191,7 +192,7 @@ impl Volume {
     /// Open (or create) a fork at `base_dir`.
     ///
     /// `base_dir` must be the fork directory (e.g. `volumes/myvm/default/`), not the
-    /// volume root. Creates `wal/`, `pending/`, and `segments/` if they do not exist.
+    /// volume root. Creates `wal/` and `pending/` if they do not exist.
     /// Rebuilds the LBA map from all committed segments across the ancestry chain
     /// (following `volume.parent` files), then recovers or creates the WAL.
     ///
@@ -218,11 +219,9 @@ impl Volume {
     ) -> io::Result<Self> {
         let wal_dir = base_dir.join("wal");
         let pending_dir = base_dir.join("pending");
-        let segments_dir = base_dir.join("segments");
 
         fs::create_dir_all(&wal_dir)?;
         fs::create_dir_all(&pending_dir)?;
-        fs::create_dir_all(&segments_dir)?;
 
         // Acquire exclusive lock. Fails immediately if another process has this
         // fork open. The lock is released when Volume is dropped.
@@ -264,7 +263,7 @@ impl Volume {
             }
         });
 
-        // Scan pending/ and segments/ to find the latest committed segment ULID
+        // Scan pending/ and index/ to find the latest committed segment ULID
         // and determine whether any segments postdate the latest snapshot.
         // Cross-session ULID comparison is reliable: those files came from
         // earlier runs at distinct timestamps.
@@ -272,14 +271,31 @@ impl Volume {
         // Done before WAL recovery so we can compute the mint floor below.
         let latest_snap = latest_snapshot(base_dir)?;
         let mut last_segment_ulid: Option<Ulid> = None;
-        let mut all_seg_paths = Vec::new();
-        for subdir in ["pending", "segments"] {
-            all_seg_paths.extend(segment::collect_segment_files(&base_dir.join(subdir))?);
+        // Collect pending/ segment ULIDs (full files, not yet uploaded).
+        for p in segment::collect_segment_files(&base_dir.join("pending"))? {
+            if let Some(ulid) = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| Ulid::from_string(s).ok())
+                && last_segment_ulid < Some(ulid)
+            {
+                last_segment_ulid = Some(ulid);
+            }
+        }
+        // Collect index/*.idx ULIDs (uploaded segments; file stem is the ULID).
+        for p in segment::collect_idx_files(&base_dir.join("index"))? {
+            if let Some(ulid) = p
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .and_then(|s| Ulid::from_string(s).ok())
+                && last_segment_ulid < Some(ulid)
+            {
+                last_segment_ulid = Some(ulid);
+            }
         }
         // A GC output in .applied state has a ULID = max(inputs).increment(),
         // which may be the highest known ULID — include it so the mint floor is correct.
-        all_seg_paths.extend(segment::collect_gc_applied_segment_files(base_dir)?);
-        for p in all_seg_paths {
+        for p in segment::collect_gc_applied_segment_files(base_dir)? {
             if let Some(ulid) = p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -820,7 +836,7 @@ impl Volume {
     /// Without pre-minting `u_flush`, the WAL segment flushed by this call would
     /// carry the WAL's *existing* ULID (assigned when the WAL was opened,
     /// before the GC ULIDs were minted).  That ULID is lower than `u_sweep`, so
-    /// after the segment is drained to `segments/`, crash-recovery rebuild would
+    /// after the segment is drained to `index/`, crash-recovery rebuild would
     /// apply the GC output *after* the WAL segment and return stale data.
     ///
     /// When the WAL is empty, the WAL file is deleted and `u_flush` is not used
@@ -855,15 +871,15 @@ impl Volume {
     ///
     /// The coordinator writes the compacted segment to `gc/<new-ulid>` (staged,
     /// signed with an ephemeral key) and then writes `gc/<new-ulid>.pending`.
-    /// This method re-signs `gc/<new-ulid>` with the volume's own key, moves it
-    /// into `segments/`, updates the in-memory extent index, and renames the
-    /// handoff file to `gc/<new-ulid>.applied`.  The coordinator monitors
-    /// `.applied` files and uses them as the signal to delete the superseded S3
-    /// objects and old local segment files.
+    /// This method re-signs `gc/<new-ulid>` in-place with the volume's own key,
+    /// updates the in-memory extent index, and renames the handoff file to
+    /// `gc/<new-ulid>.applied`.  The coordinator monitors `.applied` files and
+    /// uses them as the signal to upload the segment to S3, write
+    /// `index/<new-ulid>.idx` + `cache/<new-ulid>.{body,present}`, delete the
+    /// superseded `index/<old>.idx` entries, and clean up old cache files.
     ///
-    /// The re-signing step ensures that `segments/` always contains only
-    /// volume-signed files, so `extentindex::rebuild` never needs to skip
-    /// signature verification for in-transit coordinator output.
+    /// The re-signing step ensures that the coordinator uploads only
+    /// volume-signed segment bodies to S3.
     ///
     /// Apply GC handoff files from `gc/`, covering both `.pending` and `.applied` states.
     ///
@@ -920,6 +936,7 @@ impl Volume {
             // from the volume's perspective (just an acknowledgment).
             let pending_content = fs::read_to_string(gc_dir.join(name))?;
             let mut old_ulid_by_hash: HashMap<blake3::Hash, Ulid> = HashMap::new();
+            let mut dead_ulids: Vec<Ulid> = Vec::new();
             let mut is_tombstone = false;
             for line in pending_content.lines() {
                 match HandoffLine::parse(line) {
@@ -927,7 +944,8 @@ impl Volume {
                     | Some(HandoffLine::Remove { hash, old_ulid }) => {
                         old_ulid_by_hash.insert(hash, old_ulid);
                     }
-                    Some(HandoffLine::Dead { .. }) => {
+                    Some(HandoffLine::Dead { old_ulid }) => {
+                        dead_ulids.push(old_ulid);
                         is_tombstone = true;
                     }
                     None => {}
@@ -937,9 +955,8 @@ impl Volume {
             // The coordinator stages its output in gc/<ulid> with an ephemeral
             // key.  Re-sign it in-place with the volume's key (write to
             // gc/<ulid>.tmp, rename over gc/<ulid>).  The body stays in gc/
-            // until the coordinator moves it to segments/ after confirmed S3
-            // upload — this preserves the segments/ invariant (present ↔
-            // S3-confirmed).
+            // until the coordinator uploads it to S3 and writes index/<ulid>.idx
+            // + cache/<ulid>.{body,present}, then deletes gc/<ulid>.
             //
             // Idempotency: re-signing is a pure function of the segment content;
             // if we crash mid-rename and retry, the output is identical.
@@ -954,13 +971,18 @@ impl Volume {
                 fs::rename(&tmp_path, &gc_seg_path)?;
             }
 
-            // Locate the body: normally in gc/; after a restart with a partial
-            // apply_done_handoffs run, it may have already been moved to segments/.
+            // Locate the segment for index reads: normally gc/ (the volume-signed
+            // body); after a restart where the coordinator already uploaded and
+            // deleted gc/<ulid>, fall back to index/<ulid>.idx — it contains the
+            // same header+index section and is sufficient for read_and_verify_segment_index.
             let body_path: Option<PathBuf> = if gc_seg_path.try_exists()? {
                 Some(gc_seg_path.clone())
             } else if is_already_applied {
-                let seg_path = self.base_dir.join("segments").join(&new_ulid_str);
-                seg_path.try_exists()?.then_some(seg_path)
+                let idx_path = self
+                    .base_dir
+                    .join("index")
+                    .join(format!("{new_ulid_str}.idx"));
+                idx_path.try_exists()?.then_some(idx_path)
             } else {
                 None
             };
@@ -1119,10 +1141,50 @@ impl Volume {
                 }
             }
 
-            // For .pending handoffs: rename to .applied — signals the coordinator
-            // it is safe to delete superseded S3 objects.
-            // For .applied handoffs: already in the correct state; no rename needed.
+            // For .pending handoffs: perform the atomic commit of the GC handoff:
+            //
+            //   1. Write index/<new>.idx (volume owns index/; coordinator may upload
+            //      and promote after seeing .applied).
+            //   2. Delete index/<old>.idx for each consumed input segment — must happen
+            //      BEFORE the coordinator deletes old S3 objects (invariant: idx present
+            //      ↔ segment exists in persistent storage).
+            //   3. Delete cache/<old>.{body,present} and pending/<old> (best-effort:
+            //      files may already be absent).
+            //   4. Rename .pending → .applied to signal the coordinator.
+            //
+            // For .applied handoffs: the above steps already ran; skip them.
             if !is_already_applied {
+                // Step 1: write index/<new>.idx from the volume-signed gc body.
+                let index_dir = self.base_dir.join("index");
+                fs::create_dir_all(&index_dir)?;
+                if gc_seg_path.try_exists()? {
+                    let idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
+                    segment::extract_idx(&gc_seg_path, &idx_path)?;
+                }
+
+                // Collect all old ULIDs consumed by this handoff.
+                let mut old_ulids: Vec<Ulid> = old_ulid_by_hash.values().copied().collect();
+                old_ulids.extend_from_slice(&dead_ulids);
+                old_ulids.sort_unstable();
+                old_ulids.dedup();
+
+                // Step 2: delete index/<old>.idx and pending/<old> for each consumed input.
+                //
+                // NOTE: cache/<old>.{body,present} are NOT deleted here.
+                // Concurrent readers may hold a snapshot that still references old_ulid; their
+                // read will open cache/<old>.body AFTER this function returns.  The actor loop
+                // calls evict_applied_gc_cache() AFTER publishing the new snapshot so that by
+                // the time the cache files are removed, all concurrent reads have had a chance
+                // to reload the new snapshot and switch to new_ulid.  This two-phase approach
+                // eliminates the read-error window.
+                let pending_dir = self.base_dir.join("pending");
+                for old_ulid in &old_ulids {
+                    let old_str = old_ulid.to_string();
+                    let _ = fs::remove_file(index_dir.join(format!("{old_str}.idx")));
+                    let _ = fs::remove_file(pending_dir.join(&old_str));
+                }
+
+                // Step 3: rename .pending → .applied.
                 let applied_path =
                     gc_dir.join(handoff.with_state(GcHandoffState::Applied).filename());
                 fs::rename(gc_dir.join(name), &applied_path)?;
@@ -1139,6 +1201,101 @@ impl Volume {
         }
 
         Ok(count)
+    }
+
+    /// Evict old cache files for completed GC handoffs.
+    ///
+    /// Called by the actor AFTER publishing the new snapshot (which redirects
+    /// all new reads to the GC output segment).  Scans gc/*.applied files and
+    /// deletes cache/<old>.{body,present} for each consumed input ULID.
+    ///
+    /// Safe to call multiple times — file deletions are best-effort and
+    /// silently skip already-absent files.
+    pub fn evict_applied_gc_cache(&self) {
+        let gc_dir = self.base_dir.join("gc");
+        let cache_dir = self.base_dir.join("cache");
+        let Ok(entries) = fs::read_dir(&gc_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Some(handoff) = crate::gc::GcHandoff::from_filename(name_str) else {
+                continue;
+            };
+            if handoff.state != crate::gc::GcHandoffState::Applied {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let mut old_ulids: Vec<Ulid> = Vec::new();
+            for line in content.lines() {
+                match crate::gc::HandoffLine::parse(line) {
+                    Some(crate::gc::HandoffLine::Repack { old_ulid, .. })
+                    | Some(crate::gc::HandoffLine::Remove { old_ulid, .. })
+                    | Some(crate::gc::HandoffLine::Dead { old_ulid }) => {
+                        old_ulids.push(old_ulid);
+                    }
+                    None => {}
+                }
+            }
+            old_ulids.sort_unstable();
+            old_ulids.dedup();
+            for old_ulid in old_ulids {
+                let s = old_ulid.to_string();
+                let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+                let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+            }
+        }
+    }
+
+    /// Promote a segment to the local cache after confirmed S3 upload.
+    ///
+    /// Called in response to the coordinator's `promote <ulid>` IPC, which is
+    /// sent only after a confirmed S3 upload.
+    ///
+    /// **Drain path** (`pending/<ulid>` exists): copies the body section to
+    /// `cache/<ulid>.body`, writes `cache/<ulid>.present`, then deletes
+    /// `pending/<ulid>`.  The coordinator never deletes `pending/` directly.
+    ///
+    /// **GC path** (`gc/<ulid>` exists): copies the volume-signed body to
+    /// `cache/<ulid>.body` and writes `cache/<ulid>.present`.  The coordinator
+    /// deletes `gc/<ulid>` after receiving `ok`.
+    ///
+    /// Idempotent: if `cache/<ulid>.body` already exists, the function succeeds
+    /// without re-writing (the file was written on a previous attempt).
+    pub fn promote_segment(&self, ulid: Ulid) -> io::Result<()> {
+        let ulid_str = ulid.to_string();
+        let cache_dir = self.base_dir.join("cache");
+        let body_path = cache_dir.join(format!("{ulid_str}.body"));
+        let present_path = cache_dir.join(format!("{ulid_str}.present"));
+
+        // Determine the source: pending/ (drain) or gc/ (GC).
+        let pending_path = self.base_dir.join("pending").join(&ulid_str);
+        let gc_path = self.base_dir.join("gc").join(&ulid_str);
+        let (src_path, is_drain) = if pending_path.try_exists()? {
+            (pending_path.clone(), true)
+        } else if gc_path.try_exists()? {
+            (gc_path, false)
+        } else if body_path.try_exists()? {
+            // Already promoted on a prior attempt; idempotent success.
+            return Ok(());
+        } else {
+            return Err(io::Error::other(format!(
+                "promote {ulid_str}: segment not found in pending/ or gc/"
+            )));
+        };
+
+        fs::create_dir_all(&cache_dir)?;
+        segment::promote_to_cache(&src_path, &body_path, &present_path)?;
+
+        if is_drain {
+            fs::remove_file(&pending_path)?;
+        }
+        Ok(())
     }
 
     /// Flush the current WAL to a segment in this node's `pending/`, update
@@ -1195,6 +1352,16 @@ impl Volume {
             );
         }
         self.pending_entries.clear();
+        // Write index/<ulid>.idx — permanent LBA index for this segment.
+        // Written at flush time (before S3 upload) so the extent index can be
+        // rebuilt correctly after a crash.  The coordinator uploads the body to
+        // S3 and then sends a "promote" IPC; until then pending/<ulid> is the
+        // authoritative body source.
+        let pending_path = self.base_dir.join("pending").join(segment_ulid.to_string());
+        let index_dir = self.base_dir.join("index");
+        fs::create_dir_all(&index_dir)?;
+        let idx_path = index_dir.join(format!("{segment_ulid}.idx"));
+        segment::extract_idx(&pending_path, &idx_path)?;
         // Evict the promoted WAL from the file handle cache.  After promotion
         // the body offsets in the extent index point into the new segment file;
         // any cached fd for this ULID would use the old WAL byte layout.
@@ -1227,7 +1394,7 @@ impl Volume {
     /// writing in the same directory — no directory structure changes occur.
     ///
     /// If no new data has been committed since the latest existing snapshot
-    /// (nothing in `pending/` or `segments/` sorts after it), the existing
+    /// (nothing in `pending/` or `index/` sorts after it), the existing
     /// snapshot ULID is returned without writing a new marker.
     ///
     /// Returns the snapshot ULID.
@@ -1274,11 +1441,11 @@ impl Volume {
     /// ancestry chain.
     ///
     /// Search order:
-    ///   1. Current fork: `wal/`, `pending/`, `segments/`, `cache/<id>.body`
-    ///   2. Ancestor forks (newest first): `pending/`, `segments/`, `cache/<id>.body`
+    ///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
+    ///   2. Ancestor forks (newest first): `pending/`, `gc/*.applied`, `cache/<id>.body`
     ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
     ///
-    /// For full segment files (`wal/`, `pending/`, `segments/`), body reads use
+    /// For full segment files (`wal/`, `pending/`, `gc/*.applied`), body reads use
     /// absolute file offsets (`ExtentLocation.body_offset`). For cached body
     /// files (`cache/<id>.body`), the file IS the body section, so reads use
     /// body-relative offsets — consistent with how `extentindex::rebuild` stores
@@ -1314,7 +1481,7 @@ impl Volume {
     /// Attach a `SegmentFetcher` for demand-fetch on segment cache miss.
     ///
     /// Once set, `find_segment_file` will call the fetcher after all local
-    /// directories are checked, caching the result in `segments/`.
+    /// directories are checked, caching the result in `cache/`.
     pub fn set_fetcher(&mut self, fetcher: BoxFetcher) {
         self.fetcher = Some(fetcher);
     }
@@ -1488,8 +1655,8 @@ pub(crate) fn read_extents(
 /// Search for a segment file across the fork directory tree.
 ///
 /// Search order:
-///   1. Current fork: `wal/`, `pending/`, `segments/`, `cache/<id>.body`
-///   2. Ancestor forks (newest-first): `pending/`, `segments/`, `cache/<id>.body`
+///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
+///   2. Ancestor forks (newest-first): `pending/`, `gc/*.applied`, `cache/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
 /// When `entry_idx` is `Some`, a `cache/<id>.body` hit is only accepted if
@@ -1510,7 +1677,7 @@ pub(crate) fn find_segment_in_dirs(
     entry_idx: Option<u32>,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
-    for subdir in ["wal", "pending", "segments"] {
+    for subdir in ["wal", "pending"] {
         let path = base_dir.join(subdir).join(&sid);
         if path.exists() {
             return Ok(path);
@@ -1537,11 +1704,9 @@ pub(crate) fn find_segment_in_dirs(
         // Entry not yet fetched — fall through to fetcher below.
     }
     for layer in ancestor_layers.iter().rev() {
-        for subdir in ["pending", "segments"] {
-            let path = layer.dir.join(subdir).join(&sid);
-            if path.exists() {
-                return Ok(path);
-            }
+        let path = layer.dir.join("pending").join(&sid);
+        if path.exists() {
+            return Ok(path);
         }
         let cache_body = layer.dir.join("cache").join(format!("{sid}.body"));
         if cache_body.exists() {
@@ -1755,7 +1920,7 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
 /// Create a new volume directory, branched from the latest snapshot of the source volume.
 ///
 /// The source volume must have at least one snapshot (written by `snapshot()`).
-/// `new_fork_dir` is created with `wal/`, `pending/`, `segments/`, and a `volume.parent`
+/// `new_fork_dir` is created with `wal/`, `pending/`, and a `volume.parent`
 /// file using the flat format: `<source-ulid>/snapshots/<branch-ulid>`.
 /// The source ULID is derived from `source_fork_dir`'s directory name.
 ///
@@ -1785,7 +1950,6 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
 
     fs::create_dir_all(new_fork_dir.join("wal"))?;
     fs::create_dir_all(new_fork_dir.join("pending"))?;
-    fs::create_dir_all(new_fork_dir.join("segments"))?;
     // volume.parent format: "<source-ulid>/snapshots/<branch-ulid>"
     let origin = format!("{source_ulid}/snapshots/{branch_ulid}");
     segment::write_file_atomic(&new_fork_dir.join("volume.parent"), origin.as_bytes())?;
@@ -1927,6 +2091,30 @@ mod tests {
         p
     }
 
+    /// Simulate coordinator drain: upload all pending segments to S3 (no-op in
+    /// tests) then call `promote_segment` on each — copies body to cache/ and
+    /// deletes pending/.  In the new design `index/<ulid>.idx` is written by the
+    /// volume at WAL flush time, so this helper does NOT write it.
+    fn simulate_upload(vol_dir: &Path) {
+        let pending_dir = vol_dir.join("pending");
+        let cache_dir = vol_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        for entry in std::fs::read_dir(&pending_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.ends_with(".tmp") {
+                continue;
+            }
+            let seg_path = entry.path();
+            // Simulate promote IPC: copy body to cache/ and delete pending/<ulid>.
+            let body_path = cache_dir.join(format!("{name}.body"));
+            let present_path = cache_dir.join(format!("{name}.present"));
+            crate::segment::promote_to_cache(&seg_path, &body_path, &present_path).unwrap();
+            std::fs::remove_file(&seg_path).unwrap();
+        }
+    }
+
     /// Generate a keypair and write `volume.key` + `volume.pub` into `dir`.
     ///
     /// Must be called before `Volume::open` in any test that creates a volume.
@@ -1956,7 +2144,6 @@ mod tests {
         let _ = Volume::open(&base, &base).unwrap();
         assert!(base.join("wal").is_dir());
         assert!(base.join("pending").is_dir());
-        assert!(base.join("segments").is_dir());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -2675,8 +2862,8 @@ mod tests {
     }
 
     #[test]
-    fn repack_does_not_touch_segments() {
-        // Simulate an uploaded segment by moving it from pending/ to segments/.
+    fn repack_does_not_touch_uploaded_segments() {
+        // Simulate an uploaded segment (promoted to cache/ by the coordinator).
         // repack() must not touch it even if its extents are dead.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
@@ -2684,16 +2871,8 @@ mod tests {
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        // Move the pending segment to segments/ to simulate a completed upload.
-        let pending = base.join("pending");
-        let segments = base.join("segments");
-        let entry = fs::read_dir(&pending)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .next()
-            .unwrap();
-        let seg_name = entry.file_name().into_string().unwrap();
-        fs::rename(pending.join(&seg_name), segments.join(&seg_name)).unwrap();
+        // Simulate coordinator upload: pending → cache/ + index/.
+        simulate_upload(&base);
 
         // Overwrite LBA 0 — the uploaded segment's extent is now dead.
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
@@ -2703,7 +2882,7 @@ mod tests {
         let stats = vol.repack(1.0).unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
-            "repack must not touch segments/"
+            "repack must not touch uploaded (cache/) segments"
         );
 
         // Data still reads correctly.
@@ -2759,32 +2938,24 @@ mod tests {
     }
 
     #[test]
-    fn sweep_pending_only_scans_pending_not_segments() {
-        // Upload a segment (simulate by writing to segments/ directly via promote
-        // then moving to segments/). sweep_pending must not touch it.
+    fn sweep_pending_only_scans_pending_not_uploaded() {
+        // Upload a segment (simulate coordinator promoting pending → cache/).
+        // sweep_pending must not touch uploaded segments.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        // Move the pending segment to segments/ to simulate a completed upload.
-        let pending = base.join("pending");
-        let segments = base.join("segments");
-        let entry = fs::read_dir(&pending)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .next()
-            .unwrap();
-        let seg_name = entry.file_name().into_string().unwrap();
-        fs::rename(pending.join(&seg_name), segments.join(&seg_name)).unwrap();
+        // Simulate coordinator upload: pending → cache/ + index/.
+        simulate_upload(&base);
 
         // Now overwrite LBA 0 and promote — creates a new pending segment.
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
         let stats = vol.sweep_pending().unwrap();
-        // The old dead extent is in segments/ — sweep_pending doesn't touch it.
+        // The old dead extent is in cache/ — sweep_pending doesn't touch it.
         assert_eq!(stats.extents_removed, 0);
         // The new pending segment is small and all-live: single segment, no
         // dead extents, so sweep_pending correctly leaves it alone.
@@ -3339,7 +3510,6 @@ mod tests {
         fork_volume(&fork_dir, &default_dir).unwrap();
         assert!(fork_dir.join("wal").is_dir());
         assert!(fork_dir.join("pending").is_dir());
-        assert!(fork_dir.join("segments").is_dir());
 
         let origin = fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
         assert_eq!(origin.trim(), format!("{root_ulid}/snapshots/{snap_ulid}"));
@@ -3623,7 +3793,6 @@ mod tests {
         let vol_dir = temp_dir();
         let fork_dir = vol_dir.join("base");
         // Create the directory structure without a WAL (simulating a readonly base).
-        fs::create_dir_all(fork_dir.join("segments")).unwrap();
         fs::create_dir_all(fork_dir.join("pending")).unwrap();
 
         let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
@@ -3710,23 +3879,26 @@ mod tests {
     // --- apply_gc_handoffs tests ---
     //
     // These tests simulate the coordinator GC workflow:
-    //   write → flush → drain (pending→segments) → coordinator compacts into
-    //   new segment + writes gc/*.pending → volume applies handoff.
+    //   write → flush → drain (pending→cache + index) → coordinator compacts
+    //   into new segment + writes gc/*.pending → volume applies handoff.
 
-    /// Simulate one coordinator GC pass: read the given segment, write a
-    /// compacted copy to gc/<new_ulid> (signed with an ephemeral key, as the
-    /// real coordinator would), and write gc/<new>.pending.
+    /// Simulate one coordinator GC pass: read the given uploaded segment (from
+    /// index/ + cache/), write a compacted copy to gc/<new_ulid> (signed with
+    /// an ephemeral key, as the real coordinator would), and write gc/<new>.pending.
     ///
     /// The volume re-signs the staged segment when apply_gc_handoffs is called.
-    /// Does NOT delete the old segment.
+    /// Does NOT delete the old cache/ body or index/.idx.
     fn simulate_coord_gc(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
         use crate::{segment, signing};
 
-        let segments_dir = fork_dir.join("segments");
-        let old_path = segments_dir.join(old_ulid);
-        let (old_bss, mut entries) =
-            segment::read_and_verify_segment_index(&old_path, &vol.verifying_key).unwrap();
-        segment::read_extent_bodies(&old_path, old_bss, &mut entries).unwrap();
+        // Read index from .idx (header+index section); read body from cache/.body
+        // (body bytes starting at offset 0).
+        let idx_path = fork_dir.join("index").join(format!("{old_ulid}.idx"));
+        let body_path = fork_dir.join("cache").join(format!("{old_ulid}.body"));
+        let (_old_bss, mut entries) =
+            segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
+        // Cache .body files start at byte 0 of the body section.
+        segment::read_extent_bodies(&body_path, 0, &mut entries).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();
@@ -3770,17 +3942,17 @@ mod tests {
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
 
-        // Drain: pending/<old_ulid> → segments/<old_ulid>.
+        // Drain: pending → cache/ + index/ (simulate coordinator upload).
         let pending_dir = base.join("pending");
-        let segments_dir = base.join("segments");
-        let entry = fs::read_dir(&pending_dir)
+        let old_ulid = fs::read_dir(&pending_dir)
             .unwrap()
             .flatten()
             .next()
+            .unwrap()
+            .file_name()
+            .into_string()
             .unwrap();
-        let filename = entry.file_name();
-        let old_ulid = filename.to_str().unwrap().to_owned();
-        fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+        simulate_upload(&base);
 
         // Coordinator GC: compact into new segment, write .pending.
         let new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
@@ -3794,9 +3966,30 @@ mod tests {
         assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
         assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
 
-        // Extent index now points to new_ulid — simulate coordinator cleanup
-        // by removing the old segment and verify reads still work.
-        fs::remove_file(segments_dir.join(&old_ulid)).unwrap();
+        // apply_gc_handoffs deletes index/<old>.idx atomically with the rename.
+        let cache_dir = base.join("cache");
+        let index_dir = base.join("index");
+        assert!(
+            !index_dir.join(format!("{old_ulid}.idx")).exists(),
+            "apply_gc_handoffs must delete index/<old>.idx"
+        );
+        // index/<new>.idx must be written (volume owns index/ from flush time + GC apply).
+        assert!(
+            index_dir.join(format!("{new_ulid}.idx")).exists(),
+            "apply_gc_handoffs must write index/<new>.idx"
+        );
+        // cache/<old>.* is evicted by evict_applied_gc_cache() AFTER snapshot publish
+        // (called from actor loop); calling it explicitly here simulates that step.
+        vol.evict_applied_gc_cache();
+        assert!(
+            !cache_dir.join(format!("{old_ulid}.body")).exists(),
+            "evict_applied_gc_cache must delete cache/<old>.body"
+        );
+        assert!(
+            !cache_dir.join(format!("{old_ulid}.present")).exists(),
+            "evict_applied_gc_cache must delete cache/<old>.present"
+        );
+        // Reads still work: extent index points to new_ulid, body in gc/<new>.applied.
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
@@ -3804,7 +3997,7 @@ mod tests {
 
     #[test]
     fn gc_handoff_skips_missing_segment() {
-        // gc/*.pending exists but segments/<new_ulid> has not yet been fetched
+        // gc/*.pending exists but the new segment body has not yet been fetched
         // locally.  apply_gc_handoffs must skip the file and return Ok(0) so
         // the next idle tick retries when the segment is available.
         let base = keyed_temp_dir();
@@ -3831,13 +4024,13 @@ mod tests {
     fn gc_handoff_idempotent_after_crash() {
         // Simulate a crash between coordinator writing .pending and the volume
         // processing it.  The coordinator-staged segment is in gc/<new_ulid>;
-        // the old segment remains in segments/ until apply_gc_handoffs renames
+        // the old segment body remains in cache/ until apply_gc_handoffs renames
         // .pending → .applied (signalling the coordinator it is safe to delete).
         //
-        // After reopen, the extent index is rebuilt from segments/ (old segment
-        // still present), so reads are correct before the handoff is applied.
-        // apply_gc_handoffs re-signs gc/<new_ulid> into segments/, updates the
-        // extent index, and renames .pending → .applied.
+        // After reopen, the extent index is rebuilt from index/*.idx (old segment
+        // still has its .idx), so reads are correct before the handoff is applied.
+        // apply_gc_handoffs re-signs gc/<new_ulid> in-place, updates the extent
+        // index, and renames .pending → .applied.
         let base = keyed_temp_dir();
 
         let old_ulid;
@@ -3849,27 +4042,27 @@ mod tests {
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
 
-            // Drain.
+            // Drain: pending → cache/ + index/.
             let pending_dir = base.join("pending");
-            let segments_dir = base.join("segments");
-            let entry = fs::read_dir(&pending_dir)
+            old_ulid = fs::read_dir(&pending_dir)
                 .unwrap()
                 .flatten()
                 .next()
+                .unwrap()
+                .file_name()
+                .into_string()
                 .unwrap();
-            let filename = entry.file_name();
-            old_ulid = filename.to_str().unwrap().to_owned();
-            fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+            simulate_upload(&base);
 
             // Coordinator GC: staged segment in gc/<new_ulid> + .pending written.
-            // Old segment intentionally NOT deleted — coordinator waits for .applied.
+            // Old segment body intentionally NOT deleted — coordinator waits for .applied.
             new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
 
             // "Crash" — drop the volume before apply_gc_handoffs runs.
         }
 
-        // Reopen: rebuild scans segments/ and finds the old segment.  Reads
-        // work even though the coordinator has already produced a replacement.
+        // Reopen: rebuild scans index/ and finds the old segment's .idx.  Reads
+        // work via cache/ even though the coordinator has already produced a replacement.
         let mut vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
@@ -3882,10 +4075,29 @@ mod tests {
         assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
         assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
 
-        // Coordinator now sees .applied and deletes the old segment.
-        fs::remove_file(base.join("segments").join(&old_ulid)).unwrap();
+        // apply_gc_handoffs deletes index/<old>.idx atomically with the rename.
+        let cache_dir = base.join("cache");
+        let index_dir = base.join("index");
+        assert!(
+            !index_dir.join(format!("{old_ulid}.idx")).exists(),
+            "apply_gc_handoffs must delete index/<old>.idx"
+        );
+        assert!(
+            index_dir.join(format!("{new_ulid}.idx")).exists(),
+            "apply_gc_handoffs must write index/<new>.idx"
+        );
+        // cache/<old>.* evicted by actor after snapshot publish; simulate here.
+        vol.evict_applied_gc_cache();
+        assert!(
+            !cache_dir.join(format!("{old_ulid}.body")).exists(),
+            "evict_applied_gc_cache must delete cache/<old>.body"
+        );
+        assert!(
+            !cache_dir.join(format!("{old_ulid}.present")).exists(),
+            "evict_applied_gc_cache must delete cache/<old>.present"
+        );
 
-        // Reads still correct after the handoff and old-segment deletion.
+        // Reads still correct: extent index points to new_ulid, body in gc/<new>.applied.
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
@@ -3900,8 +4112,8 @@ mod tests {
         //
         // apply_gc_handoffs must succeed on retry: it re-signs gc/<new_ulid>
         // idempotently, updates the extent index, and renames .pending → .applied.
-        // The body stays in gc/ — the coordinator moves it to segments/ after
-        // confirmed S3 upload.
+        // The body stays in gc/ — the coordinator uploads it to S3 and writes
+        // index/<new>.idx + cache/<new>.{body,present} after confirmed upload.
         let base = keyed_temp_dir();
 
         let old_ulid;
@@ -3914,15 +4126,15 @@ mod tests {
             vol.promote_for_test().unwrap();
 
             let pending_dir = base.join("pending");
-            let segments_dir = base.join("segments");
-            let entry = fs::read_dir(&pending_dir)
+            old_ulid = fs::read_dir(&pending_dir)
                 .unwrap()
                 .flatten()
                 .next()
+                .unwrap()
+                .file_name()
+                .into_string()
                 .unwrap();
-            let filename = entry.file_name();
-            old_ulid = filename.to_str().unwrap().to_owned();
-            fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+            simulate_upload(&base);
 
             new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
         }
@@ -3958,7 +4170,7 @@ mod tests {
         assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
         assert!(
             gc_dir.join(&new_ulid).exists(),
-            "gc/<ulid> stays until coordinator moves it to segments/"
+            "gc/<ulid> stays until coordinator uploads it and promotes to cache/"
         );
 
         // Data still correct.

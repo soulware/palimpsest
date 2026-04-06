@@ -244,3 +244,115 @@ proptest! {
         }
     }
 }
+
+/// Regression test for the lbamap rebuild ordering bug:
+///
+/// After gc_checkpoint flushes the WAL (lba:7→hash1) to pending/u_flush2, then
+/// drain_local promotes u_flush2 to index/, then crash+rebuild processes gc/*.applied
+/// (u_repack2, carrying lba:7→hash0) AFTER index/*.idx (u_flush2.idx, carrying
+/// lba:7→hash1), the gc output was overwriting the correct value.
+///
+/// Fixed by processing gc/*.applied first (lowest priority), then index/*.idx, then
+/// pending/ — so the post-GC WAL flush in index/ correctly shadows the GC entry.
+#[test]
+fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
+    use std::collections::HashMap;
+    use std::thread;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+    let (actor, handle) = elide_core::actor::spawn(vol);
+    let actor_thread = thread::Builder::new()
+        .name("volume-actor".into())
+        .spawn(move || actor.run())
+        .unwrap();
+
+    let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
+
+    // Step 1: Write{lba:7, seed:0}
+    handle.write(7, vec![0u8; 4096]).unwrap();
+    oracle.insert(7, [0u8; 4096]);
+
+    // Step 2: Flush — WAL → pending/S1 with DATA(lba:7, hash0)
+    handle.flush().unwrap();
+
+    // Step 3: Write{lba:0, seed:0} — same hash0 → DEDUP_REF in WAL
+    handle.write(0, vec![0u8; 4096]).unwrap();
+    oracle.insert(0, [0u8; 4096]);
+
+    // Step 4: CoordGcLocal{2} — gc_checkpoint flushes DEDUP_REF to pending/u_flush1;
+    //   index/ is empty so simulate_coord_gc_local returns None (no candidates yet).
+    let (gc_ulid, _) = handle.gc_checkpoint().unwrap();
+    let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
+        .map(|(_, _, paths)| paths)
+        .unwrap_or_default();
+    handle.apply_gc_handoffs().unwrap();
+    for path in &to_delete {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Step 5: DrainLocal — pending/{S1, u_flush1} → index/*.idx + cache/*.{body,present}
+    common::drain_local(fork_dir);
+
+    // Step 6: Write{lba:1, seed:0} — same hash0 → DEDUP_REF in WAL
+    handle.write(1, vec![0u8; 4096]).unwrap();
+    oracle.insert(1, [0u8; 4096]);
+
+    // Step 7: Write{lba:7, seed:1} — new hash1 → DATA in WAL; oracle updated
+    handle.write(7, vec![1u8; 4096]).unwrap();
+    oracle.insert(7, [1u8; 4096]);
+
+    // Step 8: CoordGcLocal{2}
+    //   gc_checkpoint flushes (DEDUP_REF lba:1, DATA lba:7→hash1) to pending/u_flush2.
+    //   simulate_coord_gc_local finds S1.idx + u_flush1.idx as candidates (2 files),
+    //   compacts them into gc/u_repack2, writes gc/u_repack2.pending.
+    //   apply_gc_handoffs re-signs and renames to .applied; updates extent_index.
+    //   to_delete removes index/S1.idx + index/u_flush1.idx.
+    let (gc_ulid2, _) = handle.gc_checkpoint().unwrap();
+    let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
+        .map(|(_, _, paths)| paths)
+        .unwrap_or_default();
+    handle.apply_gc_handoffs().unwrap();
+    for path in &to_delete2 {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Step 9: DrainLocal — pending/u_flush2 → index/u_flush2.idx + cache/u_flush2.{body,present}
+    common::drain_local(fork_dir);
+
+    // Step 10: Crash — drop+reopen triggers lbamap + extentindex rebuild from disk.
+    //   Bug: lbamap rebuild processed gc/*.applied (u_repack2, lba:7→hash0) AFTER
+    //   index/*.idx (u_flush2.idx, lba:7→hash1), causing gc output to overwrite the
+    //   correct value → lba:7 read back [0;4096] instead of [1;4096].
+    handle.shutdown();
+    actor_thread.join().unwrap();
+
+    let vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+    let (new_actor, new_handle) = elide_core::actor::spawn(vol);
+    let new_actor_thread = thread::Builder::new()
+        .name("volume-actor".into())
+        .spawn(move || new_actor.run())
+        .unwrap();
+
+    for (&lba, expected) in &oracle {
+        let actual = new_handle.read(lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {} reads wrong data after crash+rebuild",
+            lba
+        );
+    }
+
+    new_handle.shutdown();
+    new_actor_thread.join().unwrap();
+}

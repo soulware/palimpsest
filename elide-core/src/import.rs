@@ -3,7 +3,7 @@
 // Reads the image in 4 KiB LBA-aligned blocks. Zero blocks are skipped — the
 // volume read path returns zeros for unwritten LBAs, so they need no storage.
 // Non-zero blocks are hashed, optionally compressed, and batched into large
-// segment files written directly to `<vol_dir>/base/segments/` via the
+// segment files written directly to `<vol_dir>/pending/` via the
 // standard tmp-rename commit pattern (no WAL involved — all data is known
 // upfront so crash recovery reduces to "retry the import").
 //
@@ -63,7 +63,7 @@ fn maybe_compress(block: &[u8]) -> Option<Vec<u8>> {
     Some(compressed)
 }
 
-/// Write `entries` to `segments/<ulid>` using the standard tmp-rename commit.
+/// Write `entries` to `pending/<ulid>` using the standard tmp-rename commit.
 /// Clears `entries` on success. Returns the ULID used, or `None` if there was
 /// nothing to write.
 fn flush_segment(
@@ -86,10 +86,10 @@ fn flush_segment(
 
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
 ///
-/// Creates `<vol_dir>/segments/` and `<vol_dir>/snapshots/`, reads
-/// `image_path` in 4 KiB blocks, and writes segment files directly into the
-/// volume root (flat layout). After all data is written, writes a snapshot
-/// marker (branch point for future forks) and the `volume.size` marker.
+/// Creates `<vol_dir>/pending/` and `<vol_dir>/snapshots/`, reads
+/// `image_path` in 4 KiB blocks, and writes segment files directly into
+/// `pending/`. After all data is written, writes a snapshot marker (branch
+/// point for future forks) and the `volume.size` marker.
 ///
 /// `progress` receives `(blocks_done, total_blocks)` after each block is
 /// processed. Pass a no-op closure if progress reporting is not needed.
@@ -121,7 +121,7 @@ pub fn import_image(
     let total_blocks = image_size / LBA_SIZE as u64;
 
     // Write to pending/ so the coordinator's normal drain loop picks them up,
-    // uploads to the store, and moves them to segments/ — same path as WAL flushes.
+    // uploads to the store, and writes index/<ulid>.idx + cache/<ulid>.{body,present} — same path as WAL flushes.
     let segments_dir = vol_dir.join("pending");
     let snapshots_dir = vol_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
@@ -220,7 +220,7 @@ mod tests {
             Some((LBA_SIZE * 3) as u64)
         );
         assert!(vol_dir.join("pending").exists());
-        assert!(!vol_dir.join("segments").exists()); // coordinator drains pending/ → segments/
+        assert!(!vol_dir.join("segments").exists()); // coordinator drains pending/ → index/ + cache/
         // Readonly volumes must have volume.pub (for segment verification) but
         // must NOT have volume.key (private key must never be written to disk).
         assert!(

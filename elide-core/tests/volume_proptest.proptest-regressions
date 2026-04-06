@@ -4,5 +4,3 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 1dd23abe03107b0e6cc808d65d6d57ba0f18e3886dda6a5c46adf0db5baa16f7 # shrinks to ops = [Write { lba: 0, seed: 0 }]
-cc 0b70a68defc822dc8759c4407c4f0518a31cb91fde68ad2a99db2f3f57c6771b # shrinks to ops = [Write { lba: 0, seed: 0 }, CoordGcLocal { n: 2 }]

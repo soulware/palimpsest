@@ -19,11 +19,38 @@ toml           = { version = "0.8", default-features = false, features = ["parse
 ulid           = "1"
 zerocopy       = { version = "0.8", features = ["derive"] }
 
+[features]
+# Gate the slow property-based test suites behind explicit features so that
+# `cargo test -p elide-core` runs only the fast unit/integration tests.
+#
+# Run all proptest suites:
+#   cargo test -p elide-core --features proptest-tests
+# Run a single suite:
+#   cargo test -p elide-core --features proptest-volume
+#   cargo test -p elide-core --features proptest-actor
+#   cargo test -p elide-core --features proptest-fork
+proptest-volume = []
+proptest-actor  = []
+proptest-fork   = []
+proptest-tests  = ["proptest-volume", "proptest-actor", "proptest-fork"]
+
 [dev-dependencies]
 criterion  = { version = "0.5", features = ["html_reports"] }
 proptest   = "1"
 tempfile   = "3"
 zstd       = "0.13"
+
+[[test]]
+name = "actor_proptest"
+required-features = ["proptest-actor"]
+
+[[test]]
+name = "fork_proptest"
+required-features = ["proptest-fork"]
+
+[[test]]
+name = "volume_proptest"
+required-features = ["proptest-volume"]
 
 [[bench]]
 name = "compression"

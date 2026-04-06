@@ -108,6 +108,10 @@ pub(crate) enum VolumeRequest {
     GcCheckpoint {
         reply: Sender<io::Result<(Ulid, Ulid)>>,
     },
+    Promote {
+        ulid: Ulid,
+        reply: Sender<io::Result<()>>,
+    },
     Snapshot {
         reply: Sender<io::Result<String>>,
     },
@@ -244,6 +248,11 @@ impl VolumeActor {
                                     extent_index,
                                     flush_gen: self.flush_gen,
                                 }));
+                                // Evict old cache files AFTER publishing the new snapshot.
+                                // Readers that loaded the old snapshot may still be accessing
+                                // cache/<old>.body; evicting after publish ensures all new
+                                // reads use the updated extent index (pointing to new_ulid).
+                                self.volume.evict_applied_gc_cache();
                             }
                             let _ = reply.send(result);
                         }
@@ -253,6 +262,9 @@ impl VolumeActor {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
+                        }
+                        VolumeRequest::Promote { ulid, reply } => {
+                            let _ = reply.send(self.volume.promote_segment(ulid));
                         }
                         VolumeRequest::Snapshot { reply } => {
                             let result = self.volume.snapshot().map(|u| u.to_string());
@@ -469,6 +481,22 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Promote a segment to the local cache after confirmed S3 upload.
+    ///
+    /// Sends a `promote <ulid>` request to the actor and blocks until it replies.
+    pub fn promote_segment(&self, ulid: Ulid) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Promote {
+                ulid,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

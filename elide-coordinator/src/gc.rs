@@ -67,7 +67,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error;
+use tracing::{error, warn};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -148,8 +148,8 @@ pub async fn gc_fork(
     repack_ulid: Ulid,
     sweep_ulid: Ulid,
 ) -> Result<GcStats> {
-    let segments_dir = fork_dir.join("segments");
-    if !segments_dir.exists() {
+    let index_dir = fork_dir.join("index");
+    if !index_dir.exists() {
         return Ok(GcStats::none());
     }
 
@@ -297,8 +297,7 @@ pub async fn apply_done_handoffs(
     }
 
     applied.sort_by_key(|e| e.file_name());
-    let segments_dir = fork_dir.join("segments");
-    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
     let mut count = 0;
 
     for entry in &applied {
@@ -332,40 +331,32 @@ pub async fn apply_done_handoffs(
             }
         }
 
-        // The volume re-signs the compacted segment in-place within gc/.  The
-        // coordinator uploads it from there, writes index/<ulid>.idx, then moves
-        // gc/<ulid> → segments/<ulid>.  The segments/ move is the last step so
-        // that segments/ only ever contains S3-confirmed bodies.
-        //
-        // Idempotency: if the coordinator crashes after the move (gc/<ulid> is
-        // gone), the body is already in segments/ and seg_body_path reflects that.
+        // Body state detection:
+        //   gc/<new> present          → needs upload + promote IPC
+        //   gc/<new> absent,
+        //     cache/<new>.body absent → tombstone/removal-only (no new body), or
+        //                               promote already ran (gc deleted by coordinator)
+        //   cache/<new>.body present  → promote already ran on a prior attempt; skip to cleanup
         let gc_body = gc_dir.join(&new_ulid_str);
-        let seg_body = segments_dir.join(&new_ulid_str);
-        // Body is in gc/ until the move; after a crash it may already be in segments/.
-        let seg_body_path = if gc_body.try_exists().context("checking gc body path")? {
-            Some(gc_body.clone())
-        } else if seg_body
-            .try_exists()
-            .context("checking segment body path")?
-        {
-            Some(seg_body.clone())
-        } else {
-            None
-        };
-        let seg_exists = seg_body_path.is_some();
+        let gc_body_present = gc_body.try_exists().context("checking gc body path")?;
+        let cache_body = cache_dir.join(format!("{new_ulid_str}.body"));
+        let seg_promoted = !gc_body_present
+            && cache_body
+                .try_exists()
+                .context("checking cache body path")?;
 
-        if is_repack && !seg_exists {
+        if is_repack && !gc_body_present && !seg_promoted {
             // The volume re-signs gc/<new-ulid> before renaming the handoff to
             // .applied, so a missing body here is always a bug.  Abort rather
             // than silently deleting the old segments without uploading the
             // replacement — that would cause permanent data loss.
             return Err(anyhow::anyhow!(
-                "compacted segment {new_ulid_str} missing from gc/ for repack handoff \
-                 — refusing to delete old segments before upload"
+                "compacted segment {new_ulid_str} missing from gc/ and cache/ for repack \
+                 handoff — refusing to delete old segments before upload"
             ));
         }
 
-        if let Some(ref body_path) = seg_body_path {
+        if gc_body_present {
             // Verify the volume's signature before uploading.  This catches any
             // case where the volume failed to sign correctly — we refuse to
             // propagate a bad segment to S3.  Load volume.pub here rather than
@@ -376,13 +367,13 @@ pub async fn apply_done_handoffs(
                 elide_core::signing::VOLUME_PUB_FILE,
             )
             .context("loading volume verifying key")?;
-            segment::read_and_verify_segment_index(body_path, &vk).with_context(|| {
+            segment::read_and_verify_segment_index(&gc_body, &vk).with_context(|| {
                 format!("signature verification failed for compacted segment {new_ulid_str}")
             })?;
 
             let key = segment_key(volume_id, &new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
-            let data = tokio::fs::read(body_path)
+            let data = tokio::fs::read(&gc_body)
                 .await
                 .with_context(|| format!("reading compacted segment {new_ulid_str}"))?;
             store
@@ -390,49 +381,24 @@ pub async fn apply_done_handoffs(
                 .await
                 .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
-            // Write index/<new_ulid>.idx — the S3-confirmation marker.  Must
-            // happen before the gc/ → segments/ move so that the invariant
-            // "index/<ulid>.idx present ↔ segment in S3" holds.
-            fs::create_dir_all(&index_dir)
-                .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
-            let idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
-            elide_core::segment::extract_idx(body_path, &idx_path)
-                .with_context(|| format!("writing index/{new_ulid_str}.idx"))?;
-
-            // Move gc/<new-ulid> → segments/<new-ulid>.  This is the final
-            // confirmation step: segments/ now reflects S3 availability.
-            // Skip if already in segments/ (crash recovery: prior attempt completed the move).
-            if gc_body.try_exists().context("checking gc body for move")? {
-                fs::rename(&gc_body, &seg_body)
-                    .with_context(|| format!("moving gc/{new_ulid_str} to segments/"))?;
+            // Promote: IPC → volume copies gc/<new> → cache/<new>.body + .present.
+            // If volume is down, defer: leave gc/<new> in place, retry next tick.
+            let new_ulid = handoff.ulid;
+            if !crate::control::promote_segment(fork_dir, new_ulid).await {
+                warn!("[gc] promote {new_ulid_str}: volume not running; will retry next tick");
+                continue;
             }
-        }
 
-        // Delete index/<old>.idx for each old input segment before deleting the
-        // S3 objects.  Ordering is critical: the invariant
-        //   index/<ulid>.idx present  ↔  segment guaranteed to be in S3
-        // means the .idx must be removed first.  If the coordinator crashes
-        // between here and the S3 deletes below, the .idx is gone but the S3
-        // object remains — a transient space overhead, not corruption.  On
-        // restart the coordinator retries from .applied; the .idx deletes are
-        // idempotent (already-absent files are silently skipped).
-        //
-        // Without this step, evicting segments/ and restarting leaves dangling
-        // .idx files that rebuild_segments includes in the extent index, mapping
-        // hashes to segments absent from both disk and S3 — causing "not found
-        // in any ancestor" read errors on every access to those LBAs.
-        for old_ulid_str in &old_ulids {
-            let _ = fs::remove_file(index_dir.join(format!("{old_ulid_str}.idx")));
+            // Coordinator deletes gc/<new> after promote succeeds.
+            tokio::fs::remove_file(&gc_body)
+                .await
+                .with_context(|| format!("removing gc/{new_ulid_str}"))?;
         }
+        // else: seg_promoted or tombstone/removal-only — proceed to S3 deletes.
 
-        // Delete old local segment bodies from segments/ before deleting from
-        // S3, preserving the invariant: local body present ↔ S3 present.
-        // Best-effort: files may already be evicted or absent.
-        for old_ulid_str in &old_ulids {
-            let _ = fs::remove_file(segments_dir.join(old_ulid_str));
-        }
-
-        // Delete old S3 objects.  A 404 means the object is already gone
+        // Delete old S3 objects.  index/<old>.idx and cache/<old>.* were already
+        // cleaned up by the volume in VolumeFinishApply (apply_gc_handoffs).
+        // A 404 means the object is already gone
         // (e.g. coordinator crashed after delete but before rename); treat as
         // success so the cleanup is idempotent.
         for old_ulid_str in &old_ulids {
@@ -551,10 +517,9 @@ impl SegmentStats {
     }
 }
 
-/// Scan `segments_dir` and compute liveness stats for each segment.
+/// Scan `index/` and compute liveness stats for each committed segment.
 /// Returns segments in ULID (chronological) order; snapshot-frozen segments
 /// are excluded.
-/// Scan `segments/` and compute liveness stats for each segment.
 ///
 /// Segments are sorted using `sort_for_rebuild` semantics: GC outputs (those
 /// with a `.pending` or `.applied` handoff) come first (lower priority);
@@ -571,13 +536,18 @@ fn collect_stats(
     lba_map: &LbaMap,
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
-    let segments_dir = fork_dir.join("segments");
-    let mut segment_files = segment::collect_segment_files(&segments_dir)?;
-    segment::sort_for_rebuild(fork_dir, &mut segment_files);
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    let mut idx_files = segment::collect_idx_files(&index_dir)?;
+    segment::sort_for_rebuild(fork_dir, &mut idx_files);
 
     let mut result = Vec::new();
-    for path in segment_files {
-        let Some(ulid_str) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+    for idx_path in idx_files {
+        let Some(ulid_str) = idx_path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+        else {
             continue;
         };
         let seg_ulid = Ulid::from_string(&ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
@@ -588,8 +558,16 @@ fn collect_stats(
             continue;
         }
 
-        let file_size = fs::metadata(&path)?.len();
-        let (body_section_start, entries) = segment::read_and_verify_segment_index(&path, vk)?;
+        // File size is idx + body; used for the small_segment_bytes threshold.
+        let idx_size = fs::metadata(&idx_path)?.len();
+        let body_path = cache_dir.join(format!("{ulid_str}.body"));
+        let body_size = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
+        let file_size = idx_size + body_size;
+
+        // Read index from .idx; body_section_start for the .body file is 0
+        // since cache .body files contain only the body section (byte 0 = first body byte).
+        let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
+        let body_section_start = 0u64;
 
         let mut live_bytes: u64 = 0;
         let mut total_body_bytes: u64 = 0;
@@ -642,7 +620,7 @@ fn collect_stats(
 
         result.push(SegmentStats {
             ulid_str,
-            path,
+            path: body_path,
             file_size,
             live_bytes,
             total_body_bytes,
@@ -884,6 +862,61 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
+    struct MockSocket(tokio::task::JoinHandle<()>);
+    impl Drop for MockSocket {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// Spawn a mock volume control socket at `<fork_dir>/control.sock`.
+    ///
+    /// Responds "ok" to any command, and for "promote <ulid>" also performs
+    /// the volume's promote behaviour: copies the segment body from gc/ or
+    /// pending/ into cache/, and deletes the pending/ file on the drain path.
+    async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+        let socket_path = fork_dir.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let dir = fork_dir.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let (r, mut w) = tokio::io::split(stream);
+                    let mut buf = BufReader::new(r);
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line).await;
+                    let line = line.trim().to_owned();
+                    if let Some(ulid_str) = line.strip_prefix("promote ") {
+                        let ulid_str = ulid_str.to_owned();
+                        let gc_src = dir.join("gc").join(&ulid_str);
+                        let pending_src = dir.join("pending").join(&ulid_str);
+                        let (src, is_drain) = if gc_src.exists() {
+                            (gc_src, false)
+                        } else {
+                            (pending_src, true)
+                        };
+                        if src.exists() {
+                            let cache = dir.join("cache");
+                            std::fs::create_dir_all(&cache).ok();
+                            let body = cache.join(format!("{ulid_str}.body"));
+                            let present = cache.join(format!("{ulid_str}.present"));
+                            elide_core::segment::promote_to_cache(&src, &body, &present).ok();
+                            if is_drain {
+                                std::fs::remove_file(&src).ok();
+                            }
+                        }
+                    }
+                    w.write_all(b"ok\n").await.ok();
+                });
+            }
+        });
+        MockSocket(handle)
+    }
+
     #[test]
     fn no_pending_results_when_gc_dir_absent() {
         let tmp = TempDir::new().unwrap();
@@ -976,6 +1009,53 @@ mod tests {
         assert_eq!(find_least_dense(&stats, 0.7), None);
     }
 
+    /// Simulate coordinator drain: for each file in `pending/`, write
+    /// `index/<ulid>.idx`, `cache/<ulid>.body`, and `cache/<ulid>.present`,
+    /// then remove the pending file.  Mirrors what `drain_pending` does after a
+    /// successful S3 upload.
+    fn simulate_upload(dir: &Path) {
+        const HEADER_LEN: usize = 96;
+        let pending_dir = dir.join("pending");
+        let index_dir = dir.join("index");
+        let cache_dir = dir.join("cache");
+        fs::create_dir_all(&index_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(ulid_str) = name.to_str() else {
+                continue;
+            };
+            if ulid_str.ends_with(".tmp") {
+                continue;
+            }
+            let data = fs::read(&path).unwrap();
+            assert!(data.len() >= HEADER_LEN, "segment too short");
+
+            let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+            let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            let body_section_start = HEADER_LEN + index_length as usize + inline_length as usize;
+
+            // Write .idx (header + index section).
+            let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+            fs::write(&idx_path, &data[..body_section_start]).unwrap();
+
+            // Write .body and .present.
+            let body_bytes = &data[body_section_start..];
+            let bitset_len = (entry_count as usize).div_ceil(8);
+            fs::write(cache_dir.join(format!("{ulid_str}.body")), body_bytes).unwrap();
+            fs::write(
+                cache_dir.join(format!("{ulid_str}.present")),
+                vec![0xFFu8; bitset_len],
+            )
+            .unwrap();
+
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
     // --- apply_done_handoffs tests ---
 
     fn make_store() -> Arc<dyn ObjectStore> {
@@ -1026,7 +1106,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
         let new_ulid = Ulid::from_parts(1000, 1);
         let old_ulid = Ulid::from_parts(999, 0);
@@ -1053,7 +1132,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
         let new_ulid = Ulid::from_parts(1000, 1);
         let old_ulid = Ulid::from_parts(999, 0);
@@ -1085,7 +1163,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
         let new_ulid = Ulid::from_parts(1000, 2);
         let old_ulid = Ulid::from_parts(999, 1);
@@ -1103,21 +1180,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn done_deletes_local_segment_file() {
+    async fn done_deletes_old_s3_object() {
+        // Coordinator deletes the old S3 object for Remove handoffs.
+        // Local cache cleanup is the volume's responsibility (evict_applied_gc_cache).
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let segments_dir = tmp.path().join("segments");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(&segments_dir).unwrap();
 
         let new_ulid = Ulid::from_parts(1000, 3);
         let old_ulid = Ulid::from_parts(999, 2);
 
-        let old_local = segments_dir.join(old_ulid.to_string());
-        fs::write(&old_local, "old local segment").unwrap();
-        assert!(old_local.exists());
-
         let store = make_store();
+        let key = segment_key("vol", &old_ulid.to_string()).unwrap();
+        store
+            .put(&key, bytes::Bytes::from("old segment").into())
+            .await
+            .unwrap();
+
         let hash = blake3::Hash::from_hex("d".repeat(64)).unwrap();
         let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
@@ -1127,18 +1206,17 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert!(
-            !old_local.exists(),
-            "old local segment file should be removed"
+            store.get(&key).await.is_err(),
+            "old S3 object should be deleted"
         );
+        assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
     }
 
     #[tokio::test]
     async fn done_multiple_old_ulids_in_one_handoff() {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let segments_dir = tmp.path().join("segments");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(&segments_dir).unwrap();
 
         let new_ulid = Ulid::from_parts(1000, 4);
         let old_a = Ulid::from_parts(998, 0);
@@ -1151,7 +1229,6 @@ mod tests {
                 .put(&key, bytes::Bytes::from("data").into())
                 .await
                 .unwrap();
-            fs::write(segments_dir.join(old.to_string()), "data").unwrap();
         }
 
         let h1 = blake3::Hash::from_hex("e".repeat(64)).unwrap();
@@ -1178,10 +1255,6 @@ mod tests {
                 store.get(&key).await.is_err(),
                 "{old} S3 object should be deleted"
             );
-            assert!(
-                !segments_dir.join(old.to_string()).exists(),
-                "{old} local file should be removed"
-            );
         }
         assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
     }
@@ -1191,7 +1264,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(tmp.path().join("segments")).unwrap();
 
         let store = make_store();
         for i in 1u64..=3 {
@@ -1229,21 +1301,21 @@ mod tests {
 
     #[tokio::test]
     async fn done_verifies_signature_before_upload() {
-        // A correctly-signed segment in gc/ must be uploaded to S3 and moved
-        // to segments/ successfully.
+        // A correctly-signed segment in gc/ must be uploaded to S3, promoted
+        // to cache/ (via volume IPC), and the gc body deleted.
+        // Volume writes index/ at apply_gc_handoffs time; coordinator does not.
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let segments_dir = tmp.path().join("segments");
+        let cache_dir = tmp.path().join("cache");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(&segments_dir).unwrap();
 
         let signer = setup_vol_pub(tmp.path());
 
         let new_ulid = Ulid::from_parts(1000, 10);
         let old_ulid = Ulid::from_parts(999, 9);
 
-        // Write a properly volume-signed segment to gc/<new_ulid> (volume has re-signed
-        // in-place; coordinator will upload from here and then move to segments/).
+        // Write a properly volume-signed segment to gc/<new_ulid> (volume has
+        // re-signed in-place; coordinator will upload, promote via IPC, delete gc body).
         let entry = elide_core::segment::SegmentEntry::new_data(
             blake3::hash(b"payload"),
             0,
@@ -1267,22 +1339,27 @@ mod tests {
         }]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
+        // Mock volume socket: responds "ok" to promote and copies gc body to cache/.
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
+
         let store = make_store();
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
         assert_eq!(n, 1);
 
-        // Segment should be in S3 and moved from gc/ to segments/.
+        // Segment should be in S3.
         let key = segment_key("vol", &new_ulid.to_string()).unwrap();
         assert!(store.get(&key).await.is_ok(), "segment should be in S3");
+        // Body promoted to cache/ by the mock volume socket.
         assert!(
-            segments_dir.join(new_ulid.to_string()).exists(),
-            "segment should be in segments/"
+            cache_dir.join(format!("{new_ulid}.body")).exists(),
+            "cache/{new_ulid}.body should exist after promote"
         );
+        // gc body deleted by coordinator after promote.
         assert!(
             !gc_dir.join(new_ulid.to_string()).exists(),
-            "gc body should be gone after move"
+            "gc body should be deleted after commit"
         );
         assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
     }
@@ -1292,9 +1369,7 @@ mod tests {
         // A segment signed with the wrong key must not be uploaded.
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let segments_dir = tmp.path().join("segments");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(&segments_dir).unwrap();
 
         // Set up volume.pub with one keypair…
         setup_vol_pub(tmp.path());
@@ -1426,21 +1501,21 @@ mod tests {
         // the volume to acknowledge before deletion.
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let segments_dir = tmp.path().join("segments");
-        fs::create_dir_all(&segments_dir).unwrap();
+        let cache_dir = tmp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
 
         let old_ulid = Ulid::from_parts(999, 20).to_string();
         let handoff_ulid = Ulid::from_parts(1000, 20);
 
-        // Create a fake segment file — read_extent_bodies opens the file even
+        // Create a fake cache body — read_extent_bodies opens the file even
         // when live_entries is empty, so the path must exist.
-        let old_seg_path = segments_dir.join(&old_ulid);
-        fs::write(&old_seg_path, b"fake dead segment").unwrap();
+        let old_body_path = cache_dir.join(format!("{old_ulid}.body"));
+        fs::write(&old_body_path, b"fake dead segment").unwrap();
 
         let store = make_store();
         let candidate = SegmentStats {
             ulid_str: old_ulid.clone(),
-            path: old_seg_path.clone(),
+            path: old_body_path.clone(),
             file_size: 17,
             live_bytes: 0,
             total_body_bytes: 17,
@@ -1453,10 +1528,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The segment must NOT have been deleted directly — the volume has not
+        // The cache body must NOT have been deleted directly — the volume has not
         // acknowledged the handoff yet so it may still be reading from it.
         assert!(
-            old_seg_path.exists(),
+            old_body_path.exists(),
             "all-dead segment must not be deleted directly — tombstone handoff required \
              (coordinator deletion invariant)"
         );
@@ -1481,20 +1556,16 @@ mod tests {
     async fn done_tombstone_applied_deletes_old_no_upload() {
         // When apply_done_handoffs processes a tombstone .applied file
         // (written after the volume acknowledges a dead-<ulid> handoff),
-        // it must delete the old local segment and any S3 object, but must
-        // NOT attempt to upload a new segment (there is none).
+        // it must delete the old S3 object but must NOT attempt to upload a
+        // new segment (there is none).  Local cache cleanup is the volume's
+        // responsibility (evict_applied_gc_cache).
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let segments_dir = tmp.path().join("segments");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::create_dir_all(&segments_dir).unwrap();
 
         let old_ulid = Ulid::from_parts(999, 21).to_string();
         let handoff_ulid = Ulid::from_parts(1000, 21).to_string();
 
-        // Place the old segment in both local storage and S3.
-        let old_local = segments_dir.join(&old_ulid);
-        fs::write(&old_local, b"dead segment data").unwrap();
         let store = make_store();
         let s3_key = segment_key("vol", &old_ulid).unwrap();
         store
@@ -1517,7 +1588,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(n, 1, "one tombstone handoff should complete");
-        assert!(!old_local.exists(), "old local segment must be deleted");
         assert!(
             store.get(&s3_key).await.is_err(),
             "old S3 object must be deleted"
@@ -1566,23 +1636,17 @@ mod tests {
 
         let content = [0xAAu8; 4096];
 
-        // Step 1: write [0xAA; 4096] to lba 0, flush, drain.
+        // Step 1: write [0xAA; 4096] to lba 0, flush, simulate drain.
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        let segments_dir = dir.join("segments");
-        fs::create_dir_all(&segments_dir).unwrap();
-        for e in fs::read_dir(dir.join("pending")).unwrap().flatten() {
-            fs::rename(e.path(), segments_dir.join(e.file_name())).unwrap();
-        }
+        simulate_upload(dir);
 
-        // Step 2: write the same content to lba 1, flush, drain.
+        // Step 2: write the same content to lba 1, flush, simulate drain.
         // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        for e in fs::read_dir(dir.join("pending")).unwrap().flatten() {
-            fs::rename(e.path(), segments_dir.join(e.file_name())).unwrap();
-        }
+        simulate_upload(dir);
 
         drop(vol);
 
@@ -1614,9 +1678,9 @@ mod tests {
         assert!(applied > 0, "GC handoff should have been applied");
         drop(vol);
 
-        // Step 5: coordinator completes the handoff — uploads to S3, moves
-        // gc/<new> → segments/<new>, deletes old segment files, renames
-        // .applied → .done.
+        // Step 5: coordinator completes the handoff — uploads to S3, sends
+        // promote IPC to volume (mock), deletes gc/<new>, renames .applied → .done.
+        let _mock = spawn_mock_socket(dir.to_owned()).await;
         let done = apply_done_handoffs(dir, "test-vol", &store).await.unwrap();
         assert!(
             done > 0,

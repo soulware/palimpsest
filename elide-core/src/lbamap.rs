@@ -5,9 +5,9 @@
 // lookups and is updated after every promoted write.
 //
 // Rebuild on startup:
-//   1. Scan pending/ and segments/ for committed segment files in ULID order
-//      (oldest first). Applying oldest-to-newest means each insert naturally
-//      overwrites earlier entries for the same LBA range.
+//   1. Scan index/*.idx for uploaded segments and pending/ for not-yet-uploaded
+//      segments, in ULID order (oldest first). Applying oldest-to-newest means
+//      each insert naturally overwrites earlier entries for the same LBA range.
 //   2. Volume::open() replays the in-progress WAL on top in a single pass
 //      that also rebuilds pending_entries (see src/volume.rs).
 //
@@ -250,16 +250,11 @@ impl Default for LbaMap {
 
 // --- rebuild from disk ---
 
-/// Rebuild the LBA map from all committed segments.
-///
-/// Scans `<base>/pending/` and `<base>/segments/` in ULID order (oldest
-/// first). Reads the index section of each segment file. Directories that do
-/// not exist are silently skipped.
 /// Rebuild the LBA map from all committed segments across a fork ancestry chain.
 ///
 /// `layers` is ordered oldest-first (root ancestor first, live fork last).
 /// Each element is `(fork_dir, branch_ulid)`:
-/// - `fork_dir`: the fork directory containing `pending/` and `segments/`.
+/// - `fork_dir`: the fork directory containing `pending/`, `index/`, and `cache/`.
 /// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
 ///   are included. `None` means include all segments (used for the live fork).
 ///
@@ -272,7 +267,7 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
     let mut map = LbaMap::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Include index/*.idx so evicted/remote segments are still visible in the map.
+        // index/*.idx: committed segments (evicted to two-file format; permanent LBA index).
         let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
         cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
         if let Some(cutoff) = branch_ulid {
@@ -284,16 +279,25 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             });
         }
 
-        let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
-        paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
-        // Include GC handoff bodies in .applied state (volume-signed, in gc/
-        // awaiting coordinator upload to S3).  These are treated as lower-priority
-        // GC outputs by sort_for_rebuild; the old input segments in segments/ win.
-        paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
-        segment::sort_for_rebuild(fork_dir, &mut paths);
+        // gc/*.applied: GC output bodies awaiting coordinator upload to S3.
+        // These are produced BEFORE the WAL flush that follows gc_checkpoint
+        // (u_repack < u_flush), so they are lower priority than index/*.idx
+        // entries — a WAL flush promoted to index/ after GC ran must win.
+        let mut gc_paths = segment::collect_gc_applied_segment_files(fork_dir)?;
+        gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        // pending/: in-flight WAL flushes (highest priority — most recent writes).
+        let mut pending_paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
+        pending_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         if let Some(cutoff) = branch_ulid {
-            paths.retain(|p| {
+            gc_paths.retain(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+            pending_paths.retain(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
                     .map(|n| n <= cutoff.as_str())
@@ -301,14 +305,26 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             });
         }
 
-        if cache_paths.is_empty() && paths.is_empty() {
+        if cache_paths.is_empty() && gc_paths.is_empty() && pending_paths.is_empty() {
             continue;
         }
 
         // Load the verifying key only when this layer has segments to check.
         let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
 
-        for path in &cache_paths {
+        // Process in priority order (last write wins):
+        //   1. gc/*.applied  — lowest: GC-compacted data, ULID < the following WAL flush
+        //   2. index/*.idx   — middle: committed segments promoted from pending/
+        //   3. pending/      — highest: in-flight WAL flushes, always most recent
+        //
+        // This ordering ensures that a pending-then-promoted segment (index/*.idx)
+        // with a higher ULID than the GC output correctly shadows the GC entry
+        // for any overlapping LBA.
+        for path in gc_paths
+            .iter()
+            .chain(cache_paths.iter())
+            .chain(pending_paths.iter())
+        {
             let (_bss, entries) = match segment::read_and_verify_segment_index(path, &vk) {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -320,24 +336,6 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
                 }
                 Err(e) => return Err(e),
             };
-            for entry in entries {
-                map.insert(entry.start_lba, entry.lba_length, entry.hash);
-            }
-        }
-
-        for path in &paths {
-            let (_body_section_start, entries) =
-                match segment::read_and_verify_segment_index(path, &vk) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!(
-                            "segment vanished during rebuild (GC race): {}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
             for entry in entries {
                 map.insert(entry.start_lba, entry.lba_length, entry.hash);
             }
@@ -563,7 +561,7 @@ mod tests {
 
         let ancestor = temp_dir();
         let live = temp_dir();
-        std::fs::create_dir_all(ancestor.join("segments")).unwrap();
+        std::fs::create_dir_all(ancestor.join("pending")).unwrap();
         std::fs::create_dir_all(live.join("pending")).unwrap();
         let ancestor_signer = write_test_pub(&ancestor);
         let live_signer = write_test_pub(&live);
@@ -578,7 +576,7 @@ mod tests {
                 vec![0u8; 40960],
             )];
             segment::write_segment(
-                &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &ancestor.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
                 ancestor_signer.as_ref(),
             )
