@@ -728,6 +728,35 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
     write_file_atomic(idx_path, &buf)
 }
 
+/// Copy a segment body into the local cache.
+///
+/// Reads `src_path` (a full segment in `pending/` or `gc/`), extracts the body
+/// section, writes it to `body_path` (`cache/<ulid>.body`), and writes an
+/// all-present bitset to `present_path` (`cache/<ulid>.present`).
+///
+/// Both files are written via tmp+rename for crash safety. Idempotent: if
+/// `body_path` already exists, the function returns `Ok(())` immediately without
+/// re-reading the source file.
+pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
+    if body_path.try_exists()? {
+        return Ok(());
+    }
+    let data = fs::read(src_path)?;
+    if data.len() < HEADER_LEN as usize {
+        return Err(io::Error::other("segment too short to parse header"));
+    }
+    let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    let body_section_start = HEADER_LEN as usize + index_length as usize + inline_length as usize;
+    if data.len() < body_section_start {
+        return Err(io::Error::other("segment truncated before body section"));
+    }
+    write_file_atomic(body_path, &data[body_section_start..])?;
+    let bitset_len = (entry_count as usize).div_ceil(8);
+    write_file_atomic(present_path, &vec![0xffu8; bitset_len])
+}
+
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),

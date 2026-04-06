@@ -11,21 +11,23 @@
 // Upload commit sequence per segment:
 //   1. Read pending/<ulid> into memory
 //   2. PUT to object store at the derived key
-//   3. Write index/<ulid>.idx (header+index section)
-//   4. Promote body to cache/<ulid>.body + cache/<ulid>.present (all bits set)
-//   5. Delete pending/<ulid>
-//   6. On failure at any step: leave pending/<ulid> in place, record error, continue
+//   3. IPC → volume: "promote <ulid>"
+//      Volume copies pending/<ulid> → cache/<ulid>.body, writes cache/<ulid>.present,
+//      and deletes pending/<ulid>.
+//   4. On failure at any step: leave pending/<ulid> in place, record error, continue.
+//      If volume is not running: leave pending/ in place, retry next tick.
 //
 // Crash safety:
-//   - Crash before step 3: pending/<ulid> exists with no .idx; drain retries from step 2.
-//   - Crash after step 3, before step 5: pending/<ulid> exists with .idx; drain retries
-//     upload (idempotent S3 PUT), skips .idx (already exists), promotes to cache/ (idempotent
-//     via tmp+rename), deletes pending/.
-//   - Crash after step 5: pending/<ulid> is gone; .idx and cache/ files confirm commitment.
+//   - Crash before step 3: pending/<ulid> still exists; drain re-uploads (idempotent
+//     S3 PUT) and re-sends promote on next tick.
+//   - Crash after step 3: pending/<ulid> is gone (volume deleted it); done.
 //
-// Ordering invariant: .idx written before cache promotion, cache promotion before pending/
-// deletion. Any segment absent from pending/ is guaranteed to be in S3 (its .idx exists)
-// and available locally in cache/ for immediate reads without a demand-fetch round-trip.
+// Note: index/<ulid>.idx is written by the volume at WAL flush time (before upload),
+// so it already exists when drain runs. The coordinator never writes index/.
+//
+// Ordering invariant: pending/<ulid> absent ↔ segment confirmed in S3. The volume
+// deletes pending/<ulid> only after receiving the promote IPC, which the coordinator
+// sends only after a confirmed S3 upload.
 
 use std::path::Path;
 
@@ -113,9 +115,9 @@ struct ManifestSource<'a> {
     arch: &'a str,
 }
 
-/// Upload all committed segments from `pending/` to the object store, promoting
-/// each successfully uploaded segment to `cache/`. Also uploads the volume's
-/// public key and manifest so that new hosts can bootstrap the volume.
+/// Upload all committed segments from `pending/` to the object store, then
+/// send promote IPC to the volume for each uploaded segment. Also uploads the
+/// volume's public key and manifest so that new hosts can bootstrap the volume.
 ///
 /// `drain_pending` is a one-shot batch command. Metadata (pub key, manifest,
 /// name entry) is re-uploaded on every invocation — all are idempotent and tiny.
@@ -125,8 +127,6 @@ pub async fn drain_pending(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
-    let cache_dir = vol_dir.join("cache");
-    let index_dir = vol_dir.join("index");
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
@@ -147,20 +147,25 @@ pub async fn drain_pending(
         if name.ends_with(".tmp") {
             continue;
         }
-        let name = name.to_owned();
+        let ulid = match ulid::Ulid::from_string(name) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
         let segment_path = entry.path();
 
-        match upload_segment(
-            &segment_path,
-            &name,
-            &cache_dir,
-            &index_dir,
-            volume_id,
-            store,
-        )
-        .await
-        {
-            Ok(()) => uploaded += 1,
+        match upload_segment(&segment_path, name, volume_id, store).await {
+            Ok(()) => {
+                // Segment confirmed in S3; promote IPC tells the volume to cache
+                // the body and delete pending/<ulid>.
+                if crate::control::promote_segment(vol_dir, ulid).await {
+                    uploaded += 1;
+                } else {
+                    // Volume not running; pending/<ulid> stays in place.
+                    // The coordinator retries on the next drain tick.
+                    warn!("promote {name}: volume not running; will retry next tick");
+                    failed += 1;
+                }
+            }
             Err(e) => {
                 warn!("upload failed for segment {name}: {e:#}");
                 failed += 1;
@@ -291,92 +296,19 @@ pub async fn upload_snapshot(
 async fn upload_segment(
     path: &Path,
     ulid_str: &str,
-    cache_dir: &Path,
-    index_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let key = segment_key(volume_id, ulid_str)?;
 
-    // Read the full segment into memory once; reuse bytes for both S3 upload
-    // and local cache promotion without a second read.
-    let data = Bytes::from(
-        tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading segment {ulid_str}"))?,
-    );
+    let data = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading segment {ulid_str}"))?;
 
     store
-        .put(&key, data.clone().into())
+        .put(&key, Bytes::from(data).into())
         .await
         .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
-
-    // Write .idx first (path still in pending/). A crash between .idx write
-    // and cache promotion leaves pending/ with its .idx — drain retries on the
-    // next tick. extract_idx is idempotent if .idx already exists.
-    std::fs::create_dir_all(index_dir)
-        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
-    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-    elide_core::segment::extract_idx(path, &idx_path)
-        .with_context(|| format!("writing index/{ulid_str}.idx"))?;
-
-    // Promote body to cache/ so subsequent reads are served locally without
-    // a demand-fetch round-trip.
-    promote_to_cache(&data, ulid_str, cache_dir)
-        .with_context(|| format!("promoting {ulid_str} to cache/"))?;
-
-    // Remove pending file last — its absence is the commit marker.
-    tokio::fs::remove_file(path)
-        .await
-        .with_context(|| format!("removing pending/{ulid_str}"))?;
-
-    Ok(())
-}
-
-/// Write `<ulid>.body` and `<ulid>.present` (all bits set) to `cache_dir`.
-///
-/// Used by both `upload_segment` (drain path) and `apply_done_handoffs` (GC path).
-///
-/// Parses `body_section_start` and `entry_count` directly from the in-memory
-/// segment bytes. Both files are written via tmp + rename for crash safety.
-pub(crate) fn promote_to_cache(data: &[u8], ulid_str: &str, cache_dir: &Path) -> Result<()> {
-    const HEADER_LEN: usize = 96;
-
-    if data.len() < HEADER_LEN {
-        anyhow::bail!(
-            "segment {ulid_str}: too short to parse header ({} bytes)",
-            data.len()
-        );
-    }
-
-    let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-    let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    let body_section_start = HEADER_LEN + index_length as usize + inline_length as usize;
-
-    if data.len() < body_section_start {
-        anyhow::bail!("segment {ulid_str}: truncated before body section");
-    }
-
-    let body_bytes = &data[body_section_start..];
-    let bitset_len = (entry_count as usize).div_ceil(8);
-    let present_bytes = vec![0xFFu8; bitset_len];
-
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("creating cache dir: {}", cache_dir.display()))?;
-
-    let body_tmp = cache_dir.join(format!("{ulid_str}.body.tmp"));
-    let present_tmp = cache_dir.join(format!("{ulid_str}.present.tmp"));
-
-    std::fs::write(&body_tmp, body_bytes)
-        .with_context(|| format!("writing {ulid_str}.body.tmp"))?;
-    std::fs::write(&present_tmp, &present_bytes)
-        .with_context(|| format!("writing {ulid_str}.present.tmp"))?;
-
-    std::fs::rename(&body_tmp, cache_dir.join(format!("{ulid_str}.body")))
-        .with_context(|| format!("renaming {ulid_str}.body.tmp → .body"))?;
-    std::fs::rename(&present_tmp, cache_dir.join(format!("{ulid_str}.present")))
-        .with_context(|| format!("renaming {ulid_str}.present.tmp → .present"))?;
 
     Ok(())
 }
@@ -386,6 +318,53 @@ mod tests {
     use super::*;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
+
+    struct MockSocket(tokio::task::JoinHandle<()>);
+    impl Drop for MockSocket {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// Spawn a mock volume control socket at `<fork_dir>/control.sock`.
+    ///
+    /// Responds "ok" to any command. For "promote <ulid>" also performs the
+    /// volume's promote behaviour: copies the segment body from pending/ into
+    /// cache/ and deletes the pending/ file (drain path).
+    async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+        let socket_path = fork_dir.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let dir = fork_dir.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let (r, mut w) = tokio::io::split(stream);
+                    let mut buf = BufReader::new(r);
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line).await;
+                    let line = line.trim().to_owned();
+                    if let Some(ulid_str) = line.strip_prefix("promote ") {
+                        let ulid_str = ulid_str.to_owned();
+                        let src = dir.join("pending").join(&ulid_str);
+                        if src.exists() {
+                            let cache = dir.join("cache");
+                            std::fs::create_dir_all(&cache).ok();
+                            let body = cache.join(format!("{ulid_str}.body"));
+                            let present = cache.join(format!("{ulid_str}.present"));
+                            elide_core::segment::promote_to_cache(&src, &body, &present).ok();
+                            std::fs::remove_file(&src).ok();
+                        }
+                    }
+                    w.write_all(b"ok\n").await.ok();
+                });
+            }
+        });
+        MockSocket(handle)
+    }
 
     fn make_ulid(ts_ms: u64, random: u128) -> String {
         Ulid::from_parts(ts_ms, random).to_string()
@@ -443,7 +422,6 @@ mod tests {
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
         let cache_dir = vol_dir.join("cache");
-        let index_dir = vol_dir.join("index");
         std::fs::create_dir_all(&pending_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
@@ -458,7 +436,6 @@ mod tests {
         let ulid1 = make_ulid(1743120000000, 1);
         let ulid2 = make_ulid(1743120000000, 2);
 
-        // Write real segments — extract_idx requires valid segment format.
         let data1 = vec![0xABu8; 4096];
         let h1 = blake3::hash(&data1);
         let mut entries1 = vec![SegmentEntry::new_data(
@@ -481,8 +458,11 @@ mod tests {
         )];
         write_segment(&pending_dir.join(&ulid2), &mut entries2, signer.as_ref()).unwrap();
 
-        // .tmp files must be left in place
+        // .tmp files must be left in place.
         std::fs::write(pending_dir.join(format!("{ulid1}.tmp")), b"incomplete").unwrap();
+
+        // Mock volume socket: responds "ok" to promote and copies pending → cache.
+        let _mock = spawn_mock_socket(vol_dir.clone()).await;
 
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
@@ -493,16 +473,12 @@ mod tests {
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.failed, 0);
 
-        // pending/ entries are removed after commit.
+        // pending/ entries are removed by the volume after promote IPC (mocked here).
         assert!(!pending_dir.join(&ulid1).exists());
         assert!(!pending_dir.join(&ulid2).exists());
         assert!(pending_dir.join(format!("{ulid1}.tmp")).exists());
 
-        // index/*.idx must be written after confirmed upload.
-        assert!(index_dir.join(format!("{ulid1}.idx")).exists());
-        assert!(index_dir.join(format!("{ulid2}.idx")).exists());
-
-        // cache/ body + present files must be promoted.
+        // cache/ body + present files are written by the mock volume promote handler.
         assert!(cache_dir.join(format!("{ulid1}.body")).exists());
         assert!(cache_dir.join(format!("{ulid1}.present")).exists());
         assert!(cache_dir.join(format!("{ulid2}.body")).exists());

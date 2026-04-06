@@ -10,9 +10,11 @@
 // the production implementation had a bug.
 //
 // GcSweep runs the full coordinator round-trip:
-//   1. gc_fork()            — real compact_segments / collect_stats
-//   2. apply_gc_handoffs()  — volume re-signs and updates extent index
-//   3. apply_done_handoffs() — uploads to InMemory store, deletes old files
+//   1. gc_fork()              — real compact_segments / collect_stats
+//   2. apply_gc_handoffs()    — volume re-signs and updates extent index
+//   3. promote_gc_outputs()   — simulates coordinator promote IPC + gc body cleanup
+//   4. evict_applied_gc_cache — volume evicts old cache files (actor step)
+//   5. apply_done_handoffs()  — uploads to InMemory store, deletes old S3 objects
 // Then asserts all oracle LBAs are readable with correct data.
 
 use std::collections::HashMap;
@@ -27,21 +29,18 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 
-/// Simulate coordinator drain: for each file in pending/, write index/<ulid>.idx,
-/// cache/<ulid>.body, and cache/<ulid>.present, then remove the pending file.
-fn simulate_upload(dir: &Path) {
-    const HEADER_LEN: usize = 96;
+/// Simulate coordinator drain: for each file in pending/, promote the segment
+/// body to cache/ and remove the pending file.  The volume already wrote
+/// `index/<ulid>.idx` at WAL flush time, so drain does not write it again.
+fn simulate_upload(vol: &Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
-    let index_dir = dir.join("index");
     let cache_dir = dir.join("cache");
-    fs::create_dir_all(&index_dir).unwrap();
     fs::create_dir_all(&cache_dir).unwrap();
 
     let Ok(entries) = fs::read_dir(&pending_dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
         let name = entry.file_name();
         let Some(ulid_str) = name.to_str() else {
             continue;
@@ -49,27 +48,45 @@ fn simulate_upload(dir: &Path) {
         if ulid_str.ends_with(".tmp") {
             continue;
         }
-        let Ok(data) = fs::read(&path) else {
+        let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
             continue;
         };
-        if data.len() < HEADER_LEN {
+        // promote_segment copies pending → cache and deletes pending.
+        let _ = vol.promote_segment(ulid);
+    }
+}
+
+/// Simulate the coordinator promote IPC for each pending gc output:
+/// copies gc/<new> → cache/<new>.{body,present}, then deletes gc/<new>.
+/// This mirrors what the volume process does when it receives "promote <ulid>".
+fn promote_gc_outputs(vol: &Volume, dir: &Path) {
+    let gc_dir = dir.join("gc");
+    let Ok(entries) = fs::read_dir(&gc_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Only promote .applied files' new ULID (the gc body, not the marker).
+        if !name_str.ends_with(".applied") {
             continue;
         }
-        let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-        let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-        let bss = HEADER_LEN + index_length as usize + inline_length as usize;
-        if data.len() < bss {
+        let Some(ulid_str) = name_str.strip_suffix(".applied") else {
+            continue;
+        };
+        let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
+            continue;
+        };
+        let gc_body = gc_dir.join(ulid_str);
+        if !gc_body.exists() {
             continue;
         }
-        let _ = fs::write(index_dir.join(format!("{ulid_str}.idx")), &data[..bss]);
-        let _ = fs::write(cache_dir.join(format!("{ulid_str}.body")), &data[bss..]);
-        let bitset_len = (entry_count as usize).div_ceil(8);
-        let _ = fs::write(
-            cache_dir.join(format!("{ulid_str}.present")),
-            vec![0xFFu8; bitset_len],
-        );
-        let _ = fs::remove_file(&path);
+        // promote_segment: copies gc/<ulid> → cache/<ulid>.{body,present}.
+        let _ = vol.promote_segment(ulid);
+        // Coordinator deletes gc/<ulid> after promote succeeds.
+        let _ = fs::remove_file(&gc_body);
     }
 }
 
@@ -178,9 +195,10 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::GcSweep => {
-                    // Simulate drain: pending/ → index/ + cache/, mirroring what
-                    // drain_pending does in production after a successful S3 upload.
-                    simulate_upload(fork_dir);
+                    // Drain: volume already wrote index/ at flush; simulate
+                    // coordinator drain (upload + promote IPC) by calling
+                    // promote_segment directly on the volume.
+                    simulate_upload(&vol, fork_dir);
 
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
@@ -196,7 +214,22 @@ proptest! {
                         repack_ulid,
                         sweep_ulid,
                     ));
+
+                    // Volume applies the handoff: re-signs gc body, updates extent
+                    // index, writes index/<new>.idx, deletes index/<old>.idx.
                     let _ = vol.apply_gc_handoffs();
+
+                    // Simulate coordinator promote IPC: copies gc/<new> → cache/<new>,
+                    // deletes gc/<new>.  In production this is an IPC round-trip;
+                    // here we call vol.promote_segment directly.
+                    promote_gc_outputs(&vol, fork_dir);
+
+                    // Actor step: evict old cache files after publishing the new snapshot.
+                    vol.evict_applied_gc_cache();
+
+                    // Coordinator: upload new segment to S3, delete old S3 objects.
+                    // cache/<new>.body already exists (seg_promoted=true), so
+                    // apply_done_handoffs skips the upload+promote branch.
                     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
 
                     if let Ok(stats) = gc_stats {
@@ -293,9 +326,10 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::GcSweep => {
-                    // Simulate drain: pending/ → index/ + cache/, mirroring what
-                    // drain_pending does in production after a successful S3 upload.
-                    simulate_upload(fork_dir);
+                    // Drain: volume already wrote index/ at flush; simulate
+                    // coordinator drain (upload + promote IPC) by calling
+                    // promote_segment directly on the volume.
+                    simulate_upload(&vol, fork_dir);
 
                     // gc_checkpoint flushes the WAL under a pre-minted ULID
                     // (u_wal > u_sweep) and returns (u_repack, u_sweep) from
@@ -316,7 +350,11 @@ proptest! {
                     // Step 2: volume re-signs GC output, updates extent index.
                     let _ = vol.apply_gc_handoffs();
 
-                    // Step 3: upload to InMemory store, delete old local files.
+                    // Step 3: simulate coordinator promote IPC + actor evict.
+                    promote_gc_outputs(&vol, fork_dir);
+                    vol.evict_applied_gc_cache();
+
+                    // Step 4: upload new segment to S3, delete old S3 objects.
                     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
 
                     // Assert: every oracle LBA still reads its expected value.
