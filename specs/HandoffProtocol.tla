@@ -449,14 +449,21 @@ VolumeApplyRemoved(h) ==
   deletes index/<old>.idx for each consumed input, and atomically renames
   gc/<ulid>.pending → gc/<ulid>.applied.
 
-  Preconditions:
-    - Every carried entry is now "gc" (applied) or "new" (guard fired, skipped)
-    - Every removed entry is now "gone" (applied) or "new" (guard fired, skipped)
-    - ~gc_seg_present \/ gc_seg_signed: if a staged segment was written
-      (gc_seg_present = TRUE), it must have been re-signed by the volume
-      (gc_seg_signed = TRUE) before signalling the coordinator.  This ensures
-      the body in gc/ is volume-signed before Step 3 begins.
-      (For Carried = {} no staged segment exists; gc_seg_present = FALSE always.)
+  Precondition: ~gc_seg_present \/ gc_seg_signed: if a staged segment was written
+  (gc_seg_present = TRUE), it must have been re-signed by the volume
+  (gc_seg_signed = TRUE) before signalling the coordinator.  This ensures
+  the body in gc/ is volume-signed before Step 3 begins.
+  (For Carried = {} no staged segment exists; gc_seg_present = FALSE always.)
+
+  This action atomically applies any remaining "old" entries (the per-entry
+  guard: skip if already "gc"/"gone"/"new") AND renames .pending → .applied AND
+  deletes index/<old>.idx.  In the implementation apply_gc_handoffs() does all
+  of this in a single function call; a crash anywhere restarts the whole call
+  idempotently.  Modelling it as one atomic TLA+ step is the correct abstraction:
+  per-entry partial progress (VolumeApplyCarried / VolumeApplyRemoved) is still
+  explored for safety, but the rename+idx-delete is never split from the last
+  entry update, preventing the adversary from crashing between the last apply
+  and the rename.
 
   old_idx_present' = FALSE: the volume deletes index/<old>.idx here, before the
   .applied rename.  This ensures that when the coordinator sees .applied, the old
@@ -465,26 +472,24 @@ VolumeApplyRemoved(h) ==
   can act on .applied, the restart-safety condition is already guaranteed on disk.
 
   For tombstone handoffs (Dead = TRUE, Carried = {}, Removed = {}):
-    - Both universals are vacuously true (Hashes = {})
+    - Hashes = {}; the extent update is a no-op
     - gc_seg_present = FALSE throughout (no staged segment)
     - VolumeFinishApply fires immediately after CoordWritePending
     - This models the volume's acknowledgment: it has checked its own state
       and confirmed deletion is safe
-
-  If the volume crashes before this step, the .pending file is still there
-  on restart: the volume re-applies from scratch.  Per-entry application is
-  idempotent because the guard (extent[h] = "old") does not fire for entries
-  already set to "gc" or "gone" in a previous partial run.
 *)
 VolumeFinishApply ==
   /\ vol_up
   /\ handoff = "pending"
   /\ ~gc_seg_present \/ gc_seg_signed  \* re-signing complete (or Carried = {})
-  /\ \A h \in Carried : extent[h] \in {"gc",   "new"}
-  /\ \A h \in Removed : extent[h] \in {"gone", "new"}
+  \* Apply any remaining "old" entries atomically (idempotent: "gc"/"gone"/"new" unchanged).
+  /\ extent'        = [h \in Hashes |->
+                         IF extent[h] = "old"
+                         THEN IF h \in Carried THEN "gc" ELSE "gone"
+                         ELSE extent[h]]
   /\ handoff'          = "applied"
   /\ old_idx_present'  = FALSE          \* delete index/<old>.idx before .applied rename
-  /\ UNCHANGED <<extent, old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<old_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
 
 VolumeCrash ==
   /\ vol_up
@@ -613,8 +618,22 @@ Next ==
   hash can make progress, some hash will.  This is sufficient for all
   entries to be eventually processed.
 
-  For tombstone handoffs (Hashes = {}) the \E-quantified fairness conditions
-  are vacuously satisfied; progress is driven by VolumeFinishApply alone.
+  Liveness for VolumeApplyCarried / VolumeApplyRemoved / VolumeFinishApply:
+
+  VolumeFinishApply now atomically applies any remaining "old" entries and
+  renames .pending → .applied.  It is enabled on every restart where
+  handoff = "pending" and the gc body is signed (or Carried = {}).  With
+  SF_vars(VolumeFinishApply) the system is guaranteed to eventually reach
+  .applied in some crash-free step: crashes keep vol_up = FALSE temporarily,
+  but WF_vars(VolumeRestart) brings it back, and SF_vars(VolumeFinishApply)
+  then forces the commit.
+
+  VolumeApplyCarried and VolumeApplyRemoved retain \E-quantified fairness for
+  safety exploration (partial-application states are still reachable by TLC),
+  but liveness no longer depends on them — VolumeFinishApply subsumes them.
+
+  For tombstone handoffs (Hashes = {}) all \E-quantified conditions are
+  vacuously satisfied; progress is driven by VolumeFinishApply alone.
 *)
 Spec ==
   /\ Init
