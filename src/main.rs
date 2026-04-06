@@ -1266,7 +1266,8 @@ fn remote_pull(
 /// Evict all S3-confirmed segment bodies from `cache/`.
 ///
 /// Deletes `cache/<ulid>.body` and `cache/<ulid>.present` for every segment
-/// that has a corresponding `index/<ulid>.idx` (the S3-confirmation marker).
+/// that has a corresponding `index/<ulid>.idx` (idx is written at promote time,
+/// after S3 confirmation, so its presence guarantees the segment is in S3).
 /// Bodies without an index entry are skipped — they are mid-promote and not
 /// yet confirmed in S3. `index/` entries, `pending/`, and `gc/` are untouched.
 ///
@@ -1296,7 +1297,7 @@ fn evict_bodies(vol_dir: &Path) -> std::io::Result<usize> {
         };
         let idx_path = index_dir.join(format!("{ulid_str}.idx"));
         if !idx_path.try_exists()? {
-            continue; // not yet S3-confirmed; skip
+            continue; // no idx → not yet S3-confirmed (promote not run yet); skip
         }
         std::fs::remove_file(entry.path())?;
         let _ = std::fs::remove_file(cache_dir.join(format!("{ulid_str}.present")));
@@ -1307,8 +1308,9 @@ fn evict_bodies(vol_dir: &Path) -> std::io::Result<usize> {
 
 /// Evict a single segment body from `cache/` by ULID.
 ///
-/// Refuses if `index/<ulid>.idx` is absent (not yet S3-confirmed) or if
-/// `cache/<ulid>.body` does not exist.
+/// Refuses if `index/<ulid>.idx` is absent (segment not yet S3-confirmed;
+/// idx is only written at promote time, after upload) or if `cache/<ulid>.body`
+/// does not exist.
 ///
 /// On success, returns 1.
 fn evict_one_body(vol_dir: &Path, ulid_str: &str) -> std::io::Result<usize> {

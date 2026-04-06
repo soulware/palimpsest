@@ -1,21 +1,23 @@
 // Regression tests for GC handoff index/ ownership.
 //
-// Invariant: `index/<ulid>.idx` present ↔ segment exists in persistent storage
-// (pending/ or S3).
+// Invariant: `index/<ulid>.idx` present ↔ segment confirmed in S3.
 //
-// In the new design, the VOLUME owns `index/` entirely:
-//   - Written at WAL flush time (before coordinator upload).
-//   - `index/<new>.idx` written by `apply_gc_handoffs` from the gc/ body.
-//   - `index/<old>.idx` deleted by `apply_gc_handoffs` before renaming .applied.
+// In the new design, the volume owns `index/` entirely:
+//   - `index/<ulid>.idx` written by `promote_segment` IPC after S3 upload confirmation.
+//   - `flush_wal_to_pending_as` writes only `pending/<ulid>` — no idx.
+//   - `apply_gc_handoffs` does NOT write new idx or delete old idx; it renames
+//     gc/<new>.pending → gc/<new>.applied only.
+//   - `promote_segment` (GC path): writes `index/<new>.idx` AND deletes
+//     `index/<old>.idx` by reading the `.applied` handoff file.
 //
 // The coordinator never reads or writes `index/` directly.
 //
 // These tests verify:
-//   1. `apply_gc_handoffs` correctly writes index/<new>.idx and deletes index/<old>.idx.
-//   2. After eviction + restart, the volume is fully readable with a correct lbamap.
-//   3. index/<old>.idx is always absent when the old S3 object is gone (ordering
-//      invariant automatically satisfied because apply_gc_handoffs runs before
-//      any S3 deletion).
+//   1. After `apply_gc_handoffs`: old idx still present, new idx not yet written.
+//   2. After `promote_segment`: new idx present, old idx deleted.
+//   3. After eviction + restart, the volume is fully readable with a correct lbamap.
+//   4. index/<old>.idx is always absent when the old S3 object is gone (ordering
+//      invariant: promote_segment deletes old idx before coordinator sees .applied).
 
 use std::fs;
 use std::path::PathBuf;
@@ -24,9 +26,9 @@ use elide_core::volume::Volume;
 
 mod common;
 
-/// After `apply_gc_handoffs`, `index/<new>.idx` exists and `index/<old>.idx` is
-/// gone.  After simulating coordinator cleanup (promote + delete gc body) and
-/// eviction + restart, the volume is fully readable and the lbamap is correct.
+/// After `apply_gc_handoffs`, old idx still present and new idx not yet written.
+/// After `promote_segment`, new idx is present and old idx is gone.
+/// After eviction + restart, the volume is fully readable and the lbamap is correct.
 #[test]
 fn gc_cleanup_deletes_old_idx_before_evict() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -35,9 +37,8 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Write two blocks across two separate flush cycles to produce two segments.
-    // drain_local simulates the coordinator drain: promote_segment IPC, which
-    // copies body to cache/ and deletes pending/.
-    // index/<ulid>.idx is written by the volume at flush time.
+    // drain_local simulates coordinator drain: upload + promote_segment IPC, which
+    // writes index/<ulid>.idx, copies body to cache/, and deletes pending/.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
@@ -71,30 +72,46 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
         common::simulate_coord_gc_local(&fork_dir, new_ulid, 2).unwrap();
     assert_eq!(produced_ulid, new_ulid);
 
-    // apply_gc_handoffs: re-signs gc/<new>, updates extent index, writes
-    // index/<new>.idx, deletes index/<old>.idx, renames .pending → .applied.
+    // apply_gc_handoffs: re-signs gc/<new>, updates extent index,
+    // renames .pending → .applied.  Does NOT write new idx or delete old idx.
     let applied = vol.apply_gc_handoffs().unwrap();
     assert!(applied > 0);
 
     let new_ulid_str = produced_ulid.to_string();
     let gc_seg_path = gc_dir.join(&new_ulid_str);
 
-    // index/<new>.idx must be present (written by apply_gc_handoffs).
+    // index/<new>.idx must NOT be present yet — only written at promote time.
     assert!(
-        index_dir.join(format!("{new_ulid_str}.idx")).exists(),
-        "apply_gc_handoffs must write index/<new>.idx"
+        !index_dir.join(format!("{new_ulid_str}.idx")).exists(),
+        "apply_gc_handoffs must NOT write index/<new>.idx (deferred to promote_segment)"
     );
 
-    // index/<old>.idx must be absent (deleted by apply_gc_handoffs).
+    // index/<old>.idx must still be present — not yet deleted.
     for old_stem in &old_idx_stems {
         assert!(
-            !index_dir.join(format!("{old_stem}.idx")).exists(),
-            "apply_gc_handoffs must delete index/{old_stem}.idx"
+            index_dir.join(format!("{old_stem}.idx")).exists(),
+            "apply_gc_handoffs must NOT delete index/{old_stem}.idx (deferred to promote_segment)"
         );
     }
 
-    // Simulate coordinator: promote IPC → cache/<new>.{body,present}, delete gc/<new>.
+    // Simulate coordinator: promote IPC → writes index/<new>.idx, cache/<new>.{body,present},
+    // deletes index/<old>.idx (by reading .applied handoff), deletes pending/<new>.
     vol.promote_segment(produced_ulid).unwrap();
+
+    // index/<new>.idx now present (written by promote_segment).
+    assert!(
+        index_dir.join(format!("{new_ulid_str}.idx")).exists(),
+        "promote_segment must write index/<new>.idx"
+    );
+
+    // index/<old>.idx now absent (deleted by promote_segment via .applied handoff).
+    for old_stem in &old_idx_stems {
+        assert!(
+            !index_dir.join(format!("{old_stem}.idx")).exists(),
+            "promote_segment must delete index/{old_stem}.idx"
+        );
+    }
+
     assert!(cache_dir.join(format!("{new_ulid_str}.body")).exists());
     fs::remove_file(&gc_seg_path).unwrap();
 
@@ -130,14 +147,15 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     );
 }
 
-/// Verify that `apply_gc_handoffs` atomically maintains the ordering invariant:
-/// `index/<old>.idx` is always absent by the time `.applied` is written, so
-/// the coordinator can never observe `.applied` with a dangling old idx.
+/// Verify the ordering invariant for `index/<old>.idx` deletion:
+/// `promote_segment` (not `apply_gc_handoffs`) deletes old idx and writes new idx.
+/// After `apply_gc_handoffs`: old idx still present, new idx absent, `.applied` written.
+/// After `promote_segment`: new idx present, old idx absent.
 ///
-/// The invariant "index/<ulid>.idx present ↔ segment in persistent storage" is
-/// enforced structurally: the volume deletes `index/<old>.idx` in the same atomic
-/// step as the `.pending → .applied` rename.  The coordinator sees `.applied`
-/// only after both are done.
+/// The coordinator only acts on `.applied` after `promote_segment` has run,
+/// so by the time `.applied` is visible the old S3 object is still present
+/// (coordinator deletes it after promote). Old idx is deleted inside promote_segment
+/// before coordinator sees the body — so old idx is never dangling relative to S3.
 #[test]
 fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -169,17 +187,33 @@ fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
         gc_dir.join(format!("{new_ulid_str}.applied")).exists(),
         "gc/<new>.applied must be present after apply_gc_handoffs"
     );
-    // index/<old>.idx must be absent — volume deleted them before writing .applied.
+    // index/<old>.idx must still be present — not yet deleted by promote_segment.
+    for old_ulid in &consumed_ulids {
+        let s = old_ulid.to_string();
+        assert!(
+            index_dir.join(format!("{s}.idx")).exists(),
+            "index/{s}.idx must still be present before promote_segment runs"
+        );
+    }
+    // index/<new>.idx must NOT be present yet — only written at promote time.
+    assert!(
+        !index_dir.join(format!("{new_ulid_str}.idx")).exists(),
+        "index/<new>.idx must not exist before promote_segment"
+    );
+
+    // Now run promote_segment (simulates coordinator after S3 upload of GC output).
+    vol.promote_segment(produced_ulid).unwrap();
+
+    // index/<new>.idx now present, old idx gone.
+    assert!(
+        index_dir.join(format!("{new_ulid_str}.idx")).exists(),
+        "promote_segment must write index/<new>.idx"
+    );
     for old_ulid in &consumed_ulids {
         let s = old_ulid.to_string();
         assert!(
             !index_dir.join(format!("{s}.idx")).exists(),
-            "index/{s}.idx must be absent when .applied is written"
+            "promote_segment must delete index/{s}.idx"
         );
     }
-    // index/<new>.idx must be present.
-    assert!(
-        index_dir.join(format!("{new_ulid_str}.idx")).exists(),
-        "index/<new>.idx must be written by apply_gc_handoffs"
-    );
 }

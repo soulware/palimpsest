@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 5074e42e9cc30bdf19afb1c401ff8767fb435f51d7c552cb14447d171e89662d # shrinks to ops = [Write { lba: 0, seed: 154 }, Restart, GcSweep, Write { lba: 7, seed: 245 }, Write { lba: 1, seed: 45 }, Write { lba: 4, seed: 9 }, GcSweep, DedupWrite { lba_a: 2, lba_b: 4, seed: 0 }]
 cc 3dc274dac8efc86e5901c0020e5e13cc9e0b9c0ebb0292c7fe7440379f49cedf # shrinks to ops = [Write { lba: 0, seed: 0 }, Flush, Write { lba: 0, seed: 0 }, Flush, GcSweep]
+cc d0bfacfcc38ae32bd2f829d232ad13ddb83f4ff4006356ac2f6ac3af4208d919 # shrinks to ops = [Write { lba: 1, seed: 0 }, Flush, Write { lba: 1, seed: 0 }, Flush, Write { lba: 0, seed: 1 }, Write { lba: 1, seed: 1 }, Write { lba: 0, seed: 1 }, GcSweep]
