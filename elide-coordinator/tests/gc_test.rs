@@ -170,22 +170,42 @@ fn make_gc_config() -> GcConfig {
     }
 }
 
-/// Move all files from pending/ → segments/, writing index/<ulid>.idx before
-/// each rename so the invariant "index/<ulid>.idx present → segment in S3" is
-/// upheld (mirroring what upload::drain_pending does in production).
+/// Simulate coordinator drain: promote all files from pending/ to index/ + cache/,
+/// mirroring what upload::drain_pending does in production after a successful S3 upload.
 fn drain_pending(fork_dir: &std::path::Path) {
+    const HEADER_LEN: usize = 96;
     let pending_dir = fork_dir.join("pending");
-    let segments_dir = fork_dir.join("segments");
     let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
     fs::create_dir_all(&index_dir).unwrap();
-    if let Ok(entries) = fs::read_dir(&pending_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let src = entry.path();
-            let idx_path = index_dir.join(format!("{}.idx", name.to_string_lossy()));
-            let _ = elide_core::segment::extract_idx(&src, &idx_path);
-            let _ = fs::rename(src, segments_dir.join(name));
+    fs::create_dir_all(&cache_dir).unwrap();
+    let Ok(entries) = fs::read_dir(&pending_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(ulid_str) = name.to_str() else {
+            continue;
+        };
+        if ulid_str.ends_with(".tmp") {
+            continue;
         }
+        let data = fs::read(&path).unwrap();
+        assert!(data.len() >= HEADER_LEN, "segment too short: {ulid_str}");
+        let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let bss = HEADER_LEN + index_length as usize + inline_length as usize;
+        fs::write(index_dir.join(format!("{ulid_str}.idx")), &data[..bss]).unwrap();
+        fs::write(cache_dir.join(format!("{ulid_str}.body")), &data[bss..]).unwrap();
+        let bitset_len = (entry_count as usize).div_ceil(8);
+        fs::write(
+            cache_dir.join(format!("{ulid_str}.present")),
+            vec![0xFFu8; bitset_len],
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
     }
 }
 
@@ -214,7 +234,6 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-    fs::create_dir_all(fork_dir.join("segments")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -233,7 +252,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     vol.write(0, &d1).unwrap();
     vol.flush_wal().unwrap();
 
-    // Move both pending segments to segments/ so gc_fork can operate on them.
+    // Promote both pending segments to index/ + cache/ so gc_fork can operate on them.
     drain_pending(fork_dir);
 
     // Step 3: gc_checkpoint — flush WAL, mint GC output ULIDs.
@@ -363,7 +382,6 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-    fs::create_dir_all(fork_dir.join("segments")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -473,7 +491,6 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-    fs::create_dir_all(fork_dir.join("segments")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -581,7 +598,6 @@ fn drain_failure_skips_gc_and_data_survives() {
     .unwrap();
 
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-    fs::create_dir_all(fork_dir.join("segments")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -709,7 +725,6 @@ fn gc_restart_safety_applied_handoff() {
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-    fs::create_dir_all(fork_dir.join("segments")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

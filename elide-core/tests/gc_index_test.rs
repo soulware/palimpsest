@@ -20,22 +20,23 @@ use std::path::PathBuf;
 
 use elide_core::segment::extract_idx;
 use elide_core::volume::Volume;
-use ulid::Ulid;
 
 mod common;
 
-/// After a correct GC + coordinator cleanup (idx deleted before S3 deletion),
+/// After a correct GC + coordinator cleanup (old idx deleted before S3 deletion),
 /// eviction + crash+reopen leaves no dangling `index/<old>.idx` entries and
 /// the LBA map is fully intact.
 ///
 /// Simulates the full coordinator cleanup sequence:
-///   1. Upload new segment (simulate: write `index/<new>.idx`)
-///   2. Move `gc/<new>` → `segments/<new>`
-///   3. Delete `index/<old>.idx` for each consumed segment  ← THE FIX
-///   4. Delete old local bodies from `segments/<old>`       (S3 object deleted)
-///   5. Rename `gc/<new>.applied` → `gc/<new>.done`
-///   6. Evict: delete `segments/<new>` body
-///   7. Crash + reopen — verify no dangling idx, correct lbamap
+///   1. drain_local already wrote index/<old>.idx + cache/<old>.{body,present}
+///   2. GC compacts → gc/<new>
+///   3. apply_gc_handoffs: re-signs gc/<new>, updates extent index
+///   4. Write index/<new>.idx + cache/<new>.{body,present} (simulating S3 upload + cache promotion)
+///   5. Delete index/<old>.idx for each consumed segment  ← THE FIX
+///   6. Delete cache/<old>.{body,present}
+///   7. Delete gc/<new> (body moved to cache)
+///   8. Evict: delete cache/<new>.body
+///   9. Crash + reopen — verify no dangling idx, correct lbamap
 #[test]
 fn gc_cleanup_deletes_old_idx_before_evict() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -44,29 +45,29 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Write two blocks across two separate flush cycles to produce two segments.
+    // drain_local writes index/<ulid>.idx + cache/<ulid>.{body,present} for each.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir); // pending/ → segments/
+    common::drain_local(&fork_dir);
 
     vol.write(1, &[0xBB; 4096]).unwrap();
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    // Simulate coordinator: write `index/<old>.idx` for each segment in
-    // segments/ (representing confirmed S3 upload).
-    let segments_dir = fork_dir.join("segments");
     let index_dir = fork_dir.join("index");
-    fs::create_dir_all(&index_dir).unwrap();
-    let old_seg_names: Vec<String> = fs::read_dir(&segments_dir)
+    let cache_dir = fork_dir.join("cache");
+    let gc_dir = fork_dir.join("gc");
+
+    // Collect old idx names (without extension) for verification later.
+    let old_idx_stems: Vec<String> = fs::read_dir(&index_dir)
         .unwrap()
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".idx").map(String::from)
+        })
         .collect();
-    for name in &old_seg_names {
-        let seg_path = segments_dir.join(name);
-        let idx_path = index_dir.join(format!("{name}.idx"));
-        extract_idx(&seg_path, &idx_path).unwrap();
-    }
+    assert_eq!(old_idx_stems.len(), 2, "expected 2 committed segments");
 
     // Obtain GC checkpoint ULIDs from the volume (as the coordinator would).
     let (new_ulid, _) = vol.gc_checkpoint().unwrap();
@@ -76,43 +77,68 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
         common::simulate_coord_gc_local(&fork_dir, new_ulid, 2).unwrap();
     assert_eq!(produced_ulid, new_ulid);
 
-    // Volume applies the handoff: re-signs gc/<new>, moves it to segments/<new>,
+    // Volume applies the handoff: re-signs gc/<new>, updates extent index,
     // renames gc/<new>.pending → gc/<new>.applied.
     let applied = vol.apply_gc_handoffs().unwrap();
     assert!(applied > 0);
 
     // --- Simulate correct coordinator cleanup ---
     //
-    // After apply_gc_handoffs, the re-signed segment sits in gc/<new>.
+    // After apply_gc_handoffs, the re-signed segment body is in gc/<new>.
     // The coordinator:
     //   1. Uploads gc/<new> to S3
-    //   2. Writes index/<new>.idx (from gc/<new>)
-    //   3. Moves gc/<new> → segments/<new>
-    //   4. Deletes index/<old>.idx  ← THE FIX (before S3 deletion)
-    //   5. Deletes old local bodies (old S3 objects deleted)
+    //   2. Writes index/<new>.idx (header+index section) + cache/<new>.{body,present}
+    //   3. Deletes index/<old>.idx  ← THE FIX (before S3 deletion)
+    //   4. Deletes cache/<old>.{body,present}
+    //   5. Deletes gc/<new> (body now in cache)
     //   6. Renames .applied → .done
-    let gc_dir = fork_dir.join("gc");
     let new_ulid_str = produced_ulid.to_string();
     let gc_seg_path = gc_dir.join(&new_ulid_str);
-    let new_seg_path = segments_dir.join(&new_ulid_str);
 
     // Step 1+2: upload gc/<new> to S3 (simulated), write index/<new>.idx.
     let new_idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
     extract_idx(&gc_seg_path, &new_idx_path).unwrap();
 
-    // Step 3: move gc/<new> → segments/<new>.
-    fs::rename(&gc_seg_path, &new_seg_path).unwrap();
+    // Write cache/<new>.body (body section of gc/<new>) + cache/<new>.present.
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = fs::File::open(&gc_seg_path).unwrap();
+        let mut header = [0u8; 96];
+        f.read_exact(&mut header).unwrap();
+        let index_length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let inline_length = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        let entry_count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let bss = 96 + index_length as u64 + inline_length as u64;
+        f.seek(SeekFrom::Start(bss)).unwrap();
+        let mut body = Vec::new();
+        f.read_to_end(&mut body).unwrap();
+        fs::write(cache_dir.join(format!("{new_ulid_str}.body")), &body).unwrap();
+        let bitset_len = (entry_count as usize).div_ceil(8);
+        fs::write(
+            cache_dir.join(format!("{new_ulid_str}.present")),
+            vec![0xFFu8; bitset_len],
+        )
+        .unwrap();
+    }
 
-    // Step 4: delete index/<old>.idx for every consumed segment — THE FIX.
+    // Step 3: delete index/<old>.idx for every consumed segment — THE FIX.
     for old_ulid in &consumed_ulids {
         let old_ulid_str = old_ulid.to_string();
         let _ = fs::remove_file(index_dir.join(format!("{old_ulid_str}.idx")));
     }
 
-    // Step 5: delete old local bodies (simulates S3 object deletion).
+    // Step 4: delete old cache files (simulates S3 object deletion).
     for path in &paths_to_delete {
         let _ = fs::remove_file(path);
     }
+    for old_ulid in &consumed_ulids {
+        let s = old_ulid.to_string();
+        let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+        let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+    }
+
+    // Step 5: delete gc/<new> body (moved to cache).
+    fs::remove_file(&gc_seg_path).unwrap();
 
     // Step 6: rename gc/<new>.applied → gc/<new>.done.
     let applied_path = gc_dir.join(format!("{new_ulid_str}.applied"));
@@ -121,19 +147,19 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
         fs::rename(&applied_path, &done_path).unwrap();
     }
 
-    // Evict: delete segments/<new> body (simulates post-upload eviction).
-    fs::remove_file(&new_seg_path).unwrap();
+    // Evict: delete cache/<new>.body (simulates post-upload eviction).
+    fs::remove_file(cache_dir.join(format!("{new_ulid_str}.body"))).unwrap();
 
     // Assert: no dangling old idx files remain in index/.
-    for old_ulid_str in &old_seg_names {
-        let dangling = index_dir.join(format!("{old_ulid_str}.idx"));
+    for old_stem in &old_idx_stems {
+        let dangling = index_dir.join(format!("{old_stem}.idx"));
         assert!(
             !dangling.exists(),
-            "dangling index/{old_ulid_str}.idx must not exist after correct GC cleanup"
+            "dangling index/{old_stem}.idx must not exist after correct GC cleanup"
         );
     }
 
-    // Step 7: crash + reopen.
+    // Step 9: crash + reopen.
     drop(vol);
     let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
@@ -159,7 +185,7 @@ fn gc_cleanup_without_idx_deletion_leaves_dangling_idx() {
     common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
-    // Two separate flush cycles to produce two segments in segments/.
+    // Two separate flush cycles to produce two committed segments in index/.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
@@ -168,20 +194,9 @@ fn gc_cleanup_without_idx_deletion_leaves_dangling_idx() {
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    // Simulate coordinator: write index/<old>.idx for each original segment.
-    let segments_dir = fork_dir.join("segments");
     let index_dir = fork_dir.join("index");
-    fs::create_dir_all(&index_dir).unwrap();
-    let old_seg_names: Vec<String> = fs::read_dir(&segments_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    for name in &old_seg_names {
-        let seg_path = segments_dir.join(name);
-        let idx_path = index_dir.join(format!("{name}.idx"));
-        extract_idx(&seg_path, &idx_path).unwrap();
-    }
+    let cache_dir = fork_dir.join("cache");
+    let gc_dir = fork_dir.join("gc");
 
     let (new_ulid, _) = vol.gc_checkpoint().unwrap();
     let (consumed_ulids, produced_ulid, paths_to_delete) =
@@ -195,29 +210,54 @@ fn gc_cleanup_without_idx_deletion_leaves_dangling_idx() {
     //
     // After apply_gc_handoffs, the re-signed segment is in gc/<new>.
     // The buggy cleanup:
-    //   1. Uploads gc/<new> to S3, writes index/<new>.idx
-    //   2. Moves gc/<new> → segments/<new>
+    //   1. Uploads gc/<new> to S3, writes index/<new>.idx + cache/<new>.{body,present}
+    //   2. Deletes gc/<new>
     //   BUG: skips deleting index/<old>.idx        ← missing step
-    //   3. Deletes old local bodies (old S3 objects deleted)
+    //   3. Deletes old cache files (old S3 objects deleted)
     //   4. Renames .applied → .done
-    let gc_dir = fork_dir.join("gc");
     let new_ulid_str = produced_ulid.to_string();
     let gc_seg_path = gc_dir.join(&new_ulid_str);
-    let new_seg_path = segments_dir.join(&new_ulid_str);
 
-    // Step 1+2: upload gc/<new> to S3 (simulated), write index/<new>.idx.
+    // Step 1: write index/<new>.idx (header+index section).
     let new_idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
     extract_idx(&gc_seg_path, &new_idx_path).unwrap();
 
-    // Step 3: move gc/<new> → segments/<new>.
-    fs::rename(&gc_seg_path, &new_seg_path).unwrap();
+    // Write cache/<new>.body + cache/<new>.present.
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = fs::File::open(&gc_seg_path).unwrap();
+        let mut header = [0u8; 96];
+        f.read_exact(&mut header).unwrap();
+        let index_length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let inline_length = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        let entry_count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let bss = 96 + index_length as u64 + inline_length as u64;
+        f.seek(SeekFrom::Start(bss)).unwrap();
+        let mut body = Vec::new();
+        f.read_to_end(&mut body).unwrap();
+        fs::write(cache_dir.join(format!("{new_ulid_str}.body")), &body).unwrap();
+        let bitset_len = (entry_count as usize).div_ceil(8);
+        fs::write(
+            cache_dir.join(format!("{new_ulid_str}.present")),
+            vec![0xFFu8; bitset_len],
+        )
+        .unwrap();
+    }
+
+    // Step 2: delete gc/<new>.
+    fs::remove_file(&gc_seg_path).unwrap();
 
     // BUG: skip deleting index/<old>.idx files.
     // (The real fix does `fs::remove_file(index_dir.join(old_idx))` here.)
+    // paths_to_delete = the consumed index/*.idx paths — we intentionally do NOT
+    // delete them here to simulate the pre-fix coordinator that left them behind.
+    let _ = &paths_to_delete; // acknowledge but don't use
 
-    // Step 4: delete old local bodies (simulating S3 object deletion).
-    for path in &paths_to_delete {
-        let _ = fs::remove_file(path);
+    // Step 3: delete old cache files (simulating S3 object deletion).
+    for old_ulid in &consumed_ulids {
+        let s = old_ulid.to_string();
+        let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+        let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
     }
 
     let applied_path = gc_dir.join(format!("{new_ulid_str}.applied"));
@@ -225,9 +265,6 @@ fn gc_cleanup_without_idx_deletion_leaves_dangling_idx() {
     if applied_path.exists() {
         fs::rename(&applied_path, &done_path).unwrap();
     }
-
-    // Evict the new segment body.
-    fs::remove_file(&new_seg_path).unwrap();
 
     // Assert the bug: dangling idx files are still present for old (gone) segments.
     let dangling_count = consumed_ulids

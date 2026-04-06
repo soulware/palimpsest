@@ -1,15 +1,14 @@
 // Regression tests for eviction correctness.
 //
-// `evict` (the `elide volume evict` command) deletes segment files from
-// `segments/` to reclaim local disk space.  The coordinator writes
+// `evict` (the `elide volume evict` command) deletes segment body files from
+// `cache/` to reclaim local disk space.  The coordinator writes
 // `index/<ulid>.idx` after confirmed S3 upload, so evict can safely delete the
 // body without any additional work.  After a crash+reopen, `Volume::open`
-// rebuilds the LBA map from `pending/`, `segments/`, and `index/*.idx`.
+// rebuilds the LBA map from `pending/` and `index/*.idx`.
 
 use std::fs;
 use std::path::PathBuf;
 
-use elide_core::segment::extract_idx;
 use elide_core::volume::Volume;
 
 mod common;
@@ -17,10 +16,10 @@ mod common;
 /// After correctly evicting local segment bodies (with coordinator-written
 /// `index/*.idx` already present), the LBA map survives a crash+reopen.
 ///
-/// The coordinator writes `index/<ulid>.idx` after S3 upload.  Evict then
-/// simply deletes `segments/<ulid>`.  After a restart, `Volume::open` rebuilds
-/// the LBA map from `index/*.idx` and subsequent reads fall through to the
-/// `SegmentFetcher` for body bytes.
+/// `drain_local` simulates the coordinator writing `index/<ulid>.idx` +
+/// `cache/<ulid>.body` after S3 upload.  Evict then deletes the body.
+/// After a restart, `Volume::open` rebuilds the LBA map from `index/*.idx`
+/// and subsequent reads fall through to the `SegmentFetcher` for body bytes.
 #[test]
 fn evict_then_crash_data_survives() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -31,20 +30,16 @@ fn evict_then_crash_data_survives() {
     vol.write(0, &[0xAB; 4096]).unwrap();
     vol.write(1, &[0xCD; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir); // pending/ → segments/
+    // drain_local: pending/ → index/<ulid>.idx + cache/<ulid>.body + cache/<ulid>.present
+    common::drain_local(&fork_dir);
 
-    // Simulate coordinator: write index/<ulid>.idx for each segment, then
-    // evict deletes the body.  In production the coordinator does step 1;
-    // evict does step 2.
-    let segments_dir = fork_dir.join("segments");
-    let index_dir = fork_dir.join("index");
-    fs::create_dir_all(&index_dir).unwrap();
-    for entry in fs::read_dir(&segments_dir).unwrap() {
+    // Simulate evict: delete cache/ body files (index/.idx already present from drain_local).
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
         let entry = entry.unwrap();
-        let name = entry.file_name();
-        let idx_path = index_dir.join(format!("{}.idx", name.to_string_lossy()));
-        extract_idx(&entry.path(), &idx_path).unwrap();
-        fs::remove_file(entry.path()).unwrap();
+        if entry.path().extension().is_some_and(|e| e == "body") {
+            fs::remove_file(entry.path()).unwrap();
+        }
     }
 
     // Crash + reopen (triggers full LBA map rebuild from disk).
@@ -75,10 +70,18 @@ fn evict_without_idx_loses_lba_map() {
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    // Broken evict: delete without index/*.idx (coordinator never ran).
-    let segments_dir = fork_dir.join("segments");
-    for entry in fs::read_dir(&segments_dir).unwrap() {
+    // Broken evict: delete index/*.idx (coordinator never committed to S3),
+    // then delete the body — no trace remains.
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&index_dir).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|e| e == "body") {
+            fs::remove_file(entry.path()).unwrap();
+        }
     }
 
     drop(vol);

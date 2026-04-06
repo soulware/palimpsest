@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use elide_coordinator::config::GcConfig;
@@ -25,6 +26,52 @@ use elide_core::volume::Volume;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
+
+/// Simulate coordinator drain: for each file in pending/, write index/<ulid>.idx,
+/// cache/<ulid>.body, and cache/<ulid>.present, then remove the pending file.
+fn simulate_upload(dir: &Path) {
+    const HEADER_LEN: usize = 96;
+    let pending_dir = dir.join("pending");
+    let index_dir = dir.join("index");
+    let cache_dir = dir.join("cache");
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let Ok(entries) = fs::read_dir(&pending_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(ulid_str) = name.to_str() else {
+            continue;
+        };
+        if ulid_str.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        if data.len() < HEADER_LEN {
+            continue;
+        }
+        let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let bss = HEADER_LEN + index_length as usize + inline_length as usize;
+        if data.len() < bss {
+            continue;
+        }
+        let _ = fs::write(index_dir.join(format!("{ulid_str}.idx")), &data[..bss]);
+        let _ = fs::write(cache_dir.join(format!("{ulid_str}.body")), &data[bss..]);
+        let bitset_len = (entry_count as usize).div_ceil(8);
+        let _ = fs::write(
+            cache_dir.join(format!("{ulid_str}.present")),
+            vec![0xFFu8; bitset_len],
+        );
+        let _ = fs::remove_file(&path);
+    }
+}
 
 #[derive(Debug, Clone)]
 enum SimOp {
@@ -103,8 +150,6 @@ proptest! {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
 
-        fs::create_dir_all(fork_dir.join("segments")).unwrap();
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -116,9 +161,8 @@ proptest! {
             interval_secs: 0,
         };
 
-        let segments_dir = fork_dir.join("segments");
+        let cache_dir = fork_dir.join("cache");
         let index_dir = fork_dir.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
 
         for op in &ops {
             match op {
@@ -134,25 +178,13 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::GcSweep => {
-                    // Drain pending/ → segments/ before gc_checkpoint, mirroring
-                    // the coordinator upload tick. Write .idx before rename to
-                    // keep the simulation faithful to the production invariant:
-                    // segments/<ulid> exists → index/<ulid>.idx exists.
-                    let pending_dir = fork_dir.join("pending");
-                    if let Ok(entries) = fs::read_dir(&pending_dir) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name();
-                            let src = entry.path();
-                            let idx_path =
-                                index_dir.join(format!("{}.idx", name.to_string_lossy()));
-                            let _ = elide_core::segment::extract_idx(&src, &idx_path);
-                            let _ = fs::rename(src, segments_dir.join(name));
-                        }
-                    }
+                    // Simulate drain: pending/ → index/ + cache/, mirroring what
+                    // drain_pending does in production after a successful S3 upload.
+                    simulate_upload(fork_dir);
 
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
-                    let segs_before: usize = fs::read_dir(&segments_dir)
+                    let idx_before: usize = fs::read_dir(&index_dir)
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
 
@@ -169,14 +201,32 @@ proptest! {
 
                     if let Ok(stats) = gc_stats {
                         if stats.strategy != GcStrategy::None {
-                            let segs_after: usize = fs::read_dir(&segments_dir)
+                            // After GC, index/ should have ≤1 .idx file (old ones deleted).
+                            let idx_after: usize = fs::read_dir(&index_dir)
                                 .map(|d| d.flatten().count())
                                 .unwrap_or(0);
                             prop_assert!(
-                                segs_after <= 1,
-                                "after GcSweep on {} segments, {} remain in segments/ (expected ≤1)",
-                                segs_before,
-                                segs_after
+                                idx_after <= 1,
+                                "after GcSweep on {} segments, {} .idx files remain (expected ≤1)",
+                                idx_before,
+                                idx_after
+                            );
+                            // cache/ .body files: same count as .idx files.
+                            let bodies_after: usize = fs::read_dir(&cache_dir)
+                                .map(|d| {
+                                    d.flatten()
+                                        .filter(|e| {
+                                            e.path()
+                                                .extension()
+                                                .is_some_and(|x| x == "body")
+                                        })
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            prop_assert!(
+                                bodies_after <= 1,
+                                "after GcSweep, {} .body files remain in cache/ (expected ≤1)",
+                                bodies_after
                             );
                         }
                     }
@@ -213,11 +263,6 @@ proptest! {
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
-        // segments/ must exist before gc_fork tries to read it.
-        fs::create_dir_all(fork_dir.join("segments")).unwrap();
-        let index_dir = fork_dir.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
         // Single runtime reused across all GcSweep ops in this sequence.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -248,22 +293,9 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::GcSweep => {
-                    // Drain pending/ → segments/ before gc_checkpoint, mirroring
-                    // the coordinator upload tick. Write .idx before rename to
-                    // keep the simulation faithful to the production invariant:
-                    // segments/<ulid> exists → index/<ulid>.idx exists.
-                    let pending_dir = fork_dir.join("pending");
-                    let segments_dir = fork_dir.join("segments");
-                    if let Ok(entries) = fs::read_dir(&pending_dir) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name();
-                            let src = entry.path();
-                            let idx_path =
-                                index_dir.join(format!("{}.idx", name.to_string_lossy()));
-                            let _ = elide_core::segment::extract_idx(&src, &idx_path);
-                            let _ = fs::rename(src, segments_dir.join(name));
-                        }
-                    }
+                    // Simulate drain: pending/ → index/ + cache/, mirroring what
+                    // drain_pending does in production after a successful S3 upload.
+                    simulate_upload(fork_dir);
 
                     // gc_checkpoint flushes the WAL under a pre-minted ULID
                     // (u_wal > u_sweep) and returns (u_repack, u_sweep) from

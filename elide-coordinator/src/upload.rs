@@ -11,20 +11,21 @@
 // Upload commit sequence per segment:
 //   1. Read pending/<ulid> into memory
 //   2. PUT to object store at the derived key
-//   3. Write index/<ulid>.idx (header+index section) while file is still in pending/
-//   4. On success: rename pending/<ulid> → segments/<ulid>
-//   5. On failure: leave in pending/, record error, continue
+//   3. Write index/<ulid>.idx (header+index section)
+//   4. Promote body to cache/<ulid>.body + cache/<ulid>.present (all bits set)
+//   5. Delete pending/<ulid>
+//   6. On failure at any step: leave pending/<ulid> in place, record error, continue
 //
 // Crash safety:
-//   - Crash before step 3: file stays in pending/ with no .idx; drain retries from step 2.
-//   - Crash between steps 3 and 4: file in pending/ with .idx written; drain retries rename
-//     (idempotent) and skips .idx (already exists).
-//   - Crash after step 4: file in segments/ with .idx; segment is fully committed.
+//   - Crash before step 3: pending/<ulid> exists with no .idx; drain retries from step 2.
+//   - Crash after step 3, before step 5: pending/<ulid> exists with .idx; drain retries
+//     upload (idempotent S3 PUT), skips .idx (already exists), promotes to cache/ (idempotent
+//     via tmp+rename), deletes pending/.
+//   - Crash after step 5: pending/<ulid> is gone; .idx and cache/ files confirm commitment.
 //
-// Ordering invariant: .idx is written before rename. This means any segment body
-// that appears in segments/ is guaranteed to have a corresponding index/<ulid>.idx,
-// which in turn guarantees S3 availability. evict_segments relies on this invariant
-// to safely skip any body without an .idx.
+// Ordering invariant: .idx written before cache promotion, cache promotion before pending/
+// deletion. Any segment absent from pending/ is guaranteed to be in S3 (its .idx exists)
+// and available locally in cache/ for immediate reads without a demand-fetch round-trip.
 
 use std::path::Path;
 
@@ -112,8 +113,8 @@ struct ManifestSource<'a> {
     arch: &'a str,
 }
 
-/// Upload all committed segments from `pending/` to the object store, moving
-/// each successfully uploaded segment to `segments/`. Also uploads the volume's
+/// Upload all committed segments from `pending/` to the object store, promoting
+/// each successfully uploaded segment to `cache/`. Also uploads the volume's
 /// public key and manifest so that new hosts can bootstrap the volume.
 ///
 /// `drain_pending` is a one-shot batch command. Metadata (pub key, manifest,
@@ -124,13 +125,8 @@ pub async fn drain_pending(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
-    let segments_dir = vol_dir.join("segments");
+    let cache_dir = vol_dir.join("cache");
     let index_dir = vol_dir.join("index");
-
-    // Ensure segments/ exists — import_image only creates pending/.
-    tokio::fs::create_dir_all(&segments_dir)
-        .await
-        .with_context(|| format!("creating segments dir: {}", segments_dir.display()))?;
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
@@ -157,7 +153,7 @@ pub async fn drain_pending(
         match upload_segment(
             &segment_path,
             &name,
-            &segments_dir,
+            &cache_dir,
             &index_dir,
             volume_id,
             store,
@@ -295,36 +291,92 @@ pub async fn upload_snapshot(
 async fn upload_segment(
     path: &Path,
     ulid_str: &str,
-    segments_dir: &Path,
+    cache_dir: &Path,
     index_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let key = segment_key(volume_id, ulid_str)?;
 
-    let data = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("reading segment {ulid_str}"))?;
+    // Read the full segment into memory once; reuse bytes for both S3 upload
+    // and local cache promotion without a second read.
+    let data = Bytes::from(
+        tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading segment {ulid_str}"))?,
+    );
 
     store
-        .put(&key, Bytes::from(data).into())
+        .put(&key, data.clone().into())
         .await
         .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
 
-    // Write .idx before rename. Reading from path (still in pending/) so that
-    // a crash between .idx write and rename leaves the file in pending/ with
-    // its .idx — drain will retry the rename on the next tick. If the .idx
-    // already exists (crash-recovery retry), extract_idx is idempotent.
+    // Write .idx first (path still in pending/). A crash between .idx write
+    // and cache promotion leaves pending/ with its .idx — drain retries on the
+    // next tick. extract_idx is idempotent if .idx already exists.
     std::fs::create_dir_all(index_dir)
         .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
     let idx_path = index_dir.join(format!("{ulid_str}.idx"));
     elide_core::segment::extract_idx(path, &idx_path)
         .with_context(|| format!("writing index/{ulid_str}.idx"))?;
 
-    let dest = segments_dir.join(ulid_str);
-    tokio::fs::rename(path, &dest)
+    // Promote body to cache/ so subsequent reads are served locally without
+    // a demand-fetch round-trip.
+    promote_to_cache(&data, ulid_str, cache_dir)
+        .with_context(|| format!("promoting {ulid_str} to cache/"))?;
+
+    // Remove pending file last — its absence is the commit marker.
+    tokio::fs::remove_file(path)
         .await
-        .with_context(|| format!("committing segment {ulid_str} to segments/"))?;
+        .with_context(|| format!("removing pending/{ulid_str}"))?;
+
+    Ok(())
+}
+
+/// Write `<ulid>.body` and `<ulid>.present` (all bits set) to `cache_dir`.
+///
+/// Used by both `upload_segment` (drain path) and `apply_done_handoffs` (GC path).
+///
+/// Parses `body_section_start` and `entry_count` directly from the in-memory
+/// segment bytes. Both files are written via tmp + rename for crash safety.
+pub(crate) fn promote_to_cache(data: &[u8], ulid_str: &str, cache_dir: &Path) -> Result<()> {
+    const HEADER_LEN: usize = 96;
+
+    if data.len() < HEADER_LEN {
+        anyhow::bail!(
+            "segment {ulid_str}: too short to parse header ({} bytes)",
+            data.len()
+        );
+    }
+
+    let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    let body_section_start = HEADER_LEN + index_length as usize + inline_length as usize;
+
+    if data.len() < body_section_start {
+        anyhow::bail!("segment {ulid_str}: truncated before body section");
+    }
+
+    let body_bytes = &data[body_section_start..];
+    let bitset_len = (entry_count as usize).div_ceil(8);
+    let present_bytes = vec![0xFFu8; bitset_len];
+
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("creating cache dir: {}", cache_dir.display()))?;
+
+    let body_tmp = cache_dir.join(format!("{ulid_str}.body.tmp"));
+    let present_tmp = cache_dir.join(format!("{ulid_str}.present.tmp"));
+
+    std::fs::write(&body_tmp, body_bytes)
+        .with_context(|| format!("writing {ulid_str}.body.tmp"))?;
+    std::fs::write(&present_tmp, &present_bytes)
+        .with_context(|| format!("writing {ulid_str}.present.tmp"))?;
+
+    std::fs::rename(&body_tmp, cache_dir.join(format!("{ulid_str}.body")))
+        .with_context(|| format!("renaming {ulid_str}.body.tmp → .body"))?;
+    std::fs::rename(&present_tmp, cache_dir.join(format!("{ulid_str}.present")))
+        .with_context(|| format!("renaming {ulid_str}.present.tmp → .present"))?;
 
     Ok(())
 }
@@ -390,10 +442,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
-        let segments_dir = vol_dir.join("segments");
+        let cache_dir = vol_dir.join("cache");
         let index_dir = vol_dir.join("index");
         std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
             size: Some(4096),
@@ -442,15 +493,20 @@ mod tests {
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.failed, 0);
 
+        // pending/ entries are removed after commit.
         assert!(!pending_dir.join(&ulid1).exists());
         assert!(!pending_dir.join(&ulid2).exists());
-        assert!(segments_dir.join(&ulid1).exists());
-        assert!(segments_dir.join(&ulid2).exists());
         assert!(pending_dir.join(format!("{ulid1}.tmp")).exists());
 
         // index/*.idx must be written after confirmed upload.
         assert!(index_dir.join(format!("{ulid1}.idx")).exists());
         assert!(index_dir.join(format!("{ulid2}.idx")).exists());
+
+        // cache/ body + present files must be promoted.
+        assert!(cache_dir.join(format!("{ulid1}.body")).exists());
+        assert!(cache_dir.join(format!("{ulid1}.present")).exists());
+        assert!(cache_dir.join(format!("{ulid2}.body")).exists());
+        assert!(cache_dir.join(format!("{ulid2}.present")).exists());
 
         let key1 = segment_key(VOL_ULID, &ulid1).unwrap();
         let key2 = segment_key(VOL_ULID, &ulid2).unwrap();
@@ -469,9 +525,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
-        let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
             size: Some(4096),
@@ -502,9 +556,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
-        let segments_dir = vol_dir.join("segments");
         std::fs::create_dir_all(&pending_dir).unwrap();
-        std::fs::create_dir_all(&segments_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("my-vol".into()),
             size: Some(8192),
