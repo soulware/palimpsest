@@ -51,8 +51,35 @@ The volume process is a pure data servant: it accepts NBD reads and writes, flus
 
 **Directory ownership split.** Two directories under each fork have explicit ownership:
 
-- **`index/`**: the volume writes `index/<ulid>.idx` at WAL flush time and at GC handoff apply. The presence of `index/<ulid>.idx` is the S3-confirmation marker — it is written before the segment body is removed from `pending/`, and it survives body eviction so `Volume::open` can rebuild the full LBA map without local bodies. The coordinator reads `index/` when collecting GC candidates. On cold-start, the coordinator's prefetch downloads `.idx` files from S3 and writes them here.
+- **`index/`**: the volume writes `index/<ulid>.idx` at promote time — after the coordinator confirms S3 upload via IPC. The presence of `index/<ulid>.idx` is the S3-confirmation marker; it is never written before S3 upload, so its presence guarantees the segment is retrievable from S3. `index/<ulid>.idx` survives body eviction so `Volume::open` can rebuild the full LBA map without local bodies. The coordinator reads `index/` when collecting GC candidates. On cold-start, the coordinator's prefetch downloads `.idx` files from S3 and writes them here.
 - **`cache/`**: the volume writes `<ulid>.body` and `<ulid>.present` here at promote time (after the coordinator confirms S3 upload via IPC) and on demand-fetch. Body files are evictable — once `index/<ulid>.idx` exists, the body can be deleted locally and re-fetched from S3 on demand. The coordinator does not write to `cache/`.
+
+## CLI Operations and the IPC Boundary
+
+The coordinator and volume process maintain consistent in-memory state (LBA map, extent index, GC tick sequencing) that must not be violated by concurrent direct filesystem mutations from the CLI. The rule is: **any CLI operation that mutates a live volume's directory must go through coordinator or volume IPC, never direct filesystem access.**
+
+The table below records where each CLI operation currently stands and any known gaps.
+
+| Operation | Route | Directories mutated | Status |
+|---|---|---|---|
+| `volume create` | Direct fs | `by_id/<ulid>/`, `by_name/` | Safe — volume does not exist yet; coordinator discovers on next scan |
+| `volume fork` | Direct fs + optional IPC snapshot | `by_id/<new_ulid>/`, `by_name/` | Safe for directory creation; snapshot step uses IPC if volume is running |
+| `volume remote pull` | Direct fs + rescan IPC | `by_id/<ulid>/`, `by_name/` | Safe — readonly skeleton only; rescan IPC follows |
+| `volume update` | Direct fs + IPC restart | `volume.config` | Minor TOCTOU: config written before IPC restart; config is only read at `Volume::open` so this is safe in practice |
+| `volume snapshot` | IPC (primary) / direct `Volume::open` (offline fallback) | `snapshots/`, `wal/` | Safe if volume is running (uses control socket); **offline fallback races with coordinator drain** — coordinator may be uploading `pending/` segments for that volume concurrently |
+| `volume evict` | Direct fs (current) | `cache/` | **Unsafe — see below** |
+| `volume import` | Coordinator IPC | — | Safe |
+| `volume delete` | Coordinator IPC | — | Safe |
+| `volume up/down` | Coordinator IPC | — | Safe |
+| `volume status` | Coordinator IPC | — | Safe |
+| `volume info` | Direct fs (read-only) | `index/`, `cache/`, `pending/`, `wal/` | Read-only; may see in-flight state but does not corrupt it |
+| `volume ls` | Direct fs (read-only) | `index/`, `cache/` | Read-only; same caveat as `info` |
+
+**`volume evict` (unsafe — Proposed: route through coordinator IPC).** See the Manual Eviction section below for detail. The coordinator's GC reads segment bodies in `collect_stats` → `compact_segments`; a concurrent eviction that deletes a body between those two steps causes a GC error. Fix: `elide volume evict` sends an evict IPC to the coordinator, which sequences deletion between drain/GC ticks.
+
+**`volume snapshot` offline fallback (minor gap).** When the volume is not running, `volume snapshot` opens the volume directly and writes to `snapshots/`. The coordinator may be concurrently uploading `pending/` segments for that fork. Proposed: if the coordinator is running, route all snapshot requests through it regardless of whether the individual volume process is up.
+
+**`volume create`/`fork`/`remote pull` (acceptable partial-state window).** These operations create volume directories through raw filesystem calls. The coordinator could scan `by_id/` mid-creation and discover an incomplete directory. The coordinator handles this gracefully today (incomplete volumes fail to open and are retried on the next scan). For `remote pull`, a `rescan` IPC call at the end signals the coordinator to pick up the new volume immediately. No change proposed.
 
 ### S3 Upload
 
@@ -114,7 +141,7 @@ If none of these are present, demand-fetch is disabled and reads of missing segm
 **Fetch granularity:** demand-fetch issues a range-GET for only the extents needed, not the full segment body. When a specific extent is required, the fetcher scans forward from that entry collecting contiguous, not-yet-present adjacent entries into a batch (up to 256 KiB by default, configurable via `fetch_batch_bytes` in `fetch.toml`). A single range-GET covers the batch; bytes are written into `.body` at the correct offset and the `.present` bitset is updated for all fetched entries. The `.body` file may appear as large as the full segment because it is written as a sparse file at the extent's body offset — only the fetched regions contain actual data.
 
 
-**Next step: automatic eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used `cache/<ulid>.body` files (never `pending/`). Eviction + demand-fetch together make `cache/` a transparent, bounded local cache of S3 segment bodies.
+**Next step: automatic eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used `cache/<ulid>.body` files (never `pending/`). Eviction + demand-fetch together make `cache/` a transparent, bounded local cache of S3 segment bodies. Automatic eviction must also run inside the coordinator (between ticks) for the same sequencing reason as manual eviction.
 
 ## Manual Eviction
 
@@ -122,13 +149,15 @@ If none of these are present, demand-fetch is disabled and reads of missing segm
 elide volume evict <vol>
 ```
 
-Deletes `cache/<ulid>.body` and `cache/<ulid>.present` files to reclaim local disk space. Safe to run on any volume that has S3 backing — evicted bodies are demand-fetched from S3 on next access.
+Deletes `cache/<ulid>.body` and `cache/<ulid>.present` files to reclaim local disk space. Evicted bodies are demand-fetched from S3 on next access.
 
-**Eviction always succeeds.** Segments that cannot safely be evicted are skipped silently; the command reports only the count of bodies actually deleted. `pending/` files are never touched — they have not yet been confirmed in S3.
+**Eviction always succeeds.** Segments that cannot safely be evicted are skipped silently; the command reports only the count of segments actually evicted. `pending/` files are never touched — they have not yet been confirmed in S3.
 
 **Safety predicate.** A body is evictable only if `index/<ulid>.idx` exists — that file is written by the volume's promote handler only after the coordinator has confirmed S3 upload. Bodies in `cache/` without a corresponding `index/<ulid>.idx` (e.g. partially-written promote after a crash) are skipped. `gc/` is never touched — in-flight GC handoff bodies live there until the coordinator completes upload and sends promote IPC.
 
 **S3 dependency after eviction.** Before eviction, `cache/<ulid>.body` is redundant with S3. After eviction, `index/<ulid>.idx` is the sole local record that those LBAs exist. Eviction is therefore only safe on volumes with S3 backing; running it on a volume without a reachable store risks losing access to body data. If `index/` is also empty, the coordinator's prefetch will regenerate it from S3 on startup.
+
+**Proposed: eviction must be routed through the coordinator.** The current implementation deletes `cache/` files directly from the CLI process. This is unsafe: the coordinator's GC reads segment bodies in `collect_stats` → `compact_segments` and a concurrent eviction can delete a body between those two steps, causing a GC error. Additionally, any other direct cache deletion races with the volume process's open file handles and in-flight reads. The fix is for `elide volume evict` to send an evict IPC to the coordinator, which sequences the deletion between drain/GC ticks and confirms completion before returning to the caller. The volume's read path already handles absent bodies transparently via demand-fetch, so no volume-process notification is required — only coordinator-side sequencing.
 
 ## Bootstrap from the Store
 

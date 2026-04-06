@@ -542,9 +542,9 @@ fn main() {
             VolumeCommand::Evict { segment, name } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
                 let result = if let Some(ulid_str) = segment {
-                    evict_one_body(&vol_dir, &ulid_str).map(|n| (n, "body", "bodies"))
+                    evict_one_body(&vol_dir, &ulid_str).map(|n| (n, "segment", "segments"))
                 } else {
-                    evict_bodies(&vol_dir).map(|n| (n, "body", "bodies"))
+                    evict_bodies(&vol_dir).map(|n| (n, "segment", "segments"))
                 };
                 match result {
                     Ok((n, singular, plural)) => {
