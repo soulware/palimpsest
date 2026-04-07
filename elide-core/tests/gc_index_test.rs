@@ -37,15 +37,13 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
     // Write two blocks across two separate flush cycles to produce two segments.
-    // drain_local simulates coordinator drain: upload + promote_segment IPC, which
-    // writes index/<ulid>.idx, copies body to cache/, and deletes pending/.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     vol.write(1, &[0xBB; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let cache_dir = fork_dir.join("cache");
@@ -165,11 +163,11 @@ fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
 
     vol.write(0, &[0x11; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     vol.write(1, &[0x22; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");

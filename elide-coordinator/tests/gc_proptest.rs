@@ -32,7 +32,7 @@ use proptest::prelude::*;
 /// Simulate coordinator drain: for each file in pending/, promote the segment
 /// body to cache/ and remove the pending file.  The volume already wrote
 /// `index/<ulid>.idx` at WAL flush time, so drain does not write it again.
-fn simulate_upload(vol: &Volume, dir: &Path) {
+fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
@@ -51,7 +51,8 @@ fn simulate_upload(vol: &Volume, dir: &Path) {
         let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
             continue;
         };
-        // promote_segment copies pending → cache and deletes pending.
+        // Materialise thin DedupRef → MaterializedRef, then promote.
+        let _ = vol.materialise_segment(ulid);
         let _ = vol.promote_segment(ulid);
     }
 }
@@ -59,7 +60,7 @@ fn simulate_upload(vol: &Volume, dir: &Path) {
 /// Simulate the coordinator promote IPC for each pending gc output:
 /// copies gc/<new> → cache/<new>.{body,present}, then deletes gc/<new>.
 /// This mirrors what the volume process does when it receives "promote <ulid>".
-fn promote_gc_outputs(vol: &Volume, dir: &Path) {
+fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     let gc_dir = dir.join("gc");
     let Ok(entries) = fs::read_dir(&gc_dir) else {
         return;
@@ -198,7 +199,7 @@ proptest! {
                     // Drain: volume already wrote index/ at flush; simulate
                     // coordinator drain (upload + promote IPC) by calling
                     // promote_segment directly on the volume.
-                    simulate_upload(&vol, fork_dir);
+                    simulate_upload(&mut vol, fork_dir);
 
                     // Count idx files before gc_checkpoint so we can detect
                     // any new segments it writes (WAL flush).  Those segments
@@ -234,7 +235,7 @@ proptest! {
                     // Simulate coordinator promote IPC: copies gc/<new> → cache/<new>,
                     // deletes gc/<new>.  In production this is an IPC round-trip;
                     // here we call vol.promote_segment directly.
-                    promote_gc_outputs(&vol, fork_dir);
+                    promote_gc_outputs(&mut vol, fork_dir);
 
                     // Actor step: evict old cache files after publishing the new snapshot.
                     vol.evict_applied_gc_cache();
@@ -349,7 +350,7 @@ proptest! {
                     // Drain: volume already wrote index/ at flush; simulate
                     // coordinator drain (upload + promote IPC) by calling
                     // promote_segment directly on the volume.
-                    simulate_upload(&vol, fork_dir);
+                    simulate_upload(&mut vol, fork_dir);
 
                     // gc_checkpoint flushes the WAL under a pre-minted ULID
                     // (u_wal > u_sweep) and returns (u_repack, u_sweep) from
@@ -371,7 +372,7 @@ proptest! {
                     let _ = vol.apply_gc_handoffs();
 
                     // Step 3: simulate coordinator promote IPC + actor evict.
-                    promote_gc_outputs(&vol, fork_dir);
+                    promote_gc_outputs(&mut vol, fork_dir);
                     vol.evict_applied_gc_cache();
 
                     // Step 4: upload new segment to S3, delete old S3 objects.
@@ -430,4 +431,86 @@ proptest! {
             }
         }
     }
+}
+
+/// Bug H: promote_segment with .materialized sidecar did not evict the file
+/// handle cache.  After materialise + promote, the extent index has offsets
+/// from the .materialized segment (larger index section → different
+/// body_section_start), but the file cache may still hold an fd to the
+/// deleted pending/ file with is_body=false.  The next read computes
+/// bss_materialized + body_offset against the old file, seeking past the
+/// body section → "failed to fill whole buffer".
+///
+/// Nondeterministic in the proptest because HashMap iteration order
+/// determines whether the file cache happens to hold the affected segment.
+///
+/// Sequence: DedupWrite creates a segment with a thin DedupRef.  GcSweep
+/// materialises + promotes it (replacing pending/ with cache/).  A
+/// subsequent read of the dedup-ref LBA uses the stale cached fd.
+#[test]
+fn gc_oracle_repro_bug_h() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = GcConfig {
+        density_threshold: 0.0,
+        small_segment_bytes: u64::MAX,
+        interval_secs: 0,
+    };
+
+    // DedupWrite: lba 3 gets DATA, lba 6 gets thin DEDUP_REF (same hash).
+    let data_235 = [235u8; 4096];
+    vol.write(3, &data_235).unwrap();
+    vol.write(6, &data_235).unwrap();
+
+    // GcSweep drains pending (none), then gc_checkpoint flushes the WAL
+    // to pending/S1 (DATA + DEDUP_REF).  No index files yet → gc_fork is
+    // a no-op.  The oracle read here populates the file cache with
+    // (S1, is_body=false, fd→pending/S1).
+    simulate_upload(&mut vol, fork_dir);
+    let (r, s) = vol.gc_checkpoint().unwrap();
+    let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
+    let _ = vol.apply_gc_handoffs();
+    promote_gc_outputs(&mut vol, fork_dir);
+    vol.evict_applied_gc_cache();
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+    // Read both LBAs to populate file cache with the pending/ segment.
+    assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
+    assert_eq!(&vol.read(6, 1).unwrap(), &data_235);
+
+    // Write another LBA so gc_checkpoint has something to flush.
+    vol.write(1, &[195u8; 4096]).unwrap();
+
+    // Second GcSweep: simulate_upload materialises S1 (DedupRef → fat
+    // MaterializedRef) and promotes it — pending/S1 is deleted, replaced by
+    // cache/S1.body.  The extent index is updated with offsets from the
+    // .materialized segment.  Without the Bug H fix, the file cache still
+    // holds the stale fd to pending/S1.
+    simulate_upload(&mut vol, fork_dir);
+    let (r, s) = vol.gc_checkpoint().unwrap();
+    let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
+    let _ = vol.apply_gc_handoffs();
+    promote_gc_outputs(&mut vol, fork_dir);
+    vol.evict_applied_gc_cache();
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+
+    // These reads triggered "failed to fill whole buffer" before the fix.
+    assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
+    assert_eq!(&vol.read(6, 1).unwrap(), &data_235);
+    assert_eq!(&vol.read(1, 1).unwrap(), &[195u8; 4096]);
 }

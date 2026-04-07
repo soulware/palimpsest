@@ -4,3 +4,7 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc 4793286da5cd7022d52a6cb5a37d3900f06f0eb45ac23c8f71824bf2ff44f561 # shrinks to ops = [DedupWrite { lba_a: 0, lba_b: 4, seed: 1 }, PopulateFetched { lba: 0, seed: 0 }, DrainLocal, CoordGcLocal { n: 2 }, Crash]
+cc c87101c8d945439bf3a667f7b583876723cd8a1408fb7341ece99842e8b2de11 # shrinks to ops = [Write { lba: 2, seed: 17 }, Flush, DrainLocal, Write { lba: 3, seed: 34 }, Flush, DrainLocal, Snapshot, Write { lba: 0, seed: 0 }, Write { lba: 0, seed: 0 }, Write { lba: 4, seed: 17 }, Snapshot, DrainLocal, CoordGcLocal { n: 3 }, Crash]
+cc 31d3f1e82cc31792c84eca232f66e69569c2a4c9da9ac829fec8b05fd740f5d3 # shrinks to ops = [Write { lba: 2, seed: 17 }, Flush, DrainWithMaterialise, Write { lba: 3, seed: 34 }, Flush, DrainWithMaterialise, Snapshot, DedupWrite { lba_a: 0, lba_b: 6, seed: 0 }, Flush, DedupWrite { lba_a: 0, lba_b: 6, seed: 1 }, Repack, DrainWithMaterialise]
+cc 5807ea2f886437a0013025b6a85d1227df716c4d44d73a7851c6c6224533dcf8 # shrinks to ops = [Write { lba: 0, seed: 40 }, Flush, DrainWithMaterialise, Write { lba: 1, seed: 41 }, Flush, DrainWithMaterialise, CoordGcLocal { n: 2 }, Write { lba: 0, seed: 101 }, Flush, Write { lba: 1, seed: 101 }, CoordGcLocal { n: 2 }, DrainWithMaterialise, CoordGcLocal { n: 2 }, Crash]

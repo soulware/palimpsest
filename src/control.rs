@@ -32,6 +32,11 @@
 //     Apply any pending or applied GC handoffs (updates in-memory extent index).
 //     Returns "ok <n>" where n is the number of handoffs processed.
 //
+//   materialise <ulid>
+//     Rewrite pending/<ulid> so thin DedupRef entries become fat MaterializedRef
+//     with body bytes from the canonical segment. Idempotent. Called before S3 upload.
+//     Returns "ok".
+//
 //   shutdown
 //     Flush WAL and exit cleanly.  Returns "ok" then terminates the process.
 //     The supervisor restarts the volume, picking up any updated config files.
@@ -152,6 +157,20 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
             }
             Err(e) => {
                 let _ = writeln!(writer, "err {e}");
+            }
+        }
+    } else if let Some(ulid_str) = line.strip_prefix("materialise ") {
+        match ulid::Ulid::from_string(ulid_str.trim()) {
+            Ok(ulid) => match handle.materialise_segment(ulid) {
+                Ok(()) => {
+                    let _ = writeln!(writer, "ok");
+                }
+                Err(e) => {
+                    let _ = writeln!(writer, "err {e}");
+                }
+            },
+            Err(_) => {
+                let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
             }
         }
     } else if let Some(ulid_str) = line.strip_prefix("promote ") {

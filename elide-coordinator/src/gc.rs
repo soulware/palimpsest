@@ -205,9 +205,16 @@ pub async fn gc_fork(
             candidate.live_entries.len(),
             candidate.removed_hashes.len(),
         );
-        compact_segments(vec![candidate], &gc_dir, volume_id, store, repack_ulid)
-            .await
-            .context("density compaction")?;
+        compact_segments(
+            vec![candidate],
+            &gc_dir,
+            volume_id,
+            store,
+            repack_ulid,
+            &index,
+        )
+        .await
+        .context("density compaction")?;
         true
     } else {
         false
@@ -239,7 +246,7 @@ pub async fn gc_fork(
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
         let sweep_bytes: u64 = small.iter().map(|s| s.dead_lba_bytes()).sum();
-        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid)
+        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid, &index)
             .await
             .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
@@ -376,9 +383,22 @@ pub async fn apply_done_handoffs(
                 elide_core::signing::VOLUME_PUB_FILE,
             )
             .context("loading volume verifying key")?;
-            segment::read_and_verify_segment_index(&gc_body, &vk).with_context(|| {
-                format!("signature verification failed for compacted segment {new_ulid_str}")
-            })?;
+            let (_, gc_entries) = segment::read_and_verify_segment_index(&gc_body, &vk)
+                .with_context(|| {
+                    format!("signature verification failed for compacted segment {new_ulid_str}")
+                })?;
+
+            // Sanity check: GC output must not contain thin DedupRef.
+            let thin_count = gc_entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::DedupRef)
+                .count();
+            if thin_count > 0 {
+                return Err(anyhow::anyhow!(
+                    "compacted segment {new_ulid_str} has {thin_count} thin DedupRef entries; \
+                     refusing to upload — this would lose body data when old segments are deleted"
+                ));
+            }
 
             let key = segment_key(volume_id, &new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
@@ -621,6 +641,20 @@ fn collect_stats(
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
+        // Thin DedupRef should never appear in S3 segments (upload sanity
+        // check rejects them). If one slipped through (legacy data or bug),
+        // skip this segment entirely — compacting it would lose body bytes
+        // because the canonical segment referenced by the thin ref may be
+        // deleted by GC cleanup.
+        let has_thin_ref = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
+        if has_thin_ref {
+            warn!(
+                "[gc] skipping {ulid_str}: segment contains thin DedupRef entries \
+                 (should not appear in S3); re-upload with materialise_segment first"
+            );
+            continue;
+        }
+
         for entry in entries {
             if entry.kind == EntryKind::Inline {
                 continue;
@@ -644,10 +678,12 @@ fn collect_stats(
                 continue;
             }
             physical_body_bytes += entry.stored_length as u64;
-            // Dedup refs carry a materialised body (same as DATA) and an LBA
-            // mapping. A ref is live if the LBA still maps to its hash and the
-            // extent index still points to this segment for that hash.
-            if entry.kind == EntryKind::DedupRef {
+            // Materialised refs carry body bytes (same layout as DATA) and an
+            // LBA mapping. Liveness is LBA-based: the entry is live if the LBA
+            // still maps to its hash. Thin DedupRef should not appear in S3
+            // segments (upload sanity check), but is handled identically here
+            // (stored_length = 0, so no body-byte contribution).
+            if entry.kind == EntryKind::DedupRef || entry.kind == EntryKind::MaterializedRef {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 let extent_live = index
                     .lookup(&entry.hash)
@@ -660,10 +696,18 @@ fn collect_stats(
                 }
                 continue;
             }
+            // DATA entries are content-addressed: the extent_index tracks a
+            // single canonical location per hash.  When the same hash appears
+            // in multiple segments (e.g. a regular write and a later
+            // materialised dedup ref), only one segment is "canonical" in the
+            // extent_index — the other looks extent-dead even though its LBA
+            // mapping is still live.  Check lba_live first (same as
+            // MaterializedRef above) so we never drop a live LBA mapping.
+            let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_ulid);
-            if extent_live && live_hashes.contains(&entry.hash) {
+            if lba_live || (extent_live && live_hashes.contains(&entry.hash)) {
                 live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
             } else if extent_live {
@@ -725,6 +769,7 @@ async fn compact_segments(
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     new_ulid: Ulid,
+    extent_index: &ExtentIndex,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
@@ -740,7 +785,7 @@ async fn compact_segments(
         let has_body_entries = candidate
             .live_entries
             .iter()
-            .any(|e| e.kind != EntryKind::Zero);
+            .any(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef));
 
         if has_body_entries {
             let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
@@ -841,35 +886,49 @@ async fn compact_segments(
     // Write to a tmp file first; rename into gc/ for staging.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
 
-    let mut new_entries: Vec<SegmentEntry> = all_live
-        .iter_mut()
-        .map(|(_, e)| {
-            if e.kind == EntryKind::Zero {
-                // Zero extents have no body; preserve the LBA→ZERO_HASH mapping
-                // so the volume continues to mask ancestor data after compaction.
-                SegmentEntry::new_zero(e.start_lba, e.lba_length)
-            } else if e.kind == EntryKind::DedupRef {
-                // Dedup-ref entries have no body in the source segment; the
-                // actual extent data lives in an ancestor segment that is NOT
-                // being compacted.  Preserve as a dedup-ref in the output so
-                // the LBA→hash mapping is kept, without fabricating a DATA
-                // entry with stored_length=0 (which corrupts the extent index).
-                SegmentEntry::new_dedup_ref(e.hash, e.start_lba, e.lba_length)
-            } else {
-                SegmentEntry::new_data(
+    let mut new_entries: Vec<SegmentEntry> = Vec::with_capacity(all_live.len());
+    for (_, e) in &mut all_live {
+        match e.kind {
+            EntryKind::Zero => {
+                new_entries.push(SegmentEntry::new_zero(e.start_lba, e.lba_length));
+            }
+            EntryKind::DedupRef => {
+                // collect_stats skips segments with thin refs, so this
+                // should not happen. Drop the entry rather than emitting
+                // a bodyless ref that would cause data loss on old-segment
+                // deletion. The apply_done_handoffs sanity check catches
+                // this before upload.
+                warn!(
+                    "[gc] dropping thin DedupRef {} from compaction output \
+                     (should have been filtered by collect_stats)",
+                    e.hash.to_hex()
+                );
+            }
+            EntryKind::Data | EntryKind::MaterializedRef => {
+                let flags = if e.compressed {
+                    segment::SegmentFlags::COMPRESSED
+                } else {
+                    segment::SegmentFlags::empty()
+                };
+                new_entries.push(SegmentEntry::new_data(
                     e.hash,
                     e.start_lba,
                     e.lba_length,
-                    if e.compressed {
-                        segment::SegmentFlags::COMPRESSED
-                    } else {
-                        segment::SegmentFlags::empty()
-                    },
+                    flags,
                     std::mem::take(&mut e.data),
-                )
+                ));
             }
-        })
-        .collect();
+            EntryKind::Inline => {
+                new_entries.push(SegmentEntry::new_data(
+                    e.hash,
+                    e.start_lba,
+                    e.lba_length,
+                    segment::SegmentFlags::empty(),
+                    std::mem::take(&mut e.data),
+                ));
+            }
+        }
+    }
 
     // The coordinator does not hold the volume's private key, so it signs the
     // compacted segment with an ephemeral key.  The volume re-signs it with its
@@ -896,28 +955,63 @@ async fn compact_segments(
     );
 
     // Write the handoff file using the typed HandoffLine format.
+    //
+    // Deduplicate Repack lines by hash: with dedup, the same hash can appear
+    // in multiple input segments (DATA in one, MaterializedRef in another).
+    // The extent index tracks one canonical location per hash, and
+    // apply_gc_handoffs' still_at_old check compares against the single
+    // old_ulid in the handoff — so we emit one Repack per unique hash,
+    // preferring the entry whose source segment is extent-canonical.
+    // Non-canonical entries are still in the output segment (preserving
+    // their LBA mappings) but don't generate Repack lines.
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
     // Track which candidate ULIDs get at least one Repack or Remove line.
     // Any candidate not covered had only DEDUP_REF live entries; it needs a
     // Dead line so apply_done_handoffs deletes the old segment file.
     let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_repack_hashes: std::collections::HashSet<blake3::Hash> =
+        std::collections::HashSet::new();
+    // First pass: emit Repacks for extent-canonical entries.
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
-        if new_entry.kind == EntryKind::Zero || new_entry.kind == EntryKind::DedupRef {
-            // Zero extents and dedup-ref entries have no body in the new
-            // segment and no extent index entries to update.  No Repack line
-            // is needed — apply_gc_handoffs must not touch the extent index
-            // for these entries.
+        if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
             continue;
         }
-        covered_ulids.insert(old_ulid_str.as_str());
+        if seen_repack_hashes.contains(&old_entry.hash) {
+            continue;
+        }
         let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
-        let new_offset = new_body_section_start + new_entry.stored_offset;
-        handoff_lines.push(HandoffLine::Repack {
-            hash: old_entry.hash,
-            old_ulid,
-            new_ulid,
-            new_offset,
-        });
+        let is_canonical = extent_index
+            .lookup(&old_entry.hash)
+            .is_some_and(|loc| loc.segment_id == old_ulid);
+        if is_canonical {
+            seen_repack_hashes.insert(old_entry.hash);
+            covered_ulids.insert(old_ulid_str.as_str());
+            let new_offset = new_body_section_start + new_entry.stored_offset;
+            handoff_lines.push(HandoffLine::Repack {
+                hash: old_entry.hash,
+                old_ulid,
+                new_ulid,
+                new_offset,
+            });
+        }
+    }
+    // Second pass: emit Repacks for any remaining hashes (no canonical entry
+    // was in the candidate set — use whichever source we have).
+    for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
+        if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
+            continue;
+        }
+        if seen_repack_hashes.insert(old_entry.hash) {
+            covered_ulids.insert(old_ulid_str.as_str());
+            let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
+            let new_offset = new_body_section_start + new_entry.stored_offset;
+            handoff_lines.push(HandoffLine::Repack {
+                hash: old_entry.hash,
+                old_ulid,
+                new_ulid,
+                new_offset,
+            });
+        }
     }
     for (hash, old_ulid_str) in &all_removed {
         covered_ulids.insert(old_ulid_str.as_str());
@@ -1128,74 +1222,39 @@ mod tests {
         assert_eq!(find_least_dense(&stats, 0.7), None);
     }
 
-    /// Simulate coordinator drain: for each file in `pending/`, write
-    /// `index/<ulid>.idx`, `cache/<ulid>.body`, and `cache/<ulid>.present`,
-    /// then remove the pending file.  Mirrors what `drain_pending` does after a
-    /// successful S3 upload.
-    fn simulate_upload(dir: &Path) {
-        const HEADER_LEN: usize = 96;
+    /// Materialise, upload to store, and promote all pending segments.
+    /// Mirrors the real coordinator path: materialise → S3 PUT → promote.
+    async fn drain_with_materialise(
+        vol: &mut elide_core::volume::Volume,
+        dir: &Path,
+        volume_id: &str,
+        store: &Arc<dyn ObjectStore>,
+    ) {
         let pending_dir = dir.join("pending");
-        let index_dir = dir.join("index");
-        let cache_dir = dir.join("cache");
-        fs::create_dir_all(&index_dir).unwrap();
-        fs::create_dir_all(&cache_dir).unwrap();
-
+        let mut ulids = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-            let path = entry.path();
             let name = entry.file_name();
-            let Some(ulid_str) = name.to_str() else {
-                continue;
-            };
-            if ulid_str.ends_with(".tmp") {
+            let Some(s) = name.to_str() else { continue };
+            if s.contains('.') {
                 continue;
             }
-            let data = fs::read(&path).unwrap();
-            assert!(data.len() >= HEADER_LEN, "segment too short");
-
-            let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-            let body_section_start = HEADER_LEN + index_length as usize + inline_length as usize;
-
-            // Write .idx (header + index section).
-            let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-            fs::write(&idx_path, &data[..body_section_start]).unwrap();
-
-            // Write .body and .present.
-            let body_bytes = &data[body_section_start..];
-            let bitset_len = (entry_count as usize).div_ceil(8);
-            fs::write(cache_dir.join(format!("{ulid_str}.body")), body_bytes).unwrap();
-            fs::write(
-                cache_dir.join(format!("{ulid_str}.present")),
-                vec![0xFFu8; bitset_len],
-            )
-            .unwrap();
-
-            fs::remove_file(&path).unwrap();
+            if let Ok(ulid) = Ulid::from_string(s) {
+                ulids.push(ulid);
+            }
         }
-    }
-
-    /// Upload all segments currently in `pending/` to the in-memory store under
-    /// the given volume_id, then run `simulate_upload` to drain them locally.
-    /// Used by tests that exercise the S3-fetch path in `compact_segments`.
-    async fn simulate_upload_with_store(dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
-        let pending_dir = dir.join("pending");
-        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-            let name = entry.file_name();
-            let Some(ulid_str) = name.to_str() else {
-                continue;
-            };
-            if ulid_str.ends_with(".tmp") {
-                continue;
-            }
-            let data = fs::read(entry.path()).unwrap();
-            let key = segment_key(volume_id, ulid_str).unwrap();
+        for &ulid in &ulids {
+            vol.materialise_segment(ulid).unwrap();
+            // Upload the .materialized file (fat variant) to the store.
+            let ulid_str = ulid.to_string();
+            let mat_path = pending_dir.join(format!("{ulid_str}.materialized"));
+            let data = fs::read(&mat_path).unwrap();
+            let key = segment_key(volume_id, &ulid_str).unwrap();
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
                 .unwrap();
+            vol.promote_segment(ulid).unwrap();
         }
-        simulate_upload(dir);
     }
 
     // --- apply_done_handoffs tests ---
@@ -1660,9 +1719,17 @@ mod tests {
             removed_hashes: Vec::new(),
         };
 
-        compact_segments(vec![candidate], &gc_dir, "vol", &store, handoff_ulid)
-            .await
-            .unwrap();
+        let empty_index = elide_core::extentindex::ExtentIndex::new();
+        compact_segments(
+            vec![candidate],
+            &gc_dir,
+            "vol",
+            &store,
+            handoff_ulid,
+            &empty_index,
+        )
+        .await
+        .unwrap();
 
         // A tombstone .pending file must have been written so the volume can
         // acknowledge before the coordinator deletes.
@@ -1766,17 +1833,18 @@ mod tests {
 
         let content = [0xAAu8; 4096];
 
-        // Step 1: write [0xAA; 4096] to lba 0, flush, simulate drain.
+        // Step 1: write [0xAA; 4096] to lba 0, flush, materialise, drain.
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        simulate_upload_with_store(dir, "test-vol", &store).await;
+        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
 
-        // Step 2: write the same content to lba 1, flush, simulate drain.
-        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2.
+        // Step 2: write the same content to lba 1, flush, materialise, drain.
+        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2,
+        // which materialise_segment converts to MaterializedRef before upload.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        simulate_upload_with_store(dir, "test-vol", &store).await;
+        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
 
         drop(vol);
 
@@ -1831,6 +1899,87 @@ mod tests {
             vol.read(1, 1).unwrap().as_slice(),
             &content,
             "lba 1 must read back [0xAA; 4096] after GC + crash + reopen"
+        );
+    }
+
+    /// Bug F: DATA entry at a non-canonical extent location must be kept when
+    /// its LBA mapping is live.
+    ///
+    /// Two segments with the same hash for different LBAs: S1 has DATA(LBA 0→H),
+    /// S2 has MaterializedRef(LBA 1→H).  The extent_index maps H→S2 (S2 processed
+    /// last).  collect_stats for S1 should still keep the DATA entry via lba_live.
+    #[test]
+    fn collect_stats_keeps_data_entry_when_lba_live_but_not_extent_canonical() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+
+        // S1: DATA(LBA 0→H101)
+        vol.write(0, &[101u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S2: DedupRef(LBA 1→H101) — same hash, write-path dedup
+        vol.write(1, &[101u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Drain both: materialise converts S2's DedupRef → MaterializedRef.
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
+        }
+        ulids.sort();
+        for ulid in &ulids {
+            vol.materialise_segment(*ulid).unwrap();
+            vol.promote_segment(*ulid).unwrap();
+        }
+
+        // Rebuild from disk — extent_index has H101→S2 (S2 processed last).
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.live_hashes();
+
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        // Both segments should have 1 live entry each.
+        // S1: DATA(LBA 0→H101) — not extent-canonical (H101→S2), but lba_live.
+        // S2: MaterializedRef(LBA 1→H101) — lba_live.
+        let total_live: usize = stats.iter().map(|s| s.live_entries.len()).sum();
+        assert_eq!(
+            total_live,
+            2,
+            "both LBA mappings must survive: got {} live entries across {} segments \
+             (segments: {:?})",
+            total_live,
+            stats.len(),
+            stats
+                .iter()
+                .map(|s| format!(
+                    "{}:live={},removed={}",
+                    &s.ulid_str[..8],
+                    s.live_entries.len(),
+                    s.removed_hashes.len()
+                ))
+                .collect::<Vec<_>>()
         );
     }
 }

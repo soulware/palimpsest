@@ -1,15 +1,17 @@
 // Shared simulation helpers for proptest files.
 //
-// `drain_local` and `simulate_coord_gc_local` mirror the real coordinator's
-// drain-pending and GC logic without requiring an object store.  Both proptest
-// suites (volume_proptest and actor_proptest) use these to drive the same
-// coordinator-side simulation.
+// `drain_with_materialise` and `simulate_coord_gc_local` mirror the real
+// coordinator's drain-pending and GC logic without requiring an object store.
+// Both proptest suites (volume_proptest and actor_proptest) use these to drive
+// the same coordinator-side simulation.
+
 #![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use elide_core::actor::VolumeHandle;
 use elide_core::gc::{HandoffLine, format_handoff_file};
 use elide_core::{
     extentindex, lbamap,
@@ -32,49 +34,53 @@ pub fn write_test_keypair(dir: &Path) {
     .unwrap();
 }
 
-/// Promote all committed segments from pending/ to index/ + cache/.
-/// Simulates `drain-pending` (upload + local cache promotion) without touching an object store.
-pub fn drain_local(fork_dir: &Path) {
-    const HEADER_LEN: usize = 96;
-    let pending = fork_dir.join("pending");
-    let index_dir = fork_dir.join("index");
-    let cache_dir = fork_dir.join("cache");
-    let _ = fs::create_dir_all(&index_dir);
-    let _ = fs::create_dir_all(&cache_dir);
-    let Ok(entries) = fs::read_dir(&pending) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let Some(ulid_str) = name.to_str() else {
-            continue;
-        };
-        if ulid_str.ends_with(".tmp") {
-            continue;
-        }
-        let Ok(data) = fs::read(&path) else {
-            continue;
-        };
-        if data.len() < HEADER_LEN {
-            continue;
-        }
-        let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-        let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-        let bss = HEADER_LEN + index_length as usize + inline_length as usize;
-        if data.len() < bss {
-            continue;
-        }
-        let _ = fs::write(index_dir.join(format!("{ulid_str}.idx")), &data[..bss]);
-        let _ = fs::write(cache_dir.join(format!("{ulid_str}.body")), &data[bss..]);
-        let bitset_len = (entry_count as usize).div_ceil(8);
-        let _ = fs::write(
-            cache_dir.join(format!("{ulid_str}.present")),
-            vec![0xFFu8; bitset_len],
-        );
-        let _ = fs::remove_file(&path);
+/// Drain via the full materialise → promote path, matching the production
+/// coordinator upload protocol.
+///
+/// For each pending segment: calls `vol.materialise_segment(ulid)` to produce
+/// `pending/<ulid>.materialized`, then `vol.promote_segment(ulid)` which
+/// writes `index/<ulid>.idx` + `cache/<ulid>.{body,present}` from the
+/// `.materialized` sidecar and updates the extent index.
+pub fn drain_with_materialise(vol: &mut elide_core::volume::Volume) {
+    for ulid in pending_ulids(vol.base_dir()) {
+        vol.materialise_segment(ulid).unwrap();
+        vol.promote_segment(ulid).unwrap();
     }
+}
+
+/// Drain via the actor handle: materialise + promote each pending segment.
+///
+/// Equivalent to `drain_with_materialise` but works when the `Volume` is behind
+/// an actor — sends `MaterialiseSegment` and `Promote` messages through the
+/// handle's channel, so the actor's in-memory snapshot is updated correctly.
+pub fn drain_via_handle(handle: &VolumeHandle, base_dir: &Path) {
+    for ulid in pending_ulids(base_dir) {
+        handle.materialise_segment(ulid).unwrap();
+        handle.promote_segment(ulid).unwrap();
+    }
+}
+
+/// Collect sorted ULIDs of full segment files in pending/.
+pub fn pending_ulids(base_dir: &Path) -> Vec<Ulid> {
+    let pending_dir = base_dir.join("pending");
+    let Ok(entries) = fs::read_dir(&pending_dir) else {
+        return Vec::new();
+    };
+    let mut ulids: Vec<Ulid> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.contains('.') {
+            continue;
+        }
+        if let Ok(ulid) = Ulid::from_string(name_str) {
+            ulids.push(ulid);
+        }
+    }
+    ulids.sort();
+    ulids
 }
 
 /// Write a single-entry segment directly to `index/<ulid>.idx` +
@@ -193,18 +199,38 @@ fn compact_candidates_inner(
         }
         for entry in entries.drain(..) {
             if entry.kind == EntryKind::DedupRef {
-                // Carry a dedup ref only if the LBA still maps to this hash.
+                // Thin DedupRef has no body bytes — drop from GC output.
+                // The canonical DATA entry (in another segment) carries the
+                // body. Carrying the thin ref would leave a dangling reference
+                // when the old segment is deleted.
+                continue;
+            }
+            if entry.kind == EntryKind::MaterializedRef {
+                // Fat ref — treat like DATA for liveness (LBA-based).
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+                let extent_live = extent_index
+                    .lookup(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id == *ulid);
                 if lba_live {
                     source_ulids.push(*ulid);
                     all_entries.push(entry);
+                } else if extent_live {
+                    removed.push((entry.hash, *ulid));
                 }
                 continue;
             }
+            // DATA entries are content-addressed: the extent_index tracks a
+            // single canonical location per hash.  When the same hash appears
+            // in multiple segments (e.g. a regular write and a later
+            // materialised dedup ref), only one segment is "canonical" in the
+            // extent_index — the other looks extent-dead even though its LBA
+            // mapping is still live.  Check lba_live first (same as
+            // MaterializedRef above) so we never drop a live LBA mapping.
+            let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = extent_index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == *ulid);
-            if extent_live && live_hashes.contains(&entry.hash) {
+            if lba_live || (extent_live && live_hashes.contains(&entry.hash)) {
                 source_ulids.push(*ulid);
                 all_entries.push(entry);
             } else if extent_live {
@@ -261,17 +287,52 @@ fn compact_candidates_inner(
         };
     fs::rename(&tmp_path, &final_path).ok()?;
 
-    let mut handoff_lines: Vec<HandoffLine> = all_entries
-        .iter()
-        .zip(source_ulids.iter())
-        .filter(|(e, _)| e.kind != EntryKind::DedupRef)
-        .map(|(e, src_ulid)| HandoffLine::Repack {
-            hash: e.hash,
-            old_ulid: *src_ulid,
-            new_ulid,
-            new_offset: new_bss + e.stored_offset,
-        })
-        .collect();
+    // Build Repack lines, deduplicating by hash: emit one Repack per unique
+    // hash, preferring the extent-canonical source segment.  With dedup, the
+    // same hash can appear in multiple input segments (DATA in one,
+    // MaterializedRef in another).  The extent index tracks one canonical
+    // location per hash, and apply_gc_handoffs' still_at_old check compares
+    // against the single old_ulid in the handoff — so we must use the
+    // canonical segment's ULID.  Non-canonical entries are still in the output
+    // segment (preserving their LBA mappings) but don't generate Repack lines.
+    let mut seen_repack_hashes: HashSet<blake3::Hash> = HashSet::new();
+    let mut handoff_lines: Vec<HandoffLine> = Vec::new();
+    // First pass: emit Repacks for extent-canonical entries.
+    for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
+        if e.kind == EntryKind::DedupRef {
+            continue;
+        }
+        if seen_repack_hashes.contains(&e.hash) {
+            continue;
+        }
+        let is_canonical = extent_index
+            .lookup(&e.hash)
+            .is_some_and(|loc| loc.segment_id == *src_ulid);
+        if is_canonical {
+            seen_repack_hashes.insert(e.hash);
+            handoff_lines.push(HandoffLine::Repack {
+                hash: e.hash,
+                old_ulid: *src_ulid,
+                new_ulid,
+                new_offset: new_bss + e.stored_offset,
+            });
+        }
+    }
+    // Second pass: emit Repacks for any remaining hashes (no canonical entry
+    // was in the candidate set — use whichever source we have).
+    for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
+        if e.kind == EntryKind::DedupRef {
+            continue;
+        }
+        if seen_repack_hashes.insert(e.hash) {
+            handoff_lines.push(HandoffLine::Repack {
+                hash: e.hash,
+                old_ulid: *src_ulid,
+                new_ulid,
+                new_offset: new_bss + e.stored_offset,
+            });
+        }
+    }
     for (hash, old_ulid) in &removed {
         handoff_lines.push(HandoffLine::Remove {
             hash: *hash,

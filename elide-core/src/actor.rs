@@ -108,6 +108,10 @@ pub(crate) enum VolumeRequest {
     GcCheckpoint {
         reply: Sender<io::Result<(Ulid, Ulid)>>,
     },
+    MaterialiseSegment {
+        ulid: Ulid,
+        reply: Sender<io::Result<()>>,
+    },
     Promote {
         ulid: Ulid,
         reply: Sender<io::Result<()>>,
@@ -263,8 +267,15 @@ impl VolumeActor {
                             }
                             let _ = reply.send(result);
                         }
+                        VolumeRequest::MaterialiseSegment { ulid, reply } => {
+                            let _ = reply.send(self.volume.materialise_segment(ulid));
+                        }
                         VolumeRequest::Promote { ulid, reply } => {
-                            let _ = reply.send(self.volume.promote_segment(ulid));
+                            let result = self.volume.promote_segment(ulid);
+                            if result.is_ok() {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Snapshot { reply } => {
                             let result = self.volume.snapshot().map(|u| u.to_string());
@@ -481,6 +492,24 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Materialise a pending segment: rewrite thin DedupRef entries as fat
+    /// MaterializedRef with body bytes from the canonical segment.
+    ///
+    /// Called by the coordinator before reading `pending/<ulid>` for S3 upload.
+    /// Idempotent: if no thin refs exist, no rewrite occurs.
+    pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::MaterialiseSegment {
+                ulid,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

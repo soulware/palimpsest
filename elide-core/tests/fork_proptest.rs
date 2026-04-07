@@ -116,7 +116,7 @@ proptest! {
                     base_oracle.insert(*lba as u64, data);
                 }
                 PreOp::Flush => { let _ = base.flush_wal(); }
-                PreOp::Drain => { common::drain_local(&base_dir); }
+                PreOp::Drain => { common::drain_with_materialise(&mut base); }
             }
         }
 
@@ -150,7 +150,7 @@ proptest! {
                     // child_oracle is NOT updated — post-branch base writes are invisible.
                 }
                 PostOp::BaseFlush => { let _ = base.flush_wal(); }
-                PostOp::BaseDrain => { common::drain_local(&base_dir); }
+                PostOp::BaseDrain => { common::drain_with_materialise(&mut base); }
 
                 PostOp::ChildWrite { lba, seed } => {
                     let data = [*seed; 4096];
@@ -161,7 +161,7 @@ proptest! {
                     post_branch_base_lbas.remove(&(*lba as u64));
                 }
                 PostOp::ChildFlush => { let _ = child.flush_wal(); }
-                PostOp::ChildDrain => { common::drain_local(&child_dir); }
+                PostOp::ChildDrain => { common::drain_with_materialise(&mut child); }
 
                 PostOp::ChildCrash => {
                     drop(child);

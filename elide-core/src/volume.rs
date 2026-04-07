@@ -386,32 +386,16 @@ impl Volume {
         };
 
         // Write-path dedup: if this extent already exists in this volume's
-        // segment tree (own segments + ancestors), write a REF record instead
-        // of a DATA record. The body bytes are already in hand (from the write
-        // buffer) so no fetching is required — they are written into the WAL
-        // REF record alongside the hash. Scope is limited to within-volume so
-        // that every REF is self-contained within the same S3 volume tree.
+        // segment tree (own segments + ancestors), write a thin REF record
+        // instead of a DATA record. No body bytes in the WAL — reads resolve
+        // through the extent index to the canonical segment's body.
         if self.extent_index.lookup(&hash).is_some() {
-            let body_offset =
-                self.wal
-                    .append_ref(lba, lba_length, &hash, wal_flags, &owned_data)?;
+            self.wal.append_ref(lba, lba_length, &hash)?;
             Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
-            Arc::make_mut(&mut self.extent_index).insert(
-                hash,
-                extentindex::ExtentLocation {
-                    segment_id: self.wal_ulid,
-                    body_offset,
-                    body_length: owned_data.len() as u32,
-                    compressed,
-                    entry_idx: None,
-                    body_section_start: 0,
-                },
-            );
-            let mut entry = segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length);
-            entry.compressed = compressed;
-            entry.stored_length = owned_data.len() as u32;
-            entry.data = owned_data;
-            self.pending_entries.push(entry);
+            // Do NOT update extent_index — the canonical entry already points
+            // to the segment with the body bytes.
+            self.pending_entries
+                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
             return Ok(());
         }
 
@@ -537,10 +521,11 @@ impl Volume {
                     Err(e) => return Err(e),
                 };
 
-            // Zero extents have no body bytes; DATA and REF entries both do.
+            // Only DATA and MaterializedRef entries have body bytes.
+            // Thin DedupRef and Zero have stored_length=0.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| e.kind != EntryKind::Zero)
+                .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -550,7 +535,10 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| e.kind != EntryKind::Zero && live.contains(&e.hash))
+                .filter(|e| {
+                    matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef)
+                        && live.contains(&e.hash)
+                })
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -561,17 +549,18 @@ impl Volume {
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
                 entries.drain(..).partition(|e| match e.kind {
                     EntryKind::Zero => self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH),
-                    EntryKind::DedupRef => self.lbamap.hash_at(e.start_lba) == Some(e.hash),
+                    EntryKind::DedupRef | EntryKind::MaterializedRef => {
+                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                    }
                     EntryKind::Data | EntryKind::Inline => live.contains(&e.hash),
                 });
 
             // Remove dead entries from the extent index (only those pointing at
             // this segment — entries pointing elsewhere belong to another copy).
-            // Applies to both DATA and REF entries; zero extents are not in the
-            // extent index.
+            // Thin DedupRef and Zero entries are not in the extent index.
             let mut removed = 0usize;
             for entry in &dead_entries {
-                if entry.kind == EntryKind::Zero {
+                if entry.kind == EntryKind::Zero || entry.kind == EntryKind::DedupRef {
                     continue;
                 }
                 if self
@@ -584,6 +573,10 @@ impl Volume {
                     removed += 1;
                 }
             }
+
+            // Evict the old segment from the file handle cache before
+            // replacing or deleting it.
+            self.evict_cached_segment(seg_id);
 
             if !live_entries.is_empty() {
                 // Read body bytes for live entries, then write a new denser segment.
@@ -603,36 +596,38 @@ impl Volume {
                 // write_segment reassigns stored_offset in live_entries to new positions.
                 let new_bss =
                     segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_ref())?;
+                // Atomically replaces the original segment file.
                 fs::rename(&tmp_path, &final_path)?;
                 segment::fsync_dir(&final_path)?;
                 stats.new_segments += 1;
 
                 for entry in &live_entries {
-                    if entry.kind != EntryKind::Zero {
-                        Arc::make_mut(&mut self.extent_index).insert(
-                            entry.hash,
-                            extentindex::ExtentLocation {
-                                segment_id: new_ulid,
-                                body_offset: entry.stored_offset,
-                                body_length: entry.stored_length,
-                                compressed: entry.compressed,
-                                entry_idx: None,
-                                body_section_start: new_bss,
-                            },
-                        );
+                    match entry.kind {
+                        EntryKind::Data | EntryKind::MaterializedRef => {
+                            Arc::make_mut(&mut self.extent_index).insert(
+                                entry.hash,
+                                extentindex::ExtentLocation {
+                                    segment_id: new_ulid,
+                                    body_offset: entry.stored_offset,
+                                    body_length: entry.stored_length,
+                                    compressed: entry.compressed,
+                                    entry_idx: None,
+                                    body_section_start: new_bss,
+                                },
+                            );
+                        }
+                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
                     }
                 }
+            } else {
+                // All entries are dead — delete the segment file.  Without this,
+                // a subsequent materialise_segment would try to resolve thin
+                // DedupRef entries whose canonical hashes we just removed from
+                // the extent index.
+                fs::remove_file(&seg_path)?;
+                segment::fsync_dir(&seg_path)?;
             }
 
-            // Evict the old segment from the file handle cache before deleting it.
-            let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _, _)| *id) == Some(seg_id) {
-                *cache = None;
-            }
-            drop(cache);
-
-            // The rename above replaced the source atomically (final_path == seg_path),
-            // so there is nothing left to delete.
             stats.segments_compacted += 1;
             stats.bytes_freed += total_bytes - live_bytes;
             stats.extents_removed += removed;
@@ -721,7 +716,7 @@ impl Volume {
             let dead_bytes: u64 = dead_entries.iter().map(|e| e.stored_length as u64).sum();
 
             for entry in &dead_entries {
-                if entry.kind == EntryKind::Zero {
+                if entry.kind == EntryKind::Zero || entry.kind == EntryKind::DedupRef {
                     continue;
                 }
                 if self
@@ -790,18 +785,21 @@ impl Volume {
             stats.new_segments += 1;
 
             for entry in &merged_live {
-                if entry.kind != EntryKind::Zero {
-                    Arc::make_mut(&mut self.extent_index).insert(
-                        entry.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: new_ulid,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            entry_idx: None,
-                            body_section_start: new_bss,
-                        },
-                    );
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {
+                        Arc::make_mut(&mut self.extent_index).insert(
+                            entry.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: new_ulid,
+                                body_offset: entry.stored_offset,
+                                body_length: entry.stored_length,
+                                compressed: entry.compressed,
+                                entry_idx: None,
+                                body_section_start: new_bss,
+                            },
+                        );
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
                 }
             }
         }
@@ -1304,7 +1302,7 @@ impl Volume {
     ///
     /// Idempotent: if `cache/<ulid>.body` already exists the function returns
     /// `Ok(())` without re-writing.
-    pub fn promote_segment(&self, ulid: Ulid) -> io::Result<()> {
+    pub fn promote_segment(&mut self, ulid: Ulid) -> io::Result<()> {
         let ulid_str = ulid.to_string();
         let cache_dir = self.base_dir.join("cache");
         let body_path = cache_dir.join(format!("{ulid_str}.body"));
@@ -1326,6 +1324,20 @@ impl Volume {
             )));
         };
 
+        // For drain path: prefer the .materialized sidecar (fat variant) over
+        // the original pending segment. The .materialized file matches what was
+        // uploaded to S3 — its index has MaterializedRef entries (not thin
+        // DedupRef), so the .idx file and cache body are consistent with S3.
+        let mat_path = self
+            .base_dir
+            .join("pending")
+            .join(format!("{ulid_str}.materialized"));
+        let promote_src = if is_drain && mat_path.try_exists()? {
+            &mat_path
+        } else {
+            &src_path
+        };
+
         // Write index/<ulid>.idx now — after confirmed S3 upload — so that
         // idx presence ↔ segment confirmed in S3 (restored invariant).
         // This must happen before deleting old idx files (GC path below) so
@@ -1333,12 +1345,89 @@ impl Volume {
         let index_dir = self.base_dir.join("index");
         fs::create_dir_all(&index_dir)?;
         let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-        segment::extract_idx(&src_path, &idx_path)?;
+        segment::extract_idx(promote_src, &idx_path)?;
 
         fs::create_dir_all(&cache_dir)?;
-        segment::promote_to_cache(&src_path, &body_path, &present_path)?;
+        segment::promote_to_cache(promote_src, &body_path, &present_path)?;
+
+        // When promoting from .materialized, the cache body has different
+        // offsets than the original pending segment (index section grew:
+        // DedupRef 45 bytes → MaterializedRef 57 bytes). Update the extent
+        // index so reads find body bytes at the correct positions. The actor
+        // serializes all requests — no reads can run during this update.
+        //
+        // Future: if we switch to promoting the thin version to cache (for
+        // local storage savings), this update would use the thin .idx offsets
+        // instead — and a separate fat .idx would be written for GC.
+        if is_drain && promote_src == &mat_path {
+            // The pending file is about to be deleted and replaced by a cache
+            // body with different offsets.  Evict any cached fd for this segment
+            // so the next read opens the new cache/<ulid>.body instead of
+            // reusing a stale handle to the deleted pending file.
+            self.evict_cached_segment(ulid);
+
+            let (new_bss, entries) =
+                segment::read_and_verify_segment_index(promote_src, &self.verifying_key)?;
+            let mut updated = 0usize;
+            let mut skipped_kind = 0usize;
+            let mut skipped_seg = 0usize;
+            for entry in &entries {
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    _ => {
+                        skipped_kind += 1;
+                        continue;
+                    }
+                }
+                // Update the extent index if:
+                //   (a) it already points to this segment (offset rewrite
+                //       after materialisation changed the index section size), or
+                //   (b) it points to an older segment with the same hash.
+                //       With dedup, multiple segments carry body bytes for
+                //       the same hash.  On-disk rebuild picks the latest ULID
+                //       as canonical; the in-memory index must agree so that
+                //       apply_gc_handoffs' still_at_old check matches the
+                //       coordinator's disk-rebuilt view.
+                //
+                // We do NOT overwrite an entry with a higher ULID — that
+                // would be a genuinely newer write (e.g. WAL entry from a
+                // concurrent write serialised by the actor).
+                let should_update = self
+                    .extent_index
+                    .lookup(&entry.hash)
+                    .is_none_or(|loc| loc.segment_id <= ulid);
+                if should_update {
+                    Arc::make_mut(&mut self.extent_index).insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            entry_idx: None,
+                            body_section_start: new_bss,
+                        },
+                    );
+                    updated += 1;
+                } else {
+                    skipped_seg += 1;
+                }
+            }
+            log::info!(
+                "promote {ulid_str}: extent index rewritten: \
+                 {updated} updated, {skipped_seg} pointed elsewhere, \
+                 {skipped_kind} non-body, new_bss={new_bss}"
+            );
+        } else if is_drain {
+            log::info!(
+                "promote {ulid_str}: no .materialized sidecar, \
+                 extent index unchanged"
+            );
+        }
 
         if is_drain {
+            // Clean up .materialized sidecar if materialise_segment produced one.
+            let _ = fs::remove_file(&mat_path);
             fs::remove_file(&pending_path)?;
         } else {
             // GC path: delete index/<old>.idx for each segment consumed by this
@@ -1365,12 +1454,179 @@ impl Volume {
         Ok(())
     }
 
+    /// Produce `pending/<ulid>.materialized` — a self-contained segment with
+    /// every thin DedupRef replaced by a fat MaterializedRef. Called by the
+    /// coordinator before reading the segment for S3 upload.
+    ///
+    /// If the segment already has no thin DedupRef entries, a hard link to
+    /// the original is created (zero-cost copy). Otherwise a new fat segment
+    /// is written alongside the original.
+    ///
+    /// The original `pending/<ulid>` is never modified — the extent index
+    /// stays valid and reads continue to use the original file.
+    ///
+    /// Idempotent: if `.materialized` already exists, returns Ok immediately.
+    /// `promote_segment` cleans up `.materialized` alongside the original.
+    pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let ulid_str = ulid.to_string();
+        let pending_dir = self.base_dir.join("pending");
+        let seg_path = pending_dir.join(&ulid_str);
+        let mat_path = pending_dir.join(format!("{ulid_str}.materialized"));
+
+        if mat_path.try_exists()? {
+            return Ok(());
+        }
+
+        let (body_section_start, entries) =
+            segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
+
+        // Fast path: no thin refs — hard link the original.
+        let has_thin = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
+        if !has_thin {
+            fs::hard_link(&seg_path, &mat_path)?;
+            return Ok(());
+        }
+
+        // Build new entries. For each entry:
+        // - DATA: read body bytes from the original segment file
+        // - DedupRef (thin): read body from canonical segment, emit MaterializedRef
+        // - Zero: pass through as-is
+        // All body reads happen here; no separate read_extent_bodies call
+        // (MaterializedRef entries have stored_offset=0 which is invalid for
+        // the original file — they must not be passed to read_extent_bodies).
+        let mut seg_file = fs::File::open(&seg_path)?;
+        let mut new_entries: Vec<segment::SegmentEntry> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry.kind {
+                EntryKind::Data | EntryKind::MaterializedRef => {
+                    // Read body from the original segment file.
+                    let mut body = vec![0u8; entry.stored_length as usize];
+                    seg_file.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+                    seg_file.read_exact(&mut body)?;
+                    let flags = if entry.compressed {
+                        segment::SegmentFlags::COMPRESSED
+                    } else {
+                        segment::SegmentFlags::empty()
+                    };
+                    new_entries.push(segment::SegmentEntry::new_data(
+                        entry.hash,
+                        entry.start_lba,
+                        entry.lba_length,
+                        flags,
+                        body,
+                    ));
+                }
+                EntryKind::DedupRef => {
+                    // Thin → look up canonical location in extent index.
+                    let loc = self.extent_index.lookup(&entry.hash).ok_or_else(|| {
+                        io::Error::other(format!(
+                            "materialise {ulid_str}: hash {} not in extent index",
+                            entry.hash.to_hex()
+                        ))
+                    })?;
+                    let canonical_path = self.find_segment_file(
+                        loc.segment_id,
+                        loc.body_section_start,
+                        loc.entry_idx,
+                    )?;
+                    let is_body = canonical_path.extension().is_some_and(|e| e == "body");
+                    let file_offset = if is_body {
+                        loc.body_offset
+                    } else {
+                        loc.body_section_start + loc.body_offset
+                    };
+                    let mut f = fs::File::open(&canonical_path)?;
+                    f.seek(SeekFrom::Start(file_offset))?;
+                    let mut data = vec![0u8; loc.body_length as usize];
+                    f.read_exact(&mut data)?;
+
+                    let flags = if loc.compressed {
+                        segment::SegmentFlags::COMPRESSED
+                    } else {
+                        segment::SegmentFlags::empty()
+                    };
+                    new_entries.push(segment::SegmentEntry::new_materialized_ref(
+                        entry.hash,
+                        entry.start_lba,
+                        entry.lba_length,
+                        flags,
+                        data,
+                    ));
+                }
+                EntryKind::Zero => {
+                    new_entries.push(segment::SegmentEntry::new_zero(
+                        entry.start_lba,
+                        entry.lba_length,
+                    ));
+                }
+                EntryKind::Inline => {
+                    new_entries.push(entry);
+                }
+            }
+        }
+
+        {
+            let (mut fat, mut data, mut zero) = (0usize, 0usize, 0usize);
+            for e in &new_entries {
+                match e.kind {
+                    EntryKind::MaterializedRef => fat += 1,
+                    EntryKind::Data => data += 1,
+                    EntryKind::Zero => zero += 1,
+                    EntryKind::DedupRef | EntryKind::Inline => {}
+                }
+            }
+            log::info!(
+                "materialise {ulid_str}: {fat} thin→fat, \
+                 {data} data, {zero} zero ({} entries total)",
+                new_entries.len()
+            );
+        }
+
+        // Write to .tmp then rename to .materialized (atomic).
+        let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
+        segment::write_segment(&tmp_path, &mut new_entries, self.signer.as_ref())?;
+        fs::rename(&tmp_path, &mat_path)?;
+        segment::fsync_dir(&mat_path)?;
+        Ok(())
+    }
+
     /// Flush the current WAL to a segment in this node's `pending/`, update
     /// the extent index, and clear `pending_entries`. The WAL file is deleted.
     ///
     /// If `pending_entries` is empty (nothing written since last flush), the
     /// WAL file is deleted directly without writing a segment.
     ///
+    /// Evict `segment_id` from the file handle cache.
+    ///
+    /// The read path (`read_extents`) caches the last-opened segment fd to
+    /// amortise open syscalls across sequential block reads.  The cache key
+    /// is the segment ULID plus an `is_body` flag that controls how body
+    /// offsets are computed (`.body` files start at offset 0; full segment
+    /// files add `body_section_start`).
+    ///
+    /// Callers must evict whenever a segment's on-disk representation changes
+    /// in a way that invalidates the cached fd or `is_body` flag:
+    ///
+    /// - **`flush_wal_to_pending`** — WAL file deleted, replaced by a
+    ///   pending segment with a different byte layout.
+    /// - **`promote_segment`** (materialised drain) — `pending/<ulid>`
+    ///   deleted, replaced by `cache/<ulid>.body` with a different
+    ///   `body_section_start` (the materialised index section is larger).
+    /// - **`apply_gc_handoffs`** (repack) — old segment deleted and
+    ///   replaced by a denser segment with reassigned body offsets.
+    ///
+    /// Without eviction the cached fd silently serves stale data or — worse —
+    /// applies `body_section_start` from the new extent index entry against
+    /// the old file layout, seeking past the body section.
+    fn evict_cached_segment(&self, segment_id: Ulid) {
+        let mut cache = self.file_cache.borrow_mut();
+        if cache.as_ref().map(|(id, _, _)| *id) == Some(segment_id) {
+            *cache = None;
+        }
+    }
+
     /// Does NOT open a new WAL — the caller is responsible for that.
     fn flush_wal_to_pending(&mut self) -> io::Result<()> {
         self.flush_wal_to_pending_as(self.wal_ulid)
@@ -1402,11 +1658,13 @@ impl Volume {
         )?;
         // Update the extent index: replace temporary WAL offsets with
         // body-relative offsets into the committed segment file.
-        // REF entries carry materialised body bytes in their own segment —
-        // they must be indexed here, not skipped. Zero extents are not indexed.
+        // Thin DedupRef entries have no body in this segment — the extent
+        // index already points to the canonical segment. Zero extents are
+        // not indexed.
         for entry in &self.pending_entries {
-            if entry.kind == EntryKind::Zero {
-                continue;
+            match entry.kind {
+                EntryKind::Data | EntryKind::MaterializedRef => {}
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
             }
             Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
@@ -1420,6 +1678,22 @@ impl Volume {
                 },
             );
         }
+        {
+            let (mut data, mut refs, mut zero) = (0usize, 0usize, 0usize);
+            for e in &self.pending_entries {
+                match e.kind {
+                    EntryKind::Data => data += 1,
+                    EntryKind::DedupRef => refs += 1,
+                    EntryKind::Zero => zero += 1,
+                    EntryKind::MaterializedRef | EntryKind::Inline => {}
+                }
+            }
+            log::info!(
+                "flush {segment_ulid}: {data} data, {refs} dedup-ref, \
+                 {zero} zero ({} entries total)",
+                self.pending_entries.len()
+            );
+        }
         self.pending_entries.clear();
         // index/<ulid>.idx is written later by the promote_segment IPC handler,
         // after the coordinator confirms S3 upload.  Until then pending/<ulid>
@@ -1429,10 +1703,7 @@ impl Volume {
         // any cached fd for this ULID would use the old WAL byte layout.
         // The cache key is the WAL's original ULID (the file that was deleted),
         // not segment_ulid — the cache is keyed by the path that was open.
-        let mut cache = self.file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _, _)| *id) == Some(self.wal_ulid) {
-            *cache = None;
-        }
+        self.evict_cached_segment(self.wal_ulid);
         Ok(())
     }
 
@@ -2115,30 +2386,14 @@ fn recover_wal(
                 hash,
                 start_lba,
                 lba_length,
-                flags,
-                body_offset,
-                data,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
-                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
-                extent_index.insert(
-                    hash,
-                    extentindex::ExtentLocation {
-                        segment_id: ulid,
-                        body_offset,
-                        body_length: data.len() as u32,
-                        compressed,
-                        entry_idx: None,
-                        body_section_start: 0,
-                    },
-                );
-                // Store body bytes so promote_segment can write them into the
-                // segment body section alongside DATA entries.
-                let mut entry = segment::SegmentEntry::new_dedup_ref(hash, start_lba, lba_length);
-                entry.compressed = compressed;
-                entry.stored_length = data.len() as u32;
-                entry.data = data;
-                pending_entries.push(entry);
+                // Thin REF: no body bytes, no extent_index update — the
+                // canonical entry is populated from the segment that holds
+                // the body (rebuilt from pending/ or segments/).
+                pending_entries.push(segment::SegmentEntry::new_dedup_ref(
+                    hash, start_lba, lba_length,
+                ));
             }
             writelog::LogRecord::Zero {
                 start_lba,
@@ -2191,7 +2446,7 @@ mod tests {
     /// Simulate coordinator drain: upload all pending segments to S3 (no-op in
     /// tests) then call `promote_segment` on each.  `promote_segment` writes
     /// `index/<ulid>.idx`, copies the body to `cache/`, and deletes `pending/<ulid>`.
-    fn simulate_upload(vol: &Volume) {
+    fn simulate_upload(vol: &mut Volume) {
         let pending_dir = vol.base_dir.join("pending");
         for entry in std::fs::read_dir(&pending_dir).unwrap() {
             let entry = entry.unwrap();
@@ -2961,7 +3216,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Simulate coordinator upload + promote IPC: pending → index/ + cache/.
-        simulate_upload(&vol);
+        simulate_upload(&mut vol);
 
         // Overwrite LBA 0 — the uploaded segment's extent is now dead.
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
@@ -3037,7 +3292,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Simulate coordinator upload + promote IPC: pending → index/ + cache/.
-        simulate_upload(&vol);
+        simulate_upload(&mut vol);
 
         // Now overwrite LBA 0 and promote — creates a new pending segment.
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
@@ -3268,6 +3523,623 @@ mod tests {
         let data = vec![0xCDu8; 4096];
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- dedup-ref materialise / promote regression tests ---
+
+    /// Helper: collect all pending segment ULIDs (excluding .tmp and .materialized).
+    fn pending_ulids(base: &Path) -> Vec<ulid::Ulid> {
+        let pending_dir = base.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.contains('.') {
+                continue;
+            }
+            ulids.push(ulid::Ulid::from_string(&name).unwrap());
+        }
+        ulids.sort();
+        ulids
+    }
+
+    #[test]
+    fn materialise_segment_replaces_dedup_ref_with_correct_body() {
+        // Bug 1: materialise_segment must replace thin DedupRef entries with
+        // MaterializedRef entries whose body bytes match the original data.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xEEu8; 4096];
+        // Write data to LBA 0 → DATA entry in segment S1.
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        assert_eq!(after_first.len(), 1);
+        let s1_ulid = after_first[0];
+
+        // Write same data to LBA 1 → dedup hit → DedupRef in segment S2.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        assert_eq!(after_second.len(), 2);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // Verify S2 has a DedupRef before materialisation.
+        let (_, entries_before) = segment::read_and_verify_segment_index(
+            &base.join("pending").join(s2_ulid.to_string()),
+            &vol.verifying_key,
+        )
+        .unwrap();
+        assert!(
+            entries_before.iter().any(|e| e.kind == EntryKind::DedupRef),
+            "S2 should contain a thin DedupRef before materialisation"
+        );
+
+        // Materialise S2.
+        vol.materialise_segment(s2_ulid).unwrap();
+
+        // Read the .materialized file and verify: no DedupRef, all MaterializedRef.
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", s2_ulid));
+        assert!(mat_path.exists(), ".materialized sidecar must exist");
+
+        let (mat_bss, mat_entries) =
+            segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
+        assert!(
+            !mat_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
+            ".materialized must not contain any DedupRef entries"
+        );
+        assert!(
+            mat_entries
+                .iter()
+                .any(|e| e.kind == EntryKind::MaterializedRef),
+            ".materialized should contain MaterializedRef entries"
+        );
+
+        // Verify the body bytes of the MaterializedRef match the original data.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut mat_file = fs::File::open(&mat_path).unwrap();
+        for entry in &mat_entries {
+            if entry.kind == EntryKind::MaterializedRef {
+                let mut body = vec![0u8; entry.stored_length as usize];
+                mat_file
+                    .seek(SeekFrom::Start(mat_bss + entry.stored_offset))
+                    .unwrap();
+                mat_file.read_exact(&mut body).unwrap();
+                // Body should be the same as our original data (possibly compressed).
+                // Since the data is small (4096 bytes of a single byte), compression
+                // may or may not be applied. Decompress if compressed.
+                let resolved = if entry.compressed {
+                    lz4_flex::decompress_size_prepended(&body).unwrap()
+                } else {
+                    body
+                };
+                assert_eq!(
+                    resolved, data,
+                    "MaterializedRef body must match original data"
+                );
+            }
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn promote_from_materialized_writes_materialized_ref_idx() {
+        // Bug 3: after materialise + promote, index/<ulid>.idx must contain
+        // MaterializedRef entries (not thin DedupRef).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xDDu8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        let s1_ulid = after_first[0];
+
+        vol.write(1, &data).unwrap(); // dedup hit
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // Materialise and promote S2 (simulating the coordinator drain path).
+        vol.materialise_segment(s2_ulid).unwrap();
+        vol.promote_segment(s2_ulid).unwrap();
+
+        // The .idx should exist in index/ and contain MaterializedRef, not DedupRef.
+        let idx_path = base.join("index").join(format!("{}.idx", s2_ulid));
+        assert!(
+            idx_path.exists(),
+            "index/<ulid>.idx must exist after promote"
+        );
+
+        let (_, idx_entries) =
+            segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
+        assert!(
+            !idx_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
+            "idx must not contain thin DedupRef after promote from .materialized"
+        );
+        assert!(
+            idx_entries
+                .iter()
+                .any(|e| e.kind == EntryKind::MaterializedRef),
+            "idx should contain MaterializedRef after promote from .materialized"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn extent_index_updated_after_promote_from_materialized() {
+        // Bug 4: after materialise + promote, reads must still work correctly
+        // because the extent index is updated to reflect the .materialized body
+        // offsets (which differ from the thin pending segment).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xBBu8; 4096];
+        // LBA 0 → DATA entry.
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        let s1_ulid = after_first[0];
+
+        // LBA 1 → dedup hit → DedupRef.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // Materialise and promote S2.
+        vol.materialise_segment(s2_ulid).unwrap();
+        vol.promote_segment(s2_ulid).unwrap();
+
+        // Both LBAs must read back correctly.
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            data,
+            "LBA 0 must read correctly after promote from .materialized"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            data,
+            "LBA 1 must read correctly after promote from .materialized"
+        );
+
+        // Also verify after reopen (extent index rebuilt from .idx files).
+        drop(vol);
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            data,
+            "LBA 0 must survive reopen after promote from .materialized"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            data,
+            "LBA 1 must survive reopen after promote from .materialized"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn materialise_segment_idempotent() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xAAu8; 4096];
+        // Write data to LBA 0 → DATA entry in segment S1.
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        let s1_ulid = after_first[0];
+
+        // Write same data to LBA 1 → dedup hit → DedupRef in segment S2.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // First materialise — creates .materialized.
+        vol.materialise_segment(s2_ulid).unwrap();
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", s2_ulid));
+        assert!(
+            mat_path.exists(),
+            ".materialized must exist after first call"
+        );
+
+        // Second materialise — idempotent, should succeed immediately.
+        vol.materialise_segment(s2_ulid).unwrap();
+        assert!(
+            mat_path.exists(),
+            ".materialized must still exist after second call"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn materialise_segment_hardlinks_when_no_thin_refs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Write unique data (no dedup possible).
+        let data = vec![0x77u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_ulids(&base);
+        assert_eq!(ulids.len(), 1);
+        let ulid = ulids[0];
+
+        vol.materialise_segment(ulid).unwrap();
+
+        let seg_path = base.join("pending").join(ulid.to_string());
+        let mat_path = base.join("pending").join(format!("{}.materialized", ulid));
+        assert!(mat_path.exists(), ".materialized must exist");
+
+        // Hard link: both files share the same inode.
+        let seg_meta = fs::metadata(&seg_path).unwrap();
+        let mat_meta = fs::metadata(&mat_path).unwrap();
+        assert_eq!(
+            seg_meta.ino(),
+            mat_meta.ino(),
+            "no-thin-ref materialise should hard link, not copy"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn wal_recovery_with_thin_ref() {
+        // Write data to LBA 0, promote to pending, then write same data to
+        // LBA 1 (dedup hit → thin ref in WAL). Do NOT flush — leave the thin
+        // ref in the WAL. Drop (crash), reopen, verify both LBAs read back.
+        let base = keyed_temp_dir();
+        let data = vec![0x99u8; 4096];
+
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+            // Second write: same data, different LBA → dedup hit → REF in WAL.
+            vol.write(1, &data).unwrap();
+            vol.fsync().unwrap();
+            // Drop without promote — thin ref stays in WAL only.
+        }
+
+        // Reopen triggers WAL recovery.
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            data,
+            "LBA 0 must survive crash with thin ref in WAL"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            data,
+            "LBA 1 (thin ref) must survive crash with thin ref in WAL"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Proptest regression: DedupWrite → Flush → DedupWrite (overwrite) →
+    /// Repack → DrainWithMaterialise.
+    ///
+    /// Repack finds all entries in the first segment dead (overwritten by the
+    /// second DedupWrite) and removes the hash from the extent index.  Before
+    /// the fix, repack left the segment file behind; DrainWithMaterialise then
+    /// tried to materialise it, hit a DedupRef whose canonical hash was gone,
+    /// and panicked.  The fix: repack deletes the segment file when all
+    /// entries are dead.
+    #[test]
+    fn repack_deletes_fully_dead_segment_before_materialise() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Pre-snapshot segments (frozen by snapshot, skipped by repack).
+        // Write → Flush → DrainWithMaterialise (materialise + promote).
+        let data_a = vec![17u8; 4096];
+        vol.write(2, &data_a).unwrap();
+        vol.flush_wal().unwrap();
+        for ulid in pending_ulids(&base) {
+            vol.materialise_segment(ulid).unwrap();
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        let data_b = vec![34u8; 4096];
+        vol.write(3, &data_b).unwrap();
+        vol.flush_wal().unwrap();
+        for ulid in pending_ulids(&base) {
+            vol.materialise_segment(ulid).unwrap();
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        vol.snapshot().unwrap();
+
+        // DedupWrite seed=0: LBA 0 (Data) + LBA 6 (DedupRef), same hash.
+        let dedup_data_0 = vec![0u8; 4096];
+        vol.write(0, &dedup_data_0).unwrap();
+        vol.write(6, &dedup_data_0).unwrap();
+        vol.flush_wal().unwrap();
+
+        // DedupWrite seed=1: overwrite both LBAs with new data.
+        let dedup_data_1 = vec![1u8; 4096];
+        vol.write(0, &dedup_data_1).unwrap();
+        vol.write(6, &dedup_data_1).unwrap();
+
+        // Repack: the post-snapshot segment (seed=0) is now fully dead.
+        // min_live_ratio=0.01 so the segment (0% live) is eligible.
+        // Before the fix this left the segment file on disk.
+        vol.repack(0.01).unwrap();
+
+        // The fully-dead segment must have been deleted.
+        let ulids = pending_ulids(&base);
+        assert!(
+            ulids.is_empty(),
+            "repack should delete fully-dead segment, but found: {ulids:?}"
+        );
+
+        // DrainWithMaterialise: flush the WAL (seed=1), materialise, promote.
+        // Before the fix, materialise_segment would panic here because the
+        // stale segment still existed and its DedupRef's hash was gone from
+        // the extent index.
+        vol.flush_wal().unwrap();
+        for ulid in pending_ulids(&base) {
+            vol.materialise_segment(ulid).unwrap();
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        // Verify reads.
+        assert_eq!(vol.read(0, 1).unwrap(), dedup_data_1, "LBA 0");
+        assert_eq!(vol.read(6, 1).unwrap(), dedup_data_1, "LBA 6");
+        assert_eq!(vol.read(2, 1).unwrap(), data_a, "LBA 2 (pre-snapshot)");
+        assert_eq!(vol.read(3, 1).unwrap(), data_b, "LBA 3 (pre-snapshot)");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Known failure: proptest minimal reproducer for dedup canonical overwrite
+    /// data loss. When PopulateFetched overwrites the extent index entry for a
+    /// hash that a DedupRef depends on, then DrainLocal removes pending/, then
+    /// GC runs, the thin ref's canonical body is lost. After crash, LBA 4
+    /// reads zeros instead of the expected data.
+    ///
+    /// Un-ignore when the fix lands.
+    #[test]
+    #[ignore]
+    fn proptest_minimal_dedup_overwrite_data_loss() {
+        let base = keyed_temp_dir();
+        let fork_dir = base.clone();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // DedupWrite: write [1u8; 4096] to LBA 0 and LBA 4 (dedup hit on LBA 4).
+        let data = [1u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.write(4, &data).unwrap();
+
+        // Flush — promotes WAL to pending/.
+        vol.flush_wal().unwrap();
+
+        // PopulateFetched: write different data to cache for LBA 0,
+        // overwriting the extent index entry for the original hash.
+        let (pop_ulid, _) = vol.gc_checkpoint().unwrap();
+        {
+            // Use the common helper pattern from tests/common/mod.rs.
+            let index_dir = fork_dir.join("index");
+            let cache_dir = fork_dir.join("cache");
+            let _ = fs::create_dir_all(&index_dir);
+            let _ = fs::create_dir_all(&cache_dir);
+
+            let seed = 128u8;
+            let pop_data = vec![seed; 4096];
+            let pop_hash = blake3::hash(&pop_data);
+            let mut entries = vec![segment::SegmentEntry::new_data(
+                pop_hash,
+                0,
+                1,
+                segment::SegmentFlags::empty(),
+                pop_data,
+            )];
+
+            let signer =
+                crate::signing::load_signer(&fork_dir, crate::signing::VOLUME_KEY_FILE).unwrap();
+            let tmp = cache_dir.join(format!("{pop_ulid}.tmp"));
+            let bss = segment::write_segment(&tmp, &mut entries, signer.as_ref()).unwrap();
+            let bytes = fs::read(&tmp).unwrap();
+            fs::remove_file(&tmp).unwrap();
+
+            let s = pop_ulid.to_string();
+            fs::write(index_dir.join(format!("{s}.idx")), &bytes[..bss as usize]).unwrap();
+            fs::write(cache_dir.join(format!("{s}.body")), &bytes[bss as usize..]).unwrap();
+            segment::set_present_bit(&cache_dir.join(format!("{s}.present")), 0, 1).unwrap();
+        }
+
+        // DrainLocal: promote all pending segments to index/ + cache/.
+        {
+            let pending = fork_dir.join("pending");
+            let index_dir = fork_dir.join("index");
+            let cache_dir = fork_dir.join("cache");
+            let _ = fs::create_dir_all(&index_dir);
+            let _ = fs::create_dir_all(&cache_dir);
+            if let Ok(entries) = fs::read_dir(&pending) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().into_string().unwrap();
+                    if name.contains('.') {
+                        continue;
+                    }
+                    let file_data = fs::read(entry.path()).unwrap();
+                    if file_data.len() < 96 {
+                        continue;
+                    }
+                    let entry_count = u32::from_le_bytes([
+                        file_data[8],
+                        file_data[9],
+                        file_data[10],
+                        file_data[11],
+                    ]);
+                    let index_length = u32::from_le_bytes([
+                        file_data[12],
+                        file_data[13],
+                        file_data[14],
+                        file_data[15],
+                    ]);
+                    let inline_length = u32::from_le_bytes([
+                        file_data[16],
+                        file_data[17],
+                        file_data[18],
+                        file_data[19],
+                    ]);
+                    let bss = 96 + index_length as usize + inline_length as usize;
+                    if file_data.len() < bss {
+                        continue;
+                    }
+                    let _ = fs::write(index_dir.join(format!("{name}.idx")), &file_data[..bss]);
+                    let _ = fs::write(cache_dir.join(format!("{name}.body")), &file_data[bss..]);
+                    let bitset_len = (entry_count as usize).div_ceil(8);
+                    let _ = fs::write(
+                        cache_dir.join(format!("{name}.present")),
+                        vec![0xFFu8; bitset_len],
+                    );
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        // CoordGcLocal: run GC.
+        {
+            let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+            vol.flush_wal().unwrap();
+            // Need at least 2 segments for GC; use all available.
+            let idx_files = segment::collect_idx_files(&fork_dir.join("index")).unwrap();
+            if idx_files.len() >= 2 {
+                let to_delete = {
+                    use crate::{extentindex, lbamap};
+                    let rebuild_chain = vec![(fork_dir.clone(), None)];
+                    let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+                    let _live_hashes = lba_map.live_hashes();
+                    let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
+
+                    let vk = crate::signing::load_verifying_key(
+                        &fork_dir,
+                        crate::signing::VOLUME_PUB_FILE,
+                    )
+                    .unwrap();
+                    let (ephemeral_signer, _) = crate::signing::generate_ephemeral_signer();
+
+                    let gc_dir = fork_dir.join("gc");
+                    let _ = fs::create_dir_all(&gc_dir);
+
+                    // Build candidates from all .idx files
+                    let mut candidates: Vec<(Ulid, PathBuf)> = idx_files
+                        .iter()
+                        .filter_map(|p| {
+                            let stem = p.file_stem()?.to_str()?;
+                            let ulid = Ulid::from_string(stem).ok()?;
+                            Some((ulid, p.clone()))
+                        })
+                        .collect();
+                    candidates.sort_by_key(|(u, _)| *u);
+
+                    // Read and compact
+                    let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
+                    let mut source_ulids: Vec<Ulid> = Vec::new();
+                    for (ulid, path) in &candidates {
+                        let Ok((_bss, mut seg_entries)) =
+                            segment::read_and_verify_segment_index(path, &vk)
+                        else {
+                            continue;
+                        };
+                        let body_path = fork_dir.join("cache").join(format!("{}.body", ulid));
+                        if segment::read_extent_bodies(&body_path, 0, &mut seg_entries).is_err() {
+                            continue;
+                        }
+                        for e in seg_entries {
+                            if e.kind == EntryKind::DedupRef {
+                                continue;
+                            }
+                            let lba_live = lba_map.hash_at(e.start_lba) == Some(e.hash);
+                            let extent_live = extent_index
+                                .lookup(&e.hash)
+                                .is_some_and(|loc| loc.segment_id == *ulid);
+                            if lba_live || extent_live {
+                                source_ulids.push(*ulid);
+                                all_entries.push(e);
+                            }
+                        }
+                    }
+
+                    if !all_entries.is_empty() {
+                        let tmp = gc_dir.join(format!("{gc_ulid}.tmp"));
+                        let final_path = gc_dir.join(gc_ulid.to_string());
+                        let new_bss = segment::write_segment(
+                            &tmp,
+                            &mut all_entries,
+                            ephemeral_signer.as_ref(),
+                        )
+                        .unwrap();
+                        fs::rename(&tmp, &final_path).unwrap();
+
+                        let handoff_lines: Vec<HandoffLine> = all_entries
+                            .iter()
+                            .zip(source_ulids.iter())
+                            .filter(|(e, _)| e.kind != EntryKind::DedupRef)
+                            .map(|(e, src)| HandoffLine::Repack {
+                                hash: e.hash,
+                                old_ulid: *src,
+                                new_ulid: gc_ulid,
+                                new_offset: new_bss + e.stored_offset,
+                            })
+                            .collect();
+                        let _ = fs::write(
+                            gc_dir.join(format!("{gc_ulid}.pending")),
+                            crate::gc::format_handoff_file(handoff_lines),
+                        );
+                    }
+
+                    candidates
+                        .iter()
+                        .map(|(_, p)| p.clone())
+                        .collect::<Vec<_>>()
+                };
+                let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                if applied > 0 {
+                    for path in &to_delete {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+
+        // Crash: drop and reopen.
+        drop(vol);
+        let vol = Volume::open(&base, &base).unwrap();
+
+        // Assert LBA 4 reads [1u8; 4096] — the dedup ref target.
+        // This is the assertion that currently fails due to the known bug.
+        assert_eq!(
+            vol.read(4, 1).unwrap(),
+            vec![1u8; 4096],
+            "LBA 4 (dedup ref) must read back original data after GC + crash"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -4042,7 +4914,7 @@ mod tests {
             .file_name()
             .into_string()
             .unwrap();
-        simulate_upload(&vol);
+        simulate_upload(&mut vol);
 
         // Coordinator GC: compact into new segment, write .pending.
         let new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
@@ -4158,7 +5030,7 @@ mod tests {
                 .file_name()
                 .into_string()
                 .unwrap();
-            simulate_upload(&vol);
+            simulate_upload(&mut vol);
 
             // Coordinator GC: staged segment in gc/<new_ulid> + .pending written.
             // Old segment body intentionally NOT deleted — coordinator waits for .applied.
@@ -4254,7 +5126,7 @@ mod tests {
                 .file_name()
                 .into_string()
                 .unwrap();
-            simulate_upload(&vol);
+            simulate_upload(&mut vol);
 
             new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
         }

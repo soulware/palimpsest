@@ -16,10 +16,10 @@ mod common;
 /// After correctly evicting local segment bodies (with coordinator-written
 /// `index/*.idx` already present), the LBA map survives a crash+reopen.
 ///
-/// `drain_local` simulates the coordinator writing `index/<ulid>.idx` +
-/// `cache/<ulid>.body` after S3 upload.  Evict then deletes the body.
-/// After a restart, `Volume::open` rebuilds the LBA map from `index/*.idx`
-/// and subsequent reads fall through to the `SegmentFetcher` for body bytes.
+/// `drain_with_materialise` simulates the coordinator drain: materialise thin
+/// refs then promote to `index/<ulid>.idx` + `cache/<ulid>.body`.  Evict then
+/// deletes the body.  After a restart, `Volume::open` rebuilds the LBA map
+/// from `index/*.idx` and subsequent reads fall through to the `SegmentFetcher`.
 #[test]
 fn evict_then_crash_data_survives() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -30,10 +30,9 @@ fn evict_then_crash_data_survives() {
     vol.write(0, &[0xAB; 4096]).unwrap();
     vol.write(1, &[0xCD; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    // drain_local: pending/ → index/<ulid>.idx + cache/<ulid>.body + cache/<ulid>.present
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
-    // Simulate evict: delete cache/ body files (index/.idx already present from drain_local).
+    // Simulate evict: delete cache/ body files (index/.idx already present from drain).
     let cache_dir = fork_dir.join("cache");
     for entry in fs::read_dir(&cache_dir).unwrap() {
         let entry = entry.unwrap();
@@ -68,7 +67,7 @@ fn evict_without_idx_loses_lba_map() {
 
     vol.write(0, &[0xAB; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     // Broken evict: delete index/*.idx (coordinator never committed to S3),
     // then delete the body — no trace remains.

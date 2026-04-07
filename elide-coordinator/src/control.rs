@@ -101,6 +101,25 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
     }
 }
 
+/// Materialise a pending segment: rewrite thin DedupRef → fat MaterializedRef
+/// before S3 upload. Called before `upload_segment`.
+///
+/// Returns `true` on success. Returns `false` if the socket is absent or fails.
+pub async fn materialise_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
+    let req = format!("materialise {ulid}");
+    match call(fork_dir, &req).await {
+        Some(resp) if resp.trim() == "ok" => true,
+        Some(resp) => {
+            warn!(
+                "[control] materialise {ulid} for {} returned unexpected response: {resp:?}",
+                fork_dir.display()
+            );
+            false
+        }
+        None => false,
+    }
+}
+
 /// Promote a segment to the volume's local cache after confirmed S3 upload.
 ///
 /// Sends `promote <ulid>` to the volume's control socket.  The volume copies
