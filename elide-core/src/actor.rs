@@ -271,7 +271,11 @@ impl VolumeActor {
                             let _ = reply.send(self.volume.materialise_segment(ulid));
                         }
                         VolumeRequest::Promote { ulid, reply } => {
-                            let _ = reply.send(self.volume.promote_segment(ulid));
+                            let result = self.volume.promote_segment(ulid);
+                            if result.is_ok() {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Snapshot { reply } => {
                             let result = self.volume.snapshot().map(|u| u.to_string());
