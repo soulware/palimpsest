@@ -1321,6 +1321,20 @@ impl Volume {
             )));
         };
 
+        // For drain path: prefer the .materialized sidecar (fat variant) over
+        // the original pending segment. The .materialized file matches what was
+        // uploaded to S3 — its index has MaterializedRef entries (not thin
+        // DedupRef), so the .idx file and cache body are consistent with S3.
+        let mat_path = self
+            .base_dir
+            .join("pending")
+            .join(format!("{ulid_str}.materialized"));
+        let promote_src = if is_drain && mat_path.try_exists()? {
+            &mat_path
+        } else {
+            &src_path
+        };
+
         // Write index/<ulid>.idx now — after confirmed S3 upload — so that
         // idx presence ↔ segment confirmed in S3 (restored invariant).
         // This must happen before deleting old idx files (GC path below) so
@@ -1328,17 +1342,13 @@ impl Volume {
         let index_dir = self.base_dir.join("index");
         fs::create_dir_all(&index_dir)?;
         let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-        segment::extract_idx(&src_path, &idx_path)?;
+        segment::extract_idx(promote_src, &idx_path)?;
 
         fs::create_dir_all(&cache_dir)?;
-        segment::promote_to_cache(&src_path, &body_path, &present_path)?;
+        segment::promote_to_cache(promote_src, &body_path, &present_path)?;
 
         if is_drain {
             // Clean up .materialized sidecar if materialise_segment produced one.
-            let mat_path = self
-                .base_dir
-                .join("pending")
-                .join(format!("{ulid_str}.materialized"));
             let _ = fs::remove_file(&mat_path);
             fs::remove_file(&pending_path)?;
         } else {
