@@ -159,6 +159,14 @@ pub async fn drain_pending(
         };
         let segment_path = entry.path();
 
+        // Materialise thin DedupRef → fat MaterializedRef before upload.
+        // S3 segments must be self-contained (no thin refs).
+        if !crate::control::materialise_segment(vol_dir, ulid).await {
+            warn!("materialise {name}: no process listening; will retry next tick");
+            failed += 1;
+            continue;
+        }
+
         match upload_segment(&segment_path, name, volume_id, store).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling

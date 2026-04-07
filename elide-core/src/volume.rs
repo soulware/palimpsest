@@ -1360,6 +1360,86 @@ impl Volume {
         Ok(())
     }
 
+    /// Rewrite `pending/<ulid>` so every thin DedupRef is replaced with a
+    /// MaterializedRef that carries its body bytes. Called by the coordinator
+    /// before reading the segment for S3 upload.
+    ///
+    /// Idempotent: if the segment has no thin DedupRef entries, returns Ok
+    /// immediately without rewriting.
+    ///
+    /// The rewrite is atomic (write `.tmp`, rename). The extent index is NOT
+    /// updated — the canonical entry continues to be the authoritative read
+    /// source. After upload + promote the pending file is deleted anyway.
+    pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let ulid_str = ulid.to_string();
+        let pending_dir = self.base_dir.join("pending");
+        let seg_path = pending_dir.join(&ulid_str);
+
+        let (body_section_start, entries) =
+            segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
+
+        // Fast path: nothing to materialise.
+        let has_thin = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
+        if !has_thin {
+            return Ok(());
+        }
+
+        // Build new entries, replacing thin DedupRef with fat MaterializedRef.
+        let mut new_entries: Vec<segment::SegmentEntry> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.kind != EntryKind::DedupRef {
+                // DATA, MaterializedRef, Zero — read body if applicable.
+                new_entries.push(entry);
+                continue;
+            }
+            // Thin DedupRef → look up canonical location in extent index.
+            let loc = self.extent_index.lookup(&entry.hash).ok_or_else(|| {
+                io::Error::other(format!(
+                    "materialise {ulid_str}: hash {} not in extent index",
+                    entry.hash.to_hex()
+                ))
+            })?;
+            // Read body bytes from the canonical segment.
+            let canonical_path =
+                self.find_segment_file(loc.segment_id, loc.body_section_start, loc.entry_idx)?;
+            let is_body = canonical_path.extension().is_some_and(|e| e == "body");
+            let file_offset = if is_body {
+                loc.body_offset
+            } else {
+                loc.body_section_start + loc.body_offset
+            };
+            let mut f = fs::File::open(&canonical_path)?;
+            f.seek(SeekFrom::Start(file_offset))?;
+            let mut data = vec![0u8; loc.body_length as usize];
+            f.read_exact(&mut data)?;
+
+            let flags = if loc.compressed {
+                segment::SegmentFlags::COMPRESSED
+            } else {
+                segment::SegmentFlags::empty()
+            };
+            new_entries.push(segment::SegmentEntry::new_materialized_ref(
+                entry.hash,
+                entry.start_lba,
+                entry.lba_length,
+                flags,
+                data,
+            ));
+        }
+
+        // Read body bytes for existing DATA/MaterializedRef entries.
+        segment::read_extent_bodies(&seg_path, body_section_start, &mut new_entries)?;
+
+        // Atomic rewrite.
+        let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
+        segment::write_segment(&tmp_path, &mut new_entries, self.signer.as_ref())?;
+        fs::rename(&tmp_path, &seg_path)?;
+        segment::fsync_dir(&seg_path)?;
+        Ok(())
+    }
+
     /// Flush the current WAL to a segment in this node's `pending/`, update
     /// the extent index, and clear `pending_entries`. The WAL file is deleted.
     ///
