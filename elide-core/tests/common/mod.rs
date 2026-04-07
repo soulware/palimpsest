@@ -245,10 +245,18 @@ fn compact_candidates_inner(
                 }
                 continue;
             }
+            // DATA entries are content-addressed: the extent_index tracks a
+            // single canonical location per hash.  When the same hash appears
+            // in multiple segments (e.g. a regular write and a later
+            // materialised dedup ref), only one segment is "canonical" in the
+            // extent_index — the other looks extent-dead even though its LBA
+            // mapping is still live.  Check lba_live first (same as
+            // MaterializedRef above) so we never drop a live LBA mapping.
+            let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = extent_index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == *ulid);
-            if extent_live && live_hashes.contains(&entry.hash) {
+            if lba_live || (extent_live && live_hashes.contains(&entry.hash)) {
                 source_ulids.push(*ulid);
                 all_entries.push(entry);
             } else if extent_live {
