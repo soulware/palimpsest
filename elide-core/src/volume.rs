@@ -1334,6 +1334,12 @@ impl Volume {
         segment::promote_to_cache(&src_path, &body_path, &present_path)?;
 
         if is_drain {
+            // Clean up .materialized sidecar if materialise_segment produced one.
+            let mat_path = self
+                .base_dir
+                .join("pending")
+                .join(format!("{ulid_str}.materialized"));
+            let _ = fs::remove_file(&mat_path);
             fs::remove_file(&pending_path)?;
         } else {
             // GC path: delete index/<old>.idx for each segment consumed by this
@@ -1360,29 +1366,38 @@ impl Volume {
         Ok(())
     }
 
-    /// Rewrite `pending/<ulid>` so every thin DedupRef is replaced with a
-    /// MaterializedRef that carries its body bytes. Called by the coordinator
-    /// before reading the segment for S3 upload.
+    /// Produce `pending/<ulid>.materialized` — a self-contained segment with
+    /// every thin DedupRef replaced by a fat MaterializedRef. Called by the
+    /// coordinator before reading the segment for S3 upload.
     ///
-    /// Idempotent: if the segment has no thin DedupRef entries, returns Ok
-    /// immediately without rewriting.
+    /// If the segment already has no thin DedupRef entries, a hard link to
+    /// the original is created (zero-cost copy). Otherwise a new fat segment
+    /// is written alongside the original.
     ///
-    /// The rewrite is atomic (write `.tmp`, rename). The extent index is NOT
-    /// updated — the canonical entry continues to be the authoritative read
-    /// source. After upload + promote the pending file is deleted anyway.
+    /// The original `pending/<ulid>` is never modified — the extent index
+    /// stays valid and reads continue to use the original file.
+    ///
+    /// Idempotent: if `.materialized` already exists, returns Ok immediately.
+    /// `promote_segment` cleans up `.materialized` alongside the original.
     pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
         use std::io::{Read, Seek, SeekFrom};
 
         let ulid_str = ulid.to_string();
         let pending_dir = self.base_dir.join("pending");
         let seg_path = pending_dir.join(&ulid_str);
+        let mat_path = pending_dir.join(format!("{ulid_str}.materialized"));
+
+        if mat_path.try_exists()? {
+            return Ok(());
+        }
 
         let (body_section_start, entries) =
             segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
 
-        // Fast path: nothing to materialise.
+        // Fast path: no thin refs — hard link the original.
         let has_thin = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
         if !has_thin {
+            fs::hard_link(&seg_path, &mat_path)?;
             return Ok(());
         }
 
@@ -1390,7 +1405,6 @@ impl Volume {
         let mut new_entries: Vec<segment::SegmentEntry> = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.kind != EntryKind::DedupRef {
-                // DATA, MaterializedRef, Zero — read body if applicable.
                 new_entries.push(entry);
                 continue;
             }
@@ -1449,11 +1463,11 @@ impl Volume {
             );
         }
 
-        // Atomic rewrite.
+        // Write to .tmp then rename to .materialized (atomic).
         let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
         segment::write_segment(&tmp_path, &mut new_entries, self.signer.as_ref())?;
-        fs::rename(&tmp_path, &seg_path)?;
-        segment::fsync_dir(&seg_path)?;
+        fs::rename(&tmp_path, &mat_path)?;
+        segment::fsync_dir(&mat_path)?;
         Ok(())
     }
 

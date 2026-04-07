@@ -160,14 +160,18 @@ pub async fn drain_pending(
         let segment_path = entry.path();
 
         // Materialise thin DedupRef → fat MaterializedRef before upload.
-        // S3 segments must be self-contained (no thin refs).
-        if !crate::control::materialise_segment(vol_dir, ulid).await {
-            warn!("materialise {name}: no process listening; will retry next tick");
-            failed += 1;
-            continue;
-        }
+        // Best-effort: if the volume is not running, proceed anyway — the
+        // sanity check in upload_segment will reject segments with thin refs.
+        // Segments with no thin refs upload fine without materialisation.
+        crate::control::materialise_segment(vol_dir, ulid).await;
+        let mat_path = pending_dir.join(format!("{name}.materialized"));
+        let upload_path = if mat_path.exists() {
+            &mat_path
+        } else {
+            &segment_path
+        };
 
-        match upload_segment(&segment_path, name, volume_id, store).await {
+        match upload_segment(upload_path, name, volume_id, store).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
