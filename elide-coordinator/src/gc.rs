@@ -191,9 +191,10 @@ pub async fn gc_fork(
         let candidate = all_stats.remove(pos);
         repack_bytes = candidate.dead_lba_bytes();
         tracing::info!(
-            "[gc] repack candidate: {} density={:.3} live_lba={} dead_lba={} \
+            "[gc] repack: {} → {} density={:.3} live_lba={} dead_lba={} \
              live_entries={} removed_hashes={}",
             candidate.ulid_str,
+            repack_ulid,
             candidate.density(),
             candidate.live_lba_bytes,
             candidate.dead_lba_bytes(),
