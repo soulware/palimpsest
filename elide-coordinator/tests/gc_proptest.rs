@@ -32,7 +32,7 @@ use proptest::prelude::*;
 /// Simulate coordinator drain: for each file in pending/, promote the segment
 /// body to cache/ and remove the pending file.  The volume already wrote
 /// `index/<ulid>.idx` at WAL flush time, so drain does not write it again.
-fn simulate_upload(vol: &Volume, dir: &Path) {
+fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
@@ -59,7 +59,7 @@ fn simulate_upload(vol: &Volume, dir: &Path) {
 /// Simulate the coordinator promote IPC for each pending gc output:
 /// copies gc/<new> → cache/<new>.{body,present}, then deletes gc/<new>.
 /// This mirrors what the volume process does when it receives "promote <ulid>".
-fn promote_gc_outputs(vol: &Volume, dir: &Path) {
+fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     let gc_dir = dir.join("gc");
     let Ok(entries) = fs::read_dir(&gc_dir) else {
         return;
@@ -198,7 +198,7 @@ proptest! {
                     // Drain: volume already wrote index/ at flush; simulate
                     // coordinator drain (upload + promote IPC) by calling
                     // promote_segment directly on the volume.
-                    simulate_upload(&vol, fork_dir);
+                    simulate_upload(&mut vol, fork_dir);
 
                     // Count idx files before gc_checkpoint so we can detect
                     // any new segments it writes (WAL flush).  Those segments
@@ -234,7 +234,7 @@ proptest! {
                     // Simulate coordinator promote IPC: copies gc/<new> → cache/<new>,
                     // deletes gc/<new>.  In production this is an IPC round-trip;
                     // here we call vol.promote_segment directly.
-                    promote_gc_outputs(&vol, fork_dir);
+                    promote_gc_outputs(&mut vol, fork_dir);
 
                     // Actor step: evict old cache files after publishing the new snapshot.
                     vol.evict_applied_gc_cache();
@@ -349,7 +349,7 @@ proptest! {
                     // Drain: volume already wrote index/ at flush; simulate
                     // coordinator drain (upload + promote IPC) by calling
                     // promote_segment directly on the volume.
-                    simulate_upload(&vol, fork_dir);
+                    simulate_upload(&mut vol, fork_dir);
 
                     // gc_checkpoint flushes the WAL under a pre-minted ULID
                     // (u_wal > u_sweep) and returns (u_repack, u_sweep) from
@@ -371,7 +371,7 @@ proptest! {
                     let _ = vol.apply_gc_handoffs();
 
                     // Step 3: simulate coordinator promote IPC + actor evict.
-                    promote_gc_outputs(&vol, fork_dir);
+                    promote_gc_outputs(&mut vol, fork_dir);
                     vol.evict_applied_gc_cache();
 
                     // Step 4: upload new segment to S3, delete old S3 objects.

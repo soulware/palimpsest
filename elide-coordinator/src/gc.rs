@@ -1179,74 +1179,39 @@ mod tests {
         assert_eq!(find_least_dense(&stats, 0.7), None);
     }
 
-    /// Simulate coordinator drain: for each file in `pending/`, write
-    /// `index/<ulid>.idx`, `cache/<ulid>.body`, and `cache/<ulid>.present`,
-    /// then remove the pending file.  Mirrors what `drain_pending` does after a
-    /// successful S3 upload.
-    fn simulate_upload(dir: &Path) {
-        const HEADER_LEN: usize = 96;
+    /// Materialise, upload to store, and promote all pending segments.
+    /// Mirrors the real coordinator path: materialise → S3 PUT → promote.
+    async fn drain_with_materialise(
+        vol: &mut elide_core::volume::Volume,
+        dir: &Path,
+        volume_id: &str,
+        store: &Arc<dyn ObjectStore>,
+    ) {
         let pending_dir = dir.join("pending");
-        let index_dir = dir.join("index");
-        let cache_dir = dir.join("cache");
-        fs::create_dir_all(&index_dir).unwrap();
-        fs::create_dir_all(&cache_dir).unwrap();
-
+        let mut ulids = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-            let path = entry.path();
             let name = entry.file_name();
-            let Some(ulid_str) = name.to_str() else {
-                continue;
-            };
-            if ulid_str.ends_with(".tmp") {
+            let Some(s) = name.to_str() else { continue };
+            if s.contains('.') {
                 continue;
             }
-            let data = fs::read(&path).unwrap();
-            assert!(data.len() >= HEADER_LEN, "segment too short");
-
-            let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-            let body_section_start = HEADER_LEN + index_length as usize + inline_length as usize;
-
-            // Write .idx (header + index section).
-            let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-            fs::write(&idx_path, &data[..body_section_start]).unwrap();
-
-            // Write .body and .present.
-            let body_bytes = &data[body_section_start..];
-            let bitset_len = (entry_count as usize).div_ceil(8);
-            fs::write(cache_dir.join(format!("{ulid_str}.body")), body_bytes).unwrap();
-            fs::write(
-                cache_dir.join(format!("{ulid_str}.present")),
-                vec![0xFFu8; bitset_len],
-            )
-            .unwrap();
-
-            fs::remove_file(&path).unwrap();
+            if let Ok(ulid) = Ulid::from_string(s) {
+                ulids.push(ulid);
+            }
         }
-    }
-
-    /// Upload all segments currently in `pending/` to the in-memory store under
-    /// the given volume_id, then run `simulate_upload` to drain them locally.
-    /// Used by tests that exercise the S3-fetch path in `compact_segments`.
-    async fn simulate_upload_with_store(dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
-        let pending_dir = dir.join("pending");
-        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-            let name = entry.file_name();
-            let Some(ulid_str) = name.to_str() else {
-                continue;
-            };
-            if ulid_str.ends_with(".tmp") {
-                continue;
-            }
-            let data = fs::read(entry.path()).unwrap();
-            let key = segment_key(volume_id, ulid_str).unwrap();
+        for &ulid in &ulids {
+            vol.materialise_segment(ulid).unwrap();
+            // Upload the .materialized file (fat variant) to the store.
+            let ulid_str = ulid.to_string();
+            let mat_path = pending_dir.join(format!("{ulid_str}.materialized"));
+            let data = fs::read(&mat_path).unwrap();
+            let key = segment_key(volume_id, &ulid_str).unwrap();
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
                 .unwrap();
+            vol.promote_segment(ulid).unwrap();
         }
-        simulate_upload(dir);
     }
 
     // --- apply_done_handoffs tests ---
@@ -1817,17 +1782,18 @@ mod tests {
 
         let content = [0xAAu8; 4096];
 
-        // Step 1: write [0xAA; 4096] to lba 0, flush, simulate drain.
+        // Step 1: write [0xAA; 4096] to lba 0, flush, materialise, drain.
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        simulate_upload_with_store(dir, "test-vol", &store).await;
+        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
 
-        // Step 2: write the same content to lba 1, flush, simulate drain.
-        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2.
+        // Step 2: write the same content to lba 1, flush, materialise, drain.
+        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2,
+        // which materialise_segment converts to MaterializedRef before upload.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        simulate_upload_with_store(dir, "test-vol", &store).await;
+        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
 
         drop(vol);
 
