@@ -376,9 +376,22 @@ pub async fn apply_done_handoffs(
                 elide_core::signing::VOLUME_PUB_FILE,
             )
             .context("loading volume verifying key")?;
-            segment::read_and_verify_segment_index(&gc_body, &vk).with_context(|| {
-                format!("signature verification failed for compacted segment {new_ulid_str}")
-            })?;
+            let (_, gc_entries) = segment::read_and_verify_segment_index(&gc_body, &vk)
+                .with_context(|| {
+                    format!("signature verification failed for compacted segment {new_ulid_str}")
+                })?;
+
+            // Sanity check: GC output must not contain thin DedupRef.
+            let thin_count = gc_entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::DedupRef)
+                .count();
+            if thin_count > 0 {
+                return Err(anyhow::anyhow!(
+                    "compacted segment {new_ulid_str} has {thin_count} thin DedupRef entries; \
+                     refusing to upload — this would lose body data when old segments are deleted"
+                ));
+            }
 
             let key = segment_key(volume_id, &new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
@@ -621,6 +634,20 @@ fn collect_stats(
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
+        // Thin DedupRef should never appear in S3 segments (upload sanity
+        // check rejects them). If one slipped through (legacy data or bug),
+        // skip this segment entirely — compacting it would lose body bytes
+        // because the canonical segment referenced by the thin ref may be
+        // deleted by GC cleanup.
+        let has_thin_ref = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
+        if has_thin_ref {
+            warn!(
+                "[gc] skipping {ulid_str}: segment contains thin DedupRef entries \
+                 (should not appear in S3); re-upload with materialise_segment first"
+            );
+            continue;
+        }
+
         for entry in entries {
             if entry.kind == EntryKind::Inline {
                 continue;
@@ -843,49 +870,49 @@ async fn compact_segments(
     // Write to a tmp file first; rename into gc/ for staging.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
 
-    let mut new_entries: Vec<SegmentEntry> = all_live
-        .iter_mut()
-        .map(|(_, e)| {
-            match e.kind {
-                EntryKind::Zero => {
-                    // Zero extents have no body; preserve the LBA→ZERO_HASH mapping
-                    // so the volume continues to mask ancestor data after compaction.
-                    SegmentEntry::new_zero(e.start_lba, e.lba_length)
-                }
-                EntryKind::DedupRef => {
-                    // Thin dedup-ref: no body in the source segment. Preserve as
-                    // a thin ref so the LBA→hash mapping is kept, without fabricating
-                    // a DATA entry with stored_length=0.
-                    SegmentEntry::new_dedup_ref(e.hash, e.start_lba, e.lba_length)
-                }
-                EntryKind::Data | EntryKind::MaterializedRef => {
-                    // Both have body bytes; emit as plain Data in GC output.
-                    let flags = if e.compressed {
-                        segment::SegmentFlags::COMPRESSED
-                    } else {
-                        segment::SegmentFlags::empty()
-                    };
-                    SegmentEntry::new_data(
-                        e.hash,
-                        e.start_lba,
-                        e.lba_length,
-                        flags,
-                        std::mem::take(&mut e.data),
-                    )
-                }
-                EntryKind::Inline => {
-                    // Inline entries are filtered in collect_stats; should not appear here.
-                    SegmentEntry::new_data(
-                        e.hash,
-                        e.start_lba,
-                        e.lba_length,
-                        segment::SegmentFlags::empty(),
-                        std::mem::take(&mut e.data),
-                    )
-                }
+    let mut new_entries: Vec<SegmentEntry> = Vec::with_capacity(all_live.len());
+    for (_, e) in &mut all_live {
+        match e.kind {
+            EntryKind::Zero => {
+                new_entries.push(SegmentEntry::new_zero(e.start_lba, e.lba_length));
             }
-        })
-        .collect();
+            EntryKind::DedupRef => {
+                // collect_stats skips segments with thin refs, so this
+                // should not happen. Drop the entry rather than emitting
+                // a bodyless ref that would cause data loss on old-segment
+                // deletion. The apply_done_handoffs sanity check catches
+                // this before upload.
+                warn!(
+                    "[gc] dropping thin DedupRef {} from compaction output \
+                     (should have been filtered by collect_stats)",
+                    e.hash.to_hex()
+                );
+            }
+            EntryKind::Data | EntryKind::MaterializedRef => {
+                let flags = if e.compressed {
+                    segment::SegmentFlags::COMPRESSED
+                } else {
+                    segment::SegmentFlags::empty()
+                };
+                new_entries.push(SegmentEntry::new_data(
+                    e.hash,
+                    e.start_lba,
+                    e.lba_length,
+                    flags,
+                    std::mem::take(&mut e.data),
+                ));
+            }
+            EntryKind::Inline => {
+                new_entries.push(SegmentEntry::new_data(
+                    e.hash,
+                    e.start_lba,
+                    e.lba_length,
+                    segment::SegmentFlags::empty(),
+                    std::mem::take(&mut e.data),
+                ));
+            }
+        }
+    }
 
     // The coordinator does not hold the volume's private key, so it signs the
     // compacted segment with an ephemeral key.  The volume re-signs it with its
