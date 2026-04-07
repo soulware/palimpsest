@@ -314,6 +314,22 @@ async fn upload_segment(
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
+    // Sanity check: S3 segments must be self-contained. Fail if any thin
+    // DedupRef (stored_length == 0, FLAG_DEDUP_REF without FLAG_MATERIALIZED)
+    // survived materialisation.
+    let (_, entries) = elide_core::segment::read_segment_index(path)
+        .with_context(|| format!("reading index for sanity check: {ulid_str}"))?;
+    let thin_count = entries
+        .iter()
+        .filter(|e| e.kind == elide_core::segment::EntryKind::DedupRef)
+        .count();
+    if thin_count > 0 {
+        anyhow::bail!(
+            "segment {ulid_str} has {thin_count} thin DedupRef entries; \
+             materialise_segment must run before upload"
+        );
+    }
+
     let key = segment_key(volume_id, ulid_str)?;
 
     let data = tokio::fs::read(path)

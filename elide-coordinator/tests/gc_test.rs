@@ -707,7 +707,10 @@ fn drain_failure_skips_gc_and_data_survives() {
     rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &good_store));
 
     // Write more data — this ends up in pending/ after flushing.
-    vol.write(1, &d0).unwrap();
+    // Use unique data (not d0/d1) to avoid a dedup hit that would create
+    // a thin DedupRef — the mock socket does not run materialise_segment.
+    let d2 = [33u8; 4096];
+    vol.write(1, &d2).unwrap();
     vol.flush_wal().unwrap();
 
     // --- Tick N: drain fails ---
@@ -774,7 +777,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     let got0 = vol.read(0, 1).expect("read lba=0 after recovery");
     assert_eq!(got0.as_slice(), &d1, "lba=0 should return D1 after GC");
     let got1 = vol.read(1, 1).expect("read lba=1 after recovery");
-    assert_eq!(got1.as_slice(), &d0, "lba=1 should return D0 after GC");
+    assert_eq!(got1.as_slice(), &d2, "lba=1 should return D2 after GC");
 }
 
 /// Regression test for Bug E: GC restart-safety gap.
