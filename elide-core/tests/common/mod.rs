@@ -11,7 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use elide_core::gc::{HandoffLine, format_handoff_file};
-use elide_core::{extentindex, lbamap, segment, signing};
+use elide_core::{
+    extentindex, lbamap,
+    segment::{self, EntryKind},
+    signing,
+};
 use ulid::Ulid;
 
 /// Create `dir` and write a fresh Ed25519 keypair into it.
@@ -188,7 +192,7 @@ fn compact_candidates_inner(
             continue;
         }
         for entry in entries.drain(..) {
-            if entry.is_dedup_ref {
+            if entry.kind == EntryKind::DedupRef {
                 // Carry a dedup ref only if the LBA still maps to this hash.
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 if lba_live {
@@ -260,7 +264,7 @@ fn compact_candidates_inner(
     let mut handoff_lines: Vec<HandoffLine> = all_entries
         .iter()
         .zip(source_ulids.iter())
-        .filter(|(e, _)| !e.is_dedup_ref)
+        .filter(|(e, _)| e.kind != EntryKind::DedupRef)
         .map(|(e, src_ulid)| HandoffLine::Repack {
             hash: e.hash,
             old_ulid: *src_ulid,

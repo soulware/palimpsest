@@ -77,7 +77,7 @@ use ulid::Ulid;
 use elide_core::extentindex::{self, ExtentIndex};
 use elide_core::gc::{HandoffLine, format_handoff_file};
 use elide_core::lbamap::{self, LbaMap};
-use elide_core::segment::{self, SegmentEntry};
+use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
@@ -622,7 +622,7 @@ fn collect_stats(
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
         for entry in entries {
-            if entry.is_inline {
+            if entry.kind == EntryKind::Inline {
                 continue;
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
@@ -635,7 +635,7 @@ fn collect_stats(
             // where index.lookup(ZERO_HASH) always returns None, causing live
             // zero extents to be silently dropped from GC output — allowing
             // ancestor data to bleed through after compaction in forked volumes.
-            if entry.is_zero_extent {
+            if entry.kind == EntryKind::Zero {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(ZERO_HASH);
                 if lba_live {
                     live_lba_bytes += lba_bytes;
@@ -647,7 +647,7 @@ fn collect_stats(
             // Dedup refs carry a materialised body (same as DATA) and an LBA
             // mapping. A ref is live if the LBA still maps to its hash and the
             // extent index still points to this segment for that hash.
-            if entry.is_dedup_ref {
+            if entry.kind == EntryKind::DedupRef {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 let extent_live = index
                     .lookup(&entry.hash)
@@ -737,7 +737,10 @@ async fn compact_segments(
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
     let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
     for candidate in &mut candidates {
-        let has_body_entries = candidate.live_entries.iter().any(|e| !e.is_zero_extent);
+        let has_body_entries = candidate
+            .live_entries
+            .iter()
+            .any(|e| e.kind != EntryKind::Zero);
 
         if has_body_entries {
             let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
@@ -841,11 +844,11 @@ async fn compact_segments(
     let mut new_entries: Vec<SegmentEntry> = all_live
         .iter_mut()
         .map(|(_, e)| {
-            if e.is_zero_extent {
+            if e.kind == EntryKind::Zero {
                 // Zero extents have no body; preserve the LBA→ZERO_HASH mapping
                 // so the volume continues to mask ancestor data after compaction.
                 SegmentEntry::new_zero(e.start_lba, e.lba_length)
-            } else if e.is_dedup_ref {
+            } else if e.kind == EntryKind::DedupRef {
                 // Dedup-ref entries have no body in the source segment; the
                 // actual extent data lives in an ancestor segment that is NOT
                 // being compacted.  Preserve as a dedup-ref in the output so
@@ -899,7 +902,7 @@ async fn compact_segments(
     // Dead line so apply_done_handoffs deletes the old segment file.
     let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
-        if new_entry.is_zero_extent || new_entry.is_dedup_ref {
+        if new_entry.kind == EntryKind::Zero || new_entry.kind == EntryKind::DedupRef {
             // Zero extents and dedup-ref entries have no body in the new
             // segment and no extent index entries to update.  No Repack line
             // is needed — apply_gc_handoffs must not touch the extent index

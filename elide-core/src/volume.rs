@@ -38,7 +38,8 @@ use ulid::Ulid;
 use crate::{
     extentindex,
     gc::{GcHandoff, GcHandoffState, HandoffLine},
-    lbamap, segment,
+    lbamap,
+    segment::{self, EntryKind},
     ulid_mint::UlidMint,
     writelog,
 };
@@ -539,7 +540,7 @@ impl Volume {
             // Zero extents have no body bytes; DATA and REF entries both do.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| !e.is_zero_extent)
+                .filter(|e| e.kind != EntryKind::Zero)
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -549,7 +550,7 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| !e.is_zero_extent && live.contains(&e.hash))
+                .filter(|e| e.kind != EntryKind::Zero && live.contains(&e.hash))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -558,15 +559,10 @@ impl Volume {
             }
 
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
-                entries.drain(..).partition(|e| {
-                    if e.is_zero_extent {
-                        // Live if the LBA still maps to ZERO_HASH; dead if overwritten.
-                        return self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH);
-                    }
-                    if e.is_dedup_ref {
-                        return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
-                    }
-                    live.contains(&e.hash)
+                entries.drain(..).partition(|e| match e.kind {
+                    EntryKind::Zero => self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH),
+                    EntryKind::DedupRef => self.lbamap.hash_at(e.start_lba) == Some(e.hash),
+                    EntryKind::Data | EntryKind::Inline => live.contains(&e.hash),
                 });
 
             // Remove dead entries from the extent index (only those pointing at
@@ -575,7 +571,7 @@ impl Volume {
             // extent index.
             let mut removed = 0usize;
             for entry in &dead_entries {
-                if entry.is_zero_extent {
+                if entry.kind == EntryKind::Zero {
                     continue;
                 }
                 if self
@@ -612,7 +608,7 @@ impl Volume {
                 stats.new_segments += 1;
 
                 for entry in &live_entries {
-                    if !entry.is_zero_extent {
+                    if entry.kind != EntryKind::Zero {
                         Arc::make_mut(&mut self.extent_index).insert(
                             entry.hash,
                             extentindex::ExtentLocation {
@@ -710,21 +706,22 @@ impl Volume {
                 any_dead = true;
             }
 
-            let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries.drain(..).partition(|e| {
-                if e.is_dedup_ref {
-                    // A dedup ref is only live if the LBA still maps to
-                    // this hash. If the LBA was overwritten with different
-                    // data, carrying the stale ref would reintroduce the
-                    // old mapping after crash + rebuild.
-                    return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
-                }
-                live.contains(&e.hash)
-            });
+            let (live_entries, dead_entries): (Vec<_>, Vec<_>) =
+                entries.drain(..).partition(|e| match e.kind {
+                    EntryKind::DedupRef => {
+                        // A dedup ref is only live if the LBA still maps to
+                        // this hash. If the LBA was overwritten with different
+                        // data, carrying the stale ref would reintroduce the
+                        // old mapping after crash + rebuild.
+                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                    }
+                    _ => live.contains(&e.hash),
+                });
 
             let dead_bytes: u64 = dead_entries.iter().map(|e| e.stored_length as u64).sum();
 
             for entry in &dead_entries {
-                if entry.is_zero_extent {
+                if entry.kind == EntryKind::Zero {
                     continue;
                 }
                 if self
@@ -793,7 +790,7 @@ impl Volume {
             stats.new_segments += 1;
 
             for entry in &merged_live {
-                if !entry.is_zero_extent {
+                if entry.kind != EntryKind::Zero {
                     Arc::make_mut(&mut self.extent_index).insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -1030,7 +1027,7 @@ impl Volume {
             let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
             if let Some((_, ref entries)) = segment_index {
                 for e in entries {
-                    if !e.is_dedup_ref {
+                    if e.kind != EntryKind::DedupRef {
                         carried_hashes.insert(e.hash);
                     }
                 }
@@ -1121,7 +1118,7 @@ impl Volume {
             let mut index_mutated = false;
             if let Some((body_section_start, ref entries)) = segment_index {
                 for (i, e) in entries.iter().enumerate() {
-                    if e.is_dedup_ref {
+                    if e.kind == EntryKind::DedupRef {
                         continue;
                     }
                     // Only update if the extent index still points at the old
@@ -1408,7 +1405,7 @@ impl Volume {
         // REF entries carry materialised body bytes in their own segment —
         // they must be indexed here, not skipped. Zero extents are not indexed.
         for entry in &self.pending_entries {
-            if entry.is_zero_extent {
+            if entry.kind == EntryKind::Zero {
                 continue;
             }
             Arc::make_mut(&mut self.extent_index).insert(
@@ -2397,7 +2394,7 @@ mod tests {
         let (_, entries) = segment::read_segment_index(&seg_path).unwrap();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
-        assert!(e.is_zero_extent);
+        assert_eq!(e.kind, segment::EntryKind::Zero);
         assert_eq!(e.stored_length, 0);
         assert_eq!(e.start_lba, 0);
         assert_eq!(e.lba_length, 16);
@@ -4008,7 +4005,7 @@ mod tests {
         let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
         let handoff_lines: Vec<HandoffLine> = entries
             .iter()
-            .filter(|e| !e.is_dedup_ref)
+            .filter(|e| e.kind != segment::EntryKind::DedupRef)
             .map(|e| HandoffLine::Repack {
                 hash: e.hash,
                 old_ulid: old_ulid_parsed,

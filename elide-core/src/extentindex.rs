@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use log::warn;
 use ulid::Ulid;
 
-use crate::segment;
+use crate::segment::{self, EntryKind};
 use crate::signing;
 
 /// Physical location of an extent within a segment file.
@@ -184,10 +184,10 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     Err(e) => return Err(e),
                 };
             for (raw_idx, entry) in entries.iter().enumerate() {
-                if entry.is_inline {
+                if entry.kind == EntryKind::Inline {
                     continue;
                 }
-                if entry.is_zero_extent {
+                if entry.kind == EntryKind::Zero {
                     continue;
                 }
                 // body_offset is body-relative: the .body file starts at byte 0
@@ -230,7 +230,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 };
 
             for entry in entries {
-                if entry.is_inline || entry.is_zero_extent {
+                if entry.kind == EntryKind::Inline || entry.kind == EntryKind::Zero {
                     continue;
                 }
                 index.insert(
