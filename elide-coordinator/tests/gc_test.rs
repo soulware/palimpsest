@@ -1014,3 +1014,349 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
         "S2 and S3 idx files must survive GC (found {idx_count})"
     );
 }
+
+/// Bug G — GC + restart + dedup write sequences cause "failed to fill whole
+/// buffer" read errors.
+///
+/// Minimal reproductions from gc_oracle proptest.  The read failure occurs
+/// on a previously-written LBA after a GC sweep + restart.  Multiple
+/// minimal sequences trigger the same symptom.
+///
+/// Root cause: TBD — these tests capture the minimal failing sequences so
+/// we can diagnose them.
+#[test]
+fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    // Helper: materialise + promote all pending segments (no S3 upload —
+    // mirrors the proptest's simulate_upload which works locally only).
+    let drain = |vol: &mut Volume| {
+        let pending_dir = fork_dir.join("pending");
+        if let Ok(entries) = fs::read_dir(&pending_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.contains('.') {
+                    continue;
+                }
+                if let Ok(ulid) = ulid::Ulid::from_string(s) {
+                    let _ = vol.materialise_segment(ulid);
+                    let _ = vol.promote_segment(ulid);
+                }
+            }
+        }
+    };
+
+    // Helper: promote GC outputs (gc/<ulid> → cache) and evict old cache.
+    let promote_gc = |vol: &mut Volume| {
+        let gc_dir = fork_dir.join("gc");
+        if let Ok(entries) = fs::read_dir(&gc_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if !name_str.ends_with(".applied") {
+                    continue;
+                }
+                let Some(ulid_str) = name_str.strip_suffix(".applied") else {
+                    continue;
+                };
+                if let Ok(ulid) = ulid::Ulid::from_string(ulid_str) {
+                    let gc_body = gc_dir.join(ulid_str);
+                    if gc_body.exists() {
+                        let _ = vol.promote_segment(ulid);
+                        let _ = fs::remove_file(&gc_body);
+                    }
+                }
+            }
+        }
+        vol.evict_applied_gc_cache();
+    };
+
+    // Helper: run a full GC sweep (drain + checkpoint + gc_fork + handoff +
+    // promote + done).
+    let gc_sweep = |vol: &mut Volume| {
+        drain(vol);
+        let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+        let _ = rt.block_on(gc_fork(
+            fork_dir,
+            "test-vol",
+            &store,
+            &gc_config,
+            repack_ulid,
+            sweep_ulid,
+        ));
+        let _ = vol.apply_gc_handoffs();
+        promote_gc(vol);
+        let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+    };
+
+    // Oracle: track expected value for each LBA.
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    macro_rules! w {
+        ($vol:expr, $lba:expr, $seed:expr) => {{
+            let data = [$seed; 4096];
+            $vol.write($lba as u64, &data).unwrap();
+            oracle.insert($lba as u64, data);
+        }};
+    }
+
+    macro_rules! verify {
+        ($vol:expr, $label:expr) => {
+            for (&lba, expected) in &oracle {
+                let got = $vol
+                    .read(lba, 1)
+                    .unwrap_or_else(|e| panic!("lba {lba} read failed after {}: {e}", $label));
+                assert_eq!(
+                    got.as_slice(),
+                    expected.as_slice(),
+                    "lba {lba} wrong after {}",
+                    $label
+                );
+            }
+        };
+    }
+
+    // --- Minimal failing sequence from proptest ---
+    w!(vol, 4, 145u8);
+    w!(vol, 4, 39u8);
+    w!(vol, 1, 75u8);
+    w!(vol, 2, 247u8);
+    // DedupWrite: write same data to two LBAs
+    w!(vol, 1, 220u8);
+    w!(vol, 5, 220u8);
+    // Flush x2
+    vol.flush_wal().unwrap();
+    vol.flush_wal().unwrap();
+    // DedupWrite
+    w!(vol, 3, 6u8);
+    w!(vol, 4, 6u8);
+    w!(vol, 6, 82u8);
+    w!(vol, 6, 170u8);
+    w!(vol, 5, 77u8);
+    w!(vol, 1, 218u8);
+    // DedupWrite
+    w!(vol, 2, 24u8);
+    w!(vol, 5, 24u8);
+
+    gc_sweep(&mut vol);
+    verify!(vol, "GcSweep 1");
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    w!(vol, 5, 135u8);
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    // DedupWrite
+    w!(vol, 1, 99u8);
+    w!(vol, 7, 99u8);
+
+    gc_sweep(&mut vol);
+    verify!(vol, "GcSweep 2");
+
+    gc_sweep(&mut vol);
+    verify!(vol, "GcSweep 3");
+
+    vol.flush_wal().unwrap();
+
+    gc_sweep(&mut vol);
+    verify!(vol, "final GcSweep");
+}
+
+/// Bug G variant 2: GC sweep after restart with unflushed dedup writes.
+#[test]
+fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    let drain = |vol: &mut Volume| {
+        let pending_dir = fork_dir.join("pending");
+        if let Ok(entries) = fs::read_dir(&pending_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.contains('.') {
+                    continue;
+                }
+                if let Ok(ulid) = ulid::Ulid::from_string(s) {
+                    let _ = vol.materialise_segment(ulid);
+                    let _ = vol.promote_segment(ulid);
+                }
+            }
+        }
+    };
+
+    let promote_gc = |vol: &mut Volume| {
+        let gc_dir = fork_dir.join("gc");
+        if let Ok(entries) = fs::read_dir(&gc_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if !name_str.ends_with(".applied") {
+                    continue;
+                }
+                let Some(ulid_str) = name_str.strip_suffix(".applied") else {
+                    continue;
+                };
+                if let Ok(ulid) = ulid::Ulid::from_string(ulid_str) {
+                    let gc_body = gc_dir.join(ulid_str);
+                    if gc_body.exists() {
+                        let _ = vol.promote_segment(ulid);
+                        let _ = fs::remove_file(&gc_body);
+                    }
+                }
+            }
+        }
+        vol.evict_applied_gc_cache();
+    };
+
+    let gc_sweep = |vol: &mut Volume| {
+        drain(vol);
+        let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+        let _ = rt.block_on(gc_fork(
+            fork_dir,
+            "test-vol",
+            &store,
+            &gc_config,
+            repack_ulid,
+            sweep_ulid,
+        ));
+        let _ = vol.apply_gc_handoffs();
+        promote_gc(vol);
+        let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+    };
+
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    macro_rules! w {
+        ($vol:expr, $lba:expr, $seed:expr) => {{
+            let data = [$seed; 4096];
+            $vol.write($lba as u64, &data).unwrap();
+            oracle.insert($lba as u64, data);
+        }};
+    }
+
+    macro_rules! verify {
+        ($vol:expr, $label:expr) => {
+            for (&lba, expected) in &oracle {
+                let got = $vol
+                    .read(lba, 1)
+                    .unwrap_or_else(|e| panic!("lba {lba} read failed after {}: {e}", $label));
+                assert_eq!(
+                    got.as_slice(),
+                    expected.as_slice(),
+                    "lba {lba} wrong after {}",
+                    $label
+                );
+            }
+        };
+    }
+
+    // --- Minimal failing sequence from proptest ---
+    gc_sweep(&mut vol); // no-op
+    gc_sweep(&mut vol); // no-op
+    vol.flush_wal().unwrap();
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    vol.flush_wal().unwrap();
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    w!(vol, 4, 60u8);
+    vol.flush_wal().unwrap();
+    gc_sweep(&mut vol);
+    vol.flush_wal().unwrap();
+
+    w!(vol, 7, 251u8);
+    w!(vol, 6, 170u8);
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    // DedupWrite
+    w!(vol, 1, 222u8);
+    w!(vol, 5, 222u8);
+    // DedupWrite
+    w!(vol, 2, 204u8);
+    w!(vol, 4, 204u8);
+    vol.flush_wal().unwrap();
+
+    w!(vol, 2, 230u8);
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    // DedupWrite
+    w!(vol, 3, 164u8);
+    w!(vol, 5, 164u8);
+
+    // Restart
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _ = vol.apply_gc_handoffs();
+
+    gc_sweep(&mut vol);
+    verify!(vol, "GcSweep");
+
+    // Restart — this is where the original proptest fails.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    verify!(vol, "post-restart");
+}

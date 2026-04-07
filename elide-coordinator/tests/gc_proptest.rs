@@ -51,7 +51,8 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
         let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
             continue;
         };
-        // promote_segment copies pending → cache and deletes pending.
+        // Materialise thin DedupRef → MaterializedRef, then promote.
+        let _ = vol.materialise_segment(ulid);
         let _ = vol.promote_segment(ulid);
     }
 }
