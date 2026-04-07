@@ -32,7 +32,7 @@ fn evict_then_crash_data_survives() {
     vol.flush_wal().unwrap();
     common::drain_with_materialise(&mut vol);
 
-    // Simulate evict: delete cache/ body files (index/.idx already present from drain_local).
+    // Simulate evict: delete cache/ body files (index/.idx already present from drain).
     let cache_dir = fork_dir.join("cache");
     for entry in fs::read_dir(&cache_dir).unwrap() {
         let entry = entry.unwrap();

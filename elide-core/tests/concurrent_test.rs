@@ -50,7 +50,7 @@ fn coordinator_gc_does_not_create_read_failures() {
         oracle.insert(lba, data);
     }
     handle.flush().unwrap();
-    common::drain_local(&fork_dir);
+    common::actor_drain::drain_local(&fork_dir);
 
     for lba in 4u64..8 {
         let data = vec![(lba as u8).wrapping_mul(13); 4096];
@@ -58,7 +58,7 @@ fn coordinator_gc_does_not_create_read_failures() {
         oracle.insert(lba, data);
     }
     handle.flush().unwrap();
-    common::drain_local(&fork_dir);
+    common::actor_drain::drain_local(&fork_dir);
 
     // Reader thread: continuously reads all seeded LBAs.  These are cold —
     // they are in cache/, not in the WAL.  A read failure here means the

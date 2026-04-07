@@ -1,10 +1,13 @@
 // Shared simulation helpers for proptest files.
 //
-// `drain_local` and `simulate_coord_gc_local` mirror the real coordinator's
-// drain-pending and GC logic without requiring an object store.  Both proptest
-// suites (volume_proptest and actor_proptest) use these to drive the same
-// coordinator-side simulation.
+// `drain_with_materialise` and `simulate_coord_gc_local` mirror the real
+// coordinator's drain-pending and GC logic without requiring an object store.
+// Both proptest suites (volume_proptest and actor_proptest) use these to drive
+// the same coordinator-side simulation.
+
 #![allow(dead_code)]
+
+pub mod actor_drain;
 
 use std::collections::HashSet;
 use std::fs;
@@ -32,51 +35,6 @@ pub fn write_test_keypair(dir: &Path) {
     .unwrap();
 }
 
-/// Promote all committed segments from pending/ to index/ + cache/.
-/// Simulates `drain-pending` (upload + local cache promotion) without touching an object store.
-pub fn drain_local(fork_dir: &Path) {
-    const HEADER_LEN: usize = 96;
-    let pending = fork_dir.join("pending");
-    let index_dir = fork_dir.join("index");
-    let cache_dir = fork_dir.join("cache");
-    let _ = fs::create_dir_all(&index_dir);
-    let _ = fs::create_dir_all(&cache_dir);
-    let Ok(entries) = fs::read_dir(&pending) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let Some(ulid_str) = name.to_str() else {
-            continue;
-        };
-        if ulid_str.ends_with(".tmp") || ulid_str.contains('.') {
-            continue;
-        }
-        let Ok(data) = fs::read(&path) else {
-            continue;
-        };
-        if data.len() < HEADER_LEN {
-            continue;
-        }
-        let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-        let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-        let bss = HEADER_LEN + index_length as usize + inline_length as usize;
-        if data.len() < bss {
-            continue;
-        }
-        let _ = fs::write(index_dir.join(format!("{ulid_str}.idx")), &data[..bss]);
-        let _ = fs::write(cache_dir.join(format!("{ulid_str}.body")), &data[bss..]);
-        let bitset_len = (entry_count as usize).div_ceil(8);
-        let _ = fs::write(
-            cache_dir.join(format!("{ulid_str}.present")),
-            vec![0xFFu8; bitset_len],
-        );
-        let _ = fs::remove_file(&path);
-    }
-}
-
 /// Drain via the full materialise → promote path, matching the production
 /// coordinator upload protocol.
 ///
@@ -85,9 +43,17 @@ pub fn drain_local(fork_dir: &Path) {
 /// writes `index/<ulid>.idx` + `cache/<ulid>.{body,present}` from the
 /// `.materialized` sidecar and updates the extent index.
 pub fn drain_with_materialise(vol: &mut elide_core::volume::Volume) {
-    let pending_dir = vol.base_dir().join("pending");
+    for ulid in pending_ulids(vol.base_dir()) {
+        vol.materialise_segment(ulid).unwrap();
+        vol.promote_segment(ulid).unwrap();
+    }
+}
+
+/// Collect sorted ULIDs of full segment files in pending/.
+pub fn pending_ulids(base_dir: &Path) -> Vec<Ulid> {
+    let pending_dir = base_dir.join("pending");
     let Ok(entries) = fs::read_dir(&pending_dir) else {
-        return;
+        return Vec::new();
     };
     let mut ulids: Vec<Ulid> = Vec::new();
     for entry in entries.flatten() {
@@ -103,10 +69,7 @@ pub fn drain_with_materialise(vol: &mut elide_core::volume::Volume) {
         }
     }
     ulids.sort();
-    for ulid in ulids {
-        vol.materialise_segment(ulid).unwrap();
-        vol.promote_segment(ulid).unwrap();
-    }
+    ulids
 }
 
 /// Write a single-entry segment directly to `index/<ulid>.idx` +

@@ -142,7 +142,7 @@ proptest! {
                     let _ = handle.flush();
                 }
                 ActorOp::DrainLocal => {
-                    common::drain_local(fork_dir);
+                    common::actor_drain::drain_local(fork_dir);
                 }
                 ActorOp::CoordGcLocal { n } => {
                     // Checkpoint: flush WAL and obtain a ULID for the GC
@@ -301,7 +301,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     }
 
     // Step 5: DrainLocal — pending/{S1, u_flush1} → index/*.idx + cache/*.{body,present}
-    common::drain_local(fork_dir);
+    common::actor_drain::drain_local(fork_dir);
 
     // Step 6: Write{lba:1, seed:0} — same hash0 → DEDUP_REF in WAL
     handle.write(1, vec![0u8; 4096]).unwrap();
@@ -327,7 +327,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     }
 
     // Step 9: DrainLocal — pending/u_flush2 → index/u_flush2.idx + cache/u_flush2.{body,present}
-    common::drain_local(fork_dir);
+    common::actor_drain::drain_local(fork_dir);
 
     // Step 10: Crash — drop+reopen triggers lbamap + extentindex rebuild from disk.
     //   Bug: lbamap rebuild processed gc/*.applied (u_repack2, lba:7→hash0) AFTER
