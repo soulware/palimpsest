@@ -141,9 +141,11 @@ pub struct ExtentFetch {
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
 pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
-/// Size of a DEDUP_REF or ZERO index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
-const IDX_ENTRY_REF_LEN: u32 = 45;
-/// Size of a DATA index entry: above + stored_offset(8) + stored_length(4).
+/// Size of a ZERO index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
+/// ZERO extents have no body bytes and carry no body_offset/body_length fields.
+const IDX_ENTRY_ZERO_LEN: u32 = 45;
+/// Size of a DATA or DEDUP_REF index entry: above + stored_offset(8) + stored_length(4).
+/// DEDUP_REF entries carry materialised body bytes and use the same layout as DATA.
 const IDX_ENTRY_DATA_LEN: u32 = 57;
 
 /// Extents at or below this byte size are stored inline in the inline section.
@@ -173,7 +175,26 @@ bitflags! {
     }
 }
 
-// --- SegmentEntry ---
+// --- EntryKind / SegmentEntry ---
+
+/// Discriminant for a segment index entry.
+///
+/// Variants are mutually exclusive and exhaustive — use `match entry.kind`
+/// rather than chains of `is_*` booleans so the compiler enforces handling
+/// of new variants at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Standard data entry; body bytes live in the body section.
+    Data,
+    /// Dedup reference; body bytes are materialised from the write buffer and
+    /// stored in the body section of this segment (same layout as Data).
+    DedupRef,
+    /// Zero extent; LBA range reads as zeros, no body bytes stored.
+    Zero,
+    /// Inline entry; body bytes live in the inline section.
+    /// Currently unreachable (INLINE_THRESHOLD = 0) but present for format completeness.
+    Inline,
+}
 
 /// One entry in the in-memory representation of a segment's index section.
 ///
@@ -188,12 +209,8 @@ pub struct SegmentEntry {
     pub start_lba: u64,
     pub lba_length: u32,
     pub compressed: bool,
-    /// True for dedup references (FLAG_DEDUP_REF). No bytes in this segment.
-    pub is_dedup_ref: bool,
-    /// True for zero extents (FLAG_ZERO). No bytes in this segment; reads return zeros.
-    pub is_zero_extent: bool,
-    /// True if extent bytes are in the inline section rather than the body.
-    pub is_inline: bool,
+    /// Entry kind: discriminates between Data, DedupRef, Zero, and Inline.
+    pub kind: EntryKind,
     /// Section-relative byte offset. For body entries: offset within the body
     /// section. For inline entries: offset within the inline section. Zero for
     /// dedup refs. Set by `write_segment` when writing; already set when reading.
@@ -220,15 +237,17 @@ impl SegmentEntry {
     ) -> Self {
         let stored_length = data.len() as u32;
         #[allow(clippy::absurd_extreme_comparisons)]
-        let is_inline = INLINE_THRESHOLD != 0 && data.len() <= INLINE_THRESHOLD;
+        let kind = if INLINE_THRESHOLD != 0 && data.len() <= INLINE_THRESHOLD {
+            EntryKind::Inline
+        } else {
+            EntryKind::Data
+        };
         Self {
             hash,
             start_lba,
             lba_length,
             compressed: flags.contains(SegmentFlags::COMPRESSED),
-            is_dedup_ref: false,
-            is_zero_extent: false,
-            is_inline,
+            kind,
             stored_offset: 0, // filled by write_segment
             stored_length,
             data,
@@ -242,9 +261,7 @@ impl SegmentEntry {
             start_lba,
             lba_length,
             compressed: false,
-            is_dedup_ref: true,
-            is_zero_extent: false,
-            is_inline: false,
+            kind: EntryKind::DedupRef,
             stored_offset: 0,
             stored_length: 0,
             data: Vec::new(),
@@ -258,9 +275,7 @@ impl SegmentEntry {
             start_lba,
             lba_length,
             compressed: false,
-            is_dedup_ref: false,
-            is_zero_extent: true,
-            is_inline: false,
+            kind: EntryKind::Zero,
             stored_offset: 0,
             stored_length: 0,
             data: Vec::new(),
@@ -322,13 +337,14 @@ pub fn write_segment(
 
     // Inline section (currently empty: INLINE_THRESHOLD = 0).
     for entry in entries.iter() {
-        if entry.is_inline {
+        if entry.kind == EntryKind::Inline {
             w.write_all(&entry.data)?;
         }
     }
-    // Body section: DATA extents only, raw bytes, no framing.
+    // Body section: DATA and DEDUP_REF extents, raw bytes, no framing.
+    // ZERO extents contribute no bytes; inline entries are in the inline section.
     for entry in entries.iter() {
-        if !entry.is_dedup_ref && !entry.is_zero_extent && !entry.is_inline {
+        if entry.kind != EntryKind::Zero && entry.kind != EntryKind::Inline {
             w.write_all(&entry.data)?;
         }
     }
@@ -347,16 +363,17 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
     let mut body_cursor: u64 = 0;
 
     for entry in entries.iter_mut() {
-        index_length += if entry.is_dedup_ref || entry.is_zero_extent {
-            IDX_ENTRY_REF_LEN
+        index_length += if entry.kind == EntryKind::Zero {
+            IDX_ENTRY_ZERO_LEN
         } else {
             IDX_ENTRY_DATA_LEN
         };
 
-        if entry.is_inline {
+        if entry.kind == EntryKind::Inline {
             entry.stored_offset = inline_cursor;
             inline_cursor += entry.stored_length as u64;
-        } else if !entry.is_dedup_ref && !entry.is_zero_extent {
+        } else if entry.kind != EntryKind::Zero {
+            // Both DATA and DEDUP_REF entries have materialised bodies.
             entry.stored_offset = body_cursor;
             body_cursor += entry.stored_length as u64;
         }
@@ -367,17 +384,14 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
 
 fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     let mut flags = SegmentFlags::empty();
-    if e.is_inline {
-        flags |= SegmentFlags::INLINE;
+    match e.kind {
+        EntryKind::Inline => flags |= SegmentFlags::INLINE,
+        EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
+        EntryKind::Zero => flags |= SegmentFlags::ZERO,
+        EntryKind::Data => {}
     }
     if e.compressed {
         flags |= SegmentFlags::COMPRESSED;
-    }
-    if e.is_dedup_ref {
-        flags |= SegmentFlags::DEDUP_REF;
-    }
-    if e.is_zero_extent {
-        flags |= SegmentFlags::ZERO;
     }
 
     w.write_all(e.hash.as_bytes())?;
@@ -385,8 +399,9 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     w.write_all(&e.lba_length.to_le_bytes())?;
     w.write_all(&[flags.bits()])?;
 
-    if !e.is_dedup_ref && !e.is_zero_extent {
-        // Both inline and body entries store offset + length (in their respective sections).
+    if e.kind != EntryKind::Zero {
+        // DATA, DEDUP_REF, and inline entries all store offset + length.
+        // ZERO entries have no body and carry no offset/length fields.
         w.write_all(&e.stored_offset.to_le_bytes())?;
         w.write_all(&e.stored_length.to_le_bytes())?;
     }
@@ -556,12 +571,20 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
         let lba_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
         let flags = SegmentFlags::from_bits_retain(read_u8(data, &mut pos)?);
 
-        let is_dedup_ref = flags.contains(SegmentFlags::DEDUP_REF);
-        let is_zero_extent = flags.contains(SegmentFlags::ZERO);
-        let is_inline = flags.contains(SegmentFlags::INLINE);
         let compressed = flags.contains(SegmentFlags::COMPRESSED);
+        let kind = if flags.contains(SegmentFlags::ZERO) {
+            EntryKind::Zero
+        } else if flags.contains(SegmentFlags::DEDUP_REF) {
+            EntryKind::DedupRef
+        } else if flags.contains(SegmentFlags::INLINE) {
+            EntryKind::Inline
+        } else {
+            EntryKind::Data
+        };
 
-        let (stored_offset, stored_length) = if is_dedup_ref || is_zero_extent {
+        // ZERO extents have no body fields; DATA and DEDUP_REF both carry
+        // stored_offset + stored_length pointing into the body section.
+        let (stored_offset, stored_length) = if kind == EntryKind::Zero {
             (0u64, 0u32)
         } else {
             let off = u64::from_le_bytes(read_fixed(data, &mut pos)?);
@@ -574,9 +597,7 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
             start_lba,
             lba_length,
             compressed,
-            is_dedup_ref,
-            is_zero_extent,
-            is_inline,
+            kind,
             stored_offset,
             stored_length,
             data: Vec::new(),
@@ -589,9 +610,10 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
 /// Populate `entry.data` for all body entries by reading from the segment file.
 ///
 /// `body_section_start` is the absolute file offset of the body section, as
-/// returned by `read_segment_index`. Dedup-ref and inline entries are skipped.
-/// After this call, each body entry's `data` holds exactly `stored_length` bytes
-/// read from `body_section_start + stored_offset` in the file.
+/// returned by `read_segment_index`. ZERO and inline entries are skipped.
+/// Both DATA and DEDUP_REF entries are read — they both have materialised body
+/// bytes in the body section. After this call, each body entry's `data` holds
+/// exactly `stored_length` bytes read from `body_section_start + stored_offset`.
 ///
 /// Used by the compaction path to materialise live extent bytes before writing
 /// a new, denser segment.
@@ -603,7 +625,7 @@ pub fn read_extent_bodies(
     use std::io::{Read, Seek, SeekFrom};
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
-        if entry.is_dedup_ref || entry.is_zero_extent || entry.is_inline {
+        if entry.kind == EntryKind::Zero || entry.kind == EntryKind::Inline {
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
@@ -1022,8 +1044,7 @@ mod tests {
         assert_eq!(e.start_lba, 10);
         assert_eq!(e.lba_length, 1);
         assert!(!e.compressed);
-        assert!(!e.is_dedup_ref);
-        assert!(!e.is_inline);
+        assert_eq!(e.kind, EntryKind::Data);
         assert_eq!(e.stored_offset, 0);
         assert_eq!(e.stored_length, 4096);
 
@@ -1074,7 +1095,7 @@ mod tests {
         assert_eq!(e.hash, hash);
         assert_eq!(e.start_lba, 5);
         assert_eq!(e.lba_length, 3);
-        assert!(e.is_dedup_ref);
+        assert_eq!(e.kind, EntryKind::DedupRef);
         assert_eq!(e.stored_offset, 0);
         assert_eq!(e.stored_length, 0);
 
@@ -1107,13 +1128,13 @@ mod tests {
         let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 3);
 
-        assert!(!read_back[0].is_dedup_ref);
+        assert_eq!(read_back[0].kind, EntryKind::Data);
         assert_eq!(read_back[0].stored_offset, 0); // first body entry
         assert_eq!(read_back[0].stored_length, 8192);
 
-        assert!(read_back[1].is_dedup_ref); // ref contributes no body bytes
+        assert_eq!(read_back[1].kind, EntryKind::DedupRef); // ref contributes no body bytes
 
-        assert!(!read_back[2].is_dedup_ref);
+        assert_eq!(read_back[2].kind, EntryKind::Data);
         assert_eq!(read_back[2].stored_offset, 8192); // body cursor advanced past first entry
         assert_eq!(read_back[2].stored_length, 4096);
 

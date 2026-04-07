@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use log::warn;
 use ulid::Ulid;
 
-use crate::segment;
+use crate::segment::{self, EntryKind};
 use crate::signing;
 
 /// Physical location of an extent within a segment file.
@@ -184,7 +184,10 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     Err(e) => return Err(e),
                 };
             for (raw_idx, entry) in entries.iter().enumerate() {
-                if entry.is_dedup_ref || entry.is_inline {
+                if entry.kind == EntryKind::Inline {
+                    continue;
+                }
+                if entry.kind == EntryKind::Zero {
                     continue;
                 }
                 // body_offset is body-relative: the .body file starts at byte 0
@@ -227,7 +230,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 };
 
             for entry in entries {
-                if entry.is_dedup_ref || entry.is_inline {
+                if entry.kind == EntryKind::Inline || entry.kind == EntryKind::Zero {
                     continue;
                 }
                 index.insert(
@@ -350,23 +353,25 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_skips_dedup_ref() {
+    fn rebuild_includes_dedup_ref() {
+        // REF entries carry materialised body bytes; they must be indexed so
+        // that reads after volume restart find the body in the correct segment.
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
-        let ref_hash = h(0xAA);
-        let data_hash = blake3::hash(b"real data");
+        let ref_body = b"ref body ".repeat(512)[..4096].to_vec();
+        let ref_hash = blake3::hash(&ref_body);
+        let mut ref_entry = SegmentEntry::new_dedup_ref(ref_hash, 0, 1);
+        ref_entry.stored_length = ref_body.len() as u32;
+        ref_entry.data = ref_body;
+
+        let data_body = b"real data".repeat(512)[..4096].to_vec();
+        let data_hash = blake3::hash(&data_body);
         let mut entries = vec![
-            SegmentEntry::new_dedup_ref(ref_hash, 0, 1),
-            SegmentEntry::new_data(
-                data_hash,
-                1,
-                1,
-                segment::SegmentFlags::empty(),
-                b"real data".repeat(512)[..4096].to_vec(),
-            ),
+            ref_entry,
+            SegmentEntry::new_data(data_hash, 1, 1, segment::SegmentFlags::empty(), data_body),
         ];
         segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -376,9 +381,9 @@ mod tests {
         .unwrap();
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
-        // Only the DATA entry should be indexed; the dedup-ref is skipped.
-        assert_eq!(index.len(), 1);
-        assert!(index.lookup(&ref_hash).is_none());
+        // Both REF and DATA entries should be indexed.
+        assert_eq!(index.len(), 2);
+        assert!(index.lookup(&ref_hash).is_some());
         assert!(index.lookup(&data_hash).is_some());
 
         std::fs::remove_dir_all(base).unwrap();

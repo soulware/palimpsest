@@ -26,13 +26,17 @@ data_length (u32 varint)  byte length of payload (compressed size if FLAG_COMPRE
 data        (data_length bytes)
 ```
 
-*REF record* — a dedup reference; no data payload, maps an LBA range to an existing extent:
+*REF record* — a dedup reference; carries the full extent body alongside the LBA mapping:
 ```
-hash        (32 bytes)    BLAKE3 hash of the existing extent
-start_lba   (u64 varint)
-lba_length  (u32 varint)
-flags       (u8)          FLAG_DEDUP_REF set; no further fields
+hash         (32 bytes)    BLAKE3 hash of the extent
+start_lba    (u64 varint)
+lba_length   (u32 varint)
+flags        (u8)          FLAG_DEDUP_REF set (optionally FLAG_COMPRESSED)
+data_length  (u32 varint)  byte length of payload (compressed size if FLAG_COMPRESSED)
+data         (data_length bytes)
 ```
+
+The body bytes are identical to what a DATA record would carry for the same extent. The hash additionally serves as a key into the local extent index (`hash → canonical segment ULID`), used as a local-cache read hint only — not required for correctness.
 
 *ZERO record* — a zero extent; no data payload, maps an LBA range to zeros:
 ```
@@ -46,7 +50,7 @@ Zero extents differ from unwritten regions in one important way: an unwritten LB
 
 **Flag bits:**
 - `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
-- `0x02` `FLAG_DEDUP_REF` — REF record; no data payload
+- `0x02` `FLAG_DEDUP_REF` — REF record; carries body payload (same layout as DATA record)
 - `0x04` `FLAG_ZERO` — ZERO record; no data payload; hash field is ZERO_HASH
 
 **Flag namespace note:** WAL flag bits and segment index flag bits are **distinct namespaces with different values**. When promoting WAL records to segment entries, `recover_wal` must translate between them:
@@ -112,7 +116,7 @@ When the write log reaches the 32MB threshold (or on an explicit flush), the bac
 
 **The WAL ULID marks the start of a write epoch, not the time data was written.**  All writes accepted while the WAL is open belong to that epoch and inherit its ULID when promoted.  This pre-assignment is what makes compaction ordering safe: every segment in `pending/` was produced in an earlier epoch, so `max(pending ULIDs)` is always strictly less than the running WAL's ULID — there is no need to coordinate with the live WAL during compaction.
 
-**Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes only the raw extent data bytes (no headers) to a clean body section. REF records contribute no bytes to the body — their index entries carry only the LBA mapping and `FLAG_DEDUP_REF`. All segments — freshly promoted or GC-repacked — have the same uniform format.
+**Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes the raw extent data bytes (no headers) to a clean body section. Both DATA and REF records contribute body bytes — they are treated identically during promotion. ZERO records contribute no bytes. All segments — freshly promoted or GC-repacked — have the same uniform format.
 
 **WAL-to-segment flag translation:** WAL and segment index use different bit values for `FLAG_COMPRESSED` and `FLAG_DEDUP_REF` (see the WAL flag namespace note above). `recover_wal` translates WAL flags to segment flags before constructing `SegmentEntry` values — never copy a WAL `flags` byte directly into a segment index entry.
 
@@ -221,7 +225,7 @@ body_offset   = 96 + index_length + inline_length
 delta_offset  = 96 + index_length + inline_length + body_length
 ```
 
-**The full body** is raw concatenated extent data — DATA-record extents only, clean bytes, no framing. REF-record extents contribute nothing to the body. All navigation is via the index section.
+**The full body** is raw concatenated extent data — DATA-record and REF-record extents, clean bytes, no framing. ZERO-record extents contribute nothing to the body (reads return zeros directly). All navigation is via the index section.
 
 **The delta body** is raw concatenated delta blobs, referenced by byte offset from the index section. Absent on locally-stored segment files (`delta_length = 0`); present on S3 objects when the coordinator has computed deltas against ancestor segments.
 
@@ -252,7 +256,8 @@ For each extent:
   flags         (1 byte)    — flag bits above
 
   if FLAG_DEDUP_REF:
-    (no body fields — data located via extent index lookup on hash)
+    body_offset (8 bytes)   — byte offset within full body section (u64 le)
+    body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
 
   if FLAG_ZERO:
     (no body fields — hash is ZERO_HASH; reads return lba_length × 4096 zero bytes)
@@ -280,7 +285,7 @@ For each extent:
 
 `lba_length × 4096` always gives the uncompressed extent size. `body_length` / `inline_length` gives the stored (possibly compressed) size.
 
-**FLAG_DEDUP_REF entries** carry only the LBA mapping, sufficient for LBA map reconstruction at startup. The extent data is located via the extent index (`hash → ULID + body_offset`), populated from ancestor segment files at startup.
+**FLAG_DEDUP_REF entries** carry the LBA mapping and `body_offset + body_length` into this segment's own body section. The extent body is always materialised here — every segment is self-contained. The hash also serves as a key into the extent index (`hash → canonical segment ULID`), which is used as a local-cache hint only: if the canonical segment is already warm in `cache/`, the volume may read from it directly to avoid a body read; otherwise the body in this segment is used. The fetch path always reads from this segment's body and never issues a cross-segment GET. See architecture.md § Dedup for the full rationale.
 
 **FLAG_ZERO entries** carry only the LBA mapping with ZERO_HASH. No extent index lookup is performed for these entries — the read path returns zeros directly. Zero entries must be present in the segment index (and in the serialised manifest) to correctly mask ancestor data; they are never omitted even though they have no body bytes.
 
@@ -452,7 +457,7 @@ Extents materialised from a delta (delta bytes fetched, applied against a local 
 A packed bitset with one bit per index entry (entry N → bit N). Size: `ceil(entry_count / 8)` bytes. A set bit means the bytes `[body_offset, body_offset + body_length)` for that entry are present in `.body` and ready to serve.
 
 Entries that have no body bytes never need fetching and can be treated as implicitly present:
-- `FLAG_DEDUP_REF` — data lives in an ancestor segment; no bytes in this segment's body
+- `FLAG_DEDUP_REF` — body bytes present in this segment's body section; no separate fetch needed
 - `FLAG_INLINE` — data is in the inline section of `.idx`; no body fetch needed
 - `FLAG_ZERO` — zero extent; no bytes in this segment's body; reads return zeros directly
 

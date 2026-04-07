@@ -77,7 +77,7 @@ use ulid::Ulid;
 use elide_core::extentindex::{self, ExtentIndex};
 use elide_core::gc::{HandoffLine, format_handoff_file};
 use elide_core::lbamap::{self, LbaMap};
-use elide_core::segment::{self, SegmentEntry};
+use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
@@ -532,9 +532,9 @@ struct SegmentStats {
     /// Logical total bytes: lba_length * BLOCK_BYTES summed over all entries.
     total_lba_bytes: u64,
     /// True if the segment contains at least one DATA entry (live, stale, or fully dead).
-    /// Used to distinguish ref/zero-only segments (no physical body to reclaim) from
-    /// segments with real data that warrant GC even when all DATA entries are dead.
-    has_data_entries: bool,
+    /// Used to distinguish zero-only segments (no physical body to reclaim) from
+    /// segments with DATA or REF entries that warrant GC even when all entries are dead.
+    has_body_entries: bool,
     /// Live entries (data field not yet populated for DATA entries).
     live_entries: Vec<SegmentEntry>,
     /// Hashes that are in the extent index but not reachable from the LBA map.
@@ -562,7 +562,7 @@ impl SegmentStats {
     /// dead — has no physical body; compacting it produces no storage savings
     /// and should be skipped.
     fn has_data_content(&self) -> bool {
-        self.has_data_entries
+        self.has_body_entries
     }
 }
 
@@ -622,7 +622,7 @@ fn collect_stats(
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
         for entry in entries {
-            if entry.is_inline {
+            if entry.kind == EntryKind::Inline {
                 continue;
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
@@ -635,7 +635,7 @@ fn collect_stats(
             // where index.lookup(ZERO_HASH) always returns None, causing live
             // zero extents to be silently dropped from GC output — allowing
             // ancestor data to bleed through after compaction in forked volumes.
-            if entry.is_zero_extent {
+            if entry.kind == EntryKind::Zero {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(ZERO_HASH);
                 if lba_live {
                     live_lba_bytes += lba_bytes;
@@ -643,19 +643,23 @@ fn collect_stats(
                 }
                 continue;
             }
-            // Dedup refs have no body bytes, but carry an LBA mapping. A ref
-            // is only live if the LBA still maps to its hash — otherwise the
-            // LBA was overwritten and the ref would reintroduce a stale
-            // mapping into the GC output.
-            if entry.is_dedup_ref {
+            physical_body_bytes += entry.stored_length as u64;
+            // Dedup refs carry a materialised body (same as DATA) and an LBA
+            // mapping. A ref is live if the LBA still maps to its hash and the
+            // extent index still points to this segment for that hash.
+            if entry.kind == EntryKind::DedupRef {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+                let extent_live = index
+                    .lookup(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id == seg_ulid);
                 if lba_live {
                     live_lba_bytes += lba_bytes;
                     live_entries.push(entry);
+                } else if extent_live {
+                    removed_hashes.push(entry.hash);
                 }
                 continue;
             }
-            physical_body_bytes += entry.stored_length as u64;
             let extent_live = index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_ulid);
@@ -671,12 +675,12 @@ fn collect_stats(
         }
 
         // file_size: physical on-disk size for small_segment_bytes threshold.
-        // Uses stored (compressed) DATA body bytes + idx overhead — not LBA bytes,
-        // since the threshold is about disk space, not logical coverage.
+        // Uses stored (compressed) DATA and REF body bytes + idx overhead — not
+        // LBA bytes, since the threshold is about disk space, not logical coverage.
         let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
-            has_data_entries: physical_body_bytes > 0,
+            has_body_entries: physical_body_bytes > 0,
             file_size,
             live_lba_bytes,
             total_lba_bytes,
@@ -695,9 +699,9 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
         .enumerate()
         .filter(|(_, s)| {
             // Exclude segments with no dead LBA bytes: nothing to reclaim.
-            // Exclude segments with no DATA content: compacting a segment of
-            // only dedup refs / zero extents writes an equivalent output with
-            // no physical storage savings and no extent index changes — skip.
+            // Exclude segments with no body content: compacting a segment of
+            // only zero extents writes an equivalent output with no physical
+            // storage savings and no extent index changes — skip.
             s.density() < threshold && s.dead_lba_bytes() > 0 && s.has_data_content()
         })
         .min_by(|(_, a), (_, b)| {
@@ -725,19 +729,20 @@ async fn compact_segments(
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
 
-    // For each candidate: if it has live DATA entries, download the full segment
-    // from S3 to read the body bytes.  Dedup refs and zero extents carry no body
-    // data, so candidates with only those entry types skip the S3 fetch entirely.
+    // For each candidate: if it has live entries with bodies (DATA or REF),
+    // download the full segment from S3 to read the body bytes.  Zero extents
+    // carry no body data, so candidates with only zero extents skip the S3
+    // fetch entirely.
     // removed_hashes are already fully populated from collect_stats and need no fetch.
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
     let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
     for candidate in &mut candidates {
-        let has_data_entries = candidate
+        let has_body_entries = candidate
             .live_entries
             .iter()
-            .any(|e| !e.is_dedup_ref && !e.is_zero_extent);
+            .any(|e| e.kind != EntryKind::Zero);
 
-        if has_data_entries {
+        if has_body_entries {
             let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
 
             let key = segment_key(volume_id, &candidate.ulid_str)
@@ -839,11 +844,11 @@ async fn compact_segments(
     let mut new_entries: Vec<SegmentEntry> = all_live
         .iter_mut()
         .map(|(_, e)| {
-            if e.is_zero_extent {
+            if e.kind == EntryKind::Zero {
                 // Zero extents have no body; preserve the LBA→ZERO_HASH mapping
                 // so the volume continues to mask ancestor data after compaction.
                 SegmentEntry::new_zero(e.start_lba, e.lba_length)
-            } else if e.is_dedup_ref {
+            } else if e.kind == EntryKind::DedupRef {
                 // Dedup-ref entries have no body in the source segment; the
                 // actual extent data lives in an ancestor segment that is NOT
                 // being compacted.  Preserve as a dedup-ref in the output so
@@ -897,7 +902,7 @@ async fn compact_segments(
     // Dead line so apply_done_handoffs deletes the old segment file.
     let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
-        if new_entry.is_zero_extent || new_entry.is_dedup_ref {
+        if new_entry.kind == EntryKind::Zero || new_entry.kind == EntryKind::DedupRef {
             // Zero extents and dedup-ref entries have no body in the new
             // segment and no extent index entries to update.  No Repack line
             // is needed — apply_gc_handoffs must not touch the extent index
@@ -1075,7 +1080,7 @@ mod tests {
                 file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
-                has_data_entries: true,
+                has_body_entries: true,
                 live_entries: vec![data_entry()],
                 removed_hashes: Vec::new(),
             }
@@ -1097,7 +1102,7 @@ mod tests {
             file_size: 1024 * 1024,
             live_lba_bytes: 800 * 1024,
             total_lba_bytes: 1024 * 1024,
-            has_data_entries: true,
+            has_body_entries: true,
             live_entries: Vec::new(),
             removed_hashes: Vec::new(),
         };
@@ -1114,7 +1119,7 @@ mod tests {
                 file_size: 100,
                 live_lba_bytes,
                 total_lba_bytes: 100,
-                has_data_entries: true,
+                has_body_entries: true,
                 live_entries: Vec::new(),
                 removed_hashes: Vec::new(),
             }
@@ -1650,7 +1655,7 @@ mod tests {
             file_size: 17,
             live_lba_bytes: 0,
             total_lba_bytes: 17,
-            has_data_entries: true,
+            has_body_entries: true,
             live_entries: Vec::new(),
             removed_hashes: Vec::new(),
         };

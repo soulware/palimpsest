@@ -21,7 +21,13 @@
 //   hash        (32 bytes)
 //   start_lba   (u64 varint)
 //   lba_length  (u32 varint)
-//   flags       (u8)          FLAG_DEDUP_REF set; no further fields
+//   flags       (u8)          FLAG_DEDUP_REF set (optionally FLAG_COMPRESSED)
+//   data_length (u32 varint)  byte length of payload (compressed size if FLAG_COMPRESSED)
+//   data        (data_length bytes)
+//
+// The body bytes are the same extent data that would appear in a DATA record.
+// The hash also serves as an extent index key for a local-cache read hint
+// (see architecture.md § Dedup), but is not required for correctness.
 //
 // Record layout (ZERO, FLAG_ZERO set):
 //   hash        (32 bytes)    ZERO_HASH ([0x00; 32])
@@ -47,7 +53,7 @@ bitflags! {
     pub struct WalFlags: u8 {
         /// Payload is lz4-compressed; data_length is the compressed size.
         const COMPRESSED = 0x01;
-        /// No data payload; this LBA range maps to an existing extent identified by hash.
+        /// REF record; carries a materialised body payload (same layout as DATA).
         const DEDUP_REF  = 0x02;
         /// No data payload; this LBA range reads as zeros. Hash field is ZERO_HASH.
         const ZERO       = 0x04;
@@ -78,6 +84,11 @@ pub enum LogRecord {
         hash: blake3::Hash,
         start_lba: u64,
         lba_length: u32,
+        flags: WalFlags,
+        /// Byte offset of the data payload within the WAL file.
+        body_offset: u64,
+        /// Raw payload bytes (compressed if flags contains WalFlags::COMPRESSED).
+        data: Vec<u8>,
     },
     Zero {
         start_lba: u64,
@@ -150,20 +161,33 @@ impl WriteLog {
         Ok(body_offset)
     }
 
-    /// Append a dedup reference. No data payload is written.
+    /// Append a dedup reference with materialised body bytes.
+    ///
+    /// `data` must be the same payload that would be written for a DATA record —
+    /// the raw extent bytes, already compressed if `WalFlags::COMPRESSED` is set.
+    /// The bytes come from the current write buffer and are always in hand when
+    /// dedup fires; no fetching is required.
+    ///
+    /// Returns the byte offset of the data payload within the WAL file.
     pub fn append_ref(
         &mut self,
         start_lba: u64,
         lba_length: u32,
         hash: &blake3::Hash,
-    ) -> io::Result<()> {
-        let mut rec = Vec::with_capacity(32 + 10 + 5 + 1);
-        rec.extend_from_slice(hash.as_bytes());
-        push_varint(&mut rec, start_lba);
-        push_varint32(&mut rec, lba_length);
-        rec.push(WalFlags::DEDUP_REF.bits());
+        flags: WalFlags,
+        data: &[u8],
+    ) -> io::Result<u64> {
+        let mut header = Vec::with_capacity(32 + 10 + 5 + 1 + 5);
+        header.extend_from_slice(hash.as_bytes());
+        push_varint(&mut header, start_lba);
+        push_varint32(&mut header, lba_length);
+        header.push((WalFlags::DEDUP_REF | flags).bits());
+        push_varint32(&mut header, data.len() as u32);
 
-        self.write_all_bytes(&rec)
+        self.write_all_bytes(&header)?;
+        let body_offset = self.size;
+        self.write_all_bytes(data)?;
+        Ok(body_offset)
     }
 
     /// Append a zero-extent record. No data payload is written.
@@ -272,10 +296,32 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     let flags = WalFlags::from_bits_retain(read_u8(data, pos)?);
 
     if flags.contains(WalFlags::DEDUP_REF) {
+        let data_len = read_varint32(data, pos)? as usize;
+        let body_offset = *pos as u64;
+        let payload = read_bytes(data, pos, data_len)?.to_vec();
+
+        let verify_against = if flags.contains(WalFlags::COMPRESSED) {
+            lz4_flex::decompress_size_prepended(payload.as_slice())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decompression failed"))?
+        } else {
+            payload.clone()
+        };
+        if blake3::hash(&verify_against) != hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extent hash mismatch",
+            ));
+        }
+
+        // Strip DEDUP_REF from stored flags — it is implied by the Ref variant.
+        // Only carry through modifier flags (e.g. COMPRESSED).
         return Ok(LogRecord::Ref {
             hash,
             start_lba,
             lba_length,
+            flags: flags - WalFlags::DEDUP_REF,
+            body_offset,
+            data: payload,
         });
     }
 
@@ -453,24 +499,34 @@ mod tests {
         let path = temp_path();
         let _ = std::fs::remove_file(&path);
 
-        let hash = blake3::hash(b"some existing extent");
+        let payload = b"some existing extent data";
+        let hash = blake3::hash(payload);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_ref(100, 8, &hash).unwrap();
+        let body_offset = wl
+            .append_ref(100, 8, &hash, WalFlags::empty(), payload)
+            .unwrap();
         wl.fsync().unwrap();
         drop(wl);
 
-        let (records, _) = scan(&path).unwrap();
+        let (records, size) = scan(&path).unwrap();
         assert_eq!(records.len(), 1);
         match &records[0] {
             LogRecord::Ref {
                 hash: h,
                 start_lba,
                 lba_length,
+                flags,
+                body_offset: off,
+                data,
             } => {
                 assert_eq!(h, &hash);
                 assert_eq!(*start_lba, 100);
                 assert_eq!(*lba_length, 8);
+                assert_eq!(*flags, WalFlags::empty());
+                assert_eq!(data.as_slice(), payload);
+                assert_eq!(*off, body_offset);
+                assert_eq!(*off, size - payload.len() as u64);
             }
             _ => panic!("expected Ref record"),
         }
@@ -529,7 +585,8 @@ mod tests {
         assert_eq!(valid_size, size_after_first);
 
         let mut wl = WriteLog::reopen(&path, valid_size).unwrap();
-        wl.append_ref(10, 2, &h2).unwrap();
+        wl.append_ref(10, 2, &h2, WalFlags::empty(), b"extent two")
+            .unwrap();
         wl.fsync().unwrap();
         drop(wl);
 

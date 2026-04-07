@@ -15,7 +15,10 @@ use std::os::unix::fs::MetadataExt;
 
 use serde::Deserialize;
 
-use elide_core::{segment, writelog};
+use elide_core::{
+    segment::{self, EntryKind},
+    writelog,
+};
 
 use crate::ls;
 
@@ -302,10 +305,13 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
             let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             match segment::read_segment_index(&path) {
                 Ok((_body_start, entries)) => {
-                    let dedup_ref_count = entries.iter().filter(|e| e.is_dedup_ref).count();
+                    let dedup_ref_count = entries
+                        .iter()
+                        .filter(|e| e.kind == EntryKind::DedupRef)
+                        .count();
                     let body_bytes: u64 = entries
                         .iter()
-                        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+                        .filter(|e| e.kind != EntryKind::DedupRef && e.kind != EntryKind::Inline)
                         .map(|e| e.stored_length as u64)
                         .sum();
                     let lba_blocks: u64 = entries.iter().map(|e| e.lba_length as u64).sum();
@@ -386,11 +392,11 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
 
     let fetchable_count = entries
         .iter()
-        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+        .filter(|e| e.kind != EntryKind::DedupRef && e.kind != EntryKind::Inline)
         .count();
     let body_bytes_total: u64 = entries
         .iter()
-        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+        .filter(|e| e.kind != EntryKind::DedupRef && e.kind != EntryKind::Inline)
         .map(|e| e.stored_length as u64)
         .sum();
 

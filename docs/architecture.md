@@ -791,11 +791,23 @@ This is **purely local and coordinator-free**: the shared filesystem layout is t
 
 ## Dedup
 
-**Exact dedup:** two extents with the same BLAKE3 hash are identical. Dedup is detected and applied **opportunistically on the write path**: before writing a DATA record to the WAL, the extent hash is checked against the local extent index. If a match is found, a REF record is written instead — no data payload, just a reference to the existing extent.
+**Exact dedup:** two extents with the same BLAKE3 hash are identical. Dedup is detected and applied **opportunistically on the write path**: before writing a DATA record to the WAL, the extent hash is checked against the local extent index. If a match is found, a REF record is written instead.
 
 Dedup scope is **all volumes on the local host**. The extent index covers the current volume's own tree (own + ancestor segments) plus, on a best-effort basis, all other volumes stored under the same common root. No remote or cross-host dedup check is performed. Dedup quality is highest for snapshot-derived volumes (ancestor segments already contain most of the data) and lower for freshly provisioned volumes; cross-volume dedup raises quality for volumes that share a common base image even without a snapshot relationship.
 
-**Delta compression** is a separate concern from dedup and is **S3-only**. Local segment bodies never contain delta records — an entry in a local segment is either a full extent (DATA record, data present in body) or a reference (REF record, no data in this segment's body, data lives in an ancestor segment). At S3 upload time, extents that differ only slightly from extents in ancestor segments are stored as deltas in the delta body section of the S3 segment file (see [formats.md](formats.md)). The benefit is reduced S3 fetch size, not local storage cost. On fetch, the delta is applied and the full extent is materialised locally before being cached and served.
+**REF records carry materialised body bytes.** A REF record is written when dedup is detected, and carries the full extent body in addition to the hash and LBA mapping. The canonical-segment reference (implicit in the hash, resolved via the extent index) is an advisory hint, not a load-bearing pointer. Every segment is therefore self-contained: all LBAs it covers can be served from its own body, without consulting any other segment.
+
+The write path has no additional complexity: when dedup fires, the incoming guest bytes are already in the write buffer. They are written directly into the WAL REF record — no fetching, no extra I/O, no new failure modes.
+
+- **S3 storage:** data stored once per segment that references it, not once globally. Storage cost increases in proportion to the dedup hit rate. S3 storage is treated as cheap; this tradeoff is intentional.
+- **Local storage:** unchanged — `cache/<ulid>.body` and `pending/<ulid>` files are evicted normally. REF body bytes are evicted alongside the rest of the segment.
+- **Write path:** dedup detection is unchanged (hash → extent index lookup). On a hit, body bytes from the write buffer are written into the WAL REF record alongside the hash. No recompression or rehashing — the bytes are already in hand.
+- **Read path:** when the canonical segment is already warm in `cache/`, the volume uses it as a shortcut (skip reading the current segment's body). Otherwise, the body in the current segment is used directly. The hint is a local cache optimisation only.
+- **Fetch path:** the ref hint is ignored entirely. The extent body is always present in the segment being fetched; no cross-segment GET is needed. This preserves sequential access patterns across S3 objects.
+- **Extent index:** still required for dedup detection at write time (`hash → canonical segment`). No longer load-bearing for reads. The extent index entry for a REF record is still written so that future dedup checks can find a canonical location.
+- **GC:** DATA and REF entries both carry body bytes and are treated uniformly. `has_body_entries` replaces `has_data_entries` as the guard for GC candidate selection. Zero extents remain distinct — they carry no body bytes and reads return zeros directly.
+
+**Delta compression** is a separate concern from dedup and is **S3-only**. Local segment bodies never contain delta records — an entry in a local segment is either a full extent (DATA or REF record, data present in body) or a zero extent (ZERO record, no body, reads return zeros). At S3 upload time, extents that differ only slightly from extents in ancestor segments are stored as deltas in the delta body section of the S3 segment file (see [formats.md](formats.md)). The benefit is reduced S3 fetch size, not local storage cost. On fetch, the delta is applied and the full extent is materialised locally before being cached and served.
 
 **Delta source selection** is trivial at the extent level: the natural reference for a changed file is the same-path file in the parent snapshot. The snapshot parent chain gives direct access to the prior version of each extent.
 

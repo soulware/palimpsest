@@ -391,8 +391,10 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     // Step 8: Second GC sweep — gc_checkpoint flushes the WAL, making the
     // DEDUP_REF for H0 visible on disk.  gc_fork correctly sees H0 as live,
     // carries it into the output, and the handoff completes without cancelling.
+    // REF entries now carry materialised body bytes, so the segment must be
+    // uploaded to S3 (drain_pending_to_store) before gc_fork can fetch it.
     let (repack_ulid2, sweep_ulid2) = vol.gc_checkpoint().unwrap();
-    drain_pending(fork_dir);
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
 
     rt.block_on(gc_fork(
         fork_dir,

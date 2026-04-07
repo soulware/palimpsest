@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use elide_core::segment;
+use elide_core::segment::{self, EntryKind};
 use elide_core::writelog;
 
 // --- inspect-segment ---
@@ -40,10 +40,16 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
 
     let data_count = entries
         .iter()
-        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+        .filter(|e| e.kind != EntryKind::DedupRef && e.kind != EntryKind::Inline)
         .count();
-    let dedup_count = entries.iter().filter(|e| e.is_dedup_ref).count();
-    let inline_count = entries.iter().filter(|e| e.is_inline).count();
+    let dedup_count = entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::DedupRef)
+        .count();
+    let inline_count = entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Inline)
+        .count();
 
     println!("file:               {}", path.display());
     println!(
@@ -74,7 +80,7 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
 
     let data_entries: Vec<_> = entries
         .iter()
-        .filter(|e| !e.is_dedup_ref && !e.is_inline)
+        .filter(|e| e.kind != EntryKind::DedupRef && e.kind != EntryKind::Inline)
         .collect();
     if data_entries.is_empty() {
         return Ok(());
