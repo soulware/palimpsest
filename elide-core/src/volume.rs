@@ -1401,50 +1401,83 @@ impl Volume {
             return Ok(());
         }
 
-        // Build new entries, replacing thin DedupRef with fat MaterializedRef.
+        // Build new entries. For each entry:
+        // - DATA: read body bytes from the original segment file
+        // - DedupRef (thin): read body from canonical segment, emit MaterializedRef
+        // - Zero: pass through as-is
+        // All body reads happen here; no separate read_extent_bodies call
+        // (MaterializedRef entries have stored_offset=0 which is invalid for
+        // the original file — they must not be passed to read_extent_bodies).
+        let mut seg_file = fs::File::open(&seg_path)?;
         let mut new_entries: Vec<segment::SegmentEntry> = Vec::with_capacity(entries.len());
         for entry in entries {
-            if entry.kind != EntryKind::DedupRef {
-                new_entries.push(entry);
-                continue;
+            match entry.kind {
+                EntryKind::Data | EntryKind::MaterializedRef => {
+                    // Read body from the original segment file.
+                    let mut body = vec![0u8; entry.stored_length as usize];
+                    seg_file.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+                    seg_file.read_exact(&mut body)?;
+                    let flags = if entry.compressed {
+                        segment::SegmentFlags::COMPRESSED
+                    } else {
+                        segment::SegmentFlags::empty()
+                    };
+                    new_entries.push(segment::SegmentEntry::new_data(
+                        entry.hash,
+                        entry.start_lba,
+                        entry.lba_length,
+                        flags,
+                        body,
+                    ));
+                }
+                EntryKind::DedupRef => {
+                    // Thin → look up canonical location in extent index.
+                    let loc = self.extent_index.lookup(&entry.hash).ok_or_else(|| {
+                        io::Error::other(format!(
+                            "materialise {ulid_str}: hash {} not in extent index",
+                            entry.hash.to_hex()
+                        ))
+                    })?;
+                    let canonical_path = self.find_segment_file(
+                        loc.segment_id,
+                        loc.body_section_start,
+                        loc.entry_idx,
+                    )?;
+                    let is_body = canonical_path.extension().is_some_and(|e| e == "body");
+                    let file_offset = if is_body {
+                        loc.body_offset
+                    } else {
+                        loc.body_section_start + loc.body_offset
+                    };
+                    let mut f = fs::File::open(&canonical_path)?;
+                    f.seek(SeekFrom::Start(file_offset))?;
+                    let mut data = vec![0u8; loc.body_length as usize];
+                    f.read_exact(&mut data)?;
+
+                    let flags = if loc.compressed {
+                        segment::SegmentFlags::COMPRESSED
+                    } else {
+                        segment::SegmentFlags::empty()
+                    };
+                    new_entries.push(segment::SegmentEntry::new_materialized_ref(
+                        entry.hash,
+                        entry.start_lba,
+                        entry.lba_length,
+                        flags,
+                        data,
+                    ));
+                }
+                EntryKind::Zero => {
+                    new_entries.push(segment::SegmentEntry::new_zero(
+                        entry.start_lba,
+                        entry.lba_length,
+                    ));
+                }
+                EntryKind::Inline => {
+                    new_entries.push(entry);
+                }
             }
-            // Thin DedupRef → look up canonical location in extent index.
-            let loc = self.extent_index.lookup(&entry.hash).ok_or_else(|| {
-                io::Error::other(format!(
-                    "materialise {ulid_str}: hash {} not in extent index",
-                    entry.hash.to_hex()
-                ))
-            })?;
-            // Read body bytes from the canonical segment.
-            let canonical_path =
-                self.find_segment_file(loc.segment_id, loc.body_section_start, loc.entry_idx)?;
-            let is_body = canonical_path.extension().is_some_and(|e| e == "body");
-            let file_offset = if is_body {
-                loc.body_offset
-            } else {
-                loc.body_section_start + loc.body_offset
-            };
-            let mut f = fs::File::open(&canonical_path)?;
-            f.seek(SeekFrom::Start(file_offset))?;
-            let mut data = vec![0u8; loc.body_length as usize];
-            f.read_exact(&mut data)?;
-
-            let flags = if loc.compressed {
-                segment::SegmentFlags::COMPRESSED
-            } else {
-                segment::SegmentFlags::empty()
-            };
-            new_entries.push(segment::SegmentEntry::new_materialized_ref(
-                entry.hash,
-                entry.start_lba,
-                entry.lba_length,
-                flags,
-                data,
-            ));
         }
-
-        // Read body bytes for existing DATA/MaterializedRef entries.
-        segment::read_extent_bodies(&seg_path, body_section_start, &mut new_entries)?;
 
         {
             let (mut fat, mut data, mut zero) = (0usize, 0usize, 0usize);
