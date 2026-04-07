@@ -237,9 +237,9 @@ delta_offset  = 96 + index_length + inline_length + body_length
 - `0x01` `FLAG_INLINE` — extent data is in the inline section; no body fetch needed
 - `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
 - `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
-- `0x08` `FLAG_DEDUP_REF` — dedup reference; extent data lives in the canonical segment (located via extent index); no body bytes in this segment unless `FLAG_DEDUP_MATERIALIZED` is also set
+- `0x08` `FLAG_DEDUP_REF` — dedup reference (thin variant): no body bytes; extent data located via extent index (`hash → canonical ULID + body_offset`). When combined with `FLAG_DEDUP_MATERIALIZED`, body bytes are present — see below.
 - `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
-- `0x20` `FLAG_DEDUP_MATERIALIZED` — fat REF; always set together with `FLAG_DEDUP_REF`; body bytes have been materialised into this segment's body section; entry layout is identical to a DATA entry (`body_offset + body_length`)
+- `0x20` `FLAG_DEDUP_MATERIALIZED` — modifier for `FLAG_DEDUP_REF` (always set together, never alone): body bytes have been materialised into this segment's body section (fat variant); entry layout gains `body_offset + body_length`, identical to a DATA entry. Set only by `materialise_segment` before S3 upload.
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
@@ -256,10 +256,10 @@ For each extent:
   lba_length    (4 bytes)   — extent length in 4KB blocks (u32 le)
   flags         (1 byte)    — flag bits above
 
-  if FLAG_DEDUP_REF and !FLAG_DEDUP_MATERIALIZED:
-    (no body fields — thin REF; body lives in canonical segment; same 45-byte layout as ZERO)
+  if FLAG_DEDUP_REF (thin — FLAG_DEDUP_MATERIALIZED not set):
+    (no body fields — body lives in canonical segment; same 45-byte layout as ZERO)
 
-  if FLAG_DEDUP_REF and FLAG_DEDUP_MATERIALIZED:
+  if FLAG_DEDUP_REF | FLAG_DEDUP_MATERIALIZED (fat — both flags set together):
     body_offset (8 bytes)   — byte offset within this segment's full body section (u64 le)
     body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
 
