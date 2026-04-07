@@ -467,9 +467,13 @@ Extents materialised from a delta (delta bytes fetched, applied against a local 
 A packed bitset with one bit per index entry (entry N → bit N). Size: `ceil(entry_count / 8)` bytes. A set bit means the bytes `[body_offset, body_offset + body_length)` for that entry are present in `.body` and ready to serve.
 
 Entries that have no body bytes never need fetching and can be treated as implicitly present:
-- `FLAG_DEDUP_REF` — body bytes present in this segment's body section; no separate fetch needed
+- `FLAG_DEDUP_REF` (thin, `!FLAG_MATERIALIZED`) — no body bytes in this segment; reads resolve through the extent index to the canonical segment. The present bit is irrelevant.
 - `FLAG_INLINE` — data is in the inline section of `.idx`; no body fetch needed
 - `FLAG_ZERO` — zero extent; no bytes in this segment's body; reads return zeros directly
+
+`FLAG_DEDUP_REF | FLAG_MATERIALIZED` (fat) entries have body bytes in this segment's body section. They start with their bit unset and are set when the extent is fetched, like standard DATA entries.
+
+**Thin-cache optimisation (fetch path):** when promoting a fat S3 segment to `cache/`, for each MaterializedRef entry the volume can look up the extent hash in the extent index to find the canonical segment. If the canonical is already warm in `cache/`, the MaterializedRef body bytes need not be fetched — the present bit stays unset and reads fall through to the canonical. If the canonical is later evicted, the demand-fetch path re-fetches from S3 (the fat segment itself, not the canonical). The body file is sparse so unfetched entries consume no disk space.
 
 All other entries (standard DATA entries with body bytes) start with their bit unset and are set when the extent is fetched and written to `.body`.
 
