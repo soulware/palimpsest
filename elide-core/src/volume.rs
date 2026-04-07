@@ -1299,7 +1299,7 @@ impl Volume {
     ///
     /// Idempotent: if `cache/<ulid>.body` already exists the function returns
     /// `Ok(())` without re-writing.
-    pub fn promote_segment(&self, ulid: Ulid) -> io::Result<()> {
+    pub fn promote_segment(&mut self, ulid: Ulid) -> io::Result<()> {
         let ulid_str = ulid.to_string();
         let cache_dir = self.base_dir.join("cache");
         let body_path = cache_dir.join(format!("{ulid_str}.body"));
@@ -1346,6 +1346,43 @@ impl Volume {
 
         fs::create_dir_all(&cache_dir)?;
         segment::promote_to_cache(promote_src, &body_path, &present_path)?;
+
+        // When promoting from .materialized, the cache body has different
+        // offsets than the original pending segment (index section grew:
+        // DedupRef 45 bytes → MaterializedRef 57 bytes). Update the extent
+        // index so reads find body bytes at the correct positions. The actor
+        // serializes all requests — no reads can run during this update.
+        //
+        // Future: if we switch to promoting the thin version to cache (for
+        // local storage savings), this update would use the thin .idx offsets
+        // instead — and a separate fat .idx would be written for GC.
+        if is_drain && promote_src == &mat_path {
+            let (new_bss, entries) =
+                segment::read_and_verify_segment_index(promote_src, &self.verifying_key)?;
+            for entry in &entries {
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                }
+                let points_to_this_segment = self
+                    .extent_index
+                    .lookup(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id == ulid);
+                if points_to_this_segment {
+                    Arc::make_mut(&mut self.extent_index).insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            entry_idx: None,
+                            body_section_start: new_bss,
+                        },
+                    );
+                }
+            }
+        }
 
         if is_drain {
             // Clean up .materialized sidecar if materialise_segment produced one.
