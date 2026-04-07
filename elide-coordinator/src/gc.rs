@@ -540,6 +540,21 @@ impl SegmentStats {
             0.0
         }
     }
+
+    /// True if compacting this segment would produce a meaningful result:
+    /// either a live DATA entry to carry forward (real body bytes in the output)
+    /// or a dead DATA entry in `removed_hashes` (dangling extent index entry to
+    /// clean up).  A segment of only dead/live dedup refs and zero extents has
+    /// no DATA content — compacting it writes an equivalent output segment with
+    /// no physical storage savings and no extent index changes, so it should be
+    /// skipped.
+    fn has_data_content(&self) -> bool {
+        !self.removed_hashes.is_empty()
+            || self
+                .live_entries
+                .iter()
+                .any(|e| !e.is_dedup_ref && !e.is_zero_extent)
+    }
 }
 
 /// Scan `index/` and compute liveness stats for each committed segment.
@@ -669,11 +684,11 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            // Exclude segments with no dead body bytes: repacking them produces
-            // an identically-sized output (the header/index overhead is always
-            // present and cannot be reclaimed), so density never improves and
-            // the segment would be selected again every tick indefinitely.
-            s.density() < threshold && s.dead_lba_bytes() > 0
+            // Exclude segments with no dead LBA bytes: nothing to reclaim.
+            // Exclude segments with no DATA content: compacting a segment of
+            // only dedup refs / zero extents writes an equivalent output with
+            // no physical storage savings and no extent index changes — skip.
+            s.density() < threshold && s.dead_lba_bytes() > 0 && s.has_data_content()
         })
         .min_by(|(_, a), (_, b)| {
             a.density()
@@ -1034,13 +1049,23 @@ mod tests {
 
     #[test]
     fn find_least_dense_picks_sparsest_below_threshold() {
+        // A fake DATA entry — stored_length > 0 so has_data_content() returns true.
+        fn data_entry() -> SegmentEntry {
+            SegmentEntry::new_data(
+                blake3::hash(b"x"),
+                0,
+                1,
+                segment::SegmentFlags::empty(),
+                vec![0u8; 4096],
+            )
+        }
         fn make(total_lba_bytes: u64, live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
                 file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
-                live_entries: Vec::new(),
+                live_entries: vec![data_entry()],
                 removed_hashes: Vec::new(),
             }
         }
