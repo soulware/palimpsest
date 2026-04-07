@@ -576,11 +576,7 @@ impl Volume {
 
             // Evict the old segment from the file handle cache before
             // replacing or deleting it.
-            let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _, _)| *id) == Some(seg_id) {
-                *cache = None;
-            }
-            drop(cache);
+            self.evict_cached_segment(seg_id);
 
             if !live_entries.is_empty() {
                 // Read body bytes for live entries, then write a new denser segment.
@@ -1364,6 +1360,12 @@ impl Volume {
         // local storage savings), this update would use the thin .idx offsets
         // instead — and a separate fat .idx would be written for GC.
         if is_drain && promote_src == &mat_path {
+            // The pending file is about to be deleted and replaced by a cache
+            // body with different offsets.  Evict any cached fd for this segment
+            // so the next read opens the new cache/<ulid>.body instead of
+            // reusing a stale handle to the deleted pending file.
+            self.evict_cached_segment(ulid);
+
             let (new_bss, entries) =
                 segment::read_and_verify_segment_index(promote_src, &self.verifying_key)?;
             let mut updated = 0usize;
@@ -1583,6 +1585,35 @@ impl Volume {
     /// If `pending_entries` is empty (nothing written since last flush), the
     /// WAL file is deleted directly without writing a segment.
     ///
+    /// Evict `segment_id` from the file handle cache.
+    ///
+    /// The read path (`read_extents`) caches the last-opened segment fd to
+    /// amortise open syscalls across sequential block reads.  The cache key
+    /// is the segment ULID plus an `is_body` flag that controls how body
+    /// offsets are computed (`.body` files start at offset 0; full segment
+    /// files add `body_section_start`).
+    ///
+    /// Callers must evict whenever a segment's on-disk representation changes
+    /// in a way that invalidates the cached fd or `is_body` flag:
+    ///
+    /// - **`flush_wal_to_pending`** — WAL file deleted, replaced by a
+    ///   pending segment with a different byte layout.
+    /// - **`promote_segment`** (materialised drain) — `pending/<ulid>`
+    ///   deleted, replaced by `cache/<ulid>.body` with a different
+    ///   `body_section_start` (the materialised index section is larger).
+    /// - **`apply_gc_handoffs`** (repack) — old segment deleted and
+    ///   replaced by a denser segment with reassigned body offsets.
+    ///
+    /// Without eviction the cached fd silently serves stale data or — worse —
+    /// applies `body_section_start` from the new extent index entry against
+    /// the old file layout, seeking past the body section.
+    fn evict_cached_segment(&self, segment_id: Ulid) {
+        let mut cache = self.file_cache.borrow_mut();
+        if cache.as_ref().map(|(id, _, _)| *id) == Some(segment_id) {
+            *cache = None;
+        }
+    }
+
     /// Does NOT open a new WAL — the caller is responsible for that.
     fn flush_wal_to_pending(&mut self) -> io::Result<()> {
         self.flush_wal_to_pending_as(self.wal_ulid)
@@ -1659,10 +1690,7 @@ impl Volume {
         // any cached fd for this ULID would use the old WAL byte layout.
         // The cache key is the WAL's original ULID (the file that was deleted),
         // not segment_ulid — the cache is keyed by the path that was open.
-        let mut cache = self.file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _, _)| *id) == Some(self.wal_ulid) {
-            *cache = None;
-        }
+        self.evict_cached_segment(self.wal_ulid);
         Ok(())
     }
 

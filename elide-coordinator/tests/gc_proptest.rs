@@ -432,3 +432,85 @@ proptest! {
         }
     }
 }
+
+/// Bug H: promote_segment with .materialized sidecar did not evict the file
+/// handle cache.  After materialise + promote, the extent index has offsets
+/// from the .materialized segment (larger index section → different
+/// body_section_start), but the file cache may still hold an fd to the
+/// deleted pending/ file with is_body=false.  The next read computes
+/// bss_materialized + body_offset against the old file, seeking past the
+/// body section → "failed to fill whole buffer".
+///
+/// Nondeterministic in the proptest because HashMap iteration order
+/// determines whether the file cache happens to hold the affected segment.
+///
+/// Sequence: DedupWrite creates a segment with a thin DedupRef.  GcSweep
+/// materialises + promotes it (replacing pending/ with cache/).  A
+/// subsequent read of the dedup-ref LBA uses the stale cached fd.
+#[test]
+fn gc_oracle_repro_bug_h() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = GcConfig {
+        density_threshold: 0.0,
+        small_segment_bytes: u64::MAX,
+        interval_secs: 0,
+    };
+
+    // DedupWrite: lba 3 gets DATA, lba 6 gets thin DEDUP_REF (same hash).
+    let data_235 = [235u8; 4096];
+    vol.write(3, &data_235).unwrap();
+    vol.write(6, &data_235).unwrap();
+
+    // GcSweep drains pending (none), then gc_checkpoint flushes the WAL
+    // to pending/S1 (DATA + DEDUP_REF).  No index files yet → gc_fork is
+    // a no-op.  The oracle read here populates the file cache with
+    // (S1, is_body=false, fd→pending/S1).
+    simulate_upload(&mut vol, fork_dir);
+    let (r, s) = vol.gc_checkpoint().unwrap();
+    let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
+    let _ = vol.apply_gc_handoffs();
+    promote_gc_outputs(&mut vol, fork_dir);
+    vol.evict_applied_gc_cache();
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+    // Read both LBAs to populate file cache with the pending/ segment.
+    assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
+    assert_eq!(&vol.read(6, 1).unwrap(), &data_235);
+
+    // Write another LBA so gc_checkpoint has something to flush.
+    vol.write(1, &[195u8; 4096]).unwrap();
+
+    // Second GcSweep: simulate_upload materialises S1 (DedupRef → fat
+    // MaterializedRef) and promotes it — pending/S1 is deleted, replaced by
+    // cache/S1.body.  The extent index is updated with offsets from the
+    // .materialized segment.  Without the Bug H fix, the file cache still
+    // holds the stale fd to pending/S1.
+    simulate_upload(&mut vol, fork_dir);
+    let (r, s) = vol.gc_checkpoint().unwrap();
+    let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
+    let _ = vol.apply_gc_handoffs();
+    promote_gc_outputs(&mut vol, fork_dir);
+    vol.evict_applied_gc_cache();
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+
+    // These reads triggered "failed to fill whole buffer" before the fix.
+    assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
+    assert_eq!(&vol.read(6, 1).unwrap(), &data_235);
+    assert_eq!(&vol.read(1, 1).unwrap(), &[195u8; 4096]);
+}
