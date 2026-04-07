@@ -23,8 +23,15 @@ tokio        = { version = "1", features = ["rt-multi-thread", "macros", "fs", "
 toml         = { version = "0.8", default-features = false, features = ["parse", "display"] }
 ulid         = "1"
 
+[features]
+proptest-gc = []
+
 [dev-dependencies]
 async-trait = "0.1"
 blake3      = "1"
 proptest    = "1"
 tempfile    = "3"
+
+[[test]]
+name = "gc_proptest"
+required-features = ["proptest-gc"]
