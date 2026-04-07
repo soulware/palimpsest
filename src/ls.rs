@@ -230,7 +230,6 @@ impl VolumeReader {
                         hash,
                         start_lba,
                         lba_length,
-                        ..
                     } => {
                         lbamap.insert(start_lba, lba_length, hash);
                     }

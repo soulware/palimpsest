@@ -644,10 +644,12 @@ fn collect_stats(
                 continue;
             }
             physical_body_bytes += entry.stored_length as u64;
-            // Dedup refs carry a materialised body (same as DATA) and an LBA
-            // mapping. A ref is live if the LBA still maps to its hash and the
-            // extent index still points to this segment for that hash.
-            if entry.kind == EntryKind::DedupRef {
+            // Materialised refs carry body bytes (same layout as DATA) and an
+            // LBA mapping. Liveness is LBA-based: the entry is live if the LBA
+            // still maps to its hash. Thin DedupRef should not appear in S3
+            // segments (upload sanity check), but is handled identically here
+            // (stored_length = 0, so no body-byte contribution).
+            if entry.kind == EntryKind::DedupRef || entry.kind == EntryKind::MaterializedRef {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 let extent_live = index
                     .lookup(&entry.hash)
@@ -740,7 +742,7 @@ async fn compact_segments(
         let has_body_entries = candidate
             .live_entries
             .iter()
-            .any(|e| e.kind != EntryKind::Zero);
+            .any(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef));
 
         if has_body_entries {
             let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
@@ -844,29 +846,43 @@ async fn compact_segments(
     let mut new_entries: Vec<SegmentEntry> = all_live
         .iter_mut()
         .map(|(_, e)| {
-            if e.kind == EntryKind::Zero {
-                // Zero extents have no body; preserve the LBA→ZERO_HASH mapping
-                // so the volume continues to mask ancestor data after compaction.
-                SegmentEntry::new_zero(e.start_lba, e.lba_length)
-            } else if e.kind == EntryKind::DedupRef {
-                // Dedup-ref entries have no body in the source segment; the
-                // actual extent data lives in an ancestor segment that is NOT
-                // being compacted.  Preserve as a dedup-ref in the output so
-                // the LBA→hash mapping is kept, without fabricating a DATA
-                // entry with stored_length=0 (which corrupts the extent index).
-                SegmentEntry::new_dedup_ref(e.hash, e.start_lba, e.lba_length)
-            } else {
-                SegmentEntry::new_data(
-                    e.hash,
-                    e.start_lba,
-                    e.lba_length,
-                    if e.compressed {
+            match e.kind {
+                EntryKind::Zero => {
+                    // Zero extents have no body; preserve the LBA→ZERO_HASH mapping
+                    // so the volume continues to mask ancestor data after compaction.
+                    SegmentEntry::new_zero(e.start_lba, e.lba_length)
+                }
+                EntryKind::DedupRef => {
+                    // Thin dedup-ref: no body in the source segment. Preserve as
+                    // a thin ref so the LBA→hash mapping is kept, without fabricating
+                    // a DATA entry with stored_length=0.
+                    SegmentEntry::new_dedup_ref(e.hash, e.start_lba, e.lba_length)
+                }
+                EntryKind::Data | EntryKind::MaterializedRef => {
+                    // Both have body bytes; emit as plain Data in GC output.
+                    let flags = if e.compressed {
                         segment::SegmentFlags::COMPRESSED
                     } else {
                         segment::SegmentFlags::empty()
-                    },
-                    std::mem::take(&mut e.data),
-                )
+                    };
+                    SegmentEntry::new_data(
+                        e.hash,
+                        e.start_lba,
+                        e.lba_length,
+                        flags,
+                        std::mem::take(&mut e.data),
+                    )
+                }
+                EntryKind::Inline => {
+                    // Inline entries are filtered in collect_stats; should not appear here.
+                    SegmentEntry::new_data(
+                        e.hash,
+                        e.start_lba,
+                        e.lba_length,
+                        segment::SegmentFlags::empty(),
+                        std::mem::take(&mut e.data),
+                    )
+                }
             }
         })
         .collect();
@@ -902,8 +918,8 @@ async fn compact_segments(
     // Dead line so apply_done_handoffs deletes the old segment file.
     let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
-        if new_entry.kind == EntryKind::Zero || new_entry.kind == EntryKind::DedupRef {
-            // Zero extents and dedup-ref entries have no body in the new
+        if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
+            // Zero extents and thin dedup-ref entries have no body in the new
             // segment and no extent index entries to update.  No Repack line
             // is needed — apply_gc_handoffs must not touch the extent index
             // for these entries.

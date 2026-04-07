@@ -184,11 +184,11 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     Err(e) => return Err(e),
                 };
             for (raw_idx, entry) in entries.iter().enumerate() {
-                if entry.kind == EntryKind::Inline {
-                    continue;
-                }
-                if entry.kind == EntryKind::Zero {
-                    continue;
+                // Only index entries with body bytes in this segment.
+                // Thin DedupRef has no body (reads via extent index to canonical).
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
                 }
                 // body_offset is body-relative: the .body file starts at byte 0
                 // of the body section, so no adjustment needed.
@@ -230,8 +230,9 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 };
 
             for entry in entries {
-                if entry.kind == EntryKind::Inline || entry.kind == EntryKind::Zero {
-                    continue;
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
                 }
                 index.insert(
                     entry.hash,
@@ -353,25 +354,34 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_includes_dedup_ref() {
-        // REF entries carry materialised body bytes; they must be indexed so
-        // that reads after volume restart find the body in the correct segment.
+    fn rebuild_indexes_materialized_ref_skips_thin_ref() {
+        // Thin DedupRef entries have no body; they must NOT be indexed (the
+        // extent index for that hash points to the canonical segment).
+        // MaterializedRef entries carry body bytes and MUST be indexed.
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
-        let ref_body = b"ref body ".repeat(512)[..4096].to_vec();
-        let ref_hash = blake3::hash(&ref_body);
-        let mut ref_entry = SegmentEntry::new_dedup_ref(ref_hash, 0, 1);
-        ref_entry.stored_length = ref_body.len() as u32;
-        ref_entry.data = ref_body;
+        let thin_hash = blake3::hash(b"thin ref body");
+        let thin_entry = SegmentEntry::new_dedup_ref(thin_hash, 0, 1);
+
+        let fat_body = b"fat body!".repeat(512)[..4096].to_vec();
+        let fat_hash = blake3::hash(&fat_body);
+        let fat_entry = SegmentEntry::new_materialized_ref(
+            fat_hash,
+            1,
+            1,
+            segment::SegmentFlags::empty(),
+            fat_body,
+        );
 
         let data_body = b"real data".repeat(512)[..4096].to_vec();
         let data_hash = blake3::hash(&data_body);
         let mut entries = vec![
-            ref_entry,
-            SegmentEntry::new_data(data_hash, 1, 1, segment::SegmentFlags::empty(), data_body),
+            thin_entry,
+            fat_entry,
+            SegmentEntry::new_data(data_hash, 2, 1, segment::SegmentFlags::empty(), data_body),
         ];
         segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -381,9 +391,10 @@ mod tests {
         .unwrap();
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
-        // Both REF and DATA entries should be indexed.
+        // MaterializedRef and DATA indexed; thin DedupRef skipped.
         assert_eq!(index.len(), 2);
-        assert!(index.lookup(&ref_hash).is_some());
+        assert!(index.lookup(&thin_hash).is_none());
+        assert!(index.lookup(&fat_hash).is_some());
         assert!(index.lookup(&data_hash).is_some());
 
         std::fs::remove_dir_all(base).unwrap();

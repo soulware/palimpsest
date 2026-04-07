@@ -386,32 +386,16 @@ impl Volume {
         };
 
         // Write-path dedup: if this extent already exists in this volume's
-        // segment tree (own segments + ancestors), write a REF record instead
-        // of a DATA record. The body bytes are already in hand (from the write
-        // buffer) so no fetching is required — they are written into the WAL
-        // REF record alongside the hash. Scope is limited to within-volume so
-        // that every REF is self-contained within the same S3 volume tree.
+        // segment tree (own segments + ancestors), write a thin REF record
+        // instead of a DATA record. No body bytes in the WAL — reads resolve
+        // through the extent index to the canonical segment's body.
         if self.extent_index.lookup(&hash).is_some() {
-            let body_offset =
-                self.wal
-                    .append_ref(lba, lba_length, &hash, wal_flags, &owned_data)?;
+            self.wal.append_ref(lba, lba_length, &hash)?;
             Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
-            Arc::make_mut(&mut self.extent_index).insert(
-                hash,
-                extentindex::ExtentLocation {
-                    segment_id: self.wal_ulid,
-                    body_offset,
-                    body_length: owned_data.len() as u32,
-                    compressed,
-                    entry_idx: None,
-                    body_section_start: 0,
-                },
-            );
-            let mut entry = segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length);
-            entry.compressed = compressed;
-            entry.stored_length = owned_data.len() as u32;
-            entry.data = owned_data;
-            self.pending_entries.push(entry);
+            // Do NOT update extent_index — the canonical entry already points
+            // to the segment with the body bytes.
+            self.pending_entries
+                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
             return Ok(());
         }
 
@@ -537,10 +521,11 @@ impl Volume {
                     Err(e) => return Err(e),
                 };
 
-            // Zero extents have no body bytes; DATA and REF entries both do.
+            // Only DATA and MaterializedRef entries have body bytes.
+            // Thin DedupRef and Zero have stored_length=0.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| e.kind != EntryKind::Zero)
+                .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -550,7 +535,10 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| e.kind != EntryKind::Zero && live.contains(&e.hash))
+                .filter(|e| {
+                    matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef)
+                        && live.contains(&e.hash)
+                })
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -561,17 +549,18 @@ impl Volume {
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
                 entries.drain(..).partition(|e| match e.kind {
                     EntryKind::Zero => self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH),
-                    EntryKind::DedupRef => self.lbamap.hash_at(e.start_lba) == Some(e.hash),
+                    EntryKind::DedupRef | EntryKind::MaterializedRef => {
+                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                    }
                     EntryKind::Data | EntryKind::Inline => live.contains(&e.hash),
                 });
 
             // Remove dead entries from the extent index (only those pointing at
             // this segment — entries pointing elsewhere belong to another copy).
-            // Applies to both DATA and REF entries; zero extents are not in the
-            // extent index.
+            // Thin DedupRef and Zero entries are not in the extent index.
             let mut removed = 0usize;
             for entry in &dead_entries {
-                if entry.kind == EntryKind::Zero {
+                if entry.kind == EntryKind::Zero || entry.kind == EntryKind::DedupRef {
                     continue;
                 }
                 if self
@@ -608,18 +597,21 @@ impl Volume {
                 stats.new_segments += 1;
 
                 for entry in &live_entries {
-                    if entry.kind != EntryKind::Zero {
-                        Arc::make_mut(&mut self.extent_index).insert(
-                            entry.hash,
-                            extentindex::ExtentLocation {
-                                segment_id: new_ulid,
-                                body_offset: entry.stored_offset,
-                                body_length: entry.stored_length,
-                                compressed: entry.compressed,
-                                entry_idx: None,
-                                body_section_start: new_bss,
-                            },
-                        );
+                    match entry.kind {
+                        EntryKind::Data | EntryKind::MaterializedRef => {
+                            Arc::make_mut(&mut self.extent_index).insert(
+                                entry.hash,
+                                extentindex::ExtentLocation {
+                                    segment_id: new_ulid,
+                                    body_offset: entry.stored_offset,
+                                    body_length: entry.stored_length,
+                                    compressed: entry.compressed,
+                                    entry_idx: None,
+                                    body_section_start: new_bss,
+                                },
+                            );
+                        }
+                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
                     }
                 }
             }
@@ -721,7 +713,7 @@ impl Volume {
             let dead_bytes: u64 = dead_entries.iter().map(|e| e.stored_length as u64).sum();
 
             for entry in &dead_entries {
-                if entry.kind == EntryKind::Zero {
+                if entry.kind == EntryKind::Zero || entry.kind == EntryKind::DedupRef {
                     continue;
                 }
                 if self
@@ -790,18 +782,21 @@ impl Volume {
             stats.new_segments += 1;
 
             for entry in &merged_live {
-                if entry.kind != EntryKind::Zero {
-                    Arc::make_mut(&mut self.extent_index).insert(
-                        entry.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: new_ulid,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            entry_idx: None,
-                            body_section_start: new_bss,
-                        },
-                    );
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {
+                        Arc::make_mut(&mut self.extent_index).insert(
+                            entry.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: new_ulid,
+                                body_offset: entry.stored_offset,
+                                body_length: entry.stored_length,
+                                compressed: entry.compressed,
+                                entry_idx: None,
+                                body_section_start: new_bss,
+                            },
+                        );
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
                 }
             }
         }
@@ -1402,11 +1397,13 @@ impl Volume {
         )?;
         // Update the extent index: replace temporary WAL offsets with
         // body-relative offsets into the committed segment file.
-        // REF entries carry materialised body bytes in their own segment —
-        // they must be indexed here, not skipped. Zero extents are not indexed.
+        // Thin DedupRef entries have no body in this segment — the extent
+        // index already points to the canonical segment. Zero extents are
+        // not indexed.
         for entry in &self.pending_entries {
-            if entry.kind == EntryKind::Zero {
-                continue;
+            match entry.kind {
+                EntryKind::Data | EntryKind::MaterializedRef => {}
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
             }
             Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
@@ -2115,30 +2112,14 @@ fn recover_wal(
                 hash,
                 start_lba,
                 lba_length,
-                flags,
-                body_offset,
-                data,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
-                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
-                extent_index.insert(
-                    hash,
-                    extentindex::ExtentLocation {
-                        segment_id: ulid,
-                        body_offset,
-                        body_length: data.len() as u32,
-                        compressed,
-                        entry_idx: None,
-                        body_section_start: 0,
-                    },
-                );
-                // Store body bytes so promote_segment can write them into the
-                // segment body section alongside DATA entries.
-                let mut entry = segment::SegmentEntry::new_dedup_ref(hash, start_lba, lba_length);
-                entry.compressed = compressed;
-                entry.stored_length = data.len() as u32;
-                entry.data = data;
-                pending_entries.push(entry);
+                // Thin REF: no body bytes, no extent_index update — the
+                // canonical entry is populated from the segment that holds
+                // the body (rebuilt from pending/ or segments/).
+                pending_entries.push(segment::SegmentEntry::new_dedup_ref(
+                    hash, start_lba, lba_length,
+                ));
             }
             writelog::LogRecord::Zero {
                 start_lba,
