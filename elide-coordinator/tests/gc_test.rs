@@ -898,3 +898,107 @@ fn gc_restart_safety_applied_handoff() {
         .expect("read lba=1 after restart + GC cleanup");
     assert_eq!(got1.as_slice(), &d1, "lba=1 should return D1 after restart");
 }
+
+/// Regression test for Bug F: collect_stats must skip segments that contain
+/// thin DedupRef entries. Thin refs should never appear in S3 (upload sanity
+/// check rejects them), but if one slips through (legacy data or bug), GC
+/// must not compact it — the canonical segment it points to may be deleted by
+/// GC cleanup, losing body bytes.
+///
+/// Scenario:
+///   1. Write D0 to lba=0, flush → segment S1 (DATA).
+///   2. Write D0 to lba=1 (dedup hit → DedupRef), flush → segment S2 (thin DedupRef).
+///   3. Overwrite lba=0 with D1, flush → segment S3 (DATA). S1 is now 100% dead.
+///   4. Drain ALL pending segments to index/ WITHOUT materialising S2.
+///      This simulates a thin-ref segment that somehow landed in S3.
+///   5. gc_fork: collect_stats should skip S2 (has thin ref).
+///      S1 is 100% dead and eligible; S3 is live. Two non-thin segments total.
+///      GC should compact S1 (dead) but not S2 (skipped).
+#[test]
+fn gc_collect_stats_skips_thin_dedup_ref_segment() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    // Step 1: Write D0 to lba=0 → DATA entry in S1.
+    let d0 = [0xAAu8; 4096];
+    vol.write(0, &d0).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Step 2: Write D0 to lba=1 → dedup hit → thin DedupRef in S2.
+    vol.write(1, &d0).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Step 3: Overwrite lba=0 → S1 becomes 100% dead.
+    let d1 = [0xBBu8; 4096];
+    vol.write(0, &d1).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Step 4: Drain all pending segments to index/ (no materialise step).
+    // S2 retains its thin DedupRef in the .idx file.
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
+
+    // Step 5: gc_checkpoint + gc_fork.
+    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+
+    let stats = rt
+        .block_on(gc_fork(
+            fork_dir,
+            "test-vol",
+            &store,
+            &gc_config,
+            repack_ulid,
+            sweep_ulid,
+        ))
+        .unwrap();
+
+    // S2 (thin DedupRef) must be excluded from total_segments.
+    // Only S1 and S3 should appear: S1 is dead, S3 is live.
+    assert_eq!(
+        stats.total_segments, 2,
+        "collect_stats should skip thin DedupRef segment (expected 2, got {})",
+        stats.total_segments
+    );
+
+    // S1 is 100% dead — GC should compact it (repack or sweep).
+    assert!(
+        stats.candidates >= 1,
+        "S1 is 100% dead and should be a GC candidate"
+    );
+
+    // S2 must NOT have been compacted (it was skipped).
+    // Verify S2's .idx still exists in index/ — GC did not touch it.
+    let index_dir = fork_dir.join("index");
+    let idx_count = fs::read_dir(&index_dir)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .ok()
+                .and_then(|e| e.file_name().to_str().map(|s| s.ends_with(".idx")))
+                .unwrap_or(false)
+        })
+        .count();
+    // After GC: S1 consumed (idx deleted by handoff), S2 skipped (idx remains),
+    // S3 live (idx remains), plus new GC output (idx written by handoff).
+    // At minimum S2 and S3 idx files must exist.
+    assert!(
+        idx_count >= 2,
+        "S2 and S3 idx files must survive GC (found {idx_count})"
+    );
+}

@@ -1359,10 +1359,16 @@ impl Volume {
         if is_drain && promote_src == &mat_path {
             let (new_bss, entries) =
                 segment::read_and_verify_segment_index(promote_src, &self.verifying_key)?;
+            let mut updated = 0usize;
+            let mut skipped_kind = 0usize;
+            let mut skipped_seg = 0usize;
             for entry in &entries {
                 match entry.kind {
                     EntryKind::Data | EntryKind::MaterializedRef => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                    _ => {
+                        skipped_kind += 1;
+                        continue;
+                    }
                 }
                 let points_to_this_segment = self
                     .extent_index
@@ -1380,8 +1386,21 @@ impl Volume {
                             body_section_start: new_bss,
                         },
                     );
+                    updated += 1;
+                } else {
+                    skipped_seg += 1;
                 }
             }
+            log::info!(
+                "promote {ulid_str}: extent index rewritten: \
+                 {updated} updated, {skipped_seg} pointed elsewhere, \
+                 {skipped_kind} non-body, new_bss={new_bss}"
+            );
+        } else if is_drain {
+            log::info!(
+                "promote {ulid_str}: no .materialized sidecar, \
+                 extent index unchanged"
+            );
         }
 
         if is_drain {
@@ -2379,7 +2398,7 @@ mod tests {
     /// Simulate coordinator drain: upload all pending segments to S3 (no-op in
     /// tests) then call `promote_segment` on each.  `promote_segment` writes
     /// `index/<ulid>.idx`, copies the body to `cache/`, and deletes `pending/<ulid>`.
-    fn simulate_upload(vol: &Volume) {
+    fn simulate_upload(vol: &mut Volume) {
         let pending_dir = vol.base_dir.join("pending");
         for entry in std::fs::read_dir(&pending_dir).unwrap() {
             let entry = entry.unwrap();
@@ -3149,7 +3168,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Simulate coordinator upload + promote IPC: pending → index/ + cache/.
-        simulate_upload(&vol);
+        simulate_upload(&mut vol);
 
         // Overwrite LBA 0 — the uploaded segment's extent is now dead.
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
@@ -3225,7 +3244,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Simulate coordinator upload + promote IPC: pending → index/ + cache/.
-        simulate_upload(&vol);
+        simulate_upload(&mut vol);
 
         // Now overwrite LBA 0 and promote — creates a new pending segment.
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
@@ -3456,6 +3475,212 @@ mod tests {
         let data = vec![0xCDu8; 4096];
         assert_eq!(vol.read(0, 1).unwrap(), data);
         assert_eq!(vol.read(1, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- dedup-ref materialise / promote regression tests ---
+
+    /// Helper: collect all pending segment ULIDs (excluding .tmp and .materialized).
+    fn pending_ulids(base: &Path) -> Vec<ulid::Ulid> {
+        let pending_dir = base.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.contains('.') {
+                continue;
+            }
+            ulids.push(ulid::Ulid::from_string(&name).unwrap());
+        }
+        ulids.sort();
+        ulids
+    }
+
+    #[test]
+    fn materialise_segment_replaces_dedup_ref_with_correct_body() {
+        // Bug 1: materialise_segment must replace thin DedupRef entries with
+        // MaterializedRef entries whose body bytes match the original data.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xEEu8; 4096];
+        // Write data to LBA 0 → DATA entry in segment S1.
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        assert_eq!(after_first.len(), 1);
+        let s1_ulid = after_first[0];
+
+        // Write same data to LBA 1 → dedup hit → DedupRef in segment S2.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        assert_eq!(after_second.len(), 2);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // Verify S2 has a DedupRef before materialisation.
+        let (_, entries_before) = segment::read_and_verify_segment_index(
+            &base.join("pending").join(s2_ulid.to_string()),
+            &vol.verifying_key,
+        )
+        .unwrap();
+        assert!(
+            entries_before.iter().any(|e| e.kind == EntryKind::DedupRef),
+            "S2 should contain a thin DedupRef before materialisation"
+        );
+
+        // Materialise S2.
+        vol.materialise_segment(s2_ulid).unwrap();
+
+        // Read the .materialized file and verify: no DedupRef, all MaterializedRef.
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", s2_ulid));
+        assert!(mat_path.exists(), ".materialized sidecar must exist");
+
+        let (mat_bss, mat_entries) =
+            segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
+        assert!(
+            !mat_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
+            ".materialized must not contain any DedupRef entries"
+        );
+        assert!(
+            mat_entries
+                .iter()
+                .any(|e| e.kind == EntryKind::MaterializedRef),
+            ".materialized should contain MaterializedRef entries"
+        );
+
+        // Verify the body bytes of the MaterializedRef match the original data.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut mat_file = fs::File::open(&mat_path).unwrap();
+        for entry in &mat_entries {
+            if entry.kind == EntryKind::MaterializedRef {
+                let mut body = vec![0u8; entry.stored_length as usize];
+                mat_file
+                    .seek(SeekFrom::Start(mat_bss + entry.stored_offset))
+                    .unwrap();
+                mat_file.read_exact(&mut body).unwrap();
+                // Body should be the same as our original data (possibly compressed).
+                // Since the data is small (4096 bytes of a single byte), compression
+                // may or may not be applied. Decompress if compressed.
+                let resolved = if entry.compressed {
+                    lz4_flex::decompress_size_prepended(&body).unwrap()
+                } else {
+                    body
+                };
+                assert_eq!(
+                    resolved, data,
+                    "MaterializedRef body must match original data"
+                );
+            }
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn promote_from_materialized_writes_materialized_ref_idx() {
+        // Bug 3: after materialise + promote, index/<ulid>.idx must contain
+        // MaterializedRef entries (not thin DedupRef).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xDDu8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        let s1_ulid = after_first[0];
+
+        vol.write(1, &data).unwrap(); // dedup hit
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // Materialise and promote S2 (simulating the coordinator drain path).
+        vol.materialise_segment(s2_ulid).unwrap();
+        vol.promote_segment(s2_ulid).unwrap();
+
+        // The .idx should exist in index/ and contain MaterializedRef, not DedupRef.
+        let idx_path = base.join("index").join(format!("{}.idx", s2_ulid));
+        assert!(
+            idx_path.exists(),
+            "index/<ulid>.idx must exist after promote"
+        );
+
+        let (_, idx_entries) =
+            segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
+        assert!(
+            !idx_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
+            "idx must not contain thin DedupRef after promote from .materialized"
+        );
+        assert!(
+            idx_entries
+                .iter()
+                .any(|e| e.kind == EntryKind::MaterializedRef),
+            "idx should contain MaterializedRef after promote from .materialized"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn extent_index_updated_after_promote_from_materialized() {
+        // Bug 4: after materialise + promote, reads must still work correctly
+        // because the extent index is updated to reflect the .materialized body
+        // offsets (which differ from the thin pending segment).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xBBu8; 4096];
+        // LBA 0 → DATA entry.
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        let s1_ulid = after_first[0];
+
+        // LBA 1 → dedup hit → DedupRef.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // Materialise and promote S2.
+        vol.materialise_segment(s2_ulid).unwrap();
+        vol.promote_segment(s2_ulid).unwrap();
+
+        // Both LBAs must read back correctly.
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            data,
+            "LBA 0 must read correctly after promote from .materialized"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            data,
+            "LBA 1 must read correctly after promote from .materialized"
+        );
+
+        // Also verify after reopen (extent index rebuilt from .idx files).
+        drop(vol);
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            data,
+            "LBA 0 must survive reopen after promote from .materialized"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            data,
+            "LBA 1 must survive reopen after promote from .materialized"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -4230,7 +4455,7 @@ mod tests {
             .file_name()
             .into_string()
             .unwrap();
-        simulate_upload(&vol);
+        simulate_upload(&mut vol);
 
         // Coordinator GC: compact into new segment, write .pending.
         let new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
@@ -4346,7 +4571,7 @@ mod tests {
                 .file_name()
                 .into_string()
                 .unwrap();
-            simulate_upload(&vol);
+            simulate_upload(&mut vol);
 
             // Coordinator GC: staged segment in gc/<new_ulid> + .pending written.
             // Old segment body intentionally NOT deleted — coordinator waits for .applied.
@@ -4442,7 +4667,7 @@ mod tests {
                 .file_name()
                 .into_string()
                 .unwrap();
-            simulate_upload(&vol);
+            simulate_upload(&mut vol);
 
             new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
         }
