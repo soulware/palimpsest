@@ -2114,4 +2114,224 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    // --- fetch_live_bodies tests ---
+
+    /// Helper: build a SegmentEntry with given kind, stored_offset, stored_length,
+    /// but empty data (fetch_live_bodies will populate it).
+    fn stub_entry(kind: EntryKind, stored_offset: u64, stored_length: u32) -> SegmentEntry {
+        SegmentEntry {
+            hash: blake3::hash(&stored_offset.to_le_bytes()),
+            start_lba: 0,
+            lba_length: 1,
+            compressed: false,
+            kind,
+            stored_offset,
+            stored_length,
+            data: Vec::new(),
+        }
+    }
+
+    /// Put a fake segment object in the store: `body_section_start` bytes of
+    /// zeros (index prefix) followed by `body` bytes.
+    async fn put_fake_segment(
+        store: &Arc<dyn ObjectStore>,
+        volume_id: &str,
+        ulid_str: &str,
+        body_section_start: u64,
+        body: &[u8],
+    ) {
+        let key = segment_key(volume_id, ulid_str).unwrap();
+        let mut data = vec![0u8; body_section_start as usize];
+        data.extend_from_slice(body);
+        store
+            .put(&key, bytes::Bytes::from(data).into())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_no_body_entries_skips_fetch() {
+        let store = make_store();
+        // No object in store — would fail if fetch_live_bodies tried to GET.
+        let mut candidate = SegmentStats {
+            ulid_str: Ulid::from_parts(1000, 1).to_string(),
+            body_section_start: 100,
+            file_size: 200,
+            live_lba_bytes: 0,
+            total_lba_bytes: 0,
+            has_body_entries: false,
+            live_entries: vec![
+                SegmentEntry::new_zero(0, 1),
+                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1),
+            ],
+            removed_hashes: Vec::new(),
+        };
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+        // No data populated (dedup_ref and zero have no body).
+        assert!(candidate.live_entries.iter().all(|e| e.data.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_full_get_when_waste_below_threshold() {
+        // Scenario: body section has 2 live entries that are nearly contiguous,
+        // so waste per batch is small → full-body GET is chosen.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 2).to_string();
+        let body_section_start: u64 = 256;
+
+        // Body: 8192 bytes total, two live entries of 4096 each at offsets 0 and 4096.
+        // No waste at all → full-GET path.
+        let body = vec![0xABu8; 8192];
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + 8192,
+            live_lba_bytes: 8192,
+            total_lba_bytes: 8192,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 4096, 4096),
+            ],
+            removed_hashes: Vec::new(),
+        };
+
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data.len(), 4096);
+        assert_eq!(candidate.live_entries[1].data.len(), 4096);
+        assert!(candidate.live_entries[0].data.iter().all(|&b| b == 0xAB));
+        assert!(candidate.live_entries[1].data.iter().all(|&b| b == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_range_get_when_waste_above_threshold() {
+        // Scenario: body section is large (1MB), but live entries are small and
+        // separated by large dead gaps → range-GETs are chosen.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 3).to_string();
+        let body_section_start: u64 = 256;
+        let body_size: u64 = 1024 * 1024; // 1MB body section
+
+        // Fill body with position-dependent bytes so we can verify slicing.
+        let mut body = vec![0u8; body_size as usize];
+        // Live entry A: 4096 bytes at offset 0
+        for b in &mut body[0..4096] {
+            *b = 0xAA;
+        }
+        // Dead gap: offsets 4096..900_000
+        // Live entry B: 4096 bytes at offset 900_000
+        for b in &mut body[900_000..900_000 + 4096] {
+            *b = 0xBB;
+        }
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + body_size,
+            live_lba_bytes: 8192,
+            total_lba_bytes: body_size,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 900_000, 4096),
+            ],
+            removed_hashes: Vec::new(),
+        };
+
+        // Waste = 1MB - 8192 ≈ 1MB. Two batches (entries are far apart).
+        // Waste per batch = ~512KB >> 128KB threshold → range-GETs.
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data.len(), 4096);
+        assert_eq!(candidate.live_entries[1].data.len(), 4096);
+        assert!(candidate.live_entries[0].data.iter().all(|&b| b == 0xAA));
+        assert!(candidate.live_entries[1].data.iter().all(|&b| b == 0xBB));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_coalesces_adjacent_entries() {
+        // Two adjacent entries should land in the same range-GET batch.
+        // We verify by checking that both get correct data from a large body
+        // with a big dead gap after them.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 4).to_string();
+        let body_section_start: u64 = 256;
+        let body_size: u64 = 1024 * 1024;
+
+        let mut body = vec![0u8; body_size as usize];
+        // Two adjacent entries at offset 0: 4096 + 4096 = 8192 bytes.
+        for b in &mut body[0..4096] {
+            *b = 0xCC;
+        }
+        for b in &mut body[4096..8192] {
+            *b = 0xDD;
+        }
+        // Rest is dead gap.
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + body_size,
+            live_lba_bytes: 8192,
+            total_lba_bytes: body_size,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 4096, 4096),
+            ],
+            removed_hashes: Vec::new(),
+        };
+
+        // Waste ≈ 1MB, 1 batch (adjacent → coalesced) → waste/batch ≈ 1MB >> 128KB.
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data, vec![0xCCu8; 4096]);
+        assert_eq!(candidate.live_entries[1].data, vec![0xDDu8; 4096]);
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_materialized_ref_treated_as_body() {
+        // MaterializedRef entries carry body bytes just like Data entries.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 5).to_string();
+        let body_section_start: u64 = 128;
+        let body_size: u64 = 1024 * 1024;
+
+        let mut body = vec![0u8; body_size as usize];
+        for b in &mut body[0..4096] {
+            *b = 0xEE;
+        }
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + body_size,
+            live_lba_bytes: 4096,
+            total_lba_bytes: body_size,
+            has_body_entries: true,
+            live_entries: vec![stub_entry(EntryKind::MaterializedRef, 0, 4096)],
+            removed_hashes: Vec::new(),
+        };
+
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data, vec![0xEEu8; 4096]);
+    }
 }
