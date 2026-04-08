@@ -16,7 +16,6 @@
 // See docs/architecture.md — "Concurrency model" for rationale and design.
 
 use std::cell::{Cell, RefCell};
-use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +30,9 @@ use ulid::Ulid;
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
-use crate::volume::{AncestorLayer, CompactionStats, Volume, find_segment_in_dirs, read_extents};
+use crate::volume::{
+    AncestorLayer, CompactionStats, FileCache, Volume, find_segment_in_dirs, read_extents,
+};
 
 // ---------------------------------------------------------------------------
 // Static configuration
@@ -332,9 +333,10 @@ pub struct VolumeHandle {
     tx: Sender<VolumeRequest>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     config: Arc<VolumeConfig>,
-    /// Per-handle file-handle cache.  Never contended: each ublk queue thread
-    /// holds its own clone.  `RefCell` is sufficient; `Mutex` is not needed.
-    file_cache: RefCell<Option<(ulid::Ulid, bool, fs::File)>>,
+    /// Per-handle LRU cache of open segment file handles.  Never contended:
+    /// each ublk queue thread holds its own clone.  `RefCell` is sufficient;
+    /// `Mutex` is not needed.
+    file_cache: RefCell<FileCache>,
     /// Generation of the last snapshot whose extent index offsets were used to
     /// populate `file_cache`.  Compared against `ReadSnapshot::flush_gen` on
     /// every read; if they differ the cache is evicted before proceeding.
@@ -356,7 +358,7 @@ impl Clone for VolumeHandle {
             tx: self.tx.clone(),
             snapshot: Arc::clone(&self.snapshot),
             config: Arc::clone(&self.config),
-            file_cache: RefCell::new(None), // fresh cache per clone/thread
+            file_cache: RefCell::new(FileCache::default()), // fresh cache per clone/thread
             last_flush_gen: Cell::new(current_gen),
         }
     }
@@ -449,7 +451,7 @@ impl VolumeHandle {
         // a single ArcSwap::load() gives both atomically with no window.
         let snap = self.snapshot.load();
         if snap.flush_gen != self.last_flush_gen.get() {
-            *self.file_cache.borrow_mut() = None;
+            self.file_cache.borrow_mut().clear();
             self.last_flush_gen.set(snap.flush_gen);
         }
         read_extents(
@@ -591,7 +593,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         tx,
         snapshot,
         config,
-        file_cache: RefCell::new(None),
+        file_cache: RefCell::new(FileCache::default()),
         last_flush_gen: Cell::new(0),
     };
 
