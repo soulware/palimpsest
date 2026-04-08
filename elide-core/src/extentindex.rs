@@ -118,11 +118,9 @@ impl Default for ExtentIndex {
 
 // --- rebuild from disk ---
 
-/// Rebuild the extent index from all committed segments across an ancestor chain.
-///
 /// Rebuild the extent index from all committed segments across a fork ancestry chain.
 ///
-/// `layers` is ordered oldest-first (root ancestor first, live fork last).
+/// `forks` is ordered oldest-first (root ancestor first, live fork last).
 /// Each element is `(fork_dir, branch_ulid)`:
 /// - `fork_dir`: the fork directory containing `pending/`, `index/`, and `cache/`.
 /// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
@@ -144,31 +142,23 @@ impl Default for ExtentIndex {
 ///
 /// `promote_segment`'s `should_update` check and `compact_candidates_inner`'s
 /// Repack deduplication both agree on this direction.
-pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
+pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
-    for (fork_dir, branch_ulid) in layers {
-        // Process index/*.idx first (body-relative offsets). pending/ is
-        // processed after, so its absolute-offset entries win when the same
-        // segment is present in both index/ and pending/ (e.g. coordinator
-        // crash between writing index/ and deleting pending/).
-        let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
-        cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
-        if let Some(cutoff) = branch_ulid {
-            cache_paths.retain(|p| {
-                p.file_stem()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-        }
-        // Process pending/ (absolute offsets). These overwrite index/ entries
-        // only when the same segment appears in both (crash recovery: coordinator
-        // wrote index/ but didn't delete pending/). For different segments with
-        // the same hash, first-write-wins preserves lowest-ULID-canonical.
+    for (fork_dir, branch_ulid) in forks {
+        // Process pending/ and gc/*.applied first (absolute offsets, full
+        // segment files still on disk).  index/*.idx is processed second
+        // (body-relative offsets for cache/.body files).  Both loops use
+        // insert_if_absent (first-write-wins = lowest ULID canonical).
+        //
+        // When the same segment appears in both pending/ and index/ (crash
+        // recovery: coordinator wrote index/ but didn't delete pending/),
+        // the pending/ entry goes in first and the index/ entry is skipped.
+        // The read path checks pending/ before cache/, so the stored
+        // absolute offsets match the file that will actually be opened.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         // Include GC handoff bodies in .applied state (volume-signed, in gc/
-        // awaiting coordinator upload to S3).  Lower priority than pending/.
+        // awaiting coordinator upload to S3).
         paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
@@ -181,12 +171,64 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             });
         }
 
+        let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
+        cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+        if let Some(cutoff) = branch_ulid {
+            cache_paths.retain(|p| {
+                p.file_stem()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+        }
+
         if cache_paths.is_empty() && paths.is_empty() {
             continue;
         }
 
-        // Load the verifying key only when this layer has segments to check.
+        // Load the verifying key only when this fork has segments to check.
         let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
+
+        for path in &paths {
+            let segment_id = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::other("bad segment filename"))?;
+            // Validate as ULID.
+            let segment_id =
+                Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
+
+            let (body_section_start, entries) =
+                match segment::read_and_verify_segment_index(path, &vk) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        warn!(
+                            "segment vanished during rebuild (GC race): {}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+
+            for entry in entries {
+                match entry.kind {
+                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                }
+                index.insert_if_absent(
+                    entry.hash,
+                    ExtentLocation {
+                        segment_id,
+                        body_offset: entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                        entry_idx: None,
+                        body_section_start,
+                    },
+                );
+            }
+        }
 
         for path in &cache_paths {
             let segment_id = path
@@ -217,7 +259,6 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 // body_offset is body-relative: the .body file starts at byte 0
                 // of the body section, so no adjustment needed.
                 // entry_idx and body_section_start enable per-extent range-GETs.
-                // First-write-wins: lowest ULID keeps canonical status.
                 index.insert_if_absent(
                     entry.hash,
                     ExtentLocation {
@@ -226,57 +267,6 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
                         entry_idx: Some(raw_idx as u32),
-                        body_section_start,
-                    },
-                );
-            }
-        }
-
-        for path in &paths {
-            let segment_id = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad segment filename"))?;
-            // Validate as ULID.
-            let segment_id =
-                Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
-
-            let (body_section_start, entries) =
-                match segment::read_and_verify_segment_index(path, &vk) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!(
-                            "segment vanished during rebuild (GC race): {}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-
-            for entry in entries {
-                match entry.kind {
-                    EntryKind::Data | EntryKind::MaterializedRef => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
-                }
-                // First-write-wins (lowest ULID canonical), but overwrite
-                // if the existing entry is the same segment (crash-recovery
-                // offset correction: index/ had body-relative, pending/ has
-                // absolute offsets for the still-local full segment file).
-                let dominated = index
-                    .lookup(&entry.hash)
-                    .is_some_and(|loc| loc.segment_id != segment_id);
-                if dominated {
-                    continue;
-                }
-                index.insert(
-                    entry.hash,
-                    ExtentLocation {
-                        segment_id,
-                        body_offset: entry.stored_offset,
-                        body_length: entry.stored_length,
-                        compressed: entry.compressed,
-                        entry_idx: None,
                         body_section_start,
                     },
                 );
