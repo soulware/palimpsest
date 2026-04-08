@@ -870,12 +870,18 @@ async fn fetch_live_bodies(
             }
         }
 
-        tracing::debug!(
-            "[gc] range-GET for {} ({} batches, {} live / {} total body bytes)",
+        tracing::info!(
+            "[gc] fetch {}: range-GET {} batch(es), fetched {} of {} body bytes (saved {}, {:.0}%)",
             candidate.ulid_str,
             batch_count,
             live_body_bytes,
             total_body_bytes,
+            wasted_bytes,
+            if total_body_bytes > 0 {
+                wasted_bytes as f64 / total_body_bytes as f64 * 100.0
+            } else {
+                0.0
+            },
         );
     } else {
         // Single GET for the entire body section, slice out each live entry.
@@ -893,11 +899,21 @@ async fn fetch_live_bodies(
             candidate.live_entries[idx].data = body[off..end].to_vec();
         }
 
-        tracing::debug!(
-            "[gc] full-body GET for {} ({} live / {} total body bytes)",
+        let waste_per_batch = if batch_count > 0 {
+            wasted_bytes / batch_count
+        } else {
+            0
+        };
+        tracing::info!(
+            "[gc] fetch {}: full-body GET {} of {} body bytes \
+             (waste {}, {} batch(es) \u{2192} {}/batch < {} threshold)",
             candidate.ulid_str,
-            live_body_bytes,
             total_body_bytes,
+            total_body_bytes,
+            wasted_bytes,
+            batch_count,
+            waste_per_batch,
+            MIN_WASTE_PER_RANGE_GET,
         );
     }
 
