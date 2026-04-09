@@ -32,10 +32,10 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
         let dir = fork_dir.join(subdir);
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(u) = Ulid::from_string(name) {
-                        result.insert(u);
-                    }
+                if let Some(name) = entry.file_name().to_str()
+                    && let Ok(u) = Ulid::from_string(name)
+                {
+                    result.insert(u);
                 }
             }
         }
@@ -43,12 +43,11 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     // Include index/*.idx stems so ULID monotonicity assertions cover demand-fetched segments.
     if let Ok(entries) = fs::read_dir(fork_dir.join("index")) {
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if let Some(stem) = name.strip_suffix(".idx") {
-                    if let Ok(u) = Ulid::from_string(stem) {
-                        result.insert(u);
-                    }
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && let Some(stem) = name.strip_suffix(".idx")
+                && let Ok(u) = Ulid::from_string(stem)
+            {
+                result.insert(u);
             }
         }
     }
@@ -71,11 +70,7 @@ enum SimOp {
     /// Analogous to the coordinator's repack pass but runs in-process on the
     /// volume, bypassing the actor channel.
     Repack,
-    /// Promote all committed pending/ segments to index/ + cache/, simulating
-    /// drain-pending without S3 upload. Required before CoordGcLocal has
-    /// material to work with.
-    DrainLocal,
-    /// Like DrainLocal but exercises the full materialise → promote path:
+    /// Exercises the full materialise → promote path:
     /// materialise_segment (produces .materialized sidecar) then promote_segment
     /// (reads from .materialized, updates extent index, publishes snapshot).
     DrainWithMaterialise,
@@ -370,9 +365,6 @@ proptest! {
                         );
                     }
                 }
-                SimOp::DrainLocal => {
-                    common::drain_with_materialise(&mut vol);
-                }
                 SimOp::DrainWithMaterialise => {
                     common::drain_with_materialise(&mut vol);
                 }
@@ -547,9 +539,6 @@ proptest! {
                 SimOp::Repack => {
                     let _ = vol.repack(0.9);
                 }
-                SimOp::DrainLocal => {
-                    common::drain_with_materialise(&mut vol);
-                }
                 SimOp::DrainWithMaterialise => {
                     common::drain_with_materialise(&mut vol);
                 }
@@ -682,9 +671,6 @@ proptest! {
                 }
                 SimOp::Repack => {
                     let _ = vol.repack(0.9);
-                }
-                SimOp::DrainLocal => {
-                    common::drain_with_materialise(&mut vol);
                 }
                 SimOp::DrainWithMaterialise => {
                     common::drain_with_materialise(&mut vol);

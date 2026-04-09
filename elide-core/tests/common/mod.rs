@@ -130,7 +130,7 @@ pub fn populate_cache(fork_dir: &Path, ulid: Ulid, lba: u64, seed: u8) {
 /// Sort-for-rebuild ordering: GC outputs (.pending/.applied handoff present)
 /// come first (lower priority); regular segments come last (higher priority).
 /// Within each group, sort by ULID ascending.
-fn sort_candidates(candidates: &mut Vec<(Ulid, PathBuf)>, gc_dir: &Path) {
+fn sort_candidates(candidates: &mut [(Ulid, PathBuf)], gc_dir: &Path) {
     let is_gc = |u: &Ulid| {
         let name = u.to_string();
         gc_dir.join(format!("{name}.pending")).exists()
@@ -142,6 +142,9 @@ fn sort_candidates(candidates: &mut Vec<(Ulid, PathBuf)>, gc_dir: &Path) {
         _ => ua.cmp(ub),
     });
 }
+
+/// Result of a single GC compaction pass: `(consumed_ulids, produced_ulid, paths_to_delete)`.
+pub type CompactResult = (Vec<Ulid>, Ulid, Vec<PathBuf>);
 
 /// Compact a pre-selected set of candidates using a pre-built liveness snapshot.
 ///
@@ -159,7 +162,7 @@ fn compact_candidates_inner(
     live_hashes: &HashSet<blake3::Hash>,
     extent_index: &extentindex::ExtentIndex,
     new_ulid: Ulid,
-) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
+) -> Option<CompactResult> {
     if candidates.is_empty() {
         return None;
     }
@@ -370,7 +373,7 @@ pub fn simulate_coord_gc_local(
     fork_dir: &Path,
     new_ulid: Ulid,
     n_candidates: usize,
-) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
+) -> Option<CompactResult> {
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
 
@@ -428,10 +431,7 @@ pub fn simulate_coord_gc_both_local(
     fork_dir: &Path,
     repack_ulid: Ulid,
     sweep_ulid: Ulid,
-) -> Option<(
-    (Vec<Ulid>, Ulid, Vec<PathBuf>),
-    (Vec<Ulid>, Ulid, Vec<PathBuf>),
-)> {
+) -> Option<(CompactResult, CompactResult)> {
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
 
