@@ -85,10 +85,33 @@ Byte count is included so the coordinator can make size-aware decisions (e.g. sk
 
 ## Delta computation at upload time
 
-When the coordinator uploads a segment from a child snapshot, it:
+There are two source-selection strategies, used in different scenarios. Both produce the same output: delta options appended to the segment's delta section with `source_hash` references in the index entries.
 
-1. Loads the child's filemap (`path→hash`) and the parent's filemap (`path→hash`)
-2. Iterates the child filemap by path:
+### LBA-based delta (live writes against a parent snapshot)
+
+When a writable fork produces segments (WAL → pending), each DATA entry records the LBA it was written to. The parent snapshot's LBA map tells the coordinator what hash previously occupied that LBA. If the hash differs, the old extent is a natural delta source — the user modified data in-place.
+
+The coordinator already builds an LBA map during GC via `lbamap::rebuild_segments()` (see `gc.rs`). The same rebuild is used here, scoped to the parent snapshot's segments (everything up to the branch-point ULID).
+
+**Steps (per pending segment from a writable fork):**
+
+1. Rebuild the parent snapshot's LBA map from ancestor `index/*.idx` files (same `rebuild_segments` call GC uses, with the ancestor chain truncated at the branch-point ULID)
+2. Rebuild the extent index for the same ancestor chain (needed to locate source extent bodies)
+3. For each DATA entry in the pending segment:
+   a. Look up `entry.start_lba` in the parent LBA map → `old_hash`
+   b. If no previous hash (new allocation): no delta candidate
+   c. If `old_hash == entry.hash`: dedup already handled this, no delta needed
+   d. If `old_hash != entry.hash` (data changed): look up `old_hash` in the extent index → read the old extent body → use it as zstd dictionary to compress the new extent body → delta blob
+4. For each delta blob produced, append it to the segment's delta body section and record `source_hash = old_hash` in the index entry's delta options
+
+The segment on S3 remains self-contained: the full extent body stays in the body section. The delta section is additive — an additional fetch option for readers that already have the source extent cached locally.
+
+### Filemap-based delta (imported snapshot vs imported snapshot)
+
+When the coordinator uploads segments from an imported snapshot that has a parent snapshot (future: sequential imports into one volume), it uses filemap path-matching instead of LBA matching. This handles file relocation across ext4 updates — the same file path in both snapshots is the natural delta source even if ext4 moved it to different LBAs.
+
+1. Load the child's filemap (`path→hash`) and the parent's filemap (`path→hash`)
+2. Iterate the child filemap by path:
    a. Look up the same path in the parent filemap
    b. If path absent in parent: new file, no delta candidate
    c. If parent hash == child hash: exact match, dedup handles it, no delta needed
@@ -99,16 +122,27 @@ After this step, the filemap's job is done. The segment on S3 contains delta ent
 
 ### Source data availability
 
-The coordinator needs the actual byte content of both the child extent (which it has — it's in the segment being uploaded) and the parent extent (which it needs to fetch from a local segment or cache file). This is the same data path used for GC compaction — read extent data by hash from the extent index.
+The coordinator needs the actual byte content of both the new extent (which it has — it's in the segment being uploaded) and the source extent (which it needs to read from a local segment or cache file). This is the same data path used for GC compaction and materialisation — read extent data by hash from the extent index.
 
 ### Skipping delta for poor candidates
 
-Not every changed file benefits from delta compression. The coordinator should skip delta when:
-- The file is small (< some threshold, e.g. 4 KiB — delta overhead exceeds savings)
-- The resulting delta is larger than the standalone zstd-compressed extent (delta made it worse)
+Not every changed extent benefits from delta compression. The coordinator should skip delta when:
+- The extent is small (< some threshold, e.g. 4 KiB — delta overhead exceeds savings)
+- The resulting delta is larger than the raw extent (delta made it worse — e.g. high-entropy data replacing low-entropy data)
 - The source extent is not locally available (don't fetch from S3 just to compute a delta)
 
 When delta is skipped, the extent is stored as a normal full-body entry. The read path handles this transparently.
+
+### Where in the upload pipeline
+
+Delta computation slots in after materialisation in `drain_pending()`:
+
+1. **Materialise** — fill DedupRef body holes with canonical extent data (existing)
+2. **Compute deltas** — for each DATA entry with an LBA-based (or filemap-based) source, compress with zstd dictionary and append to the delta section (new)
+3. **Upload** — PUT the segment to S3 (existing)
+4. **Promote** — IPC to volume: write index/, cache/, delete pending/ (existing)
+
+Both materialisation and delta computation are additive operations: the segment gets larger, not smaller. Materialisation adds body bytes for DedupRef entries; delta computation adds an additional delta section. The savings come at read time when demand-fetch can pull the small delta instead of the full body.
 
 ## Read path: unchanged
 
@@ -123,16 +157,19 @@ No file paths, no filemaps, no filesystem awareness. The read path is purely con
 
 ## Scope and sequencing
 
-**Phase 1 (this design):** file-aware import + filemap + delta at upload for readonly imported volumes. This covers the primary use case: importing two point releases of the same Ubuntu image and achieving the 94% S3 savings measured in findings.md.
+**Phase 1 (this design):** LBA-based delta for live writes. Import an image, fork it, make changes via NBD, and the coordinator delta-compresses changed blocks at upload time using the parent snapshot's LBA state as dictionary source. This exercises the full delta pipeline (computation, segment format, read path) as a proof-of-concept. The benefit is modest for small manual changes (most unchanged blocks are already deduped), but it validates the end-to-end machinery.
 
-**Phase 2 (deferred):** snapshot-time filemap generation for live write paths. Deferred — the primary use case (imported readonly images) doesn't need it.
+**Phase 2:** filemap-based delta for imported snapshots. Sequential import of point releases into one volume, with filemap path-matching for source selection. This is where the 94% S3 fetch savings from findings.md are realised.
 
-**Phase 3 (deferred):** content-similarity-based source selection for filesystem-agnostic delta. Deferred — marginal benefit over path matching for the primary workload, significantly more complex.
+**Phase 3 (deferred):** content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
 ## Non-ext4 volumes
 
-Volumes without an ext4 filesystem (data volumes, XFS, Windows/NTFS, raw block usage) simply don't get a filemap. The import path falls back to the existing block-by-block import. Delta compression is not available — segments are stored with full extents only. This is not a degraded mode that needs handling; it's the absence of an optimisation. The read path, segment format, and GC all work identically regardless of whether deltas exist.
+For phase 1 (LBA-based delta), filesystem type doesn't matter — the delta source is selected purely by LBA identity, so it works for any volume with a parent snapshot.
+
+For phase 2 (filemap-based delta), volumes without an ext4 filesystem simply don't get a filemap. The import path falls back to the existing block-by-block import. Delta compression is not available — segments are stored with full extents only. This is not a degraded mode that needs handling; it's the absence of an optimisation. The read path, segment format, and GC all work identically regardless of whether deltas exist.
 
 ## Open questions
 
 - **Symlinks and hardlinks:** the filemap maps paths to content hashes. Symlinks are not regular files and are skipped. Hardlinks (multiple paths, same inode) will produce duplicate filemap entries with different paths but the same hash — harmless, but worth deduplicating in the filemap to keep it compact.
+- **Multi-block writes:** the write path may coalesce contiguous blocks into a single extent covering multiple LBAs. When looking up the parent LBA map, each LBA within the extent may have a different old hash (or some may be new allocations). The simplest approach: only attempt delta when all LBAs in the extent map to a single contiguous source extent in the parent. If the mapping is fragmented, skip delta for that entry.
