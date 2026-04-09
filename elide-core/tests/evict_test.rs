@@ -7,8 +7,11 @@
 // rebuilds the LBA map from `pending/` and `index/*.idx`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use elide_core::segment::{self, SegmentFetcher};
 use elide_core::volume::Volume;
 
 mod common;
@@ -91,5 +94,136 @@ fn evict_without_idx_loses_lba_map() {
         vol.lbamap_len(),
         0,
         "evict without index/*.idx must produce empty lba map"
+    );
+}
+
+/// A SegmentFetcher that reads from a local directory (simulates S3).
+///
+/// For each fetch, reads the full segment from `store_dir/<segment_id>`,
+/// extracts the body section, writes it to `body_dir/<segment_id>.body`,
+/// and sets the present bit.
+struct LocalStoreFetcher {
+    store_dir: PathBuf,
+}
+
+impl SegmentFetcher for LocalStoreFetcher {
+    fn fetch_extent(
+        &self,
+        segment_id: ulid::Ulid,
+        _index_dir: &Path,
+        body_dir: &Path,
+        extent: &segment::ExtentFetch,
+    ) -> io::Result<()> {
+        let sid = segment_id.to_string();
+        let store_path = self.store_dir.join(&sid);
+        let data = fs::read(&store_path)?;
+        let bss = extent.body_section_start as usize;
+        let body_path = body_dir.join(format!("{sid}.body"));
+        if !body_path.exists() {
+            fs::write(&body_path, &data[bss..])?;
+        }
+        segment::set_present_bit(
+            &body_dir.join(format!("{sid}.present")),
+            extent.entry_idx,
+            1, // at least 1 entry
+        )?;
+        Ok(())
+    }
+}
+
+/// After promote (drain path), the in-memory extent index must transition
+/// entries from `BodySource::Local` to `BodySource::Cached`.  Without this,
+/// evicting the cache body bypasses demand-fetch and reads fail with
+/// "segment not found".
+///
+/// Regression test for: promote_segment did not update the extent index's
+/// BodySource, so after evict the demand-fetch guard `BodySource::Cached(idx)`
+/// never matched and the fetcher was never called.
+#[test]
+fn evict_live_volume_reads_via_demand_fetch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+
+    // Set up a local "store" directory and a fetcher.
+    let store_dir = fork_dir.join("test_store");
+    fs::create_dir_all(&store_dir).unwrap();
+
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    let block_a = vec![0xABu8; 4096];
+    let block_b = vec![0xCDu8; 4096];
+    vol.write(0, &block_a).unwrap();
+    vol.write(1, &block_b).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Copy pending segments to the store before promote deletes them.
+    let pending_dir = fork_dir.join("pending");
+    for entry in fs::read_dir(&pending_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name.to_string_lossy().contains('.') {
+            continue;
+        }
+        fs::copy(entry.path(), store_dir.join(&name)).unwrap();
+    }
+
+    // Drain: materialise + promote (moves pending → cache + index).
+    common::drain_with_materialise(&mut vol);
+
+    // Verify extent index entries are now BodySource::Cached, not Local.
+    let hash_a = blake3::hash(&block_a);
+    let hash_b = blake3::hash(&block_b);
+    let (_, extent_index) = vol.snapshot_maps();
+    let loc_a = extent_index
+        .lookup(&hash_a)
+        .expect("hash_a must be in extent index");
+    let loc_b = extent_index
+        .lookup(&hash_b)
+        .expect("hash_b must be in extent index");
+    assert!(
+        matches!(
+            loc_a.body_source,
+            elide_core::extentindex::BodySource::Cached(_)
+        ),
+        "after promote, body_source must be Cached, got {:?}",
+        loc_a.body_source
+    );
+    assert!(
+        matches!(
+            loc_b.body_source,
+            elide_core::extentindex::BodySource::Cached(_)
+        ),
+        "after promote, body_source must be Cached, got {:?}",
+        loc_b.body_source
+    );
+
+    // Attach fetcher, then evict cache bodies.
+    vol.set_fetcher(Arc::new(LocalStoreFetcher {
+        store_dir: store_dir.clone(),
+    }));
+
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext == Some("body") || ext == Some("present") {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    // Reads must succeed via demand-fetch — not fail with "segment not found".
+    let got_a = vol.read(0, 1).unwrap();
+    let got_b = vol.read(1, 1).unwrap();
+    assert_eq!(
+        got_a.as_slice(),
+        &block_a,
+        "LBA 0 must be readable after evict"
+    );
+    assert_eq!(
+        got_b.as_slice(),
+        &block_b,
+        "LBA 1 must be readable after evict"
     );
 }

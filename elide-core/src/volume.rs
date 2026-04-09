@@ -1508,6 +1508,43 @@ impl Volume {
         }
 
         if is_drain {
+            // Update extent index: entries transition from BodySource::Local
+            // (full pending file with header) to BodySource::Cached (sparse
+            // cache file).  Without this, eviction of the cache body leaves
+            // stale BodySource::Local entries that bypass demand-fetch, causing
+            // "segment not found" errors on read.
+            //
+            // body_section_start is preserved (not zeroed): reads from
+            // BodyOnly cache files ignore it (SegmentLayout::BodyOnly path),
+            // but demand-fetch needs the original value to compute the S3
+            // range-GET offset.
+            let (promote_bss, entries) =
+                segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
+            for (i, entry) in entries.iter().enumerate() {
+                if entry.kind != segment::EntryKind::Data {
+                    continue;
+                }
+                // Only update if the extent index still points to this segment
+                // (a concurrent write may have superseded it).
+                if self
+                    .extent_index
+                    .lookup(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id == ulid)
+                {
+                    Arc::make_mut(&mut self.extent_index).insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Cached(i as u32),
+                            body_section_start: promote_bss,
+                        },
+                    );
+                }
+            }
+
             // Clean up .materialized sidecar if materialise_segment produced one.
             let mat_path = self
                 .base_dir
