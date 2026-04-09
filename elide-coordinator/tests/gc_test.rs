@@ -392,13 +392,17 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     let got5 = vol.read(5, 1).expect("read lba=5 after Bug B GC cancel");
     assert_eq!(
         got5.as_slice(),
-        &d0,
+        d0.as_slice(),
         "lba=5 should return D0 after GC cancel"
     );
 
     // lba=0 should return D1 — unaffected by the cancellation.
     let got0 = vol.read(0, 1).expect("read lba=0 after Bug B GC cancel");
-    assert_eq!(got0.as_slice(), &d1, "lba=0 should return D1 unchanged");
+    assert_eq!(
+        got0.as_slice(),
+        d1.as_slice(),
+        "lba=0 should return D1 unchanged"
+    );
 
     // Step 8: Second GC sweep — gc_checkpoint flushes the WAL, making the
     // DEDUP_REF for H0 visible on disk.  gc_fork correctly sees H0 as live,
@@ -425,14 +429,14 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     let got5 = vol.read(5, 1).expect("read lba=5 after second GC sweep");
     assert_eq!(
         got5.as_slice(),
-        &d0,
+        d0.as_slice(),
         "lba=5 should return D0 after second sweep"
     );
 
     let got0 = vol.read(0, 1).expect("read lba=0 after second GC sweep");
     assert_eq!(
         got0.as_slice(),
-        &d1,
+        d1.as_slice(),
         "lba=0 should return D1 after second sweep"
     );
 }
@@ -491,9 +495,16 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
 
     // Step 1-2: write D0 then D1 to lba=0 so H0 is dead and H1 is live.
     // Two separate flushes so gc_fork has two distinct input segments to compact.
-    let d0 = [11u8; 4096];
-    let d1 = [22u8; 4096];
-    let d2 = [33u8; 4096];
+    // High-entropy data that won't compress below INLINE_THRESHOLD.
+    let d0: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(7).wrapping_add(11) as u8)
+        .collect();
+    let d1: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(11).wrapping_add(22) as u8)
+        .collect();
+    let d2: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(13).wrapping_add(33) as u8)
+        .collect();
 
     vol.write(0, &d0).unwrap();
     vol.flush_wal().unwrap();
@@ -546,7 +557,7 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     let got = vol.read(0, 1).expect("read lba=0 after crash");
     assert_eq!(
         got.as_slice(),
-        &d2,
+        d2.as_slice(),
         "lba=0 should return D2 (latest write) after crash, not D1 (stale GC output)"
     );
 }
@@ -598,9 +609,16 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
 
     let gc_config = make_gc_config();
 
-    let d0 = [11u8; 4096];
-    let d1 = [22u8; 4096];
-    let d2 = [33u8; 4096];
+    // High-entropy data that won't compress below INLINE_THRESHOLD.
+    let d0: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(7).wrapping_add(11) as u8)
+        .collect();
+    let d1: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(11).wrapping_add(22) as u8)
+        .collect();
+    let d2: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(13).wrapping_add(33) as u8)
+        .collect();
 
     // Steps 1-2: write D0 then D1 to lba=0 so H0 is dead and H1 is live.
     vol.write(0, &d0).unwrap();
@@ -653,7 +671,7 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
     let got = vol.read(0, 1).expect("read lba=0 after crash");
     assert_eq!(
         got.as_slice(),
-        &d2,
+        d2.as_slice(),
         "lba=0 should return D2 (latest write) after crash, not D1 (stale GC output)"
     );
 }
@@ -787,9 +805,17 @@ fn drain_failure_skips_gc_and_data_survives() {
 
     // All data must be readable after recovery.
     let got0 = vol.read(0, 1).expect("read lba=0 after recovery");
-    assert_eq!(got0.as_slice(), &d1, "lba=0 should return D1 after GC");
+    assert_eq!(
+        got0.as_slice(),
+        d1.as_slice(),
+        "lba=0 should return D1 after GC"
+    );
     let got1 = vol.read(1, 1).expect("read lba=1 after recovery");
-    assert_eq!(got1.as_slice(), &d2, "lba=1 should return D2 after GC");
+    assert_eq!(
+        got1.as_slice(),
+        d2.as_slice(),
+        "lba=1 should return D2 after GC"
+    );
 }
 
 /// Regression test for Bug E: GC restart-safety gap.
@@ -838,9 +864,16 @@ fn gc_restart_safety_applied_handoff() {
 
     let gc_config = make_gc_config();
 
-    let d0 = [11u8; 4096];
-    let d1 = [22u8; 4096];
-    let d2 = [33u8; 4096];
+    // High-entropy data that won't compress below INLINE_THRESHOLD.
+    let d0: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(7).wrapping_add(11) as u8)
+        .collect();
+    let d1: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(11).wrapping_add(22) as u8)
+        .collect();
+    let d2: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(13).wrapping_add(33) as u8)
+        .collect();
 
     // Step 1: write D0 to lba=0 and D1 to lba=1, flush, drain.
     vol.write(0, &d0).unwrap();
@@ -902,13 +935,17 @@ fn gc_restart_safety_applied_handoff() {
         .expect("read lba=0 after restart + GC cleanup");
     assert_eq!(
         got0.as_slice(),
-        &d2,
+        d2.as_slice(),
         "lba=0 should return D2 after restart (Bug E: previously returned segment not found)"
     );
     let got1 = vol
         .read(1, 1)
         .expect("read lba=1 after restart + GC cleanup");
-    assert_eq!(got1.as_slice(), &d1, "lba=1 should return D1 after restart");
+    assert_eq!(
+        got1.as_slice(),
+        d1.as_slice(),
+        "lba=1 should return D1 after restart"
+    );
 }
 
 /// Regression test for Bug F: collect_stats must skip segments that contain

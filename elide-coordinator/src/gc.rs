@@ -705,15 +705,29 @@ fn collect_stats(
         let idx_size = segment::idx_body_section_start(&idx_path)?;
         let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
+        // Read inline section from .idx for any inline entries.
+        let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+        let inline_bytes = if has_inline {
+            segment::read_inline_section(&idx_path)?
+        } else {
+            Vec::new()
+        };
+
         let mut live_lba_bytes: u64 = 0;
         let mut total_lba_bytes: u64 = 0;
         let mut physical_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
-        for entry in entries {
+        for mut entry in entries {
+            // Pre-populate inline entry data from the .idx inline section.
+            // compact_segments needs this data to write the output segment.
             if entry.kind == EntryKind::Inline {
-                continue;
+                let start = entry.stored_offset as usize;
+                let end = start + entry.stored_length as usize;
+                if end <= inline_bytes.len() {
+                    entry.data = inline_bytes[start..end].to_vec();
+                }
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
             total_lba_bytes += lba_bytes;
@@ -733,7 +747,12 @@ fn collect_stats(
                 }
                 continue;
             }
-            physical_body_bytes += entry.stored_length as u64;
+            // Inline entries have stored bytes in the inline section (part of
+            // .idx, not S3 body). They do not contribute to physical_body_bytes
+            // but do participate in liveness like DATA entries.
+            if entry.kind != EntryKind::Inline {
+                physical_body_bytes += entry.stored_length as u64;
+            }
             // DedupRef entries carry body bytes in S3 (filled by materialization)
             // and an LBA mapping. Liveness is LBA-based: the entry is live if
             // the LBA still maps to its hash.
@@ -779,7 +798,7 @@ fn collect_stats(
         result.push(SegmentStats {
             ulid_str,
             body_section_start: idx_size,
-            has_body_entries: physical_body_bytes > 0,
+            has_body_entries: physical_body_bytes > 0 || has_inline,
             file_size,
             live_lba_bytes,
             total_lba_bytes,
@@ -1079,11 +1098,16 @@ async fn compact_segments(
                 ));
             }
             EntryKind::Inline => {
+                let flags = if e.compressed {
+                    segment::SegmentFlags::COMPRESSED
+                } else {
+                    segment::SegmentFlags::empty()
+                };
                 new_entries.push(SegmentEntry::new_data(
                     e.hash,
                     e.start_lba,
                     e.lba_length,
-                    segment::SegmentFlags::empty(),
+                    flags,
                     std::mem::take(&mut e.data),
                 ));
             }
@@ -2365,5 +2389,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(candidate.live_entries[0].data, vec![0xEEu8; 4096]);
+    }
+
+    /// Regression: GC compactor must preserve the COMPRESSED flag on inline
+    /// entries.  Without it, the GC output contains a tiny compressed blob
+    /// marked as uncompressed; the read path skips decompression and tries to
+    /// index 4096 bytes from a ~20-byte buffer → "inline payload too short".
+    ///
+    /// Sequence:
+    ///   1. Write all-same-byte block (compresses below INLINE_THRESHOLD → inline)
+    ///   2. Drain (materialise + promote): segment with Inline entry in S3
+    ///   3. GC compacts: output segment must carry compressed flag on inline data
+    ///   4. Volume applies handoff + crash + reopen
+    ///   5. Read must succeed — data served from inline section in .idx
+    #[tokio::test]
+    async fn gc_inline_entry_preserves_compressed_flag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+
+        // All-same-byte block compresses to ~20 bytes → inline.
+        let block = [0xBBu8; 4096];
+        vol.write(0, &block).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+
+        // Write a second segment so GC has ≥2 candidates to sweep.
+        let block2 = [0xCCu8; 4096];
+        vol.write(1, &block2).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+
+        drop(vol);
+
+        // GC: compact both segments.
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            small_segment_bytes: u64::MAX,
+            interval_secs: 0,
+        };
+        let sweep_ulid = Ulid::new();
+        let repack_ulid = Ulid::new();
+        let stats = gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
+            .await
+            .unwrap();
+        assert!(
+            stats.candidates >= 2,
+            "GC should compact ≥2 segments, got {}",
+            stats.candidates
+        );
+
+        // Volume applies handoff.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        let applied = vol.apply_gc_handoffs().unwrap();
+        assert!(applied > 0, "GC handoff should have been applied");
+        drop(vol);
+
+        // Coordinator completes: upload + promote.
+        let _mock = spawn_mock_socket(dir.to_owned()).await;
+        let done = apply_done_handoffs(dir, "test-vol", &store).await.unwrap();
+        assert!(done > 0, "handoff should complete");
+
+        // Crash + reopen — rebuild from index/*.idx.
+        let vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+
+        // Before the fix: "corrupt segment: inline payload too short"
+        assert_eq!(
+            vol.read(0, 1).unwrap().as_slice(),
+            &block,
+            "lba 0 must survive GC + crash + reopen (inline entry)"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap().as_slice(),
+            &block2,
+            "lba 1 must survive GC + crash + reopen (inline entry)"
+        );
     }
 }

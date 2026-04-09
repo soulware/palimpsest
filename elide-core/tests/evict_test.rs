@@ -97,6 +97,89 @@ fn evict_without_idx_loses_lba_map() {
     );
 }
 
+/// Inline extents survive `.body` deletion without a fetcher.
+///
+/// When all data compresses below `INLINE_THRESHOLD`, every extent is stored in
+/// the segment's inline section (carried in `.idx`).  After promote, deleting
+/// the `.body` file must not affect reads — the data is served from the
+/// in-memory `inline_data` on the `ExtentLocation`.
+#[test]
+fn inline_extents_survive_body_deletion() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    // All-same-byte blocks compress to a few bytes → inline.
+    let block_a = vec![0xAAu8; 4096];
+    let block_b = vec![0xBBu8; 4096];
+    vol.write(0, &block_a).unwrap();
+    vol.write(1, &block_b).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_materialise(&mut vol);
+
+    // Delete every .body file in cache/ — simulates eviction.
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|e| e == "body") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    // Reads must still succeed — data comes from inline_data, not the body file.
+    // No SegmentFetcher is configured, so any body-path read would fail.
+    let got_a = vol.read(0, 1).unwrap();
+    let got_b = vol.read(1, 1).unwrap();
+    assert_eq!(
+        got_a.as_slice(),
+        &block_a,
+        "LBA 0 must survive body deletion (inline)"
+    );
+    assert_eq!(
+        got_b.as_slice(),
+        &block_b,
+        "LBA 1 must survive body deletion (inline)"
+    );
+}
+
+/// Inline extents survive `.body` deletion across crash+reopen.
+///
+/// Same as `inline_extents_survive_body_deletion` but also verifies the
+/// property holds after a full reopen (rebuild from `index/*.idx`).
+#[test]
+fn inline_extents_survive_body_deletion_after_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+
+    {
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+        let block = vec![0xCCu8; 4096];
+        vol.write(0, &block).unwrap();
+        vol.flush_wal().unwrap();
+        common::drain_with_materialise(&mut vol);
+    }
+
+    // Delete .body files while volume is closed.
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|e| e == "body") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    // Reopen — rebuild from index/*.idx (which carries inline section).
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    let got = vol.read(0, 1).unwrap();
+    assert_eq!(
+        got.as_slice(),
+        &vec![0xCCu8; 4096],
+        "inline data must survive reopen without body"
+    );
+}
+
 /// A SegmentFetcher that reads from a local directory (simulates S3).
 ///
 /// For each fetch, reads the full segment from `store_dir/<segment_id>`,

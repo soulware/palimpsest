@@ -54,6 +54,24 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     result
 }
 
+/// Generate 4096 bytes of incompressible data from a seed.
+///
+/// Uses blake3 in counter mode to fill the block with pseudo-random bytes.
+/// The result does not compress below `INLINE_THRESHOLD` (4096), so it is
+/// stored in the segment body section rather than inline.
+fn incompressible_block(seed: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    let key = [seed; 32];
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for (i, chunk) in buf.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        chunk.copy_from_slice(&hash.as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    buf
+}
+
 // --- strategy ---
 
 #[derive(Debug, Clone)]
@@ -100,6 +118,16 @@ enum SimOp {
     /// DEDUP_REF pointing at lba_a's segment.  Guarantees the dedup and
     /// dead-REF paths are exercised on every run that includes this op.
     DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
+    /// Write a single block of incompressible (hash-derived) data.
+    ///
+    /// Unlike `Write` — whose `[seed; 4096]` pattern compresses to a few bytes
+    /// and always lands in the inline section — `WriteLarge` produces data that
+    /// does not compress below `INLINE_THRESHOLD`, so it is stored in the body
+    /// section.  This exercises the body read path through GC, crash, and reopen.
+    ///
+    /// LBAs are in range 24..32, disjoint from Write (0..8), WriteZeroes (8..16),
+    /// PopulateFetched (16..24), and ReadUnwritten (64).
+    WriteLarge { lba: u8, seed: u8 },
     /// Zero a single LBA.
     ///
     /// LBAs are in range 8..16 to stay disjoint from Write (0..8),
@@ -117,6 +145,10 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         // collide with data written through the volume's write path, mirroring
         // the production invariant that the fetcher only caches data that was
         // previously written through the volume (and thus already indexed).
+        //
+        // NOTE: Write always produces **inline** entries — [seed; 4096] (all
+        // same byte) compresses to ~20 bytes, well below INLINE_THRESHOLD
+        // (4096).  The body-entry lifecycle is exercised by WriteLarge below.
         (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
         Just(SimOp::Flush),
         Just(SimOp::SweepPending),
@@ -134,6 +166,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             seed
         }),
         (8u8..16).prop_map(|lba| SimOp::WriteZeroes { lba }),
+        (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::WriteLarge { lba, seed }),
     ]
 }
 
@@ -504,6 +537,10 @@ proptest! {
                     // is created, so no ULID ordering assertion is needed here.
                     let _ = vol.write_zeroes(*lba as u64, 1);
                 }
+                SimOp::WriteLarge { lba, seed } => {
+                    let data = incompressible_block(*seed);
+                    let _ = vol.write(24 + *lba as u64, &data);
+                }
             }
         }
     }
@@ -638,6 +675,14 @@ proptest! {
                     // Oracle records zeros; a subsequent Crash asserts they survive rebuild.
                     oracle.insert(*lba as u64, [0u8; 4096]);
                 }
+                SimOp::WriteLarge { lba, seed } => {
+                    let data = incompressible_block(*seed);
+                    let actual_lba = 24 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&data);
+                    oracle.insert(actual_lba, block);
+                }
             }
         }
     }
@@ -753,6 +798,14 @@ proptest! {
                 SimOp::WriteZeroes { lba } => {
                     let _ = vol.write_zeroes(*lba as u64, 1);
                     oracle.insert(*lba as u64, [0u8; 4096]);
+                }
+                SimOp::WriteLarge { lba, seed } => {
+                    let data = incompressible_block(*seed);
+                    let actual_lba = 24 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&data);
+                    oracle.insert(actual_lba, block);
                 }
             }
         }

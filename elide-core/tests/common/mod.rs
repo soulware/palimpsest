@@ -197,11 +197,14 @@ fn compact_candidates_inner(
         } else {
             (path.clone(), bss_header)
         };
+        // Read inline section for inline entries from the source (.idx or segment).
+        let inline_bytes = segment::read_inline_section(path).unwrap_or_default();
         if segment::read_extent_bodies(
             &body_path,
             bss,
             &mut entries,
-            segment::EntryKind::LOCAL_BODY,
+            [segment::EntryKind::Data, segment::EntryKind::Inline],
+            &inline_bytes,
         )
         .is_err()
         {
