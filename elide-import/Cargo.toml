@@ -9,7 +9,9 @@ anyhow             = "1"
 tracing-log        = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap       = { version = "4", features = ["derive"] }
+blake3     = "1"
 elide-core = { path = "../elide-core" }
+ext4-view  = { version = "0.9", features = ["std"] }
 oci-client = "0.16"
 oci-spec   = { version = "0.9", features = ["image"] }
 ocirender  = "0.2"
