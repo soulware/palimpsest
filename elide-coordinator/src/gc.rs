@@ -726,7 +726,7 @@ fn collect_stats(
                 let start = entry.stored_offset as usize;
                 let end = start + entry.stored_length as usize;
                 if end <= inline_bytes.len() {
-                    entry.data = inline_bytes[start..end].to_vec();
+                    entry.data = Some(inline_bytes[start..end].to_vec());
                 }
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
@@ -927,7 +927,7 @@ async fn fetch_live_bodies(
                 let e = &candidate.live_entries[idx];
                 let local_off = (e.stored_offset - batch_body_start) as usize;
                 let local_end = local_off + e.stored_length as usize;
-                candidate.live_entries[idx].data = data[local_off..local_end].to_vec();
+                candidate.live_entries[idx].data = Some(data[local_off..local_end].to_vec());
             }
         }
 
@@ -957,7 +957,7 @@ async fn fetch_live_bodies(
             let e = &candidate.live_entries[idx];
             let off = e.stored_offset as usize;
             let end = off + e.stored_length as usize;
-            candidate.live_entries[idx].data = body[off..end].to_vec();
+            candidate.live_entries[idx].data = Some(body[off..end].to_vec());
         }
 
         let waste_per_batch = if batch_count > 0 {
@@ -1094,7 +1094,7 @@ async fn compact_segments(
                     e.start_lba,
                     e.lba_length,
                     flags,
-                    std::mem::take(&mut e.data),
+                    e.data.take().unwrap_or_default(),
                 ));
             }
             EntryKind::Inline => {
@@ -1108,7 +1108,7 @@ async fn compact_segments(
                     e.start_lba,
                     e.lba_length,
                     flags,
-                    std::mem::take(&mut e.data),
+                    e.data.take().unwrap_or_default(),
                 ));
             }
         }
@@ -2184,7 +2184,7 @@ mod tests {
             kind,
             stored_offset,
             stored_length,
-            data: Vec::new(),
+            data: None,
         }
     }
 
@@ -2227,7 +2227,7 @@ mod tests {
             .await
             .unwrap();
         // No data populated (dedup_ref and zero have no body).
-        assert!(candidate.live_entries.iter().all(|e| e.data.is_empty()));
+        assert!(candidate.live_entries.iter().all(|e| e.data.is_none()));
     }
 
     #[tokio::test]
@@ -2261,10 +2261,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(candidate.live_entries[0].data.len(), 4096);
-        assert_eq!(candidate.live_entries[1].data.len(), 4096);
-        assert!(candidate.live_entries[0].data.iter().all(|&b| b == 0xAB));
-        assert!(candidate.live_entries[1].data.iter().all(|&b| b == 0xAB));
+        assert_eq!(candidate.live_entries[0].data.as_ref().unwrap().len(), 4096);
+        assert_eq!(candidate.live_entries[1].data.as_ref().unwrap().len(), 4096);
+        assert!(
+            candidate.live_entries[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0xAB)
+        );
+        assert!(
+            candidate.live_entries[1]
+                .data
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0xAB)
+        );
     }
 
     #[tokio::test]
@@ -2309,10 +2323,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(candidate.live_entries[0].data.len(), 4096);
-        assert_eq!(candidate.live_entries[1].data.len(), 4096);
-        assert!(candidate.live_entries[0].data.iter().all(|&b| b == 0xAA));
-        assert!(candidate.live_entries[1].data.iter().all(|&b| b == 0xBB));
+        assert_eq!(candidate.live_entries[0].data.as_ref().unwrap().len(), 4096);
+        assert_eq!(candidate.live_entries[1].data.as_ref().unwrap().len(), 4096);
+        assert!(
+            candidate.live_entries[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0xAA)
+        );
+        assert!(
+            candidate.live_entries[1]
+                .data
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0xBB)
+        );
     }
 
     #[tokio::test]
@@ -2355,8 +2383,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(candidate.live_entries[0].data, vec![0xCCu8; 4096]);
-        assert_eq!(candidate.live_entries[1].data, vec![0xDDu8; 4096]);
+        assert_eq!(
+            candidate.live_entries[0].data.as_deref(),
+            Some(vec![0xCCu8; 4096].as_slice())
+        );
+        assert_eq!(
+            candidate.live_entries[1].data.as_deref(),
+            Some(vec![0xDDu8; 4096].as_slice())
+        );
     }
 
     #[tokio::test]
@@ -2388,7 +2422,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(candidate.live_entries[0].data, vec![0xEEu8; 4096]);
+        assert_eq!(
+            candidate.live_entries[0].data.as_deref(),
+            Some(vec![0xEEu8; 4096].as_slice())
+        );
     }
 
     /// Regression: GC compactor must preserve the COMPRESSED flag on inline

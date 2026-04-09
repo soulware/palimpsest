@@ -226,9 +226,11 @@ pub struct SegmentEntry {
     /// Byte length of the stored data (compressed size if `compressed`).
     /// Zero for dedup refs.
     pub stored_length: u32,
-    /// Raw extent bytes for entries being built for promotion. Empty for dedup
-    /// refs and for entries read from a committed segment (data stays on disk).
-    pub data: Vec<u8>,
+    /// Raw extent bytes for entries being built for promotion. `None` for dedup
+    /// refs, zero entries, and entries read from a committed segment (data stays
+    /// on disk). Populated by `read_extent_bodies` or during write-session
+    /// accumulation.
+    pub data: Option<Vec<u8>>,
 }
 
 impl SegmentEntry {
@@ -257,7 +259,7 @@ impl SegmentEntry {
             kind,
             stored_offset: 0, // filled by write_segment
             stored_length,
-            data,
+            data: Some(data),
         }
     }
 
@@ -281,7 +283,7 @@ impl SegmentEntry {
             kind: EntryKind::DedupRef,
             stored_offset: 0, // filled by assign_offsets
             stored_length,
-            data: Vec::new(),
+            data: None,
         }
     }
 
@@ -295,7 +297,7 @@ impl SegmentEntry {
             kind: EntryKind::Zero,
             stored_offset: 0,
             stored_length: 0,
-            data: Vec::new(),
+            data: None,
         }
     }
 }
@@ -354,8 +356,10 @@ pub fn write_segment(
 
     // Inline section.
     for entry in entries.iter() {
-        if entry.kind == EntryKind::Inline {
-            w.write_all(&entry.data)?;
+        if entry.kind == EntryKind::Inline
+            && let Some(data) = &entry.data
+        {
+            w.write_all(data)?;
         }
     }
     // Body section: raw bytes, no framing.
@@ -366,7 +370,9 @@ pub fn write_segment(
     for entry in entries.iter() {
         match entry.kind {
             EntryKind::Data => {
-                w.write_all(&entry.data)?;
+                if let Some(data) = &entry.data {
+                    w.write_all(data)?;
+                }
             }
             EntryKind::DedupRef => {
                 // Seek past the reserved body region, creating a sparse hole.
@@ -661,7 +667,7 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
             kind,
             stored_offset,
             stored_length,
-            data: Vec::new(),
+            data: None,
         });
     }
 
@@ -706,13 +712,14 @@ pub fn read_extent_bodies(
             let start = entry.stored_offset as usize;
             let end = start + entry.stored_length as usize;
             if end <= inline_bytes.len() {
-                entry.data = inline_bytes[start..end].to_vec();
+                entry.data = Some(inline_bytes[start..end].to_vec());
             }
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-        entry.data = vec![0u8; entry.stored_length as usize];
-        f.read_exact(&mut entry.data)?;
+        let mut buf = vec![0u8; entry.stored_length as usize];
+        f.read_exact(&mut buf)?;
+        entry.data = Some(buf);
     }
     Ok(())
 }
@@ -1635,9 +1642,9 @@ mod tests {
         // Body data is readable via read_extent_bodies.
         let (bss, mut entries2) = read_and_verify_segment_index(&path, &vk).unwrap();
         read_extent_bodies(&path, bss, &mut entries2, [EntryKind::Data], &[]).unwrap();
-        assert_eq!(entries2[1].data, large);
+        assert_eq!(entries2[1].data.as_deref(), Some(large.as_slice()));
         // Inline entry data is NOT populated by body read (empty inline_bytes).
-        assert!(entries2[0].data.is_empty());
+        assert!(entries2[0].data.is_none());
 
         // Now read with inline bytes too.
         let (_, mut entries3) = read_and_verify_segment_index(&path, &vk).unwrap();
@@ -1649,8 +1656,8 @@ mod tests {
             &inline_bytes,
         )
         .unwrap();
-        assert_eq!(entries3[0].data, small);
-        assert_eq!(entries3[1].data, large);
+        assert_eq!(entries3[0].data.as_deref(), Some(small.as_slice()));
+        assert_eq!(entries3[1].data.as_deref(), Some(large.as_slice()));
 
         fs::remove_file(&path).unwrap();
     }

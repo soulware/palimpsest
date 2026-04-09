@@ -780,7 +780,7 @@ impl Volume {
                                     compressed: entry.compressed,
                                     body_source: BodySource::Local,
                                     body_section_start: new_bss,
-                                    inline_data: Some(entry.data.clone().into_boxed_slice()),
+                                    inline_data: entry.data.clone().map(Vec::into_boxed_slice),
                                 },
                             );
                         }
@@ -985,7 +985,7 @@ impl Volume {
                                 compressed: entry.compressed,
                                 body_source: BodySource::Local,
                                 body_section_start: new_bss,
-                                inline_data: Some(entry.data.clone().into_boxed_slice()),
+                                inline_data: entry.data.clone().map(Vec::into_boxed_slice),
                             },
                         );
                     }
@@ -1874,7 +1874,7 @@ impl Volume {
                 EntryKind::DedupRef | EntryKind::Zero => continue,
             }
             let idata = if entry.kind == EntryKind::Inline {
-                Some(entry.data.clone().into_boxed_slice())
+                entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
             };
