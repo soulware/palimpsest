@@ -72,6 +72,10 @@ pub struct ExtentLocation {
     /// The actual seek position for a read is `body_section_start + body_offset`.
     /// Also used to compute the store range-GET start for per-extent fetching.
     pub body_section_start: u64,
+    /// For inline extents: the raw payload bytes held in memory.
+    /// Reads return this directly with zero file I/O.  `None` for non-inline
+    /// entries (the normal case).
+    pub inline_data: Option<Box<[u8]>>,
 }
 
 /// In-memory index mapping content hash to segment location.
@@ -143,10 +147,13 @@ impl Default for ExtentIndex {
 /// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
 ///   are included. `None` means include all segments (used for the live fork).
 ///
-/// Inline entries and dedup-ref entries are skipped:
-/// - Inline entries: read path not yet implemented (INLINE_THRESHOLD = 0).
+/// Dedup-ref and zero entries are skipped:
 /// - Dedup-ref entries: no body in this segment; the hash is already indexed
 ///   from the ancestor segment that holds the actual data.
+///
+/// Inline entries are indexed with their data held in memory (`inline_data`).
+/// The inline section bytes are read from the segment or `.idx` file and
+/// sliced per entry, so reads can return inline data with zero file I/O.
 ///
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
 /// Canonical location semantics: when the same hash appears in multiple
@@ -228,11 +235,31 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                     Err(e) => return Err(e),
                 };
 
+            // Read inline section lazily: only when at least one Inline entry exists.
+            let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+            let inline_bytes = if has_inline {
+                segment::read_inline_section(path)?
+            } else {
+                Vec::new()
+            };
+
             for entry in entries {
                 match entry.kind {
-                    EntryKind::Data => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::DedupRef | EntryKind::Zero => continue,
                 }
+                let idata = if entry.kind == EntryKind::Inline {
+                    let start = entry.stored_offset as usize;
+                    let end = start + entry.stored_length as usize;
+                    if end <= inline_bytes.len() {
+                        Some(inline_bytes[start..end].into())
+                    } else {
+                        // Truncated inline section — skip this entry.
+                        continue;
+                    }
+                } else {
+                    None
+                };
                 index.insert_if_absent(
                     entry.hash,
                     ExtentLocation {
@@ -242,6 +269,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         compressed: entry.compressed,
                         body_source: BodySource::Local,
                         body_section_start,
+                        inline_data: idata,
                     },
                 );
             }
@@ -270,13 +298,30 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 }
                 Err(e) => return Err(e),
             };
+            // Read inline section from .idx (which includes header + index + inline).
+            let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+            let inline_bytes = if has_inline {
+                segment::read_inline_section(path)?
+            } else {
+                Vec::new()
+            };
+
             for (raw_idx, entry) in entries.iter().enumerate() {
-                // Only index entries with body bytes in this segment.
-                // Thin DedupRef has no body (reads via extent index to canonical).
                 match entry.kind {
-                    EntryKind::Data => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::DedupRef | EntryKind::Zero => continue,
                 }
+                let idata = if entry.kind == EntryKind::Inline {
+                    let start = entry.stored_offset as usize;
+                    let end = start + entry.stored_length as usize;
+                    if end <= inline_bytes.len() {
+                        Some(inline_bytes[start..end].into())
+                    } else {
+                        continue;
+                    }
+                } else {
+                    None
+                };
                 // body_offset is body-relative: the .body file starts at byte 0
                 // of the body section, so no adjustment needed.
                 // body_source and body_section_start enable per-extent range-GETs.
@@ -289,6 +334,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         compressed: entry.compressed,
                         body_source: BodySource::Cached(raw_idx as u32),
                         body_section_start,
+                        inline_data: idata,
                     },
                 );
             }
@@ -353,6 +399,7 @@ mod tests {
                 compressed: false,
                 body_source: BodySource::Local,
                 body_section_start: 0,
+                inline_data: None,
             },
         );
         let loc = index.lookup(&hash).unwrap();

@@ -223,6 +223,7 @@ impl VolumeReader {
                                 compressed: flags.contains(writelog::WalFlags::COMPRESSED),
                                 body_source: extentindex::BodySource::Local,
                                 body_section_start: 0,
+                                inline_data: None,
                             },
                         );
                     }
@@ -288,6 +289,19 @@ impl VolumeReader {
             return Ok([0u8; 4096]); // hash not indexed — treat as unwritten
         };
         let loc = loc.clone();
+
+        // Inline extents: data is held in memory, no file I/O needed.
+        if let Some(ref idata) = loc.inline_data {
+            let raw = if loc.compressed {
+                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
+            } else {
+                idata.to_vec()
+            };
+            let src = block_offset as usize * 4096;
+            let mut block = [0u8; 4096];
+            block.copy_from_slice(&raw[src..src + 4096]);
+            return Ok(block);
+        }
 
         // Per-extent demand-fetch for cached entries.
         if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
@@ -495,8 +509,14 @@ mod tests {
         let vol_dir = new_vol_dir(&by_id);
         let vol_id = vol_dir.file_name().unwrap().to_str().unwrap().to_owned();
 
-        // Write LBA 0 and snapshot so the data lands in pending/.
-        write_and_snapshot(&vol_dir, &by_id, 0, 0xAB);
+        // Write high-entropy data larger than INLINE_THRESHOLD so the extent
+        // goes into the body section and triggers demand-fetch.
+        {
+            let mut vol = Volume::open(&vol_dir, &by_id).unwrap();
+            let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+            vol.write(0, &data).unwrap();
+            vol.snapshot().unwrap();
+        }
 
         // Find the segment in pending/.
         let pending_dir = vol_dir.join("pending");
@@ -536,8 +556,10 @@ mod tests {
         // per-extent fetch on the first read_block(0).
         let reader = VolumeReader::open(&vol_dir).unwrap();
         let block = reader.read_block(0).unwrap();
+        let expected: Vec<u8> = (0..4096).map(|i| ((i * 7 + 13) & 0xFF) as u8).collect();
         assert_eq!(
-            block, [0xABu8; 4096],
+            block.as_slice(),
+            expected.as_slice(),
             "demand-fetched block must match written data"
         );
 

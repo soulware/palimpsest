@@ -705,15 +705,29 @@ fn collect_stats(
         let idx_size = segment::idx_body_section_start(&idx_path)?;
         let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
+        // Read inline section from .idx for any inline entries.
+        let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+        let inline_bytes = if has_inline {
+            segment::read_inline_section(&idx_path)?
+        } else {
+            Vec::new()
+        };
+
         let mut live_lba_bytes: u64 = 0;
         let mut total_lba_bytes: u64 = 0;
         let mut physical_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
-        for entry in entries {
+        for mut entry in entries {
+            // Pre-populate inline entry data from the .idx inline section.
+            // compact_segments needs this data to write the output segment.
             if entry.kind == EntryKind::Inline {
-                continue;
+                let start = entry.stored_offset as usize;
+                let end = start + entry.stored_length as usize;
+                if end <= inline_bytes.len() {
+                    entry.data = inline_bytes[start..end].to_vec();
+                }
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
             total_lba_bytes += lba_bytes;
@@ -733,7 +747,12 @@ fn collect_stats(
                 }
                 continue;
             }
-            physical_body_bytes += entry.stored_length as u64;
+            // Inline entries have stored bytes in the inline section (part of
+            // .idx, not S3 body). They do not contribute to physical_body_bytes
+            // but do participate in liveness like DATA entries.
+            if entry.kind != EntryKind::Inline {
+                physical_body_bytes += entry.stored_length as u64;
+            }
             // DedupRef entries carry body bytes in S3 (filled by materialization)
             // and an LBA mapping. Liveness is LBA-based: the entry is live if
             // the LBA still maps to its hash.
@@ -779,7 +798,7 @@ fn collect_stats(
         result.push(SegmentStats {
             ulid_str,
             body_section_start: idx_size,
-            has_body_entries: physical_body_bytes > 0,
+            has_body_entries: physical_body_bytes > 0 || has_inline,
             file_size,
             live_lba_bytes,
             total_lba_bytes,

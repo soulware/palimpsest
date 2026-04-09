@@ -566,6 +566,7 @@ impl Volume {
                 compressed,
                 body_source: BodySource::Local,
                 body_section_start: 0,
+                inline_data: None,
             },
         );
         self.pending_entries.push(segment::SegmentEntry::new_data(
@@ -667,11 +668,11 @@ impl Volume {
                     Err(e) => return Err(e),
                 };
 
-            // Only DATA entries have real body bytes.
+            // DATA and Inline entries have real stored bytes.
             // DedupRef body regions are zero-filled; Zero has stored_length=0.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| matches!(e.kind, EntryKind::Data))
+                .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::Inline))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -681,7 +682,9 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| matches!(e.kind, EntryKind::Data) && live.contains(&e.hash))
+                .filter(|e| {
+                    matches!(e.kind, EntryKind::Data | EntryKind::Inline) && live.contains(&e.hash)
+                })
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -720,14 +723,16 @@ impl Volume {
             self.evict_cached_segment(seg_id);
 
             if !live_entries.is_empty() {
-                // Read body bytes for live entries.  Only Data entries have
-                // real body bytes; DedupRef regions are zero-filled placeholders
-                // in pending/ and are re-emitted as zeros by write_segment.
+                // Read body bytes for live entries (Data) and inline data (Inline).
+                // DedupRef regions are zero-filled placeholders in pending/ and are
+                // re-emitted as zeros by write_segment.
+                let inline_bytes = segment::read_inline_section(&seg_path)?;
                 segment::read_extent_bodies(
                     &seg_path,
                     body_section_start,
                     &mut live_entries,
-                    segment::EntryKind::LOCAL_BODY,
+                    [EntryKind::Data, EntryKind::Inline],
+                    &inline_bytes,
                 )?;
 
                 // Reuse the source segment's own ULID for the output.  This
@@ -761,10 +766,25 @@ impl Volume {
                                     compressed: entry.compressed,
                                     body_source: BodySource::Local,
                                     body_section_start: new_bss,
+                                    inline_data: None,
                                 },
                             );
                         }
-                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
+                        EntryKind::Inline => {
+                            Arc::make_mut(&mut self.extent_index).insert(
+                                entry.hash,
+                                extentindex::ExtentLocation {
+                                    segment_id: new_ulid,
+                                    body_offset: entry.stored_offset,
+                                    body_length: entry.stored_length,
+                                    compressed: entry.compressed,
+                                    body_source: BodySource::Local,
+                                    body_section_start: new_bss,
+                                    inline_data: Some(entry.data.clone().into_boxed_slice()),
+                                },
+                            );
+                        }
+                        EntryKind::DedupRef | EntryKind::Zero => {}
                     }
                 }
             } else {
@@ -879,11 +899,13 @@ impl Volume {
             }
 
             let mut live_entries = live_entries;
+            let inline_bytes = segment::read_inline_section(seg_path)?;
             segment::read_extent_bodies(
                 seg_path,
                 body_section_start,
                 &mut live_entries,
-                segment::EntryKind::LOCAL_BODY,
+                [EntryKind::Data, EntryKind::Inline],
+                &inline_bytes,
             )?;
             merged_live.extend(live_entries);
 
@@ -949,10 +971,25 @@ impl Volume {
                                 compressed: entry.compressed,
                                 body_source: BodySource::Local,
                                 body_section_start: new_bss,
+                                inline_data: None,
                             },
                         );
                     }
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
+                    EntryKind::Inline => {
+                        Arc::make_mut(&mut self.extent_index).insert(
+                            entry.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: new_ulid,
+                                body_offset: entry.stored_offset,
+                                body_length: entry.stored_length,
+                                compressed: entry.compressed,
+                                body_source: BodySource::Local,
+                                body_section_start: new_bss,
+                                inline_data: Some(entry.data.clone().into_boxed_slice()),
+                            },
+                        );
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero => {}
                 }
             }
         }
@@ -1122,11 +1159,13 @@ impl Volume {
             // .applied handoffs: already volume-signed; skip re-signing.
             if !is_already_applied && gc_seg_path.try_exists()? {
                 let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
+                let gc_inline = segment::read_inline_section(&gc_seg_path)?;
                 segment::read_extent_bodies(
                     &gc_seg_path,
                     bss,
                     &mut entries,
-                    segment::EntryKind::ALL_BODY,
+                    [EntryKind::Data, EntryKind::DedupRef, EntryKind::Inline],
+                    &gc_inline,
                 )?;
                 let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
                 segment::write_segment(&tmp_path, &mut entries, self.signer.as_ref())?;
@@ -1271,6 +1310,17 @@ impl Volume {
             // restart recovery from a redundant steady-state re-check.
             let mut index_mutated = false;
             if let Some((body_section_start, ref entries)) = segment_index {
+                // Read inline section for any inline entries in the GC output.
+                let handoff_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
+                    body_path
+                        .as_ref()
+                        .map(|p| segment::read_inline_section(p))
+                        .transpose()?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
                 for (i, e) in entries.iter().enumerate() {
                     if e.kind == EntryKind::DedupRef {
                         continue;
@@ -1289,6 +1339,17 @@ impl Volume {
                     if !still_at_old {
                         continue;
                     }
+                    let idata = if e.kind == EntryKind::Inline {
+                        let start = e.stored_offset as usize;
+                        let end = start + e.stored_length as usize;
+                        if end <= handoff_inline.len() {
+                            Some(handoff_inline[start..end].into())
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        None
+                    };
                     Arc::make_mut(&mut self.extent_index).insert(
                         e.hash,
                         extentindex::ExtentLocation {
@@ -1298,6 +1359,7 @@ impl Volume {
                             compressed: e.compressed,
                             body_source: BodySource::Cached(i as u32),
                             body_section_start,
+                            inline_data: idata,
                         },
                     );
                     index_mutated = true;
@@ -1520,8 +1582,14 @@ impl Volume {
             // range-GET offset.
             let (promote_bss, entries) =
                 segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
+            // Read inline section for any inline entries being promoted.
+            let promote_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
+                segment::read_inline_section(&src_path)?
+            } else {
+                Vec::new()
+            };
             for (i, entry) in entries.iter().enumerate() {
-                if entry.kind != segment::EntryKind::Data {
+                if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
                     continue;
                 }
                 // Only update if the extent index still points to this segment
@@ -1531,6 +1599,17 @@ impl Volume {
                     .lookup(&entry.hash)
                     .is_some_and(|loc| loc.segment_id == ulid)
                 {
+                    let idata = if entry.kind == EntryKind::Inline {
+                        let start = entry.stored_offset as usize;
+                        let end = start + entry.stored_length as usize;
+                        if end <= promote_inline.len() {
+                            Some(promote_inline[start..end].into())
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        None
+                    };
                     Arc::make_mut(&mut self.extent_index).insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -1540,6 +1619,7 @@ impl Volume {
                             compressed: entry.compressed,
                             body_source: BodySource::Cached(i as u32),
                             body_section_start: promote_bss,
+                            inline_data: idata,
                         },
                     );
                 }
@@ -1649,6 +1729,11 @@ impl Volume {
             if entry.stored_length == 0 {
                 continue;
             }
+            // Inline entries: data is in the inline section, not body.
+            // The inline section was already copied verbatim; nothing to patch.
+            if entry.kind == EntryKind::Inline {
+                continue;
+            }
 
             let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
             let hash_alive = live_hashes.contains(&entry.hash);
@@ -1677,25 +1762,31 @@ impl Volume {
                     out.write_all(&zeros)?;
                     continue;
                 };
-                let canonical_path = self.find_segment_file(
-                    loc.segment_id,
-                    loc.body_section_start,
-                    loc.body_source,
-                )?;
-                let file_offset = match SegmentLayout::from_path(&canonical_path) {
-                    SegmentLayout::BodyOnly => loc.body_offset,
-                    SegmentLayout::Full => loc.body_section_start + loc.body_offset,
+                // Canonical source may be an inline extent (data in memory).
+                let data = if let Some(ref idata) = loc.inline_data {
+                    idata.to_vec()
+                } else {
+                    let canonical_path = self.find_segment_file(
+                        loc.segment_id,
+                        loc.body_section_start,
+                        loc.body_source,
+                    )?;
+                    let file_offset = match SegmentLayout::from_path(&canonical_path) {
+                        SegmentLayout::BodyOnly => loc.body_offset,
+                        SegmentLayout::Full => loc.body_section_start + loc.body_offset,
+                    };
+                    let mut f = fs::File::open(&canonical_path)?;
+                    f.seek(SeekFrom::Start(file_offset))?;
+                    let mut buf = vec![0u8; loc.body_length as usize];
+                    f.read_exact(&mut buf)?;
+                    buf
                 };
-                let mut f = fs::File::open(&canonical_path)?;
-                f.seek(SeekFrom::Start(file_offset))?;
-                let mut data = vec![0u8; loc.body_length as usize];
-                f.read_exact(&mut data)?;
 
                 out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
                 out.write_all(&data)?;
                 filled += 1;
             }
-            // Data/Zero/Inline with live hash: body bytes are already correct
+            // Data/Zero with live hash: body bytes are already correct
             // from the copy.
         }
         out.sync_data()?;
@@ -1779,9 +1870,14 @@ impl Volume {
         // not indexed.
         for entry in &self.pending_entries {
             match entry.kind {
-                EntryKind::Data => {}
-                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::DedupRef | EntryKind::Zero => continue,
             }
+            let idata = if entry.kind == EntryKind::Inline {
+                Some(entry.data.clone().into_boxed_slice())
+            } else {
+                None
+            };
             Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
                 extentindex::ExtentLocation {
@@ -1791,21 +1887,22 @@ impl Volume {
                     compressed: entry.compressed,
                     body_source: BodySource::Local,
                     body_section_start,
+                    inline_data: idata,
                 },
             );
         }
         {
-            let (mut data, mut refs, mut zero) = (0usize, 0usize, 0usize);
+            let (mut data, mut refs, mut zero, mut inline) = (0usize, 0usize, 0usize, 0usize);
             for e in &self.pending_entries {
                 match e.kind {
                     EntryKind::Data => data += 1,
                     EntryKind::DedupRef => refs += 1,
                     EntryKind::Zero => zero += 1,
-                    EntryKind::Inline => {}
+                    EntryKind::Inline => inline += 1,
                 }
             }
             log::info!(
-                "flush {segment_ulid}: {data} data, {refs} dedup-ref, \
+                "flush {segment_ulid}: {data} data, {inline} inline, {refs} dedup-ref, \
                  {zero} zero ({} entries total)",
                 self.pending_entries.len()
             );
@@ -2017,7 +2114,15 @@ pub(crate) fn read_extents(
 
         // Extract owned copies so the borrow of extent_index ends before
         // we mutate file_cache.
-        let (segment_id, body_offset, body_length, compressed, body_section_start, body_source) = {
+        let (
+            segment_id,
+            body_offset,
+            body_length,
+            compressed,
+            body_section_start,
+            body_source,
+            inline_data,
+        ) = {
             let Some(loc) = extent_index.lookup(&er.hash) else {
                 continue; // hash not indexed — treat as unwritten
             };
@@ -2028,8 +2133,29 @@ pub(crate) fn read_extents(
                 loc.compressed,
                 loc.body_section_start,
                 loc.body_source,
+                loc.inline_data.clone(),
             )
         };
+
+        // Inline extents: data is held in memory, no file I/O needed.
+        if let Some(ref idata) = inline_data {
+            let block_count = (er.range_end - er.range_start) as usize;
+            let out_start = (er.range_start - lba) as usize * 4096;
+            let out_slice = &mut out[out_start..out_start + block_count * 4096];
+
+            let raw = if compressed {
+                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
+            } else {
+                idata.to_vec()
+            };
+            let src_start = er.payload_block_offset as usize * 4096;
+            let src_end = src_start + block_count * 4096;
+            let src_slice = raw
+                .get(src_start..src_end)
+                .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
+            out_slice.copy_from_slice(src_slice);
+            continue;
+        }
 
         // For cached entries, always call find_segment to check the .present
         // bitset — the .body file may exist but the specific entry may not
@@ -2487,6 +2613,7 @@ fn recover_wal(
                         compressed,
                         body_source: BodySource::Local,
                         body_section_start: 0,
+                        inline_data: None,
                     },
                 );
                 pending_entries.push(segment::SegmentEntry::new_data(
@@ -3933,20 +4060,21 @@ mod tests {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
-        let data = vec![0xCCu8; 4096];
-        // LBA 0 → DATA(hash=H).  Also dedup-indexed.
+        // Use high-entropy data that won't compress below INLINE_THRESHOLD.
+        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+        // LBA 0-1 → DATA(hash=H).  Also dedup-indexed.
         vol.write(0, &data).unwrap();
-        // LBA 1 → dedup hit → DedupRef(hash=H).  Hash H is now alive at LBAs 0 and 1.
-        vol.write(1, &data).unwrap();
+        // LBA 2-3 → dedup hit → DedupRef(hash=H).  Hash H is now alive at LBAs 0 and 2.
+        vol.write(2, &data).unwrap();
         vol.promote_for_test().unwrap();
 
         let ulids = pending_ulids(&base);
         assert_eq!(ulids.len(), 1);
         let seg_ulid = ulids[0];
 
-        // Overwrite LBA 0 with different data.  Now the original DATA entry
-        // at LBA 0 is LBA-dead, but hash H is still alive at LBA 1.
-        let other = vec![0xDDu8; 4096];
+        // Overwrite LBA 0-1 with different data.  Now the original DATA entry
+        // at LBA 0 is LBA-dead, but hash H is still alive at LBA 2.
+        let other: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
         vol.write(0, &other).unwrap();
 
         // Materialise: the entry at LBA 0 must NOT be zeroed because its hash
@@ -3985,11 +4113,12 @@ mod tests {
     fn materialise_zeros_body_when_hash_fully_dead() {
         // When both the LBA and the hash are dead (no LBA references the hash),
         // materialise must zero the body to prevent uploading deleted data.
+        // Uses high-entropy data that won't compress below INLINE_THRESHOLD.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
-        let data = vec![0xAAu8; 4096];
-        // LBA 0 → DATA(hash=H).
+        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+        // LBA 0-1 → DATA(hash=H).
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
 
@@ -3997,9 +4126,9 @@ mod tests {
         assert_eq!(ulids.len(), 1);
         let seg_ulid = ulids[0];
 
-        // Overwrite LBA 0 with different data.  Hash H is no longer alive
+        // Overwrite LBA 0-1 with different data.  Hash H is no longer alive
         // at ANY LBA.
-        let other = vec![0xBBu8; 4096];
+        let other: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
         vol.write(0, &other).unwrap();
 
         vol.materialise_segment(seg_ulid).unwrap();
@@ -4298,6 +4427,7 @@ mod tests {
                             0,
                             &mut seg_entries,
                             segment::EntryKind::LOCAL_BODY,
+                            &[],
                         )
                         .is_err()
                         {
@@ -5089,9 +5219,17 @@ mod tests {
         let body_path = fork_dir.join("cache").join(format!("{old_ulid}.body"));
         let (_old_bss, mut entries) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
+        // Read inline data from .idx for inline entries.
+        let inline_bytes = segment::read_inline_section(&idx_path).unwrap();
         // Cache .body files start at byte 0 of the body section.
-        segment::read_extent_bodies(&body_path, 0, &mut entries, segment::EntryKind::LOCAL_BODY)
-            .unwrap();
+        segment::read_extent_bodies(
+            &body_path,
+            0,
+            &mut entries,
+            [segment::EntryKind::Data, segment::EntryKind::Inline],
+            &inline_bytes,
+        )
+        .unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();
@@ -5131,7 +5269,7 @@ mod tests {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
-        let data = vec![0x42u8; 4096];
+        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
 
@@ -5200,7 +5338,7 @@ mod tests {
             "evict_applied_gc_cache must delete cache/<old>.present"
         );
         // Reads still work via cache/<new>.body.
-        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(0, 2).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -5245,7 +5383,7 @@ mod tests {
 
         let old_ulid;
         let new_ulid;
-        let data = vec![0xABu8; 4096];
+        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
 
         {
             let mut vol = Volume::open(&base, &base).unwrap();
@@ -5274,7 +5412,7 @@ mod tests {
         // Reopen: rebuild scans index/ and finds the old segment's .idx.  Reads
         // work via cache/ even though the coordinator has already produced a replacement.
         let mut vol = Volume::open(&base, &base).unwrap();
-        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(0, 2).unwrap(), data);
 
         // Apply the pending handoff: re-signs gc/<new_ulid> in-place,
         // updates extent index, renames .pending → .applied.
@@ -5322,7 +5460,7 @@ mod tests {
         );
 
         // Reads still correct: extent index points to new_ulid, body in cache/.
-        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(0, 2).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -5342,7 +5480,7 @@ mod tests {
 
         let old_ulid;
         let new_ulid;
-        let data = vec![0xCDu8; 4096];
+        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
 
         {
             let mut vol = Volume::open(&base, &base).unwrap();
@@ -5398,7 +5536,7 @@ mod tests {
         );
 
         // Data still correct.
-        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(0, 2).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
     }
