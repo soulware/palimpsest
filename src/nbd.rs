@@ -1092,6 +1092,7 @@ fn read_u64(s: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1110,29 +1111,29 @@ mod tests {
         p
     }
 
-    // Bind on port 0, spawn the server, return the port.
+    // Bind a Unix socket in the temp dir, spawn the server, return the socket path.
     // The listener is already bound before the thread starts, so the client can
     // connect immediately — the OS queues the connection until accept() is called.
-    fn start_server(dir: &std::path::Path, size_bytes: u64) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+    fn start_server(dir: &std::path::Path, size_bytes: u64) -> std::path::PathBuf {
+        let sock = dir.join("nbd.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, NbdListener::Tcp(listener), None, None).ok();
+            serve_volume_listener(&dir, size_bytes, NbdListener::Unix(listener), None, None).ok();
         });
-        port
+        sock
     }
 
     // --- NBD client helpers ---
 
     struct NbdClient {
-        s: TcpStream,
+        s: UnixStream,
     }
 
     impl NbdClient {
         /// Connect and complete the newstyle NBD handshake via NBD_OPT_GO.
-        fn connect(port: u16) -> io::Result<Self> {
-            let mut s = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+        fn connect(sock: &std::path::Path) -> io::Result<Self> {
+            let mut s = UnixStream::connect(sock)?;
 
             // Server greeting
             let mut buf = [0u8; 8];
@@ -1265,14 +1266,15 @@ mod tests {
         }
     }
 
-    fn start_readonly_server(dir: &std::path::Path, size_bytes: u64) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+    fn start_readonly_server(dir: &std::path::Path, size_bytes: u64) -> std::path::PathBuf {
+        let sock = dir.join("nbd.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_readonly_volume_listener(&dir, size_bytes, NbdListener::Tcp(listener), None).ok();
+            serve_readonly_volume_listener(&dir, size_bytes, NbdListener::Unix(listener), None)
+                .ok();
         });
-        port
+        sock
     }
 
     // --- Tests ---
@@ -1280,8 +1282,8 @@ mod tests {
     #[test]
     fn unwritten_blocks_read_as_zeros() {
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
         let buf = c.read(1, 0, 4096).unwrap();
         assert!(buf.iter().all(|&b| b == 0));
         c.disconnect().unwrap();
@@ -1291,8 +1293,8 @@ mod tests {
     #[test]
     fn write_then_read_roundtrip() {
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         let data: Vec<u8> = (0..4096u16).map(|i| (i & 0xff) as u8).collect();
         c.write(1, 0, &data).unwrap();
@@ -1306,8 +1308,8 @@ mod tests {
     #[test]
     fn multi_block_write_and_partial_read() {
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         // Write 3 blocks starting at LBA 2 (offset 8192)
         let data: Vec<u8> = (0..12288u16).map(|i| (i & 0xff) as u8).collect();
@@ -1328,8 +1330,8 @@ mod tests {
     #[test]
     fn flush_succeeds() {
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
         c.flush(1).unwrap();
         c.disconnect().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
@@ -1338,8 +1340,8 @@ mod tests {
     #[test]
     fn overwrite_block_returns_new_data() {
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         let first = vec![0xaau8; 4096];
         let second = vec![0xbbu8; 4096];
@@ -1357,8 +1359,8 @@ mod tests {
         // Simulate the kernel using 512-byte sectors: write 1024 bytes at
         // offset 1024 (the ext4 superblock location), then read it back.
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         // Write 1024 bytes at byte offset 1024 (not 4096-aligned).
         let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
@@ -1383,8 +1385,8 @@ mod tests {
         // Write a full block, then overwrite part of it with a sub-block write.
         // The untouched bytes in the block should be preserved.
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         // Fill block 0 with 0xaa.
         c.write(1, 0, &vec![0xaau8; 4096]).unwrap();
@@ -1407,8 +1409,8 @@ mod tests {
         // All existing NBD tests use repetitive (compressible) data.
         // This test exercises the uncompressed path through the full NBD stack.
         let dir = temp_dir();
-        let port = start_server(&dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         // Build a high-entropy block: LCG with coprime multiplier gives all 256
         // values exactly 16 times in 4096 bytes (entropy = 8 bits/byte).
@@ -1448,8 +1450,8 @@ mod tests {
             vol.promote_for_test().unwrap();
         }
 
-        let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
         let back = c.read(1, 0, 4096).unwrap();
         assert_eq!(back, data);
 
@@ -1466,8 +1468,8 @@ mod tests {
         std::fs::create_dir_all(fork_dir.join("index")).unwrap();
         std::fs::create_dir_all(fork_dir.join("pending")).unwrap();
 
-        let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
 
         let result = c.write(1, 0, &vec![0xABu8; 4096]);
         let err_msg = result.unwrap_err().to_string();
@@ -1486,8 +1488,8 @@ mod tests {
         std::fs::create_dir_all(fork_dir.join("index")).unwrap();
         std::fs::create_dir_all(fork_dir.join("pending")).unwrap();
 
-        let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
-        let mut c = NbdClient::connect(port).unwrap();
+        let sock = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
         let buf = c.read(1, 0, 4096).unwrap();
         assert_eq!(buf, vec![0u8; 4096]);
 
