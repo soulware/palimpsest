@@ -99,12 +99,13 @@ async fn prefetch_fork(
     verifying_key: &VerifyingKey,
     result: &mut PrefetchResult,
 ) -> Result<()> {
-    let prefix = StorePath::from(format!("by_id/{volume_id}/"));
+    // Prefetch segment indexes from segments/ sub-prefix.
+    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
     let objects: Vec<_> = store
-        .list(Some(&prefix))
+        .list(Some(&seg_prefix))
         .try_collect()
         .await
-        .with_context(|| format!("listing by_id/{volume_id}"))?;
+        .with_context(|| format!("listing by_id/{volume_id}/segments/"))?;
 
     for obj in objects {
         let key = &obj.location;
@@ -114,7 +115,7 @@ async fn prefetch_fork(
             continue;
         };
 
-        // Validate as ULID (skips non-segment entries like manifest.toml).
+        // Validate as ULID.
         if Ulid::from_string(ulid_str).is_err() {
             continue;
         }
@@ -143,6 +144,9 @@ async fn prefetch_fork(
             }
         }
     }
+
+    // Prefetch snapshot markers and filemaps from snapshots/ sub-prefix.
+    prefetch_snapshots(store, fork_dir, volume_id).await?;
 
     Ok(())
 }
@@ -198,6 +202,62 @@ async fn fetch_idx(
     tokio::fs::rename(&tmp_path, &final_path)
         .await
         .context("renaming idx.tmp")?;
+
+    Ok(())
+}
+
+/// Download snapshot markers and filemaps from S3 into `<fork_dir>/snapshots/`.
+///
+/// Lists `by_id/<volume_id>/snapshots/` and downloads any files not already
+/// present locally. Snapshot markers are empty files; filemaps are small text
+/// files. Both are written atomically (tmp → rename).
+async fn prefetch_snapshots(
+    store: &Arc<dyn ObjectStore>,
+    fork_dir: &Path,
+    volume_id: &str,
+) -> Result<()> {
+    let prefix = StorePath::from(format!("by_id/{volume_id}/snapshots/"));
+    let objects: Vec<_> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .with_context(|| format!("listing by_id/{volume_id}/snapshots/"))?;
+
+    let snap_dir = fork_dir.join("snapshots");
+
+    for obj in objects {
+        let Some(filename) = obj.location.filename() else {
+            continue;
+        };
+        let filename = filename.to_owned();
+
+        let local_path = snap_dir.join(&filename);
+        if local_path.exists() {
+            continue;
+        }
+
+        let data = store
+            .get(&obj.location)
+            .await
+            .with_context(|| format!("downloading {}", obj.location))?
+            .bytes()
+            .await
+            .with_context(|| format!("reading {}", obj.location))?;
+
+        tokio::fs::create_dir_all(&snap_dir)
+            .await
+            .context("creating snapshots dir")?;
+
+        let tmp_path = snap_dir.join(format!("{filename}.tmp"));
+        tokio::fs::write(&tmp_path, &data)
+            .await
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, &local_path)
+            .await
+            .with_context(|| format!("renaming to {}", local_path.display()))?;
+
+        info!("[prefetch] fetched snapshot artifact: {filename}");
+    }
 
     Ok(())
 }
@@ -272,7 +332,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = StorePath::from(format!("by_id/{parent_ulid}/19700101/{seg_ulid}"));
+        let key = StorePath::from(format!("by_id/{parent_ulid}/segments/19700101/{seg_ulid}"));
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Run prefetch_indexes on the child fork.
@@ -333,7 +393,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = StorePath::from(format!("by_id/{root_ulid}/19700101/{seg_ulid}"));
+        let key = StorePath::from(format!("by_id/{root_ulid}/segments/19700101/{seg_ulid}"));
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // prefetch_indexes should now fetch the root's own segment.
@@ -347,5 +407,62 @@ mod tests {
         let (_, entries) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, hash);
+    }
+
+    #[tokio::test]
+    async fn prefetch_downloads_snapshot_and_filemap() {
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let vol_dir = by_id.join(vol_ulid);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+
+        // Write volume.pub so prefetch_indexes doesn't fail.
+        let (_, vk) = generate_ephemeral_signer();
+        let vk_hex: String = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), &vk_hex).unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        // Upload a snapshot marker and filemap to the store.
+        let snap_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let snap_key = StorePath::from(format!("by_id/{vol_ulid}/snapshots/19700101/{snap_ulid}"));
+        store
+            .put(&snap_key, bytes::Bytes::new().into())
+            .await
+            .unwrap();
+
+        let filemap_content = b"# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n";
+        let fm_key = StorePath::from(format!(
+            "by_id/{vol_ulid}/snapshots/19700101/{snap_ulid}.filemap"
+        ));
+        store
+            .put(&fm_key, bytes::Bytes::from_static(filemap_content).into())
+            .await
+            .unwrap();
+
+        // Run prefetch — should download both snapshot marker and filemap.
+        let result = prefetch_indexes(&vol_dir, &store).await.unwrap();
+        assert_eq!(result.failed, 0);
+
+        let snap_dir = vol_dir.join("snapshots");
+        assert!(
+            snap_dir.join(snap_ulid).exists(),
+            "snapshot marker should exist locally"
+        );
+        let local_filemap = snap_dir.join(format!("{snap_ulid}.filemap"));
+        assert!(local_filemap.exists(), "filemap should exist locally");
+        assert_eq!(std::fs::read(&local_filemap).unwrap(), filemap_content);
+
+        // Running again should skip (already present).
+        prefetch_indexes(&vol_dir, &store).await.unwrap();
+        // No error, no re-download.
     }
 }

@@ -1109,7 +1109,21 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
                 .map(|s| s.trim().to_owned())
                 .map_err(|e| std::io::Error::other(format!("names/{name} is not valid utf-8: {e}")))
         })?;
-        println!("{name}  {ulid}");
+
+        // Check for snapshot availability (determines if this volume can be pulled).
+        let has_snapshot = rt.block_on(async {
+            let snap_prefix = StorePath::from(format!("by_id/{ulid}/snapshots/"));
+            let mut listing = store.list(Some(&snap_prefix));
+            // We only need to know if at least one snapshot exists.
+            use futures::StreamExt;
+            listing.next().await.is_some()
+        });
+
+        if has_snapshot {
+            println!("{name}  {ulid}  [snapshot]");
+        } else {
+            println!("{name}  {ulid}");
+        }
     }
 
     Ok(())

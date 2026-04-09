@@ -539,7 +539,7 @@ mod tests {
         let seg_ulid: ulid::Ulid = seg_id.parse().unwrap();
         let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
         let date = dt.format("%Y%m%d").to_string();
-        let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
+        let key = StorePath::from(format!("by_id/{vol_id}/segments/{date}/{seg_id}"));
         rt.block_on(store.put(&key, seg_bytes.clone().into()))
             .unwrap();
         std::fs::remove_file(&seg_path).unwrap();

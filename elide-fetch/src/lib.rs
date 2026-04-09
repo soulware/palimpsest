@@ -14,7 +14,7 @@
 // AWS_ENDPOINT_URL and AWS_DEFAULT_REGION (optional).
 //
 // Key layout mirrors the coordinator's upload layout:
-//   by_id/<volume_id>/YYYYMMDD/<ulid>
+//   by_id/<volume_id>/segments/YYYYMMDD/<ulid>
 //
 // Fetch sequence per extent miss:
 //   1. Read the local .idx to find the extent's S3 byte range
@@ -353,7 +353,7 @@ async fn fetch_one_extent(
 
 /// Build the S3 object key for a segment.
 ///
-/// Format: `by_id/<volume_id>/YYYYMMDD/<segment_ulid>`
+/// Format: `by_id/<volume_id>/segments/YYYYMMDD/<segment_ulid>`
 fn segment_key(volume_id: &str, ulid_str: &str) -> io::Result<StorePath> {
     let ulid: Ulid = ulid_str
         .parse()
@@ -361,7 +361,7 @@ fn segment_key(volume_id: &str, ulid_str: &str) -> io::Result<StorePath> {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
     Ok(StorePath::from(format!(
-        "by_id/{volume_id}/{date}/{ulid_str}"
+        "by_id/{volume_id}/segments/{date}/{ulid_str}"
     )))
 }
 
@@ -472,7 +472,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
         let date = dt.format("%Y%m%d").to_string();
-        let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
+        let key = StorePath::from(format!("by_id/{vol_id}/segments/{date}/{seg_id}"));
         rt.block_on(store.put(&key, full_bytes.into())).unwrap();
 
         // Create a fork dir named with vol_id and write volume.pub so the
@@ -582,7 +582,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
         let date = dt.format("%Y%m%d").to_string();
-        let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
+        let key = StorePath::from(format!("by_id/{vol_id}/segments/{date}/{seg_id}"));
         rt.block_on(store.put(&key, full_bytes.into())).unwrap();
 
         // Create a fork dir named with vol_id and write volume.pub.
@@ -742,7 +742,7 @@ mod tests {
         let key = segment_key(vol_ulid, &seg_str).unwrap();
         assert_eq!(
             key.as_ref(),
-            format!("by_id/{vol_ulid}/{expected_date}/{seg_str}")
+            format!("by_id/{vol_ulid}/segments/{expected_date}/{seg_str}")
         );
     }
 }

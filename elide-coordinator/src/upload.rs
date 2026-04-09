@@ -1,6 +1,6 @@
 // Segment upload: drain all committed segments from pending/ to the object store.
 //
-// Object key format: by_id/<volume_ulid>/YYYYMMDD/<ulid>
+// Object key format: by_id/<volume_ulid>/segments/YYYYMMDD/<ulid>
 //
 // The date is extracted from the ULID timestamp (creation time, not upload time),
 // so keys are stable and deterministic regardless of when drain-pending runs.
@@ -61,7 +61,7 @@ pub fn derive_names(vol_dir: &Path) -> Result<String> {
 
 /// Build the object store key for a segment.
 ///
-/// Format: `by_id/<volume_ulid>/YYYYMMDD/<segment_ulid>`
+/// Format: `by_id/<volume_ulid>/segments/YYYYMMDD/<segment_ulid>`
 pub fn segment_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let ulid: Ulid = ulid_str
         .parse()
@@ -69,14 +69,13 @@ pub fn segment_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
     Ok(StorePath::from(format!(
-        "by_id/{volume_id}/{date}/{ulid_str}"
+        "by_id/{volume_id}/segments/{date}/{ulid_str}"
     )))
 }
 
 /// Build the object store key for a snapshot marker.
 ///
 /// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>`
-#[allow(dead_code)] // used when S3 snapshot upload is wired up
 pub fn snapshot_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let ulid: Ulid = ulid_str
         .parse()
@@ -85,6 +84,20 @@ pub fn snapshot_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let date = dt.format("%Y%m%d").to_string();
     Ok(StorePath::from(format!(
         "by_id/{volume_id}/snapshots/{date}/{ulid_str}"
+    )))
+}
+
+/// Build the object store key for a snapshot filemap.
+///
+/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.filemap`
+pub fn filemap_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
+    let ulid: Ulid = ulid_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
+    let dt: DateTime<Utc> = ulid.datetime().into();
+    let date = dt.format("%Y%m%d").to_string();
+    Ok(StorePath::from(format!(
+        "by_id/{volume_id}/snapshots/{date}/{ulid_str}.filemap"
     )))
 }
 
@@ -221,7 +234,8 @@ fn try_delta(
     Ok(result)
 }
 
-/// Upload volume metadata: public key, manifest.toml, and names/<name> entry.
+/// Upload volume metadata: public key, manifest.toml, names/<name> entry,
+/// snapshot markers, and filemaps.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
@@ -234,6 +248,10 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
 
     if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
         warn!("manifest upload failed: {e:#}");
+    }
+
+    if let Err(e) = upload_snapshots_and_filemaps(vol_dir, volume_id, store).await {
+        warn!("snapshot/filemap upload failed: {e:#}");
     }
 }
 
@@ -324,7 +342,6 @@ async fn upload_manifest(
 
 /// Upload a snapshot marker as an empty object at
 /// `by_id/<volume_id>/snapshots/YYYYMMDD/<snapshot_ulid>`.
-#[allow(dead_code)] // used when S3 snapshot upload is wired up
 pub async fn upload_snapshot(
     volume_id: &str,
     snapshot_ulid: &str,
@@ -335,6 +352,59 @@ pub async fn upload_snapshot(
         .put(&key, Bytes::new().into())
         .await
         .with_context(|| format!("uploading snapshot marker to {key}"))?;
+    Ok(())
+}
+
+/// Upload all snapshot markers and filemaps from `vol_dir/snapshots/` to S3.
+///
+/// For each snapshot ULID found locally, uploads:
+/// - The empty snapshot marker at `snapshots/YYYYMMDD/<ulid>`
+/// - The filemap at `snapshots/YYYYMMDD/<ulid>.filemap` (if present)
+async fn upload_snapshots_and_filemaps(
+    vol_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<()> {
+    let snap_dir = vol_dir.join("snapshots");
+    let mut entries = match tokio::fs::read_dir(&snap_dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // Skip filemap files — they are uploaded alongside their snapshot marker.
+        if name.contains('.') {
+            continue;
+        }
+        // Validate as ULID.
+        if ulid::Ulid::from_string(name).is_err() {
+            continue;
+        }
+
+        // Upload snapshot marker.
+        if let Err(e) = upload_snapshot(volume_id, name, store).await {
+            warn!("snapshot marker upload failed for {name}: {e:#}");
+        }
+
+        // Upload filemap if present.
+        let filemap_path = snap_dir.join(format!("{name}.filemap"));
+        if filemap_path.exists() {
+            let key = filemap_key(volume_id, name)?;
+            let data = tokio::fs::read(&filemap_path)
+                .await
+                .with_context(|| format!("reading filemap: {}", filemap_path.display()))?;
+            store
+                .put(&key, Bytes::from(data).into())
+                .await
+                .with_context(|| format!("uploading filemap to {key}"))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -439,7 +509,7 @@ mod tests {
         let key = segment_key(VOL_ULID, &ulid_str).unwrap();
         assert_eq!(
             key.as_ref(),
-            format!("by_id/{VOL_ULID}/{expected_date}/{ulid_str}")
+            format!("by_id/{VOL_ULID}/segments/{expected_date}/{ulid_str}")
         );
     }
 
@@ -624,5 +694,67 @@ mod tests {
         let key = snapshot_key(VOL_ULID, &snap_ulid).unwrap();
         let meta = store.head(&key).await.expect("snapshot not in store");
         assert_eq!(meta.size, 0);
+    }
+
+    #[test]
+    fn filemap_key_format() {
+        let ulid = Ulid::from_parts(1743120000000, 42);
+        let ulid_str = ulid.to_string();
+
+        let dt: DateTime<Utc> = ulid.datetime().into();
+        let expected_date = dt.format("%Y%m%d").to_string();
+
+        let key = filemap_key(VOL_ULID, &ulid_str).unwrap();
+        assert_eq!(
+            key.as_ref(),
+            format!("by_id/{VOL_ULID}/snapshots/{expected_date}/{ulid_str}.filemap")
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_uploads_snapshot_and_filemap() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        let pending_dir = vol_dir.join("pending");
+        let snap_dir = vol_dir.join("snapshots");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("test-vol".into()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
+
+        // Create a snapshot marker and filemap.
+        let snap_ulid = Ulid::from_parts(1743120000000, 77).to_string();
+        std::fs::write(snap_dir.join(&snap_ulid), "").unwrap();
+        let filemap_content = "# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n";
+        std::fs::write(
+            snap_dir.join(format!("{snap_ulid}.filemap")),
+            filemap_content,
+        )
+        .unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+
+        // Snapshot marker should be in store.
+        let snap_key = snapshot_key(VOL_ULID, &snap_ulid).unwrap();
+        let meta = store
+            .head(&snap_key)
+            .await
+            .expect("snapshot marker not in store");
+        assert_eq!(meta.size, 0);
+
+        // Filemap should be in store with correct content.
+        let fm_key = filemap_key(VOL_ULID, &snap_ulid).unwrap();
+        let got = store.get(&fm_key).await.expect("filemap not in store");
+        let bytes = got.bytes().await.unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), filemap_content);
     }
 }
