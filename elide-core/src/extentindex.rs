@@ -584,4 +584,87 @@ mod tests {
         std::fs::remove_dir_all(ancestor).unwrap();
         std::fs::remove_dir_all(live).unwrap();
     }
+
+    #[test]
+    fn rebuild_indexes_inline_entries_from_pending() {
+        // Inline entries should be indexed with their data in inline_data.
+        let base = temp_dir();
+        let pending = base.join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        let signer = write_test_pub(&base);
+
+        let data = vec![0xABu8; 100]; // well below INLINE_THRESHOLD
+        let hash = blake3::hash(&data);
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            segment::SegmentFlags::empty(),
+            data.clone(),
+        )];
+        assert_eq!(entries[0].kind, segment::EntryKind::Inline);
+
+        segment::write_segment(
+            &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            &mut entries,
+            signer.as_ref(),
+        )
+        .unwrap();
+
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        assert_eq!(index.len(), 1);
+
+        let loc = index.lookup(&hash).unwrap();
+        assert!(
+            loc.inline_data.is_some(),
+            "inline entry must have inline_data populated"
+        );
+        assert_eq!(loc.inline_data.as_deref().unwrap(), &data);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rebuild_indexes_inline_entries_from_idx() {
+        // .idx files include the inline section; rebuild must load inline_data.
+        let base = temp_dir();
+        let pending = base.join("pending");
+        let index_dir = base.join("index");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let signer = write_test_pub(&base);
+
+        let data = vec![0xCDu8; 200];
+        let hash = blake3::hash(&data);
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            segment::SegmentFlags::empty(),
+            data.clone(),
+        )];
+
+        let seg_name = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let seg_path = pending.join(seg_name);
+        segment::write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // Extract .idx and remove the full segment so rebuild uses the .idx.
+        let idx_path = index_dir.join(format!("{seg_name}.idx"));
+        segment::extract_idx(&seg_path, &idx_path).unwrap();
+        std::fs::remove_file(&seg_path).unwrap();
+
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        assert_eq!(index.len(), 1);
+
+        let loc = index.lookup(&hash).unwrap();
+        assert!(
+            loc.inline_data.is_some(),
+            "inline entry rebuilt from .idx must have inline_data"
+        );
+        assert_eq!(loc.inline_data.as_deref().unwrap(), &data);
+        // Should be Cached source since it came from an .idx file.
+        assert!(matches!(loc.body_source, BodySource::Cached(_)));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

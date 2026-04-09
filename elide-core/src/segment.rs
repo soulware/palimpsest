@@ -1560,4 +1560,166 @@ mod tests {
 
         fs::remove_dir_all(dir).unwrap();
     }
+
+    // --- inline extent tests ---
+
+    #[test]
+    fn inline_entry_roundtrip() {
+        // Data below INLINE_THRESHOLD becomes an Inline entry.
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+        let data = vec![0x42u8; 100]; // well below threshold
+        let hash = blake3::hash(&data);
+
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data.clone(),
+        )];
+        assert_eq!(entries[0].kind, EntryKind::Inline);
+
+        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let (bss2, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(bss, bss2);
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].kind, EntryKind::Inline);
+        assert_eq!(read_back[0].hash, hash);
+        assert_eq!(read_back[0].stored_length, 100);
+
+        // Inline data lives in the inline section, not body.
+        // Body section should be empty (body_length = 0 in header).
+        let file_len = fs::metadata(&path).unwrap().len();
+        // file = header(96) + index(57) + inline(100) + body(0) = 253
+        assert_eq!(file_len, bss); // bss = header + index + inline; no body beyond it
+
+        // Verify inline section contains the data.
+        let inline_bytes = read_inline_section(&path).unwrap();
+        assert_eq!(inline_bytes.len(), 100);
+        assert_eq!(inline_bytes, data);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn mixed_inline_and_body_entries() {
+        // A segment with both inline and body entries.
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let small = vec![0xAAu8; 64]; // inline
+        let large = vec![0xBBu8; 8192]; // body
+        let small_hash = blake3::hash(&small);
+        let large_hash = blake3::hash(&large);
+
+        let mut entries = vec![
+            SegmentEntry::new_data(small_hash, 0, 1, SegmentFlags::empty(), small.clone()),
+            SegmentEntry::new_data(large_hash, 1, 2, SegmentFlags::empty(), large.clone()),
+        ];
+        assert_eq!(entries[0].kind, EntryKind::Inline);
+        assert_eq!(entries[1].kind, EntryKind::Data);
+
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
+
+        assert_eq!(read_back[0].kind, EntryKind::Inline);
+        assert_eq!(read_back[0].stored_length, 64);
+        assert_eq!(read_back[1].kind, EntryKind::Data);
+        assert_eq!(read_back[1].stored_length, 8192);
+
+        // Inline data is readable from inline section.
+        let inline_bytes = read_inline_section(&path).unwrap();
+        assert_eq!(inline_bytes, small);
+
+        // Body data is readable via read_extent_bodies.
+        let (bss, mut entries2) = read_and_verify_segment_index(&path, &vk).unwrap();
+        read_extent_bodies(&path, bss, &mut entries2, [EntryKind::Data], &[]).unwrap();
+        assert_eq!(entries2[1].data, large);
+        // Inline entry data is NOT populated by body read (empty inline_bytes).
+        assert!(entries2[0].data.is_empty());
+
+        // Now read with inline bytes too.
+        let (_, mut entries3) = read_and_verify_segment_index(&path, &vk).unwrap();
+        read_extent_bodies(
+            &path,
+            bss,
+            &mut entries3,
+            [EntryKind::Data, EntryKind::Inline],
+            &inline_bytes,
+        )
+        .unwrap();
+        assert_eq!(entries3[0].data, small);
+        assert_eq!(entries3[1].data, large);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn all_inline_segment_has_zero_body_length() {
+        // When every entry is inline, body_length should be 0.
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let d1 = vec![0x11u8; 32];
+        let d2 = vec![0x22u8; 64];
+        let mut entries = vec![
+            SegmentEntry::new_data(blake3::hash(&d1), 0, 1, SegmentFlags::empty(), d1.clone()),
+            SegmentEntry::new_data(blake3::hash(&d2), 1, 1, SegmentFlags::empty(), d2.clone()),
+        ];
+        assert!(entries.iter().all(|e| e.kind == EntryKind::Inline));
+
+        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+
+        // File size == bss (no body section).
+        let file_len = fs::metadata(&path).unwrap().len();
+        assert_eq!(file_len, bss);
+
+        // read_inline_section returns both entries' data concatenated.
+        let inline_bytes = read_inline_section(&path).unwrap();
+        assert_eq!(inline_bytes.len(), 32 + 64);
+
+        // Entries are parseable and both inline.
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back.len(), 2);
+        assert!(read_back.iter().all(|e| e.kind == EntryKind::Inline));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn extract_idx_preserves_inline_section() {
+        // .idx files must include the inline section so inline data survives
+        // cache eviction.
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let idx_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA.idx");
+        let (signer, vk) = test_signer();
+
+        let data = vec![0xFFu8; 200];
+        let hash = blake3::hash(&data);
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data.clone(),
+        )];
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // Extract .idx from the full segment.
+        extract_idx(&seg_path, &idx_path).unwrap();
+
+        // .idx should include inline section.
+        let idx_inline = read_inline_section(&idx_path).unwrap();
+        assert_eq!(idx_inline, data, ".idx must contain inline data");
+
+        // Entries parsed from .idx should match.
+        let (_, idx_entries) = read_and_verify_segment_index(&idx_path, &vk).unwrap();
+        assert_eq!(idx_entries.len(), 1);
+        assert_eq!(idx_entries[0].kind, EntryKind::Inline);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

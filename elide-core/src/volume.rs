@@ -5698,4 +5698,151 @@ mod tests {
         assert!(cache.get(ulid(2)).is_some());
         assert!(cache.get(ulid(3)).is_some());
     }
+
+    // --- inline extent tests ---
+
+    #[test]
+    fn inline_write_and_read_roundtrip() {
+        // Small writes that compress below INLINE_THRESHOLD should be
+        // readable immediately (from WAL) and after promotion (from inline_data).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // All-same-byte 4KB data compresses to a few bytes → inline.
+        let data = vec![0xAAu8; 4096];
+        vol.write(0, &data).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data, "read before promotion");
+
+        vol.promote_for_test().unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data, "read after promotion");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn inline_survives_reopen() {
+        // After close+reopen, inline data is rebuilt from the segment's
+        // inline section and reads still work.
+        let base = keyed_temp_dir();
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            let data = vec![0xBBu8; 4096];
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+        // Reopen: extent index is rebuilt from pending/ segments.
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0xBBu8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn inline_coexists_with_body_entries() {
+        // A segment with both inline and body entries: both are readable.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Small write → inline (compresses below threshold).
+        let small = vec![0xCCu8; 4096];
+        vol.write(0, &small).unwrap();
+
+        // Large high-entropy write → body (doesn't compress below threshold).
+        let large: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+        vol.write(1, &large).unwrap();
+
+        vol.promote_for_test().unwrap();
+
+        assert_eq!(vol.read(0, 1).unwrap(), small);
+        assert_eq!(vol.read(1, 2).unwrap(), large);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn inline_dedup_as_canonical_source() {
+        // An inline extent can serve as the canonical source for dedup.
+        // Write the same small data at two different LBAs: first is DATA/Inline,
+        // second should dedup (REF).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xDDu8; 4096]; // compresses → inline
+        vol.write(0, &data).unwrap();
+        vol.write(1, &data).unwrap(); // dedup hit → REF
+
+        vol.promote_for_test().unwrap();
+
+        // Both LBAs should read correctly — the REF resolves via the
+        // inline canonical entry.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(1, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn inline_repack_preserves_data() {
+        // GC repack of a segment containing inline entries must preserve
+        // inline data through the rewrite.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let d0 = vec![0xEEu8; 4096]; // inline
+        let d1 = vec![0xFFu8; 4096]; // inline
+        vol.write(0, &d0).unwrap();
+        vol.write(1, &d1).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Overwrite LBA 0 to make d0 dead, creating GC opportunity.
+        let d2 = vec![0x11u8; 4096];
+        vol.write(0, &d2).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Repack: the segment with d0+d1 should be compacted; d1 survives.
+        // Threshold 1.0 → compact any segment with dead extents.
+        let stats = vol.repack(1.0).unwrap();
+        assert!(stats.segments_compacted > 0);
+
+        // Reads still correct after repack.
+        assert_eq!(vol.read(0, 1).unwrap(), d2);
+        assert_eq!(vol.read(1, 1).unwrap(), d1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn all_inline_segment_readable() {
+        // A segment where every entry is inline (body_length = 0).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Write several small extents — all compress to inline.
+        for lba in 0..4u64 {
+            let data = vec![lba as u8; 4096];
+            vol.write(lba, &data).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+
+        // Verify all reads.
+        for lba in 0..4u64 {
+            let expected = vec![lba as u8; 4096];
+            assert_eq!(vol.read(lba, 1).unwrap(), expected, "LBA {lba} mismatch");
+        }
+
+        // Verify the segment has body_length = 0.
+        let pending_dir = base.join("pending");
+        let seg_path = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let (bss, _) =
+            segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+        let file_len = fs::metadata(&seg_path).unwrap().len();
+        assert_eq!(file_len, bss, "all-inline segment should have no body");
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }
