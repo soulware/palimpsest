@@ -155,19 +155,63 @@ The demand-fetch path already handles the delta format as designed in [formats.m
 
 No file paths, no filemaps, no filesystem awareness. The read path is purely content-addressed.
 
+## NBD fragmentation and the inline threshold
+
+NBD is a block protocol. Every write through ext4 → NBD arrives as one or more 4 KiB blocks, regardless of the logical file size. A 200 KiB file written by the kernel becomes ~50 individual 4 KiB block writes in the WAL. This fragmentation has two consequences:
+
+1. **Every extent is exactly one block.** There are no file-sized extents from NBD writes — only 4 KiB chunks (or small coalesced runs of contiguous blocks).
+
+2. **Compressed block size determines inlining.** A 4 KiB block containing "hello" + zeros compresses to ~20 bytes via lz4. The inline threshold determines whether this goes in the `.idx` (fetched by every host) or the body section (demand-fetched when needed).
+
+The inline threshold must be low (256 bytes) to avoid bloating the `.idx` with compressed block data. At the previous threshold (4096), virtually every compressed 4 KiB block was inlined — the `.idx` contained all the data, defeating demand-fetch and delta compression entirely.
+
+At 256 bytes, only genuinely tiny data inlines (mostly-zero blocks, sparse metadata). Real data blocks go to the body section, where they benefit from demand-fetch and are eligible for delta compression. For file-aware import (phase 2), the stored size naturally reflects the real file size — a 5-byte config file stores as ~5 bytes (inline), a 200 KiB library stores as ~150 KiB compressed (body).
+
+## Delta integration points
+
+Delta compression fires at two points — both explicit user actions on a consistent filesystem state. The regular `drain_pending()` upload path ships raw segments as-is with no delta attempt.
+
+### Import (file-aware, phase 2)
+
+File-aware import reads the ext4 image directly (not via NBD), producing file-sized extents. The filemap enables path-matching against a parent import. This is where the 94% S3 fetch savings from findings.md are realised. See "Phase 2: import-time parent association" below.
+
+### Snapshot (coalescing, future)
+
+NBD writes fragment files into 4 KiB blocks. At snapshot time, the filesystem is in a consistent state — Elide can parse the ext4 metadata from its own block data and reconstruct file-level extents:
+
+1. Parse the ext4 superblock, inode tables, and extent trees from the volume's current LBA state
+2. Identify which 4 KiB blocks belong to the same file
+3. Coalesce them into a single file-sized extent with one content hash
+4. Emit a filemap for the snapshot (`path → hash`)
+5. Compute deltas against the prior snapshot's filemap
+
+This is "retroactive file-aware import" applied to live-write data. The ext4 parsing infrastructure already exists in `src/extents.rs`. The snapshot is the natural integration point because it represents a user-declared consistent state — unlike GC, which may see in-flight writes with uncommitted journal state.
+
+This also means NBD-written volumes get filemaps at snapshot time, enabling filemap-based delta for subsequent snapshots — not just for imported volumes.
+
+### Why not at drain time?
+
+The current implementation includes an LBA-based delta step in `drain_pending()` as a proof-of-concept. In practice this has very limited value for NBD writes:
+
+- Every pending segment contains fragmented 4 KiB blocks, not file-sized extents
+- LBA-based source selection works but produces small deltas of small extents — marginal savings
+- Rebuilding the parent LBA map and extent index per segment is expensive relative to the benefit
+
+The drain-time delta path validates the end-to-end machinery (computation, segment format, serialization) but is not the intended production integration point.
+
 ## Scope and sequencing
 
-**Phase 1 (this design):** LBA-based delta for live writes. Import an image, fork it, make changes via NBD, and the coordinator delta-compresses changed blocks at upload time using the parent snapshot's LBA state as dictionary source. This exercises the full delta pipeline (computation, segment format, read path) as a proof-of-concept. The benefit is modest for small manual changes (most unchanged blocks are already deduped), but it validates the end-to-end machinery.
+**Phase 1 (done):** Delta format and machinery. Segment format v3 with delta table in the index, `rewrite_with_deltas()`, `compute_deltas()` with LBA-based source selection, integration into `drain_pending()` for validation. Proof-of-concept only — the real savings come from phases 2 and 3.
 
-**Phase 2:** filemap-based delta for imported snapshots. Import a point-release update with `--parent` pointing at the prior import, and the coordinator uses filemap path-matching for delta source selection. This is where the 94% S3 fetch savings from findings.md are realised. See "Phase 2: import-time parent association" below.
+**Phase 2:** File-aware import with filemap-based delta. Import a point-release update with `--parent` pointing at the prior import, and the coordinator uses filemap path-matching for delta source selection. See "Phase 2: import-time parent association" below.
 
-**Phase 3 (deferred):** content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
+**Phase 3:** Snapshot-time coalescing. Parse ext4 metadata at snapshot time to reconstruct file-level extents from fragmented NBD blocks, emit filemaps, and compute deltas against prior snapshots. This extends filemap-based delta to live-write volumes.
+
+**Phase 4 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
 ## Non-ext4 volumes
 
-For phase 1 (LBA-based delta), filesystem type doesn't matter — the delta source is selected purely by LBA identity, so it works for any volume with a parent snapshot.
-
-For phase 2 (filemap-based delta), volumes without an ext4 filesystem simply don't get a filemap. The import path falls back to the existing block-by-block import. Delta compression is not available — segments are stored with full extents only. This is not a degraded mode that needs handling; it's the absence of an optimisation. The read path, segment format, and GC all work identically regardless of whether deltas exist.
+For phase 2 (filemap-based delta at import) and phase 3 (snapshot coalescing), volumes without an ext4 filesystem simply don't get a filemap. The import path falls back to the existing block-by-block import. Delta compression is not available — segments are stored with full extents only. This is not a degraded mode that needs handling; it's the absence of an optimisation. The read path, segment format, and GC all work identically regardless of whether deltas exist.
 
 ## Phase 2: import-time parent association
 

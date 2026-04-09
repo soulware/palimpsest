@@ -166,9 +166,14 @@ const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
 /// data survives cache eviction (it lives in the `.idx` file and in-memory
 /// `ExtentLocation::inline_data`), eliminating S3 demand-fetch for small writes.
 ///
-/// Set to one 4 KiB block: compressed single-block writes (metadata updates,
-/// journal entries) land inline; uncompressed full blocks stay in the body.
-const INLINE_THRESHOLD: usize = 4096;
+/// Extents with stored (compressed) size below this go in the inline section
+/// of the `.idx` file.  Only genuinely tiny data should inline — the `.idx` is
+/// fetched by every host, so bloating it with compressed block data defeats
+/// demand-fetch and delta compression.
+///
+/// 256 bytes captures mostly-zero blocks, tiny config files, and sparse
+/// metadata while keeping real data in the body section.
+const INLINE_THRESHOLD: usize = 256;
 
 /// Compute the total index section byte length for a slice of entries.
 ///
@@ -1805,10 +1810,10 @@ mod tests {
 
     #[test]
     fn inline_entry_roundtrip() {
-        // Data below INLINE_THRESHOLD becomes an Inline entry.
+        // Data below INLINE_THRESHOLD (256 bytes) becomes an Inline entry.
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
-        let data = vec![0x42u8; 100]; // well below threshold
+        let data = vec![0x42u8; 100]; // well below 256-byte threshold
         let hash = blake3::hash(&data);
 
         let mut entries = vec![SegmentEntry::new_data(
@@ -1848,7 +1853,7 @@ mod tests {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
 
-        let small = vec![0xAAu8; 64]; // inline
+        let small = vec![0xAAu8; 64]; // inline (below 256-byte threshold)
         let large = vec![0xBBu8; 8192]; // body
         let small_hash = blake3::hash(&small);
         let large_hash = blake3::hash(&large);

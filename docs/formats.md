@@ -304,7 +304,7 @@ In `cache/`, `promote_to_cache` writes a `.present` bitset marking only DATA ent
 | 3 delta options, 16% of extents | ~77KB | Realistic point-release update |
 | 3 delta options, all extents | ~204KB | Worst case |
 
-Inline section size depends on the inline threshold and extent size distribution — typically small if the threshold is kept tight (e.g. ≤ a few KB per extent).
+Inline section size depends on the inline threshold (256 bytes stored size) and extent size distribution. Only genuinely tiny compressed extents inline — mostly-zero blocks, small config files. The threshold is deliberately low: at higher thresholds (e.g. 4096), compressed 4 KiB blocks from NBD writes would all inline, bloating the `.idx` and defeating demand-fetch.
 
 ### S3 object layout
 
