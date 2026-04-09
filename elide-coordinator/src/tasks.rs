@@ -304,9 +304,13 @@ pub async fn run_volume_tasks(
                 Ok(gc::GcStats {
                     strategy: gc::GcStrategy::Repack,
                     bytes_freed,
+                    dead_cleaned,
                     ..
                 }) => {
                     gc_was_active = true;
+                    if dead_cleaned > 0 {
+                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
+                    }
                     info!(
                         "[gc {volume_id}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
                     );
@@ -315,9 +319,13 @@ pub async fn run_volume_tasks(
                     strategy: gc::GcStrategy::Sweep,
                     candidates,
                     bytes_freed,
+                    dead_cleaned,
                     ..
                 }) => {
                     gc_was_active = true;
+                    if dead_cleaned > 0 {
+                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
+                    }
                     info!(
                         "[gc {volume_id}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
                     );
@@ -326,9 +334,13 @@ pub async fn run_volume_tasks(
                     strategy: gc::GcStrategy::Both,
                     candidates,
                     bytes_freed,
+                    dead_cleaned,
                     ..
                 }) => {
                     gc_was_active = true;
+                    if dead_cleaned > 0 {
+                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
+                    }
                     info!(
                         "[gc {volume_id}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
                     );
@@ -336,9 +348,14 @@ pub async fn run_volume_tasks(
                 Ok(gc::GcStats {
                     strategy: gc::GcStrategy::None,
                     total_segments,
+                    dead_cleaned,
                     ..
                 }) => {
-                    if gc_was_active {
+                    if dead_cleaned > 0 {
+                        gc_was_active = true;
+                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
+                    }
+                    if gc_was_active && dead_cleaned == 0 {
                         info!(
                             "[gc {volume_id}] idle — {total_segments} segment(s), \
                              all at or above density threshold ({:.2})",

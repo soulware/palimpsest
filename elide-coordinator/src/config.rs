@@ -184,7 +184,7 @@ pub struct GcConfig {
     #[serde(default = "default_gc_small_segment")]
     pub small_segment_bytes: u64,
 
-    /// How often (seconds) to run a GC pass per fork. Default: 300.
+    /// How often (seconds) to run a GC pass per fork. Default: 10.
     #[serde(default = "default_gc_interval")]
     pub interval_secs: u64,
 }
@@ -196,7 +196,7 @@ fn default_gc_small_segment() -> u64 {
     8 * 1024 * 1024
 }
 fn default_gc_interval() -> u64 {
-    30
+    10
 }
 
 impl Default for GcConfig {

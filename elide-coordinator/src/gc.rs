@@ -132,6 +132,8 @@ pub struct GcStats {
     pub bytes_freed: u64,
     /// Total segments considered during this pass (above the snapshot floor).
     pub total_segments: usize,
+    /// Number of fully-dead segments cleaned up in the pre-pass.
+    pub dead_cleaned: usize,
 }
 
 impl GcStats {
@@ -140,6 +142,7 @@ impl GcStats {
             strategy: GcStrategy::None,
             candidates: 0,
             bytes_freed: 0,
+            dead_cleaned: 0,
             total_segments,
         }
     }
@@ -195,14 +198,55 @@ pub async fn gc_fork(
 
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
-    let mut all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
+    let all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
+    // Pre-pass: extract fully-dead segments (no live entries, no extent index
+    // refs).  These are the cheapest possible GC: the handoff is tombstone-only
+    // (just `dead` lines), no S3 fetch, no segment write, no upload — the
+    // coordinator just DELETEs the old S3 objects.  Batch all of them into a
+    // single tombstone handoff under repack_ulid.
+    let mut dead_segments: Vec<SegmentStats> = Vec::new();
+    let mut remaining: Vec<SegmentStats> = Vec::new();
+    for s in all_stats {
+        if s.live_entries.is_empty() && s.removed_hashes.is_empty() {
+            dead_segments.push(s);
+        } else {
+            remaining.push(s);
+        }
+    }
+    let mut all_stats = remaining;
+    let dead_count = dead_segments.len();
+    let repack_consumed_by_dead = if dead_count > 0 {
+        let dead_ulids: Vec<String> = dead_segments.iter().map(|s| s.ulid_str.clone()).collect();
+        tracing::info!(
+            "[gc] dead pre-pass: {} fully-dead segment(s) → tombstone {repack_ulid}: [{}]",
+            dead_count,
+            dead_ulids.join(", "),
+        );
+        compact_segments(
+            dead_segments,
+            &gc_dir,
+            volume_id,
+            store,
+            repack_ulid,
+            &index,
+        )
+        .await
+        .context("dead segment pre-pass")?;
+        true
+    } else {
+        false
+    };
+
     // Repack: density pass — extract the single least-dense segment.
     // Removes it from all_stats so sweep only sees the remainder.
+    // Skipped when the pre-pass consumed repack_ulid.
     let mut repack_bytes: u64 = 0;
-    let ran_repack = if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
+    let ran_repack = if repack_consumed_by_dead {
+        false
+    } else if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.remove(pos);
         repack_bytes = candidate.dead_lba_bytes();
         tracing::info!(
@@ -266,23 +310,33 @@ pub async fn gc_fork(
     };
 
     match (ran_repack, ran_sweep) {
-        (false, None) => Ok(GcStats::none(total_segments)),
+        (false, None) if dead_count == 0 => Ok(GcStats::none(total_segments)),
+        (false, None) => Ok(GcStats {
+            strategy: GcStrategy::None,
+            candidates: 0,
+            bytes_freed: 0,
+            dead_cleaned: dead_count,
+            total_segments,
+        }),
         (true, None) => Ok(GcStats {
             strategy: GcStrategy::Repack,
             candidates: 1,
             bytes_freed: repack_bytes,
+            dead_cleaned: dead_count,
             total_segments,
         }),
         (false, Some((n, sweep_bytes))) => Ok(GcStats {
             strategy: GcStrategy::Sweep,
             candidates: n,
             bytes_freed: sweep_bytes,
+            dead_cleaned: dead_count,
             total_segments,
         }),
         (true, Some((n, sweep_bytes))) => Ok(GcStats {
             strategy: GcStrategy::Both,
             candidates: 1 + n,
             bytes_freed: repack_bytes + sweep_bytes,
+            dead_cleaned: dead_count,
             total_segments,
         }),
     }
@@ -476,7 +530,7 @@ pub async fn apply_done_handoffs(
 ///
 /// `.done` files are inert markers left after a completed GC handoff. They are
 /// useful for post-mortem debugging (which segments were compacted and when)
-/// but accumulate indefinitely without cleanup. At the default 5-minute GC
+/// but accumulate indefinitely without cleanup. At the default 10-second GC
 /// interval a fork produces ~288 per day; this function prunes the tail.
 ///
 /// Deletion is best-effort: errors on individual files are logged and skipped

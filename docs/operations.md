@@ -104,7 +104,7 @@ The `object_store` crate is used for all store access, providing a uniform inter
 4. Upload — read each `pending/` file, PUT to S3, send `promote <ulid>` IPC on success
 5. GC — if the GC interval has elapsed, call `gc_checkpoint` to get two output ULIDs, run a GC pass on S3-uploaded segments (using `index/*.idx` for liveness), and apply any completed handoffs (see Coordinator-driven segment GC below)
 
-Steps 1–4 run every tick; step 5 is rate-limited to a configurable `gc_interval` (default 5 minutes). All five steps run sequentially within a single task per fork. Because the coordinator is the only caller of sweep and repack, and upload follows immediately in the same task, there is no concurrent access to `pending/` and no race between compaction and upload.
+Steps 1–4 run every tick; step 5 is rate-limited to a configurable `gc_interval` (default 10 seconds). All five steps run sequentially within a single task per fork. Because the coordinator is the only caller of sweep and repack, and upload follows immediately in the same task, there is no concurrent access to `pending/` and no race between compaction and upload.
 
 Steps 1–3 require `control.sock` to be present (volume running). If the socket is absent, those steps are skipped silently and the drain proceeds with upload only. Step 5 (GC) also requires the socket; if absent, the GC tick is skipped and retried next interval.
 
@@ -338,7 +338,13 @@ Segment GC — reclaiming space from already-uploaded segments — is a coordina
 
 **Why the coordinator, not the volume:** segment GC requires S3 mutations (uploading replacement segments, deleting old ones). The volume holds read-only S3 credentials; all S3 writes go through the coordinator.
 
-**Two strategies, run per fork on a configurable interval (default: every 30 seconds):**
+**Three passes, run per fork on a configurable interval (default: every 10 seconds):**
+
+*Dead pre-pass:*
+- After collecting stats, extract all segments that are fully dead: no live entries (LBA or extent index) and no removed hashes
+- Batch all of them into a single tombstone handoff (`dead` lines only) under `repack_ulid`
+- No S3 fetch, no segment write, no upload — the only S3 operation is DELETE of the old objects
+- If the pre-pass fires, the repack pass is skipped this tick (it consumed `repack_ulid`); sweep runs normally
 
 *Repack pass* (mirrors lsvd `StartGC` and volume `repack()`):
 - Reconstruct the extent index from this fork's `index/` and `pending/` index files
@@ -351,7 +357,7 @@ Segment GC — reclaiming space from already-uploaded segments — is a coordina
 - Skip if fewer than 2 candidates — a single small segment with density ≥ threshold has no meaningful dead space
 - Merge all candidates → one output segment
 
-Both passes run in the same tick if both find candidates; they operate on disjoint input sets (repack removes its candidate from the stats before sweep selects). Each produces an independent output segment with its own ULID, obtained via a separate `gc_checkpoint` call (the second WAL flush is a no-op). Per-tick work remains bounded: repack processes one segment; sweep is capped at 32 MiB of live data.
+Repack and sweep run in the same tick if both find candidates; they operate on disjoint input sets (repack removes its candidate from the stats before sweep selects). Each produces an independent output segment with its own ULID, obtained via `gc_checkpoint`. The dead pre-pass and repack share `repack_ulid` (mutually exclusive). Per-tick work remains bounded: the dead pre-pass is O(1) per segment (no I/O beyond handoff writes); repack processes one segment; sweep is capped at 32 MiB of live data.
 
 **Liveness:** an extent entry is live only if it passes two checks:
 
@@ -477,7 +483,7 @@ The coordinator must never directly delete a `segments/` file or its S3 counterp
 
 This design was validated in the TLA+ model (`specs/HandoffProtocol.tla`): `CoordApplyDone` (the only deletion action) requires `handoff = "applied"`, and the `NoSegmentNotFound` and `NoLostData` invariants are checked exhaustively across all crash and concurrent-write interleavings. The all-dead direct deletion path that previously existed in the coordinator was not modelled in the spec — an inconsistency that reflected a real safety violation in the code.
 
-**`.done` file accumulation:** at the default 5-minute GC interval, a fork accumulates ~288 `.done` files per day. Each file is small (one line per moved or removed extent, ~100–130 bytes each), but directory inode count grows unboundedly without cleanup. The coordinator runs a TTL cleanup pass each tick, deleting `.done` files whose mtime is older than 7 days. This retains a recent window useful for post-mortem debugging (which segments were compacted, when) without unbounded growth. Deletion is safe because by the time a handoff reaches `.done` the old input segments are already removed; `sort_for_rebuild` only classifies `.pending` and `.applied` sidecars as in-flight GC outputs.
+**`.done` file accumulation:** at the default 10-second GC interval, a fork can accumulate many `.done` files per day. Each file is small (one line per moved or removed extent, ~100–130 bytes each), but directory inode count grows unboundedly without cleanup. The coordinator runs a TTL cleanup pass each tick, deleting `.done` files whose mtime is older than 7 days. This retains a recent window useful for post-mortem debugging (which segments were compacted, when) without unbounded growth. Deletion is safe because by the time a handoff reaches `.done` the old input segments are already removed; `sort_for_rebuild` only classifies `.pending` and `.applied` sidecars as in-flight GC outputs.
 
 *S3 repacking* (locality optimisation in object storage) is a coordinator-level operation and is **not subject to the leaf-only constraint**. The coordinator can read extents from any node's local segments or from S3, create new S3 objects with better layout, and update the extent index to point to them. Local files are caches — the coordinator does not modify them to repack at the S3 level.
 
