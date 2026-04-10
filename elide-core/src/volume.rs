@@ -529,19 +529,14 @@ impl Volume {
         // segment tree (own segments + ancestors), write a thin REF record
         // instead of a DATA record. No body bytes in the WAL — reads resolve
         // through the extent index to the canonical segment's body.
-        if let Some(loc) = self.extent_index.lookup(&hash) {
+        if self.extent_index.lookup(&hash).is_some() {
             self.wal.append_ref(lba, lba_length, &hash)?;
             Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
             // Do NOT update extent_index — the canonical entry already points
-            // to the segment with the body bytes.
+            // to the segment with the body bytes. DedupRef entries carry no
+            // body bytes and no body reservation.
             self.pending_entries
-                .push(segment::SegmentEntry::new_dedup_ref(
-                    hash,
-                    lba,
-                    lba_length,
-                    loc.body_length,
-                    loc.compressed,
-                ));
+                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
             return Ok(());
         }
 
@@ -2731,21 +2726,11 @@ fn recover_wal(
                 lba_length,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
-                // REF: no body bytes, no extent_index update — the canonical
-                // entry is populated from the segment that holds the body
-                // (rebuilt from pending/ or segments/).
-                // Look up the canonical extent to get stored_length/compressed
-                // for the unified index entry format.
-                let (body_length, compressed) = extent_index
-                    .lookup(&hash)
-                    .map(|loc| (loc.body_length, loc.compressed))
-                    .unwrap_or((0, false));
+                // REF: no body bytes, no body reservation, no extent_index
+                // update. The canonical entry is populated from whichever
+                // segment holds the DATA for this hash.
                 pending_entries.push(segment::SegmentEntry::new_dedup_ref(
-                    hash,
-                    start_lba,
-                    lba_length,
-                    body_length,
-                    compressed,
+                    hash, start_lba, lba_length,
                 ));
             }
             writelog::LogRecord::Zero {

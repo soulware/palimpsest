@@ -150,14 +150,8 @@ pub fn import_image(
         // caller), emit a thin DedupRef instead of a fresh Data entry. The
         // parent segment supplies the body bytes at read time.
         let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
-        if let Some(loc) = parent_hit {
-            entries.push(SegmentEntry::new_dedup_ref(
-                hash,
-                lba,
-                1,
-                loc.body_length,
-                loc.compressed,
-            ));
+        if parent_hit.is_some() {
+            entries.push(SegmentEntry::new_dedup_ref(hash, lba, 1));
         } else {
             let (flags, data) = match maybe_compress(&block) {
                 Some(compressed) => (SegmentFlags::COMPRESSED, compressed),

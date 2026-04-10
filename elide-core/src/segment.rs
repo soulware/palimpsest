@@ -8,7 +8,7 @@
 //   [Delta body: delta_length bytes]      — absent locally (delta_length = 0)
 //
 // Header (96 bytes):
-//   0..8   magic         "ELIDSEG\x03"
+//   0..8   magic         "ELIDSEG\x04"
 //   8..12  entry_count   u32 le
 //   12..16 index_length  u32 le
 //   16..20 inline_length u32 le; 0 if no inline data
@@ -40,8 +40,9 @@
 //       delta_length   (4 bytes)  u32 le — byte length in delta body
 //
 // Body section: raw concatenated extent bytes, no framing.
-// Data entries have real body bytes; DedupRef entries have zero-filled placeholders
-// (filled by materialisation before S3 upload). Zero entries contribute nothing.
+// Data entries have real body bytes. DedupRef and Zero entries contribute nothing
+// to the body: they carry no body bytes and reserve no space. DedupRef reads
+// resolve through the extent index to the canonical segment's body.
 //
 // Locally-stored files have delta_length = 0. The local file IS the S3 object
 // minus the delta body, which the coordinator appends at upload time.
@@ -64,7 +65,7 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 // --- constants ---
 
-const MAGIC: &[u8; 8] = b"ELIDSEG\x03";
+const MAGIC: &[u8; 8] = b"ELIDSEG\x04";
 const HEADER_LEN: u64 = 96;
 
 // --- on-disk header ---
@@ -205,8 +206,8 @@ bitflags! {
         const HAS_DELTAS = 0x02;
         /// Stored data is lz4-compressed; stored_length is the compressed size.
         const COMPRESSED = 0x04;
-        /// Dedup reference; body region is reserved (zero-filled) locally and
-        /// populated during materialization before S3 upload.
+        /// Dedup reference; no body bytes, no body reservation. Reads resolve
+        /// through the extent index to the canonical segment's body.
         const DEDUP_REF    = 0x08;
         /// Zero extent; hash field is ZERO_HASH; no bytes in this segment's body; reads as zeros.
         const ZERO         = 0x10;
@@ -224,9 +225,8 @@ bitflags! {
 pub enum EntryKind {
     /// Standard data entry; body bytes live in the body section.
     Data,
-    /// Dedup reference; body region is reserved (zero-filled) locally. Reads
-    /// resolve through the extent index to the canonical segment's body.
-    /// Materialization fills the reserved body region before S3 upload.
+    /// Dedup reference; no body bytes in any segment. Reads resolve through
+    /// the extent index to the canonical segment's body.
     DedupRef,
     /// Zero extent; LBA range reads as zeros, no body bytes stored.
     Zero,
@@ -324,24 +324,19 @@ impl SegmentEntry {
 
     /// Create a DEDUP_REF entry.
     ///
-    /// `stored_length` and `compressed` come from the canonical extent's
-    /// `ExtentLocation` in the extent index.  The body region is reserved
-    /// in the segment (zero-filled) but not populated until materialization.
-    pub fn new_dedup_ref(
-        hash: blake3::Hash,
-        start_lba: u64,
-        lba_length: u32,
-        stored_length: u32,
-        compressed: bool,
-    ) -> Self {
+    /// DedupRef entries carry no body bytes and reserve no body space.
+    /// `stored_offset` and `stored_length` are both zero; the entry contributes
+    /// nothing to the segment's `body_length`. Reads resolve through the extent
+    /// index to the canonical DATA entry's body, which may live in any segment.
+    pub fn new_dedup_ref(hash: blake3::Hash, start_lba: u64, lba_length: u32) -> Self {
         Self {
             hash,
             start_lba,
             lba_length,
-            compressed,
+            compressed: false,
             kind: EntryKind::DedupRef,
-            stored_offset: 0, // filled by assign_offsets
-            stored_length,
+            stored_offset: 0,
+            stored_length: 0,
             data: None,
             delta_options: Vec::new(),
         }
@@ -427,9 +422,7 @@ pub fn write_segment(
     }
     // Body section: raw bytes, no framing.
     // Data entries write their body bytes.
-    // DedupRef entries seek past their reserved region (sparse hole).
-    // Zero entries have stored_length=0 and contribute nothing.
-    // Inline entries are in the inline section.
+    // DedupRef, Zero, and Inline entries contribute nothing to the body.
     for entry in entries.iter() {
         match entry.kind {
             EntryKind::Data => {
@@ -437,19 +430,14 @@ pub fn write_segment(
                     w.write_all(data)?;
                 }
             }
-            EntryKind::DedupRef => {
-                // Seek past the reserved body region, creating a sparse hole.
-                // Materialization fills this region before S3 upload.
-                use std::io::Seek;
-                w.seek(std::io::SeekFrom::Current(entry.stored_length as i64))?;
-            }
-            EntryKind::Zero | EntryKind::Inline => {}
+            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
         }
     }
 
-    // Set the file length explicitly: the trailing seek for a DedupRef at the
-    // end of the body section doesn't extend the file.  set_len ensures the
-    // file is the correct size regardless of entry order.
+    // `body_length = Σ Data stored_length`, matching what was just written.
+    // set_len is defensive: nothing above should leave the file short, but
+    // keeping it makes the file size invariant explicit regardless of how
+    // entries are ordered.
     let expected_len = body_section_start + body_length;
     w.get_ref().set_len(expected_len)?;
 
@@ -471,12 +459,13 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
                 entry.stored_offset = inline_cursor;
                 inline_cursor += entry.stored_length as u64;
             }
-            EntryKind::Data | EntryKind::DedupRef => {
+            EntryKind::Data => {
                 entry.stored_offset = body_cursor;
                 body_cursor += entry.stored_length as u64;
             }
-            EntryKind::Zero => {
-                // Zero entries have no body; stored_offset/stored_length stay 0.
+            EntryKind::DedupRef | EntryKind::Zero => {
+                // DedupRef and Zero contribute nothing to the body section.
+                // stored_offset/stored_length stay 0.
             }
         }
     }
@@ -1506,7 +1495,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let hash = blake3::hash(b"existing extent");
 
-        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3, 4096, false)];
+        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3)];
         write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
         let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
@@ -1518,7 +1507,7 @@ mod tests {
         assert_eq!(e.lba_length, 3);
         assert_eq!(e.kind, EntryKind::DedupRef);
         assert_eq!(e.stored_offset, 0);
-        assert_eq!(e.stored_length, 4096);
+        assert_eq!(e.stored_length, 0);
 
         fs::remove_file(&path).unwrap();
     }
@@ -1535,7 +1524,7 @@ mod tests {
         let data2 = b"x".repeat(8192);
         let mut entries = vec![
             SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data),
-            SegmentEntry::new_dedup_ref(ref_hash, 2, 1, 4096, false),
+            SegmentEntry::new_dedup_ref(ref_hash, 2, 1),
             SegmentEntry::new_data(blake3::hash(&data2), 10, 2, SegmentFlags::empty(), data2),
         ];
 
@@ -1548,12 +1537,14 @@ mod tests {
         assert_eq!(read_back[0].stored_offset, 0); // first body entry
         assert_eq!(read_back[0].stored_length, 8192);
 
+        // DedupRef contributes nothing to the body: zeroed offset/length.
         assert_eq!(read_back[1].kind, EntryKind::DedupRef);
-        assert_eq!(read_back[1].stored_offset, 8192); // reserves body space
-        assert_eq!(read_back[1].stored_length, 4096);
+        assert_eq!(read_back[1].stored_offset, 0);
+        assert_eq!(read_back[1].stored_length, 0);
 
+        // Next Data entry lands directly after the first Data — no DedupRef gap.
         assert_eq!(read_back[2].kind, EntryKind::Data);
-        assert_eq!(read_back[2].stored_offset, 8192 + 4096); // after data + dedup ref
+        assert_eq!(read_back[2].stored_offset, 8192);
         assert_eq!(read_back[2].stored_length, 8192);
 
         fs::remove_file(&path).unwrap();

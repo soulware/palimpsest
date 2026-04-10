@@ -2220,7 +2220,7 @@ mod tests {
             has_body_entries: false,
             live_entries: vec![
                 SegmentEntry::new_zero(0, 1),
-                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1, 0, false),
+                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1),
             ],
             removed_hashes: Vec::new(),
         };
