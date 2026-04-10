@@ -245,6 +245,7 @@ delta_offset  = 96 + index_length + inline_length + body_length
 - `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
 - `0x08` `FLAG_DEDUP_REF` — dedup reference; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry layout is the same 64 bytes as DATA. See § Segment File Format — FLAG_DEDUP_REF below.
 - `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
+- `0x20` `FLAG_DELTA` — **Proposed (Phase C):** thin delta entry; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry implies `FLAG_HAS_DELTAS` and must have at least one delta option; the content is served by fetching a delta blob from the segment's delta body section and decompressing it against the `source_hash` extent body located via the extent index. See § Segment File Format — FLAG_DELTA below.
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
@@ -269,7 +270,7 @@ For each extent (64 bytes, fixed-size):
   reserved        (7 bytes)  — must be zero
 ```
 
-All entry kinds (DATA, DEDUP_REF, ZERO, INLINE) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA, inline-section-relative for INLINE, zero for both DEDUP_REF and ZERO.
+All entry kinds (DATA, DEDUP_REF, ZERO, INLINE, and **Proposed** DELTA) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA, inline-section-relative for INLINE, zero for DEDUP_REF, ZERO, and DELTA.
 
 **Delta table** (appended after base entries, variable-length):
 
@@ -302,6 +303,34 @@ Hash-dead DATA entries (LBA overwritten and hash no longer referenced by any liv
 2. **Canonical presence.** For every live DedupRef hash H, `extent_index.lookup(H)` returns a DATA entry. Maintained by GC's LBA-referenced-hash liveness rule.
 
 In `cache/`, `promote_to_cache` writes a `.body` file sized to the thin `body_length` (no DedupRef holes) and a `.present` bitset marking only DATA entries as present. DedupRef entries have their `.present` bit unset because their canonical bytes are served from a different segment entirely, not from this cache body.
+
+**FLAG_DELTA entries (Proposed — Phase C, thin delta).** Same 64-byte index layout as DATA. `stored_offset` and `stored_length` are both zero — a Delta entry reserves no space in the body section of any segment (`pending/`, `cache/`, or S3). The segment's `body_length` excludes Delta entries alongside DedupRef entries; only DATA and INLINE contribute to `body_length`.
+
+A Delta entry implicitly carries `FLAG_HAS_DELTAS` and must have **at least one** delta option in the delta table. Each option records a `source_hash` + `delta_offset` + `delta_length` pointing into this segment's delta body section (or the inline section, with `FLAG_DELTA_INLINE`). The reader picks the first option whose `source_hash` resolves via the local extent index, fetches the delta blob, and decompresses it using the source extent body as the zstd dictionary.
+
+**Delta source must be a DATA entry.** A Delta entry's `source_hash` always resolves via `extent_index.lookup(source_hash)` to a DATA entry — never to another Delta. No delta-of-delta chains. This bounds decompression cost to a single dictionary apply and keeps GC liveness reasoning linear.
+
+**Unified across `pending/`, `cache/`, and S3**, same as DedupRef: the local `pending/<ULID>` file, the three-file cache format, and the uploaded S3 object all agree that Delta entries carry no body bytes. Delta blobs live in the segment's delta body section, which *is* uploaded to S3 and *is* present in the cache file.
+
+Reads of a Delta-mapped LBA:
+1. Scan the entry's delta options in order (earliest-source preference; see Phase A in `design-delta-compression.md`).
+2. For each option, check `extent_index.lookup(source_hash)`. First hit wins.
+3. Fetch the source extent body (local or via demand-fetch).
+4. Fetch the delta blob from the segment's delta body section (or inline).
+5. Decompress with source as zstd dictionary → materialised extent bytes.
+
+If no option's source resolves, the fetch fails. Unlike entries with `FLAG_HAS_DELTAS` on top of a DATA body, a Delta entry has no full-body fallback in the same segment — this is the price of thin delta, symmetric with thin DedupRef's dependence on `extent_index.lookup()`.
+
+**Two invariants make thin Delta sound**, mirroring the thin DedupRef invariants:
+
+1. **Pinning.** Every live Delta's source extent lives in a segment GC cannot rewrite or remove. Cross-import delta sources come from `extent_index` provenance lineage, which names only fully-snapshotted ancestors (enforced at import time by Phase 2a).
+2. **Canonical presence.** For every live Delta with source hash H, `extent_index.lookup(H)` returns a DATA entry. Maintained by GC's liveness rule, extended: a DATA entry is kept alive if any live LBA in the volume references its hash directly (Data/DedupRef) or indirectly as a Delta's `source_hash`.
+
+The **`lba_referenced_hashes()`** set is extended to include delta source hashes for every live Delta LBA. GC's existing rule ("keep DATA alive iff any live LBA references its hash") then covers delta sources with no new code path.
+
+**GC** carries Delta entries through `compact_candidates_inner` unchanged, same as DedupRef: a match arm that debug-asserts `stored_offset == 0, stored_length == 0`, copies the entry through, and skips `fetch_live_bodies` (it contributes no body bytes). The delta blob stays in the source segment's delta body section; GC does not move delta blobs between segments. The segment's delta body section is carried into the GC output as-is.
+
+In `cache/`, `promote_to_cache` treats Delta entries the same as DedupRef entries: `.present` bit unset (delta blob is served from the delta body section, not the `.body` file), no contribution to `.body` size.
 
 **FLAG_ZERO entries** carry only the LBA mapping with ZERO_HASH. No extent index lookup is performed for these entries — the read path returns zeros directly. Zero entries must be present in the segment index (and in the serialised manifest) to correctly mask ancestor data; they are never omitted even though they have no body bytes.
 

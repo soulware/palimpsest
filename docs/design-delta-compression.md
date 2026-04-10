@@ -1,8 +1,8 @@
 # Design: Delta compression via file-path matching
 
-Status: **proposed**
+Status: **phase 2b + thin delta in progress** (Phase 1 + 2a landed; see § Scope and sequencing)
 
-Date: 2026-04-09
+Date: 2026-04-09 (updated 2026-04-10)
 
 ---
 
@@ -85,26 +85,18 @@ Byte count is included so the coordinator can make size-aware decisions (e.g. sk
 
 ## Delta computation at upload time
 
-There are two source-selection strategies, used in different scenarios. Both produce the same output: delta options appended to the segment's delta section with `source_hash` references in the index entries.
+The production source-selection strategy is **filemap path-matching** across imported snapshots linked via `extent_index` provenance. This is the path that realises the 94% S3 fetch savings from `findings.md` and is load-bearing on Phase 2a's cross-import extent_index lineage.
 
-### LBA-based delta (live writes against a parent snapshot)
+### Removed: LBA-based delta (previously a PoC at drain time)
 
-When a writable fork produces segments (WAL → pending), each DATA entry records the LBA it was written to. The parent snapshot's LBA map tells the coordinator what hash previously occupied that LBA. If the hash differs, the old extent is a natural delta source — the user modified data in-place.
+**Proposed:** remove the existing LBA-based delta path in `elide-coordinator/src/delta.rs` and its hook in `drain_pending()`. Rationale:
 
-The coordinator already builds an LBA map during GC via `lbamap::rebuild_segments()` (see `gc.rs`). The same rebuild is used here, scoped to the parent snapshot's segments (everything up to the branch-point ULID).
+- NBD live writes are block-granular — each pending segment is a bag of fragmented 4 KiB blocks, not file-sized extents. LBA-based matching produces tiny deltas of tiny extents, with rebuild cost per segment greater than the marginal saving.
+- The design always called this out as "PoC only; validates machinery; not the intended production integration point" (this doc, §"Why not at drain time?").
+- Keeping it alongside filemap-based delta would create two delta paths racing for the same entries, each with different source-selection rules — unnecessary complexity.
+- The delta format machinery it validated (segment format, delta options table, zstd dictionary compression, read-path decompression) is unaffected and remains in use.
 
-**Steps (per pending segment from a writable fork):**
-
-1. Rebuild the parent snapshot's LBA map from ancestor `index/*.idx` files (same `rebuild_segments` call GC uses, with the ancestor chain truncated at the branch-point ULID)
-2. Rebuild the extent index for the same ancestor chain (needed to locate source extent bodies)
-3. For each DATA entry in the pending segment:
-   a. Look up `entry.start_lba` in the parent LBA map → `old_hash`
-   b. If no previous hash (new allocation): no delta candidate
-   c. If `old_hash == entry.hash`: dedup already handled this, no delta needed
-   d. If `old_hash != entry.hash` (data changed): look up `old_hash` in the extent index → read the old extent body → use it as zstd dictionary to compress the new extent body → delta blob
-4. For each delta blob produced, append it to the segment's delta body section and record `source_hash = old_hash` in the index entry's delta options
-
-The segment on S3 remains self-contained: the full extent body stays in the body section. The delta section is additive — an additional fetch option for readers that already have the source extent cached locally.
+Snapshot-time coalescing (design doc §"Snapshot (coalescing, future)") is the eventual replacement for LBA-based delta on live-write volumes, but is deferred. Until then, NBD-written volumes get filemaps only via Phase 3; delta at drain time is **gone**, not degraded.
 
 ### Filemap-based delta (imported snapshot vs imported snapshot)
 
@@ -135,14 +127,53 @@ When delta is skipped, the extent is stored as a normal full-body entry. The rea
 
 ### Where in the upload pipeline
 
-Delta computation slots into `drain_pending()` alongside the sparse-on-upload step:
+**Proposed (Phase B):** delta computation runs only for segments produced by an **import** whose volume provenance lists one or more `extent_index` sources with filemaps available locally. Writable-fork drain segments bypass the delta stage entirely.
 
-1. **Sparse-on-upload** — hole-punch dead body regions; leave live DedupRef body regions as holes (thin upload) (existing)
-2. **Compute deltas** — for each DATA entry with an LBA-based (or filemap-based) source, compress with zstd dictionary and append to the delta section (new)
+1. **Redact** — hole-punch dead DATA body regions in place (existing)
+2. **Compute deltas** (Proposed, import-only) — load child + source filemaps, path-match changed files, compress with zstd dictionary using the source extent body, append to the delta section
 3. **Upload** — PUT the segment to S3 (existing)
 4. **Promote** — IPC to volume: write index/, cache/, delete pending/ (existing)
 
-Delta computation is additive: the segment's delta section grows, the body section is untouched. The savings come at read time when demand-fetch can pull the small delta instead of the full body. Thin DedupRef upload is complementary: it removes body bytes that never needed to be there in the first place, while delta compression reduces the cost of body bytes that do need to exist.
+Delta computation under Phase B is **additive**: the segment's delta section grows, the full body section is untouched. Phase C (thin delta entry kind) then makes the body itself optional when a delta is produced — see below.
+
+### Proposed: thin delta entry kind (Phase C)
+
+Phase B's additive delta stores the full extent body *and* the delta blob, which is wasteful when a delta is produced: cold hosts pay for body bytes they would never fetch, and warm hosts pay for body bytes they never need. This mirrors the problem the thin DedupRef PR (#36) solved for dedup references.
+
+**Proposed:** a new `EntryKind::Delta` that mirrors the format-level shape of `DedupRef`:
+
+- `stored_offset = 0`, `stored_length = 0` — the entry reserves no body space. Its own content is not present in the body section of any segment (local, cache, or S3).
+- The entry's content is served by fetching the delta blob from the segment's delta body section (or inline, via `FLAG_DELTA_INLINE`) and decompressing it against the source extent body, which is located via `extent_index.lookup(source_hash)`.
+- One or more delta options per entry (`delta_count ≥ 1`) act as **hints**: the reader picks the first `source_hash` it can resolve locally. More than one option is a graceful-degradation mechanism across skipped releases.
+- **Delta source must resolve to a DATA entry.** A Delta's `source_hash` never targets another Delta — no delta-of-delta chains. This bounds decompression cost to a single dictionary apply and keeps GC liveness reasoning linear.
+- **Producer:** the Phase B upload stage emits `Delta` instead of `Data` when `delta_length < body_length` and the source is confirmed locally available. The body bytes are dropped from the segment entirely; only the delta blob is written.
+- **Reader:** the demand-fetch path (`elide-fetch`) already handles delta options on Data entries. A Delta entry uses the same decompression step, with the only difference being that there is no full-body fallback in the same segment — if no option's source resolves, the fetch fails rather than falling back. This is the price of thin delta and is symmetric with thin DedupRef's dependence on `extent_index.lookup()`.
+
+**Invariants** (mirroring the two DedupRef invariants):
+
+1. **Pinning.** Every live Delta's source extent lives in a segment GC cannot rewrite or remove. The snapshot floor + first-snapshot pinning rules already provide this for cross-import delta sources, because `extent_index` lineage sources are always fully-snapshotted ancestors (checked at import time by Phase 2a).
+2. **Canonical presence.** For every live Delta with source hash H, `extent_index.lookup(H)` returns a DATA entry. Maintained by GC's liveness rule, extended: a DATA entry is kept alive if any live LBA in the volume references its hash *either directly (Data or DedupRef) or indirectly via a Delta's source_hash*.
+
+**`lba_referenced_hashes` extension.** The LBA map's `lba_referenced_hashes()` set already includes the hash reached by each live LBA. A Delta LBA reaches *two* hashes that must stay alive: the Delta's own content hash (for extent index visibility, though Delta entries are not themselves registered in the extent index) and the source hash (for decompression). The source hash is the load-bearing one — it must be folded into the same `lba_referenced_hashes()` set that PR #36 introduced, so GC's existing "keep DATA alive iff any live LBA references its hash" rule covers delta sources with no special-case code path.
+
+**GC preservation.** GC carries Delta entries through `compact_candidates_inner` unchanged, same pattern as DedupRef: a new match arm that asserts `stored_offset == 0, stored_length == 0` and copies the entry through to the output, skipping `fetch_live_bodies` entirely (it contributes no body bytes). The delta blob itself stays in the source segment's delta section; GC does not move delta blobs between segments.
+
+**Regression tests** (mirroring `gc_ordering_test.rs` from PR #36):
+
+- A segment containing a Delta entry whose source lives in an ancestor segment passes through GC compaction unchanged.
+- A segment containing a Delta entry whose source lives in the *same segment* as a Data entry (variant-b-analogue) is compacted correctly: overwriting the Delta's LBA before GC must still keep the source DATA alive if any other LBA references either hash.
+- Crash recovery mid-compaction with Delta entries present.
+- Rejecting an old format version that encoded delta-of-delta chains (format version bump signals the new invariant).
+
+### Read path: earliest-source preference (Phase A, prerequisite)
+
+The demand-fetch path (`elide-fetch/src/lib.rs`) currently picks a delta source arbitrarily when multiple options resolve locally. **Proposed (Phase A):** prefer an already-cached source; otherwise fall back to the earliest ULID among uncached candidates. Rationale:
+
+- Determinism across hosts: the same demand-fetch decision on any host maximises shared-base reuse (fewer distinct source bodies materialised in `cache/` per volume).
+- Already-cached wins trivially: no fetch cost at all.
+- Earliest ULID as the uncached tiebreaker prefers the *oldest shared base*, which is likely to already be present on more hosts and is the most reusable across future delta chains.
+
+Phase A is a small, standalone change in the delta option scan at `elide-fetch/src/lib.rs:226+`. It is not strictly required for Phase B correctness but is load-bearing on Phase C's reuse model and should land first.
 
 ## Read path: unchanged
 
@@ -201,13 +232,17 @@ The drain-time delta path validates the end-to-end machinery (computation, segme
 
 ## Scope and sequencing
 
-**Phase 1 (done):** Delta format and machinery. Segment format v3 with delta table in the index, `rewrite_with_deltas()`, `compute_deltas()` with LBA-based source selection, integration into `drain_pending()` for validation. Proof-of-concept only — the real savings come from phases 2 and 3.
+**Phase 1 (done):** Delta format and machinery. Segment format v3 with delta table in the index, `rewrite_with_deltas()`, `compute_deltas()` with LBA-based source selection, integration into `drain_pending()` for validation. Proof-of-concept only — the real savings come from later phases.
 
-**Phase 2a (this change):** Import-time extent-source linkage. The `extent_index` field in `volume.provenance` names one or more snapshots whose extents are merged into the child's hash pool (but not into its LBA map). `elide volume import --extents-from <name>` (repeatable) wires this up; blocks whose hash already exists in any listed source are written as `DedupRef` entries during the import block loop. Delivers cross-import dedup; lays the groundwork for filemap-based delta. All lineage is carried in the signed provenance file — no standalone `volume.extent_index` file exists.
+**Phase 2a (done):** Import-time extent-source linkage. The `extent_index` field in `volume.provenance` names one or more snapshots whose extents are merged into the child's hash pool (but not into its LBA map). `elide volume import --extents-from <name>` (repeatable) wires this up; blocks whose hash already exists in any listed source are written as `DedupRef` entries during the import block loop. Delivers cross-import dedup; lays the groundwork for filemap-based delta. All lineage is carried in the signed provenance file — no standalone `volume.extent_index` file exists.
 
-**Phase 2b:** File-aware import with filemap-based delta on top of the linkage from 2a. The coordinator loads both filemaps, matches paths, and computes zstd deltas against parent extent data for changed files. See "Phase 2: import-time parent association" below.
+**Phase A (Proposed, in progress — Task #9):** Earliest-source demand-fetch preference in `elide-fetch`. Prefer already-cached sources, then earliest ULID among uncached candidates. Small, standalone change; prerequisite for B/C reuse determinism. See §"Read path: earliest-source preference".
 
-**Phase 3:** Snapshot-time coalescing. Parse ext4 metadata at snapshot time to reconstruct file-level extents from fragmented NBD blocks, emit filemaps, and compute deltas against prior snapshots. This extends filemap-based delta to live-write volumes.
+**Phase B (Proposed, in progress — was Phase 2b):** Filemap-based delta at coordinator upload. Load child + source volume filemaps via provenance lineage, path-match changed files, compute zstd deltas against locally-available source extent bodies, append delta blobs to the segment's delta body section. **Additive only** — full body bytes still present. Simultaneously **removes** the existing LBA-based PoC delta path in `drain_pending()`; filemap-based delta becomes the single production delta path at upload time.
+
+**Phase C (Proposed, in progress):** Thin delta entry kind. New `EntryKind::Delta` with `stored_offset = 0, stored_length = 0`, mirroring the shape of thin DedupRef. Producer drops the full body when a delta is produced; reader resolves via `extent_index.lookup(source_hash)`. GC preservation and `lba_referenced_hashes` folding follow the DedupRef pattern. See §"Proposed: thin delta entry kind".
+
+**Phase 3 (deferred):** Snapshot-time coalescing. Parse ext4 metadata at snapshot time to reconstruct file-level extents from fragmented NBD blocks, emit filemaps, and compute deltas against prior snapshots. Extends filemap-based delta to live-write volumes — until this lands, delta is import-only.
 
 **Phase 4 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
