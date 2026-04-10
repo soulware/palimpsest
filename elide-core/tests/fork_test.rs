@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use elide_core::volume::{Volume, fork_volume};
+use elide_core::volume::{Volume, fork_volume, walk_ancestors};
 
 mod common;
 
@@ -149,5 +149,130 @@ fn three_level_fork_isolation() {
         gc.read(7, 1).unwrap(),
         vec![0u8; 4096],
         "lba 7 (post-branch child write)"
+    );
+}
+
+/// `walk_ancestors` returns each layer in oldest-first order and implicitly
+/// verifies the Ed25519 signature on every `volume.provenance` file it reads
+/// (via `load_lineage_or_empty` → `read_lineage_verifying_signature`).
+///
+/// This test exercises the happy path: a three-level chain where every
+/// provenance file is well-formed and signed by its own key. The walker must
+/// return both ancestors without error.
+#[test]
+fn fork_chain_walk_verifies_provenance_signatures() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let by_id = dir.path().to_path_buf();
+    let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+    let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+    let grandchild_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+    let root_dir = by_id.join(root_ulid);
+    let child_dir = by_id.join(child_ulid);
+    let grandchild_dir = by_id.join(grandchild_ulid);
+
+    common::write_test_keypair(&root_dir);
+    let mut root = Volume::open(&root_dir, &by_id).unwrap();
+    root.write(0, &[0xAA; 4096]).unwrap();
+    root.flush_wal().unwrap();
+    root.snapshot().unwrap();
+    drop(root);
+
+    fork_volume(&child_dir, &root_dir).unwrap();
+    let mut child = Volume::open(&child_dir, &by_id).unwrap();
+    child.write(1, &[0xBB; 4096]).unwrap();
+    child.flush_wal().unwrap();
+    child.snapshot().unwrap();
+    drop(child);
+
+    fork_volume(&grandchild_dir, &child_dir).unwrap();
+
+    // Walk from grandchild — must return [root, child] in oldest-first order
+    // and verify both signatures along the way.
+    let ancestors = walk_ancestors(&grandchild_dir, &by_id).unwrap();
+    assert_eq!(ancestors.len(), 2, "expected two ancestor layers");
+    assert_eq!(
+        ancestors[0].dir, root_dir,
+        "oldest layer should be the root volume"
+    );
+    assert_eq!(
+        ancestors[1].dir, child_dir,
+        "second layer should be the child volume"
+    );
+    assert!(
+        ancestors[0].branch_ulid.is_some(),
+        "root layer should carry a branch_ulid"
+    );
+    assert!(
+        ancestors[1].branch_ulid.is_some(),
+        "child layer should carry a branch_ulid"
+    );
+
+    // Walking from child should also succeed and yield [root] only.
+    let child_ancestors = walk_ancestors(&child_dir, &by_id).unwrap();
+    assert_eq!(child_ancestors.len(), 1);
+    assert_eq!(child_ancestors[0].dir, root_dir);
+}
+
+/// Tampering with an ancestor's `volume.provenance` (even in a way that keeps
+/// the file well-formed) must cause `walk_ancestors` to fail with a signature
+/// verification error. This is the integrity guarantee that makes consolidated
+/// provenance trustworthy: an attacker who modifies parent/extent_index cannot
+/// mask their change without re-signing, which requires the volume's private
+/// key.
+#[test]
+fn tampered_provenance_rejected_by_walker() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let by_id = dir.path().to_path_buf();
+    let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+    let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+    let grandchild_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+    let root_dir: PathBuf = by_id.join(root_ulid);
+    let child_dir: PathBuf = by_id.join(child_ulid);
+    let grandchild_dir: PathBuf = by_id.join(grandchild_ulid);
+
+    common::write_test_keypair(&root_dir);
+    let mut root = Volume::open(&root_dir, &by_id).unwrap();
+    root.write(0, &[0xAA; 4096]).unwrap();
+    root.flush_wal().unwrap();
+    root.snapshot().unwrap();
+    drop(root);
+
+    fork_volume(&child_dir, &root_dir).unwrap();
+    let mut child = Volume::open(&child_dir, &by_id).unwrap();
+    child.write(1, &[0xBB; 4096]).unwrap();
+    child.flush_wal().unwrap();
+    child.snapshot().unwrap();
+    drop(child);
+
+    fork_volume(&grandchild_dir, &child_dir).unwrap();
+
+    // Sanity: the walker succeeds before tampering.
+    walk_ancestors(&grandchild_dir, &by_id).expect("untampered walk should succeed");
+
+    // Tamper with the child's provenance by flipping one character in the
+    // hostname line. The file stays parseable (parse_provenance only requires
+    // `hostname: <value>\n`) but the recorded signing input no longer matches,
+    // so the Ed25519 signature check must fail.
+    let child_provenance = child_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
+    let original = std::fs::read_to_string(&child_provenance).unwrap();
+    let tampered = if let Some(rest) = original.strip_prefix("hostname: ") {
+        let newline = rest.find('\n').unwrap();
+        let (host, after) = rest.split_at(newline);
+        // Prepend an "x" to the hostname; still valid UTF-8, still parseable,
+        // definitely different from what was signed.
+        format!("hostname: x{host}{after}")
+    } else {
+        panic!("provenance file did not start with hostname line");
+    };
+    std::fs::write(&child_provenance, tampered).unwrap();
+
+    let err = match walk_ancestors(&grandchild_dir, &by_id) {
+        Ok(_) => panic!("tampered provenance must be rejected"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("signature invalid"),
+        "expected signature-invalid error, got: {msg}"
     );
 }

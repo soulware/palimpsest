@@ -34,14 +34,14 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // Seed batch 2 — LBAs 4-7 = 0xBB — drain to index/ + cache/.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // Take GC checkpoint (flushes WAL, advances mint).
     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
@@ -105,14 +105,14 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // Seed batch 2 — LBAs 4-7 = 0xBB.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // GC checkpoint then GC pass — no overwrites yet so GC output contains
     // 0xAA for LBAs 0-3 and 0xBB for LBAs 4-7.
@@ -193,12 +193,12 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     // S1: LBA 0 = seed 40
     vol.write(0, &[40u8; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // S2: LBA 1 = seed 41
     vol.write(1, &[41u8; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // GC pass 1: compact S1+S2 into G1.
     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
@@ -229,7 +229,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     // Drain: materialise S3 (no thin refs) and S4 (DedupRef → DedupRef).
     // After promote, index/ has S3.idx (Data) and S4.idx (DedupRef).
     // extent_index: H101 → S4 (S4 processed last, overwrites S3).
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // GC pass 3: compact S3+S4.
     // Bug: S3's DATA entry is not extent-canonical (extent says H101→S4), so
@@ -271,5 +271,99 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
         vol.read(1, 1).unwrap(),
         vec![101u8; 4096],
         "LBA 1 wrong after crash+rebuild"
+    );
+}
+
+/// Variant (b) regression: DATA + sibling DedupRef in the **same segment**,
+/// with the DATA's LBA overwritten so the DATA entry is LBA-dead but its
+/// hash is still referenced by the sibling DedupRef's LBA.
+///
+/// The canonical-presence invariant requires this DATA entry to survive
+/// both redact and GC, because it is the only copy of the hash's bytes
+/// anywhere — dropping it would leave the DedupRef unresolvable.
+///
+/// This is load-bearing on `lba_map::lba_referenced_hashes()` being sourced
+/// from the LBA map and *not* from a DATA-only filter. If a future change
+/// narrows the filter, this test fails loudly — see the worked examples in
+/// `docs/architecture.md § Dedup`.
+#[test]
+fn gc_preserves_canonical_when_only_sibling_dedup_ref_keeps_hash_alive() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    // High-entropy payload so it does not compress below INLINE_THRESHOLD
+    // and lands in the body section as a genuine DATA entry.
+    let payload: Vec<u8> = (0..4096).map(|i| (i * 7 + 13) as u8).collect();
+
+    // Variant (b): single segment containing Data(LBA 0, H) and
+    // DedupRef(LBA 1, H). In-session dedup produces the DedupRef in the
+    // same WAL as the Data entry, so both land in the same segment on
+    // flush.
+    vol.write(0, &payload).unwrap();
+    vol.write(1, &payload).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Overwrite LBA 0 with different data. The DATA entry at LBA 0 is now
+    // LBA-dead (LBA 0 maps to a new hash), but hash H is still referenced
+    // by LBA 1's DedupRef. The DATA must NOT be dropped — it is the only
+    // copy of H's bytes anywhere.
+    let overwrite: Vec<u8> = (0..4096).map(|i| (i * 11 + 3) as u8).collect();
+    vol.write(0, &overwrite).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Drain: redact must preserve the LBA-dead-but-hash-alive DATA entry,
+    // and promote publishes the segment to index/ + cache/.
+    common::drain_with_redact(&mut vol);
+
+    // LBA 1 reads must return the original payload (resolved via extent
+    // index to the same-segment DATA at LBA 0).
+    assert_eq!(
+        vol.read(1, 1).unwrap(),
+        payload,
+        "LBA 1 must read original payload after drain"
+    );
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        overwrite,
+        "LBA 0 must read overwrite after drain"
+    );
+
+    // GC pass: compact the drained segment and any others. The canonical
+    // DATA for H must be carried through — dropping it would break LBA 1.
+    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+    if let Some((_, _, to_delete)) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 1) {
+        vol.apply_gc_handoffs().unwrap();
+        for path in &to_delete {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // Verify both reads before crash.
+    assert_eq!(
+        vol.read(1, 1).unwrap(),
+        payload,
+        "LBA 1 must read original payload after GC"
+    );
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        overwrite,
+        "LBA 0 must read overwrite after GC"
+    );
+
+    // Crash + rebuild: extent index rebuilt from disk must still carry the
+    // canonical DATA for H, so LBA 1 resolves.
+    drop(vol);
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(
+        vol.read(1, 1).unwrap(),
+        payload,
+        "LBA 1 must read original payload after crash+rebuild"
+    );
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        overwrite,
+        "LBA 0 must read overwrite after crash+rebuild"
     );
 }

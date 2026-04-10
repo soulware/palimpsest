@@ -129,6 +129,11 @@ impl ExtentIndex {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Iterate `(hash, location)` pairs. Ordering is unspecified.
+    pub fn iter(&self) -> impl Iterator<Item = (&blake3::Hash, &ExtentLocation)> {
+        self.inner.iter()
+    }
 }
 
 impl Default for ExtentIndex {
@@ -448,16 +453,16 @@ mod tests {
 
     #[test]
     fn rebuild_indexes_data_skips_dedup_ref() {
-        // DedupRef entries have reserved body space (zero-filled) but must NOT
-        // be indexed — the extent index for that hash points to the canonical
-        // segment.  Only Data entries are indexed.
+        // DedupRef entries carry no body bytes and must NOT be indexed — the
+        // extent index for that hash points to the canonical Data segment.
+        // Only Data entries are indexed.
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
         let ref_hash = blake3::hash(b"dedup ref body");
-        let ref_entry = SegmentEntry::new_dedup_ref(ref_hash, 0, 1, 4096, false);
+        let ref_entry = SegmentEntry::new_dedup_ref(ref_hash, 0, 1);
 
         let data_body = b"real data".repeat(512)[..4096].to_vec();
         let data_hash = blake3::hash(&data_body);

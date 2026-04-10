@@ -39,11 +39,11 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     // Write two blocks across two separate flush cycles to produce two segments.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     vol.write(1, &[0xBB; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let cache_dir = fork_dir.join("cache");
@@ -163,11 +163,11 @@ fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
 
     vol.write(0, &[0x11; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     vol.write(1, &[0x22; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");

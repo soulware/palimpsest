@@ -172,26 +172,21 @@ pub async fn drain_pending(
         };
         let segment_path = entry.path();
 
-        // Materialise DedupRef body holes before upload.  Best-effort: if the
-        // volume is not running, proceed anyway.  Segments with no DedupRef
-        // entries upload fine without materialisation (hard-link fast path).
-        crate::control::materialise_segment(vol_dir, ulid).await;
-        let mat_path = pending_dir.join(format!("{name}.materialized"));
-        let after_mat_path = if mat_path.exists() {
-            &mat_path
-        } else {
-            &segment_path
-        };
+        // Redact dead DATA regions in place before upload. Best-effort: if
+        // the volume is not running, proceed anyway — segments with no
+        // hash-dead entries are a no-op, and the thin DedupRef format means
+        // DedupRef bodies are never in the file to begin with.
+        crate::control::redact_segment(vol_dir, ulid).await;
 
         // Compute delta options against parent snapshot LBA state.
         // Best-effort: if delta fails, upload the non-delta segment.
         let delta_path = pending_dir.join(format!("{name}.delta"));
-        let upload_path = match try_delta(vol_dir, after_mat_path, &delta_path) {
+        let upload_path = match try_delta(vol_dir, &segment_path, &delta_path) {
             Ok(Some(p)) => p,
-            Ok(None) => after_mat_path.to_owned(),
+            Ok(None) => segment_path.clone(),
             Err(e) => {
                 warn!("delta computation failed for {name}: {e:#}");
-                after_mat_path.to_owned()
+                segment_path.clone()
             }
         };
 

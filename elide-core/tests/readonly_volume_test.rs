@@ -62,7 +62,7 @@ fn readonly_sees_drained_segments() {
         vol.write(lba, &[0xCC; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     for lba in 0u64..4 {
@@ -83,13 +83,13 @@ fn readonly_sees_data_after_gc() {
         vol.write(lba, &[0xDD; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     for lba in 4u64..8 {
         vol.write(lba, &[0xEE; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
     let (_, _, to_delete) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)

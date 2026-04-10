@@ -692,7 +692,7 @@ DEDUP_REF writes do not update the extent index — causing reads for that LBA t
 return zeros.
 
 **Fix**: in `apply_gc_handoffs`, before any extent index mutations, check
-`self.lbamap.live_hashes()` for each hash not carried into the GC output.  If
+`self.lbamap.lba_referenced_hashes()` for each hash not carried into the GC output.  If
 any such hash is still live, cancel the GC pass (delete `.pending` and body) so
 `gc_fork` can re-run with current liveness data on the next tick.
 

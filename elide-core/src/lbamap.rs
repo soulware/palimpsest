@@ -220,10 +220,20 @@ impl LbaMap {
         self.inner.is_empty()
     }
 
-    /// Return the set of all content hashes currently referenced by any LBA range.
+    /// Return the set of all content hashes currently referenced by any LBA
+    /// range, regardless of how the LBA got its hash (DATA write, DedupRef
+    /// write, or rebuilt from a segment of any entry kind).
     ///
-    /// Used by GC to identify which extents in segment files are still live.
-    pub fn live_hashes(&self) -> HashSet<blake3::Hash> {
+    /// **Load-bearing for the canonical-presence invariant.** GC and
+    /// `redact_segment` use this to keep a DATA entry alive whenever any
+    /// live LBA references its hash — including LBAs that reference the
+    /// hash via a DedupRef. The naming is deliberately precise (`lba_`-
+    /// prefixed) to discourage a future "optimisation" to a DATA-only
+    /// filter: such a filter would drop DATA entries whose only live
+    /// referrer is a sibling DedupRef, violating canonical-presence and
+    /// corrupting reads. See `docs/architecture.md § Dedup` for the
+    /// worked examples.
+    pub fn lba_referenced_hashes(&self) -> HashSet<blake3::Hash> {
         self.inner.values().map(|e| e.hash).collect()
     }
 

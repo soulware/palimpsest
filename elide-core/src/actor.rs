@@ -109,7 +109,7 @@ pub(crate) enum VolumeRequest {
     GcCheckpoint {
         reply: Sender<io::Result<(Ulid, Ulid)>>,
     },
-    MaterialiseSegment {
+    RedactSegment {
         ulid: Ulid,
         reply: Sender<io::Result<()>>,
     },
@@ -268,8 +268,8 @@ impl VolumeActor {
                             }
                             let _ = reply.send(result);
                         }
-                        VolumeRequest::MaterialiseSegment { ulid, reply } => {
-                            let _ = reply.send(self.volume.materialise_segment(ulid));
+                        VolumeRequest::RedactSegment { ulid, reply } => {
+                            let _ = reply.send(self.volume.redact_segment(ulid));
                         }
                         VolumeRequest::Promote { ulid, reply } => {
                             let result = self.volume.promote_segment(ulid);
@@ -500,15 +500,15 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Materialise a pending segment: fill DedupRef body holes with data
-    /// from the canonical segment.
+    /// Redact a pending segment: hole-punch hash-dead DATA entries in place
+    /// so deleted data never leaves the host via S3 upload.
     ///
-    /// Called by the coordinator before reading `pending/<ulid>` for S3 upload.
-    /// Idempotent: if no DedupRef entries exist, a hard link is created.
-    pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
+    /// Called by the coordinator before reading `pending/<ulid>` for S3
+    /// upload. Idempotent; no-op when the segment has no hash-dead entries.
+    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::MaterialiseSegment {
+            .send(VolumeRequest::RedactSegment {
                 ulid,
                 reply: reply_tx,
             })

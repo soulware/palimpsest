@@ -19,10 +19,11 @@ mod common;
 /// After correctly evicting local segment bodies (with coordinator-written
 /// `index/*.idx` already present), the LBA map survives a crash+reopen.
 ///
-/// `drain_with_materialise` simulates the coordinator drain: materialise thin
-/// refs then promote to `index/<ulid>.idx` + `cache/<ulid>.body`.  Evict then
-/// deletes the body.  After a restart, `Volume::open` rebuilds the LBA map
-/// from `index/*.idx` and subsequent reads fall through to the `SegmentFetcher`.
+/// `drain_with_redact` simulates the coordinator drain: hole-punch dead
+/// DATA regions in place on `pending/<ulid>`, then promote to
+/// `index/<ulid>.idx` + `cache/<ulid>.body`. Evict then deletes the body.
+/// After a restart, `Volume::open` rebuilds the LBA map from `index/*.idx`
+/// and subsequent reads fall through to the `SegmentFetcher`.
 #[test]
 fn evict_then_crash_data_survives() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -33,7 +34,7 @@ fn evict_then_crash_data_survives() {
     vol.write(0, &[0xAB; 4096]).unwrap();
     vol.write(1, &[0xCD; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // Simulate evict: delete cache/ body files (index/.idx already present from drain).
     let cache_dir = fork_dir.join("cache");
@@ -70,7 +71,7 @@ fn evict_without_idx_loses_lba_map() {
 
     vol.write(0, &[0xAB; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // Broken evict: delete index/*.idx (coordinator never committed to S3),
     // then delete the body — no trace remains.
@@ -116,7 +117,7 @@ fn inline_extents_survive_body_deletion() {
     vol.write(0, &block_a).unwrap();
     vol.write(1, &block_b).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_materialise(&mut vol);
+    common::drain_with_redact(&mut vol);
 
     // Delete every .body file in cache/ — simulates eviction.
     let cache_dir = fork_dir.join("cache");
@@ -158,7 +159,7 @@ fn inline_extents_survive_body_deletion_after_reopen() {
         let block = vec![0xCCu8; 4096];
         vol.write(0, &block).unwrap();
         vol.flush_wal().unwrap();
-        common::drain_with_materialise(&mut vol);
+        common::drain_with_redact(&mut vol);
     }
 
     // Delete .body files while volume is closed.
@@ -251,8 +252,8 @@ fn evict_live_volume_reads_via_demand_fetch() {
         fs::copy(entry.path(), store_dir.join(&name)).unwrap();
     }
 
-    // Drain: materialise + promote (moves pending → cache + index).
-    common::drain_with_materialise(&mut vol);
+    // Drain: redact + promote (moves pending → cache + index).
+    common::drain_with_redact(&mut vol);
 
     // Verify extent index entries are now BodySource::Cached, not Local.
     let hash_a = blake3::hash(&block_a);

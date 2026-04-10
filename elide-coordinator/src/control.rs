@@ -101,17 +101,18 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
     }
 }
 
-/// Materialise a pending segment: fill DedupRef body holes with canonical data
-/// before S3 upload. Called before `upload_segment`.
+/// Redact a pending segment: hole-punch hash-dead DATA entries in place so
+/// deleted data never leaves the host via S3 upload. Called before
+/// `upload_segment`.
 ///
 /// Returns `true` on success. Returns `false` if the socket is absent or fails.
-pub async fn materialise_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
-    let req = format!("materialise {ulid}");
+pub async fn redact_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
+    let req = format!("redact {ulid}");
     match call(fork_dir, &req).await {
         Some(resp) if resp.trim() == "ok" => true,
         Some(resp) => {
             warn!(
-                "[control] materialise {ulid} for {} returned unexpected response: {resp:?}",
+                "[control] redact {ulid} for {} returned unexpected response: {resp:?}",
                 fork_dir.display()
             );
             false

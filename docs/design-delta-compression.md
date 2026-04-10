@@ -135,14 +135,14 @@ When delta is skipped, the extent is stored as a normal full-body entry. The rea
 
 ### Where in the upload pipeline
 
-Delta computation slots in after materialisation in `drain_pending()`:
+Delta computation slots into `drain_pending()` alongside the sparse-on-upload step:
 
-1. **Materialise** — fill DedupRef body holes with canonical extent data (existing)
+1. **Sparse-on-upload** — hole-punch dead body regions; leave live DedupRef body regions as holes (thin upload) (existing)
 2. **Compute deltas** — for each DATA entry with an LBA-based (or filemap-based) source, compress with zstd dictionary and append to the delta section (new)
 3. **Upload** — PUT the segment to S3 (existing)
 4. **Promote** — IPC to volume: write index/, cache/, delete pending/ (existing)
 
-Both materialisation and delta computation are additive operations: the segment gets larger, not smaller. Materialisation adds body bytes for DedupRef entries; delta computation adds an additional delta section. The savings come at read time when demand-fetch can pull the small delta instead of the full body.
+Delta computation is additive: the segment's delta section grows, the body section is untouched. The savings come at read time when demand-fetch can pull the small delta instead of the full body. Thin DedupRef upload is complementary: it removes body bytes that never needed to be there in the first place, while delta compression reduces the cost of body bytes that do need to exist.
 
 ## Read path: unchanged
 

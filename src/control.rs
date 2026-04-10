@@ -32,9 +32,10 @@
 //     Apply any pending or applied GC handoffs (updates in-memory extent index).
 //     Returns "ok <n>" where n is the number of handoffs processed.
 //
-//   materialise <ulid>
-//     Fill DedupRef body holes in pending/<ulid> with data from the canonical
-//     segment. Idempotent. Called before S3 upload.
+//   redact <ulid>
+//     Hole-punch hash-dead DATA entries in pending/<ulid> in place so
+//     deleted data never leaves the host via S3 upload. Idempotent;
+//     no-op when the segment has no hash-dead entries.
 //     Returns "ok".
 //
 //   shutdown
@@ -159,9 +160,9 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
                 let _ = writeln!(writer, "err {e}");
             }
         }
-    } else if let Some(ulid_str) = line.strip_prefix("materialise ") {
+    } else if let Some(ulid_str) = line.strip_prefix("redact ") {
         match ulid::Ulid::from_string(ulid_str.trim()) {
-            Ok(ulid) => match handle.materialise_segment(ulid) {
+            Ok(ulid) => match handle.redact_segment(ulid) {
                 Ok(()) => {
                     let _ = writeln!(writer, "ok");
                 }

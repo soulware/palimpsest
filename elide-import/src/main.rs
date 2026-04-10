@@ -383,11 +383,11 @@ fn serve_loop(
             handle_promote(ulid_str, pending_dir, index_dir, cache_dir);
         }
         // All commands (including promote) receive "ok\n".
-        // Non-promote commands (flush, sweep_pending, repack, gc_checkpoint)
-        // are no-ops — the coordinator handles their absence gracefully.
-        // TODO: handle "materialise <ulid>" — without this, segments containing
-        // thin DedupRef entries will fail the upload sanity check and stay in
-        // pending/ until a volume process handles them.
+        // Non-promote commands (flush, sweep_pending, repack, gc_checkpoint,
+        // redact) are no-ops — the coordinator handles their absence
+        // gracefully. `redact` in particular is a no-op for import-produced
+        // segments because they have no hash-dead DATA (nothing has been
+        // overwritten yet in a freshly-imported volume).
         let _ = writer.write_all(b"ok\n");
     }
     Ok(())

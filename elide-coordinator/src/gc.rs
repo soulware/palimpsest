@@ -194,7 +194,7 @@ pub async fn gc_fork(
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
-    let live_hashes = lbamap.live_hashes();
+    let live_hashes = lbamap.lba_referenced_hashes();
 
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
@@ -453,19 +453,21 @@ pub async fn apply_done_handoffs(
                     format!("signature verification failed for compacted segment {new_ulid_str}")
                 })?;
 
-            // Sanity check: GC output should contain only Data and Zero entries.
-            // DedupRef entries from S3 input are reclassified as Data during
-            // compaction; if any survive, something is wrong.
-            let dedup_count = gc_entries
-                .iter()
-                .filter(|e| e.kind == EntryKind::DedupRef)
-                .count();
-            if dedup_count > 0 {
-                return Err(anyhow::anyhow!(
-                    "compacted segment {new_ulid_str} has {dedup_count} DedupRef entries; \
-                     refusing to upload — GC output must be self-contained"
-                ));
-            }
+            // Sanity check: GC output is well-formed. DedupRef entries pass
+            // through the compactor unchanged (thin format: stored_length=0,
+            // no body bytes) and their hashes still resolve via the extent
+            // index to canonical DATA entries living elsewhere. The "GC
+            // output must be self-contained" invariant was dropped along
+            // with format-level thin DedupRef — the canonical-presence
+            // invariant takes its place (see architecture.md § Dedup).
+            debug_assert!(
+                gc_entries.iter().all(|e| match e.kind {
+                    EntryKind::DedupRef => e.stored_length == 0 && e.stored_offset == 0,
+                    EntryKind::Zero => e.stored_length == 0,
+                    _ => true,
+                }),
+                "compacted segment {new_ulid_str}: malformed DedupRef/Zero entry"
+            );
 
             let key = segment_key(volume_id, &new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
@@ -753,9 +755,10 @@ fn collect_stats(
             if entry.kind != EntryKind::Inline {
                 physical_body_bytes += entry.stored_length as u64;
             }
-            // DedupRef entries carry body bytes in S3 (filled by materialization)
-            // and an LBA mapping. Liveness is LBA-based: the entry is live if
-            // the LBA still maps to its hash.
+            // DedupRef entries carry no body bytes (thin format: stored_length=0)
+            // but still carry an LBA mapping. Liveness is LBA-based: the entry
+            // is live if the LBA still maps to its hash. The canonical DATA
+            // for the hash lives elsewhere (canonical-presence invariant).
             if entry.kind == EntryKind::DedupRef {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 let extent_live = index
@@ -843,13 +846,13 @@ async fn fetch_live_bodies(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     // Collect indices of live entries that carry body bytes.
+    // DedupRef entries contribute no body in the thin format
+    // (stored_length=0) — we never fetch bytes for them.
     let body_indices: Vec<usize> = candidate
         .live_entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| {
-            matches!(e.kind, EntryKind::Data | EntryKind::DedupRef) && e.stored_length > 0
-        })
+        .filter(|(_, e)| e.kind == EntryKind::Data && e.stored_length > 0)
         .map(|(i, _)| i)
         .collect();
 
@@ -1081,9 +1084,18 @@ async fn compact_segments(
             EntryKind::Zero => {
                 new_entries.push(SegmentEntry::new_zero(e.start_lba, e.lba_length));
             }
-            EntryKind::DedupRef | EntryKind::Data => {
-                // GC input comes from S3 where DedupRef body holes are filled
-                // by materialization.  Convert both to Data in the output.
+            EntryKind::DedupRef => {
+                // DedupRef entries carry no body bytes in the thin format.
+                // Pass them through the compactor unchanged: the canonical
+                // DATA lives elsewhere (maintained by the canonical-presence
+                // invariant) and reads resolve via the extent index.
+                new_entries.push(SegmentEntry::new_dedup_ref(
+                    e.hash,
+                    e.start_lba,
+                    e.lba_length,
+                ));
+            }
+            EntryKind::Data => {
                 let flags = if e.compressed {
                     segment::SegmentFlags::COMPRESSED
                 } else {
@@ -1140,18 +1152,19 @@ async fn compact_segments(
 
     // Write the handoff file using the typed HandoffLine format.
     //
-    // Deduplicate Repack lines by hash: with dedup, the same hash can appear
-    // in multiple input segments (DATA in one, DedupRef in another).
-    // The extent index tracks one canonical location per hash, and
-    // apply_gc_handoffs' still_at_old check compares against the single
-    // old_ulid in the handoff — so we emit one Repack per unique hash,
-    // preferring the entry whose source segment is extent-canonical.
-    // Non-canonical entries are still in the output segment (preserving
-    // their LBA mappings) but don't generate Repack lines.
+    // Deduplicate Repack lines by hash: the same hash can appear in
+    // multiple input segments (a Data entry in one, a Data entry in another
+    // at a different LBA via dedup-at-write). Repack lines are emitted only
+    // for Data entries whose old segment is the extent-canonical location
+    // for the hash; apply_gc_handoffs' still_at_old guard rejects any
+    // others. DedupRef entries pass through the compactor as DedupRef
+    // (preserving their LBA mappings) and never generate Repack lines —
+    // the canonical Data for their hash is already somewhere the extent
+    // index points at, independent of the GC candidate set.
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
     // Track which candidate ULIDs get at least one Repack or Remove line.
-    // Any candidate not covered had only DEDUP_REF live entries; it needs a
-    // Dead line so apply_done_handoffs deletes the old segment file.
+    // A candidate not covered contributed only DedupRef live entries; it
+    // needs a Dead line so apply_done_handoffs deletes the old segment file.
     let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut seen_repack_hashes: std::collections::HashSet<blake3::Hash> =
         std::collections::HashSet::new();
@@ -1206,9 +1219,10 @@ async fn compact_segments(
         });
     }
     // Candidates whose ULID has no Repack or Remove line contributed only
-    // DEDUP_REF live entries.  Their entries are already carried into the new
-    // output segment above, so it is safe to delete the old files.  Emit a
-    // Dead line for each so apply_done_handoffs knows to delete them.
+    // DedupRef live entries. Their entries are carried through to the new
+    // output segment (as DedupRef), so deleting the old files is safe —
+    // the extent index still resolves via the preserved canonical DATA
+    // elsewhere. Emit a Dead line for each so apply_done_handoffs deletes.
     for candidate in &candidates {
         if !covered_ulids.contains(candidate.ulid_str.as_str()) {
             let old_ulid =
@@ -1409,9 +1423,9 @@ mod tests {
         assert_eq!(find_least_dense(&stats, 0.7), None);
     }
 
-    /// Materialise, upload to store, and promote all pending segments.
-    /// Mirrors the real coordinator path: materialise → S3 PUT → promote.
-    async fn drain_with_materialise(
+    /// Redact, upload to store, and promote all pending segments.
+    /// Mirrors the real coordinator path: redact → S3 PUT → promote.
+    async fn drain_with_redact(
         vol: &mut elide_core::volume::Volume,
         dir: &Path,
         volume_id: &str,
@@ -1430,11 +1444,12 @@ mod tests {
             }
         }
         for &ulid in &ulids {
-            vol.materialise_segment(ulid).unwrap();
-            // Upload the .materialized file (fat variant) to the store.
+            vol.redact_segment(ulid).unwrap();
+            // Upload the pending segment directly — redact hole-punches in
+            // place, so there is no sidecar. The in-place file is the upload.
             let ulid_str = ulid.to_string();
-            let mat_path = pending_dir.join(format!("{ulid_str}.materialized"));
-            let data = fs::read(&mat_path).unwrap();
+            let seg_path = pending_dir.join(&ulid_str);
+            let data = fs::read(&seg_path).unwrap();
             let key = segment_key(volume_id, &ulid_str).unwrap();
             store
                 .put(&key, bytes::Bytes::from(data).into())
@@ -2021,18 +2036,18 @@ mod tests {
 
         let content = [0xAAu8; 4096];
 
-        // Step 1: write [0xAA; 4096] to lba 0, flush, materialise, drain.
+        // Step 1: write [0xAA; 4096] to lba 0, flush, redact, drain.
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
-        // Step 2: write the same content to lba 1, flush, materialise, drain.
-        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2,
-        // which materialise_segment converts to DedupRef before upload.
+        // Step 2: write the same content to lba 1, flush, redact, drain.
+        // Same hash H_aa → the write path emits DedupRef(lba=1, H_aa) in S2,
+        // carried through unchanged by the thin-DedupRef format.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
         drop(vol);
 
@@ -2121,7 +2136,7 @@ mod tests {
         vol.write(1, &[101u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
 
-        // Drain both: materialise converts S2's DedupRef → DedupRef.
+        // Drain both: redact in place, then promote.
         let pending_dir = fork_dir.join("pending");
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
@@ -2136,7 +2151,7 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.materialise_segment(*ulid).unwrap();
+            vol.redact_segment(*ulid).unwrap();
             vol.promote_segment(*ulid).unwrap();
         }
 
@@ -2144,7 +2159,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.live_hashes();
+        let live_hashes = lbamap.lba_referenced_hashes();
 
         let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
@@ -2220,7 +2235,7 @@ mod tests {
             has_body_entries: false,
             live_entries: vec![
                 SegmentEntry::new_zero(0, 1),
-                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1, 0, false),
+                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1),
             ],
             removed_hashes: Vec::new(),
         };
@@ -2395,27 +2410,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_live_bodies_dedup_ref_treated_as_body() {
-        // DedupRef entries carry body bytes just like Data entries.
+    async fn fetch_live_bodies_skips_dedup_ref() {
+        // DedupRef entries carry no body bytes in the thin format — they
+        // must be skipped by fetch_live_bodies entirely, regardless of
+        // their `stored_length` field. The canonical Data lives elsewhere
+        // and is fetched separately (if at all) when its own segment is
+        // in the candidate set.
         let store = make_store();
         let ulid_str = Ulid::from_parts(1000, 5).to_string();
-        let body_section_start: u64 = 128;
-        let body_size: u64 = 1024 * 1024;
-
-        let mut body = vec![0u8; body_size as usize];
-        for b in &mut body[0..4096] {
-            *b = 0xEE;
-        }
-        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
 
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
-            body_section_start,
-            file_size: body_section_start + body_size,
+            body_section_start: 128,
+            file_size: 128,
             live_lba_bytes: 4096,
-            total_lba_bytes: body_size,
-            has_body_entries: true,
-            live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 4096)],
+            total_lba_bytes: 4096,
+            has_body_entries: false,
+            // stored_length=0 matches the real thin-DedupRef format; the
+            // filter in fetch_live_bodies now gates on `kind == Data` so
+            // the length check is redundant but left for robustness.
+            live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 0)],
             removed_hashes: Vec::new(),
         };
 
@@ -2423,9 +2437,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            candidate.live_entries[0].data.as_deref(),
-            Some(vec![0xEEu8; 4096].as_slice())
+        assert!(
+            candidate.live_entries[0].data.is_none(),
+            "DedupRef entries must not have body bytes fetched"
         );
     }
 
@@ -2436,7 +2450,7 @@ mod tests {
     ///
     /// Sequence:
     ///   1. Write all-same-byte block (compresses below INLINE_THRESHOLD → inline)
-    ///   2. Drain (materialise + promote): segment with Inline entry in S3
+    ///   2. Drain (redact + promote): segment with Inline entry in S3
     ///   3. GC compacts: output segment must carry compressed flag on inline data
     ///   4. Volume applies handoff + crash + reopen
     ///   5. Read must succeed — data served from inline section in .idx
@@ -2459,13 +2473,13 @@ mod tests {
         let block = [0xBBu8; 4096];
         vol.write(0, &block).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
         // Write a second segment so GC has ≥2 candidates to sweep.
         let block2 = [0xCCu8; 4096];
         vol.write(1, &block2).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
         drop(vol);
 
