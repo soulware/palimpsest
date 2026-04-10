@@ -1409,9 +1409,9 @@ mod tests {
         assert_eq!(find_least_dense(&stats, 0.7), None);
     }
 
-    /// Materialise, upload to store, and promote all pending segments.
-    /// Mirrors the real coordinator path: materialise → S3 PUT → promote.
-    async fn drain_with_materialise(
+    /// Redact, upload to store, and promote all pending segments.
+    /// Mirrors the real coordinator path: redact → S3 PUT → promote.
+    async fn drain_with_redact(
         vol: &mut elide_core::volume::Volume,
         dir: &Path,
         volume_id: &str,
@@ -1430,11 +1430,12 @@ mod tests {
             }
         }
         for &ulid in &ulids {
-            vol.materialise_segment(ulid).unwrap();
-            // Upload the .materialized file (fat variant) to the store.
+            vol.redact_segment(ulid).unwrap();
+            // Upload the pending segment directly — redact hole-punches in
+            // place, so there is no sidecar. The in-place file is the upload.
             let ulid_str = ulid.to_string();
-            let mat_path = pending_dir.join(format!("{ulid_str}.materialized"));
-            let data = fs::read(&mat_path).unwrap();
+            let seg_path = pending_dir.join(&ulid_str);
+            let data = fs::read(&seg_path).unwrap();
             let key = segment_key(volume_id, &ulid_str).unwrap();
             store
                 .put(&key, bytes::Bytes::from(data).into())
@@ -2021,18 +2022,18 @@ mod tests {
 
         let content = [0xAAu8; 4096];
 
-        // Step 1: write [0xAA; 4096] to lba 0, flush, materialise, drain.
+        // Step 1: write [0xAA; 4096] to lba 0, flush, redact, drain.
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
-        // Step 2: write the same content to lba 1, flush, materialise, drain.
-        // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2,
-        // which materialise_segment converts to DedupRef before upload.
+        // Step 2: write the same content to lba 1, flush, redact, drain.
+        // Same hash H_aa → the write path emits DedupRef(lba=1, H_aa) in S2,
+        // carried through unchanged by the thin-DedupRef format.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
         drop(vol);
 
@@ -2121,7 +2122,7 @@ mod tests {
         vol.write(1, &[101u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
 
-        // Drain both: materialise converts S2's DedupRef → DedupRef.
+        // Drain both: redact in place, then promote.
         let pending_dir = fork_dir.join("pending");
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
@@ -2136,7 +2137,7 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.materialise_segment(*ulid).unwrap();
+            vol.redact_segment(*ulid).unwrap();
             vol.promote_segment(*ulid).unwrap();
         }
 
@@ -2436,7 +2437,7 @@ mod tests {
     ///
     /// Sequence:
     ///   1. Write all-same-byte block (compresses below INLINE_THRESHOLD → inline)
-    ///   2. Drain (materialise + promote): segment with Inline entry in S3
+    ///   2. Drain (redact + promote): segment with Inline entry in S3
     ///   3. GC compacts: output segment must carry compressed flag on inline data
     ///   4. Volume applies handoff + crash + reopen
     ///   5. Read must succeed — data served from inline section in .idx
@@ -2459,13 +2460,13 @@ mod tests {
         let block = [0xBBu8; 4096];
         vol.write(0, &block).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
         // Write a second segment so GC has ≥2 candidates to sweep.
         let block2 = [0xCCu8; 4096];
         vol.write(1, &block2).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
 
         drop(vol);
 

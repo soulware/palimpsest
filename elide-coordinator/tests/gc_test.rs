@@ -738,7 +738,7 @@ fn drain_failure_skips_gc_and_data_survives() {
 
     // Write more data — this ends up in pending/ after flushing.
     // Use unique data (not d0/d1) to avoid a dedup hit that would create
-    // a thin DedupRef — the mock socket does not run materialise_segment.
+    // a thin DedupRef — the mock socket does not run redact_segment.
     let d2 = [33u8; 4096];
     vol.write(1, &d2).unwrap();
     vol.flush_wal().unwrap();
@@ -1063,7 +1063,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
 
     let gc_config = make_gc_config();
 
-    // Helper: materialise + promote all pending segments (no S3 upload —
+    // Helper: redact + promote all pending segments (no S3 upload —
     // mirrors the proptest's simulate_upload which works locally only).
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
@@ -1075,7 +1075,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
                     continue;
                 }
                 if let Ok(ulid) = ulid::Ulid::from_string(s) {
-                    let _ = vol.materialise_segment(ulid);
+                    let _ = vol.redact_segment(ulid);
                     let _ = vol.promote_segment(ulid);
                 }
             }
@@ -1240,7 +1240,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
                     continue;
                 }
                 if let Ok(ulid) = ulid::Ulid::from_string(s) {
-                    let _ = vol.materialise_segment(ulid);
+                    let _ = vol.redact_segment(ulid);
                     let _ = vol.promote_segment(ulid);
                 }
             }
@@ -1414,7 +1414,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
                     continue;
                 }
                 if let Ok(ulid) = ulid::Ulid::from_string(s) {
-                    let _ = vol.materialise_segment(ulid);
+                    let _ = vol.redact_segment(ulid);
                     let _ = vol.promote_segment(ulid);
                 }
             }

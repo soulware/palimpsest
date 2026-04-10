@@ -211,7 +211,7 @@ Each segment is a **single file** both locally and in S3. The same format is use
 
 ```
 [Header: 96 bytes]
-  magic          (8 bytes)  — "ELIDSEG\x03"
+  magic          (8 bytes)  — "ELIDSEG\x04"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none

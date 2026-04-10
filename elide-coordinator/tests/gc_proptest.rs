@@ -52,7 +52,7 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
             continue;
         };
         // Materialise thin DedupRef → DedupRef (filled), then promote.
-        let _ = vol.materialise_segment(ulid);
+        let _ = vol.redact_segment(ulid);
         let _ = vol.promote_segment(ulid);
     }
 }

@@ -42,7 +42,7 @@ pub struct PrefetchResult {
 
 /// Segment file header constants (matches elide-core/src/segment.rs).
 const HEADER_LEN: usize = 96;
-const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x03";
+const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x04";
 
 /// Prefetch the index section (`.idx`) for all segments in `fork_dir` and its
 /// ancestors that are not present locally.

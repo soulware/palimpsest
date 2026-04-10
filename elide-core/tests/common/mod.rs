@@ -1,6 +1,6 @@
 // Shared simulation helpers for proptest files.
 //
-// `drain_with_materialise` and `simulate_coord_gc_local` mirror the real
+// `drain_with_redact` and `simulate_coord_gc_local` mirror the real
 // coordinator's drain-pending and GC logic without requiring an object store.
 // Both proptest suites (volume_proptest and actor_proptest) use these to drive
 // the same coordinator-side simulation.
@@ -34,28 +34,28 @@ pub fn write_test_keypair(dir: &Path) {
     .unwrap();
 }
 
-/// Drain via the full materialise → promote path, matching the production
+/// Drain via the full redact → promote path, matching the production
 /// coordinator upload protocol.
 ///
-/// For each pending segment: calls `vol.materialise_segment(ulid)` to produce
-/// `pending/<ulid>.materialized`, then `vol.promote_segment(ulid)` which
-/// writes `index/<ulid>.idx` + `cache/<ulid>.{body,present}` from the
-/// `.materialized` sidecar and updates the extent index.
-pub fn drain_with_materialise(vol: &mut elide_core::volume::Volume) {
+/// For each pending segment: calls `vol.redact_segment(ulid)` (in-place
+/// hole-punching of hash-dead DATA regions) then `vol.promote_segment(ulid)`
+/// which writes `index/<ulid>.idx` + `cache/<ulid>.{body,present}` from the
+/// pending file and updates the extent index.
+pub fn drain_with_redact(vol: &mut elide_core::volume::Volume) {
     for ulid in pending_ulids(vol.base_dir()) {
-        vol.materialise_segment(ulid).unwrap();
+        vol.redact_segment(ulid).unwrap();
         vol.promote_segment(ulid).unwrap();
     }
 }
 
-/// Drain via the actor handle: materialise + promote each pending segment.
+/// Drain via the actor handle: redact + promote each pending segment.
 ///
-/// Equivalent to `drain_with_materialise` but works when the `Volume` is behind
-/// an actor — sends `MaterialiseSegment` and `Promote` messages through the
+/// Equivalent to `drain_with_redact` but works when the `Volume` is behind
+/// an actor — sends `RedactSegment` and `Promote` messages through the
 /// handle's channel, so the actor's in-memory snapshot is updated correctly.
 pub fn drain_via_handle(handle: &VolumeHandle, base_dir: &Path) {
     for ulid in pending_ulids(base_dir) {
-        handle.materialise_segment(ulid).unwrap();
+        handle.redact_segment(ulid).unwrap();
         handle.promote_segment(ulid).unwrap();
     }
 }
