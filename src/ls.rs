@@ -381,6 +381,26 @@ impl Ext4Read for VolumeReader {
     }
 }
 
+fn find_segment_file(search_dirs: &[PathBuf], segment_id: ulid::Ulid) -> io::Result<PathBuf> {
+    let sid = segment_id.to_string();
+    for dir in search_dirs {
+        for subdir in ["wal", "pending"] {
+            let path = dir.join(subdir).join(&sid);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+        // Check for a demand-fetched body file. The `.body` file contains only
+        // the body section, and ExtentLocation.body_offset is body-relative for
+        // cached entries, so seeking to body_offset in this file is correct.
+        let body = dir.join("cache").join(format!("{sid}.body"));
+        if body.exists() {
+            return Ok(body);
+        }
+    }
+    Err(io::Error::other(format!("segment not found: {sid}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,24 +634,4 @@ mod tests {
             "unshadowed ancestor block must still be visible"
         );
     }
-}
-
-fn find_segment_file(search_dirs: &[PathBuf], segment_id: ulid::Ulid) -> io::Result<PathBuf> {
-    let sid = segment_id.to_string();
-    for dir in search_dirs {
-        for subdir in ["wal", "pending"] {
-            let path = dir.join(subdir).join(&sid);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        // Check for a demand-fetched body file. The `.body` file contains only
-        // the body section, and ExtentLocation.body_offset is body-relative for
-        // cached entries, so seeking to body_offset in this file is correct.
-        let body = dir.join("cache").join(format!("{sid}.body"));
-        if body.exists() {
-            return Ok(body);
-        }
-    }
-    Err(io::Error::other(format!("segment not found: {sid}")))
 }

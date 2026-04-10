@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
+use elide_core::extentindex::ExtentIndex;
 use elide_core::signing::{VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
@@ -117,22 +118,55 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
         VOLUME_PROVENANCE_FILE,
     )
     .context("setup volume identity")?;
+    let parent_extent_index =
+        load_parent_extent_index(vol_dir).context("load parent extent index")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(ext4_path, vol_dir, signer.as_ref(), |done, total| {
-        let pct = done * 100 / total;
-        if pct != last_pct {
-            last_pct = pct;
-            eprint!("\r  {pct}%");
-        }
-        if done == total {
-            eprintln!();
-        }
-    })?;
+    elide_core::import::import_image(
+        ext4_path,
+        vol_dir,
+        signer.as_ref(),
+        parent_extent_index.as_ref(),
+        |done, total| {
+            let pct = done * 100 / total;
+            if pct != last_pct {
+                last_pct = pct;
+                eprint!("\r  {pct}%");
+            }
+            if done == total {
+                eprintln!();
+            }
+        },
+    )?;
     filemap::generate(ext4_path, vol_dir).context("generate filemap")?;
     write_meta(vol_dir, &ext4_path.display().to_string(), "", "")?;
     serve_promote(vol_dir).context("serve promote IPC")?;
     eprintln!("Done. Volume ready at {}", vol_dir.display());
     Ok(())
+}
+
+/// Load the parent's `ExtentIndex` from a `volume.extent_index` file, if
+/// present. Returns `None` if the file is absent (no parent configured) or
+/// points at an empty chain. The coordinator is responsible for writing
+/// `volume.extent_index` into `vol_dir` and ensuring the parent's `.idx`
+/// files are present locally before `elide-import` runs.
+fn load_parent_extent_index(vol_dir: &Path) -> anyhow::Result<Option<ExtentIndex>> {
+    if !vol_dir.join("volume.extent_index").exists() {
+        return Ok(None);
+    }
+    let by_id_dir = vol_dir
+        .parent()
+        .context("vol_dir has no parent; cannot resolve by_id_dir")?;
+    let ancestors = elide_core::volume::walk_extent_ancestors(vol_dir, by_id_dir)
+        .context("walk extent ancestors")?;
+    if ancestors.is_empty() {
+        return Ok(None);
+    }
+    let chain: Vec<(PathBuf, Option<String>)> = ancestors
+        .into_iter()
+        .map(|l| (l.dir, l.branch_ulid))
+        .collect();
+    let idx = elide_core::extentindex::rebuild(&chain).context("rebuild parent extent index")?;
+    Ok(Some(idx))
 }
 
 async fn run_oci(
@@ -212,17 +246,25 @@ async fn run_oci(
         VOLUME_PROVENANCE_FILE,
     )
     .context("setup volume identity")?;
+    let parent_extent_index =
+        load_parent_extent_index(vol_dir).context("load parent extent index")?;
     let mut last_pct = u64::MAX;
-    elide_core::import::import_image(&ext4_path, vol_dir, signer.as_ref(), |done, total| {
-        let pct = done * 100 / total;
-        if pct != last_pct {
-            last_pct = pct;
-            eprint!("\r  {pct}%");
-        }
-        if done == total {
-            eprintln!();
-        }
-    })?;
+    elide_core::import::import_image(
+        &ext4_path,
+        vol_dir,
+        signer.as_ref(),
+        parent_extent_index.as_ref(),
+        |done, total| {
+            let pct = done * 100 / total;
+            if pct != last_pct {
+                last_pct = pct;
+                eprint!("\r  {pct}%");
+            }
+            if done == total {
+                eprintln!();
+            }
+        },
+    )?;
 
     // 8. Generate filemap (ext4 path → content hash) for delta compression
     filemap::generate(&ext4_path, vol_dir).context("generate filemap")?;

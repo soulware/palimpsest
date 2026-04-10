@@ -203,7 +203,9 @@ The drain-time delta path validates the end-to-end machinery (computation, segme
 
 **Phase 1 (done):** Delta format and machinery. Segment format v3 with delta table in the index, `rewrite_with_deltas()`, `compute_deltas()` with LBA-based source selection, integration into `drain_pending()` for validation. Proof-of-concept only — the real savings come from phases 2 and 3.
 
-**Phase 2:** File-aware import with filemap-based delta. Import a point-release update with `--parent` pointing at the prior import, and the coordinator uses filemap path-matching for delta source selection. See "Phase 2: import-time parent association" below.
+**Phase 2a (this change):** Import-time parent linkage. New file `volume.extent_index` names a parent snapshot whose extent index is merged into the child's hash pool (but not into its LBA map). `elide volume import --parent` wires this up; blocks whose hash already exists in the parent pool are written as `DedupRef` entries during the import block loop. Delivers cross-import dedup; lays the groundwork for filemap-based delta.
+
+**Phase 2b:** File-aware import with filemap-based delta on top of the linkage from 2a. The coordinator loads both filemaps, matches paths, and computes zstd deltas against parent extent data for changed files. See "Phase 2: import-time parent association" below.
 
 **Phase 3:** Snapshot-time coalescing. Parse ext4 metadata at snapshot time to reconstruct file-level extents from fragmented NBD blocks, emit filemaps, and compute deltas against prior snapshots. This extends filemap-based delta to live-write volumes.
 
@@ -220,19 +222,30 @@ OCI images are opaque blobs — Ubuntu 22.04.1 and 22.04.2 are published as inde
 Elide makes this explicit: the operator declares the relationship at import time.
 
 ```
-elide import ubuntu-22.04.1.img --name ubuntu
-elide import ubuntu-22.04.2.img --name ubuntu --parent ubuntu
+elide volume import ubuntu-22.04.1 ubuntu-22.04.1.img
+elide volume import --extents-from ubuntu-22.04.1 ubuntu-22.04.2 ubuntu-22.04.2.img
+
+# Union multiple hash sources:
+elide volume import --extents-from ubuntu-22.04.2 --extents-from debian-12 \
+    hybrid-release hybrid.img
 ```
 
-The `--parent` flag:
-1. Resolves the parent volume and its latest snapshot
-2. Sets `volume.parent` on the new volume, pointing at that snapshot
-3. Loads the parent's filemap (`snapshots/<ulid>.filemap`)
-4. During import, matches file paths between the two filemaps
-5. For matched files with different hashes, computes zstd deltas against the parent's extent data
-6. Writes segments with delta options referencing the parent's content hashes
+The `--extents-from` flag (repeatable) contributes a volume's extent index to the new volume's hash pool. For each source the coordinator:
+1. Resolves the source volume and its latest snapshot
+2. Reads the source's own `volume.extent_index` (if present) and copies every entry into the new volume's file
+3. Appends the source itself at its latest snapshot
+4. Dedupes by ULID and truncates to `MAX_EXTENT_INDEX_SOURCES` entries (oldest-added dropped, with a warning)
 
-The new volume is a fork of the parent at the import level — not a live-write fork, but a "this is the next version of the same image" relationship. The `volume.parent` pointer is the same mechanism used by live forks; the ancestry chain, LBA map rebuild, and extent index rebuild all work identically.
+On the import path:
+1. `elide-import` reads `volume.extent_index` (already flat — no traversal), rebuilds a hash-only `ExtentIndex` over the listed sources, and passes it into `import_image`
+2. During the block loop, any block whose hash is already present in the pool is written as a `DedupRef` instead of a fresh `Data` entry (automatic dedup across imports)
+3. **Follow-up** (separate change): the coordinator's upload pipeline loads the child's and sources' filemaps, matches paths, and appends zstd delta options to changed extents using a source extent as the dictionary
+
+`volume.extent_index` is deliberately **not** the same file as `volume.parent`. A fork (`volume.parent`) merges the parent's segments into the child's LBA map so the child can read parent data through CoW fall-through. An extent-index source (`volume.extent_index`) contributes only to the extent index, never to the LBA map: the child's reads only return hashes the child itself wrote, so no source data leaks even though source segments are used as a hash pool. The file is **flat, not hierarchical** — unlike fork ancestry, which chains through `walk_ancestors`, extent-index sources are computed once at import time and written as a pre-expanded union, so attach-time resolution is a single file read.
+
+Multiple sources are a first-class feature: the operator can union several prior releases (e.g. the last few point releases plus a security-patched build) into the hash pool of a new import. Each source contributes its own pre-flattened list, and the coordinator dedupes across them. The `MAX_EXTENT_INDEX_SOURCES` cap bounds the list at 32 entries so attach cost stays predictable as operators chain imports over release trains; once the cap is hit, the coordinator logs a warning and drops the oldest-added entries.
+
+See [architecture.md](architecture.md) for the layout and invariants around both files.
 
 ### Relationship to OCI layers
 

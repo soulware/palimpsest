@@ -123,6 +123,11 @@ elide_data/                           — single root (default --data-dir)
       volume.name                     — "server-2-experiment"
       volume.parent                   — "01JQCCCCCCC/snapshots/<ulid>"
       ...
+    01JQEEEEEEE/                      — readonly import layered on ubuntu-22.04
+      volume.name                     — "ubuntu-22.04.1"
+      volume.readonly
+      volume.extent_index             — "01JQAAAAAAA/snapshots/01JQXXXXX"
+      ...
   by_name/
     ubuntu-22.04  ->  ../by_id/01JQAAAAAAA
     server-1      ->  ../by_id/01JQBBBBBBB
@@ -131,6 +136,10 @@ elide_data/                           — single root (default --data-dir)
 ```
 
 The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snapshot-ulid>`, where `<parent-ulid>` is the sibling directory name within `by_id/`. Using ULIDs in `volume.parent` means ancestry links survive renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` resolves `by_id_dir/<parent-ulid>` and follows the chain to the root.
+
+`volume.extent_index` is a **flat multi-line file**, not a chain: one `<source-ulid>/snapshots/<snapshot-ulid>` entry per line, optionally interleaved with blank lines and `#` comments. Each entry names a snapshot whose extents contribute hashes to this volume's extent index for dedup (and later delta compression source selection) but are **never** merged into the LBA map. The child is born with an empty LBA map and writes its own data; source segments are only fetched when a child write references a source hash via `DedupRef`. This means `volume.extent_index` provides no read-path fall-through — unused source data is never visible from the child. `walk_extent_ancestors(vol_dir, by_id_dir)` reads the file line-by-line, dedupes by source directory, and returns the list in parallel with `walk_ancestors`; both feed the extent index rebuild, only the fork chain feeds the LBA map rebuild.
+
+The list is **flat because it is computed at import time, not resolved at attach time**. When a new volume is imported with `--extents-from X`, the coordinator reads `X`'s own `volume.extent_index`, appends `X`, dedupes by ULID, and writes the expanded list to the new volume. Multiple `--extents-from` values contribute their already-flat lists in order. The total is capped at a fixed ceiling (`MAX_EXTENT_INDEX_SOURCES = 32`) to bound attach-time cost — chained imports that would exceed the cap drop oldest-added entries with a warning in the import job log. A volume may carry both `volume.parent` (fork ancestry, merged into the LBA map) and `volume.extent_index` (flat hash pool, never merged into the LBA map) independently.
 
 **S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/manifest.toml` and `by_id/<volume-ulid>/volume.pub`. Volume names are indexed at `names/<name>` (plain text ULID), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
 
@@ -147,7 +156,8 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
 - `volume.provenance` present in every volume — hostname + canonical path + Ed25519 signature over both; signed by the private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
-- `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
+- `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`; parent is merged into both the LBA map and the extent index
+- `volume.extent_index` present → volume contributes a flat list of source snapshots to its own extent index; one `<source-ulid>/snapshots/<snapshot-ulid>` per line; each source is merged into the extent index only, **never** into the LBA map (no read-path fall-through, no data leak); bounded at `MAX_EXTENT_INDEX_SOURCES` entries
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present while an import is in progress (write phase) or in serve phase (handling promote IPC) or was interrupted

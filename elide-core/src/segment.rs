@@ -1767,7 +1767,7 @@ mod tests {
         let path = dir.join("x.present");
 
         // Write a 1-byte file, then set a bit in the (non-existent) second byte.
-        fs::write(&path, &[0u8]).unwrap();
+        fs::write(&path, [0u8]).unwrap();
         set_present_bit(&path, 8, 16).unwrap();
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 2);

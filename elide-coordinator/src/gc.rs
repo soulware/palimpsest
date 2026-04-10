@@ -1713,7 +1713,7 @@ mod tests {
         );
         elide_core::segment::write_segment(
             &gc_dir.join(new_ulid.to_string()),
-            &mut vec![entry],
+            &mut [entry],
             signer.as_ref(),
         )
         .unwrap();
@@ -1769,7 +1769,7 @@ mod tests {
 
         elide_core::segment::write_segment(
             &gc_dir.join(new_ulid.to_string()),
-            &mut vec![elide_core::segment::SegmentEntry::new_data(
+            &mut [elide_core::segment::SegmentEntry::new_data(
                 blake3::hash(b"payload"),
                 0,
                 1,

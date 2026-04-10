@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use elide_core::signing::{self, VerifyingKey};
-use elide_core::volume::walk_ancestors;
+use elide_core::volume::{walk_ancestors, walk_extent_ancestors};
 
 use crate::upload::derive_names;
 
@@ -56,7 +56,14 @@ pub async fn prefetch_indexes(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<PrefetchResult> {
     let by_id_dir = fork_dir.parent().unwrap_or(fork_dir);
-    let ancestors = walk_ancestors(fork_dir, by_id_dir).context("walking ancestor chain")?;
+    // Walk both kinds of ancestry: fork ancestors (volume.parent) and
+    // extent-index ancestors (volume.extent_index). Both contribute segments
+    // that need .idx files locally. Extent-only ancestors are deduplicated
+    // against the fork chain by directory path.
+    let fork_ancestors =
+        walk_ancestors(fork_dir, by_id_dir).context("walking fork ancestor chain")?;
+    let extent_ancestors = walk_extent_ancestors(fork_dir, by_id_dir)
+        .context("walking extent-index ancestor chain")?;
 
     let mut result = PrefetchResult {
         fetched: 0,
@@ -71,8 +78,17 @@ pub async fn prefetch_indexes(
         .with_context(|| format!("loading volume.pub from {}", fork_dir.display()))?;
     prefetch_fork(store, fork_dir, &current_volume_id, None, &vk, &mut result).await?;
 
-    // Ancestor forks: each has a branch-point cutoff.
-    for ancestor in &ancestors {
+    // Merge the two ancestor chains into a single list, deduped by dir path.
+    // Fork ancestors come first so their cutoffs take precedence if an
+    // ancestor appears in both chains.
+    let mut all_ancestors = fork_ancestors;
+    for layer in extent_ancestors {
+        if !all_ancestors.iter().any(|a| a.dir == layer.dir) {
+            all_ancestors.push(layer);
+        }
+    }
+
+    for ancestor in &all_ancestors {
         let volume_id = derive_names(&ancestor.dir)
             .with_context(|| format!("resolving volume id for {}", ancestor.dir.display()))?;
         let ancestor_vk = signing::load_verifying_key(&ancestor.dir, signing::VOLUME_PUB_FILE)

@@ -2438,14 +2438,54 @@ fn open_read_state(
     by_id_dir: &Path,
 ) -> io::Result<(Vec<AncestorLayer>, lbamap::LbaMap, extentindex::ExtentIndex)> {
     let ancestor_layers = walk_ancestors(fork_dir, by_id_dir)?;
-    let rebuild_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
+    let lba_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
         .iter()
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_owned(), None)))
         .collect();
-    let lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
-    let extent_index = extentindex::rebuild(&rebuild_chain)?;
+    let lbamap = lbamap::rebuild_segments(&lba_chain)?;
+
+    // The extent index is seeded from both the fork ancestry (volume.parent)
+    // and the extent-index ancestry (volume.extent_index). The extent-only
+    // ancestors contribute hashes for dedup/delta without affecting the LBA
+    // map, so reads never fall through to them.
+    let extent_only = walk_extent_ancestors(fork_dir, by_id_dir)?;
+    let mut hash_chain = lba_chain.clone();
+    for layer in extent_only {
+        if !hash_chain.iter().any(|(dir, _)| dir == &layer.dir) {
+            hash_chain.push((layer.dir, layer.branch_ulid));
+        }
+    }
+    let extent_index = extentindex::rebuild(&hash_chain)?;
     Ok((ancestor_layers, lbamap, extent_index))
+}
+
+/// Parse a `<parent-ulid>/snapshots/<branch-ulid>` origin line, validating both
+/// components as ULIDs (prevents path traversal). Shared between
+/// `volume.parent` and `volume.extent_index`.
+fn parse_origin_line<'a>(
+    content: &'a str,
+    file_name: &str,
+    fork_dir: &Path,
+) -> io::Result<(&'a str, String)> {
+    let origin = content.trim();
+    let (parent_ulid_str, branch_ulid_str) =
+        origin.rsplit_once("/snapshots/").ok_or_else(|| {
+            io::Error::other(format!(
+                "malformed {file_name} in {}: {origin}",
+                fork_dir.display()
+            ))
+        })?;
+    let branch_ulid = Ulid::from_string(branch_ulid_str)
+        .map_err(|e| io::Error::other(format!("bad branch ULID in {file_name}: {e}")))?
+        .to_string();
+    Ulid::from_string(parent_ulid_str).map_err(|_| {
+        io::Error::other(format!(
+            "malformed {file_name} in {}: parent '{parent_ulid_str}' is not a valid ULID",
+            fork_dir.display(),
+        ))
+    })?;
+    Ok((parent_ulid_str, branch_ulid))
 }
 
 /// Each layer holds the ancestor fork directory and the branch-point ULID.
@@ -2463,27 +2503,7 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let origin = content.trim();
-    let (parent_ulid_str, branch_ulid_str) =
-        origin.rsplit_once("/snapshots/").ok_or_else(|| {
-            io::Error::other(format!(
-                "malformed volume.parent in {}: {origin}",
-                fork_dir.display()
-            ))
-        })?;
-    let branch_ulid = Ulid::from_string(branch_ulid_str)
-        .map_err(|e| io::Error::other(format!("bad branch ULID in origin: {e}")))?
-        .to_string();
-
-    // Validate parent component: must be a valid ULID (no path traversal).
-    Ulid::from_string(parent_ulid_str).map_err(|_| {
-        io::Error::other(format!(
-            "malformed volume.parent in {}: parent '{}' is not a valid ULID",
-            fork_dir.display(),
-            parent_ulid_str
-        ))
-    })?;
-
+    let (parent_ulid_str, branch_ulid) = parse_origin_line(&content, "volume.parent", fork_dir)?;
     let parent_fork_dir = by_id_dir.join(parent_ulid_str);
 
     // Recurse into the parent's ancestry first (builds oldest-first order).
@@ -2493,6 +2513,52 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
         branch_ulid: Some(branch_ulid),
     });
     Ok(ancestors)
+}
+
+/// Read the flat extent-index source list.
+///
+/// `volume.extent_index` is a multi-line file: one
+/// `<volume-ulid>/snapshots/<snapshot-ulid>` entry per line, optionally
+/// interleaved with blank lines and `#` comments. Each entry names a snapshot
+/// whose extents populate this volume's `ExtentIndex` (for dedup and delta
+/// compression source lookups) but are **never** merged into the LBA map.
+/// The child is born with an empty LBA map; hashes from these sources are
+/// only consulted when the child writes an extent whose content hash matches
+/// a source extent, in which case the child emits a `DedupRef` pointing at
+/// the source segment. See `docs/architecture.md` for the "not in read path"
+/// invariant.
+///
+/// The file is a flat union, not a chain: when a new volume is imported with
+/// `--extents-from X`, the coordinator reads `X`'s own `volume.extent_index`,
+/// appends `X`, dedupes, and writes the result. There is no recursion at
+/// attach time — the file is already fully expanded. Multiple sources passed
+/// at import time each contribute their (already-flat) lists, concatenated
+/// and deduped by directory path.
+pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
+    let origin_path = fork_dir.join("volume.extent_index");
+    let content = match fs::read_to_string(&origin_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut layers: Vec<AncestorLayer> = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (source_ulid_str, snapshot_ulid) =
+            parse_origin_line(line, "volume.extent_index", fork_dir)?;
+        let source_dir = by_id_dir.join(source_ulid_str);
+        if layers.iter().any(|l| l.dir == source_dir) {
+            continue;
+        }
+        layers.push(AncestorLayer {
+            dir: source_dir,
+            branch_ulid: Some(snapshot_ulid),
+        });
+    }
+    Ok(layers)
 }
 
 /// Return the latest snapshot ULID string for a fork, or `None` if no
@@ -4608,6 +4674,152 @@ mod tests {
             ancestors[1].branch_ulid.as_deref(),
             Some("01BX5ZZKJKTSV4RRFFQ69G5FAV")
         );
+    }
+
+    // --- walk_extent_ancestors tests ---
+
+    #[test]
+    fn walk_extent_ancestors_missing_file_is_empty() {
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        fs::create_dir_all(&vol_dir).unwrap();
+        assert!(walk_extent_ancestors(&vol_dir, &by_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn walk_extent_ancestors_rejects_invalid() {
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        fs::create_dir_all(&vol_dir).unwrap();
+        let bad_origins = [
+            "not-a-ulid/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "../01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+        ];
+        for bad in bad_origins {
+            fs::write(vol_dir.join("volume.extent_index"), bad).unwrap();
+            assert!(
+                walk_extent_ancestors(&vol_dir, &by_id).is_err(),
+                "expected error for origin: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_extent_ancestors_one_level() {
+        let by_id = temp_dir();
+        let parent_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("volume.extent_index"),
+            format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        )
+        .unwrap();
+
+        let ancestors = walk_extent_ancestors(&child_dir, &by_id).unwrap();
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(ancestors[0].dir, parent_dir);
+        assert_eq!(
+            ancestors[0].branch_ulid.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    #[test]
+    fn walk_extent_ancestors_multi_line() {
+        // Flat union of several sources, one per line, with a comment and a
+        // blank line to verify they are skipped.
+        let by_id = temp_dir();
+        let a_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let b_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let c_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let a_dir = by_id.join(a_ulid);
+        let b_dir = by_id.join(b_ulid);
+        let c_dir = by_id.join(c_ulid);
+        fs::create_dir_all(&a_dir).unwrap();
+        fs::create_dir_all(&b_dir).unwrap();
+        fs::create_dir_all(&c_dir).unwrap();
+
+        let body = format!(
+            "# elide extent-index sources\n\
+             {a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV\n\
+             \n\
+             {b_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV\n"
+        );
+        fs::write(c_dir.join("volume.extent_index"), body).unwrap();
+
+        let layers = walk_extent_ancestors(&c_dir, &by_id).unwrap();
+        assert_eq!(layers.len(), 2, "two sources expected");
+        assert_eq!(layers[0].dir, a_dir);
+        assert_eq!(layers[1].dir, b_dir);
+        assert_eq!(
+            layers[0].branch_ulid.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            layers[1].branch_ulid.as_deref(),
+            Some("01BX5ZZKJKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    #[test]
+    fn walk_extent_ancestors_dedupes_duplicate_lines() {
+        let by_id = temp_dir();
+        let a_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let c_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let a_dir = by_id.join(a_ulid);
+        let c_dir = by_id.join(c_ulid);
+        fs::create_dir_all(&a_dir).unwrap();
+        fs::create_dir_all(&c_dir).unwrap();
+
+        // Same source listed twice — later entry is silently dropped.
+        let body = format!(
+            "{a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV\n\
+             {a_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV\n"
+        );
+        fs::write(c_dir.join("volume.extent_index"), body).unwrap();
+
+        let layers = walk_extent_ancestors(&c_dir, &by_id).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].dir, a_dir);
+    }
+
+    #[test]
+    fn walk_extent_ancestors_combined_with_walk_ancestors() {
+        // P is a fork parent of C, and C also has an extent_index parent X.
+        // walk_ancestors returns [P], walk_extent_ancestors returns [X].
+        let by_id = temp_dir();
+        let p_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let x_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let c_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let p_dir = by_id.join(p_ulid);
+        let x_dir = by_id.join(x_ulid);
+        let c_dir = by_id.join(c_ulid);
+        fs::create_dir_all(&p_dir).unwrap();
+        fs::create_dir_all(&x_dir).unwrap();
+        fs::create_dir_all(&c_dir).unwrap();
+        fs::write(
+            c_dir.join("volume.parent"),
+            format!("{p_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        )
+        .unwrap();
+        fs::write(
+            c_dir.join("volume.extent_index"),
+            format!("{x_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV"),
+        )
+        .unwrap();
+
+        let fork_chain = walk_ancestors(&c_dir, &by_id).unwrap();
+        let extent_chain = walk_extent_ancestors(&c_dir, &by_id).unwrap();
+        assert_eq!(fork_chain.len(), 1);
+        assert_eq!(fork_chain[0].dir, p_dir);
+        assert_eq!(extent_chain.len(), 1);
+        assert_eq!(extent_chain[0].dir, x_dir);
     }
 
     // --- ancestor-aware open / read integration test ---

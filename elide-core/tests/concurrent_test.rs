@@ -73,13 +73,13 @@ fn coordinator_gc_does_not_create_read_failures() {
             for lba in 0u64..8 {
                 match read_handle.read(lba, 1) {
                     Ok(actual) => {
-                        if let Some(expected) = oracle_snap.get(&lba) {
-                            if actual != *expected {
-                                read_errors_clone
-                                    .lock()
-                                    .unwrap()
-                                    .push(format!("lba {lba}: wrong data"));
-                            }
+                        if let Some(expected) = oracle_snap.get(&lba)
+                            && actual != *expected
+                        {
+                            read_errors_clone
+                                .lock()
+                                .unwrap()
+                                .push(format!("lba {lba}: wrong data"));
                         }
                     }
                     Err(e) => {

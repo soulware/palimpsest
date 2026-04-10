@@ -44,8 +44,24 @@ pub fn status(socket_path: &Path, volume: &str) -> io::Result<String> {
 
 /// Ask the coordinator to start an OCI import.
 /// Returns the import ULID on success (internal; callers use the volume name).
-pub fn import_start(socket_path: &Path, name: &str, oci_ref: &str) -> io::Result<()> {
-    let resp = call(socket_path, &format!("import {name} {oci_ref}"))?;
+///
+/// `extents_from` is a list of volume names whose extent indices should
+/// populate the new volume's hash pool (dedup/delta source). The coordinator
+/// validates each name and writes the flat `volume.extent_index` file.
+pub fn import_start(
+    socket_path: &Path,
+    name: &str,
+    oci_ref: &str,
+    extents_from: &[String],
+) -> io::Result<()> {
+    let line = if extents_from.is_empty() {
+        format!("import {name} {oci_ref}")
+    } else {
+        // Volume names are [a-zA-Z0-9._-] so comma is a safe separator.
+        let joined = extents_from.join(",");
+        format!("import {name} {oci_ref} extents:{joined}")
+    };
+    let resp = call(socket_path, &line)?;
     match resp.split_once(' ') {
         Some(("ok", _ulid)) => Ok(()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),

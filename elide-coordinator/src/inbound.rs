@@ -148,11 +148,37 @@ async fn dispatch(
                     import_status_by_name(sub_args, data_dir, registry).await
                 }
                 _ => {
-                    // `import <name> <oci-ref>`: sub = name, sub_args = oci-ref
+                    // `import <name> <oci-ref> [extents:<name>[,<name>…]]`:
+                    //   sub = volume name
+                    //   sub_args = oci-ref [space extents:<name,name…>]
                     if sub_args.is_empty() {
-                        return "err usage: import <name> <oci-ref>".to_string();
+                        return "err usage: import <name> <oci-ref> [extents:<name>[,<name>…]]"
+                            .to_string();
                     }
-                    start_import(sub, sub_args, data_dir, elide_import_bin, registry, &rescan).await
+                    let (oci_ref, extents_from) = match sub_args.split_once(' ') {
+                        Some((oci, rest)) => match rest.trim().strip_prefix("extents:") {
+                            Some(list) if !list.is_empty() => {
+                                let names: Vec<String> =
+                                    list.split(',').map(|s| s.to_owned()).collect();
+                                (oci, names)
+                            }
+                            _ => {
+                                return "err malformed import args; expected extents:<name>[,…]"
+                                    .to_string();
+                            }
+                        },
+                        None => (sub_args, Vec::new()),
+                    };
+                    start_import(
+                        sub,
+                        oci_ref,
+                        &extents_from,
+                        data_dir,
+                        elide_import_bin,
+                        registry,
+                        &rescan,
+                    )
+                    .await
                 }
             }
         }
@@ -187,6 +213,7 @@ async fn dispatch(
 async fn start_import(
     vol_name: &str,
     oci_ref: &str,
+    extents_from: &[String],
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
@@ -195,6 +222,7 @@ async fn start_import(
     match import::spawn_import(
         vol_name,
         oci_ref,
+        extents_from,
         data_dir,
         elide_import_bin,
         registry,

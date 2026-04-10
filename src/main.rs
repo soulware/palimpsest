@@ -312,6 +312,18 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "detach")]
     fork: Option<String>,
 
+    /// Name of an existing volume whose extent index contributes to the new
+    /// volume's hash pool. Repeat the flag to union multiple sources.
+    ///
+    /// The new volume is written as a fresh import but any 4 KiB block whose
+    /// content hash matches a block in any listed source is recorded as a
+    /// `DedupRef` pointing back at that source's segment. Sources must exist
+    /// locally (with their index files materialised). Source data is never
+    /// merged into the new volume's read path — only its extent index is
+    /// consulted for dedup.
+    #[arg(long = "extents-from")]
+    extents_from: Vec<String>,
+
     /// Start the import in the background and return immediately
     #[arg(long)]
     detach: bool,
@@ -490,8 +502,12 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    if let Err(e) = coordinator_client::import_start(&socket_path, &name, &oci_ref)
-                    {
+                    if let Err(e) = coordinator_client::import_start(
+                        &socket_path,
+                        &name,
+                        &oci_ref,
+                        &import_args.extents_from,
+                    ) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
