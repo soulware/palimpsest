@@ -24,40 +24,49 @@ use ulid::Ulid;
 
 pub const LOCK_FILE: &str = "import.lock";
 
-/// Hard cap on entries written to `volume.extent_index`.
+/// Hard cap on entries in the new volume's `extent_index` provenance field.
 ///
 /// Each entry costs a full `.idx` file load at volume open time (and at
 /// remote-pull prefetch time). Chained imports naturally grow the list:
-/// importing `v2 --extents-from v1` copies v1's list and appends v1, so a
-/// long chain can balloon. Truncating at a fixed ceiling keeps attach cost
-/// bounded. The ceiling is chosen to comfortably cover typical release
-/// trains (major version → current + a handful of prior point releases)
-/// without open-ended growth. If the union exceeds this, oldest-added
-/// entries are dropped and a warning is logged.
+/// importing `v2 --extents-from v1` copies v1's list and appends v1, so
+/// a long chain can balloon. The ceiling is chosen to comfortably cover
+/// typical release trains (a base image plus a handful of point releases)
+/// without open-ended growth.
 pub(crate) const MAX_EXTENT_INDEX_SOURCES: usize = 32;
 
-/// Resolve a list of extent-source volume names to the multi-line body of
-/// the new child's `volume.extent_index` file.
+/// Resolve a list of `--extents-from` source volume names into the flat
+/// list of entries that will populate the new volume's `extent_index`
+/// provenance field.
 ///
-/// For each source the function:
+/// For each explicitly-named source the function:
 ///   1. Resolves the `by_name/<name>` symlink to a `by_id/<ulid>` dir
-///   2. Copies every entry from the source's own `volume.extent_index` (if
-///      present) into the result
-///   3. Appends the source itself at its latest snapshot
+///   2. Reads the source's **signed provenance** (no unsigned file fallback)
+///      and copies every `extent_index` entry into the inherited set
+///   3. Records the source itself at its latest snapshot as an explicit entry
 ///
-/// The result is deduplicated by source ULID (first-wins) and truncated at
-/// `MAX_EXTENT_INDEX_SOURCES` to keep attach-time cost bounded. Sources
-/// must exist locally and must carry at least one snapshot — import fails
-/// fast otherwise, because silently losing dedup is worse than a clean error.
+/// Eviction, when the total exceeds `MAX_EXTENT_INDEX_SOURCES`:
+///   - **Explicit entries** (the direct `--extents-from` sources) are
+///     sacred and kept in full. If explicit count alone exceeds the cap,
+///     the function returns an error — silently dropping operator intent
+///     is worse than a clean failure.
+///   - **Inherited entries** fill the remaining slots. The first
+///     inherited entry encountered (oldest-added in the source's list) is
+///     always kept as the "base" position; the rest of the slots are
+///     filled with the most recently added inherited entries. Middle
+///     inherited entries are dropped with a warning.
 ///
-/// Returns `Ok(None)` if `sources` is empty (no `volume.extent_index` file
-/// is written). Otherwise returns the file body as a newline-terminated
-/// multi-line string.
-fn build_extent_index_body(sources: &[String], data_dir: &Path) -> std::io::Result<Option<String>> {
+/// Returns the final flat list (empty if `sources` is empty).
+fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::Result<Vec<String>> {
     if sources.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let mut lines: Vec<String> = Vec::new();
+
+    // Phase 1: resolve every source, collecting its own explicit entry and
+    // the inherited entries from its provenance. Order is preserved so that
+    // "oldest inherited" is well-defined (first-appearing in the source's
+    // flat list).
+    let mut explicit: Vec<String> = Vec::new();
+    let mut inherited: Vec<String> = Vec::new();
     let mut seen_ulids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for source_name in sources {
@@ -82,58 +91,91 @@ fn build_extent_index_body(sources: &[String], data_dir: &Path) -> std::io::Resu
             ))
         })?;
 
-        // 1. Inherit entries from the source's own extent_index file.
-        let source_index_path = source_dir.join("volume.extent_index");
-        if let Ok(existing) = std::fs::read_to_string(&source_index_path) {
-            for raw in existing.lines() {
-                let line = raw.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let ulid_str = line
-                    .rsplit_once("/snapshots/")
-                    .and_then(|(u, s)| {
-                        Ulid::from_string(u).ok()?;
-                        Ulid::from_string(s).ok()?;
-                        Some(u.to_owned())
-                    })
-                    .ok_or_else(|| {
-                        std::io::Error::other(format!(
-                            "extents-from volume '{source_name}' has malformed volume.extent_index line: {line}"
-                        ))
-                    })?;
-                if seen_ulids.insert(ulid_str) {
-                    lines.push(line.to_owned());
-                }
+        // Inherit entries from the source's signed provenance. Signature
+        // verification guards against a tampered source dragging malicious
+        // lineage claims into the new volume. Host/path match is NOT
+        // required (the source may have been pulled from a different host).
+        let source_lineage = elide_core::signing::read_lineage_verifying_signature(
+            &source_dir,
+            elide_core::signing::VOLUME_PUB_FILE,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "extents-from volume '{source_name}' provenance read failed: {e}"
+            ))
+        })?;
+
+        for entry in source_lineage.extent_index {
+            let ulid_key = entry
+                .rsplit_once("/snapshots/")
+                .and_then(|(u, s)| {
+                    Ulid::from_string(u).ok()?;
+                    Ulid::from_string(s).ok()?;
+                    Some(u.to_owned())
+                })
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "extents-from volume '{source_name}' has malformed extent_index entry: {entry}"
+                    ))
+                })?;
+            if seen_ulids.insert(ulid_key) {
+                inherited.push(entry);
             }
         }
 
-        // 2. Append the source itself at its latest snapshot.
+        // Add the source itself as an explicit entry at its latest snapshot.
         let snapshot = elide_core::volume::latest_snapshot(&source_dir)?.ok_or_else(|| {
             std::io::Error::other(format!(
                 "extents-from volume '{source_name}' has no snapshot; only imported/snapshotted volumes can contribute an extent index"
             ))
         })?;
         if seen_ulids.insert(source_ulid_str.to_owned()) {
-            lines.push(format!("{source_ulid}/snapshots/{snapshot}"));
+            explicit.push(format!("{source_ulid}/snapshots/{snapshot}"));
         }
     }
 
-    if lines.len() > MAX_EXTENT_INDEX_SOURCES {
-        warn!(
-            "[import] extent-index source union grew to {} entries; truncating to {} (oldest-added entries dropped)",
-            lines.len(),
+    // Phase 2: eviction. Explicit entries are sacred.
+    if explicit.len() > MAX_EXTENT_INDEX_SOURCES {
+        return Err(std::io::Error::other(format!(
+            "--extents-from lists {} explicit sources, exceeding the hard cap of {}; reduce the number of direct sources",
+            explicit.len(),
             MAX_EXTENT_INDEX_SOURCES
-        );
-        lines.truncate(MAX_EXTENT_INDEX_SOURCES);
+        )));
     }
+    let slots_for_inherited = MAX_EXTENT_INDEX_SOURCES - explicit.len();
 
-    let mut body = String::new();
-    for line in lines {
-        body.push_str(&line);
-        body.push('\n');
-    }
-    Ok(Some(body))
+    let final_inherited: Vec<String> = if inherited.len() <= slots_for_inherited {
+        inherited
+    } else {
+        // Keep-oldest-plus-most-recent: always preserve the first inherited
+        // entry (the base, most likely to hold the largest reusable
+        // footprint) and fill the remaining slots with the N most recently
+        // added inherited entries. Middle entries are dropped.
+        let dropped = inherited.len() - slots_for_inherited;
+        warn!(
+            "[import] extent-index inherited source count {} exceeds available slots {}; \
+             dropping {} middle entries (keeping 1 oldest + {} most recent)",
+            inherited.len(),
+            slots_for_inherited,
+            dropped,
+            slots_for_inherited.saturating_sub(1)
+        );
+        let mut kept = Vec::with_capacity(slots_for_inherited);
+        if slots_for_inherited > 0 {
+            kept.push(inherited[0].clone());
+            let tail_take = slots_for_inherited - 1;
+            let tail_start = inherited.len() - tail_take;
+            for entry in &inherited[tail_start..] {
+                kept.push(entry.clone());
+            }
+        }
+        kept
+    };
+
+    let mut result = explicit;
+    result.extend(final_inherited);
+    Ok(result)
 }
 
 /// Validate a volume name: non-empty, only `[a-zA-Z0-9._-]`.
@@ -235,9 +277,9 @@ pub async fn spawn_import(
     }
 
     // If --extents-from was given, resolve all sources up-front and
-    // compute the flat union. Fail fast before creating any on-disk state
-    // for the new volume.
-    let extent_index_body = build_extent_index_body(extents_from, data_dir)?;
+    // compute the flat extent-source list (applying the eviction rule).
+    // Fail fast before creating any on-disk state for the new volume.
+    let extent_sources = build_extent_index_entries(extents_from, data_dir)?;
 
     // Generate a stable ULID for this volume (= S3 prefix).
     let vol_ulid = Ulid::new().to_string();
@@ -256,12 +298,6 @@ pub async fn spawn_import(
     }
     .write(&vol_dir)?;
 
-    // Write volume.extent_index now (before spawning elide-import) so the
-    // import process picks it up when loading the parent hash pool.
-    if let Some(body) = &extent_index_body {
-        std::fs::write(vol_dir.join("volume.extent_index"), body)?;
-    }
-
     // Write the import lock.
     let import_ulid = Ulid::new().to_string();
     std::fs::write(vol_dir.join(LOCK_FILE), &import_ulid)?;
@@ -276,6 +312,15 @@ pub async fn spawn_import(
         .arg(oci_ref)
         .stderr(Stdio::piped())
         .stdout(Stdio::null());
+
+    // Pass each resolved extent-source entry to elide-import. It will sign
+    // them into volume.provenance as part of setup_readonly_identity, and
+    // walk provenance to rebuild the parent ExtentIndex for dedup during
+    // the import block loop. No separate file is written — provenance is
+    // the single signed source of truth for lineage.
+    for entry in &extent_sources {
+        cmd.arg("--extent-source").arg(entry);
+    }
 
     // Place the child in a new session so it is not affected by the
     // coordinator's lifetime. pre_exec is unsafe because the callback runs

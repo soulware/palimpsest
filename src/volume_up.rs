@@ -126,8 +126,8 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
     }
 
     use elide_core::signing::{
-        VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, generate_keypair, load_signer,
-        write_origin,
+        ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
+        generate_keypair, load_signer, write_provenance,
     };
 
     // 1. Load S3 store config (two separate loads: one Arc<dyn ObjectStore> for
@@ -149,7 +149,12 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
         load_signer(vol_dir, VOLUME_KEY_FILE)?
     } else {
         let key = generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
-        write_origin(vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
+        write_provenance(
+            vol_dir,
+            &key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )?;
         load_signer(vol_dir, VOLUME_KEY_FILE)?
     };
 

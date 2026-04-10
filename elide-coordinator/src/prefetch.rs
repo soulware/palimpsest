@@ -287,7 +287,10 @@ mod tests {
     use tempfile::TempDir;
 
     use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
-    use elide_core::signing::generate_ephemeral_signer;
+    use elide_core::signing::{
+        ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
+        generate_ephemeral_signer, generate_keypair, load_signer, write_provenance,
+    };
 
     /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
     /// Upload the parent segment to the store at the correct by_id/ prefix.
@@ -306,7 +309,23 @@ mod tests {
         std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
         std::fs::create_dir_all(child_dir.join("pending")).unwrap();
 
-        // Write one segment into a staging file, upload it, then discard locally.
+        // Generate a keypair for each of parent and child, writing their
+        // volume.key + volume.pub to disk. The child's signing key is used
+        // below to sign provenance with a real `parent` lineage entry.
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+
+        // Parent's own provenance (no lineage) — prefetch will
+        // read+verify it when walking from the child.
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        // Build the parent segment, signed by the parent's key.
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -317,28 +336,24 @@ mod tests {
             SegmentFlags::empty(),
             data,
         )];
-        let (signer, vk) = generate_ephemeral_signer();
+        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
-        write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
-
-        // Write volume.pub (hex-encoded) so prefetch can verify signatures.
-        let vk_hex: String = vk
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-            + "\n";
-        std::fs::write(parent_dir.join("volume.pub"), &vk_hex).unwrap();
-        std::fs::write(child_dir.join("volume.pub"), &vk_hex).unwrap();
+        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
 
         // Create a snapshot marker in parent (branch point for child).
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
 
-        // child's volume.parent: <parent_ulid>/snapshots/<snap_ulid>
-        std::fs::write(
-            child_dir.join("volume.parent"),
-            format!("{parent_ulid}/snapshots/{snap_ulid}"),
+        // Child's signed provenance carries the parent reference in its
+        // `parent` field. Prefetch reads this via `walk_ancestors`.
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(format!("{parent_ulid}/snapshots/{snap_ulid}")),
+                extent_index: Vec::new(),
+            },
         )
         .unwrap();
 

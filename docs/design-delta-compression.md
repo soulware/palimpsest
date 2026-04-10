@@ -203,7 +203,7 @@ The drain-time delta path validates the end-to-end machinery (computation, segme
 
 **Phase 1 (done):** Delta format and machinery. Segment format v3 with delta table in the index, `rewrite_with_deltas()`, `compute_deltas()` with LBA-based source selection, integration into `drain_pending()` for validation. Proof-of-concept only — the real savings come from phases 2 and 3.
 
-**Phase 2a (this change):** Import-time parent linkage. New file `volume.extent_index` names a parent snapshot whose extent index is merged into the child's hash pool (but not into its LBA map). `elide volume import --parent` wires this up; blocks whose hash already exists in the parent pool are written as `DedupRef` entries during the import block loop. Delivers cross-import dedup; lays the groundwork for filemap-based delta.
+**Phase 2a (this change):** Import-time extent-source linkage. The `extent_index` field in `volume.provenance` names one or more snapshots whose extents are merged into the child's hash pool (but not into its LBA map). `elide volume import --extents-from <name>` (repeatable) wires this up; blocks whose hash already exists in any listed source are written as `DedupRef` entries during the import block loop. Delivers cross-import dedup; lays the groundwork for filemap-based delta. All lineage is carried in the signed provenance file — no standalone `volume.extent_index` file exists.
 
 **Phase 2b:** File-aware import with filemap-based delta on top of the linkage from 2a. The coordinator loads both filemaps, matches paths, and computes zstd deltas against parent extent data for changed files. See "Phase 2: import-time parent association" below.
 
@@ -232,20 +232,31 @@ elide volume import --extents-from ubuntu-22.04.2 --extents-from debian-12 \
 
 The `--extents-from` flag (repeatable) contributes a volume's extent index to the new volume's hash pool. For each source the coordinator:
 1. Resolves the source volume and its latest snapshot
-2. Reads the source's own `volume.extent_index` (if present) and copies every entry into the new volume's file
+2. Reads the source's **signed `volume.provenance`**, verifies the signature, and inherits every entry from the source's `extent_index` field
 3. Appends the source itself at its latest snapshot
-4. Dedupes by ULID and truncates to `MAX_EXTENT_INDEX_SOURCES` entries (oldest-added dropped, with a warning)
+4. Dedupes by source ULID and applies the eviction rule described below
 
 On the import path:
-1. `elide-import` reads `volume.extent_index` (already flat — no traversal), rebuilds a hash-only `ExtentIndex` over the listed sources, and passes it into `import_image`
-2. During the block loop, any block whose hash is already present in the pool is written as a `DedupRef` instead of a fresh `Data` entry (automatic dedup across imports)
-3. **Follow-up** (separate change): the coordinator's upload pipeline loads the child's and sources' filemaps, matches paths, and appends zstd delta options to changed extents using a source extent as the dictionary
+1. `elide-import` receives the resolved entries as repeatable `--extent-source` CLI args from the coordinator
+2. `setup_readonly_identity` generates an ephemeral keypair and writes them into the new volume's `volume.provenance` under `extent_index`, all signed together
+3. The import then walks its own (just-written) provenance via `walk_extent_ancestors` to rebuild a hash-only `ExtentIndex` over the listed sources, and passes it into `import_image`
+4. During the block loop, any block whose hash is already present in the pool is written as a `DedupRef` instead of a fresh `Data` entry (automatic dedup across imports)
+5. **Follow-up** (separate change): the coordinator's upload pipeline loads the child's and sources' filemaps, matches paths, and appends zstd delta options to changed extents using a source extent as the dictionary
 
-`volume.extent_index` is deliberately **not** the same file as `volume.parent`. A fork (`volume.parent`) merges the parent's segments into the child's LBA map so the child can read parent data through CoW fall-through. An extent-index source (`volume.extent_index`) contributes only to the extent index, never to the LBA map: the child's reads only return hashes the child itself wrote, so no source data leaks even though source segments are used as a hash pool. The file is **flat, not hierarchical** — unlike fork ancestry, which chains through `walk_ancestors`, extent-index sources are computed once at import time and written as a pre-expanded union, so attach-time resolution is a single file read.
+The `extent_index` lineage is deliberately **not** the same as the `parent` lineage. A fork (`parent`) merges the parent's segments into the child's LBA map so the child can read parent data through CoW fall-through. An extent-index source (`extent_index`) contributes only to the extent index, never to the LBA map: the child's reads only return hashes the child itself wrote, so no source data leaks even though source segments are used as a hash pool. The list is **flat, not hierarchical** — unlike fork ancestry, which chains through `walk_ancestors`, extent-index sources are computed once at import time and written as a pre-expanded union inside the signed provenance, so attach-time resolution is a single read.
 
-Multiple sources are a first-class feature: the operator can union several prior releases (e.g. the last few point releases plus a security-patched build) into the hash pool of a new import. Each source contributes its own pre-flattened list, and the coordinator dedupes across them. The `MAX_EXTENT_INDEX_SOURCES` cap bounds the list at 32 entries so attach cost stays predictable as operators chain imports over release trains; once the cap is hit, the coordinator logs a warning and drops the oldest-added entries.
+Multiple sources are a first-class feature: the operator can union several prior releases (e.g. the last few point releases plus a security-patched build) into the hash pool of a new import. Each source contributes its own pre-flattened list, and the coordinator dedupes across them.
 
-See [architecture.md](architecture.md) for the layout and invariants around both files.
+### Eviction rule when the cap is hit
+
+`MAX_EXTENT_INDEX_SOURCES = 32` bounds the list so attach cost stays predictable as operators chain imports over release trains. When the expanded union exceeds the cap:
+
+- **Explicit sources** (the `--extents-from` arguments on this specific import) are sacred and kept in full. If the explicit count alone exceeds the cap, the import is rejected with a clear error — silently dropping operator intent is worse than a clean failure.
+- **Inherited entries** (copied from explicit sources' own `extent_index` lists) fill the remaining slots via "oldest + most recent" pruning: the first-added entry is always kept (it's typically the base image, which holds the largest reusable pool), and the rest of the slots are filled with the most recently added inherited entries. Middle entries are dropped with a warning logged to the import job.
+
+The rationale: for a release train like `v1 → v2 → … → v33`, the base `v1` holds the bulk of the unchanged content and must not be evicted, while the most recent releases hold the content most similar to what's being imported. Middle versions matter for delta compression between specific version pairs but contribute little marginal dedup. When smarter heuristics become worthwhile (e.g. filemap path-overlap scoring before import), they can replace this rule without changing the on-disk format.
+
+See [architecture.md](architecture.md) for the provenance file format and invariants.
 
 ### Relationship to OCI layers
 
@@ -268,17 +279,17 @@ This is why phase 2 requires filemaps and path-matching rather than LBA-based de
 
 ## Read-path delta: warm hosts, not cold starts
 
-Delta options in S3 segments benefit **warm hosts** — hosts that already have the parent version's extents cached locally. The flow:
+Delta options in S3 segments benefit **warm hosts** — hosts that already have a prior version's extents cached locally. The flow:
 
 1. Host runs version N — demand-fetches extents as needed, caches them in `cache/`
-2. Operator publishes version N+1 (imported with `--parent` pointing at version N)
-3. Host pulls version N+1 via `volume remote pull` — the `volume.parent` pointer is preserved in the manifest, so the ancestor chain resolves to the local version N directory
-4. Volume open rebuilds the extent index across the ancestor chain — version N's cached extents are visible
+2. Operator publishes version N+1 (imported with `--extents-from <version N>`)
+3. Host pulls version N+1 via `volume remote pull` — the signed `volume.provenance` is preserved, so the walkers resolve the fork parent and extent-index sources to local `by_id/<ulid>/` directories
+4. Volume open rebuilds the extent index across the signed lineage — version N's cached extents are visible via the `extent_index` entry
 5. Demand-fetch for version N+1's changed extents checks delta options: if `source_hash` is in the local extent index (from version N's cache), fetch the delta blob (small) instead of the full body
 
 On a **cold host** with no prior version cached, delta options are useless — no source extent is available locally, so the full body is fetched. This is correct and transparent; the delta path is purely an optimisation, never a requirement.
 
-The `prefetch_indexes` coordinator task downloads `.idx` files for all ancestors on volume discovery, so the LBA map and extent index are always complete across the ancestry chain. Only body data is demand-fetched.
+The `prefetch_indexes` coordinator task downloads `.idx` files for every source in the signed lineage on volume discovery (both `parent` fork chain and `extent_index` flat list), so the LBA map and extent index are always complete. Only body data is demand-fetched.
 
 ## Open questions
 

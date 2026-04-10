@@ -61,6 +61,15 @@ struct Args {
     /// Only valid with --image; ignored with --from-file (the file is already flat).
     #[arg(long, value_name = "PATH")]
     save_flat: Option<PathBuf>,
+
+    /// Extent-index source entry, in the canonical
+    /// `<source-ulid>/snapshots/<snapshot-ulid>` form. Repeat for each
+    /// source. The coordinator is the normal producer of this list; it
+    /// resolves `--extents-from <name>` flags to source directories,
+    /// flattens the union, applies the eviction cap, and passes the
+    /// resolved entries here.
+    #[arg(long = "extent-source", value_name = "ULID/snapshots/ULID")]
+    extent_sources: Vec<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -81,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let vol_dir = Path::new(&args.vol_dir);
+    let lineage = elide_core::signing::ProvenanceLineage {
+        parent: None,
+        extent_index: args.extent_sources,
+    };
     match (args.image, args.from_file) {
         (Some(image), None) => {
             run_oci(
@@ -89,11 +102,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 args.size.as_deref(),
                 args.arch.as_deref(),
                 args.save_flat.as_deref(),
+                &lineage,
             )
             .await?;
         }
         (None, Some(ext4_path)) => {
-            run_from_file(&ext4_path, vol_dir)?;
+            run_from_file(&ext4_path, vol_dir, &lineage)?;
         }
         _ => {
             bail!("provide --image <ref> or --from-file <path>");
@@ -102,7 +116,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
+fn run_from_file(
+    ext4_path: &Path,
+    vol_dir: &Path,
+    lineage: &elide_core::signing::ProvenanceLineage,
+) -> anyhow::Result<()> {
     eprintln!(
         "Importing {} into {}...",
         ext4_path.display(),
@@ -111,11 +129,13 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
     // Readonly volumes must not have a private key on disk — use an ephemeral
-    // keypair that signs segments during import but is never persisted.
+    // keypair that signs segments during import but is never persisted. The
+    // extent-source list is signed into volume.provenance at the same time.
     let signer = elide_core::signing::setup_readonly_identity(
         vol_dir,
         VOLUME_PUB_FILE,
         VOLUME_PROVENANCE_FILE,
+        lineage,
     )
     .context("setup volume identity")?;
     let parent_extent_index =
@@ -144,15 +164,17 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load the parent's `ExtentIndex` from a `volume.extent_index` file, if
-/// present. Returns `None` if the file is absent (no parent configured) or
-/// points at an empty chain. The coordinator is responsible for writing
-/// `volume.extent_index` into `vol_dir` and ensuring the parent's `.idx`
-/// files are present locally before `elide-import` runs.
+/// Build the parent `ExtentIndex` from the extent-source list in
+/// `volume.provenance`. The coordinator has already validated and
+/// persisted the list via `--extent-source` CLI args, which
+/// `setup_readonly_identity` signed into provenance. Walking provenance
+/// here is the single source of truth: if provenance is tampered with,
+/// `walk_extent_ancestors` will fail signature verification and the
+/// import aborts.
+///
+/// Returns `None` when the list is empty (no `--extent-source` was
+/// passed), which is the normal case for a standalone import.
 fn load_parent_extent_index(vol_dir: &Path) -> anyhow::Result<Option<ExtentIndex>> {
-    if !vol_dir.join("volume.extent_index").exists() {
-        return Ok(None);
-    }
     let by_id_dir = vol_dir
         .parent()
         .context("vol_dir has no parent; cannot resolve by_id_dir")?;
@@ -175,6 +197,7 @@ async fn run_oci(
     size: Option<&str>,
     arch: Option<&str>,
     save_flat: Option<&Path>,
+    lineage: &elide_core::signing::ProvenanceLineage,
 ) -> anyhow::Result<()> {
     let target_arch = arch.map(parse_arch).unwrap_or_else(host_arch);
 
@@ -239,11 +262,13 @@ async fn run_oci(
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
     // Readonly volumes must not have a private key on disk — use an ephemeral
-    // keypair that signs segments during import but is never persisted.
+    // keypair that signs segments during import but is never persisted. The
+    // extent-source list is signed into volume.provenance at the same time.
     let signer = elide_core::signing::setup_readonly_identity(
         vol_dir,
         VOLUME_PUB_FILE,
         VOLUME_PROVENANCE_FILE,
+        lineage,
     )
     .context("setup volume identity")?;
     let parent_extent_index =

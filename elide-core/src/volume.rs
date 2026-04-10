@@ -2460,53 +2460,75 @@ fn open_read_state(
     Ok((ancestor_layers, lbamap, extent_index))
 }
 
-/// Parse a `<parent-ulid>/snapshots/<branch-ulid>` origin line, validating both
-/// components as ULIDs (prevents path traversal). Shared between
-/// `volume.parent` and `volume.extent_index`.
-fn parse_origin_line<'a>(
-    content: &'a str,
-    file_name: &str,
+/// Parse a `<source-ulid>/snapshots/<snapshot-ulid>` lineage entry, validating
+/// both components as ULIDs to prevent path traversal. Returns the source ULID
+/// slice (borrowed from `entry`) and the owned snapshot ULID string.
+fn parse_lineage_entry<'a>(
+    entry: &'a str,
+    field: &str,
     fork_dir: &Path,
 ) -> io::Result<(&'a str, String)> {
-    let origin = content.trim();
-    let (parent_ulid_str, branch_ulid_str) =
-        origin.rsplit_once("/snapshots/").ok_or_else(|| {
+    let (source_ulid_str, snapshot_ulid_str) =
+        entry.rsplit_once("/snapshots/").ok_or_else(|| {
             io::Error::other(format!(
-                "malformed {file_name} in {}: {origin}",
+                "malformed {field} entry in {}: {entry}",
                 fork_dir.display()
             ))
         })?;
-    let branch_ulid = Ulid::from_string(branch_ulid_str)
-        .map_err(|e| io::Error::other(format!("bad branch ULID in {file_name}: {e}")))?
+    let snapshot_ulid = Ulid::from_string(snapshot_ulid_str)
+        .map_err(|e| io::Error::other(format!("bad snapshot ULID in {field}: {e}")))?
         .to_string();
-    Ulid::from_string(parent_ulid_str).map_err(|_| {
+    Ulid::from_string(source_ulid_str).map_err(|_| {
         io::Error::other(format!(
-            "malformed {file_name} in {}: parent '{parent_ulid_str}' is not a valid ULID",
+            "malformed {field} entry in {}: source '{source_ulid_str}' is not a valid ULID",
             fork_dir.display(),
         ))
     })?;
-    Ok((parent_ulid_str, branch_ulid))
+    Ok((source_ulid_str, snapshot_ulid))
+}
+
+/// A volume with no `volume.provenance` is treated as root (empty chain).
+/// All other provenance read errors propagate — in particular, a missing
+/// or malformed file on a volume that had lineage is a loud failure.
+///
+/// Verification is opt-in at the walker layer via `load_verified_lineage`
+/// when the caller can afford a host/path match check; volume-open paths
+/// that need to survive host moves use `read_lineage_unchecked` (below).
+fn load_lineage_or_empty(fork_dir: &Path) -> io::Result<crate::signing::ProvenanceLineage> {
+    let provenance_path = fork_dir.join(crate::signing::VOLUME_PROVENANCE_FILE);
+    if !provenance_path.exists() {
+        return Ok(crate::signing::ProvenanceLineage::default());
+    }
+    // Walkers run on both the current volume and on ancestor volumes in
+    // other `by_id/<ulid>/` directories. Ancestors do not necessarily live
+    // on the same host path as they did when their provenance was signed,
+    // so walkers verify the signature but deliberately skip the host/path
+    // match check that `verify_provenance` performs. The signature still
+    // anchors lineage integrity against tampering.
+    crate::signing::read_lineage_verifying_signature(
+        fork_dir,
+        crate::signing::VOLUME_PUB_FILE,
+        crate::signing::VOLUME_PROVENANCE_FILE,
+    )
 }
 
 /// Each layer holds the ancestor fork directory and the branch-point ULID.
-/// Segments with ULID > `branch_ulid` in that ancestor fork were written after
-/// the branch and are excluded when rebuilding the LBA map.
+/// Segments with ULID > `branch_ulid` in that ancestor fork were written
+/// after the branch and are excluded when rebuilding the LBA map.
 ///
-/// A fork with no `volume.parent` file is the root fork; returns an empty vec.
-/// The `volume.parent` file format is `<parent-ulid>/snapshots/<branch-ulid>`, where
-/// `parent-ulid` is the ULID-named directory under `by_id_dir`. Both components
-/// are validated as ULIDs to prevent path traversal.
+/// A volume with no `volume.provenance` or with an empty `parent` field is
+/// the root of its fork chain; returns an empty vec. The `parent` field is
+/// in the form `<parent-ulid>/snapshots/<branch-ulid>`, validated as ULIDs
+/// at parse time.
 pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
-    let origin_path = fork_dir.join("volume.parent");
-    let content = match fs::read_to_string(&origin_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let lineage = load_lineage_or_empty(fork_dir)?;
+    let Some(parent_entry) = lineage.parent else {
+        return Ok(Vec::new());
     };
-    let (parent_ulid_str, branch_ulid) = parse_origin_line(&content, "volume.parent", fork_dir)?;
+    let (parent_ulid_str, branch_ulid) = parse_lineage_entry(&parent_entry, "parent", fork_dir)?;
     let parent_fork_dir = by_id_dir.join(parent_ulid_str);
 
-    // Recurse into the parent's ancestry first (builds oldest-first order).
+    // Recurse into the parent's fork chain first (builds oldest-first order).
     let mut ancestors = walk_ancestors(&parent_fork_dir, by_id_dir)?;
     ancestors.push(AncestorLayer {
         dir: parent_fork_dir,
@@ -2515,11 +2537,10 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
     Ok(ancestors)
 }
 
-/// Read the flat extent-index source list.
+/// Read the flat extent-index source list from `volume.provenance`.
 ///
-/// `volume.extent_index` is a multi-line file: one
-/// `<volume-ulid>/snapshots/<snapshot-ulid>` entry per line, optionally
-/// interleaved with blank lines and `#` comments. Each entry names a snapshot
+/// The `extent_index` field is a flat list of
+/// `<source-ulid>/snapshots/<snapshot-ulid>` entries, each naming a snapshot
 /// whose extents populate this volume's `ExtentIndex` (for dedup and delta
 /// compression source lookups) but are **never** merged into the LBA map.
 /// The child is born with an empty LBA map; hashes from these sources are
@@ -2528,27 +2549,18 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
 /// the source segment. See `docs/architecture.md` for the "not in read path"
 /// invariant.
 ///
-/// The file is a flat union, not a chain: when a new volume is imported with
-/// `--extents-from X`, the coordinator reads `X`'s own `volume.extent_index`,
-/// appends `X`, dedupes, and writes the result. There is no recursion at
-/// attach time — the file is already fully expanded. Multiple sources passed
-/// at import time each contribute their (already-flat) lists, concatenated
-/// and deduped by directory path.
+/// The list is flat, not a chain: when a new volume is imported with
+/// `--extents-from X`, the coordinator reads `X`'s own extent_index list,
+/// appends `X`, dedupes, and writes the result into the new provenance.
+/// There is no recursion at attach time — the list is already fully
+/// expanded. Multiple sources passed at import time each contribute their
+/// (already-flat) lists, concatenated and deduped by directory path.
 pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
-    let origin_path = fork_dir.join("volume.extent_index");
-    let content = match fs::read_to_string(&origin_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
+    let lineage = load_lineage_or_empty(fork_dir)?;
     let mut layers: Vec<AncestorLayer> = Vec::new();
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
+    for entry in &lineage.extent_index {
         let (source_ulid_str, snapshot_ulid) =
-            parse_origin_line(line, "volume.extent_index", fork_dir)?;
+            parse_lineage_entry(entry, "extent_index", fork_dir)?;
         let source_dir = by_id_dir.join(source_ulid_str);
         if layers.iter().any(|l| l.dir == source_dir) {
             continue;
@@ -2580,8 +2592,9 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
 /// Create a new volume directory, branched from the latest snapshot of the source volume.
 ///
 /// The source volume must have at least one snapshot (written by `snapshot()`).
-/// `new_fork_dir` is created with `wal/`, `pending/`, and a `volume.parent`
-/// file using the flat format: `<source-ulid>/snapshots/<branch-ulid>`.
+/// `new_fork_dir` is created with `wal/` and `pending/`, a fresh keypair is
+/// generated, and a signed `volume.provenance` is written recording the
+/// fork's `parent` field in the form `<source-ulid>/snapshots/<branch-ulid>`.
 /// The source ULID is derived from `source_fork_dir`'s directory name.
 ///
 /// Returns `Ok(())` on success; `new_fork_dir` must not already exist.
@@ -2610,16 +2623,29 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
 
     fs::create_dir_all(new_fork_dir.join("wal"))?;
     fs::create_dir_all(new_fork_dir.join("pending"))?;
-    // volume.parent format: "<source-ulid>/snapshots/<branch-ulid>"
-    let origin = format!("{source_ulid}/snapshots/{branch_ulid}");
-    segment::write_file_atomic(&new_fork_dir.join("volume.parent"), origin.as_bytes())?;
 
     // Generate a fresh keypair for the new fork. Every writable volume must have
     // a signing key; the fork gets its own identity independent of its parent.
-    crate::signing::generate_keypair(
+    // The signing key's in-memory form is reused immediately to write provenance
+    // so we never have to re-read it from disk.
+    let key = crate::signing::generate_keypair(
         new_fork_dir,
         crate::signing::VOLUME_KEY_FILE,
         crate::signing::VOLUME_PUB_FILE,
+    )?;
+
+    // Write signed provenance carrying the fork's parent reference. Extent
+    // index is empty for forks — fork ancestry is a read-path relationship
+    // tracked in `parent`, not a hash-pool relationship.
+    let lineage = crate::signing::ProvenanceLineage {
+        parent: Some(format!("{source_ulid}/snapshots/{branch_ulid}")),
+        extent_index: Vec::new(),
+    };
+    crate::signing::write_provenance(
+        new_fork_dir,
+        &key,
+        crate::signing::VOLUME_PROVENANCE_FILE,
+        &lineage,
     )?;
 
     Ok(())
@@ -2787,6 +2813,37 @@ mod tests {
             dir,
             crate::signing::VOLUME_KEY_FILE,
             crate::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+    }
+
+    /// Write a signed `volume.provenance` with the given lineage fields into
+    /// `dir`, generating a fresh keypair (`volume.pub` is written; the
+    /// private key is discarded). Used by walker tests that need to
+    /// construct fake ancestor volumes without running full setup.
+    ///
+    /// `parent_entry` and `extent_entries` may contain syntactically bad
+    /// strings — they are signed as-is, and any validation is done on the
+    /// reader side. This lets the invalid-entry tests still exercise the
+    /// walker's parse path.
+    fn write_test_provenance(dir: &Path, parent_entry: Option<&str>, extent_entries: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_hex = crate::signing::encode_hex(&key.verifying_key().to_bytes()) + "\n";
+        crate::segment::write_file_atomic(
+            &dir.join(crate::signing::VOLUME_PUB_FILE),
+            pub_hex.as_bytes(),
+        )
+        .unwrap();
+        let lineage = crate::signing::ProvenanceLineage {
+            parent: parent_entry.map(|s| s.to_owned()),
+            extent_index: extent_entries.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        crate::signing::write_provenance(
+            dir,
+            &key,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+            &lineage,
         )
         .unwrap();
     }
@@ -4587,12 +4644,10 @@ mod tests {
     }
 
     #[test]
-    fn walk_ancestors_rejects_invalid_origin_paths() {
+    fn walk_ancestors_rejects_invalid_parent_entries() {
         let by_id = temp_dir();
         let fork_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
-        fs::create_dir_all(&fork_dir).unwrap();
-
-        let bad_origins = [
+        let bad_parents = [
             // not a ULID parent (old "base/" prefix)
             "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             // path traversal attempt
@@ -4604,11 +4659,11 @@ mod tests {
             // branch ULID missing after snapshots/
             "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
         ];
-        for bad in bad_origins {
-            fs::write(fork_dir.join("volume.parent"), bad).unwrap();
+        for bad in bad_parents {
+            write_test_provenance(&fork_dir, Some(bad), &[]);
             assert!(
                 walk_ancestors(&fork_dir, &by_id).is_err(),
-                "expected error for origin: {bad}"
+                "expected error for parent entry: {bad}"
             );
         }
     }
@@ -4621,13 +4676,14 @@ mod tests {
         let default_dir = by_id.join(parent_ulid);
         let dev_dir = by_id.join(child_ulid);
 
-        // dev's origin points to default at a fixed branch ULID.
-        fs::create_dir_all(&dev_dir).unwrap();
-        fs::write(
-            dev_dir.join("volume.parent"),
-            format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        )
-        .unwrap();
+        // dev's provenance names default at a fixed branch ULID.
+        write_test_provenance(
+            &dev_dir,
+            Some(&format!(
+                "{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            )),
+            &[],
+        );
 
         let ancestors = walk_ancestors(&dev_dir, &by_id).unwrap();
         assert_eq!(ancestors.len(), 1);
@@ -4648,19 +4704,16 @@ mod tests {
         let mid_dir = by_id.join(mid_ulid);
         let leaf_dir = by_id.join(leaf_ulid);
 
-        fs::create_dir_all(&mid_dir).unwrap();
-        fs::write(
-            mid_dir.join("volume.parent"),
-            format!("{root_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        )
-        .unwrap();
-
-        fs::create_dir_all(&leaf_dir).unwrap();
-        fs::write(
-            leaf_dir.join("volume.parent"),
-            format!("{mid_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV"),
-        )
-        .unwrap();
+        write_test_provenance(
+            &mid_dir,
+            Some(&format!("{root_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+            &[],
+        );
+        write_test_provenance(
+            &leaf_dir,
+            Some(&format!("{mid_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV")),
+            &[],
+        );
 
         let ancestors = walk_ancestors(&leaf_dir, &by_id).unwrap();
         assert_eq!(ancestors.len(), 2);
@@ -4687,21 +4740,20 @@ mod tests {
     }
 
     #[test]
-    fn walk_extent_ancestors_rejects_invalid() {
+    fn walk_extent_ancestors_rejects_invalid_entries() {
         let by_id = temp_dir();
         let vol_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
-        fs::create_dir_all(&vol_dir).unwrap();
-        let bad_origins = [
+        let bad_entries = [
             "not-a-ulid/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "../01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
             "01AAAAAAAAAAAAAAAAAAAAAAAA",
         ];
-        for bad in bad_origins {
-            fs::write(vol_dir.join("volume.extent_index"), bad).unwrap();
+        for bad in bad_entries {
+            write_test_provenance(&vol_dir, None, &[bad]);
             assert!(
                 walk_extent_ancestors(&vol_dir, &by_id).is_err(),
-                "expected error for origin: {bad}"
+                "expected error for extent_index entry: {bad}"
             );
         }
     }
@@ -4713,13 +4765,8 @@ mod tests {
         let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         let parent_dir = by_id.join(parent_ulid);
         let child_dir = by_id.join(child_ulid);
-        fs::create_dir_all(&parent_dir).unwrap();
-        fs::create_dir_all(&child_dir).unwrap();
-        fs::write(
-            child_dir.join("volume.extent_index"),
-            format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        )
-        .unwrap();
+        let entry = format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        write_test_provenance(&child_dir, None, &[&entry]);
 
         let ancestors = walk_extent_ancestors(&child_dir, &by_id).unwrap();
         assert_eq!(ancestors.len(), 1);
@@ -4731,9 +4778,8 @@ mod tests {
     }
 
     #[test]
-    fn walk_extent_ancestors_multi_line() {
-        // Flat union of several sources, one per line, with a comment and a
-        // blank line to verify they are skipped.
+    fn walk_extent_ancestors_multi_entry() {
+        // Flat union of several sources in a single signed provenance.
         let by_id = temp_dir();
         let a_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let b_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
@@ -4741,17 +4787,9 @@ mod tests {
         let a_dir = by_id.join(a_ulid);
         let b_dir = by_id.join(b_ulid);
         let c_dir = by_id.join(c_ulid);
-        fs::create_dir_all(&a_dir).unwrap();
-        fs::create_dir_all(&b_dir).unwrap();
-        fs::create_dir_all(&c_dir).unwrap();
-
-        let body = format!(
-            "# elide extent-index sources\n\
-             {a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV\n\
-             \n\
-             {b_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV\n"
-        );
-        fs::write(c_dir.join("volume.extent_index"), body).unwrap();
+        let a_entry = format!("{a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let b_entry = format!("{b_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        write_test_provenance(&c_dir, None, &[&a_entry, &b_entry]);
 
         let layers = walk_extent_ancestors(&c_dir, &by_id).unwrap();
         assert_eq!(layers.len(), 2, "two sources expected");
@@ -4768,21 +4806,16 @@ mod tests {
     }
 
     #[test]
-    fn walk_extent_ancestors_dedupes_duplicate_lines() {
+    fn walk_extent_ancestors_dedupes_duplicate_entries() {
         let by_id = temp_dir();
         let a_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let c_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
         let a_dir = by_id.join(a_ulid);
         let c_dir = by_id.join(c_ulid);
-        fs::create_dir_all(&a_dir).unwrap();
-        fs::create_dir_all(&c_dir).unwrap();
-
         // Same source listed twice — later entry is silently dropped.
-        let body = format!(
-            "{a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV\n\
-             {a_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV\n"
-        );
-        fs::write(c_dir.join("volume.extent_index"), body).unwrap();
+        let a1 = format!("{a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let a2 = format!("{a_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        write_test_provenance(&c_dir, None, &[&a1, &a2]);
 
         let layers = walk_extent_ancestors(&c_dir, &by_id).unwrap();
         assert_eq!(layers.len(), 1);
@@ -4791,8 +4824,9 @@ mod tests {
 
     #[test]
     fn walk_extent_ancestors_combined_with_walk_ancestors() {
-        // P is a fork parent of C, and C also has an extent_index parent X.
-        // walk_ancestors returns [P], walk_extent_ancestors returns [X].
+        // A single signed provenance carrying both fork parent (P) and
+        // extent-index source (X). walk_ancestors returns [P],
+        // walk_extent_ancestors returns [X]: the two chains are distinct.
         let by_id = temp_dir();
         let p_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let x_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
@@ -4800,19 +4834,9 @@ mod tests {
         let p_dir = by_id.join(p_ulid);
         let x_dir = by_id.join(x_ulid);
         let c_dir = by_id.join(c_ulid);
-        fs::create_dir_all(&p_dir).unwrap();
-        fs::create_dir_all(&x_dir).unwrap();
-        fs::create_dir_all(&c_dir).unwrap();
-        fs::write(
-            c_dir.join("volume.parent"),
-            format!("{p_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        )
-        .unwrap();
-        fs::write(
-            c_dir.join("volume.extent_index"),
-            format!("{x_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV"),
-        )
-        .unwrap();
+        let parent_entry = format!("{p_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let extent_entry = format!("{x_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        write_test_provenance(&c_dir, Some(&parent_entry), &[&extent_entry]);
 
         let fork_chain = walk_ancestors(&c_dir, &by_id).unwrap();
         let extent_chain = walk_extent_ancestors(&c_dir, &by_id).unwrap();
@@ -5031,7 +5055,7 @@ mod tests {
     // --- fork_volume tests ---
 
     #[test]
-    fn fork_volume_creates_fork_with_origin() {
+    fn fork_volume_creates_fork_with_signed_provenance() {
         let by_id = temp_dir();
         let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
@@ -5049,9 +5073,23 @@ mod tests {
         fork_volume(&fork_dir, &default_dir).unwrap();
         assert!(fork_dir.join("wal").is_dir());
         assert!(fork_dir.join("pending").is_dir());
+        assert!(
+            !fork_dir.join("volume.parent").exists(),
+            "standalone volume.parent file must not exist; parent lives in provenance"
+        );
 
-        let origin = fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
-        assert_eq!(origin.trim(), format!("{root_ulid}/snapshots/{snap_ulid}"));
+        // Parent lineage must be present in the signed provenance file.
+        let lineage = crate::signing::read_lineage_verifying_signature(
+            &fork_dir,
+            crate::signing::VOLUME_PUB_FILE,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        assert_eq!(
+            lineage.parent.as_deref(),
+            Some(format!("{root_ulid}/snapshots/{snap_ulid}").as_str())
+        );
+        assert!(lineage.extent_index.is_empty());
 
         fs::remove_dir_all(by_id).unwrap();
     }
@@ -5093,11 +5131,16 @@ mod tests {
         assert!(snap2 > snap1);
 
         fork_volume(&fork_dir, &default_dir).unwrap();
-        let origin = fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
+        let lineage = crate::signing::read_lineage_verifying_signature(
+            &fork_dir,
+            crate::signing::VOLUME_PUB_FILE,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
         assert_eq!(
-            origin.trim(),
-            format!("{root_ulid}/snapshots/{snap2}"),
-            "origin should point to the latest snapshot"
+            lineage.parent.as_deref(),
+            Some(format!("{root_ulid}/snapshots/{snap2}").as_str()),
+            "provenance parent should point to the latest snapshot"
         );
 
         // Fork branched from snap2 sees both pre-snap1 and pre-snap2 writes.
@@ -5141,16 +5184,28 @@ mod tests {
         // Leaf volume: branch from mid.
         fork_volume(&leaf_dir, &mid_dir).unwrap();
 
-        // origin chain: leaf → mid → default (ULID-based flat layout).
-        let leaf_origin = fs::read_to_string(leaf_dir.join("volume.parent")).unwrap();
+        // origin chain: leaf → mid → default (read from signed provenance).
+        let leaf_lineage = crate::signing::read_lineage_verifying_signature(
+            &leaf_dir,
+            crate::signing::VOLUME_PUB_FILE,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        let leaf_parent = leaf_lineage.parent.as_deref().unwrap_or("");
         assert!(
-            leaf_origin.starts_with(&format!("{mid_ulid}/snapshots/")),
-            "leaf origin: {leaf_origin}"
+            leaf_parent.starts_with(&format!("{mid_ulid}/snapshots/")),
+            "leaf parent: {leaf_parent}"
         );
-        let mid_origin = fs::read_to_string(mid_dir.join("volume.parent")).unwrap();
+        let mid_lineage = crate::signing::read_lineage_verifying_signature(
+            &mid_dir,
+            crate::signing::VOLUME_PUB_FILE,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        let mid_parent = mid_lineage.parent.as_deref().unwrap_or("");
         assert!(
-            mid_origin.starts_with(&format!("{root_ulid}/snapshots/")),
-            "mid origin: {mid_origin}"
+            mid_parent.starts_with(&format!("{root_ulid}/snapshots/")),
+            "mid parent: {mid_parent}"
         );
 
         // Leaf sees data from all three levels.

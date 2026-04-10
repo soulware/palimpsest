@@ -8,14 +8,16 @@ use elide_core::volume::{Volume, fork_volume};
 
 mod common;
 
-/// Regression test: `fork_volume` must write the real ULID into the origin
-/// file even when the source path is a symlink (e.g. `by_name/<name>`).
+/// Regression test: `fork_volume` must write the real ULID into the signed
+/// `parent` field even when the source path is a symlink (e.g.
+/// `by_name/<name>`).
 ///
 /// Before the fix, `fork_volume` called `file_name()` on the raw source path,
-/// so a symlink named `"myvol"` produced `"myvol/snapshots/..."` in the origin
-/// file.  `Volume::open` then rejected it: "parent 'myvol' is not a valid ULID".
+/// so a symlink named `"myvol"` produced `"myvol/snapshots/..."` in the
+/// parent entry. `Volume::open` then rejected it: "parent 'myvol' is not a
+/// valid ULID".
 #[test]
-fn fork_via_symlink_writes_ulid_in_origin() {
+fn fork_via_symlink_writes_ulid_in_provenance_parent() {
     let dir = tempfile::TempDir::new().unwrap();
     let by_id = dir.path().join("by_id");
     let by_name = dir.path().join("by_name");
@@ -42,15 +44,21 @@ fn fork_via_symlink_writes_ulid_in_origin() {
     // Fork via the symlink path — this is what the CLI does.
     fork_volume(&fork_dir, &symlink).unwrap();
 
-    // The origin file must contain the real ULID, not the symlink name.
-    let origin = std::fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
+    // The signed provenance must record the real ULID, not the symlink name.
+    let lineage = elide_core::signing::read_lineage_verifying_signature(
+        &fork_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    )
+    .unwrap();
+    let parent_entry = lineage.parent.as_deref().unwrap_or("");
     assert!(
-        origin.starts_with(source_ulid),
-        "origin should start with the source ULID, got: {origin:?}"
+        parent_entry.starts_with(source_ulid),
+        "provenance parent should start with the source ULID, got: {parent_entry:?}"
     );
 
     // Volume::open on the fork must succeed (would fail with "not a valid ULID"
-    // if the origin contained the symlink name instead).
+    // if the parent entry contained the symlink name instead).
     Volume::open(&fork_dir, &by_id).unwrap();
 }
 
