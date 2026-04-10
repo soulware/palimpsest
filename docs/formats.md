@@ -114,9 +114,9 @@ When the write log reaches the 32MB threshold (or on an explicit flush), the bac
 
 **The WAL ULID marks the start of a write epoch, not the time data was written.**  All writes accepted while the WAL is open belong to that epoch and inherit its ULID when promoted.  This pre-assignment is what makes compaction ordering safe: every segment in `pending/` was produced in an earlier epoch, so `max(pending ULIDs)` is always strictly less than the running WAL's ULID — there is no need to coordinate with the live WAL during compaction.
 
-**Proposed (PR 1):** **Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes the raw extent data bytes (no headers) to a clean body section. DATA records contribute body bytes; DedupRef and ZERO records contribute no bytes and reserve no body space (`stored_offset = 0`, `stored_length = 0`). All segments — freshly promoted or GC-repacked — have the same uniform 64-byte index entry format.
+**Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes the raw extent data bytes (no headers) to a clean body section. DATA records contribute body bytes; DedupRef and ZERO records contribute no bytes and reserve no body space (`stored_offset = 0`, `stored_length = 0`). All segments — freshly promoted or GC-repacked — have the same uniform 64-byte index entry format.
 
-**Proposed (PR 1):** **`redact_segment` (in-place dead-data hole-punching):** Before the coordinator reads a `pending/<ULID>` segment for S3 upload, it calls `redact_segment(ulid)` IPC on the volume. The volume hole-punches any hash-dead DATA entries **in place on the original `pending/<ULID>` file**: no sidecar, no copy, no rename, no layout change — only the physical byte ranges of dead DATA regions are freed. Hash-dead means: the LBA no longer maps to this hash, and no other live LBA anywhere in the volume references this hash (so there is no concurrent reader for those bytes). DedupRef entries are not touched: the thin format carries no DedupRef body bytes in the first place. The `body_length`, index section, signature, and file size are all unchanged. The operation is idempotent — re-running redact on a segment with no hash-dead entries is a no-op. Fast-path: segments with zero hash-dead entries return immediately.
+**`redact_segment` (in-place dead-data hole-punching).** Before the coordinator reads a `pending/<ULID>` segment for S3 upload, it calls `redact_segment(ulid)` IPC on the volume. The volume hole-punches any hash-dead DATA entries **in place on the original `pending/<ULID>` file**: no sidecar, no copy, no rename, no layout change — only the physical byte ranges of dead DATA regions are freed. Hash-dead means: the LBA no longer maps to this hash, and no other live LBA anywhere in the volume references this hash (so there is no concurrent reader for those bytes). DedupRef entries are not touched: the thin format carries no DedupRef body bytes in the first place. The `body_length`, index section, signature, and file size are all unchanged. The operation is idempotent — re-running redact on a segment with no hash-dead entries is a no-op. Fast-path: segments with zero hash-dead entries return immediately.
 
 The name `redact` reflects the intent: the sole purpose of this step is to ensure deleted data never leaves the host via S3 upload. Deferring it to upload time (rather than doing it at overwrite time) lets multiple dead hashes accumulate in a single `redact` pass and avoids coupling the write path to hash-liveness bookkeeping.
 
@@ -169,8 +169,6 @@ Step 6 — the directory fsync — is required because `rename()` updates the di
 The same `rename + fsync_dir` pattern applies to all segment-creating renames: WAL promotion, repack, sweep, and import.
 
 **S3 upload completion:**
-
-**Proposed (PR 1):**
 
 ```
 6. Read pending/<ULID>; choose S3 reduction strategy (if applicable):
@@ -245,7 +243,7 @@ delta_offset  = 96 + index_length + inline_length + body_length
 - `0x01` `FLAG_INLINE` — extent data is in the inline section; no body fetch needed
 - `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
 - `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
-- `0x08` `FLAG_DEDUP_REF` — dedup reference; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry layout is the same 64 bytes as DATA. See § Segment File Format — FLAG_DEDUP_REF below. *(Proposed: PR 1 changes the semantics of this flag. Previously, DedupRef entries reserved body space as a sparse hole. Post-PR-1, they contribute nothing to `body_length` and have zeroed offset/length fields.)*
+- `0x08` `FLAG_DEDUP_REF` — dedup reference; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry layout is the same 64 bytes as DATA. See § Segment File Format — FLAG_DEDUP_REF below.
 - `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
@@ -271,7 +269,7 @@ For each extent (64 bytes, fixed-size):
   reserved        (7 bytes)  — must be zero
 ```
 
-All entry kinds (DATA, DEDUP_REF, ZERO, INLINE) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA, inline-section-relative for INLINE, zero for both DEDUP_REF and ZERO. *(Proposed: PR 1 drops body-section interpretation for DEDUP_REF — DedupRefs now contribute zero to `body_length` and have zeroed offset/length fields, matching the ZERO entry shape.)*
+All entry kinds (DATA, DEDUP_REF, ZERO, INLINE) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA, inline-section-relative for INLINE, zero for both DEDUP_REF and ZERO.
 
 **Delta table** (appended after base entries, variable-length):
 
@@ -289,8 +287,6 @@ Per entry with deltas:
 The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64)`. Readers that don't need delta info (LBA map rebuild, extent index rebuild) read only the first `entry_count × 64` bytes.
 
 `lba_length × 4096` always gives the uncompressed extent size. `stored_length` gives the stored (possibly compressed) size.
-
-**Proposed (PR 1 — format-level thin DedupRef):**
 
 **FLAG_DEDUP_REF entries** use the same 64-byte index layout as DATA entries but carry no body bytes and reserve no body space. `stored_offset` and `stored_length` are both zero. The segment's `body_length` is the sum of `stored_length` over DATA entries only — DedupRefs contribute nothing. The write path never seeks past a DedupRef and never allocates a sparse hole for one.
 
@@ -470,7 +466,7 @@ An OS sparse file of `body_length` bytes. Byte offsets within the file are **bod
 
 Each fetched extent is written at its exact `body_offset` within this file. OS holes represent unfetched ranges. The `.present` bitset is the authoritative record of what is present; OS zeros in a hole are not distinguishable from legitimate zero-filled extent data without it.
 
-*(Note post-PR-1: DedupRef entries contribute no bytes and no byte ranges to `.body` — they are invisible at the file level. The `.present` bit for a DedupRef index entry is always unset, but this is vestigial: the read path resolves DedupRefs through the extent index, not through the bitset.)*
+DedupRef entries contribute no bytes and no byte ranges to `.body` — they are invisible at the file level. The `.present` bit for a DedupRef index entry is always unset, but this is vestigial: the read path resolves DedupRefs through the extent index, not through the bitset.
 
 Extents materialised from a delta (delta bytes fetched, applied against a local source extent, result written) are stored at the same `body_offset` as the full-body version. From the read path's perspective, materialised delta output is identical to a directly-fetched body extent.
 
