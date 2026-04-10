@@ -195,29 +195,29 @@ async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 let (r, mut w) = stream.into_split();
                 let mut lines = BufReader::new(r).lines();
-                if let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(ulid_str) = line.strip_prefix("promote ") {
-                        let ulid_str = ulid_str.trim().to_owned();
-                        // Check gc/ first (GC handoff path), then pending/ (drain path).
-                        let gc_src = dir.join("gc").join(&ulid_str);
-                        let pending_src = dir.join("pending").join(&ulid_str);
-                        let (src, is_drain) = if gc_src.exists() {
-                            (gc_src, false)
-                        } else {
-                            (pending_src, true)
-                        };
-                        if src.exists() {
-                            let index_dir = dir.join("index");
-                            let cache_dir = dir.join("cache");
-                            std::fs::create_dir_all(&cache_dir).ok();
-                            let idx = index_dir.join(format!("{ulid_str}.idx"));
-                            let body = cache_dir.join(format!("{ulid_str}.body"));
-                            let present = cache_dir.join(format!("{ulid_str}.present"));
-                            elide_core::segment::extract_idx(&src, &idx).ok();
-                            elide_core::segment::promote_to_cache(&src, &body, &present).ok();
-                            if is_drain {
-                                std::fs::remove_file(&src).ok();
-                            }
+                if let Ok(Some(line)) = lines.next_line().await
+                    && let Some(ulid_str) = line.strip_prefix("promote ")
+                {
+                    let ulid_str = ulid_str.trim().to_owned();
+                    // Check gc/ first (GC handoff path), then pending/ (drain path).
+                    let gc_src = dir.join("gc").join(&ulid_str);
+                    let pending_src = dir.join("pending").join(&ulid_str);
+                    let (src, is_drain) = if gc_src.exists() {
+                        (gc_src, false)
+                    } else {
+                        (pending_src, true)
+                    };
+                    if src.exists() {
+                        let index_dir = dir.join("index");
+                        let cache_dir = dir.join("cache");
+                        std::fs::create_dir_all(&cache_dir).ok();
+                        let idx = index_dir.join(format!("{ulid_str}.idx"));
+                        let body = cache_dir.join(format!("{ulid_str}.body"));
+                        let present = cache_dir.join(format!("{ulid_str}.present"));
+                        elide_core::segment::extract_idx(&src, &idx).ok();
+                        elide_core::segment::promote_to_cache(&src, &body, &present).ok();
+                        if is_drain {
+                            std::fs::remove_file(&src).ok();
                         }
                     }
                 }

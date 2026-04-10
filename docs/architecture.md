@@ -104,10 +104,9 @@ elide_data/                           — single root (default --data-dir)
     01JQBBBBBBB/                      — writable volume forked from ubuntu-22.04
       volume.name                     — "server-1"
       volume.size
-      volume.parent                   — "01JQAAAAAAA/snapshots/01JQXXXXX"
       volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
       volume.pub
-      volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
+      volume.provenance               — signed: host + path + parent="01JQAAAAAAA/snapshots/01JQXXXXX" + empty extent_index
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
@@ -117,11 +116,16 @@ elide_data/                           — single root (default --data-dir)
       control.sock                    — volume process IPC socket (coordinator connects here)
     01JQCCCCCCC/
       volume.name                     — "server-2"
-      volume.parent                   — "01JQAAAAAAA/snapshots/01JQXXXXX"
+      volume.provenance               — signed: parent="01JQAAAAAAA/snapshots/01JQXXXXX", extent_index empty
       ...
     01JQDDDDDDD/
       volume.name                     — "server-2-experiment"
-      volume.parent                   — "01JQCCCCCCC/snapshots/<ulid>"
+      volume.provenance               — signed: parent="01JQCCCCCCC/snapshots/<ulid>", extent_index empty
+      ...
+    01JQEEEEEEE/                      — readonly import layered on ubuntu-22.04
+      volume.name                     — "ubuntu-22.04.1"
+      volume.readonly
+      volume.provenance               — signed: parent="", extent_index=["01JQAAAAAAA/snapshots/01JQXXXXX"]
       ...
   by_name/
     ubuntu-22.04  ->  ../by_id/01JQAAAAAAA
@@ -130,7 +134,27 @@ elide_data/                           — single root (default --data-dir)
     server-2-experiment  ->  ../by_id/01JQDDDDDDD
 ```
 
-The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snapshot-ulid>`, where `<parent-ulid>` is the sibling directory name within `by_id/`. Using ULIDs in `volume.parent` means ancestry links survive renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` resolves `by_id_dir/<parent-ulid>` and follows the chain to the root.
+Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` / `volume.extent_index` files. Provenance is a single signed document recording hostname + canonical path + both lineage relationships under one Ed25519 signature. Tampering with lineage is detectable with the volume's own public key, and the file format is extensible — adding new lineage fields in the future means extending the signed payload rather than dropping more unsigned files into the directory.
+
+Provenance file format:
+
+```
+hostname: build-host-42
+path: /var/elide/by_id/01JQ…
+parent: 01JQAAA…/snapshots/01JQX…    # empty string if no fork parent
+extent_index:
+  01JQBBB…/snapshots/01JQY…
+  01JQCCC…/snapshots/01JQZ…
+sig: <hex-encoded 64-byte Ed25519 signature>
+```
+
+`parent:` is the fork ancestor — a read-path relationship. Fork children CoW against their parent at open time; `walk_ancestors(vol_dir, by_id_dir)` follows the chain from provenance `parent` fields to the root, and the result feeds **both** the LBA map rebuild and the extent index rebuild.
+
+`extent_index:` is a flat list of snapshot references whose extents populate this volume's extent index **only**. Each entry names a snapshot whose hashes are available for dedup (and later delta compression source lookups) but whose data is **never** merged into the LBA map. The child is born with an empty LBA map and writes its own data; source segments are only fetched when a child write references a source hash via `DedupRef`. This means the `extent_index` field provides no read-path fall-through — unused source data is never visible from the child. `walk_extent_ancestors(vol_dir, by_id_dir)` reads the `extent_index` entries from provenance, dedupes by source directory, and returns the list in parallel with `walk_ancestors`. Only the fork chain feeds the LBA map rebuild.
+
+The `extent_index` list is **flat because it is computed at import time, not resolved at attach time**. When a new volume is imported with `--extents-from X`, the coordinator reads `X`'s own provenance (verifying its signature), inherits every entry from `X`'s `extent_index` field, appends `X` itself at its latest snapshot, dedupes by source ULID, and signs the result into the new volume's provenance. Multiple `--extents-from` values contribute their already-flat lists in order. The total is capped at `MAX_EXTENT_INDEX_SOURCES = 32` to bound attach-time cost. When the expanded list exceeds the cap: **explicit sources** (passed directly via `--extents-from`) are sacred and kept in full — if the explicit count alone exceeds the cap, the import is rejected; **inherited entries** fill the remaining slots via "oldest + most recent" pruning, keeping the first-added entry (the base, likely the largest reusable pool) plus as many recently-added entries as fit. Middle inherited entries are dropped with a warning.
+
+Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the signature of each volume's provenance before reading its lineage fields, using the volume's own `volume.pub`. Host and path match are **not** required on ancestor volumes (they may have been pulled from a different host), but the Ed25519 signature still anchors lineage integrity against tampering.
 
 **S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/manifest.toml` and `by_id/<volume-ulid>/volume.pub`. Volume names are indexed at `names/<name>` (plain text ULID), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
 
@@ -145,9 +169,10 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
 - `volume.pub` present in every volume — readonly volumes have only `volume.pub` (no `volume.key`); `serve-volume` verifies provenance against it on every open, writable or not
 - `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
-- `volume.provenance` present in every volume — hostname + canonical path + Ed25519 signature over both; signed by the private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open
+- `volume.provenance` present in every volume — hostname + canonical path + lineage (`parent`, `extent_index`) + Ed25519 signature over all of them; signed by the volume's private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open. Lineage is never stored outside provenance; there are no standalone `volume.parent` / `volume.extent_index` files.
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
-- `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
+- `parent` field set → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`; parent is merged into both the LBA map and the extent index
+- `extent_index` field non-empty → volume lists a flat union of source snapshots; one `<source-ulid>/snapshots/<snapshot-ulid>` per entry; each source is merged into the extent index only, **never** into the LBA map (no read-path fall-through, no data leak); bounded at `MAX_EXTENT_INDEX_SOURCES` entries
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present while an import is in progress (write phase) or in serve phase (handling promote IPC) or was interrupted

@@ -312,6 +312,18 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "detach")]
     fork: Option<String>,
 
+    /// Name of an existing volume whose extent index contributes to the new
+    /// volume's hash pool. Repeat the flag to union multiple sources.
+    ///
+    /// The new volume is written as a fresh import but any 4 KiB block whose
+    /// content hash matches a block in any listed source is recorded as a
+    /// `DedupRef` pointing back at that source's segment. Sources must exist
+    /// locally (with their index files materialised). Source data is never
+    /// merged into the new volume's read path — only its extent index is
+    /// consulted for dedup.
+    #[arg(long = "extents-from")]
+    extents_from: Vec<String>,
+
     /// Start the import in the background and return immediately
     #[arg(long)]
     detach: bool,
@@ -490,8 +502,12 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    if let Err(e) = coordinator_client::import_start(&socket_path, &name, &oci_ref)
-                    {
+                    if let Err(e) = coordinator_client::import_start(
+                        &socket_path,
+                        &name,
+                        &oci_ref,
+                        &import_args.extents_from,
+                    ) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -649,7 +665,7 @@ fn main() {
                 std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
                 let signer = if fork_dir.join(VOLUME_KEY_FILE).exists() {
                     if !force_origin {
-                        elide_core::signing::verify_origin(
+                        elide_core::signing::verify_provenance(
                             &fork_dir,
                             VOLUME_PUB_FILE,
                             VOLUME_PROVENANCE_FILE,
@@ -670,8 +686,13 @@ fn main() {
                         VOLUME_PUB_FILE,
                     )
                     .expect("failed to generate volume keypair");
-                    elide_core::signing::write_origin(&fork_dir, &key, VOLUME_PROVENANCE_FILE)
-                        .expect("failed to write volume.provenance");
+                    elide_core::signing::write_provenance(
+                        &fork_dir,
+                        &key,
+                        VOLUME_PROVENANCE_FILE,
+                        &elide_core::signing::ProvenanceLineage::default(),
+                    )
+                    .expect("failed to write volume.provenance");
                     elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
                         .expect("failed to load volume signing key")
                 };
@@ -870,7 +891,12 @@ fn create_volume(
     std::fs::create_dir_all(vol_dir.join("cache"))?;
 
     let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
-    elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
+    elide_core::signing::write_provenance(
+        &vol_dir,
+        &key,
+        VOLUME_PROVENANCE_FILE,
+        &elide_core::signing::ProvenanceLineage::default(),
+    )?;
 
     let nbd = if let Some(path) = nbd_socket {
         Some(elide_core::config::NbdConfig {
@@ -979,19 +1005,7 @@ fn create_fork(
         )));
     }
 
-    let key =
-        elide_core::signing::generate_keypair(&new_fork_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
-            .map_err(|e| {
-                cleanup(&new_fork_dir, &symlink_path);
-                std::io::Error::other(format!("failed to generate fork keypair: {e}"))
-            })?;
-
-    elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_PROVENANCE_FILE).map_err(
-        |e| {
-            cleanup(&new_fork_dir, &symlink_path);
-            std::io::Error::other(format!("failed to write volume.provenance: {e}"))
-        },
-    )?;
+    // fork_volume wrote keypair + signed provenance already; nothing to add.
 
     println!("{}", new_fork_dir.display());
     if coordinator_client::rescan(socket_path).is_err() {

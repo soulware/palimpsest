@@ -92,12 +92,19 @@ struct CacheInfo {
     ulid: String,
     /// Total entries in the index (all kinds).
     entry_count: usize,
-    /// Entries with body data (non-inline, non-dedup) — the ones that can be fetched.
+    /// Entries of each kind.
+    data_count: usize,
+    dedup_ref_count: usize,
+    zero_count: usize,
+    inline_count: usize,
+    /// Entries with body data (Data + DedupRef) — the ones that can be fetched.
     fetchable_count: usize,
     /// How many fetchable entries have their present bit set.
     present_count: usize,
-    /// Sum of stored_length for all body entries (apparent body size if fully cached).
-    body_bytes_total: u64,
+    /// Sum of stored_length for Data entries only (the unique bytes this segment stores).
+    data_body_bytes: u64,
+    /// Sum of stored_length for DedupRef entries (body bytes referenced from canonical segments).
+    dedup_ref_body_bytes: u64,
     /// Actual disk blocks occupied by the .body sparse file.
     body_bytes_cached: u64,
     error: Option<String>,
@@ -220,23 +227,27 @@ fn print_totals(t: &Totals) {
         );
     }
     if t.cache_files > 0 {
-        let pct = if t.cache_entries > 0 {
+        let pct = if t.cache_fetchable > 0 {
             format!(
                 "{:.1}%",
-                100.0 * t.cache_present as f64 / t.cache_entries as f64
+                100.0 * t.cache_present as f64 / t.cache_fetchable as f64
             )
         } else {
             "0%".to_owned()
         };
         println!(
-            "Cache: {} segment{}  {} entries  {} present ({})  {} on disk / {} total",
+            "Cache: {} segment{}  data {} ({})  dedup_ref {} ({})  zero {}  present {}/{} ({})  body file {} on disk",
             t.cache_files,
             if t.cache_files == 1 { "" } else { "s" },
-            fmt_commas(t.cache_entries as u64),
+            fmt_commas(t.cache_data as u64),
+            fmt_size(t.cache_data_body),
+            fmt_commas(t.cache_dedup_ref as u64),
+            fmt_size(t.cache_dedup_ref_body),
+            fmt_commas(t.cache_zero as u64),
             fmt_commas(t.cache_present as u64),
+            fmt_commas(t.cache_fetchable as u64),
             pct,
             fmt_size(t.cache_body_actual),
-            fmt_size(t.cache_body_total),
         );
     }
 }
@@ -375,9 +386,14 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
             Err(e) => infos.push(CacheInfo {
                 ulid,
                 entry_count: 0,
+                data_count: 0,
+                dedup_ref_count: 0,
+                zero_count: 0,
+                inline_count: 0,
                 fetchable_count: 0,
                 present_count: 0,
-                body_bytes_total: 0,
+                data_body_bytes: 0,
+                dedup_ref_body_bytes: 0,
                 body_bytes_cached: 0,
                 error: Some(e.to_string()),
             }),
@@ -390,15 +406,27 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let (_body_start, entries) = segment::read_segment_index(idx_path)
         .map_err(|e| io::Error::other(format!("reading index: {e}")))?;
 
-    let fetchable_count = entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
-        .count();
-    let body_bytes_total: u64 = entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
-        .map(|e| e.stored_length as u64)
-        .sum();
+    let mut data_count = 0usize;
+    let mut dedup_ref_count = 0usize;
+    let mut zero_count = 0usize;
+    let mut inline_count = 0usize;
+    let mut data_body_bytes = 0u64;
+    let mut dedup_ref_body_bytes = 0u64;
+    for e in &entries {
+        match e.kind {
+            EntryKind::Data => {
+                data_count += 1;
+                data_body_bytes += e.stored_length as u64;
+            }
+            EntryKind::DedupRef => {
+                dedup_ref_count += 1;
+                dedup_ref_body_bytes += e.stored_length as u64;
+            }
+            EntryKind::Zero => zero_count += 1,
+            EntryKind::Inline => inline_count += 1,
+        }
+    }
+    let fetchable_count = data_count + dedup_ref_count;
 
     // Count set bits in .present, capped at fetchable_count to ignore padding
     // bits in the last byte (write_cache sets all bits in the final byte).
@@ -422,9 +450,14 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     Ok(CacheInfo {
         ulid: ulid.to_owned(),
         entry_count: entries.len(),
+        data_count,
+        dedup_ref_count,
+        zero_count,
+        inline_count,
         fetchable_count,
         present_count,
-        body_bytes_total,
+        data_body_bytes,
+        dedup_ref_body_bytes,
         body_bytes_cached,
         error: None,
     })
@@ -439,10 +472,14 @@ struct Totals {
     wal_files: usize,
     wal_records: usize,
     cache_files: usize,
-    cache_entries: usize,
+    cache_data: usize,
+    cache_dedup_ref: usize,
+    cache_zero: usize,
+    cache_fetchable: usize,
     cache_present: usize,
+    cache_data_body: u64,
+    cache_dedup_ref_body: u64,
     cache_body_actual: u64,
-    cache_body_total: u64,
 }
 
 fn totals(node: &NodeInfo) -> Totals {
@@ -462,10 +499,14 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
     }
     for f in &node.cache {
         t.cache_files += 1;
-        t.cache_entries += f.fetchable_count;
+        t.cache_data += f.data_count;
+        t.cache_dedup_ref += f.dedup_ref_count;
+        t.cache_zero += f.zero_count;
+        t.cache_fetchable += f.fetchable_count;
         t.cache_present += f.present_count;
+        t.cache_data_body += f.data_body_bytes;
+        t.cache_dedup_ref_body += f.dedup_ref_body_bytes;
         t.cache_body_actual += f.body_bytes_cached;
-        t.cache_body_total += f.body_bytes_total;
     }
     for child in &node.children {
         accumulate(child, t);
@@ -594,14 +635,38 @@ fn print_cache_section(cache: &[CacheInfo], prefix: &str) {
         } else {
             "0%".to_owned()
         };
+        let indent = format!("{p}  ");
         println!(
-            "{p}{}  {} entries  {} present ({})  {} on disk / {} total body",
+            "{p}{}  {} entries",
             f.ulid,
             fmt_commas(f.entry_count as u64),
+        );
+        println!(
+            "{indent}data:      {:>8}  ({} body)",
+            fmt_commas(f.data_count as u64),
+            fmt_size(f.data_body_bytes),
+        );
+        println!(
+            "{indent}dedup_ref: {:>8}  ({} referenced)",
+            fmt_commas(f.dedup_ref_count as u64),
+            fmt_size(f.dedup_ref_body_bytes),
+        );
+        println!("{indent}zero:      {:>8}", fmt_commas(f.zero_count as u64),);
+        if f.inline_count > 0 {
+            println!(
+                "{indent}inline:    {:>8}",
+                fmt_commas(f.inline_count as u64),
+            );
+        }
+        println!(
+            "{indent}present:   {:>8} / {} fetchable ({})",
             fmt_commas(f.present_count as u64),
+            fmt_commas(f.fetchable_count as u64),
             pct,
+        );
+        println!(
+            "{indent}body file: {} on disk",
             fmt_size(f.body_bytes_cached),
-            fmt_size(f.body_bytes_total),
         );
     }
 }

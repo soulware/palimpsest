@@ -1077,39 +1077,78 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
     write_file_atomic(idx_path, &buf)
 }
 
-/// Copy a segment body into the local cache.
+/// Copy a segment body into the local cache, preserving sparseness.
 ///
-/// Reads `src_path` (a full segment in `pending/` or `gc/`), extracts the body
-/// section, writes it to `body_path` (`cache/<ulid>.body`), and builds a
-/// `.present` bitset marking only DATA entries as present.  DedupRef body
-/// regions are zero-filled placeholders — their `.present` bits are unset so
-/// the read path falls through to the canonical segment via the extent index.
+/// Reads `src_path` (a full segment in `pending/` or `gc/`) and writes
+/// `body_path` (`cache/<ulid>.body`) containing only the Data-entry body bytes
+/// at their stored offsets.  DedupRef and Zero regions are left as OS holes:
+/// `set_len(body_length)` establishes the file size, and only Data entries are
+/// written, so unwritten regions never allocate disk blocks.  The `.present`
+/// bitset marks only Data entries as present; reads of DedupRef ranges fall
+/// through to the canonical segment via the extent index.
 ///
 /// Both files are written via tmp+rename for crash safety. Idempotent: if
 /// `body_path` already exists, the function returns `Ok(())` immediately without
 /// re-reading the source file.
 pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
     if body_path.try_exists()? {
         return Ok(());
     }
-    let data = fs::read(src_path)?;
-    if data.len() < HEADER_LEN as usize {
-        return Err(io::Error::other("segment too short to parse header"));
-    }
-    let entry_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let index_length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-    let inline_length = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    let body_section_start = HEADER_LEN as usize + index_length as usize + inline_length as usize;
-    if data.len() < body_section_start {
-        return Err(io::Error::other("segment truncated before body section"));
-    }
-    write_file_atomic(body_path, &data[body_section_start..])?;
 
-    // Build sparse .present bitset: only Data entries are marked present.
-    // DedupRef body regions are zero-filled placeholders; Zero entries have
-    // no body.  Parse the index section to determine entry kinds.
-    let index_data = &data[HEADER_LEN as usize..HEADER_LEN as usize + index_length as usize];
-    let entries = parse_index_section(index_data, entry_count)?;
+    let mut src = fs::File::open(src_path)?;
+    let mut header = [0u8; HEADER_LEN as usize];
+    src.read_exact(&mut header)?;
+    if &header[0..8] != MAGIC {
+        return Err(io::Error::other("bad segment magic"));
+    }
+    let entry_count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    let index_length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+    let inline_length = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    let body_length = u64::from_le_bytes([
+        header[20], header[21], header[22], header[23], header[24], header[25], header[26],
+        header[27],
+    ]);
+    let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
+
+    let mut index_data = vec![0u8; index_length as usize];
+    src.read_exact(&mut index_data)?;
+    let entries = parse_index_section(&index_data, entry_count)?;
+
+    let tmp = {
+        let mut name = body_path
+            .file_name()
+            .ok_or_else(|| io::Error::other("path has no filename"))?
+            .to_owned();
+        name.push(".tmp");
+        body_path.with_file_name(name)
+    };
+    {
+        let mut dst = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        dst.set_len(body_length)?;
+        for entry in &entries {
+            if entry.kind != EntryKind::Data || entry.stored_length == 0 {
+                continue;
+            }
+            src.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+            dst.seek(SeekFrom::Start(entry.stored_offset))?;
+            // io::copy uses copy_file_range/sendfile/fcopyfile where available,
+            // keeping the extent bytes in the kernel on Linux.
+            let n = io::copy(&mut (&mut src).take(entry.stored_length as u64), &mut dst)?;
+            if n != entry.stored_length as u64 {
+                return Err(io::Error::other("short read promoting segment body"));
+            }
+        }
+        dst.sync_data()?;
+    }
+    fs::rename(&tmp, body_path)?;
+    fsync_dir(body_path)?;
+
     let bitset_len = (entry_count as usize).div_ceil(8);
     let mut bitset = vec![0u8; bitset_len];
     for (i, entry) in entries.iter().enumerate() {
@@ -1767,7 +1806,7 @@ mod tests {
         let path = dir.join("x.present");
 
         // Write a 1-byte file, then set a bit in the (non-existent) second byte.
-        fs::write(&path, &[0u8]).unwrap();
+        fs::write(&path, [0u8]).unwrap();
         set_present_bit(&path, 8, 16).unwrap();
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 2);

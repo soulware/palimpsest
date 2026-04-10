@@ -18,6 +18,7 @@ use std::path::Path;
 
 use ulid::Ulid;
 
+use crate::extentindex::ExtentIndex;
 use crate::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
@@ -102,6 +103,7 @@ pub fn import_image(
     image_path: &Path,
     vol_dir: &Path,
     signer: &dyn SegmentSigner,
+    parent_extent_index: Option<&ExtentIndex>,
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
     // `vol_dir` may already exist (caller may have created it to write key files
@@ -142,11 +144,27 @@ pub fn import_image(
         }
 
         let hash = blake3::hash(&block);
-        let (flags, data) = match maybe_compress(&block) {
-            Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
-            None => (SegmentFlags::empty(), block.to_vec()),
-        };
-        entries.push(SegmentEntry::new_data(hash, lba, 1, flags, data));
+
+        // Parent dedup: if this block's hash already exists in a parent
+        // volume's extent index (populated from `volume.extent_index` by the
+        // caller), emit a thin DedupRef instead of a fresh Data entry. The
+        // parent segment supplies the body bytes at read time.
+        let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
+        if let Some(loc) = parent_hit {
+            entries.push(SegmentEntry::new_dedup_ref(
+                hash,
+                lba,
+                1,
+                loc.body_length,
+                loc.compressed,
+            ));
+        } else {
+            let (flags, data) = match maybe_compress(&block) {
+                Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
+                None => (SegmentFlags::empty(), block.to_vec()),
+            };
+            entries.push(SegmentEntry::new_data(hash, lba, 1, flags, data));
+        }
         batch_raw_bytes += LBA_SIZE;
 
         if batch_raw_bytes >= IMPORT_SEGMENT_BYTES {
@@ -211,7 +229,7 @@ mod tests {
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("testimport");
         let signer = setup_vol_pub(&vol_dir);
-        import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
+        import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
 
         // readonly is now in meta.toml (written by caller, not import_image)
         assert!(!vol_dir.join("readonly").exists());
@@ -264,7 +282,7 @@ mod tests {
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("zeroimport");
         let signer = setup_vol_pub(&vol_dir);
-        import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
+        import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
 
         // All-zero image: no segment files should be written.
         let segs: Vec<_> = fs::read_dir(vol_dir.join("pending")).unwrap().collect();
@@ -280,8 +298,93 @@ mod tests {
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("bad");
         let signer = setup_vol_pub(&vol_dir);
-        let err = import_image(&path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap_err();
+        let err = import_image(&path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("multiple of 4096"));
+    }
+
+    #[test]
+    fn import_with_parent_emits_dedup_refs() {
+        // Parent import writes two distinct data blocks.
+        let b_shared: [u8; LBA_SIZE] = [0xAAu8; LBA_SIZE];
+        let b_parent_only: [u8; LBA_SIZE] = [0xBBu8; LBA_SIZE];
+        let b_child_only: [u8; LBA_SIZE] = [0xCCu8; LBA_SIZE];
+
+        let (_src_parent, parent_image) = make_image(&[&b_shared, &b_parent_only]);
+        let (_src_child, child_image) = make_image(&[&b_shared, &b_child_only]);
+
+        // Parent volume: its own signing key + import.
+        let vol_tmp = TempDir::new().unwrap();
+        let by_id_dir = vol_tmp.path();
+        let parent_dir = by_id_dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let parent_signer = setup_vol_pub(&parent_dir);
+        import_image(
+            &parent_image,
+            &parent_dir,
+            parent_signer.as_ref(),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+
+        // Build the parent's extent index directly from its pending/ segments.
+        // rebuild walks pending/ + index/ + cache/ and verifies signatures
+        // using volume.pub, which setup_vol_pub wrote.
+        let parent_extent_index = crate::extentindex::rebuild(&[(parent_dir.clone(), None)])
+            .expect("parent extent index rebuild");
+        assert!(
+            parent_extent_index
+                .lookup(&blake3::hash(&b_shared))
+                .is_some(),
+            "parent must contain shared-block hash"
+        );
+
+        // Child import reuses the parent's hash pool.
+        let child_dir = by_id_dir.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        let child_signer = setup_vol_pub(&child_dir);
+        import_image(
+            &child_image,
+            &child_dir,
+            child_signer.as_ref(),
+            Some(&parent_extent_index),
+            |_, _| {},
+        )
+        .unwrap();
+
+        // Read the child's segment back and assert: shared block is a
+        // DedupRef, unique block is a Data entry.
+        use crate::segment::EntryKind;
+        let mut pending: Vec<_> = fs::read_dir(child_dir.join("pending"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(pending.len(), 1, "one child segment expected");
+        let seg_path = pending.pop().unwrap().path();
+        let vk = signing::load_verifying_key(&child_dir, signing::VOLUME_PUB_FILE).unwrap();
+        let (_, entries) = segment::read_and_verify_segment_index(&seg_path, &vk).unwrap();
+
+        let shared_hash = blake3::hash(&b_shared);
+        let child_only_hash = blake3::hash(&b_child_only);
+        let shared_entry = entries
+            .iter()
+            .find(|e| e.hash == shared_hash)
+            .expect("shared hash present");
+        assert_eq!(
+            shared_entry.kind,
+            EntryKind::DedupRef,
+            "shared block must be a DedupRef pointing at the parent"
+        );
+        let unique_entry = entries
+            .iter()
+            .find(|e| e.hash == child_only_hash)
+            .expect("child-only hash present");
+        // A fresh block is stored locally as either Data (body) or Inline
+        // (small compressed payload lifted into the index). Either way it is
+        // NOT a DedupRef — the child wrote its own bytes.
+        assert!(
+            matches!(unique_entry.kind, EntryKind::Data | EntryKind::Inline),
+            "child-only block must be stored locally, got {:?}",
+            unique_entry.kind
+        );
     }
 
     #[test]
@@ -296,7 +399,7 @@ mod tests {
         let vol_tmp = TempDir::new().unwrap();
         let vol_dir = vol_tmp.path().join("readable");
         let signer = setup_vol_pub(&vol_dir);
-        import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
+        import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
 
         // Readonly volumes must have volume.pub but not volume.key.
         assert!(

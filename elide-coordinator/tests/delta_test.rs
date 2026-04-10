@@ -108,11 +108,11 @@ fn delta_compression_single_block_mutation() {
         .unwrap()
         .expect("parent state should exist after snapshot");
     assert!(
-        parent_lbamap.len() > 0,
+        !parent_lbamap.is_empty(),
         "parent LBA map should not be empty"
     );
     assert!(
-        source_index.len() > 0,
+        !source_index.is_empty(),
         "source extent index should not be empty"
     );
 
