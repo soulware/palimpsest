@@ -165,15 +165,20 @@ Phase B's additive delta stores the full extent body *and* the delta blob, which
 - Crash recovery mid-compaction with Delta entries present.
 - Rejecting an old format version that encoded delta-of-delta chains (format version bump signals the new invariant).
 
-### Read path: earliest-source preference (Phase A, prerequisite)
+### Read path: delta decompression and source selection (part of Phase C)
 
-The demand-fetch path (`elide-fetch/src/lib.rs`) currently picks a delta source arbitrarily when multiple options resolve locally. **Proposed (Phase A):** prefer an already-cached source; otherwise fall back to the earliest ULID among uncached candidates. Rationale:
+`elide-fetch/src/lib.rs` currently has **no delta decompression path at all**: `fetch_one_extent` ignores `delta_options` entirely and always fetches full body bytes. This is correct for the current state (delta options are produced by the PoC but never consumed), but becomes wrong as soon as Phase B starts writing meaningful deltas, and is a hard blocker for Phase C's thin Delta entries (which have no full body to fall back on).
 
-- Determinism across hosts: the same demand-fetch decision on any host maximises shared-base reuse (fewer distinct source bodies materialised in `cache/` per volume).
-- Already-cached wins trivially: no fetch cost at all.
-- Earliest ULID as the uncached tiebreaker prefers the *oldest shared base*, which is likely to already be present on more hosts and is the most reusable across future delta chains.
+Phase C wires up delta decompression for the first time. The read path for an entry with one or more delta options:
 
-Phase A is a small, standalone change in the delta option scan at `elide-fetch/src/lib.rs:226+`. It is not strictly required for Phase B correctness but is load-bearing on Phase C's reuse model and should land first.
+1. Scan delta options in the order they appear in the entry. For each option:
+   a. Look up `source_hash` in the local extent index.
+   b. If the source segment's body is **already present in local cache** (`.present` bit set for that entry, or source lives in `pending/`/`segments/`), pick this option and stop scanning.
+2. If no option's source was cached, scan again and pick the option whose source segment has the **earliest ULID** — oldest bases are most reusable across future deltas and most likely to be shared with other hosts, giving deterministic cross-host cache-reuse.
+3. Fetch the source body (local read or demand-fetch), fetch the delta blob, zstd-dict decompress → materialised extent bytes → write to `.body` and set the `.present` bit.
+4. If no option resolves at all: for a Data entry with delta options, fall back to fetching the full body from the segment's body section; for a thin Delta entry, return a fetch error (there is no fallback — this is the price of thin delta, and is symmetric with thin DedupRef's dependence on `extent_index.lookup()`).
+
+Already-cached wins trivially (no fetch cost). Earliest-ULID as the uncached tiebreaker is the host-stable choice that maximises shared-base reuse across the fleet: any two hosts fetching the same child extent will pick the same source, so their caches converge on the same set of source bodies rather than fragmenting across many bases.
 
 ## Read path: unchanged
 
@@ -236,11 +241,14 @@ The drain-time delta path validates the end-to-end machinery (computation, segme
 
 **Phase 2a (done):** Import-time extent-source linkage. The `extent_index` field in `volume.provenance` names one or more snapshots whose extents are merged into the child's hash pool (but not into its LBA map). `elide volume import --extents-from <name>` (repeatable) wires this up; blocks whose hash already exists in any listed source are written as `DedupRef` entries during the import block loop. Delivers cross-import dedup; lays the groundwork for filemap-based delta. All lineage is carried in the signed provenance file — no standalone `volume.extent_index` file exists.
 
-**Phase A (Proposed, in progress — Task #9):** Earliest-source demand-fetch preference in `elide-fetch`. Prefer already-cached sources, then earliest ULID among uncached candidates. Small, standalone change; prerequisite for B/C reuse determinism. See §"Read path: earliest-source preference".
+**Phase B (Proposed, in progress — was Phase 2b):** Filemap-based delta at coordinator upload. Load child + source volume filemaps via provenance lineage, path-match changed files, compute zstd deltas against locally-available source extent bodies, append delta blobs to the segment's delta body section. **Additive only** — full body bytes still present. Simultaneously **removes** the existing LBA-based PoC delta path in `drain_pending()`; filemap-based delta becomes the single production delta path at upload time. Phase B's output is not yet exercised on the read path — until Phase C lands, delta blobs on disk are written but never decompressed.
 
-**Phase B (Proposed, in progress — was Phase 2b):** Filemap-based delta at coordinator upload. Load child + source volume filemaps via provenance lineage, path-match changed files, compute zstd deltas against locally-available source extent bodies, append delta blobs to the segment's delta body section. **Additive only** — full body bytes still present. Simultaneously **removes** the existing LBA-based PoC delta path in `drain_pending()`; filemap-based delta becomes the single production delta path at upload time.
+**Phase C (Proposed, in progress):** Thin delta entry kind + delta-aware demand-fetch reader. Two pieces that land together because they share the same source-selection loop:
 
-**Phase C (Proposed, in progress):** Thin delta entry kind. New `EntryKind::Delta` with `stored_offset = 0, stored_length = 0`, mirroring the shape of thin DedupRef. Producer drops the full body when a delta is produced; reader resolves via `extent_index.lookup(source_hash)`. GC preservation and `lba_referenced_hashes` folding follow the DedupRef pattern. See §"Proposed: thin delta entry kind".
+1. **Format:** new `EntryKind::Delta` with `stored_offset = 0, stored_length = 0`, mirroring the shape of thin DedupRef. Producer drops the full body when a delta is produced; GC preservation and `lba_referenced_hashes` folding follow the DedupRef pattern.
+2. **Reader:** first-time implementation of delta decompression in `elide-fetch`. Scan an entry's delta options, pick the first `source_hash` that resolves locally (already-cached preferred; earliest ULID as tiebreaker among uncached candidates), fetch the source body, fetch the delta blob, zstd-dict decompress. Applies to both Data+deltas entries from Phase B and thin Delta entries.
+
+The earliest-source preference was originally scoped as a standalone Phase A, but its natural home is inside the Phase C reader's source-selection loop — there is no pre-existing delta-decompression path in `elide-fetch` to add a preference to. Landing it as part of Phase C means the preference and the decompression logic can be tested against the same producer-consumer fixtures in one pass.
 
 **Phase 3 (deferred):** Snapshot-time coalescing. Parse ext4 metadata at snapshot time to reconstruct file-level extents from fragmented NBD blocks, emit filemaps, and compute deltas against prior snapshots. Extends filemap-based delta to live-write volumes — until this lands, delta is import-only.
 
