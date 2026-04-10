@@ -43,9 +43,13 @@ The file-aware import path:
 
 ### Multi-extent files and LBA mapping
 
-A single file may span non-contiguous physical blocks (multiple ext4 extents). The Elide extent — one hash, one contiguous data blob — represents the entire file's content. But the LBA map needs to know which LBAs this extent covers.
+A single file may span non-contiguous physical blocks (multiple ext4 extents). Each such contiguous LBA range is a **fragment** of the file. For each fragment, the import emits one DATA entry covering that LBA range, with the fragment's own hash (BLAKE3 of the fragment's bytes) and the fragment's bytes as the body.
 
-Each file produces one logical extent (one hash of the full file data) that may map to multiple discontiguous LBA ranges. The import emits one DATA entry for the first contiguous LBA range (carrying the actual file data), and DedupRef entries for the remaining ranges (pointing back to the same content hash at the appropriate byte offset within the extent). This reuses the existing segment format with no changes — DedupRef already exists for exactly this purpose.
+A **contiguous file** (the overwhelming common case for fresh `mkfs.ext4` + extract) produces exactly one DATA entry whose hash equals the whole-file hash and whose block count covers the whole file. A **fragmented file** produces one DATA entry per contiguous LBA range, each with its own fragment-scoped hash.
+
+The segment format is unchanged — these are all normal DATA entries. The knowledge that multiple entries belong to the same file lives only in the filemap (see below); the LBA map and the extent index treat each fragment as an independent extent.
+
+**Delta compression on fragmented files is best-effort.** The filemap records `(path, file_offset, byte_count, hash)` per fragment. At delta-compute time, the coordinator walks the child filemap grouped by path and looks up the same path in the source filemap. If the two fragment layouts match exactly — same set of `(file_offset, byte_count)` tuples — the coordinator pairs fragments by offset and computes per-fragment deltas. If layouts differ, **no delta for this file**; the child fragments are uploaded as full DATA entries with no delta options. Exact dedup still applies opportunistically (any fragment whose hash matches an existing extent in the source pool becomes a DedupRef via the normal Phase 2a path). This is an accepted degradation for an edge case — fragmented layouts are rare for fresh imports, and when they do differ across releases it's usually on large binaries where delta benefit is already marginal.
 
 ### Metadata and free-space blocks
 
@@ -60,20 +64,24 @@ Metadata and directory blocks should still be imported block-by-block at 4 KiB g
 
 A new file per snapshot: `snapshots/<ulid>.filemap`
 
-Maps file path → content hash for every regular file at that snapshot point. Written once at import time, immutable thereafter.
+Maps file path → list of fragment records for every regular file at that snapshot point. Written once at import time, immutable thereafter.
 
-**Format (line-oriented text, one entry per line):**
+**Format (line-oriented text, one entry per fragment):**
 
 ```
-# elide-filemap v1
-<path>\t<blake3-hex>\t<byte_count>
-<path>\t<blake3-hex>\t<byte_count>
+# elide-filemap v2
+<path>\t<file_offset>\t<blake3-hex>\t<byte_count>
+<path>\t<file_offset>\t<blake3-hex>\t<byte_count>
 ...
 ```
 
-Keyed by path because the coordinator's workflow is path-driven: iterate the child filemap by path, look up the same path in the parent filemap, compare hashes. If different, both hashes are known and the coordinator can fetch both extents to compute the delta.
+A **contiguous file** (the common case) appears as a single line with `file_offset = 0` and `byte_count` = file size; the hash is the whole-file hash and equals the segment DATA entry's hash. A **fragmented file** appears as multiple lines with the same path and ascending `file_offset` values covering the file end-to-end; each line's hash is the fragment's own hash (BLAKE3 of just that fragment's bytes) and equals the corresponding segment DATA entry's hash. The fragmentation is determined entirely by how ext4 laid the file out; the filemap records it as-is.
 
-Byte count is included so the coordinator can make size-aware decisions (e.g. skip delta for tiny files where the overhead isn't worth it).
+Keyed by path because the coordinator's workflow is path-driven: iterate the child filemap by path, look up the same path in the parent filemap, compare fragment tuples. If both sides have the same fragment layout, pair by offset and compute per-fragment deltas where hashes differ.
+
+The `file_offset` column makes fragment identity explicit: two fragments at the same path are "the same fragment" if and only if they share `(file_offset, byte_count)`. This is what allows the coordinator to match child and source fragments deterministically without any cross-referencing of ext4 layout metadata.
+
+Byte count is included so the coordinator can make size-aware decisions (e.g. skip delta for tiny fragments where the overhead isn't worth it).
 
 **Properties:**
 - Written once at import time, never modified
