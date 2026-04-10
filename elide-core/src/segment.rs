@@ -1628,6 +1628,21 @@ mod tests {
     }
 
     #[test]
+    fn old_format_version_rejected() {
+        // Segments written with the pre-thin-DedupRef format (magic "\x03")
+        // must be rejected. Per no-compat-by-default, there is no migration
+        // path — users regenerate volumes from their source data.
+        let path = temp_path(".seg");
+        let (_, vk) = test_signer();
+        let mut buf = [0u8; HEADER_LEN as usize];
+        buf[..8].copy_from_slice(b"ELIDSEG\x03");
+        fs::write(&path, buf).unwrap();
+        let err = read_and_verify_segment_index(&path, &vk).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn promote_writes_segment_and_deletes_wal() {
         use crate::writelog;
 
