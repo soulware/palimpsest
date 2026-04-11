@@ -1154,7 +1154,7 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
 /// Used for small metadata files (`origin`, `size`, key material) that are
 /// not large enough to warrant the full segment write path but still need
 /// atomic, durable creation.
-pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+pub fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
     let tmp = {
         let mut name = path
             .file_name()

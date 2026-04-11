@@ -313,18 +313,37 @@ async fn fetch_one_extent(
             Ok(bytes) => {
                 std::fs::create_dir_all(body_dir)?;
 
-                // Write the contiguous batch into .body at the batch start offset.
+                // Durability ordering: write .body bytes and fsync them before
+                // publishing the present bit.  The invariant is "a set present
+                // bit implies the body bytes are durable" — the opposite
+                // reordering (bit durable, bytes still in page cache) would
+                // surface as a silent read of zeros after a crash.  .present is
+                // then written via write_file_atomic (tmp + rename + dir fsync)
+                // so a torn write can't leave a partially updated bitset.
                 let body_path = body_dir.join(format!("{segment_id}.body"));
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&body_path)
-                    .map_err(|e| io::Error::other(format!("open .body: {e}")))?;
-                f.seek(SeekFrom::Start(batch_body_start))
-                    .map_err(|e| io::Error::other(format!("seek .body: {e}")))?;
-                f.write_all(&bytes)
-                    .map_err(|e| io::Error::other(format!("write .body: {e}")))?;
+                let body_is_new = !body_path.exists();
+                {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&body_path)
+                        .map_err(|e| io::Error::other(format!("open .body: {e}")))?;
+                    f.seek(SeekFrom::Start(batch_body_start))
+                        .map_err(|e| io::Error::other(format!("seek .body: {e}")))?;
+                    f.write_all(&bytes)
+                        .map_err(|e| io::Error::other(format!("write .body: {e}")))?;
+                    f.sync_data()
+                        .map_err(|e| io::Error::other(format!("fsync .body: {e}")))?;
+                }
+                // If this call created the .body file, fsync the parent dir so
+                // the new directory entry is durable before the present bit
+                // that references it.
+                if body_is_new {
+                    std::fs::File::open(body_dir)
+                        .and_then(|d| d.sync_all())
+                        .map_err(|e| io::Error::other(format!("fsync body dir: {e}")))?;
+                }
 
                 // Bulk-update .present for all entries in the batch (one read + one write).
                 let entry_count = entries.len() as u32;
@@ -339,7 +358,7 @@ async fn fetch_one_extent(
                 for i in start..=batch_last {
                     new_present[i / 8] |= 1 << (i % 8);
                 }
-                std::fs::write(&present_path, &new_present)
+                segment::write_file_atomic(&present_path, &new_present)
                     .map_err(|e| io::Error::other(format!("write .present: {e}")))?;
 
                 tracing::debug!(

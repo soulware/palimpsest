@@ -1138,4 +1138,15 @@ The `repack` CLI command triggers repacking with a configurable `--min-live-rati
 
 1. **Rollback within a fork.** Not yet designed. Two candidate approaches: (a) discard segments and WAL above target snapshot ULID in-place; (b) fork from the target snapshot and rename.
 
-2. **`fetch_extent` crash-durability gap.** The demand-fetch path in `elide-fetch::fetch_one_extent` writes body bytes into `cache/<id>.body` (seek + `write_all`) and then updates `cache/<id>.present` via a plain `fs::write`, with no `fsync` on either file. The ordering is bytes-then-bit, so the intended recovery is: if a crash leaves the bit unset, the next read re-fetches and rewrites the same bytes idempotently. The hazard is the opposite reordering under storage-level write caching: `.present`'s bit could become durable before the `.body` bytes, producing a "present but empty" extent that reads as zeros. `.present` is also not written via tmp+rename, so a torn write to the bitset file itself is another minor hazard. Neither has been observed in practice — the usual single-drive + ordered-journal setup makes the reordering unlikely — but the path should be tightened: `fsync` `.body` after the write, and route `.present` through `write_file_atomic`. Orthogonal to delta compression; flagged on branch `delta-demand-fetch` while auditing promote/commit ordering.
+### `fetch_extent` durability ordering
+
+The demand-fetch path in `elide-fetch::fetch_one_extent` maintains the invariant "a set present bit implies the body bytes are durable". To enforce it, the fetch writes `cache/<id>.body` and then publishes the present bit in strict order:
+
+1. `write_all` body bytes at `batch_body_start` into `cache/<id>.body`.
+2. `sync_data()` the `.body` file handle — fsync barrier before any bit is published.
+3. If the `.body` file was newly created by this fetch, fsync `cache/` so the directory entry itself is durable.
+4. Build the updated present bitset and write it via `segment::write_file_atomic` (tmp + `sync_data` + rename + parent-dir fsync).
+
+The reverse reordering — present bit durable, body bytes still in the page cache — would surface after a crash as a silent read of zeros, because the LBA map would treat the extent as cached and skip refetching. The fsync at step 2 is the correctness barrier; without it, the filesystem is free to commit `.present` first regardless of syscall order. Routing `.present` through `write_file_atomic` additionally prevents a torn bitset write from losing or inventing bits.
+
+The opposite failure — body bytes durable, present bit not yet published — is harmless: the next read redundantly refetches and rewrites the same bytes idempotently.
