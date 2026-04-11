@@ -2266,7 +2266,8 @@ fn try_read_delta_extent(
         return Ok(false);
     };
     let delta_segment_id = delta_loc.segment_id;
-    let delta_body_offset = delta_loc.delta_body_offset;
+    let delta_body_rel_offset = delta_loc.delta_body_rel_offset;
+    let delta_body_section_start = delta_loc.body_section_start;
     let options = delta_loc.options.clone();
 
     // Pick the first option whose source hash resolves to a DATA/Inline
@@ -2326,22 +2327,37 @@ fn try_read_delta_extent(
     };
 
     // --- Read the delta blob from the Delta segment's delta body section. ---
+    //
+    // The segment file may be a full segment (pending/, gc/*.applied)
+    // or a `cache/<id>.body` file with the delta body appended after
+    // the sparse body section (post-promote shape — see
+    // `promote_to_cache`). `SegmentLayout` tells us which shape we
+    // opened and selects the right seek base.
     let delta_blob: Vec<u8> = {
         let mut cache = file_cache.borrow_mut();
         if cache.get(delta_segment_id).is_none() {
-            // Delta entries need access to the delta body section, which
-            // only exists in full segment files (not in `.idx`/`.body`
-            // cache pairs). Call find_segment with Local so the lookup
-            // falls through to pending/ or segments/ rather than to the
-            // cache .body file.
-            let path = find_segment(delta_segment_id, delta_body_offset, BodySource::Local)?;
+            // Pass BodySource::Local so find_segment considers
+            // cache/<id>.body as a candidate. The `.body` shape now
+            // carries the delta body region when the import host has
+            // promoted it, or when a future demand-fetch extension
+            // writes it. A full pending/ segment is still accepted as
+            // a fallback.
+            let path = find_segment(
+                delta_segment_id,
+                delta_body_section_start,
+                BodySource::Local,
+            )?;
             let layout = SegmentLayout::from_path(&path);
             cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
         }
-        let (_, f) = cache
+        let (layout, f) = cache
             .get(delta_segment_id)
             .expect("delta segment just inserted or found");
-        f.seek(SeekFrom::Start(delta_body_offset + opt.delta_offset))?;
+        let file_delta_base = match layout {
+            SegmentLayout::BodyOnly => delta_body_rel_offset,
+            SegmentLayout::Full => delta_body_section_start + delta_body_rel_offset,
+        };
+        f.seek(SeekFrom::Start(file_delta_base + opt.delta_offset))?;
         let mut buf = vec![0u8; opt.delta_length as usize];
         f.read_exact(&mut buf)?;
         buf

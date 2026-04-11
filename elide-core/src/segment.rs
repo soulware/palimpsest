@@ -5,7 +5,7 @@
 //   [Index section: index_length bytes]   — starts at byte 96
 //   [Inline section: inline_length bytes] — starts at byte 96 + index_length
 //   [Full body: body_length bytes]        — starts at byte 96 + index_length + inline_length
-//   [Delta body: delta_length bytes]      — absent locally (delta_length = 0)
+//   [Delta body: delta_length bytes]      — starts at byte 96 + index_length + inline_length + body_length
 //
 // Header (96 bytes):
 //   0..8   magic         "ELIDSEG\x04"
@@ -13,7 +13,7 @@
 //   12..16 index_length  u32 le
 //   16..20 inline_length u32 le; 0 if no inline data
 //   20..28 body_length   u64 le
-//   28..32 delta_length  u32 le; 0 for locally-stored files
+//   28..32 delta_length  u32 le; 0 if no delta body
 //   32..96 signature     Ed25519 sig over BLAKE3(header[0..32] || index_bytes)
 //
 // Index section layout:
@@ -44,8 +44,12 @@
 // to the body: they carry no body bytes and reserve no space. DedupRef reads
 // resolve through the extent index to the canonical segment's body.
 //
-// Locally-stored files have delta_length = 0. The local file IS the S3 object
-// minus the delta body, which the coordinator appends at upload time.
+// Local segment files and S3 objects use the same format. File-aware imports
+// produce segments with a populated delta body section (elide-import's Phase
+// B2 stage), which is then preserved locally by `promote_to_cache` into
+// `cache/<id>.body` as a contiguous region appended after the sparse body
+// section — the `.body` file mirrors the S3 object's `[body_offset, EOF)`
+// range byte-for-byte.
 //
 // Promotion commit ordering:
 //   1. Build entries in memory from WAL records
@@ -1194,6 +1198,14 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
 /// bitset marks only Data entries as present; reads of DedupRef ranges fall
 /// through to the canonical segment via the extent index.
 ///
+/// If the source segment has a populated delta body section
+/// (`header.delta_length > 0`), that section is appended after the sparse
+/// body region, so the `.body` file shape becomes `[body section |
+/// delta body section]`. This preserves the delta blobs a Delta entry
+/// reader needs, which would otherwise only live in the S3 object. The
+/// appended section is a single contiguous `copy_file_range` — one
+/// kernel-side copy regardless of how many delta blobs it contains.
+///
 /// Both files are written via tmp+rename for crash safety. Idempotent: if
 /// `body_path` already exists, the function returns `Ok(())` immediately without
 /// re-reading the source file.
@@ -1217,6 +1229,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         header[20], header[21], header[22], header[23], header[24], header[25], header[26],
         header[27],
     ]);
+    let delta_length = u32::from_le_bytes([header[28], header[29], header[30], header[31]]) as u64;
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
     let mut index_data = vec![0u8; index_length as usize];
@@ -1237,7 +1250,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             .create(true)
             .truncate(true)
             .open(&tmp)?;
-        dst.set_len(body_length)?;
+        dst.set_len(body_length + delta_length)?;
         for entry in &entries {
             if entry.kind != EntryKind::Data || entry.stored_length == 0 {
                 continue;
@@ -1249,6 +1262,14 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             let n = io::copy(&mut (&mut src).take(entry.stored_length as u64), &mut dst)?;
             if n != entry.stored_length as u64 {
                 return Err(io::Error::other("short read promoting segment body"));
+            }
+        }
+        if delta_length > 0 {
+            src.seek(SeekFrom::Start(body_section_start + body_length))?;
+            dst.seek(SeekFrom::Start(body_length))?;
+            let n = io::copy(&mut (&mut src).take(delta_length), &mut dst)?;
+            if n != delta_length {
+                return Err(io::Error::other("short read promoting delta body"));
             }
         }
         dst.sync_data()?;

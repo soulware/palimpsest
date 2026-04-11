@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use elide_core::config::VolumeConfig;
 use elide_core::segment::{
-    DeltaOption, SegmentEntry, SegmentFlags, SegmentSigner, write_segment,
-    write_segment_with_delta_body,
+    DeltaOption, SegmentEntry, SegmentFlags, SegmentSigner, extract_idx, promote_to_cache,
+    write_segment, write_segment_with_delta_body,
 };
 use elide_core::signing;
 use elide_core::volume::ReadonlyVolume;
@@ -128,6 +128,102 @@ fn delta_entry_end_to_end_decompression() {
 
     // Also: reading the parent LBA should return the parent bytes
     // (sanity check that the normal DATA path still works).
+    let parent_read = vol.read(0, 1).unwrap();
+    assert_eq!(parent_read, parent_bytes);
+}
+
+/// Drained-cache regression for Phase B2/C: after both segments
+/// are promoted into the `index/` + `cache/` three-file shape and
+/// `pending/` is cleared, the Delta LBA must still round-trip via
+/// the cache/<id>.body file's appended delta body section.
+#[test]
+fn delta_entry_roundtrip_from_drained_cache() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    fs::create_dir_all(vol_dir.join("index")).unwrap();
+
+    let parent_bytes = vec![0x55u8; 4096];
+    let parent_hash = blake3::hash(&parent_bytes);
+
+    let mut child_bytes = vec![0x55u8; 4096];
+    for (i, byte) in child_bytes.iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+
+    // ── Parent segment: one DATA entry with the parent bytes.
+    let parent_seg_ulid = Ulid::new();
+    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let mut parent_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        1,
+        SegmentFlags::empty(),
+        parent_bytes.clone(),
+    )];
+    write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
+
+    // ── Delta segment: one Delta entry pointing at the parent hash.
+    let delta_seg_ulid = Ulid::new();
+    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_option = DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+    };
+    let mut delta_entries = vec![SegmentEntry::new_delta(
+        child_hash,
+        10,
+        1,
+        vec![delta_option],
+    )];
+    write_segment_with_delta_body(
+        &delta_seg_path,
+        &mut delta_entries,
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    // ── Drain both segments into the `index/` + `cache/` shape,
+    // mirroring what the coordinator does post-upload.
+    for ulid in [parent_seg_ulid, delta_seg_ulid] {
+        let pending = vol_dir.join(format!("pending/{ulid}"));
+        let idx = vol_dir.join(format!("index/{ulid}.idx"));
+        let body = vol_dir.join(format!("cache/{ulid}.body"));
+        let present = vol_dir.join(format!("cache/{ulid}.present"));
+        fs::create_dir_all(vol_dir.join("cache")).unwrap();
+        extract_idx(&pending, &idx).unwrap();
+        promote_to_cache(&pending, &body, &present).unwrap();
+        fs::remove_file(&pending).unwrap();
+    }
+
+    // The delta-segment's `.body` file must now contain both the
+    // (empty) body section and the delta body appended after, so
+    // its file size equals body_length + delta_length.
+    let delta_body_file = vol_dir.join(format!("cache/{delta_seg_ulid}.body"));
+    let sz = fs::metadata(&delta_body_file).unwrap().len();
+    assert_eq!(
+        sz,
+        delta_blob.len() as u64,
+        "delta segment's .body file should hold delta body section"
+    );
+
+    // Snapshot marker on the post-drain volume.
+    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+
+    // ── Read the Delta LBA. Extent-index rebuild must register the
+    // Delta entry from the cached path, and the reader must resolve
+    // through the `.body` file's delta body region.
+    let vol = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
+    let bytes = vol.read(10, 1).unwrap();
+    assert_eq!(bytes, child_bytes, "post-drain delta read must round-trip");
+
+    // Parent LBA still round-trips too.
     let parent_read = vol.read(0, 1).unwrap();
     assert_eq!(parent_read, parent_bytes);
 }
