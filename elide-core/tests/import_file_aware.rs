@@ -142,7 +142,7 @@ fn import_emits_file_sized_extents_and_filemap_v2() {
 
     // Two regular files of different sizes; a small config file likely
     // fits in one block, the larger binary fits in several.
-    let small = b"hello world\n".repeat(1); // 12 bytes, one-block fragment
+    let small = b"hello world\n".to_vec(); // 12 bytes, one-block fragment
     let medium = vec![0xABu8; 40_000]; // ~10 blocks
     fs::write(rootfs.join("greeting"), &small).unwrap();
     fs::write(rootfs.join("blob"), &medium).unwrap();

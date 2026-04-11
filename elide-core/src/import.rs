@@ -22,13 +22,14 @@
 // standard tmp-rename commit pattern.
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use ulid::Ulid;
 
 use crate::ext4_scan::{self, Ext4Scan, FileFragment};
 use crate::extentindex::ExtentIndex;
+use crate::filemap::{self, FilemapRow};
 use crate::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
@@ -268,43 +269,12 @@ pub fn import_image(
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
     // Write the filemap alongside the snapshot marker.
-    write_filemap(&snapshots_dir, &snap_ulid, &filemap_rows)?;
+    filemap::write(&snapshots_dir, &snap_ulid, &filemap_rows)?;
 
     // Write size into volume.toml (read-modify-write to preserve name if already set).
     let mut cfg = crate::config::VolumeConfig::read(vol_dir)?;
     cfg.size = Some(image_size);
     cfg.write(vol_dir)?;
 
-    Ok(())
-}
-
-struct FilemapRow {
-    path: String,
-    file_offset: u64,
-    hash: blake3::Hash,
-    byte_count: u64,
-}
-
-fn write_filemap(snapshots_dir: &Path, snap_ulid: &str, rows: &[FilemapRow]) -> io::Result<()> {
-    // Sort for deterministic output: by (path, file_offset) so a file's
-    // fragments appear in logical order and two imports of similar
-    // images produce byte-identical filemaps modulo content.
-    let mut sorted: Vec<&FilemapRow> = rows.iter().collect();
-    sorted.sort_by(|a, b| a.path.cmp(&b.path).then(a.file_offset.cmp(&b.file_offset)));
-
-    let path = snapshots_dir.join(format!("{snap_ulid}.filemap"));
-    let mut out = fs::File::create(&path)?;
-    writeln!(out, "# elide-filemap v2")?;
-    for row in sorted {
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{}",
-            row.path,
-            row.file_offset,
-            row.hash.to_hex(),
-            row.byte_count
-        )?;
-    }
-    out.flush()?;
     Ok(())
 }
