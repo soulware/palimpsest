@@ -174,11 +174,17 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Create a new volume branched from the latest snapshot of the source volume
+    /// Create a new volume branched from the latest snapshot of a source volume.
+    ///
+    /// `--from` accepts either a local volume name (branches from that
+    /// volume's latest snapshot) or an explicit `<vol_ulid>/<snap_ulid>`
+    /// which pins the branch point to a specific snapshot. The ULID form
+    /// resolves the source in `by_id/` first and falls back to `readonly/`,
+    /// so it works for volumes that exist only as pulled readonly ancestors.
     Fork {
         /// Name for the new volume
         fork_name: String,
-        /// Source volume to branch from
+        /// Source to branch from: `<name>` or `<vol_ulid>/<snap_ulid>`
         #[arg(long)]
         from: String,
     },
@@ -933,15 +939,18 @@ fn create_volume(
     Ok(())
 }
 
-/// Create a new volume forked from the latest snapshot of `from_name`.
+/// Create a new volume forked from a source, specified either by name or by
+/// explicit `<vol_ulid>/<snap_ulid>`.
 ///
-/// Takes an implicit snapshot of the source, creates a new `by_id/<ulid>/`
-/// directory, writes the fork keypair and provenance, creates the `by_name/`
-/// symlink, and signals the coordinator to rescan.
+/// Name form: takes an implicit snapshot of the source and branches from it.
+/// ULID form: resolves the source in `by_id/` first, then `readonly/`, and
+/// pins the branch point to the explicit snapshot ULID without taking a new
+/// snapshot of the source (required because readonly ancestors are not
+/// writable).
 fn create_fork(
     data_dir: &Path,
     fork_name: &str,
-    from_name: &str,
+    from: &str,
     socket_path: &Path,
     by_id_dir: &Path,
 ) -> std::io::Result<()> {
@@ -955,16 +964,46 @@ fn create_fork(
         )));
     }
 
-    let source_fork_dir = resolve_volume_dir(data_dir, from_name);
+    // Parse `from`: either `<vol_ulid>/<snap_ulid>` (explicit pin) or a
+    // plain volume name resolved via `by_name/`.
+    let explicit_pin: Option<(ulid::Ulid, ulid::Ulid)> = if let Some((vol, snap)) =
+        from.split_once('/')
+    {
+        let vol = ulid::Ulid::from_string(vol)
+            .map_err(|e| std::io::Error::other(format!("invalid volume ULID in --from: {e}")))?;
+        let snap = ulid::Ulid::from_string(snap)
+            .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
+        Some((vol, snap))
+    } else {
+        None
+    };
+
+    let source_fork_dir = if let Some((vol_ulid, _)) = explicit_pin {
+        let ulid_str = vol_ulid.to_string();
+        let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
+        if !dir.exists() {
+            return Err(std::io::Error::other(format!(
+                "source volume {ulid_str} not found locally; run `elide volume remote pull {ulid_str}` first"
+            )));
+        }
+        dir
+    } else {
+        resolve_volume_dir(data_dir, from)
+    };
+
     if source_fork_dir.join("import.lock").exists() {
         return Err(std::io::Error::other(format!(
-            "volume '{from_name}' is still importing; wait for import to complete before forking"
+            "volume '{from}' is still importing; wait for import to complete before forking"
         )));
     }
 
-    // Take an implicit snapshot so the fork branches from "now".
-    // Idempotent if the tip is already snapshotted.
-    snapshot_volume(&source_fork_dir, by_id_dir)?;
+    // Take an implicit snapshot of the source so the fork branches from "now"
+    // — but only for the name-based path. For explicit ULID pins the source
+    // is typically a readonly ancestor (so snapshotting is impossible), and
+    // the caller already chose a specific snapshot ULID.
+    if explicit_pin.is_none() {
+        snapshot_volume(&source_fork_dir, by_id_dir)?;
+    }
 
     let new_vol_ulid = ulid::Ulid::new().to_string();
     let new_fork_dir = data_dir.join("by_id").join(&new_vol_ulid);
@@ -974,7 +1013,14 @@ fn create_fork(
         let _ = std::fs::remove_dir_all(new_fork_dir);
     };
 
-    volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
+    match explicit_pin {
+        Some((_, snap_ulid)) => {
+            volume::fork_volume_at(&new_fork_dir, &source_fork_dir, snap_ulid)?;
+        }
+        None => {
+            volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
+        }
+    }
 
     let src_cfg = elide_core::config::VolumeConfig::read(&source_fork_dir).map_err(|e| {
         cleanup(&new_fork_dir, &symlink_path);

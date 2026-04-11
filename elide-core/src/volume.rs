@@ -2837,6 +2837,32 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
 ///
 /// Returns `Ok(())` on success; `new_fork_dir` must not already exist.
 pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()> {
+    let branch_ulid = latest_snapshot(source_fork_dir)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "source volume '{}' has no snapshots; run snapshot-volume first",
+            source_fork_dir.display()
+        ))
+    })?;
+    fork_volume_at(new_fork_dir, source_fork_dir, branch_ulid)
+}
+
+/// Like `fork_volume` but pins the fork to an explicit snapshot ULID.
+///
+/// Used by `volume fork --from <vol_ulid>/<snap_ulid>` when the caller
+/// wants the branch point to be something other than the source volume's
+/// latest snapshot — typically because the source is a pulled readonly
+/// ancestor and the caller has a specific snapshot ULID in mind.
+///
+/// The snapshot is **not** required to exist as a local file: a pulled
+/// readonly ancestor may not have its snapshot markers prefetched yet at
+/// the time of forking. The snapshot ULID is still recorded in the child's
+/// signed provenance and will be resolved at open time once prefetch has
+/// populated the ancestor's `snapshots/` directory.
+pub fn fork_volume_at(
+    new_fork_dir: &Path,
+    source_fork_dir: &Path,
+    branch_ulid: Ulid,
+) -> io::Result<()> {
     if new_fork_dir.exists() {
         return Err(io::Error::other(format!(
             "fork directory '{}' already exists",
@@ -2851,11 +2877,12 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::other("source fork dir has no name"))?;
-
-    let branch_ulid = latest_snapshot(source_fork_dir)?.ok_or_else(|| {
+    // Validate the source directory name really is a ULID before we embed
+    // it in the child's provenance as an ancestor reference.
+    Ulid::from_string(source_ulid).map_err(|e| {
         io::Error::other(format!(
-            "source volume '{}' has no snapshots; run snapshot-volume first",
-            source_fork_dir.display()
+            "source fork dir name is not a ULID ({}): {e}",
+            source_real.display()
         ))
     })?;
 
@@ -5325,6 +5352,47 @@ mod tests {
         fs::create_dir_all(&root_dir).unwrap();
         let err = fork_volume(&child_dir, &root_dir).unwrap_err();
         assert!(err.to_string().contains("no snapshots"), "{err}");
+    }
+
+    #[test]
+    fn fork_volume_at_pins_explicit_snapshot_without_requiring_local_marker() {
+        // Simulate forking from a readonly ancestor: the source dir exists
+        // but has no snapshots/ directory (prefetch hasn't landed yet). The
+        // explicit pin must still succeed and be recorded in provenance.
+        let by_id = temp_dir();
+        let source_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let source_dir = by_id.join(source_ulid);
+        let child_dir = by_id.join(child_ulid);
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let branch_ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        fork_volume_at(&child_dir, &source_dir, branch_ulid).unwrap();
+
+        let lineage = crate::signing::read_lineage_verifying_signature(
+            &child_dir,
+            crate::signing::VOLUME_PUB_FILE,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        assert_eq!(
+            lineage.parent.as_deref(),
+            Some(format!("{source_ulid}/snapshots/{branch_ulid}").as_str()),
+        );
+
+        fs::remove_dir_all(by_id).unwrap();
+    }
+
+    #[test]
+    fn fork_volume_at_rejects_non_ulid_source_dir() {
+        let tmp = temp_dir();
+        let source_dir = tmp.join("not-a-ulid");
+        let child_dir = tmp.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        fs::create_dir_all(&source_dir).unwrap();
+        let branch_ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let err = fork_volume_at(&child_dir, &source_dir, branch_ulid).unwrap_err();
+        assert!(err.to_string().contains("ULID"), "{err}");
+        fs::remove_dir_all(tmp).ok();
     }
 
     #[test]

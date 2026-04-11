@@ -27,6 +27,15 @@ Key references:
 - Import sets `volume.readonly` at spawn: `elide-coordinator/src/import.rs:292`
 - Remote pull (to be rewritten): `src/main.rs:1247` (currently conditional — already edited on branch to be unconditional, but will move under the layout refactor)
 
+## Status
+
+Phases 1a, 1b, 1c, and 2 are implemented on this branch. See
+`git log fork-from-remote ^main` for the commits. Key tests:
+- `walk_ancestors_crosses_into_readonly_tree` (elide-core)
+- `discover_volumes_scans_readonly_tree` (elide-coordinator)
+- `prefetch_indexes_writes_readonly_ancestor_idx` (elide-coordinator)
+- `fork_volume_at_pins_explicit_snapshot_without_requiring_local_marker` (elide-core)
+
 ## Phases
 
 ### Phase 0 — confirmed cause, no code
