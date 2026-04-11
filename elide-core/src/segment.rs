@@ -1226,9 +1226,13 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
 /// size = body_length) and a pull host can demand-fetch just the
 /// delta region by creating `.delta` without touching `.body`.
 ///
-/// All files are written via tmp+rename for crash safety. Idempotent:
-/// if `body_path` already exists, the function returns `Ok(())`
-/// immediately without re-reading the source file.
+/// All files are written via tmp+rename for crash safety. `.body` is
+/// written **last** so its existence acts as a commit marker for the
+/// whole promote — any crash before the final rename is recovered by
+/// re-running the promote, since the idempotence guard at the top
+/// only triggers once `.body` is in place. Callers can therefore
+/// trust that if `body_path` exists, `.delta` (when `delta_length >
+/// 0`) and `.present` also exist.
 pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
 
@@ -1256,6 +1260,9 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     src.read_exact(&mut index_data)?;
     let entries = parse_index_section(&index_data, entry_count)?;
 
+    // Build the sparse body in a temp file but do not rename yet —
+    // the rename is the last step so `.body`'s existence implies
+    // `.delta` and `.present` are both already committed.
     let body_tmp = {
         let mut name = body_path
             .file_name()
@@ -1286,9 +1293,9 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         }
         dst.sync_data()?;
     }
-    fs::rename(&body_tmp, body_path)?;
-    fsync_dir(body_path)?;
 
+    // Commit .delta first so that once .body appears, .delta is
+    // guaranteed to be in place.
     if delta_length > 0 {
         let delta_path = body_path.with_extension("delta");
         let delta_tmp = {
@@ -1316,6 +1323,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         fsync_dir(&delta_path)?;
     }
 
+    // Commit .present next, still before .body.
     let bitset_len = (entry_count as usize).div_ceil(8);
     let mut bitset = vec![0u8; bitset_len];
     for (i, entry) in entries.iter().enumerate() {
@@ -1323,7 +1331,15 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             bitset[i / 8] |= 1 << (i % 8);
         }
     }
-    write_file_atomic(present_path, &bitset)
+    write_file_atomic(present_path, &bitset)?;
+
+    // Final rename makes the whole promote visible atomically — any
+    // crash before this point leaves the old state intact and the
+    // next promote re-runs from scratch.
+    fs::rename(&body_tmp, body_path)?;
+    fsync_dir(body_path)?;
+
+    Ok(())
 }
 
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
