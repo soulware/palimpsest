@@ -2526,8 +2526,27 @@ pub(crate) fn find_segment_in_dirs(
         }
     }
     if let (Some(fetcher), BodySource::Cached(idx)) = (fetcher, body_source) {
-        let index_dir = base_dir.join("index");
-        let body_dir = base_dir.join("cache");
+        // The segment's `.idx` file lives in the index directory of whichever
+        // volume wrote it — self for locally-written segments, an ancestor
+        // for fork-parent segments. Search self first, then the ancestor
+        // chain (in the same order rebuild_segments merges), and use that
+        // volume's dirs so the fetched body lands in the owner's `cache/`
+        // (where subsequent reads will find it via the ancestor scan above).
+        let idx_filename = format!("{sid}.idx");
+        let owner_dir = std::iter::once(base_dir)
+            .chain(ancestor_layers.iter().map(|l| l.dir.as_path()))
+            .find(|dir| dir.join("index").join(&idx_filename).exists())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "segment index not found in self or ancestors: {sid}.idx \
+                         (ancestor chain may not be prefetched yet)"
+                    ),
+                )
+            })?;
+        let index_dir = owner_dir.join("index");
+        let body_dir = owner_dir.join("cache");
         fetcher.fetch_extent(
             segment_id,
             &index_dir,
@@ -2539,7 +2558,7 @@ pub(crate) fn find_segment_in_dirs(
                 entry_idx: idx,
             },
         )?;
-        return Ok(base_dir.join("cache").join(format!("{sid}.body")));
+        return Ok(body_dir.join(format!("{sid}.body")));
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
 }
@@ -5731,6 +5750,180 @@ mod tests {
         assert_eq!(rv.read(0, 1).unwrap(), ancestor_data);
 
         fs::remove_dir_all(by_id).unwrap();
+    }
+
+    /// Regression test for the fork-from-remote demand-fetch bug: when a
+    /// forked child needs to demand-fetch a segment that belongs to an
+    /// ancestor, `find_segment_in_dirs` must route the fetcher at the
+    /// ancestor's `index/` and `cache/` directories — not the child's.
+    /// The child's `index/` does not hold ancestor `.idx` files in the
+    /// `readonly/` layout, so using the child's dirs fails with ENOENT on
+    /// the very first read. See docs/fork-from-remote-plan.md phase 1c.
+    #[test]
+    fn find_segment_in_dirs_routes_fetcher_at_ancestor_index_dir() {
+        use crate::extentindex::BodySource;
+        use std::sync::Mutex;
+
+        struct OwnerAssertingFetcher {
+            captured: Mutex<Option<(PathBuf, PathBuf)>>,
+        }
+
+        impl crate::segment::SegmentFetcher for OwnerAssertingFetcher {
+            fn fetch_extent(
+                &self,
+                segment_id: Ulid,
+                index_dir: &Path,
+                body_dir: &Path,
+                _extent: &crate::segment::ExtentFetch,
+            ) -> io::Result<()> {
+                *self.captured.lock().unwrap() = Some((index_dir.to_owned(), body_dir.to_owned()));
+                // Simulate a successful fetch: write the body file where
+                // the caller expects to find it on return.
+                std::fs::create_dir_all(body_dir)?;
+                std::fs::write(body_dir.join(format!("{segment_id}.body")), b"fake body")?;
+                Ok(())
+            }
+
+            fn fetch_delta_body(
+                &self,
+                _segment_id: Ulid,
+                _index_dir: &Path,
+                _body_dir: &Path,
+            ) -> io::Result<()> {
+                Err(io::Error::other("unused"))
+            }
+        }
+
+        let tmp = temp_dir();
+        let child_dir = tmp.join("child");
+        let ancestor_dir = tmp.join("ancestor");
+        std::fs::create_dir_all(child_dir.join("index")).unwrap();
+        std::fs::create_dir_all(ancestor_dir.join("index")).unwrap();
+
+        // Only the ancestor holds the segment's `.idx`, matching the
+        // fork-from-remote layout where each volume's signed index lives
+        // in its own `index/` directory. Content is irrelevant — the
+        // routing code only checks existence.
+        let seg_ulid = Ulid::new();
+        let idx_name = format!("{seg_ulid}.idx");
+        std::fs::write(ancestor_dir.join("index").join(&idx_name), b"stub").unwrap();
+
+        let layers = vec![AncestorLayer {
+            dir: ancestor_dir.clone(),
+            branch_ulid: None,
+        }];
+        let concrete = Arc::new(OwnerAssertingFetcher {
+            captured: Mutex::new(None),
+        });
+        let fetcher: BoxFetcher = concrete.clone();
+
+        let returned = find_segment_in_dirs(
+            seg_ulid,
+            &child_dir,
+            &layers,
+            Some(&fetcher),
+            0,
+            BodySource::Cached(0),
+        )
+        .expect("fetcher should have been routed at the ancestor's dirs");
+
+        // The body must land under the ancestor, not the child.
+        assert_eq!(
+            returned,
+            ancestor_dir.join("cache").join(format!("{seg_ulid}.body")),
+        );
+        assert!(
+            !child_dir
+                .join("cache")
+                .join(format!("{seg_ulid}.body"))
+                .exists(),
+            "body must not be written under the child's cache dir"
+        );
+
+        // And the fetcher itself must have been called with the ancestor's
+        // dirs — this is what the pre-fix code got wrong.
+        let (idx_dir, body_dir) = concrete
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("fetcher must be called");
+        assert_eq!(idx_dir, ancestor_dir.join("index"));
+        assert_eq!(body_dir, ancestor_dir.join("cache"));
+
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// Complement to the previous test: when the child itself owns the
+    /// segment (its own `index/` holds the `.idx`), the fetcher must be
+    /// routed at the child's own dirs even if an ancestor is present.
+    #[test]
+    fn find_segment_in_dirs_prefers_self_over_ancestor_when_self_owns_idx() {
+        use crate::extentindex::BodySource;
+        use std::sync::Mutex;
+
+        struct CaptureFetcher {
+            captured: Mutex<Option<PathBuf>>,
+        }
+        impl crate::segment::SegmentFetcher for CaptureFetcher {
+            fn fetch_extent(
+                &self,
+                segment_id: Ulid,
+                index_dir: &Path,
+                body_dir: &Path,
+                _extent: &crate::segment::ExtentFetch,
+            ) -> io::Result<()> {
+                *self.captured.lock().unwrap() = Some(index_dir.to_owned());
+                std::fs::create_dir_all(body_dir)?;
+                std::fs::write(body_dir.join(format!("{segment_id}.body")), b"")?;
+                Ok(())
+            }
+            fn fetch_delta_body(&self, _: Ulid, _: &Path, _: &Path) -> io::Result<()> {
+                Err(io::Error::other("unused"))
+            }
+        }
+
+        let tmp = temp_dir();
+        let child_dir = tmp.join("child");
+        let ancestor_dir = tmp.join("ancestor");
+        std::fs::create_dir_all(child_dir.join("index")).unwrap();
+        std::fs::create_dir_all(ancestor_dir.join("index")).unwrap();
+
+        let seg_ulid = Ulid::new();
+        let idx_name = format!("{seg_ulid}.idx");
+        // Both self and ancestor have the `.idx`; self must win.
+        std::fs::write(child_dir.join("index").join(&idx_name), b"stub").unwrap();
+        std::fs::write(ancestor_dir.join("index").join(&idx_name), b"stub").unwrap();
+
+        let layers = vec![AncestorLayer {
+            dir: ancestor_dir.clone(),
+            branch_ulid: None,
+        }];
+        let concrete = Arc::new(CaptureFetcher {
+            captured: Mutex::new(None),
+        });
+        let fetcher: BoxFetcher = concrete.clone();
+
+        let returned = find_segment_in_dirs(
+            seg_ulid,
+            &child_dir,
+            &layers,
+            Some(&fetcher),
+            0,
+            BodySource::Cached(0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            returned,
+            child_dir.join("cache").join(format!("{seg_ulid}.body")),
+        );
+        assert_eq!(
+            concrete.captured.lock().unwrap().clone().unwrap(),
+            child_dir.join("index")
+        );
+
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
