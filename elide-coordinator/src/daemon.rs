@@ -33,7 +33,7 @@ use crate::config::CoordinatorConfig;
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
-use elide_coordinator::EvictRegistry;
+use elide_coordinator::{EvictRegistry, SnapshotLockRegistry, new_snapshot_lock_registry};
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
     let drain_interval = Duration::from_secs(config.drain.interval_secs);
@@ -75,6 +75,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // Per-fork eviction channel registry.
     let evict_registry: EvictRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // Per-fork snapshot lock registry (shared by the snapshot inbound handler
+    // and every per-volume tick loop via try_lock).
+    let snapshot_locks: SnapshotLockRegistry = new_snapshot_lock_registry();
+
     // Spawn the inbound socket server.
     {
         let data_dir = data_dir.clone();
@@ -82,8 +86,20 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         let registry = import_registry.clone();
         let bin = elide_import_bin.clone();
         let evict_reg = evict_registry.clone();
+        let snap_locks = snapshot_locks.clone();
+        let store = store.clone();
         tokio::spawn(async move {
-            inbound::serve(&socket_path, data_dir, notify, registry, bin, evict_reg).await;
+            inbound::serve(
+                &socket_path,
+                data_dir,
+                notify,
+                registry,
+                bin,
+                evict_reg,
+                snap_locks,
+                store,
+            )
+            .await;
         });
     }
 
@@ -135,6 +151,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     drain_interval,
                     gc_config.clone(),
                     evict_rx,
+                    snapshot_locks.clone(),
                 ));
 
                 // Readonly volumes (imported bases) have no live process —

@@ -26,6 +26,7 @@ use crate::control;
 use crate::gc;
 use crate::prefetch;
 use crate::upload;
+use crate::{SnapshotLockRegistry, snapshot_lock_for};
 
 /// Name of the import lock file inside a volume directory.
 /// Present while an import job is actively writing to the volume; drain and GC
@@ -97,6 +98,7 @@ pub async fn run_volume_tasks(
     drain_interval: Duration,
     gc_config: GcConfig,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
+    snapshot_locks: SnapshotLockRegistry,
 ) {
     let volume_id = match upload::derive_names(&fork_dir) {
         Ok(id) => id,
@@ -201,6 +203,22 @@ pub async fn run_volume_tasks(
         if fork_dir.join(IMPORT_LOCK_FILE).exists() && !fork_dir.join("control.sock").exists() {
             continue;
         }
+
+        // Skip drain/GC while a snapshot is in flight for this volume. The
+        // snapshot handler holds this lock for its full sequence (flush →
+        // drain → sign manifest → upload); racing the tick loop against it
+        // would reorder pending/ uploads against the manifest's index view.
+        let snap_lock = snapshot_lock_for(&snapshot_locks, &fork_dir).await;
+        let _tick_guard = match snap_lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::debug!(
+                    "[coordinator] skipping tick for {}: snapshot in flight",
+                    fork_dir.display()
+                );
+                continue;
+            }
+        };
 
         // Steps 1-3: compact pending segments via volume IPC (best-effort;
         // skipped silently if the control socket is absent so that upload

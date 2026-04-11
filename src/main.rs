@@ -402,16 +402,13 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Snapshot { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                match snapshot_volume(&vol_dir, &by_id_dir) {
-                    Ok(ulid) => println!("{ulid}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
+            VolumeCommand::Snapshot { name } => match snapshot_volume(&args.data_dir, &name) {
+                Ok(ulid) => println!("{ulid}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
                 }
-            }
+            },
 
             VolumeCommand::Fork { fork_name, from } => {
                 if let Err(e) = validate_volume_name(&fork_name) {
@@ -783,34 +780,17 @@ fn main() {
     }
 }
 
-/// Snapshot a volume: uses the control socket if the volume is live,
-/// falls back to direct open if not running.  Returns the snapshot ULID.
-fn snapshot_volume(vol_dir: &Path, by_id_dir: &Path) -> std::io::Result<String> {
-    use std::io::{self, BufRead, Write};
-    use std::os::unix::net::UnixStream;
-    match UnixStream::connect(vol_dir.join("control.sock")) {
-        Ok(mut stream) => {
-            writeln!(stream, "snapshot")?;
-            stream.flush()?;
-            let mut reader = io::BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            let line = line.trim();
-            line.strip_prefix("ok ")
-                .map(|u| u.trim().to_owned())
-                .ok_or_else(|| io::Error::other(format!("snapshot failed: {line}")))
-        }
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) =>
-        {
-            let mut vol = volume::Volume::open(vol_dir, by_id_dir)?;
-            vol.snapshot().map(|u| u.to_string())
-        }
-        Err(e) => Err(e),
-    }
+/// Snapshot a volume by asking the coordinator to orchestrate the full
+/// sequence (flush → drain → sign manifest → upload). The coordinator is
+/// the only path — there is no in-process fallback, because the snapshot
+/// cannot write a signed `.manifest` file without the drain step, and
+/// the drain step requires the coordinator's per-volume lock and S3
+/// client.
+///
+/// Returns the snapshot ULID on success.
+fn snapshot_volume(data_dir: &Path, name: &str) -> std::io::Result<String> {
+    let socket = data_dir.join("coordinator.sock");
+    coordinator_client::snapshot_volume(&socket, name)
 }
 
 enum ListFilter {
@@ -1002,7 +982,7 @@ fn create_fork(
     // is typically a readonly ancestor (so snapshotting is impossible), and
     // the caller already chose a specific snapshot ULID.
     if explicit_pin.is_none() {
-        snapshot_volume(&source_fork_dir, by_id_dir)?;
+        snapshot_volume(data_dir, from)?;
     }
 
     let new_vol_ulid = ulid::Ulid::new().to_string();
@@ -1418,10 +1398,7 @@ fn pull_one_readonly(
             elide_core::signing::VOLUME_PUB_FILE,
             elide_core::signing::VOLUME_PROVENANCE_FILE,
         ) {
-            Ok(lineage) => lineage
-                .parent
-                .as_deref()
-                .and_then(|entry| entry.split_once('/').map(|(p, _)| p.to_owned())),
+            Ok(lineage) => lineage.parent.map(|p| p.volume_ulid),
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&vol_dir);
                 return Err(std::io::Error::other(format!(

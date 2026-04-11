@@ -20,16 +20,24 @@ use elide_core::{
 };
 use ulid::Ulid;
 
-/// Create `dir` and write a fresh Ed25519 keypair into it.
-///
-/// Required before `Volume::open` in tests that construct their own directories
-/// (rather than using a `tempfile::TempDir` that already has keys).
+/// Create `dir` and write a fresh Ed25519 keypair into it, plus a default
+/// (root) `volume.provenance`. Matches production `volume up` behaviour: a
+/// fresh writable volume has both a keypair and a provenance file, even
+/// when it has no parent. Required before `Volume::open` in tests that
+/// construct their own directories.
 pub fn write_test_keypair(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    elide_core::signing::generate_keypair(
+    let key = elide_core::signing::generate_keypair(
         dir,
         elide_core::signing::VOLUME_KEY_FILE,
         elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+    elide_core::signing::write_provenance(
+        dir,
+        &key,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        &elide_core::signing::ProvenanceLineage::default(),
     )
     .unwrap();
 }

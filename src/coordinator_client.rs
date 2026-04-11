@@ -140,6 +140,23 @@ pub fn evict_volume(socket_path: &Path, name: &str, ulid: Option<&str>) -> io::R
     }
 }
 
+/// Trigger a coordinator-orchestrated snapshot of a running volume.
+///
+/// The coordinator acquires the per-volume snapshot lock, flushes the WAL
+/// via the volume control socket, runs the inline drain, triggers the
+/// signed `.manifest` file, and uploads the snapshot files. The CLI
+/// only blocks on the reply.
+///
+/// Returns the snapshot ULID on success.
+pub fn snapshot_volume(socket_path: &Path, name: &str) -> io::Result<String> {
+    let resp = call(socket_path, &format!("snapshot {name}"))?;
+    match resp.split_once(' ') {
+        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
 /// Stop all processes for a volume and remove its directory.
 pub fn delete_volume(socket_path: &Path, name: &str) -> io::Result<()> {
     let resp = call(socket_path, &format!("delete {name}"))?;

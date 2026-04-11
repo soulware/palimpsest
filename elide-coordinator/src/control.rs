@@ -121,6 +121,31 @@ pub async fn redact_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
     }
 }
 
+/// Sign and write a snapshot manifest (`snapshots/<snap_ulid>.manifest`)
+/// plus the `snapshots/<snap_ulid>` marker via the volume's control socket.
+///
+/// Called by the coordinator snapshot handler after a synchronous drain has
+/// moved every in-flight segment from `pending/` into `index/`. The volume
+/// enumerates its own `index/` at handler time and writes a full, signed
+/// manifest listing every segment ULID that belongs to the snapshot.
+///
+/// Returns `true` on success. Returns `false` with a warning if the socket
+/// is absent or the call fails.
+pub async fn sign_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
+    let req = format!("snapshot_manifest {snap_ulid}");
+    match call(fork_dir, &req).await {
+        Some(resp) if resp.trim() == "ok" => true,
+        Some(resp) => {
+            warn!(
+                "[control] snapshot_manifest {snap_ulid} for {} returned unexpected response: {resp:?}",
+                fork_dir.display()
+            );
+            false
+        }
+        None => false,
+    }
+}
+
 /// Promote a segment to the volume's local cache after confirmed S3 upload.
 ///
 /// Sends `promote <ulid>` to the volume's control socket.  The volume copies

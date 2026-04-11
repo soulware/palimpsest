@@ -38,6 +38,13 @@
 //     no-op when the segment has no hash-dead entries.
 //     Returns "ok".
 //
+//   snapshot_manifest <snap_ulid>
+//     Sign and write snapshots/<snap_ulid>.manifest (listing every
+//     segment ULID in index/ at the moment of the call) followed by
+//     the snapshots/<snap_ulid> marker. Called by the coordinator at
+//     the end of the inline drain step of a coordinator-driven
+//     snapshot. Returns "ok".
+//
 //   shutdown
 //     Flush WAL and exit cleanly.  Returns "ok" then terminates the process.
 //     The supervisor restarts the volume, picking up any updated config files.
@@ -163,6 +170,20 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
     } else if let Some(ulid_str) = line.strip_prefix("redact ") {
         match ulid::Ulid::from_string(ulid_str.trim()) {
             Ok(ulid) => match handle.redact_segment(ulid) {
+                Ok(()) => {
+                    let _ = writeln!(writer, "ok");
+                }
+                Err(e) => {
+                    let _ = writeln!(writer, "err {e}");
+                }
+            },
+            Err(_) => {
+                let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
+            }
+        }
+    } else if let Some(ulid_str) = line.strip_prefix("snapshot_manifest ") {
+        match ulid::Ulid::from_string(ulid_str.trim()) {
+            Ok(ulid) => match handle.sign_snapshot_manifest(ulid) {
                 Ok(()) => {
                     let _ = writeln!(writer, "ok");
                 }

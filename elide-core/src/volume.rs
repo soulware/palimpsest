@@ -1877,11 +1877,20 @@ impl Volume {
         Ok(())
     }
 
-    /// Checkpoint the fork at the current point in the segment sequence.
+    /// In-process checkpoint of the fork at the current point in the
+    /// segment sequence. **Not** the production path — the coordinator-
+    /// driven snapshot flow (see `docs/coordinator-driven-snapshot-plan.md`)
+    /// orchestrates flush → S3 drain → signed manifest → upload.
     ///
-    /// Flushes the WAL to a segment in `pending/`, then writes a
-    /// `snapshots/<ulid>` marker file. The fork stays live and continues
-    /// writing in the same directory — no directory structure changes occur.
+    /// This in-process variant exists for tests and offline tooling that
+    /// need a self-contained snapshot without a running coordinator. It
+    /// flushes the WAL to `pending/`, promotes every pending segment so it
+    /// appears under `index/`, signs the `.manifest` file over the
+    /// resulting full index, then writes the `snapshots/<ulid>` marker.
+    ///
+    /// Note that promotion writes `cache/<ulid>.body` + `index/<ulid>.idx`
+    /// without uploading to S3; in production only the coordinator is
+    /// allowed to promote, and only after confirming upload.
     ///
     /// If no new data has been committed since the latest existing snapshot
     /// (nothing in `pending/` or `index/` sorts after it), the existing
@@ -1957,10 +1966,60 @@ impl Volume {
             }
         }
 
-        let snap_ulid_str = snap_ulid.to_string();
+        // Promote every pending segment so the signed `.manifest` file
+        // can enumerate a complete `index/` rather than a partial view.
+        // In production this is driven by the coordinator after confirming
+        // S3 upload; the in-process variant skips the upload step.
+        let pending_dir = self.base_dir.join("pending");
+        let mut pending_ulids: Vec<Ulid> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&pending_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.contains('.') {
+                    continue;
+                }
+                if let Ok(u) = Ulid::from_string(s) {
+                    pending_ulids.push(u);
+                }
+            }
+        }
+        pending_ulids.sort();
+        for u in pending_ulids {
+            self.promote_segment(u)?;
+        }
+
         let snapshots_dir = self.base_dir.join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;
-        fs::write(snapshots_dir.join(&snap_ulid_str), "")?;
+
+        // Collect every segment ULID now under `index/` for the signed
+        // manifest — this is the full set of segments belonging to this
+        // volume up to `snap_ulid`, including promoted-this-call and
+        // anything already there from prior activity.
+        let index_dir = self.base_dir.join("index");
+        let mut index_ulids: Vec<Ulid> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&index_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                let Some(stem) = s.strip_suffix(".idx") else {
+                    continue;
+                };
+                if let Ok(u) = Ulid::from_string(stem) {
+                    index_ulids.push(u);
+                }
+            }
+        }
+        crate::signing::write_snapshot_manifest(
+            &self.base_dir,
+            self.signer.as_ref(),
+            &snap_ulid,
+            &index_ulids,
+        )?;
+
+        // Marker is written last — a partial sequence leaves no snapshot
+        // visible under `snapshots/`.
+        fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
         self.has_new_segments = false;
 
         // Open a fresh WAL to continue writing.
@@ -1972,6 +2031,59 @@ impl Volume {
         self.pending_entries = pending_entries;
 
         Ok(snap_ulid)
+    }
+
+    /// Sign and write a snapshot manifest under `snapshots/<snap_ulid>.manifest`,
+    /// then write the `snapshots/<snap_ulid>` marker.
+    ///
+    /// Called by the coordinator after a synchronous drain has moved every
+    /// in-flight segment out of `pending/` and into `index/`. The volume
+    /// enumerates its own `index/` at the moment of the call: the result is a
+    /// full list of every segment ULID that belongs to this volume as of the
+    /// snapshot, *not* a delta over the previous snapshot. See
+    /// `docs/coordinator-driven-snapshot-plan.md` for the rationale.
+    ///
+    /// The manifest is signed with the volume's private key so ancestor
+    /// verification at open time can trust it via the embedded
+    /// `parent_pubkey` in the child's `volume.provenance`.
+    ///
+    /// The caller selects `snap_ulid` — typically the max ULID in `index/`
+    /// at the moment the lock is acquired, or a fresh ULID if `index/` is
+    /// empty. The volume does not validate the choice.
+    pub fn sign_snapshot_manifest(&mut self, snap_ulid: Ulid) -> io::Result<()> {
+        let index_dir = self.base_dir.join("index");
+        let mut seg_ulids: Vec<Ulid> = Vec::new();
+        match fs::read_dir(&index_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(s) = name.to_str() else { continue };
+                    let Some(stem) = s.strip_suffix(".idx") else {
+                        continue;
+                    };
+                    if let Ok(u) = Ulid::from_string(stem) {
+                        seg_ulids.push(u);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+
+        let snapshots_dir = self.base_dir.join("snapshots");
+        fs::create_dir_all(&snapshots_dir)?;
+
+        crate::signing::write_snapshot_manifest(
+            &self.base_dir,
+            self.signer.as_ref(),
+            &snap_ulid,
+            &seg_ulids,
+        )?;
+
+        // Write the marker last — partial sequences leave no snapshot visible.
+        fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
+        self.has_new_segments = false;
+        Ok(())
     }
 
     /// Locate the segment body file for `segment_id` within this fork's
@@ -2672,6 +2784,11 @@ fn open_read_state(
     fork_dir: &Path,
     by_id_dir: &Path,
 ) -> io::Result<(Vec<AncestorLayer>, lbamap::LbaMap, extentindex::ExtentIndex)> {
+    // Fail-fast verification: every ancestor in the fork chain must have a
+    // signed `.manifest` file whose listed `.idx` files are all present
+    // locally. The trust chain is rooted in this volume's own pubkey and
+    // walked via the `parent_pubkey` embedded in each child's provenance.
+    verify_ancestor_manifests(fork_dir, by_id_dir)?;
     let ancestor_layers = walk_ancestors(fork_dir, by_id_dir)?;
     let lba_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
         .iter()
@@ -2695,7 +2812,7 @@ fn open_read_state(
     Ok((ancestor_layers, lbamap, extent_index))
 }
 
-/// Parse a `<source-ulid>/snapshots/<snapshot-ulid>` lineage entry, validating
+/// Parse a `<source-ulid>/<snapshot-ulid>` lineage entry, validating
 /// both components as ULIDs to prevent path traversal. Returns the source ULID
 /// slice (borrowed from `entry`) and the owned snapshot ULID string.
 fn parse_lineage_entry<'a>(
@@ -2703,13 +2820,18 @@ fn parse_lineage_entry<'a>(
     field: &str,
     fork_dir: &Path,
 ) -> io::Result<(&'a str, String)> {
-    let (source_ulid_str, snapshot_ulid_str) =
-        entry.rsplit_once("/snapshots/").ok_or_else(|| {
-            io::Error::other(format!(
-                "malformed {field} entry in {}: {entry}",
-                fork_dir.display()
-            ))
-        })?;
+    let (source_ulid_str, snapshot_ulid_str) = entry.split_once('/').ok_or_else(|| {
+        io::Error::other(format!(
+            "malformed {field} entry in {}: {entry}",
+            fork_dir.display()
+        ))
+    })?;
+    if snapshot_ulid_str.contains('/') {
+        return Err(io::Error::other(format!(
+            "malformed {field} entry in {}: {entry} has more than one '/' separator",
+            fork_dir.display()
+        )));
+    }
     let snapshot_ulid = Ulid::from_string(snapshot_ulid_str)
         .map_err(|e| io::Error::other(format!("bad snapshot ULID in {field}: {e}")))?
         .to_string();
@@ -2777,19 +2899,101 @@ pub fn resolve_ancestor_dir(by_id_dir: &Path, ulid: &str) -> PathBuf {
     by_id_candidate
 }
 
+/// Verify every ancestor of `fork_dir` by walking the fork chain from the
+/// current volume, using the `parent_pubkey` embedded in each child's
+/// signed provenance as the trust anchor for the next link.
+///
+/// For each ancestor in the chain:
+/// 1. Verify the ancestor's `volume.provenance` under the pubkey the child
+///    signed over (NOT the `volume.pub` on disk at the ancestor path).
+/// 2. Read the ancestor's `snapshots/<snap_ulid>.manifest` file, also
+///    verified under the same pubkey.
+/// 3. Assert every segment ULID listed in the manifest is present as
+///    `index/<ulid>.idx` in the ancestor directory.
+///
+/// Fails fast on any missing file, failed signature, or missing `.idx`.
+/// Does not perform any demand-fetch — the caller is expected to prefetch
+/// ancestor data before opening a fork.
+///
+/// The trust root is the current volume's own `volume.pub`, which the
+/// caller has already validated as the identity of the volume they asked
+/// to open.
+pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Result<()> {
+    // Fast-path: if this volume has no parent, nothing to verify.
+    let provenance_path = fork_dir.join(crate::signing::VOLUME_PROVENANCE_FILE);
+    if !provenance_path.exists() {
+        return Ok(());
+    }
+    let own_pubkey = crate::signing::load_verifying_key(fork_dir, crate::signing::VOLUME_PUB_FILE)?;
+    let own_lineage = crate::signing::read_lineage_with_key(
+        fork_dir,
+        &own_pubkey,
+        crate::signing::VOLUME_PROVENANCE_FILE,
+    )?;
+    let Some(mut current_parent) = own_lineage.parent else {
+        return Ok(());
+    };
+
+    loop {
+        let parent_dir = resolve_ancestor_dir(by_id_dir, &current_parent.volume_ulid);
+        if !parent_dir.exists() {
+            return Err(io::Error::other(format!(
+                "ancestor {} not found locally (run `elide volume remote pull` first)",
+                current_parent.volume_ulid
+            )));
+        }
+        let parent_verifying = crate::signing::VerifyingKey::from_bytes(&current_parent.pubkey)
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "invalid parent pubkey in provenance for {}: {e}",
+                    current_parent.volume_ulid
+                ))
+            })?;
+
+        let snap_ulid = Ulid::from_string(&current_parent.snapshot_ulid).map_err(|e| {
+            io::Error::other(format!("invalid snapshot ULID in provenance parent: {e}"))
+        })?;
+        let segments =
+            crate::signing::read_snapshot_manifest(&parent_dir, &parent_verifying, &snap_ulid)?;
+
+        let index_dir = parent_dir.join("index");
+        for seg in &segments {
+            let idx_path = index_dir.join(format!("{seg}.idx"));
+            if !idx_path.exists() {
+                return Err(io::Error::other(format!(
+                    "ancestor {} snapshot {}: missing index/{}.idx",
+                    current_parent.volume_ulid, snap_ulid, seg
+                )));
+            }
+        }
+
+        // Advance to this ancestor's own parent (if any), verifying its
+        // provenance under the pubkey we already trust (from the previous
+        // child's embedded parent_pubkey).
+        let parent_lineage = crate::signing::read_lineage_with_key(
+            &parent_dir,
+            &parent_verifying,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )?;
+        let Some(next) = parent_lineage.parent else {
+            return Ok(());
+        };
+        current_parent = next;
+    }
+}
+
 pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     let lineage = load_lineage_or_empty(fork_dir)?;
-    let Some(parent_entry) = lineage.parent else {
+    let Some(parent) = lineage.parent else {
         return Ok(Vec::new());
     };
-    let (parent_ulid_str, branch_ulid) = parse_lineage_entry(&parent_entry, "parent", fork_dir)?;
-    let parent_fork_dir = resolve_ancestor_dir(by_id_dir, parent_ulid_str);
+    let parent_fork_dir = resolve_ancestor_dir(by_id_dir, &parent.volume_ulid);
 
     // Recurse into the parent's fork chain first (builds oldest-first order).
     let mut ancestors = walk_ancestors(&parent_fork_dir, by_id_dir)?;
     ancestors.push(AncestorLayer {
         dir: parent_fork_dir,
-        branch_ulid: Some(branch_ulid),
+        branch_ulid: Some(parent.snapshot_ulid),
     });
     Ok(ancestors)
 }
@@ -2921,8 +3125,18 @@ pub fn fork_volume_at(
     // Write signed provenance carrying the fork's parent reference. Extent
     // index is empty for forks — fork ancestry is a read-path relationship
     // tracked in `parent`, not a hash-pool relationship.
+    //
+    // Embed the parent's current public key under the child's signature so
+    // the fork's open-time ancestor walk has a trust anchor for the parent's
+    // own signed artefacts — see `ParentRef` in signing.rs.
+    let parent_pubkey =
+        crate::signing::load_verifying_key(&source_real, crate::signing::VOLUME_PUB_FILE)?;
     let lineage = crate::signing::ProvenanceLineage {
-        parent: Some(format!("{source_ulid}/snapshots/{branch_ulid}")),
+        parent: Some(crate::signing::ParentRef {
+            volume_ulid: source_ulid.to_owned(),
+            snapshot_ulid: branch_ulid.to_string(),
+            pubkey: parent_pubkey.to_bytes(),
+        }),
         extent_index: Vec::new(),
     };
     crate::signing::write_provenance(
@@ -3083,41 +3297,45 @@ mod tests {
     /// Must be called before `Volume::open` in any test that creates a volume.
     fn write_test_keypair(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        crate::signing::generate_keypair(
+        let key = crate::signing::generate_keypair(
             dir,
             crate::signing::VOLUME_KEY_FILE,
             crate::signing::VOLUME_PUB_FILE,
         )
         .unwrap();
-    }
-
-    /// Write a signed `volume.provenance` with the given lineage fields into
-    /// `dir`, generating a fresh keypair (`volume.pub` is written; the
-    /// private key is discarded). Used by walker tests that need to
-    /// construct fake ancestor volumes without running full setup.
-    ///
-    /// `parent_entry` and `extent_entries` may contain syntactically bad
-    /// strings — they are signed as-is, and any validation is done on the
-    /// reader side. This lets the invalid-entry tests still exercise the
-    /// walker's parse path.
-    fn write_test_provenance(dir: &Path, parent_entry: Option<&str>, extent_entries: &[&str]) {
-        std::fs::create_dir_all(dir).unwrap();
-        let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-        let pub_hex = crate::signing::encode_hex(&key.verifying_key().to_bytes()) + "\n";
-        crate::segment::write_file_atomic(
-            &dir.join(crate::signing::VOLUME_PUB_FILE),
-            pub_hex.as_bytes(),
-        )
-        .unwrap();
-        let lineage = crate::signing::ProvenanceLineage {
-            parent: parent_entry.map(|s| s.to_owned()),
-            extent_index: extent_entries.iter().map(|s| (*s).to_owned()).collect(),
-        };
+        // Match production `volume up` behaviour: a fresh writable volume
+        // also gets a default (root) `volume.provenance`. Skipping this
+        // makes `Volume::open` fail in the ancestor walk when another
+        // volume forks from this one, because the child's provenance
+        // refers back to a volume whose own provenance is missing.
         crate::signing::write_provenance(
             dir,
             &key,
             crate::signing::VOLUME_PROVENANCE_FILE,
-            &lineage,
+            &crate::signing::ProvenanceLineage::default(),
+        )
+        .unwrap();
+    }
+
+    /// Write a signed `volume.provenance` with the given lineage fields into
+    /// `dir`. Routes through `write_raw_provenance_for_test` so that
+    /// syntactically bad `parent_entry` strings can be persisted for
+    /// parse-error coverage — the file signature is still valid over the raw
+    /// bytes, so the parse error fires before signature verification.
+    ///
+    /// When `parent_entry` is `Some`, an all-zero dummy `parent_pubkey` is
+    /// embedded. Tests that walk the chain only care about structural fields.
+    fn write_test_provenance(dir: &Path, parent_entry: Option<&str>, extent_entries: &[&str]) {
+        let (raw_parent, raw_parent_pubkey) = match parent_entry {
+            Some(p) => (p.to_owned(), crate::signing::encode_hex(&[0u8; 32])),
+            None => (String::new(), String::new()),
+        };
+        let extent_owned: Vec<String> = extent_entries.iter().map(|s| (*s).to_owned()).collect();
+        crate::signing::write_raw_provenance_for_test(
+            dir,
+            &raw_parent,
+            &raw_parent_pubkey,
+            &extent_owned,
         )
         .unwrap();
     }
@@ -4868,15 +5086,15 @@ mod tests {
         let fork_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
         let bad_parents = [
             // not a ULID parent (old "base/" prefix)
-            "base/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "base/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             // path traversal attempt
-            "../01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "../01AAAAAAAAAAAAAAAAAAAAAAAA/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             // parent component is not a valid ULID
-            "not-a-ulid/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // missing /snapshots/ separator entirely
+            "not-a-ulid/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            // missing '/' separator entirely
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            // branch ULID missing after snapshots/
-            "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
+            // branch ULID missing
+            "01AAAAAAAAAAAAAAAAAAAAAAAA/",
         ];
         for bad in bad_parents {
             write_test_provenance(&fork_dir, Some(bad), &[]);
@@ -4898,9 +5116,7 @@ mod tests {
         // dev's provenance names default at a fixed branch ULID.
         write_test_provenance(
             &dev_dir,
-            Some(&format!(
-                "{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"
-            )),
+            Some(&format!("{parent_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV")),
             &[],
         );
 
@@ -4931,9 +5147,7 @@ mod tests {
 
         write_test_provenance(
             &child_dir,
-            Some(&format!(
-                "{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"
-            )),
+            Some(&format!("{parent_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV")),
             &[],
         );
         // Create the readonly parent dir so `resolve_ancestor_dir` picks it.
@@ -4973,12 +5187,12 @@ mod tests {
 
         write_test_provenance(
             &mid_dir,
-            Some(&format!("{root_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+            Some(&format!("{root_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV")),
             &[],
         );
         write_test_provenance(
             &leaf_dir,
-            Some(&format!("{mid_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV")),
+            Some(&format!("{mid_ulid}/01BX5ZZKJKTSV4RRFFQ69G5FAV")),
             &[],
         );
 
@@ -5011,9 +5225,9 @@ mod tests {
         let by_id = temp_dir();
         let vol_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
         let bad_entries = [
-            "not-a-ulid/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "../01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
+            "not-a-ulid/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "../01AAAAAAAAAAAAAAAAAAAAAAAA/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "01AAAAAAAAAAAAAAAAAAAAAAAA/",
             "01AAAAAAAAAAAAAAAAAAAAAAAA",
         ];
         for bad in bad_entries {
@@ -5032,7 +5246,7 @@ mod tests {
         let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         let parent_dir = by_id.join(parent_ulid);
         let child_dir = by_id.join(child_ulid);
-        let entry = format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let entry = format!("{parent_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV");
         write_test_provenance(&child_dir, None, &[&entry]);
 
         let ancestors = walk_extent_ancestors(&child_dir, &by_id).unwrap();
@@ -5054,8 +5268,8 @@ mod tests {
         let a_dir = by_id.join(a_ulid);
         let b_dir = by_id.join(b_ulid);
         let c_dir = by_id.join(c_ulid);
-        let a_entry = format!("{a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let b_entry = format!("{b_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        let a_entry = format!("{a_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let b_entry = format!("{b_ulid}/01BX5ZZKJKTSV4RRFFQ69G5FAV");
         write_test_provenance(&c_dir, None, &[&a_entry, &b_entry]);
 
         let layers = walk_extent_ancestors(&c_dir, &by_id).unwrap();
@@ -5080,8 +5294,8 @@ mod tests {
         let a_dir = by_id.join(a_ulid);
         let c_dir = by_id.join(c_ulid);
         // Same source listed twice — later entry is silently dropped.
-        let a1 = format!("{a_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let a2 = format!("{a_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        let a1 = format!("{a_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let a2 = format!("{a_ulid}/01BX5ZZKJKTSV4RRFFQ69G5FAV");
         write_test_provenance(&c_dir, None, &[&a1, &a2]);
 
         let layers = walk_extent_ancestors(&c_dir, &by_id).unwrap();
@@ -5101,8 +5315,8 @@ mod tests {
         let p_dir = by_id.join(p_ulid);
         let x_dir = by_id.join(x_ulid);
         let c_dir = by_id.join(c_ulid);
-        let parent_entry = format!("{p_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let extent_entry = format!("{x_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        let parent_entry = format!("{p_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let extent_entry = format!("{x_ulid}/01BX5ZZKJKTSV4RRFFQ69G5FAV");
         write_test_provenance(&c_dir, Some(&parent_entry), &[&extent_entry]);
 
         let fork_chain = walk_ancestors(&c_dir, &by_id).unwrap();
@@ -5224,14 +5438,15 @@ mod tests {
         vol.write(0, &vec![0xAAu8; 4096]).unwrap();
         let snap_ulid = vol.snapshot().unwrap().to_string();
 
-        // The snapshot file name must equal the segment file name in pending/.
-        let pending_files: Vec<_> = fs::read_dir(fork_dir.join("pending"))
+        // Snapshot promotes segments from pending/ to index/ + cache/, so
+        // the segment shows up as `index/<ulid>.idx` after the call.
+        let idx_files: Vec<_> = fs::read_dir(fork_dir.join("index"))
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(pending_files.len(), 1);
-        let seg_name = pending_files[0].file_name().into_string().unwrap();
-        assert_eq!(snap_ulid, seg_name);
+        assert_eq!(idx_files.len(), 1);
+        let idx_name = idx_files[0].file_name().into_string().unwrap();
+        assert_eq!(idx_name, format!("{snap_ulid}.idx"));
 
         fs::remove_dir_all(fork_dir).unwrap();
     }
@@ -5261,9 +5476,14 @@ mod tests {
         let ulid2 = vol.snapshot().unwrap();
         assert_eq!(ulid1, ulid2);
 
-        // Still only one snapshot marker on disk.
-        let snaps: Vec<_> = fs::read_dir(fork_dir.join("snapshots")).unwrap().collect();
-        assert_eq!(snaps.len(), 1);
+        // Still only one snapshot marker on disk (filter out the
+        // `<ulid>.manifest` file that sits next to each marker).
+        let marker_count = fs::read_dir(fork_dir.join("snapshots"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|s| !s.contains('.')))
+            .count();
+        assert_eq!(marker_count, 1);
 
         fs::remove_dir_all(fork_dir).unwrap();
     }
@@ -5281,8 +5501,12 @@ mod tests {
         let ulid2 = vol.snapshot().unwrap();
         assert_ne!(ulid1, ulid2);
 
-        let snaps: Vec<_> = fs::read_dir(fork_dir.join("snapshots")).unwrap().collect();
-        assert_eq!(snaps.len(), 2);
+        let marker_count = fs::read_dir(fork_dir.join("snapshots"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|s| !s.contains('.')))
+            .count();
+        assert_eq!(marker_count, 2);
 
         fs::remove_dir_all(fork_dir).unwrap();
     }
@@ -5352,10 +5576,9 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        assert_eq!(
-            lineage.parent.as_deref(),
-            Some(format!("{root_ulid}/snapshots/{snap_ulid}").as_str())
-        );
+        let parent = lineage.parent.expect("fork must record parent");
+        assert_eq!(parent.volume_ulid, root_ulid);
+        assert_eq!(parent.snapshot_ulid, snap_ulid);
         assert!(lineage.extent_index.is_empty());
 
         fs::remove_dir_all(by_id).unwrap();
@@ -5378,12 +5601,17 @@ mod tests {
         // Simulate forking from a readonly ancestor: the source dir exists
         // but has no snapshots/ directory (prefetch hasn't landed yet). The
         // explicit pin must still succeed and be recorded in provenance.
+        //
+        // The source still needs its `volume.pub` locally so the fork can
+        // embed the parent pubkey in its signed provenance — volume.pub is
+        // pulled by the prefetch pathway before any fork operation.
         let by_id = temp_dir();
         let source_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         let source_dir = by_id.join(source_ulid);
         let child_dir = by_id.join(child_ulid);
         fs::create_dir_all(&source_dir).unwrap();
+        write_test_keypair(&source_dir);
 
         let branch_ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         fork_volume_at(&child_dir, &source_dir, branch_ulid).unwrap();
@@ -5394,10 +5622,9 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        assert_eq!(
-            lineage.parent.as_deref(),
-            Some(format!("{source_ulid}/snapshots/{branch_ulid}").as_str()),
-        );
+        let parent = lineage.parent.expect("fork must record parent");
+        assert_eq!(parent.volume_ulid, source_ulid);
+        assert_eq!(parent.snapshot_ulid, branch_ulid.to_string());
 
         fs::remove_dir_all(by_id).unwrap();
     }
@@ -5445,9 +5672,10 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
+        let parent = lineage.parent.expect("fork must record parent");
+        assert_eq!(parent.volume_ulid, root_ulid);
         assert_eq!(
-            lineage.parent.as_deref(),
-            Some(format!("{root_ulid}/snapshots/{snap2}").as_str()),
+            parent.snapshot_ulid, snap2,
             "provenance parent should point to the latest snapshot"
         );
 
@@ -5499,22 +5727,16 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let leaf_parent = leaf_lineage.parent.as_deref().unwrap_or("");
-        assert!(
-            leaf_parent.starts_with(&format!("{mid_ulid}/snapshots/")),
-            "leaf parent: {leaf_parent}"
-        );
+        let leaf_parent = leaf_lineage.parent.expect("leaf must record parent");
+        assert_eq!(leaf_parent.volume_ulid, mid_ulid);
         let mid_lineage = crate::signing::read_lineage_verifying_signature(
             &mid_dir,
             crate::signing::VOLUME_PUB_FILE,
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let mid_parent = mid_lineage.parent.as_deref().unwrap_or("");
-        assert!(
-            mid_parent.starts_with(&format!("{root_ulid}/snapshots/")),
-            "mid parent: {mid_parent}"
-        );
+        let mid_parent = mid_lineage.parent.expect("mid must record parent");
+        assert_eq!(mid_parent.volume_ulid, root_ulid);
 
         // Leaf sees data from all three levels.
         let vol = Volume::open(&leaf_dir, &by_id).unwrap();

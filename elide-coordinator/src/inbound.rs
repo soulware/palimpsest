@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use object_store::ObjectStore;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
@@ -28,8 +29,9 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::import::{self, ImportRegistry, ImportState};
-use elide_coordinator::EvictRegistry;
+use elide_coordinator::{EvictRegistry, SnapshotLockRegistry};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     socket_path: &Path,
     data_dir: Arc<PathBuf>,
@@ -37,6 +39,8 @@ pub async fn serve(
     registry: ImportRegistry,
     elide_import_bin: Arc<PathBuf>,
     evict_registry: EvictRegistry,
+    snapshot_locks: SnapshotLockRegistry,
+    store: Arc<dyn ObjectStore>,
 ) {
     let _ = std::fs::remove_file(socket_path);
 
@@ -58,13 +62,18 @@ pub async fn serve(
                 let registry = registry.clone();
                 let bin = elide_import_bin.clone();
                 let evict_reg = evict_registry.clone();
-                tokio::spawn(handle(stream, data_dir, rescan, registry, bin, evict_reg));
+                let snap_locks = snapshot_locks.clone();
+                let store = store.clone();
+                tokio::spawn(handle(
+                    stream, data_dir, rescan, registry, bin, evict_reg, snap_locks, store,
+                ));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     stream: tokio::net::UnixStream,
     data_dir: Arc<PathBuf>,
@@ -72,6 +81,8 @@ async fn handle(
     registry: ImportRegistry,
     elide_import_bin: Arc<PathBuf>,
     evict_registry: EvictRegistry,
+    snapshot_locks: SnapshotLockRegistry,
+    store: Arc<dyn ObjectStore>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -100,11 +111,14 @@ async fn handle(
         &registry,
         &elide_import_bin,
         &evict_registry,
+        &snapshot_locks,
+        &store,
     )
     .await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     line: &str,
     data_dir: &Path,
@@ -112,6 +126,8 @@ async fn dispatch(
     registry: &ImportRegistry,
     elide_import_bin: &Path,
     evict_registry: &EvictRegistry,
+    snapshot_locks: &SnapshotLockRegistry,
+    store: &Arc<dyn ObjectStore>,
 ) -> String {
     if line.is_empty() {
         return "err empty request".to_string();
@@ -199,6 +215,13 @@ async fn dispatch(
                 None => (args, None),
             };
             evict_volume(vol_name, ulid_str, data_dir, evict_registry).await
+        }
+
+        "snapshot" => {
+            if args.is_empty() {
+                return "err usage: snapshot <volume>".to_string();
+            }
+            snapshot_volume(args, data_dir, snapshot_locks, store).await
         }
 
         _ => {
@@ -379,6 +402,120 @@ async fn evict_volume(
         Ok(Err(e)) => format!("err {e}"),
         Err(_) => "err fork task dropped reply".to_string(),
     }
+}
+
+// ── Volume snapshot ──────────────────────────────────────────────────────────
+
+/// Coordinator-orchestrated snapshot handler.
+///
+/// Sequence for the named volume:
+///   1. Acquire per-volume snapshot lock (blocks the tick loop for this volume).
+///   2. `flush` IPC to the volume → WAL into `pending/`.
+///   3. Inline drain of `pending/` via `upload::drain_pending` (uploads to S3
+///      and triggers `promote` IPCs that move bodies into `cache/` and
+///      materialise `index/<ulid>.idx`).
+///   4. Pick `snap_ulid` as the max ULID in `index/` after drain, or a fresh
+///      ULID if `index/` is empty.
+///   5. `snapshot_manifest <snap_ulid>` IPC → volume writes the signed
+///      `snapshots/<snap_ulid>.manifest` file and marker.
+///   6. Upload the just-written snapshot files to S3 via
+///      `upload::upload_snapshots_and_filemaps`.
+///
+/// Lock is released when this function returns (via the `Drop` guard on
+/// the returned `MutexGuard`).
+async fn snapshot_volume(
+    vol_name: &str,
+    data_dir: &Path,
+    snapshot_locks: &SnapshotLockRegistry,
+    store: &Arc<dyn ObjectStore>,
+) -> String {
+    let link = data_dir.join("by_name").join(vol_name);
+    let fork_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(_) => return format!("err volume not found: {vol_name}"),
+    };
+    if !fork_dir.join("control.sock").exists() {
+        return format!("err volume '{vol_name}' is not running — start it first");
+    }
+    if fork_dir.join("volume.readonly").exists() {
+        return format!("err volume '{vol_name}' is readonly");
+    }
+
+    let volume_id = match elide_coordinator::upload::derive_names(&fork_dir) {
+        Ok(id) => id,
+        Err(e) => return format!("err deriving volume id: {e}"),
+    };
+
+    let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir).await;
+    let _guard = lock.lock_owned().await;
+
+    // 1. Flush WAL into pending/.
+    if !elide_coordinator::control::flush(&fork_dir).await {
+        return "err flush failed or volume unreachable".to_string();
+    }
+
+    // 2. Inline drain: upload every pending segment, promote each, then
+    //    upload any snapshot files already sitting under snapshots/.
+    //    We run this before sign_snapshot_manifest so that index/ is populated
+    //    with every segment up to the flush point.
+    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store).await {
+        Ok(r) if r.failed > 0 => {
+            return format!("err drain reported {} failed segment(s)", r.failed);
+        }
+        Ok(_) => {}
+        Err(e) => return format!("err drain: {e:#}"),
+    }
+
+    // 3. Pick snap_ulid: the max ULID in index/, or a fresh ULID if empty.
+    let snap_ulid = match pick_snapshot_ulid(&fork_dir) {
+        Ok(u) => u,
+        Err(e) => return format!("err picking snap_ulid: {e}"),
+    };
+
+    // 4. Tell the volume to sign and write the manifest + marker.
+    if !elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await {
+        return format!("err sign_snapshot_manifest {snap_ulid} failed");
+    }
+
+    // 5. Upload the new snapshot marker and manifest.
+    if let Err(e) =
+        elide_coordinator::upload::upload_snapshots_and_filemaps(&fork_dir, &volume_id, store).await
+    {
+        return format!("err uploading snapshot files: {e:#}");
+    }
+
+    info!("[snapshot {volume_id}] committed {snap_ulid}");
+    format!("ok {snap_ulid}")
+}
+
+/// Pick a snapshot ULID: the max ULID in `fork_dir/index/`, or a fresh one
+/// if `index/` is empty.
+fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
+    let index_dir = fork_dir.join("index");
+    let mut latest: Option<ulid::Ulid> = None;
+    match std::fs::read_dir(&index_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                let Some(stem) = s.strip_suffix(".idx") else {
+                    continue;
+                };
+                if let Ok(u) = ulid::Ulid::from_string(stem)
+                    && latest.is_none_or(|cur| u > cur)
+                {
+                    latest = Some(u);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // `Ulid::new()` mints a fresh ULID — not the default (zero) Ulid that
+    // `unwrap_or_default` would produce. Both clippy lints point at the same
+    // spot, so suppress the unwrap_or_default one locally.
+    #[allow(clippy::unwrap_or_default)]
+    Ok(latest.unwrap_or_else(ulid::Ulid::new))
 }
 
 // ── Volume status ─────────────────────────────────────────────────────────────

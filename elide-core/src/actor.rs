@@ -121,6 +121,10 @@ pub(crate) enum VolumeRequest {
     Snapshot {
         reply: Sender<io::Result<String>>,
     },
+    SignSnapshotManifest {
+        snap_ulid: Ulid,
+        reply: Sender<io::Result<()>>,
+    },
     Shutdown,
 }
 
@@ -285,6 +289,9 @@ impl VolumeActor {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
+                        }
+                        VolumeRequest::SignSnapshotManifest { snap_ulid, reply } => {
+                            let _ = reply.send(self.volume.sign_snapshot_manifest(snap_ulid));
                         }
                         VolumeRequest::Shutdown => return,
                     }
@@ -549,6 +556,26 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::Snapshot { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Sign and write a `snapshots/<snap_ulid>.manifest` file plus the
+    /// marker file. Called by the coordinator after a synchronous drain has
+    /// moved every in-flight segment from `pending/` to `index/`.
+    ///
+    /// The volume enumerates its own `index/` at handler time — no prior
+    /// snapshot is read. The result is a full list of segment ULIDs
+    /// belonging to this volume as of the snapshot.
+    pub fn sign_snapshot_manifest(&self, snap_ulid: Ulid) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::SignSnapshotManifest {
+                snap_ulid,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

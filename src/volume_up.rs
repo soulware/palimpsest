@@ -238,6 +238,7 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
             drain_interval,
             gc_config,
             evict_rx,
+            elide_coordinator::new_snapshot_lock_registry(),
         ))
     });
 

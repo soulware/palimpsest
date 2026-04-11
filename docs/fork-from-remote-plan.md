@@ -71,8 +71,8 @@ Known gaps that did not make this branch and should be tackled next:
    helper `open_volume_ensuring_ancestors` that runs prefetch
    synchronously before `Volume::open`.
 
-3. **Snapshot completeness manifest (`.segments` file).** Proposed
-   design: a signed file `snapshots/<snap_ulid>.segments` listing every
+3. **Snapshot completeness manifest (`.manifest` file).** Proposed
+   design: a signed file `snapshots/<snap_ulid>.manifest` listing every
    segment ULID in this volume's `index/` with ULID ≤ snap_ulid (built
    incrementally from the previous snapshot's manifest). `Volume::open`
    would verify for each ancestor layer that the manifest exists,
@@ -82,11 +82,11 @@ Known gaps that did not make this branch and should be tackled next:
    prefetched" an exact predicate, not a brittle "index/ non-empty"
    heuristic. **Blocked on:** the snapshot flow moving into the
    coordinator (see `docs/coordinator-driven-snapshot-plan.md`),
-   because the `.segments` write must happen *after* all pending
+   because the `.manifest` write must happen *after* all pending
    segments are drained+promoted to `index/` — which is a cross-
    component sequencing concern.
 
-4. **Volume::open fail-fast guard.** Once `.segments` is in place,
+4. **Volume::open fail-fast guard.** Once `.manifest` is in place,
    `Volume::open` rejects any ancestor whose manifest is missing or
    whose listed `.idx` files are not all present. Current behaviour
    silently returns zeros. Invariant: *it must be impossible for a
