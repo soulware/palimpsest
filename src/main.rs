@@ -174,11 +174,17 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Create a new volume branched from the latest snapshot of the source volume
+    /// Create a new volume branched from the latest snapshot of a source volume.
+    ///
+    /// `--from` accepts either a local volume name (branches from that
+    /// volume's latest snapshot) or an explicit `<vol_ulid>/<snap_ulid>`
+    /// which pins the branch point to a specific snapshot. The ULID form
+    /// resolves the source in `by_id/` first and falls back to `readonly/`,
+    /// so it works for volumes that exist only as pulled readonly ancestors.
     Fork {
         /// Name for the new volume
         fork_name: String,
-        /// Source volume to branch from
+        /// Source to branch from: `<name>` or `<vol_ulid>/<snap_ulid>`
         #[arg(long)]
         from: String,
     },
@@ -289,10 +295,16 @@ enum RemoteCommand {
     /// List all named volumes available in the store
     List,
 
-    /// Download a volume from the store and register it locally
+    /// Download a volume from the store as a readonly ancestor.
+    ///
+    /// Accepts either a volume name (resolved via `names/<name>` in the store)
+    /// or an explicit `<vol_ulid>[/<snap_ulid>]`. Pulled volumes land under
+    /// `readonly/<vol_ulid>/` and are never supervised locally — they exist
+    /// only as fork ancestors. The full ancestor chain is walked and every
+    /// ancestor not already present locally is pulled too.
     Pull {
-        /// Volume name to pull
-        name: String,
+        /// Volume spec: `<name>` or `<vol_ulid>` or `<vol_ulid>/<snap_ulid>`
+        spec: String,
     },
 }
 
@@ -616,8 +628,8 @@ fn main() {
                             std::process::exit(1);
                         }
                     }
-                    RemoteCommand::Pull { name } => {
-                        if let Err(e) = remote_pull(&config, &name, &args.data_dir, &socket_path) {
+                    RemoteCommand::Pull { spec } => {
+                        if let Err(e) = remote_pull(&config, &spec, &args.data_dir, &socket_path) {
                             eprintln!("error: {e}");
                             std::process::exit(1);
                         }
@@ -927,15 +939,18 @@ fn create_volume(
     Ok(())
 }
 
-/// Create a new volume forked from the latest snapshot of `from_name`.
+/// Create a new volume forked from a source, specified either by name or by
+/// explicit `<vol_ulid>/<snap_ulid>`.
 ///
-/// Takes an implicit snapshot of the source, creates a new `by_id/<ulid>/`
-/// directory, writes the fork keypair and provenance, creates the `by_name/`
-/// symlink, and signals the coordinator to rescan.
+/// Name form: takes an implicit snapshot of the source and branches from it.
+/// ULID form: resolves the source in `by_id/` first, then `readonly/`, and
+/// pins the branch point to the explicit snapshot ULID without taking a new
+/// snapshot of the source (required because readonly ancestors are not
+/// writable).
 fn create_fork(
     data_dir: &Path,
     fork_name: &str,
-    from_name: &str,
+    from: &str,
     socket_path: &Path,
     by_id_dir: &Path,
 ) -> std::io::Result<()> {
@@ -949,16 +964,46 @@ fn create_fork(
         )));
     }
 
-    let source_fork_dir = resolve_volume_dir(data_dir, from_name);
+    // Parse `from`: either `<vol_ulid>/<snap_ulid>` (explicit pin) or a
+    // plain volume name resolved via `by_name/`.
+    let explicit_pin: Option<(ulid::Ulid, ulid::Ulid)> = if let Some((vol, snap)) =
+        from.split_once('/')
+    {
+        let vol = ulid::Ulid::from_string(vol)
+            .map_err(|e| std::io::Error::other(format!("invalid volume ULID in --from: {e}")))?;
+        let snap = ulid::Ulid::from_string(snap)
+            .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
+        Some((vol, snap))
+    } else {
+        None
+    };
+
+    let source_fork_dir = if let Some((vol_ulid, _)) = explicit_pin {
+        let ulid_str = vol_ulid.to_string();
+        let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
+        if !dir.exists() {
+            return Err(std::io::Error::other(format!(
+                "source volume {ulid_str} not found locally; run `elide volume remote pull {ulid_str}` first"
+            )));
+        }
+        dir
+    } else {
+        resolve_volume_dir(data_dir, from)
+    };
+
     if source_fork_dir.join("import.lock").exists() {
         return Err(std::io::Error::other(format!(
-            "volume '{from_name}' is still importing; wait for import to complete before forking"
+            "volume '{from}' is still importing; wait for import to complete before forking"
         )));
     }
 
-    // Take an implicit snapshot so the fork branches from "now".
-    // Idempotent if the tip is already snapshotted.
-    snapshot_volume(&source_fork_dir, by_id_dir)?;
+    // Take an implicit snapshot of the source so the fork branches from "now"
+    // — but only for the name-based path. For explicit ULID pins the source
+    // is typically a readonly ancestor (so snapshotting is impossible), and
+    // the caller already chose a specific snapshot ULID.
+    if explicit_pin.is_none() {
+        snapshot_volume(&source_fork_dir, by_id_dir)?;
+    }
 
     let new_vol_ulid = ulid::Ulid::new().to_string();
     let new_fork_dir = data_dir.join("by_id").join(&new_vol_ulid);
@@ -968,7 +1013,14 @@ fn create_fork(
         let _ = std::fs::remove_dir_all(new_fork_dir);
     };
 
-    volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
+    match explicit_pin {
+        Some((_, snap_ulid)) => {
+            volume::fork_volume_at(&new_fork_dir, &source_fork_dir, snap_ulid)?;
+        }
+        None => {
+            volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
+        }
+    }
 
     let src_cfg = elide_core::config::VolumeConfig::read(&source_fork_dir).map_err(|e| {
         cleanup(&new_fork_dir, &symlink_path);
@@ -1143,67 +1195,155 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Pull a named volume from the remote store and register it locally.
+/// Pull a volume (and its full ancestor chain) from the remote store as
+/// readonly fork sources.
 ///
-/// 1. Resolves `names/<name>` → ULID
-/// 2. Downloads `by_id/<ulid>/manifest.toml` and `by_id/<ulid>/volume.pub`
-/// 3. Reconstructs the local directory skeleton under `data_dir/by_id/<ulid>/`
-/// 4. Creates `data_dir/by_name/<name>` symlink
-/// 5. Signals the coordinator to rescan (best-effort)
+/// `spec` is one of:
+///   - a volume name (resolved via `names/<name>` → ULID in the store)
+///   - `<vol_ulid>` (address directly by ULID)
+///   - `<vol_ulid>/<snap_ulid>` (address a specific snapshot; the ULID part
+///     is what gets pulled — the snapshot ULID is retained for the caller
+///     that wants to pin provenance, e.g. `volume fork --from`)
 ///
-/// After this returns, the coordinator's next tick will run `prefetch_indexes`
-/// to download segment index sections, making the volume openable.
+/// Each pulled volume lands under `data_dir/readonly/<vol_ulid>/` with
+/// `volume.readonly`, `volume.pub`, `volume.provenance`, and an empty
+/// `index/` dir. The coordinator's next rescan then runs `prefetch_indexes`
+/// which downloads the signed `.idx` files into each volume's own `index/`
+/// directory (signature verification uses that volume's own `volume.pub`).
+///
+/// The ancestor chain is walked via the downloaded `volume.provenance`:
+/// for every parent ULID not already present in `by_id/` or `readonly/`,
+/// its skeleton is pulled too. Encountering a mid-chain ancestor that is
+/// already local terminates the walk — the local copy is authoritative.
 fn remote_pull(
     config: &elide_fetch::FetchConfig,
-    name: &str,
+    spec: &str,
     data_dir: &Path,
     socket_path: &Path,
 ) -> std::io::Result<()> {
-    use object_store::ObjectStore;
-    use object_store::path::Path as StorePath;
-
-    validate_volume_name(name)?;
-
     let store = config
         .build_store()
         .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
     let rt = tokio::runtime::Runtime::new()?;
 
-    // Step 1: resolve name → ULID.
-    let name_key = StorePath::from(format!("names/{name}"));
-    let volume_id = rt.block_on(async {
+    // Step 1: parse `spec` and resolve to a root ULID to pull.
+    let root_ulid = resolve_pull_spec(&rt, &*store, spec)?;
+
+    // Step 2: walk the ancestor chain, pulling each skeleton that isn't
+    // already local. Start from the requested volume; after each pull, parse
+    // its downloaded provenance to find the next parent.
+    let mut pulled: Vec<String> = Vec::new();
+    let mut next: Option<String> = Some(root_ulid);
+    while let Some(ulid_str) = next.take() {
+        if ancestor_exists_locally(data_dir, &ulid_str) {
+            // Local copy is authoritative; stop walking up from here.
+            break;
+        }
+        let parent_ulid = pull_one_readonly(&rt, &*store, data_dir, &ulid_str)?;
+        pulled.push(ulid_str);
+        next = parent_ulid;
+    }
+
+    if pulled.is_empty() {
+        println!("pull: volume already present locally");
+    } else {
+        for id in &pulled {
+            println!("pulled {id}");
+        }
+    }
+
+    // Step 3: signal coordinator to rescan (best-effort) so it picks up the
+    // new readonly volumes and kicks off prefetch_indexes on each.
+    if coordinator_client::rescan(socket_path).is_err() {
+        eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
+    }
+
+    Ok(())
+}
+
+/// Parse a pull spec and resolve it to a volume ULID to fetch.
+///
+/// Accepts `<name>`, `<vol_ulid>`, or `<vol_ulid>/<snap_ulid>`. For ULID
+/// forms the snapshot portion is validated but discarded — this function
+/// only decides *which volume* to pull; the snapshot ULID is a pinning
+/// concern for the caller (`volume fork --from`), not for pull itself.
+fn resolve_pull_spec(
+    rt: &tokio::runtime::Runtime,
+    store: &dyn object_store::ObjectStore,
+    spec: &str,
+) -> std::io::Result<String> {
+    use object_store::path::Path as StorePath;
+
+    if let Some((vol, snap)) = spec.split_once('/') {
+        let vol = ulid::Ulid::from_string(vol)
+            .map_err(|e| std::io::Error::other(format!("invalid volume ULID in spec: {e}")))?;
+        ulid::Ulid::from_string(snap)
+            .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in spec: {e}")))?;
+        return Ok(vol.to_string());
+    }
+    if let Ok(vol) = ulid::Ulid::from_string(spec) {
+        return Ok(vol.to_string());
+    }
+
+    // Fallback: treat `spec` as a name and resolve via `names/<name>`.
+    validate_volume_name(spec)?;
+    let name_key = StorePath::from(format!("names/{spec}"));
+    let raw = rt.block_on(async {
         let data = store.get(&name_key).await.map_err(|e| match e {
             object_store::Error::NotFound { .. } => {
-                std::io::Error::other(format!("volume '{name}' not found in store"))
+                std::io::Error::other(format!("volume '{spec}' not found in store"))
             }
-            e => std::io::Error::other(format!("reading names/{name}: {e}")),
+            e => std::io::Error::other(format!("reading names/{spec}: {e}")),
         })?;
-        let bytes = data
-            .bytes()
+        data.bytes()
             .await
-            .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
-        std::str::from_utf8(&bytes)
-            .map(|s| s.trim().to_owned())
-            .map_err(|e| std::io::Error::other(format!("names/{name}: {e}")))
+            .map_err(|e| std::io::Error::other(format!("reading names/{spec}: {e}")))
     })?;
+    let ulid_str = std::str::from_utf8(&raw)
+        .map_err(|e| std::io::Error::other(format!("names/{spec}: {e}")))?
+        .trim();
+    let parsed = ulid::Ulid::from_string(ulid_str)
+        .map_err(|e| std::io::Error::other(format!("names/{spec} contains invalid ULID: {e}")))?;
+    Ok(parsed.to_string())
+}
 
-    // Validate the ULID before using it as a directory name.
-    ulid::Ulid::from_string(&volume_id)
-        .map_err(|e| std::io::Error::other(format!("names/{name} contains invalid ULID: {e}")))?;
+/// Return `true` if a local copy of `<ulid>` exists in either tree.
+fn ancestor_exists_locally(data_dir: &Path, ulid_str: &str) -> bool {
+    data_dir.join("by_id").join(ulid_str).exists()
+        || data_dir.join("readonly").join(ulid_str).exists()
+}
 
-    let vol_dir = data_dir.join("by_id").join(&volume_id);
+/// Download the readonly skeleton for one volume into `readonly/<ulid>/`.
+///
+/// Fetches `manifest.toml`, `volume.pub`, and `volume.provenance` from the
+/// store and writes them, along with a `volume.readonly` marker and an empty
+/// `index/` directory so `discover_volumes` queues the volume for prefetch.
+///
+/// Returns the parent volume ULID to pull next, or `None` if this volume is
+/// the root of its fork chain. The parent is extracted from the downloaded
+/// provenance's `parent` field (`<ulid>/snapshots/<ulid>`), signature-verified
+/// against the volume's own `volume.pub`.
+fn pull_one_readonly(
+    rt: &tokio::runtime::Runtime,
+    store: &dyn object_store::ObjectStore,
+    data_dir: &Path,
+    volume_id: &str,
+) -> std::io::Result<Option<String>> {
+    use object_store::path::Path as StorePath;
+
+    let vol_dir = data_dir.join("readonly").join(volume_id);
     if vol_dir.exists() {
         return Err(std::io::Error::other(format!(
-            "volume already present locally: {volume_id}"
+            "readonly volume already present locally: {volume_id}"
         )));
     }
 
-    // Step 2: download manifest.toml and volume.pub.
+    // Fetch manifest.toml.
     let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
     let manifest_bytes = rt.block_on(async {
         let data = store.get(&manifest_key).await.map_err(|e| match e {
             object_store::Error::NotFound { .. } => std::io::Error::other(format!(
-                "manifest not found in store for volume '{name}' ({volume_id})"
+                "manifest not found in store for volume {volume_id}"
             )),
             e => std::io::Error::other(format!("downloading manifest: {e}")),
         })?;
@@ -1211,17 +1351,21 @@ fn remote_pull(
             .await
             .map_err(|e| std::io::Error::other(format!("reading manifest: {e}")))
     })?;
-
     let manifest: toml::Table = toml::from_str(
         std::str::from_utf8(&manifest_bytes)
             .map_err(|e| std::io::Error::other(format!("manifest is not valid utf-8: {e}")))?,
     )
     .map_err(|e| std::io::Error::other(format!("parsing manifest.toml: {e}")))?;
+    let size = manifest
+        .get("size")
+        .and_then(|v| v.as_integer())
+        .ok_or_else(|| std::io::Error::other("manifest.toml missing 'size'"))?;
 
+    // Fetch volume.pub.
     let pub_key_bytes = rt.block_on(async {
-        let pub_key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
+        let key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
         let data = store
-            .get(&pub_key)
+            .get(&key)
             .await
             .map_err(|e| std::io::Error::other(format!("downloading volume.pub: {e}")))?;
         data.bytes()
@@ -1229,60 +1373,67 @@ fn remote_pull(
             .map_err(|e| std::io::Error::other(format!("reading volume.pub: {e}")))
     })?;
 
-    // Step 3: reconstruct local directory skeleton.
+    // Fetch volume.provenance (may be absent for the root volume — treat
+    // NotFound as "no lineage" and continue).
+    let provenance_bytes = rt.block_on(async {
+        let key = StorePath::from(format!("by_id/{volume_id}/volume.provenance"));
+        match store.get(&key).await {
+            Ok(data) => Ok(Some(data.bytes().await.map_err(|e| {
+                std::io::Error::other(format!("reading volume.provenance: {e}"))
+            })?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(std::io::Error::other(format!(
+                "downloading volume.provenance: {e}"
+            ))),
+        }
+    })?;
+
+    // Write the skeleton.
     std::fs::create_dir_all(&vol_dir)?;
-
-    let size = manifest
-        .get("size")
-        .and_then(|v| v.as_integer())
-        .ok_or_else(|| std::io::Error::other("manifest.toml missing 'size'"))?;
-
     elide_core::config::VolumeConfig {
-        name: Some(name.to_owned()),
+        name: manifest
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
         size: Some(size as u64),
         nbd: None,
     }
     .write(&vol_dir)?;
-
-    if manifest
-        .get("readonly")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        std::fs::write(vol_dir.join("volume.readonly"), "")?;
-    }
-
-    if let Some(origin) = manifest.get("origin").and_then(|v| v.as_str()) {
-        std::fs::write(vol_dir.join("volume.parent"), origin)?;
-    }
-
+    std::fs::write(vol_dir.join("volume.readonly"), "")?;
     std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
-
-    // Create index/ so discover_volumes picks up the volume and the
-    // coordinator runs prefetch_indexes to download the .idx files.
+    if let Some(bytes) = &provenance_bytes {
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
+            bytes,
+        )?;
+    }
+    // Empty index/ so discover_volumes queues the volume for prefetch.
     std::fs::create_dir_all(vol_dir.join("index"))?;
 
-    // Step 4: create by_name symlink.
-    let by_name_dir = data_dir.join("by_name");
-    std::fs::create_dir_all(&by_name_dir)?;
-    let symlink_path = by_name_dir.join(name);
-    if symlink_path.is_symlink() || symlink_path.exists() {
-        // Clean up and fail cleanly.
-        let _ = std::fs::remove_dir_all(&vol_dir);
-        return Err(std::io::Error::other(format!(
-            "volume name already in use locally: {name}"
-        )));
-    }
-    std::os::unix::fs::symlink(format!("../by_id/{volume_id}"), &symlink_path)?;
+    // Parse the downloaded provenance to find the parent ULID (if any).
+    // Signature is verified against the just-written `volume.pub`.
+    let parent_ulid = if provenance_bytes.is_some() {
+        match elide_core::signing::read_lineage_verifying_signature(
+            &vol_dir,
+            elide_core::signing::VOLUME_PUB_FILE,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+        ) {
+            Ok(lineage) => lineage
+                .parent
+                .as_deref()
+                .and_then(|entry| entry.split_once('/').map(|(p, _)| p.to_owned())),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&vol_dir);
+                return Err(std::io::Error::other(format!(
+                    "verifying provenance for {volume_id}: {e}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
 
-    println!("pulled {name} ({volume_id})");
-
-    // Step 5: signal coordinator to rescan (best-effort).
-    if coordinator_client::rescan(socket_path).is_err() {
-        eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
-    }
-
-    Ok(())
+    Ok(parent_ulid)
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {

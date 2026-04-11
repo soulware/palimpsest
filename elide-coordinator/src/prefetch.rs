@@ -55,14 +55,22 @@ pub async fn prefetch_indexes(
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<PrefetchResult> {
-    let by_id_dir = fork_dir.parent().unwrap_or(fork_dir);
+    // `fork_dir` is either `<data_dir>/by_id/<ulid>/` or
+    // `<data_dir>/readonly/<ulid>/`. Ancestors are always resolved against
+    // `by_id/` first (with a fallback to `readonly/` inside `walk_ancestors`),
+    // so recover the canonical `by_id/` path from the data dir root.
+    let data_dir = fork_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(fork_dir);
+    let by_id_dir = data_dir.join("by_id");
     // Walk both kinds of ancestry: fork ancestors (volume.parent) and
     // extent-index ancestors (volume.extent_index). Both contribute segments
     // that need .idx files locally. Extent-only ancestors are deduplicated
     // against the fork chain by directory path.
     let fork_ancestors =
-        walk_ancestors(fork_dir, by_id_dir).context("walking fork ancestor chain")?;
-    let extent_ancestors = walk_extent_ancestors(fork_dir, by_id_dir)
+        walk_ancestors(fork_dir, by_id_dir.as_path()).context("walking fork ancestor chain")?;
+    let extent_ancestors = walk_extent_ancestors(fork_dir, by_id_dir.as_path())
         .context("walking extent-index ancestor chain")?;
 
     let mut result = PrefetchResult {
@@ -384,6 +392,92 @@ mod tests {
         let result2 = prefetch_indexes(&child_dir, &store).await.unwrap();
         assert_eq!(result2.fetched, 0);
         assert_eq!(result2.skipped, 1);
+    }
+
+    /// Cross-tree ancestor: the child is writable in `by_id/<child>/` but its
+    /// parent lives in `readonly/<parent>/` (pulled as a readonly ancestor).
+    /// `walk_ancestors` must resolve across both trees and prefetch must write
+    /// the parent's `.idx` into the readonly parent's own `index/` dir,
+    /// verifying it against the parent's own `volume.pub`.
+    #[tokio::test]
+    async fn prefetch_indexes_writes_readonly_ancestor_idx() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let by_id = data_dir.join("by_id");
+        let readonly = data_dir.join("readonly");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        // Parent is in readonly/ (pulled); child is a writable volume in by_id/.
+        let parent_dir = readonly.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+
+        std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
+        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
+
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        let data = vec![0x5Au8; 4096];
+        let hash = blake3::hash(&data);
+        let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
+        let staging = tmp.path().join(seg_ulid);
+        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
+
+        let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
+
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(format!("{parent_ulid}/snapshots/{snap_ulid}")),
+                extent_index: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+        let seg_bytes = std::fs::read(&staging).unwrap();
+        let key = StorePath::from(format!("by_id/{parent_ulid}/segments/19700101/{seg_ulid}"));
+        store.put(&key, seg_bytes.into()).await.unwrap();
+
+        let result = prefetch_indexes(&child_dir, &store).await.unwrap();
+        assert_eq!(result.fetched, 1);
+        assert_eq!(result.failed, 0);
+
+        let idx_path = parent_dir.join("index").join(format!("{seg_ulid}.idx"));
+        assert!(
+            idx_path.exists(),
+            ".idx must land in readonly/<parent>/index/"
+        );
+        // And definitely not in the child's index dir.
+        assert!(
+            !child_dir
+                .join("index")
+                .join(format!("{seg_ulid}.idx"))
+                .exists(),
+            "child must not inherit parent's .idx"
+        );
     }
 
     /// Root volume (no volume.parent): prefetch_indexes must fetch its own segments.

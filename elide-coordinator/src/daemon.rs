@@ -224,63 +224,68 @@ async fn wait_for_pids(pids: &[u32], timeout: Duration) {
     }
 }
 
-/// Scan `<data_dir>/by_id/` and return volume directories that need coordinator
-/// attention (drain, GC, supervision, or prefetch).
+/// Scan `<data_dir>/by_id/` and `<data_dir>/readonly/` for volume directories
+/// that need coordinator attention (drain, GC, supervision, or prefetch).
+///
+/// `by_id/` holds writable volumes; `readonly/` holds pulled-readonly ancestors
+/// that exist only as fork sources. Both trees are scanned by the same rules;
+/// the supervisor gate in the caller uses `volume.readonly` (and directory
+/// placement) to decide whether to spawn a serve process.
 ///
 /// Skips:
 ///   - entries whose name is not a valid ULID
 ///   - volumes with no `pending/` or `index/` subdirectory (not yet initialised)
 ///   - readonly volumes that are fully indexed: `index/` is non-empty
-///     (drain/prefetch completed)
+///     (prefetch completed)
 ///
-/// Readonly volumes with `pending/` are included for drain. Readonly volumes
-/// with no `index/` are included for prefetch (pulled from the store but not
-/// yet indexed locally).
+/// Readonly volumes with no `index/` (or an empty one) are included for
+/// prefetch. Writable volumes with `pending/` are included for drain.
 fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
-    let by_id_dir = data_dir.join("by_id");
     let mut volumes = Vec::new();
-    let entries = match std::fs::read_dir(&by_id_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return volumes,
-        Err(e) => {
-            warn!(
-                "[coordinator] cannot read by_id dir {}: {e}",
-                by_id_dir.display()
-            );
-            return volumes;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if ulid::Ulid::from_string(name).is_err() {
-            continue;
-        }
-        let has_pending = path.join("pending").exists();
-        let has_index = path.join("index").exists();
-        if !has_pending && !has_index {
-            continue;
-        }
-        // Skip readonly volumes that are already fully indexed locally —
-        // index/ is non-empty (drain or prefetch completed). Include volumes
-        // with pending/ (need drain) or with empty/absent index/ (need prefetch).
-        if path.join("volume.readonly").exists() && !has_pending {
-            let dir_non_empty = |sub: &str| {
-                path.join(sub)
-                    .read_dir()
-                    .map(|mut d| d.next().is_some())
-                    .unwrap_or(false)
-            };
-            if dir_non_empty("index") {
+    for sub in ["by_id", "readonly"] {
+        let root = data_dir.join(sub);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(
+                    "[coordinator] cannot read {sub} dir {}: {e}",
+                    root.display()
+                );
                 continue;
             }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if ulid::Ulid::from_string(name).is_err() {
+                continue;
+            }
+            let has_pending = path.join("pending").exists();
+            let has_index = path.join("index").exists();
+            if !has_pending && !has_index {
+                continue;
+            }
+            // Skip readonly volumes that are already fully indexed locally —
+            // index/ is non-empty (prefetch completed).
+            if path.join("volume.readonly").exists() && !has_pending {
+                let dir_non_empty = |sub: &str| {
+                    path.join(sub)
+                        .read_dir()
+                        .map(|mut d| d.next().is_some())
+                        .unwrap_or(false)
+                };
+                if dir_non_empty("index") {
+                    continue;
+                }
+            }
+            volumes.push(path);
         }
-        volumes.push(path);
     }
     volumes
 }
@@ -443,6 +448,49 @@ mod tests {
                 format!("by_id/{ulid5}"),
                 format!("by_id/{ulid7}"),
             ]
+        );
+    }
+
+    #[test]
+    fn discover_volumes_scans_readonly_tree() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Writable volume in by_id/.
+        let wid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        mk(root, &format!("by_id/{wid}/index"));
+
+        // Pulled readonly ancestor with empty index/ — needs prefetch.
+        let rid_new = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        mk(root, &format!("readonly/{rid_new}/index"));
+        std::fs::write(root.join(format!("readonly/{rid_new}/volume.readonly")), "").unwrap();
+
+        // Pulled readonly ancestor with populated index/ — prefetch done, skip.
+        let rid_done = "01JQCCCCCCCCCCCCCCCCCCCCCC";
+        mk(root, &format!("readonly/{rid_done}/index"));
+        std::fs::write(
+            root.join(format!(
+                "readonly/{rid_done}/index/01JQAAAAAAAAAAAAAAAAAAAAA1.idx"
+            )),
+            "",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("readonly/{rid_done}/volume.readonly")),
+            "",
+        )
+        .unwrap();
+
+        let volumes = discover_volumes(root);
+        let mut names: Vec<String> = volumes
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![format!("by_id/{wid}"), format!("readonly/{rid_new}"),]
         );
     }
 }

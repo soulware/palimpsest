@@ -2526,8 +2526,27 @@ pub(crate) fn find_segment_in_dirs(
         }
     }
     if let (Some(fetcher), BodySource::Cached(idx)) = (fetcher, body_source) {
-        let index_dir = base_dir.join("index");
-        let body_dir = base_dir.join("cache");
+        // The segment's `.idx` file lives in the index directory of whichever
+        // volume wrote it — self for locally-written segments, an ancestor
+        // for fork-parent segments. Search self first, then the ancestor
+        // chain (in the same order rebuild_segments merges), and use that
+        // volume's dirs so the fetched body lands in the owner's `cache/`
+        // (where subsequent reads will find it via the ancestor scan above).
+        let idx_filename = format!("{sid}.idx");
+        let owner_dir = std::iter::once(base_dir)
+            .chain(ancestor_layers.iter().map(|l| l.dir.as_path()))
+            .find(|dir| dir.join("index").join(&idx_filename).exists())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "segment index not found in self or ancestors: {sid}.idx \
+                         (ancestor chain may not be prefetched yet)"
+                    ),
+                )
+            })?;
+        let index_dir = owner_dir.join("index");
+        let body_dir = owner_dir.join("cache");
         fetcher.fetch_extent(
             segment_id,
             &index_dir,
@@ -2539,7 +2558,7 @@ pub(crate) fn find_segment_in_dirs(
                 entry_idx: idx,
             },
         )?;
-        return Ok(base_dir.join("cache").join(format!("{sid}.body")));
+        return Ok(body_dir.join(format!("{sid}.body")));
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
 }
@@ -2736,13 +2755,35 @@ fn load_lineage_or_empty(fork_dir: &Path) -> io::Result<crate::signing::Provenan
 /// the root of its fork chain; returns an empty vec. The `parent` field is
 /// in the form `<parent-ulid>/snapshots/<branch-ulid>`, validated as ULIDs
 /// at parse time.
+/// Resolve an ancestor volume directory by ULID.
+///
+/// An ancestor may live in the writable `by_id/<ulid>/` tree or in the
+/// readonly pulled tree `readonly/<ulid>/`. Prefer `by_id/` when both exist:
+/// a locally writable copy supersedes a pulled readonly skeleton.
+///
+/// Falls back to `by_id_dir.join(ulid)` when neither candidate is present so
+/// that callers (and tests) get a deterministic path they can report in errors.
+pub fn resolve_ancestor_dir(by_id_dir: &Path, ulid: &str) -> PathBuf {
+    let by_id_candidate = by_id_dir.join(ulid);
+    if by_id_candidate.exists() {
+        return by_id_candidate;
+    }
+    if let Some(parent) = by_id_dir.parent() {
+        let readonly_candidate = parent.join("readonly").join(ulid);
+        if readonly_candidate.exists() {
+            return readonly_candidate;
+        }
+    }
+    by_id_candidate
+}
+
 pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     let lineage = load_lineage_or_empty(fork_dir)?;
     let Some(parent_entry) = lineage.parent else {
         return Ok(Vec::new());
     };
     let (parent_ulid_str, branch_ulid) = parse_lineage_entry(&parent_entry, "parent", fork_dir)?;
-    let parent_fork_dir = by_id_dir.join(parent_ulid_str);
+    let parent_fork_dir = resolve_ancestor_dir(by_id_dir, parent_ulid_str);
 
     // Recurse into the parent's fork chain first (builds oldest-first order).
     let mut ancestors = walk_ancestors(&parent_fork_dir, by_id_dir)?;
@@ -2777,7 +2818,7 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
     for entry in &lineage.extent_index {
         let (source_ulid_str, snapshot_ulid) =
             parse_lineage_entry(entry, "extent_index", fork_dir)?;
-        let source_dir = by_id_dir.join(source_ulid_str);
+        let source_dir = resolve_ancestor_dir(by_id_dir, source_ulid_str);
         if layers.iter().any(|l| l.dir == source_dir) {
             continue;
         }
@@ -2815,6 +2856,32 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
 ///
 /// Returns `Ok(())` on success; `new_fork_dir` must not already exist.
 pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()> {
+    let branch_ulid = latest_snapshot(source_fork_dir)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "source volume '{}' has no snapshots; run snapshot-volume first",
+            source_fork_dir.display()
+        ))
+    })?;
+    fork_volume_at(new_fork_dir, source_fork_dir, branch_ulid)
+}
+
+/// Like `fork_volume` but pins the fork to an explicit snapshot ULID.
+///
+/// Used by `volume fork --from <vol_ulid>/<snap_ulid>` when the caller
+/// wants the branch point to be something other than the source volume's
+/// latest snapshot — typically because the source is a pulled readonly
+/// ancestor and the caller has a specific snapshot ULID in mind.
+///
+/// The snapshot is **not** required to exist as a local file: a pulled
+/// readonly ancestor may not have its snapshot markers prefetched yet at
+/// the time of forking. The snapshot ULID is still recorded in the child's
+/// signed provenance and will be resolved at open time once prefetch has
+/// populated the ancestor's `snapshots/` directory.
+pub fn fork_volume_at(
+    new_fork_dir: &Path,
+    source_fork_dir: &Path,
+    branch_ulid: Ulid,
+) -> io::Result<()> {
     if new_fork_dir.exists() {
         return Err(io::Error::other(format!(
             "fork directory '{}' already exists",
@@ -2829,11 +2896,12 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::other("source fork dir has no name"))?;
-
-    let branch_ulid = latest_snapshot(source_fork_dir)?.ok_or_else(|| {
+    // Validate the source directory name really is a ULID before we embed
+    // it in the child's provenance as an ancestor reference.
+    Ulid::from_string(source_ulid).map_err(|e| {
         io::Error::other(format!(
-            "source volume '{}' has no snapshots; run snapshot-volume first",
-            source_fork_dir.display()
+            "source fork dir name is not a ULID ({}): {e}",
+            source_real.display()
         ))
     })?;
 
@@ -4846,6 +4914,54 @@ mod tests {
     }
 
     #[test]
+    fn walk_ancestors_crosses_into_readonly_tree() {
+        // Simulate the fork-from-remote layout: a writable child in
+        // `by_id/<child>/` whose parent only exists as a pulled readonly
+        // skeleton in `readonly/<parent>/`. `walk_ancestors` must resolve
+        // across both trees.
+        let data_dir = temp_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let by_id = data_dir.join("by_id");
+        let readonly = data_dir.join("readonly");
+
+        let parent_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = readonly.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+
+        write_test_provenance(
+            &child_dir,
+            Some(&format!(
+                "{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            )),
+            &[],
+        );
+        // Create the readonly parent dir so `resolve_ancestor_dir` picks it.
+        std::fs::create_dir_all(&parent_dir).unwrap();
+
+        let ancestors = walk_ancestors(&child_dir, &by_id).unwrap();
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(
+            ancestors[0].dir, parent_dir,
+            "ancestor should resolve into the readonly/ tree"
+        );
+        assert_eq!(
+            ancestors[0].branch_ulid.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    #[test]
+    fn resolve_ancestor_dir_prefers_by_id_over_readonly() {
+        let data_dir = temp_dir();
+        let by_id = data_dir.join("by_id");
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        std::fs::create_dir_all(by_id.join(ulid)).unwrap();
+        std::fs::create_dir_all(data_dir.join("readonly").join(ulid)).unwrap();
+        assert_eq!(resolve_ancestor_dir(&by_id, ulid), by_id.join(ulid));
+    }
+
+    #[test]
     fn walk_ancestors_two_levels() {
         let by_id = temp_dir();
         let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -5258,6 +5374,47 @@ mod tests {
     }
 
     #[test]
+    fn fork_volume_at_pins_explicit_snapshot_without_requiring_local_marker() {
+        // Simulate forking from a readonly ancestor: the source dir exists
+        // but has no snapshots/ directory (prefetch hasn't landed yet). The
+        // explicit pin must still succeed and be recorded in provenance.
+        let by_id = temp_dir();
+        let source_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let source_dir = by_id.join(source_ulid);
+        let child_dir = by_id.join(child_ulid);
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let branch_ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        fork_volume_at(&child_dir, &source_dir, branch_ulid).unwrap();
+
+        let lineage = crate::signing::read_lineage_verifying_signature(
+            &child_dir,
+            crate::signing::VOLUME_PUB_FILE,
+            crate::signing::VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        assert_eq!(
+            lineage.parent.as_deref(),
+            Some(format!("{source_ulid}/snapshots/{branch_ulid}").as_str()),
+        );
+
+        fs::remove_dir_all(by_id).unwrap();
+    }
+
+    #[test]
+    fn fork_volume_at_rejects_non_ulid_source_dir() {
+        let tmp = temp_dir();
+        let source_dir = tmp.join("not-a-ulid");
+        let child_dir = tmp.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        fs::create_dir_all(&source_dir).unwrap();
+        let branch_ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let err = fork_volume_at(&child_dir, &source_dir, branch_ulid).unwrap_err();
+        assert!(err.to_string().contains("ULID"), "{err}");
+        fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
     fn fork_volume_uses_latest_snapshot_when_multiple_exist() {
         let by_id = temp_dir();
         let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -5593,6 +5750,180 @@ mod tests {
         assert_eq!(rv.read(0, 1).unwrap(), ancestor_data);
 
         fs::remove_dir_all(by_id).unwrap();
+    }
+
+    /// Regression test for the fork-from-remote demand-fetch bug: when a
+    /// forked child needs to demand-fetch a segment that belongs to an
+    /// ancestor, `find_segment_in_dirs` must route the fetcher at the
+    /// ancestor's `index/` and `cache/` directories — not the child's.
+    /// The child's `index/` does not hold ancestor `.idx` files in the
+    /// `readonly/` layout, so using the child's dirs fails with ENOENT on
+    /// the very first read. See docs/fork-from-remote-plan.md phase 1c.
+    #[test]
+    fn find_segment_in_dirs_routes_fetcher_at_ancestor_index_dir() {
+        use crate::extentindex::BodySource;
+        use std::sync::Mutex;
+
+        struct OwnerAssertingFetcher {
+            captured: Mutex<Option<(PathBuf, PathBuf)>>,
+        }
+
+        impl crate::segment::SegmentFetcher for OwnerAssertingFetcher {
+            fn fetch_extent(
+                &self,
+                segment_id: Ulid,
+                index_dir: &Path,
+                body_dir: &Path,
+                _extent: &crate::segment::ExtentFetch,
+            ) -> io::Result<()> {
+                *self.captured.lock().unwrap() = Some((index_dir.to_owned(), body_dir.to_owned()));
+                // Simulate a successful fetch: write the body file where
+                // the caller expects to find it on return.
+                std::fs::create_dir_all(body_dir)?;
+                std::fs::write(body_dir.join(format!("{segment_id}.body")), b"fake body")?;
+                Ok(())
+            }
+
+            fn fetch_delta_body(
+                &self,
+                _segment_id: Ulid,
+                _index_dir: &Path,
+                _body_dir: &Path,
+            ) -> io::Result<()> {
+                Err(io::Error::other("unused"))
+            }
+        }
+
+        let tmp = temp_dir();
+        let child_dir = tmp.join("child");
+        let ancestor_dir = tmp.join("ancestor");
+        std::fs::create_dir_all(child_dir.join("index")).unwrap();
+        std::fs::create_dir_all(ancestor_dir.join("index")).unwrap();
+
+        // Only the ancestor holds the segment's `.idx`, matching the
+        // fork-from-remote layout where each volume's signed index lives
+        // in its own `index/` directory. Content is irrelevant — the
+        // routing code only checks existence.
+        let seg_ulid = Ulid::new();
+        let idx_name = format!("{seg_ulid}.idx");
+        std::fs::write(ancestor_dir.join("index").join(&idx_name), b"stub").unwrap();
+
+        let layers = vec![AncestorLayer {
+            dir: ancestor_dir.clone(),
+            branch_ulid: None,
+        }];
+        let concrete = Arc::new(OwnerAssertingFetcher {
+            captured: Mutex::new(None),
+        });
+        let fetcher: BoxFetcher = concrete.clone();
+
+        let returned = find_segment_in_dirs(
+            seg_ulid,
+            &child_dir,
+            &layers,
+            Some(&fetcher),
+            0,
+            BodySource::Cached(0),
+        )
+        .expect("fetcher should have been routed at the ancestor's dirs");
+
+        // The body must land under the ancestor, not the child.
+        assert_eq!(
+            returned,
+            ancestor_dir.join("cache").join(format!("{seg_ulid}.body")),
+        );
+        assert!(
+            !child_dir
+                .join("cache")
+                .join(format!("{seg_ulid}.body"))
+                .exists(),
+            "body must not be written under the child's cache dir"
+        );
+
+        // And the fetcher itself must have been called with the ancestor's
+        // dirs — this is what the pre-fix code got wrong.
+        let (idx_dir, body_dir) = concrete
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("fetcher must be called");
+        assert_eq!(idx_dir, ancestor_dir.join("index"));
+        assert_eq!(body_dir, ancestor_dir.join("cache"));
+
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// Complement to the previous test: when the child itself owns the
+    /// segment (its own `index/` holds the `.idx`), the fetcher must be
+    /// routed at the child's own dirs even if an ancestor is present.
+    #[test]
+    fn find_segment_in_dirs_prefers_self_over_ancestor_when_self_owns_idx() {
+        use crate::extentindex::BodySource;
+        use std::sync::Mutex;
+
+        struct CaptureFetcher {
+            captured: Mutex<Option<PathBuf>>,
+        }
+        impl crate::segment::SegmentFetcher for CaptureFetcher {
+            fn fetch_extent(
+                &self,
+                segment_id: Ulid,
+                index_dir: &Path,
+                body_dir: &Path,
+                _extent: &crate::segment::ExtentFetch,
+            ) -> io::Result<()> {
+                *self.captured.lock().unwrap() = Some(index_dir.to_owned());
+                std::fs::create_dir_all(body_dir)?;
+                std::fs::write(body_dir.join(format!("{segment_id}.body")), b"")?;
+                Ok(())
+            }
+            fn fetch_delta_body(&self, _: Ulid, _: &Path, _: &Path) -> io::Result<()> {
+                Err(io::Error::other("unused"))
+            }
+        }
+
+        let tmp = temp_dir();
+        let child_dir = tmp.join("child");
+        let ancestor_dir = tmp.join("ancestor");
+        std::fs::create_dir_all(child_dir.join("index")).unwrap();
+        std::fs::create_dir_all(ancestor_dir.join("index")).unwrap();
+
+        let seg_ulid = Ulid::new();
+        let idx_name = format!("{seg_ulid}.idx");
+        // Both self and ancestor have the `.idx`; self must win.
+        std::fs::write(child_dir.join("index").join(&idx_name), b"stub").unwrap();
+        std::fs::write(ancestor_dir.join("index").join(&idx_name), b"stub").unwrap();
+
+        let layers = vec![AncestorLayer {
+            dir: ancestor_dir.clone(),
+            branch_ulid: None,
+        }];
+        let concrete = Arc::new(CaptureFetcher {
+            captured: Mutex::new(None),
+        });
+        let fetcher: BoxFetcher = concrete.clone();
+
+        let returned = find_segment_in_dirs(
+            seg_ulid,
+            &child_dir,
+            &layers,
+            Some(&fetcher),
+            0,
+            BodySource::Cached(0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            returned,
+            child_dir.join("cache").join(format!("{seg_ulid}.body")),
+        );
+        assert_eq!(
+            concrete.captured.lock().unwrap().clone().unwrap(),
+            child_dir.join("index")
+        );
+
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
