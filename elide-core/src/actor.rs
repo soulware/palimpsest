@@ -31,7 +31,8 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
 use crate::volume::{
-    AncestorLayer, CompactionStats, FileCache, Volume, find_segment_in_dirs, read_extents,
+    AncestorLayer, CompactionStats, FileCache, Volume, find_segment_in_dirs,
+    open_delta_body_in_dirs, read_extents,
 };
 
 // ---------------------------------------------------------------------------
@@ -468,6 +469,14 @@ impl VolumeHandle {
                     self.config.fetcher.as_ref(),
                     bss,
                     idx,
+                )
+            },
+            |id| {
+                open_delta_body_in_dirs(
+                    id,
+                    &self.config.base_dir,
+                    &self.config.ancestor_layers,
+                    self.config.fetcher.as_ref(),
                 )
             },
         )

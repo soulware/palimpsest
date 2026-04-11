@@ -612,6 +612,14 @@ impl Volume {
             &self.extent_index,
             &self.file_cache,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
+            |id| {
+                open_delta_body_in_dirs(
+                    id,
+                    &self.base_dir,
+                    &self.ancestor_layers,
+                    self.fetcher.as_ref(),
+                )
+            },
         )
     }
 
@@ -2085,6 +2093,7 @@ pub(crate) fn read_extents(
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
+    open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -2126,6 +2135,7 @@ pub(crate) fn read_extents(
                     extent_index,
                     file_cache,
                     &find_segment,
+                    &open_delta_body,
                     &mut out,
                 )? {
                     continue;
@@ -2258,6 +2268,7 @@ fn try_read_delta_extent(
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
     find_segment: &dyn Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
+    open_delta_body: &dyn Fn(Ulid) -> io::Result<fs::File>,
     out: &mut [u8],
 ) -> io::Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
@@ -2266,8 +2277,7 @@ fn try_read_delta_extent(
         return Ok(false);
     };
     let delta_segment_id = delta_loc.segment_id;
-    let delta_body_rel_offset = delta_loc.delta_body_rel_offset;
-    let delta_body_section_start = delta_loc.body_section_start;
+    let delta_body_source = delta_loc.body_source;
     let options = delta_loc.options.clone();
 
     // Pick the first option whose source hash resolves to a DATA/Inline
@@ -2328,39 +2338,47 @@ fn try_read_delta_extent(
 
     // --- Read the delta blob from the Delta segment's delta body section. ---
     //
-    // The segment file may be a full segment (pending/, gc/*.applied)
-    // or a `cache/<id>.body` file with the delta body appended after
-    // the sparse body section (post-promote shape — see
-    // `promote_to_cache`). `SegmentLayout` tells us which shape we
-    // opened and selects the right seek base.
-    let delta_blob: Vec<u8> = {
-        let mut cache = file_cache.borrow_mut();
-        if cache.get(delta_segment_id).is_none() {
-            // Pass BodySource::Local so find_segment considers
-            // cache/<id>.body as a candidate. The `.body` shape now
-            // carries the delta body region when the import host has
-            // promoted it, or when a future demand-fetch extension
-            // writes it. A full pending/ segment is still accepted as
-            // a fallback.
-            let path = find_segment(
-                delta_segment_id,
-                delta_body_section_start,
-                BodySource::Local,
-            )?;
-            let layout = SegmentLayout::from_path(&path);
-            cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
+    // Two shapes: a full segment in `pending/` (delta body inline at
+    // `body_section_start + body_length`) or a separate
+    // `cache/<id>.delta` file (delta body starts at byte 0). The
+    // extent_index records which via `DeltaBodySource`. For the
+    // cached case we call `open_delta_body`, which returns an open
+    // file handle — demand-fetching from the volume's attached
+    // `SegmentFetcher` on miss.
+    let delta_blob: Vec<u8> = match delta_body_source {
+        extentindex::DeltaBodySource::Full {
+            body_section_start: delta_bss,
+            body_length: delta_body_length,
+        } => {
+            let mut cache = file_cache.borrow_mut();
+            if cache.get(delta_segment_id).is_none() {
+                let path = find_segment(delta_segment_id, delta_bss, BodySource::Local)?;
+                let layout = SegmentLayout::from_path(&path);
+                cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
+            }
+            let (_layout, f) = cache
+                .get(delta_segment_id)
+                .expect("delta segment just inserted or found");
+            f.seek(SeekFrom::Start(
+                delta_bss + delta_body_length + opt.delta_offset,
+            ))?;
+            let mut buf = vec![0u8; opt.delta_length as usize];
+            f.read_exact(&mut buf)?;
+            buf
         }
-        let (layout, f) = cache
-            .get(delta_segment_id)
-            .expect("delta segment just inserted or found");
-        let file_delta_base = match layout {
-            SegmentLayout::BodyOnly => delta_body_rel_offset,
-            SegmentLayout::Full => delta_body_section_start + delta_body_rel_offset,
-        };
-        f.seek(SeekFrom::Start(file_delta_base + opt.delta_offset))?;
-        let mut buf = vec![0u8; opt.delta_length as usize];
-        f.read_exact(&mut buf)?;
-        buf
+        extentindex::DeltaBodySource::Cached => {
+            // Opens cache/<id>.delta (demand-fetching via the attached
+            // `SegmentFetcher` if the file is absent on a pull host).
+            // Not routed through `file_cache` because .delta is a
+            // distinct file from the segment body, and delta reads
+            // are rare enough that caching the FD would complicate
+            // eviction for little benefit.
+            let mut f = open_delta_body(delta_segment_id)?;
+            f.seek(SeekFrom::Start(opt.delta_offset))?;
+            let mut buf = vec![0u8; opt.delta_length as usize];
+            f.read_exact(&mut buf)?;
+            buf
+        }
     };
 
     // --- Decompress the delta blob using the source as the zstd dictionary. ---
@@ -2390,6 +2408,48 @@ fn try_read_delta_extent(
         .ok_or_else(|| io::Error::other("delta decompressed payload too short"))?;
     out_slice.copy_from_slice(src_slice);
     Ok(true)
+}
+
+/// Open `cache/<id>.delta` for reading, demand-fetching it on miss.
+///
+/// Only called from `try_read_delta_extent` when the extent_index
+/// recorded the Delta entry as `DeltaBodySource::Cached` — i.e. the
+/// segment has already been promoted to the three-file cache shape,
+/// so the delta body, if local, lives in its own `.delta` file
+/// rather than inline in a full segment.
+///
+/// On a pull host where `.delta` is absent the attached fetcher
+/// downloads it atomically (tmp+rename) before we open. Returns
+/// `NotFound` when the file is missing locally and no fetcher is
+/// attached to fetch it.
+pub(crate) fn open_delta_body_in_dirs(
+    segment_id: Ulid,
+    base_dir: &Path,
+    ancestor_layers: &[AncestorLayer],
+    fetcher: Option<&BoxFetcher>,
+) -> io::Result<fs::File> {
+    let sid = segment_id.to_string();
+
+    let cache_delta = base_dir.join("cache").join(format!("{sid}.delta"));
+    if cache_delta.exists() {
+        return fs::File::open(&cache_delta);
+    }
+    for layer in ancestor_layers.iter().rev() {
+        let ancestor_delta = layer.dir.join("cache").join(format!("{sid}.delta"));
+        if ancestor_delta.exists() {
+            return fs::File::open(&ancestor_delta);
+        }
+    }
+    if let Some(fetcher) = fetcher {
+        let index_dir = base_dir.join("index");
+        let body_dir = base_dir.join("cache");
+        fetcher.fetch_delta_body(segment_id, &index_dir, &body_dir)?;
+        return fs::File::open(&cache_delta);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("delta body not found: {sid}"),
+    ))
 }
 
 /// Search for a segment file across the fork directory tree.
@@ -2538,6 +2598,14 @@ impl ReadonlyVolume {
             &self.extent_index,
             &self.file_cache,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
+            |id| {
+                open_delta_body_in_dirs(
+                    id,
+                    &self.base_dir,
+                    &self.ancestor_layers,
+                    self.fetcher.as_ref(),
+                )
+            },
         )
     }
 

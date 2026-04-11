@@ -268,24 +268,44 @@ The earliest-source preference was originally scoped as a standalone Phase A. It
 
 **Phase 4 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
-## Post-B2 gap: pull-host demand-fetch of the delta body section
+## Pull-host demand-fetch of the delta body section
 
-B2 produces segments with a delta body section and uploads them to S3 correctly. The *import host* can read its own delta entries because `promote_to_cache` is extended to preserve the delta body section in `cache/<id>.body` alongside the existing body section (appended after `body_length`, so the file shape becomes `[body section | delta body section]`). The `.body` file is the local mirror of the S3 object's contiguous `[body_offset, EOF)` region, and `extent_index::rebuild` registers Delta entries against it at the cached-segment path.
+A **pull host** (a host that never ran the import, and obtains the segment by pulling from S3) reads Delta LBAs by demand-fetching the segment's delta body section on first access. The delta body lives in its own local file, `cache/<id>.delta`, parallel to `cache/<id>.body` and `cache/<id>.present`:
 
-A **pull host** (a host that never ran the import, and obtains the segment by pulling from S3) is **not** yet covered. The current pipeline:
+```
+cache/<id>.idx     — header + index + inline (coordinator-written, permanent)
+cache/<id>.body    — sparse body section (size = body_length); Data entries at their
+                     stored_offset, holes elsewhere
+cache/<id>.present — per-entry bitset for .body
+cache/<id>.delta   — exactly the delta body region (size = delta_length), starting at
+                     delta-region byte 0; absent iff the segment has no deltas or the
+                     host hasn't fetched them yet
+```
 
-1. Pull-host prefetch downloads the `.idx` file (header + index + inline) for the segment.
-2. `extent_index::rebuild` walks the `.idx` and finds Delta entries, but the local `.body` file either does not exist or contains only the sparse body section copied by prior fetches — no delta body section.
-3. `elide-fetch` has no awareness of `EntryKind::Delta` (it breaks only on `DedupRef` and `Inline` in its batch-scanner, and a Delta entry with `stored_length = 0` looks like a gap in the body layout). It does not know to issue a range-GET for `[body_offset + body_length, EOF)` of the S3 object.
-4. A read against a Delta LBA on a pull host therefore fails — `extent_index.lookup_delta` returns `None` (rebuild skipped the registration for lack of local delta body bytes), and the read falls through to "unwritten LBA" handling.
+Keeping the delta region out of `.body` means `.body` has a single unambiguous shape and the "do I have the delta body locally?" question is answered by `.delta`'s existence, not by comparing file sizes against header fields.
 
-**Closing this gap requires:**
+### Rebuild semantics
 
-1. `elide-fetch` learns to recognise Delta entries and, on first access to any Delta LBA in a segment, fetch the segment's full delta body section (`GET [body_offset + body_length, EOF)` against the S3 object) and append those bytes to `cache/<id>.body` at offset `body_length`. After this, the file shape matches exactly what the import host produced via `promote_to_cache` extension, and all subsequent reads resolve via the same cached path.
-2. `extent_index::rebuild` for cached segments conditionally registers Delta entries when the `.body` file's length exceeds `body_length` (i.e. the delta body section is present). Today the cached-path rebuild has an explicit `continue` for Delta entries; the post-B2 extension removes that when the sidecar is available.
-3. A sentinel or per-segment marker so rebuild can distinguish "this segment has no delta body" (never had one; normal case) from "this segment has a delta body but it isn't cached yet" (pull host, fetch required). Simplest: check `delta_length > 0` in the `.idx` header — which rebuild already reads — and treat Delta entries as "present if local body file size > body_length, otherwise pending demand-fetch."
+`extent_index::rebuild` registers every Delta entry it encounters in the `.idx`, unconditionally, with `DeltaBodySource::Cached`. Rebuild does **not** stat `.delta`. The reader is responsible for handling the missing-file case.
 
-This is deferred to a follow-up branch. Until it lands, delta compression is an import-host-only optimisation: the import host benefits from thin Delta entries (smaller S3 objects, 90% savings on jammy → jammy point releases), and any pull host of the same volume reads the Delta LBAs only after the demand-fetch extension lands. B2 does not break the pull-host read path — it just leaves it returning zeros for delta LBAs instead of their actual content, which will be corrected once (1)–(3) ship.
+For segments still in `pending/` (not yet promoted), Delta entries register with `DeltaBodySource::Full { body_section_start, body_length }` because the delta body lives inline at the end of the pending file. These are mutually exclusive — a segment is either still in `pending/` or has been promoted to the cache shape; rebuild sees exactly one of the two at any point in time.
+
+### Read path
+
+`try_read_delta_extent` dispatches on `DeltaBodySource`:
+
+- `Full`: open the segment file via `find_segment` (unchanged path), seek to `body_section_start + body_length + opt.delta_offset`, read `opt.delta_length` bytes.
+- `Cached`: call `open_delta_body_in_dirs` → open `cache/<id>.delta`; on miss, invoke the volume's attached `SegmentFetcher::fetch_delta_body`, which downloads and atomically writes (`tmp` + `rename`) the file. Then seek to `opt.delta_offset`, read `opt.delta_length` bytes.
+
+`fetch_delta_body` issues a single range-GET for `[body_section_start + body_length, body_section_start + body_length + delta_length)` — the exact bounds, derived from the local `.idx` header. One request covers every Delta entry in the segment.
+
+### Promote and the import host
+
+`promote_to_cache` writes `.body` and `.delta` as two tmp+rename operations against distinct target files. The import host's Delta reads take the `Cached` path like any other host, except `.delta` is always present locally from promote onward.
+
+### Crash safety
+
+Both `promote_to_cache` and `fetch_delta_body` write `.delta` via tmp+rename, so a partial write never produces a visible `.delta` file. A rebuild after an interrupted fetch sees `.delta` as absent and the next read re-triggers the fetch.
 
 ## Non-ext4 volumes
 

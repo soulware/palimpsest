@@ -213,6 +213,18 @@ impl SegmentFetcher for LocalStoreFetcher {
         )?;
         Ok(())
     }
+
+    fn fetch_delta_body(
+        &self,
+        segment_id: ulid::Ulid,
+        _index_dir: &Path,
+        _body_dir: &Path,
+    ) -> io::Result<()> {
+        // Eviction tests do not exercise delta entries.
+        Err(io::Error::other(format!(
+            "LocalStoreFetcher: fetch_delta_body unused (seg {segment_id})"
+        )))
+    }
 }
 
 /// After promote (drain path), the in-memory extent index must transition

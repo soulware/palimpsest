@@ -17,10 +17,14 @@
 use std::fs;
 use std::sync::Arc;
 
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use elide_core::config::VolumeConfig;
 use elide_core::segment::{
-    DeltaOption, SegmentEntry, SegmentFlags, SegmentSigner, extract_idx, promote_to_cache,
-    write_segment, write_segment_with_delta_body,
+    DeltaOption, ExtentFetch, SegmentEntry, SegmentFetcher, SegmentFlags, SegmentSigner,
+    extract_idx, promote_to_cache, write_segment, write_segment_with_delta_body,
 };
 use elide_core::signing;
 use elide_core::volume::ReadonlyVolume;
@@ -202,15 +206,17 @@ fn delta_entry_roundtrip_from_drained_cache() {
         fs::remove_file(&pending).unwrap();
     }
 
-    // The delta-segment's `.body` file must now contain both the
-    // (empty) body section and the delta body appended after, so
-    // its file size equals body_length + delta_length.
-    let delta_body_file = vol_dir.join(format!("cache/{delta_seg_ulid}.body"));
-    let sz = fs::metadata(&delta_body_file).unwrap().len();
+    // Post-promote the delta segment has a separate `.delta` file
+    // sized exactly `delta_length`, sitting alongside an empty `.body`
+    // (body_length == 0 for this fixture — the parent segment holds
+    // the source extent). Reader opens `.delta` directly for cached
+    // Delta entries.
+    let delta_file = vol_dir.join(format!("cache/{delta_seg_ulid}.delta"));
+    let sz = fs::metadata(&delta_file).unwrap().len();
     assert_eq!(
         sz,
         delta_blob.len() as u64,
-        "delta segment's .body file should hold delta body section"
+        "cache/<id>.delta must hold exactly the delta body section"
     );
 
     // Snapshot marker on the post-drain volume.
@@ -226,4 +232,148 @@ fn delta_entry_roundtrip_from_drained_cache() {
     // Parent LBA still round-trips too.
     let parent_read = vol.read(0, 1).unwrap();
     assert_eq!(parent_read, parent_bytes);
+}
+
+/// Pull-host demand-fetch regression: a post-promote volume where
+/// `cache/<id>.delta` is absent (simulating a host that received the
+/// segment via S3 rather than running the import itself).  The
+/// volume's attached `SegmentFetcher` is consulted on the first Delta
+/// LBA read, materialises `.delta` in place, and the read returns the
+/// expected child bytes.  A second read for the same LBA must resolve
+/// locally without re-invoking the fetcher.
+#[test]
+fn delta_entry_demand_fetch_from_pull_host() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    fs::create_dir_all(vol_dir.join("index")).unwrap();
+
+    let parent_bytes = vec![0x55u8; 4096];
+    let parent_hash = blake3::hash(&parent_bytes);
+
+    let mut child_bytes = vec![0x55u8; 4096];
+    for (i, byte) in child_bytes.iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+
+    let parent_seg_ulid = Ulid::new();
+    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let mut parent_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        1,
+        SegmentFlags::empty(),
+        parent_bytes.clone(),
+    )];
+    write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
+
+    let delta_seg_ulid = Ulid::new();
+    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_option = DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+    };
+    let mut delta_entries = vec![SegmentEntry::new_delta(
+        child_hash,
+        10,
+        1,
+        vec![delta_option],
+    )];
+    write_segment_with_delta_body(
+        &delta_seg_path,
+        &mut delta_entries,
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    // Promote both segments as the import host would, then delete
+    // cache/<delta>.delta so the volume looks like a pull host that
+    // hasn't yet materialised the delta body region.
+    for ulid in [parent_seg_ulid, delta_seg_ulid] {
+        let pending = vol_dir.join(format!("pending/{ulid}"));
+        let idx = vol_dir.join(format!("index/{ulid}.idx"));
+        let body = vol_dir.join(format!("cache/{ulid}.body"));
+        let present = vol_dir.join(format!("cache/{ulid}.present"));
+        fs::create_dir_all(vol_dir.join("cache")).unwrap();
+        extract_idx(&pending, &idx).unwrap();
+        promote_to_cache(&pending, &body, &present).unwrap();
+        fs::remove_file(&pending).unwrap();
+    }
+    let delta_file = vol_dir.join(format!("cache/{delta_seg_ulid}.delta"));
+    assert!(delta_file.exists(), "promote should have created .delta");
+
+    // Stash the delta bytes the test fetcher will hand back, then
+    // delete the file to simulate a pull host with no local copy.
+    let staged_delta_bytes = fs::read(&delta_file).unwrap();
+    fs::remove_file(&delta_file).unwrap();
+
+    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+
+    // --- Fake fetcher: only fetch_delta_body is exercised. Writes the
+    // staged bytes atomically (tmp+rename) into body_dir/<id>.delta
+    // and counts invocations so the test can verify caching. ---
+    struct StagedDeltaFetcher {
+        segment_id: Ulid,
+        bytes: Vec<u8>,
+        calls: AtomicUsize,
+    }
+    impl SegmentFetcher for StagedDeltaFetcher {
+        fn fetch_extent(
+            &self,
+            _segment_id: Ulid,
+            _index_dir: &Path,
+            _body_dir: &Path,
+            _extent: &ExtentFetch,
+        ) -> io::Result<()> {
+            Err(io::Error::other("unused in this test"))
+        }
+        fn fetch_delta_body(
+            &self,
+            segment_id: Ulid,
+            _index_dir: &Path,
+            body_dir: &Path,
+        ) -> io::Result<()> {
+            assert_eq!(segment_id, self.segment_id);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let out = body_dir.join(format!("{segment_id}.delta"));
+            let tmp = body_dir.join(format!("{segment_id}.delta.tmp"));
+            fs::write(&tmp, &self.bytes)?;
+            fs::rename(&tmp, &out)?;
+            Ok(())
+        }
+    }
+    let fetcher = Arc::new(StagedDeltaFetcher {
+        segment_id: delta_seg_ulid,
+        bytes: staged_delta_bytes,
+        calls: AtomicUsize::new(0),
+    });
+    let calls = Arc::clone(&fetcher);
+
+    let mut vol = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
+    vol.set_fetcher(fetcher);
+
+    // First read triggers the fetcher and rehydrates .delta.
+    let bytes = vol.read(10, 1).unwrap();
+    assert_eq!(bytes, child_bytes, "pull-host delta read must round-trip");
+    assert_eq!(
+        calls.calls.load(Ordering::SeqCst),
+        1,
+        "first read should invoke fetch_delta_body exactly once"
+    );
+    assert!(delta_file.exists(), ".delta must exist post-fetch");
+
+    // Second read hits the cached path — fetcher must not be invoked again.
+    let bytes2 = vol.read(10, 1).unwrap();
+    assert_eq!(bytes2, child_bytes);
+    assert_eq!(
+        calls.calls.load(Ordering::SeqCst),
+        1,
+        "second read must not re-invoke the fetcher"
+    );
 }

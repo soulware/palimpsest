@@ -128,6 +128,25 @@ pub trait SegmentFetcher: Send + Sync {
         body_dir: &Path,
         extent: &ExtentFetch,
     ) -> io::Result<()>;
+
+    /// Fetch a segment's delta body section and write it atomically to
+    /// `body_dir/<segment_id>.delta`.
+    ///
+    /// The delta body lives at `[body_section_start + body_length,
+    /// body_section_start + body_length + delta_length)` in the remote
+    /// segment object; this method issues a single range-GET for exactly
+    /// that region, so every Delta entry in the segment is serviced by
+    /// one request. The resulting file starts at delta-region byte 0
+    /// (no leading body section), matching `promote_to_cache`'s output
+    /// shape so `try_read_delta_extent` can open it uniformly.
+    ///
+    /// Written via tmp+rename for crash safety.
+    fn fetch_delta_body(
+        &self,
+        segment_id: ulid::Ulid,
+        index_dir: &Path,
+        body_dir: &Path,
+    ) -> io::Result<()>;
 }
 
 /// Parameters for fetching a single extent from an object store.
@@ -1199,16 +1218,21 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
 /// through to the canonical segment via the extent index.
 ///
 /// If the source segment has a populated delta body section
-/// (`header.delta_length > 0`), that section is appended after the sparse
-/// body region, so the `.body` file shape becomes `[body section |
-/// delta body section]`. This preserves the delta blobs a Delta entry
-/// reader needs, which would otherwise only live in the S3 object. The
-/// appended section is a single contiguous `copy_file_range` — one
-/// kernel-side copy regardless of how many delta blobs it contains.
+/// (`header.delta_length > 0`), the delta blobs are written to a
+/// separate `cache/<id>.delta` file (derived from `body_path` by
+/// swapping the extension), starting at byte 0 and sized exactly
+/// `delta_length`. Keeping the delta region out of `.body` means
+/// `.body` has a single, unambiguous shape (sparse body section,
+/// size = body_length) and a pull host can demand-fetch just the
+/// delta region by creating `.delta` without touching `.body`.
 ///
-/// Both files are written via tmp+rename for crash safety. Idempotent: if
-/// `body_path` already exists, the function returns `Ok(())` immediately without
-/// re-reading the source file.
+/// All files are written via tmp+rename for crash safety. `.body` is
+/// written **last** so its existence acts as a commit marker for the
+/// whole promote — any crash before the final rename is recovered by
+/// re-running the promote, since the idempotence guard at the top
+/// only triggers once `.body` is in place. Callers can therefore
+/// trust that if `body_path` exists, `.delta` (when `delta_length >
+/// 0`) and `.present` also exist.
 pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
 
@@ -1236,7 +1260,10 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     src.read_exact(&mut index_data)?;
     let entries = parse_index_section(&index_data, entry_count)?;
 
-    let tmp = {
+    // Build the sparse body in a temp file but do not rename yet —
+    // the rename is the last step so `.body`'s existence implies
+    // `.delta` and `.present` are both already committed.
+    let body_tmp = {
         let mut name = body_path
             .file_name()
             .ok_or_else(|| io::Error::other("path has no filename"))?
@@ -1249,8 +1276,8 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&tmp)?;
-        dst.set_len(body_length + delta_length)?;
+            .open(&body_tmp)?;
+        dst.set_len(body_length)?;
         for entry in &entries {
             if entry.kind != EntryKind::Data || entry.stored_length == 0 {
                 continue;
@@ -1264,19 +1291,39 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
                 return Err(io::Error::other("short read promoting segment body"));
             }
         }
-        if delta_length > 0 {
+        dst.sync_data()?;
+    }
+
+    // Commit .delta first so that once .body appears, .delta is
+    // guaranteed to be in place.
+    if delta_length > 0 {
+        let delta_path = body_path.with_extension("delta");
+        let delta_tmp = {
+            let mut name = delta_path
+                .file_name()
+                .ok_or_else(|| io::Error::other("path has no filename"))?
+                .to_owned();
+            name.push(".tmp");
+            delta_path.with_file_name(name)
+        };
+        {
+            let mut dst = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&delta_tmp)?;
             src.seek(SeekFrom::Start(body_section_start + body_length))?;
-            dst.seek(SeekFrom::Start(body_length))?;
             let n = io::copy(&mut (&mut src).take(delta_length), &mut dst)?;
             if n != delta_length {
                 return Err(io::Error::other("short read promoting delta body"));
             }
+            dst.sync_data()?;
         }
-        dst.sync_data()?;
+        fs::rename(&delta_tmp, &delta_path)?;
+        fsync_dir(&delta_path)?;
     }
-    fs::rename(&tmp, body_path)?;
-    fsync_dir(body_path)?;
 
+    // Commit .present next, still before .body.
     let bitset_len = (entry_count as usize).div_ceil(8);
     let mut bitset = vec![0u8; bitset_len];
     for (i, entry) in entries.iter().enumerate() {
@@ -1284,7 +1331,15 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             bitset[i / 8] |= 1 << (i % 8);
         }
     }
-    write_file_atomic(present_path, &bitset)
+    write_file_atomic(present_path, &bitset)?;
+
+    // Final rename makes the whole promote visible atomically — any
+    // crash before this point leaves the old state intact and the
+    // next promote re-runs from scratch.
+    fs::rename(&body_tmp, body_path)?;
+    fsync_dir(body_path)?;
+
+    Ok(())
 }
 
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {

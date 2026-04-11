@@ -198,6 +198,21 @@ impl SegmentFetcher for ObjectStoreFetcher {
             },
         ))
     }
+
+    fn fetch_delta_body(
+        &self,
+        segment_id: ulid::Ulid,
+        index_dir: &Path,
+        body_dir: &Path,
+    ) -> io::Result<()> {
+        self.rt.block_on(fetch_one_delta_body(
+            &self.store,
+            &self.chain,
+            &segment_id.to_string(),
+            index_dir,
+            body_dir,
+        ))
+    }
 }
 
 /// Load the ancestry chain from fork directories.
@@ -348,6 +363,72 @@ async fn fetch_one_extent(
     Err(io::Error::other(format!(
         "extent {segment_id}[{}] not found in any ancestor",
         extent.entry_idx
+    )))
+}
+
+/// Fetch a segment's delta body section and write it to `body_dir/<id>.delta`.
+///
+/// Reads layout from the local `.idx` (header carries `body_length` and
+/// `delta_length`), issues one range-GET for exactly the delta region,
+/// and writes the result atomically (tmp+rename). Searches the ancestry
+/// chain newest-first on NotFound, mirroring `fetch_one_extent`.
+async fn fetch_one_delta_body(
+    store: &Arc<dyn ObjectStore>,
+    chain: &[(String, VerifyingKey)],
+    segment_id: &str,
+    index_dir: &Path,
+    body_dir: &Path,
+) -> io::Result<()> {
+    let idx_path = index_dir.join(format!("{segment_id}.idx"));
+    let layout = segment::read_segment_layout(&idx_path)?;
+    if layout.delta_length == 0 {
+        return Err(io::Error::other(format!(
+            "segment {segment_id} has no delta body to fetch"
+        )));
+    }
+
+    let delta_path = body_dir.join(format!("{segment_id}.delta"));
+    if delta_path.try_exists()? {
+        return Ok(());
+    }
+
+    let range_start = (layout.body_section_start + layout.body_length) as usize;
+    let range_end = range_start + layout.delta_length as usize;
+
+    for (volume_id, _) in chain.iter().rev() {
+        let key = segment_key(volume_id, segment_id)?;
+        match store.get_range(&key, range_start..range_end).await {
+            Ok(bytes) => {
+                std::fs::create_dir_all(body_dir)?;
+                let tmp_path = body_dir.join(format!("{segment_id}.delta.tmp"));
+                {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&tmp_path)
+                        .map_err(|e| io::Error::other(format!("open .delta.tmp: {e}")))?;
+                    f.write_all(&bytes)
+                        .map_err(|e| io::Error::other(format!("write .delta.tmp: {e}")))?;
+                    f.sync_data()
+                        .map_err(|e| io::Error::other(format!("fsync .delta.tmp: {e}")))?;
+                }
+                std::fs::rename(&tmp_path, &delta_path)
+                    .map_err(|e| io::Error::other(format!("rename .delta: {e}")))?;
+                tracing::debug!(segment_id, bytes = bytes.len(), "fetched delta body");
+                return Ok(());
+            }
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "fetching delta body {segment_id} from {volume_id}: {e}"
+                )));
+            }
+        }
+    }
+    Err(io::Error::other(format!(
+        "delta body {segment_id} not found in any ancestor"
     )))
 }
 

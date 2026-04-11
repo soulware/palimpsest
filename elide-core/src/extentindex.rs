@@ -23,7 +23,6 @@
 //   records on top via recover_wal().
 
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 use std::path::PathBuf;
 
@@ -79,6 +78,33 @@ pub struct ExtentLocation {
     pub inline_data: Option<Box<[u8]>>,
 }
 
+/// Where a Delta entry's delta blob lives locally.
+///
+/// Delta blobs are tiny — typically sub-KB post-zstd-dict — but they
+/// live in different files depending on how the segment is staged:
+///
+/// - `Full`: the segment is a complete file (e.g. `pending/<id>`),
+///   so the delta body section is inline at
+///   `body_section_start + body_length`. The reader opens the
+///   segment file and seeks there.
+/// - `Cached`: the segment has been evicted to the cache three-file
+///   shape, so the delta body section lives in a separate
+///   `cache/<id>.delta` file that starts at delta-region byte 0.
+///   On a pull host, `.delta` may not exist yet — the reader is
+///   responsible for demand-fetching it.
+#[derive(Clone, Copy, Debug)]
+pub enum DeltaBodySource {
+    /// Delta body lives inline in a full segment file.
+    /// Seek base in that file = `body_section_start + body_length`.
+    Full {
+        body_section_start: u64,
+        body_length: u64,
+    },
+    /// Delta body lives in a separate `cache/<id>.delta` file.
+    /// Seek base = 0; reader demand-fetches if the file is absent.
+    Cached,
+}
+
 /// Location of a thin Delta entry. Separate from `ExtentLocation`
 /// because Delta entries are materialised lazily at read time by
 /// fetching a delta blob from their owning segment's delta body
@@ -88,16 +114,8 @@ pub struct DeltaLocation {
     /// ULID of the segment that holds both the Delta index entry and
     /// its delta blob in the segment's delta body section.
     pub segment_id: Ulid,
-    /// Byte offset of the delta body section, expressed as an offset
-    /// from the start of the segment's **body section** (equals
-    /// `header.body_length`). Combined with `body_section_start` when
-    /// the reader opens a full segment file; used directly when the
-    /// reader opens a `cache/<id>.body` file (which begins at byte 0
-    /// of the body section).
-    pub delta_body_rel_offset: u64,
-    /// Absolute file offset of the body section in a full segment
-    /// file. Zero for `cache/<id>.body` reads.
-    pub body_section_start: u64,
+    /// Where to find the delta blob bytes locally.
+    pub body_source: DeltaBodySource,
     /// Delta options exactly as stored on disk. The reader scans them
     /// in order: already-cached sources preferred, then earliest ULID.
     pub options: Vec<segment::DeltaOption>,
@@ -309,7 +327,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             // record their delta body offset relative to the body
             // section. Only needed when at least one Delta entry is
             // present.
-            let delta_body_rel_offset = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
+            let delta_body_length = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
                 Some(segment::read_segment_layout(path)?.body_length)
             } else {
                 None
@@ -320,13 +338,15 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                     EntryKind::Data | EntryKind::Inline => {}
                     EntryKind::DedupRef | EntryKind::Zero => continue,
                     EntryKind::Delta => {
-                        if let Some(rel) = delta_body_rel_offset {
+                        if let Some(body_length) = delta_body_length {
                             index.insert_delta_if_absent(
                                 entry.hash,
                                 DeltaLocation {
                                     segment_id,
-                                    delta_body_rel_offset: rel,
-                                    body_section_start,
+                                    body_source: DeltaBodySource::Full {
+                                        body_section_start,
+                                        body_length,
+                                    },
                                     options: entry.delta_options.clone(),
                                 },
                             );
@@ -406,46 +426,27 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 Vec::new()
             };
 
-            // Check whether the cache/<id>.body file carries the delta
-            // body section appended after the body section (file size
-            // extends past `body_length`). The import host's
-            // `promote_to_cache` writes it; a pull host won't have it
-            // until elide-fetch learns to demand-fetch delta bodies
-            // (see docs/design-delta-compression.md "Post-B2 gap").
-            let delta_body_local = if delta_length > 0 {
-                let body_path = fork_dir.join("cache").join(format!("{segment_id}.body"));
-                match fs::metadata(&body_path) {
-                    Ok(m) => m.len() >= body_length + delta_length as u64,
-                    Err(_) => false,
-                }
-            } else {
-                false
-            };
+            // For cached segments, Delta entries register unconditionally:
+            // the delta body lives in a separate `cache/<id>.delta` file
+            // which may or may not be present locally. The reader
+            // (`try_read_delta_extent`) stats `.delta` before reading and
+            // demand-fetches via the attached `SegmentFetcher` when it's
+            // missing. Rebuild has no file-size check for delta presence.
+            let _ = (body_length, delta_length); // retained for future diagnostics
 
             for (raw_idx, entry) in entries.iter().enumerate() {
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline => {}
                     EntryKind::DedupRef | EntryKind::Zero => continue,
                     EntryKind::Delta => {
-                        if delta_body_local {
-                            index.insert_delta_if_absent(
-                                entry.hash,
-                                DeltaLocation {
-                                    segment_id,
-                                    delta_body_rel_offset: body_length,
-                                    // Reader opens cache/<id>.body, which starts at
-                                    // body-section byte 0, so body_section_start
-                                    // is zero.
-                                    body_section_start: 0,
-                                    options: entry.delta_options.clone(),
-                                },
-                            );
-                        }
-                        // Else: delta body not yet local (pull host
-                        // pre-demand-fetch). Skip registration; the
-                        // LBA map still knows the hash, but reads
-                        // will fall through to "unwritten" until the
-                        // sidecar fetch lands.
+                        index.insert_delta_if_absent(
+                            entry.hash,
+                            DeltaLocation {
+                                segment_id,
+                                body_source: DeltaBodySource::Cached,
+                                options: entry.delta_options.clone(),
+                            },
+                        );
                         continue;
                     }
                 }
