@@ -17,12 +17,10 @@ use serde::Deserialize;
 
 use elide_core::{
     segment::{self, EntryKind},
-    writelog,
+    volume, writelog,
 };
 
-use crate::ls;
-
-pub fn run(dir: &Path) -> io::Result<()> {
+pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     let cfg = elide_core::config::VolumeConfig::read(dir)?;
 
     let vol_name = cfg
@@ -36,13 +34,14 @@ pub fn run(dir: &Path) -> io::Result<()> {
     let is_readonly = dir.join("volume.readonly").exists();
     let meta = read_meta(dir);
 
-    println!("Volume: {vol_name}");
+    println!("Volume:     {vol_name}");
     match size_bytes {
-        Some(b) => println!("Size:   {} ({} bytes)", fmt_size(b), fmt_commas(b)),
-        None => println!("Size:   (no size file found)"),
+        Some(b) => println!("Size:       {} ({} bytes)", fmt_size(b), fmt_commas(b)),
+        None => println!("Size:       (no size file found)"),
     }
+    println!("Filesystem: ext4");
     if is_readonly {
-        println!("Type:   readonly");
+        println!("Type:       readonly");
     }
     if let Some(VolumeMeta {
         source: Some(source),
@@ -52,26 +51,32 @@ pub fn run(dir: &Path) -> io::Result<()> {
     }) = &meta
     {
         let short_digest = digest.get(7..19).unwrap_or(digest);
-        println!("Source: {}  (sha256:{})  {}", source, short_digest, arch);
+        println!(
+            "Source:     {}  (sha256:{})  {}",
+            source, short_digest, arch
+        );
     }
     if let Some(origin) = read_origin(dir) {
-        println!("Origin: {origin}");
+        println!("Origin:     {origin}");
     }
     println!();
 
-    let node = collect_node(dir, true, false)?;
     let snap_count = count_snapshots(dir);
-    if snap_count > 0 {
-        println!("{snap_count} snapshot(s)");
+    let latest_snap = volume::latest_snapshot(dir).ok().flatten();
+    match (snap_count, &latest_snap) {
+        (0, _) => {}
+        (n, Some(s)) => println!("{n} snapshot(s), latest {s}"),
+        (n, None) => println!("{n} snapshot(s)"),
     }
-    print_node(&node, "", "  ");
-    let t = totals(&node);
-    print_totals(&t);
 
-    if let Some(summary) = ls::try_fs_summary(dir) {
-        println!();
-        print_fs_summary(&vol_name, &summary);
-    }
+    let latest_snap_str = latest_snap.as_ref().map(|s| s.to_string());
+    let node = collect_node(dir)?;
+    let ancestors = collect_ancestor_nodes(dir, by_id_dir)?;
+    print_node(&node, latest_snap_str.as_deref());
+    print_ancestor_nodes(&ancestors);
+
+    let t = totals(&node, &ancestors);
+    print_totals(&t);
 
     Ok(())
 }
@@ -79,13 +84,16 @@ pub fn run(dir: &Path) -> io::Result<()> {
 // --- node collection ---
 
 struct NodeInfo {
-    is_root: bool,
-    ulid: Option<String>,
     is_live: bool,
     wal_files: Vec<WalInfo>,
     pending: Vec<SegInfo>,
     cache: Vec<CacheInfo>,
-    children: Vec<NodeInfo>,
+}
+
+struct AncestorNode {
+    volume_ulid: String,
+    branch_ulid: Option<String>,
+    cache: Vec<CacheInfo>,
 }
 
 struct CacheInfo {
@@ -106,6 +114,10 @@ struct CacheInfo {
     data_body_bytes: u64,
     /// Sum of stored_length for DedupRef entries (body bytes referenced from canonical segments).
     dedup_ref_body_bytes: u64,
+    /// Byte length of the segment's delta body section (from the segment header).
+    delta_body_bytes: u64,
+    /// Size of the `.idx` file on disk.
+    idx_file_bytes: u64,
     /// Actual disk blocks occupied by the .body sparse file.
     body_bytes_cached: u64,
     error: Option<String>,
@@ -130,62 +142,52 @@ struct SegInfo {
     lba_blocks: u64,
     dedup_ref_count: usize,
     delta_count: usize,
+    delta_body_bytes: u64,
     error: Option<String>,
 }
 
-fn collect_node(dir: &Path, is_root: bool, with_children: bool) -> io::Result<NodeInfo> {
-    let ulid = if is_root {
-        None
-    } else {
-        dir.file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_owned())
-    };
-
+fn collect_node(dir: &Path) -> io::Result<NodeInfo> {
     let is_live = dir.join("wal").is_dir();
 
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
     let pending = collect_seg_dir(&dir.join("pending"))?;
     let cache = collect_cache_dir(dir)?;
 
-    // Children only used in legacy single-node mode; Named Forks lists forks separately.
-    let mut children = Vec::new();
-    if with_children {
-        let children_dir = dir.join("children");
-        match fs::read_dir(&children_dir) {
-            Ok(entries) => {
-                let mut child_dirs: Vec<PathBuf> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.is_dir()
-                            && p.file_name()
-                                .and_then(|s| s.to_str())
-                                .map(|s| ulid::Ulid::from_string(s).is_ok())
-                                .unwrap_or(false)
-                    })
-                    .collect();
-                child_dirs.sort();
-                for child_dir in child_dirs {
-                    children.push(collect_node(&child_dir, false, true)?);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                eprintln!("warning: cannot read {}: {e}", children_dir.display());
-            }
-        }
-    }
-
     Ok(NodeInfo {
-        is_root,
-        ulid,
         is_live,
         wal_files,
         pending,
         cache,
-        children,
     })
+}
+
+/// Walk the ancestry chain, newest-first, collecting each ancestor's
+/// committed segments up to the branch point.
+fn collect_ancestor_nodes(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorNode>> {
+    let layers = match volume::walk_ancestors(fork_dir, by_id_dir) {
+        Ok(l) => l,
+        Err(_) => return Ok(Vec::new()),
+    };
+    // walk_ancestors returns oldest-first; user wants newest-first.
+    let mut nodes: Vec<AncestorNode> = Vec::new();
+    for layer in layers.into_iter().rev() {
+        let volume_ulid = layer
+            .dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_owned();
+        let mut cache = collect_cache_dir(&layer.dir)?;
+        if let Some(ref branch) = layer.branch_ulid {
+            cache.retain(|c| c.ulid.as_str() <= branch.as_str());
+        }
+        nodes.push(AncestorNode {
+            volume_ulid,
+            branch_ulid: layer.branch_ulid,
+            cache,
+        });
+    }
+    Ok(nodes)
 }
 
 fn count_snapshots(fork_dir: &Path) -> usize {
@@ -212,22 +214,7 @@ fn read_origin(fork_dir: &Path) -> Option<String> {
 }
 
 fn print_totals(t: &Totals) {
-    if t.wal_files > 0 {
-        println!(
-            "Total: {} segment entries, {} stored  (+{} WAL records across {} file{})",
-            fmt_commas(t.seg_entries as u64),
-            fmt_size(t.body_bytes),
-            t.wal_records,
-            t.wal_files,
-            if t.wal_files == 1 { "" } else { "s" },
-        );
-    } else {
-        println!(
-            "Total: {} entries, {} stored",
-            fmt_commas(t.seg_entries as u64),
-            fmt_size(t.body_bytes),
-        );
-    }
+    println!();
     if t.cache_files > 0 {
         let pct = if t.cache_fetchable > 0 {
             format!(
@@ -237,25 +224,48 @@ fn print_totals(t: &Totals) {
         } else {
             "0%".to_owned()
         };
-        let delta_part = if t.cache_delta > 0 {
-            format!("  delta {}", fmt_commas(t.cache_delta as u64))
-        } else {
-            String::new()
-        };
+        let total_index: usize =
+            t.cache_data + t.cache_dedup_ref + t.cache_delta + t.cache_zero + t.cache_inline;
         println!(
-            "Cache: {} segment{}  data {} ({})  dedup_ref {} ({}){}  zero {}  present {}/{} ({})  body file {} on disk",
+            "Total: {} segment{}",
             t.cache_files,
             if t.cache_files == 1 { "" } else { "s" },
+        );
+        println!(
+            "  index:   {} ({} idx, {} body on disk)  (dedup {}, inline {}, zero {})",
+            fmt_commas(total_index as u64),
+            fmt_size(t.cache_idx_file_bytes),
+            fmt_size(t.cache_body_actual),
+            fmt_commas(t.cache_dedup_ref as u64),
+            fmt_commas(t.cache_inline as u64),
+            fmt_commas(t.cache_zero as u64),
+        );
+        println!(
+            "  data:    {} ({})",
             fmt_commas(t.cache_data as u64),
             fmt_size(t.cache_data_body),
-            fmt_commas(t.cache_dedup_ref as u64),
-            fmt_size(t.cache_dedup_ref_body),
-            delta_part,
-            fmt_commas(t.cache_zero as u64),
+        );
+        println!(
+            "  delta:   {} ({})",
+            fmt_commas(t.cache_delta as u64),
+            fmt_size(t.cache_delta_body),
+        );
+        println!(
+            "  present: {} / {} fetchable ({})",
             fmt_commas(t.cache_present as u64),
             fmt_commas(t.cache_fetchable as u64),
             pct,
-            fmt_size(t.cache_body_actual),
+        );
+    }
+    if t.wal_files > 0 || t.seg_entries > 0 {
+        println!(
+            "  wal:     {} record{} across {} file{}, {} pending entries ({} stored)",
+            t.wal_records,
+            if t.wal_records == 1 { "" } else { "s" },
+            t.wal_files,
+            if t.wal_files == 1 { "" } else { "s" },
+            fmt_commas(t.seg_entries as u64),
+            fmt_size(t.body_bytes),
         );
     }
 }
@@ -338,6 +348,9 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         .map(|e| e.stored_length as u64)
                         .sum();
                     let lba_blocks: u64 = entries.iter().map(|e| e.lba_length as u64).sum();
+                    let delta_body_bytes = segment::read_segment_layout(&path)
+                        .map(|l| l.delta_length as u64)
+                        .unwrap_or(0);
                     SegInfo {
                         ulid,
                         file_size,
@@ -346,6 +359,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         lba_blocks,
                         dedup_ref_count,
                         delta_count,
+                        delta_body_bytes,
                         error: None,
                     }
                 }
@@ -357,6 +371,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                     lba_blocks: 0,
                     dedup_ref_count: 0,
                     delta_count: 0,
+                    delta_body_bytes: 0,
                     error: Some(e.to_string()),
                 },
             }
@@ -409,6 +424,8 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
                 present_count: 0,
                 data_body_bytes: 0,
                 dedup_ref_body_bytes: 0,
+                delta_body_bytes: 0,
+                idx_file_bytes: 0,
                 body_bytes_cached: 0,
                 error: Some(e.to_string()),
             }),
@@ -464,6 +481,14 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     #[cfg(not(unix))]
     let body_bytes_cached = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
 
+    // Delta body section size is recorded in the segment header; .idx files
+    // carry the same header so read_segment_layout works on them.
+    let delta_body_bytes = segment::read_segment_layout(idx_path)
+        .map(|l| l.delta_length as u64)
+        .unwrap_or(0);
+
+    let idx_file_bytes = fs::metadata(idx_path).map(|m| m.len()).unwrap_or(0);
+
     Ok(CacheInfo {
         ulid: ulid.to_owned(),
         entry_count: entries.len(),
@@ -476,6 +501,8 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         present_count,
         data_body_bytes,
         dedup_ref_body_bytes,
+        delta_body_bytes,
+        idx_file_bytes,
         body_bytes_cached,
         error: None,
     })
@@ -493,17 +520,23 @@ struct Totals {
     cache_data: usize,
     cache_dedup_ref: usize,
     cache_zero: usize,
+    cache_inline: usize,
     cache_delta: usize,
     cache_fetchable: usize,
     cache_present: usize,
     cache_data_body: u64,
     cache_dedup_ref_body: u64,
+    cache_delta_body: u64,
+    cache_idx_file_bytes: u64,
     cache_body_actual: u64,
 }
 
-fn totals(node: &NodeInfo) -> Totals {
+fn totals(node: &NodeInfo, ancestors: &[AncestorNode]) -> Totals {
     let mut t = Totals::default();
     accumulate(node, &mut t);
+    for a in ancestors {
+        accumulate_cache(&a.cache, &mut t);
+    }
     t
 }
 
@@ -516,57 +549,90 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
         t.seg_entries += s.entry_count;
         t.body_bytes += s.body_bytes;
     }
-    for f in &node.cache {
+    accumulate_cache(&node.cache, t);
+}
+
+fn accumulate_cache(cache: &[CacheInfo], t: &mut Totals) {
+    for f in cache {
         t.cache_files += 1;
         t.cache_data += f.data_count;
         t.cache_dedup_ref += f.dedup_ref_count;
         t.cache_zero += f.zero_count;
+        t.cache_inline += f.inline_count;
         t.cache_delta += f.delta_count;
         t.cache_fetchable += f.fetchable_count;
         t.cache_present += f.present_count;
         t.cache_data_body += f.data_body_bytes;
         t.cache_dedup_ref_body += f.dedup_ref_body_bytes;
+        t.cache_delta_body += f.delta_body_bytes;
+        t.cache_idx_file_bytes += f.idx_file_bytes;
         t.cache_body_actual += f.body_bytes_cached;
-    }
-    for child in &node.children {
-        accumulate(child, t);
     }
 }
 
 // --- display ---
-//
-// `line_prefix`  — prepended to the node header line (includes connector for non-root)
-// `child_prefix` — prepended to section headers and children of this node
 
-fn print_node(node: &NodeInfo, line_prefix: &str, child_prefix: &str) {
-    if node.is_root {
-        let state = if node.is_live { "live" } else { "frozen" };
-        println!("[{state} root]");
-    } else {
-        let ulid = node.ulid.as_deref().unwrap_or("?");
-        let state = if node.is_live { "live" } else { "frozen" };
-        println!("{line_prefix}{ulid}  [{state}]");
-    }
+fn print_node(node: &NodeInfo, latest_snap: Option<&str>) {
+    let state = if node.is_live { "live" } else { "frozen" };
+    println!("[{state} root]");
 
-    print_wal_section(&node.wal_files, child_prefix, node.is_live);
-    print_seg_section("pending", &node.pending, child_prefix, node.is_live);
-    print_cache_section(&node.cache, child_prefix);
+    let prefix = "  ";
+    print_wal_section(&node.wal_files, prefix, node.is_live, latest_snap);
+    print_seg_section("pending", &node.pending, prefix, node.is_live, latest_snap);
+    print_cache_section(&node.cache, prefix, latest_snap, true);
+}
 
-    let n = node.children.len();
-    for (i, child) in node.children.iter().enumerate() {
-        let last = i + 1 == n;
-        let (connector, continuation) = if last {
-            ("└── ", "    ")
-        } else {
-            ("├── ", "│   ")
-        };
-        let child_line_prefix = format!("{child_prefix}{connector}");
-        let grandchild_prefix = format!("{child_prefix}{continuation}");
-        print_node(child, &child_line_prefix, &grandchild_prefix);
+fn print_ancestor_nodes(ancestors: &[AncestorNode]) {
+    for a in ancestors {
+        if a.cache.is_empty() {
+            continue;
+        }
+        let plural = if a.cache.len() == 1 { "file" } else { "files" };
+        match &a.branch_ulid {
+            Some(b) => println!(
+                "  index/ (from ancestor {} @ snap {}, {} {}):",
+                a.volume_ulid,
+                b,
+                a.cache.len(),
+                plural,
+            ),
+            None => println!(
+                "  index/ (from ancestor {}, {} {}):",
+                a.volume_ulid,
+                a.cache.len(),
+                plural,
+            ),
+        }
+        // Ancestor segments are by definition in a snapshot, so no
+        // post-snapshot marker applies.
+        print_cache_section(&a.cache, "  ", None, false);
     }
 }
 
-fn print_wal_section(files: &[WalInfo], prefix: &str, always_show: bool) {
+/// True if `ulid` sorts strictly greater than the latest snapshot ULID
+/// — meaning this file was created after the most recent snapshot and is
+/// therefore still eligible for future repacking/GC.
+fn is_post_snapshot(ulid: &str, latest_snap: Option<&str>) -> bool {
+    match latest_snap {
+        Some(s) => ulid > s,
+        None => false,
+    }
+}
+
+fn post_snap_tag(ulid: &str, latest_snap: Option<&str>) -> &'static str {
+    if is_post_snapshot(ulid, latest_snap) {
+        "  [post-snapshot]"
+    } else {
+        ""
+    }
+}
+
+fn print_wal_section(
+    files: &[WalInfo],
+    prefix: &str,
+    always_show: bool,
+    latest_snap: Option<&str>,
+) {
     if files.is_empty() {
         if always_show {
             println!("{prefix}wal/: empty");
@@ -587,7 +653,7 @@ fn print_wal_section(files: &[WalInfo], prefix: &str, always_show: bool) {
             ""
         };
         println!(
-            "{p}{}  {}  {} records ({} data, {} ref), {} LBA blocks{}",
+            "{p}{}  {}  {} records ({} data, {} ref), {} LBA blocks{}{}",
             f.ulid,
             fmt_size(f.file_size),
             f.record_count,
@@ -595,11 +661,18 @@ fn print_wal_section(files: &[WalInfo], prefix: &str, always_show: bool) {
             f.ref_count,
             f.lba_blocks,
             tail,
+            post_snap_tag(&f.ulid, latest_snap),
         );
     }
 }
 
-fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: bool) {
+fn print_seg_section(
+    label: &str,
+    segs: &[SegInfo],
+    prefix: &str,
+    always_show: bool,
+    latest_snap: Option<&str>,
+) {
     if segs.is_empty() {
         if always_show {
             println!("{prefix}{label}/: empty");
@@ -625,15 +698,16 @@ fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: b
         };
         let delta_note = if s.delta_count > 0 {
             format!(
-                ", {} delta{}",
+                ", {} delta{} ({} delta body)",
                 s.delta_count,
-                if s.delta_count == 1 { "" } else { "s" }
+                if s.delta_count == 1 { "" } else { "s" },
+                fmt_size(s.delta_body_bytes),
             )
         } else {
             String::new()
         };
         println!(
-            "{p}{}  {}  {} entries, {} body, {} LBA blocks{}{}",
+            "{p}{}  {}  {} entries, {} body, {} LBA blocks{}{}{}",
             s.ulid,
             fmt_size(s.file_size),
             s.entry_count,
@@ -641,16 +715,24 @@ fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: b
             s.lba_blocks,
             ref_note,
             delta_note,
+            post_snap_tag(&s.ulid, latest_snap),
         );
     }
 }
 
-fn print_cache_section(cache: &[CacheInfo], prefix: &str) {
+fn print_cache_section(
+    cache: &[CacheInfo],
+    prefix: &str,
+    latest_snap: Option<&str>,
+    print_header: bool,
+) {
     if cache.is_empty() {
         return;
     }
-    let plural = if cache.len() == 1 { "file" } else { "files" };
-    println!("{prefix}index/ ({} {plural}):", cache.len());
+    if print_header {
+        let plural = if cache.len() == 1 { "file" } else { "files" };
+        println!("{prefix}index/ ({} {plural}):", cache.len());
+    }
     for f in cache {
         let p = format!("{prefix}  ");
         if let Some(ref e) = f.error {
@@ -666,52 +748,31 @@ fn print_cache_section(cache: &[CacheInfo], prefix: &str) {
             "0%".to_owned()
         };
         let indent = format!("{p}  ");
+        println!("{p}{}{}", f.ulid, post_snap_tag(&f.ulid, latest_snap),);
         println!(
-            "{p}{}  {} entries",
-            f.ulid,
+            "{indent}index:   {} ({})  (dedup {}, inline {}, zero {})",
             fmt_commas(f.entry_count as u64),
+            fmt_size(f.idx_file_bytes),
+            fmt_commas(f.dedup_ref_count as u64),
+            fmt_commas(f.inline_count as u64),
+            fmt_commas(f.zero_count as u64),
         );
         println!(
-            "{indent}data:      {:>8}  ({} body)",
+            "{indent}data:    {} ({})",
             fmt_commas(f.data_count as u64),
             fmt_size(f.data_body_bytes),
         );
         println!(
-            "{indent}dedup_ref: {:>8}  ({} referenced)",
-            fmt_commas(f.dedup_ref_count as u64),
-            fmt_size(f.dedup_ref_body_bytes),
+            "{indent}delta:   {} ({})",
+            fmt_commas(f.delta_count as u64),
+            fmt_size(f.delta_body_bytes),
         );
-        println!("{indent}zero:      {:>8}", fmt_commas(f.zero_count as u64),);
-        if f.inline_count > 0 {
-            println!(
-                "{indent}inline:    {:>8}",
-                fmt_commas(f.inline_count as u64),
-            );
-        }
-        if f.delta_count > 0 {
-            println!("{indent}delta:     {:>8}", fmt_commas(f.delta_count as u64),);
-        }
         println!(
-            "{indent}present:   {:>8} / {} fetchable ({})",
+            "{indent}present: {} / {} fetchable ({})",
             fmt_commas(f.present_count as u64),
             fmt_commas(f.fetchable_count as u64),
             pct,
         );
-        println!(
-            "{indent}body file: {} on disk",
-            fmt_size(f.body_bytes_cached),
-        );
-    }
-}
-
-fn print_fs_summary(fork_name: &str, summary: &ls::FsSummary) {
-    println!("Filesystem ({fork_name}):");
-    if let Some(ref name) = summary.os_name {
-        println!("  OS: {name}");
-    }
-    if !summary.root_entries.is_empty() {
-        let listing = summary.root_entries.join("  ");
-        println!("  /  {listing}");
     }
 }
 
@@ -785,10 +846,8 @@ mod tests {
         .unwrap();
         let _vol = Volume::open(&vol_dir, &by_id_dir).unwrap();
 
-        let node = collect_node(&vol_dir, true, false).unwrap();
+        let node = collect_node(&vol_dir).unwrap();
         assert!(node.is_live);
-        assert!(node.is_root);
-        assert!(node.children.is_empty());
         assert_eq!(node.wal_files.len(), 1);
         assert_eq!(node.wal_files[0].record_count, 0);
 
@@ -821,7 +880,7 @@ mod tests {
             vol.snapshot().unwrap();
         }
 
-        let node = collect_node(&vol_dir, true, false).unwrap();
+        let node = collect_node(&vol_dir).unwrap();
         assert!(node.is_live);
         // snapshot() auto-promotes pending segments to index/cache.
         assert_eq!(node.cache.len(), 1);
@@ -838,7 +897,7 @@ mod tests {
         fs::create_dir_all(vol_dir.join("index")).unwrap();
         fs::create_dir_all(vol_dir.join("pending")).unwrap();
 
-        let node = collect_node(&vol_dir, true, false).unwrap();
+        let node = collect_node(&vol_dir).unwrap();
         assert!(!node.is_live);
 
         fs::remove_dir_all(tmp).unwrap();

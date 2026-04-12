@@ -411,7 +411,7 @@ fn main() {
 
             VolumeCommand::Info { name } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                if let Err(e) = inspect::run(&vol_dir) {
+                if let Err(e) = inspect::run(&vol_dir, &by_id_dir) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
