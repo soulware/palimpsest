@@ -221,11 +221,17 @@ File-aware import reads the ext4 image directly (not via NBD), producing file-si
 
 ### Snapshot (filemap generation, phase 3)
 
-A coordinator-side background task parses ext4 metadata from the frozen snapshot's segments and emits `snapshots/<ulid>.filemap` asynchronously after the synchronous snapshot operation returns. Scope is filemap-only: no coalescing of NBD-fragmented 4 KiB extents into file-sized extents, no new segment writes, no body rehashing — the filemap records paths and fragment layouts exactly as the existing DATA entries describe them.
+A coordinator-side background task parses ext4 metadata from the frozen snapshot's segments and emits `snapshots/<ulid>.filemap` asynchronously after the synchronous snapshot operation returns. Scope is filemap-only: no body rehashing, no new segment writes — the filemap records paths and fragment layouts exactly as the existing DATA entries describe them.
 
-This extends filemap coverage to NBD-written volumes. Immediate delta benefit is limited — NBD fragment layouts will not match file-sized import extents (§"Multi-extent files and LBA mapping"), so cross-layout delta still skips. Intra-chain deltas on the same volume (snapshot N → N+1) become possible wherever fragment layouts align. Full delta benefit for writable volumes against imported sources requires phase 4 coalescing.
+This extends filemap coverage to NBD-written volumes. Phase 3 does not itself perform delta compression for writable volumes — that's Phase 4's job — but the filemap it produces is the structural input Phase 4 needs to path-match LBAs after the fact.
 
 See §"Phase 3: Snapshot-time filemap generation" for the full design.
+
+### GC repack delta (phase 4)
+
+Phase 4 extends the existing GC repack pass with a delta step, operating on the segments GC already owns — **post-snapshot-floor segments, above the most recent sealed snapshot**. For each LBA in a post-floor segment, the prior snapshot's filemap (produced by Phase 3) is consulted as a **heuristic hint**: if the LBA used to belong to some file, its prior extent hash is tried as a zstd dictionary against the post-floor 4 KiB target. The hint is right for in-place file modification (the dominant case for package upgrades and config edits) and silently wrong for delete-then-reallocate, metadata blocks, and fresh allocations — the existing size check catches every miss by emitting a raw DATA entry when `delta_length >= body_length`. zstd dictionary compression is always correct for any target against any dictionary, so the heuristic only affects compression ratio, never reconstructed bytes. Repacked segments supersede the originals through the existing GC replacement path; the sealed snapshot below the floor is never touched.
+
+See §"Phase 4: GC repack with delta" for the full design (future).
 
 ### Why not at drain time?
 
@@ -258,9 +264,9 @@ The earliest-source preference was originally scoped as a standalone Phase A. It
 
 **Phase B2 (Proposed, after C):** Filemap-based delta at coordinator upload. Load child + source volume filemaps via provenance lineage, path-match changed files, compute zstd deltas against locally-available source extent bodies, emit `EntryKind::Delta` entries using the format from C (not additive `Data + delta_options`). Simultaneously **removes** the existing LBA-based PoC delta path in `elide-coordinator/src/delta.rs` and its hook in `drain_pending()`. B2 is the first real producer of Delta entries; end-to-end verification runs through B1's file-aware import + C's reader.
 
-**Phase 3 (Proposed):** Snapshot-time filemap generation. A coordinator-side background task parses ext4 metadata from the frozen snapshot's segment data and emits `snapshots/<ulid>.filemap` for writable-volume snapshots. Metadata-only (no body reads, no rehashing, no coalescing); best-effort (non-ext4 volumes and parse failures skip cleanly); crash-safe via tmp+fsync+upload+rename with a filesystem-as-queue restart scan. Extends filemap coverage to NBD-written volumes, enabling path-level inspection and serving as a prerequisite for later intra-chain delta. See §"Phase 3: Snapshot-time filemap generation" for the full design.
+**Phase 3 (Proposed):** Snapshot-time filemap generation. A coordinator-side background task parses ext4 metadata from the frozen snapshot's segment data and emits `snapshots/<ulid>.filemap` for writable-volume snapshots. Metadata-only (no body reads, no rehashing); best-effort (non-ext4 volumes and parse failures skip cleanly); crash-safe via tmp+fsync+upload+rename with a filesystem-as-queue restart scan. Extends filemap coverage to NBD-written volumes, serves as the structural input Phase 4 needs, and unlocks the "unfragmented entries as delta sources" exception as a side-effect for file-aware imports. See §"Phase 3: Snapshot-time filemap generation" for the full design.
 
-**Phase 4 (deferred):** Snapshot-time extent coalescing. Reconstruct file-level extents from fragmented NBD blocks and emit new DATA entries with file-sized hashes; the filemap format is unchanged (one row per coalesced file instead of per fragment). This is the step that unlocks full filemap-based delta for writable volumes against imported sources. Separate from phase 3 because coalescing involves body reads, rehashing, and new segment writes, whereas phase 3 is purely metadata.
+**Phase 4 (deferred):** GC repack delta. Extend the existing GC repack/sweep pass with a delta step that operates on post-snapshot-floor segments (segments drained since the most recent sealed snapshot). For each LBA in a post-floor segment, consult the prior snapshot's filemap as a **heuristic hint** for which file used to live at that LBA, and try the prior file's extent hash as a zstd dictionary against the 4 KiB target fragment. The heuristic is right for in-place file modification (the dominant case) and silently wrong for delete-then-reallocate and metadata blocks — the existing `delta_length >= body_length` size check catches every miss by emitting a raw DATA entry. zstd is correct regardless of dictionary, so the heuristic only affects compression ratio, never reconstructed bytes. No new lifecycle machinery: post-floor segments are already GC-rewriteable, repacked outputs supersede the originals through GC's existing cleanup path, and the sealed snapshot providing the source filemap is read-only — published snapshots remain immutable. This is the step that delivers filemap-based delta for writable volumes and closes the drain-time LBA→path knowledge gap.
 
 **Phase 5 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
@@ -383,22 +389,55 @@ Phase 3 generates a filemap for such snapshots after they are written, asynchron
 
 ### What Phase 3 does **not** deliver
 
-**Delta compression for NBD-written volumes — under any combination of source and target fragmentation.** (Throughout this section, *source* is the older extent used as the zstd dictionary — the same meaning as the `source_hash` field in the segment format — and *target* is the new extent being compressed against it.) The reason Phase 3 doesn't deliver delta is a knowledge-gap issue in the upload pipeline, not a format issue, and it's worth stating explicitly so the limitation isn't rediscovered later:
+**Delta compression for NBD-written volumes as the delta target.** (Throughout this section, *source* is the older extent used as the zstd dictionary — the same meaning as the `source_hash` field in the segment format — and *target* is the new extent being compressed against it.) Phase 3 generates a filemap but does not itself compress anything. The reason is a knowledge-gap issue in the upload pipeline:
 
 - The coordinator's upload stage runs at **drain time**, when a pending segment is promoted to S3. At that moment, the coordinator knows only LBAs for the fragments in the segment — there is no LBA → filesystem-path mapping available anywhere.
-- The filemap is the only structure that carries LBA → path, and Phase 3 generates it **after** the snapshot is sealed — which is typically **after** most of the pending segments for that snapshot have already drained to S3.
+- The filemap is the only structure that carries LBA → path, and Phase 3 generates it **after** the snapshot is sealed.
 - The current design already encodes this constraint: §"Where in the upload pipeline" restricts drain-time delta to import-produced segments, because imports are the only code path where filesystem knowledge is available while segments are being written. Writable-volume drain bypasses delta entirely.
 
-To close this gap, something has to run **after** the snapshot is sealed and the filemap is ready, and produce new segments that supersede the drained ones — S3 segments are immutable post-upload, so "add deltas to an existing segment" is not an operation. That post-snapshot rewrite is structurally similar to GC compaction with a delta step, and is the domain of Phase 4. Phase 3 deliberately does not attempt it.
+Closing this gap is the domain of **Phase 4**, which is not a new subsystem but an extension to the existing GC repack pass. GC already operates on post-snapshot-floor segments (segments above the most recent sealed snapshot, which are the segments drained since that snapshot) and rewrites them in place — repacked segments supersede the originals through the same cleanup path GC uses today. Phase 4 adds a delta step to that rewrite: for each LBA in a post-floor segment, consult the prior snapshot's filemap as a **heuristic hint** for which file used to live at that LBA, and try the prior file's extent hash as a zstd dictionary against the 4 KiB target fragment. The sealed snapshot providing the source filemap is never modified — Phase 4 only reads from it.
 
-This applies to *all* source/target fragmentation shapes, not just layout mismatches:
+The "LBA → path" heuristic holds in the dominant case (in-place file modification — package upgrades, config edits, log writes at fixed offsets) and degrades gracefully elsewhere:
 
-- **Target fragmented, source whole** (NBD-written snapshot with an imported source as its dictionary): even though zstd would happily use the whole source file as a dictionary against each 4 KiB target fragment, the drain-time coordinator doesn't know which path any given target fragment belongs to, so it cannot look the source up.
-- **Both fragmented** (intra-chain snapshot N → N+1 on a writable volume, with snapshot N as the source): same problem, plus the additional format question of multi-source delta dictionaries. Both concerns are Phase 4's.
+- **In-place modification:** prior LBA and current LBA both belong to the same file. The heuristic is right, the delta is tight.
+- **New allocation / file growth:** post-floor LBA didn't belong to any file in the prior snapshot. Lookup returns nothing → raw body, no delta attempted.
+- **ext4 metadata (inode tables, journal, group descriptors):** same as new allocation — not in the filemap → raw body.
+- **Delete-then-reallocate:** prior file A was freed, ext4 reused the LBAs for file B. The heuristic hands zstd A's content as a dictionary for B's bytes. zstd still compresses correctly (dictionary compression is always correct regardless of dictionary), just with a useless ratio. **The existing size-check catches this unconditionally**: if `delta_length >= body_length * safety_margin`, emit a raw DATA entry and discard the delta. No corruption, just wasted compute.
+- **Extent migration / defrag:** file moved to new LBAs. The new LBAs are treated as new allocations (lookup misses); the old LBAs have nothing writing to them.
+
+So the correctness story is **always correct, sometimes no benefit**, with the size check as the backstop. Phase 4 may additionally short-circuit known-miss cases (e.g. ext4 metadata regions identified from the superblock) to avoid paying compression cost on LBAs that provably can't benefit, but correctness does not depend on it.
+
+This approach works for Phase 4 because:
+
+- **Post-floor segments are already rewriteable.** GC's existing machinery is the state machine we need. No new lifecycle, no sidecar manifests, no amendment of published snapshots.
+- **The source filemap we need is the *prior* snapshot's, not the current one's.** Phase 3 is exactly what ensures that filemap exists for NBD-written volumes.
+- **Published snapshots remain immutable.** Forks, remote pulls, and mirrors that committed to a historical snapshot's segment list see no change — Phase 4 never crosses the snapshot floor.
+
+The two fragmentation shapes both reduce to the same Phase 4 operation:
+
+- **Prior source whole** (imported prior snapshot): lookup returns a single filemap row whose hash covers the whole source file — the cleanest case. zstd gets a file-sized dictionary against a 4 KiB target and finds matches anywhere in the file.
+- **Prior source fragmented** (NBD-written prior snapshot): handled by the single-row predicate from §"Narrow exception: unfragmented entries as delta sources" applied to the prior filemap — source files that appear as a single row in the prior snapshot's filemap participate; fragmented source files are skipped until a richer source-reconstruction design lands.
 
 Phase 3 also does not change the filemap format, the segment format, or the synchronous snapshot operation. It is strictly additive — it produces a new file that some consumers can use if it exists.
 
 The absence of immediate delta benefit is the main cost-benefit question for Phase 3. It lands anyway because the cost is modest (bounded by ext4 metadata size, not volume size) and because every later filemap-consuming feature — Phase 4 most of all — assumes snapshot filemaps exist.
+
+### Narrow exception: unfragmented entries as delta sources
+
+The drain-time knowledge gap above applies to the **target** side of delta compression — the new bytes being compressed. It does not apply to the **source** side. Phase 3 does unlock one small but genuine delta path without any Phase 4 infrastructure.
+
+**Flow.** File-aware import runs with `--extents-from <writable-volume>`. The new import is the target; the writable volume's most recent snapshot is the source. The import walks ext4 directly, so it has filesystem knowledge on the target side. Phase 3 has already generated the source snapshot's filemap by the time the import runs, so it has filesystem knowledge on the source side. Neither side needs drain-time path information.
+
+**Predicate.** For each new file, the import looks up the same path in the source filemap and checks whether it appears on **exactly one line**. A single-line entry means the source file is contiguous — one hash covers the whole file — and that hash plugs straight into the existing `source_hash` field. (A `file_offset = 0` row is necessary but not sufficient: every fragmented file also has a row at offset 0. The filemap is sorted by path, so the single-line check is a scan of adjacent rows.)
+
+**Producer.** Reuses the Phase 2b filemap-based upload-time delta pass almost unchanged: the pass already accepts a source filemap and path-matches against it. The only change is that the source filemap may now be one Phase 3 generated for a writable-volume snapshot, rather than strictly one written by the import path. Source rows that are not single-line are skipped (existing best-effort rule for fragmented sources).
+
+**Expected value profile.** The volume write path coalesces contiguous 4 KiB writes (§"Multi-block writes"), so small files flushed in one writeback tend to land as a single extent. Large files written across many flushes tend to fragment. The practical consequence:
+
+- **Delta coverage** (files matched) is likely substantial for the long tail of small files — `/etc`, scripts, small binaries, interpreted source trees.
+- **Delta savings** (bytes compressed) is likely modest, because the bytes that dominate total volume size live in large files, and those are the files most likely to fragment and be skipped.
+
+This is the opposite of Phase 4's expected profile: Phase 4 coalescing would preferentially benefit the large-file cases this exception skips. The two are complementary — the narrow exception ships as a side-effect of Phase 3, and Phase 4 picks up the rest later.
 
 ### Worker placement and scheduling
 
