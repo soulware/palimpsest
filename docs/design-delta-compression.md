@@ -2,7 +2,7 @@
 
 Status: **phase 2b + thin delta in progress** (Phase 1 + 2a landed; see § Scope and sequencing)
 
-Date: 2026-04-09 (updated 2026-04-10)
+Date: 2026-04-09 (updated 2026-04-12)
 
 ---
 
@@ -219,19 +219,13 @@ Delta compression fires at two points — both explicit user actions on a consis
 
 File-aware import reads the ext4 image directly (not via NBD), producing file-sized extents. The filemap enables path-matching against a parent import. This is where the 94% S3 fetch savings from findings.md are realised. See "Phase 2: import-time parent association" below.
 
-### Snapshot (coalescing, future)
+### Snapshot (filemap generation, phase 3)
 
-NBD writes fragment files into 4 KiB blocks. At snapshot time, the filesystem is in a consistent state — Elide can parse the ext4 metadata from its own block data and reconstruct file-level extents:
+A coordinator-side background task parses ext4 metadata from the frozen snapshot's segments and emits `snapshots/<ulid>.filemap` asynchronously after the synchronous snapshot operation returns. Scope is filemap-only: no coalescing of NBD-fragmented 4 KiB extents into file-sized extents, no new segment writes, no body rehashing — the filemap records paths and fragment layouts exactly as the existing DATA entries describe them.
 
-1. Parse the ext4 superblock, inode tables, and extent trees from the volume's current LBA state
-2. Identify which 4 KiB blocks belong to the same file
-3. Coalesce them into a single file-sized extent with one content hash
-4. Emit a filemap for the snapshot (`path → hash`)
-5. Compute deltas against the prior snapshot's filemap
+This extends filemap coverage to NBD-written volumes. Immediate delta benefit is limited — NBD fragment layouts will not match file-sized import extents (§"Multi-extent files and LBA mapping"), so cross-layout delta still skips. Intra-chain deltas on the same volume (snapshot N → N+1) become possible wherever fragment layouts align. Full delta benefit for writable volumes against imported sources requires phase 4 coalescing.
 
-This is "retroactive file-aware import" applied to live-write data. The ext4 parsing infrastructure already exists in `src/extents.rs`. The snapshot is the natural integration point because it represents a user-declared consistent state — unlike GC, which may see in-flight writes with uncommitted journal state.
-
-This also means NBD-written volumes get filemaps at snapshot time, enabling filemap-based delta for subsequent snapshots — not just for imported volumes.
+See §"Phase 3: Snapshot-time filemap generation" for the full design.
 
 ### Why not at drain time?
 
@@ -264,9 +258,11 @@ The earliest-source preference was originally scoped as a standalone Phase A. It
 
 **Phase B2 (Proposed, after C):** Filemap-based delta at coordinator upload. Load child + source volume filemaps via provenance lineage, path-match changed files, compute zstd deltas against locally-available source extent bodies, emit `EntryKind::Delta` entries using the format from C (not additive `Data + delta_options`). Simultaneously **removes** the existing LBA-based PoC delta path in `elide-coordinator/src/delta.rs` and its hook in `drain_pending()`. B2 is the first real producer of Delta entries; end-to-end verification runs through B1's file-aware import + C's reader.
 
-**Phase 3 (deferred):** Snapshot-time coalescing. Parse ext4 metadata at snapshot time to reconstruct file-level extents from fragmented NBD blocks, emit filemaps, and compute deltas against prior snapshots. Extends filemap-based delta to live-write volumes — until this lands, delta is import-only.
+**Phase 3 (Proposed):** Snapshot-time filemap generation. A coordinator-side background task parses ext4 metadata from the frozen snapshot's segment data and emits `snapshots/<ulid>.filemap` for writable-volume snapshots. Metadata-only (no body reads, no rehashing, no coalescing); best-effort (non-ext4 volumes and parse failures skip cleanly); crash-safe via tmp+fsync+upload+rename with a filesystem-as-queue restart scan. Extends filemap coverage to NBD-written volumes, enabling path-level inspection and serving as a prerequisite for later intra-chain delta. See §"Phase 3: Snapshot-time filemap generation" for the full design.
 
-**Phase 4 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
+**Phase 4 (deferred):** Snapshot-time extent coalescing. Reconstruct file-level extents from fragmented NBD blocks and emit new DATA entries with file-sized hashes; the filemap format is unchanged (one row per coalesced file instead of per fragment). This is the step that unlocks full filemap-based delta for writable volumes against imported sources. Separate from phase 3 because coalescing involves body reads, rehashing, and new segment writes, whereas phase 3 is purely metadata.
+
+**Phase 5 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
 ## Pull-host demand-fetch of the delta body section
 
@@ -372,6 +368,108 @@ NBD live writes are block-granular (4 KiB per write). Each block becomes one seg
 Import, by contrast, reads the ext4 image and writes file-level extents — one hash for an entire file's content. Two imports of different image versions produce entries at potentially different LBAs (ext4 may lay out files differently between builds). LBA matching finds nothing; file-path matching finds everything.
 
 This is why phase 2 requires filemaps and path-matching rather than LBA-based delta.
+
+## Phase 3: Snapshot-time filemap generation
+
+Today, filemaps exist only for imported snapshots — they are written by `elide-core/src/import.rs` in the same pass that emits segment DATA entries from an ext4 image. Snapshots produced by `elide volume snapshot` on a writable (NBD-written) volume get only a signed manifest and a marker file; no filemap.
+
+Phase 3 generates a filemap for such snapshots after they are written, asynchronously and best-effort. Scope is deliberately narrow: **filemap only, no coalescing of NBD-fragmented extents into file-sized extents.** The filemap records paths and fragment layouts exactly as the existing DATA entries describe them — one row per fragment. No body reads, no rehashing, no new segment writes.
+
+### What Phase 3 delivers
+
+- Filemap coverage for NBD-written volumes (previously: imported only).
+- Path-level inspection of any snapshot — "what files exist here?", "what changed between these two snapshots?" — for debugging, fork-lineage analysis, and operator tooling.
+- A prerequisite for every later filemap-consuming feature. Phase 4 in particular has nothing to consume without Phase 3.
+
+### What Phase 3 does **not** deliver
+
+**Delta compression for NBD-written volumes — under any combination of source and target fragmentation.** (Throughout this section, *source* is the older extent used as the zstd dictionary — the same meaning as the `source_hash` field in the segment format — and *target* is the new extent being compressed against it.) The reason Phase 3 doesn't deliver delta is a knowledge-gap issue in the upload pipeline, not a format issue, and it's worth stating explicitly so the limitation isn't rediscovered later:
+
+- The coordinator's upload stage runs at **drain time**, when a pending segment is promoted to S3. At that moment, the coordinator knows only LBAs for the fragments in the segment — there is no LBA → filesystem-path mapping available anywhere.
+- The filemap is the only structure that carries LBA → path, and Phase 3 generates it **after** the snapshot is sealed — which is typically **after** most of the pending segments for that snapshot have already drained to S3.
+- The current design already encodes this constraint: §"Where in the upload pipeline" restricts drain-time delta to import-produced segments, because imports are the only code path where filesystem knowledge is available while segments are being written. Writable-volume drain bypasses delta entirely.
+
+To close this gap, something has to run **after** the snapshot is sealed and the filemap is ready, and produce new segments that supersede the drained ones — S3 segments are immutable post-upload, so "add deltas to an existing segment" is not an operation. That post-snapshot rewrite is structurally similar to GC compaction with a delta step, and is the domain of Phase 4. Phase 3 deliberately does not attempt it.
+
+This applies to *all* source/target fragmentation shapes, not just layout mismatches:
+
+- **Target fragmented, source whole** (NBD-written snapshot with an imported source as its dictionary): even though zstd would happily use the whole source file as a dictionary against each 4 KiB target fragment, the drain-time coordinator doesn't know which path any given target fragment belongs to, so it cannot look the source up.
+- **Both fragmented** (intra-chain snapshot N → N+1 on a writable volume, with snapshot N as the source): same problem, plus the additional format question of multi-source delta dictionaries. Both concerns are Phase 4's.
+
+Phase 3 also does not change the filemap format, the segment format, or the synchronous snapshot operation. It is strictly additive — it produces a new file that some consumers can use if it exists.
+
+The absence of immediate delta benefit is the main cost-benefit question for Phase 3. It lands anyway because the cost is modest (bounded by ext4 metadata size, not volume size) and because every later filemap-consuming feature — Phase 4 most of all — assumes snapshot filemaps exist.
+
+### Worker placement and scheduling
+
+A **coordinator-side background task**, enqueued after the synchronous `snapshot_volume()` returns to the caller. The synchronous path (flush WAL → drain pending → sign manifest → write marker → upload manifest + marker to S3) is unchanged and runs at full speed. The caller sees the snapshot as complete the moment the manifest and marker are published; the filemap appears some seconds later.
+
+Failure of the worker — for any reason — is logged but does not affect snapshot validity. Consumers already tolerate missing filemaps (old snapshots, non-ext4 volumes, never-generated); the code path is exercised today by every writable-volume snapshot.
+
+### Reading the frozen snapshot
+
+The worker reads block state through **local `index/` + `segments/`**, using the **snapshot manifest's segment list** as the universe. This freezes the worker's view at snapshot time — writes that land on the volume after the snapshot was taken do not enter it, and no coordination with live I/O is required.
+
+A `SnapshotBlockReader` presents a `read_block(lba) -> Option<Bytes>` interface backed by:
+
+1. The manifest's segment list (frozen at snapshot creation)
+2. A rebuilt LBA map over only those segments, using the same last-writer-wins rules as the volume's own rebuild path
+3. The existing extent index for `hash → segment + offset` resolution
+4. Direct reads from `segments/<ulid>` body files; `DedupRef` and `Delta` entries are resolved transparently through the normal read path
+
+The reader is **metadata-only**: the ext4 walker requests only the blocks it actually needs (superblock, group descriptors, inode tables, directory blocks, extent tree nodes). File data blocks are **never read** — the filemap records their hashes by looking up the existing LBA map, not by rehashing bytes.
+
+### ext4 detection
+
+The ext4 magic `0xEF53` lives at byte 56 of the superblock, which starts at byte 1024 of the volume. One block read through the snapshot block reader decides whether to proceed. No magic → exit cleanly with no filemap; no error, no retry.
+
+### Filemap construction
+
+With a `SnapshotBlockReader` in hand, the existing ext4 walker in `src/extents.rs` is adapted to consume a `&dyn BlockReader` rather than a `&File`. The walk produces `path → Vec<FileFragment>`, the same structure the import path produces, with one difference: each fragment's hash comes from the **existing extent index** looked up by LBA range, not from rehashing the fragment bytes.
+
+If a fragment's LBA range resolves to multiple distinct hashes (the range spans a boundary where a partial rewrite happened), it is emitted as multiple finer-grained filemap rows — each contiguous run of identical-hash blocks becomes one row. The v2 format already accommodates arbitrarily fine fragmentation.
+
+### Output: tmp + fsync + upload + rename
+
+Filemap output follows a write-temp, fsync, upload, rename discipline. The on-disk state unambiguously reflects work progress:
+
+1. Write `snapshots/<snap_ulid>.filemap.tmp` with the generated rows, then `fsync` the file and its parent directory. A valid filemap now exists on disk.
+2. PUT the file to S3 under the same prefix as the snapshot marker and manifest (`.../snapshots/<snap_ulid>.filemap`). Upload is idempotent.
+3. Rename `.tmp` to `snapshots/<snap_ulid>.filemap` and fsync the parent directory.
+4. Log success.
+
+Any failure before step 3 leaves `.tmp` on disk. Any success leaves `.filemap` on disk in both local and S3 state. There is no ambiguous half-state.
+
+### Restart recovery
+
+On coordinator startup, a scan walks `snapshots/` in every locally-present volume and classifies each snapshot marker using three mutually exclusive disk states:
+
+| State | Meaning | Action |
+|---|---|---|
+| Marker only, no `.tmp`, no `.filemap` | Never generated | Enqueue generation |
+| `.tmp` present (with or without marker) | Upload pending or failed | Re-upload from `.tmp` (idempotent PUT), then rename |
+| `.filemap` present | Complete | Skip |
+
+No persistent job queue is needed — **the filesystem is the queue**. Each action converges to the terminal state. The scan is one `readdir` per volume; the system is robust to an arbitrary number of crashes, and a half-done filemap is never regenerated from scratch.
+
+### Failure and best-effort semantics
+
+- **Non-ext4 volume** (magic check fails): exit cleanly. Debug-level log only.
+- **ext4 parse error** (corrupt superblock, unreadable inode table, etc.): warn-level log with the snapshot ULID and the first error encountered; delete `.tmp` if present; do not retry. The snapshot is still valid.
+- **Local I/O error during block reads**: same as parse error — warn, delete `.tmp`, exit.
+- **S3 upload failure**: leave `.tmp` in place. The next coordinator restart re-uploads from `.tmp`; the ext4 walk is not repeated. (A periodic in-process retry pass can be added later if restart is too coarse; restart alone is sufficient for a first implementation.)
+- **Rename failure**: log and leave `.tmp` in place; restart recovery handles it.
+
+### Cost model
+
+For a 2.1 GB Ubuntu cloud image (findings.md: ~33,700 extents, ~100K–200K inodes):
+
+- **Metadata block reads:** ~10–50 MB, served entirely from local `segments/`.
+- **Walk:** linear in file count; `ext4_scan` already handles volumes of this size in well under a second on typical hardware.
+- **Hash lookups:** O(1) per filemap row against the existing extent index.
+- **Output write + S3 upload:** ~50 bytes per row (~2 MB for 33K fragments); single PUT.
+
+**Expected wall-clock time:** single-digit seconds for a 2.1 GB volume, dominated by metadata reads and S3 upload latency, not CPU. The worker runs on a bounded task pool; snapshots on different volumes process in parallel without interference.
 
 ## Read-path delta: warm hosts, not cold starts
 
