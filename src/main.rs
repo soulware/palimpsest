@@ -1091,17 +1091,26 @@ fn create_fork(
     let snap_ulid: Option<ulid::Ulid> = match &spec {
         FromSpec::ExplicitPin(_, snap) => Some(*snap),
         _ if source_fork_dir.join("volume.readonly").exists() => {
-            // Readonly volume (pulled or already local): local snapshots/ may
-            // be empty (not yet prefetched by coordinator), so discover the
-            // latest snapshot from the remote store.
-            let vol_id = pulled_vol_ulid.as_deref().unwrap_or_else(|| {
-                source_fork_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .expect("readonly dir must have a ULID name")
-            });
-            let config = load_fetch_config(data_dir, vol_id)?;
-            Some(resolve_latest_remote_snapshot(&config, vol_id)?)
+            // Readonly volume (pulled or already local). Prefer the local
+            // snapshots/ directory — it is always authoritative when present
+            // (e.g. after a local import). Fall back to the remote store
+            // only when snapshots/ is missing or empty (volume pulled from
+            // the store but coordinator hasn't prefetched yet).
+            if let Some(snap) = volume::latest_snapshot(&source_fork_dir)? {
+                Some(snap)
+            } else {
+                // Canonicalize through any by_name/ symlink so file_name()
+                // returns the ULID, not the human volume name.
+                let real_dir = std::fs::canonicalize(&source_fork_dir)?;
+                let vol_id = pulled_vol_ulid.as_deref().unwrap_or_else(|| {
+                    real_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .expect("readonly dir must have a ULID name")
+                });
+                let config = load_fetch_config(data_dir, vol_id)?;
+                Some(resolve_latest_remote_snapshot(&config, vol_id)?)
+            }
         }
         FromSpec::BareUlid(_) => {
             // Writable volume addressed by ULID: take an implicit snapshot.
