@@ -61,9 +61,6 @@ enum Command {
         /// use this flag to explicitly serve a writable volume read-only)
         #[arg(long)]
         readonly: bool,
-        /// Skip the fork.origin hostname/path check (use after an intentional move)
-        #[arg(long)]
-        force_origin: bool,
     },
 
     /// Scan an image for file extents and analyse dedup + delta compression potential
@@ -653,7 +650,6 @@ fn main() {
             port,
             socket,
             readonly,
-            force_origin,
         } => {
             // In the flat layout, fork_dir IS the volume directory.
             let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
@@ -673,19 +669,12 @@ fn main() {
             } else {
                 std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
                 let signer = if fork_dir.join(VOLUME_KEY_FILE).exists() {
-                    if !force_origin {
-                        elide_core::signing::verify_provenance(
-                            &fork_dir,
-                            VOLUME_PUB_FILE,
-                            VOLUME_PROVENANCE_FILE,
-                        )
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
-                                "{e} — use --force-origin if this fork has been intentionally moved"
-                            ))
-                        })
-                        .expect("volume.provenance check failed");
-                    }
+                    elide_core::signing::read_lineage_verifying_signature(
+                        &fork_dir,
+                        VOLUME_PUB_FILE,
+                        VOLUME_PROVENANCE_FILE,
+                    )
+                    .expect("volume.provenance signature check failed");
                     elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
                         .expect("failed to load volume signing key")
                 } else {
@@ -1353,19 +1342,21 @@ fn pull_one_readonly(
             .map_err(|e| std::io::Error::other(format!("reading volume.pub: {e}")))
     })?;
 
-    // Fetch volume.provenance (may be absent for the root volume — treat
-    // NotFound as "no lineage" and continue).
+    // Fetch volume.provenance. Every volume — including roots — has a
+    // signed provenance recording its lineage (possibly empty). NotFound is
+    // a hard error: it means the upstream store is missing load-bearing
+    // metadata and we cannot safely materialise a readonly skeleton.
     let provenance_bytes = rt.block_on(async {
         let key = StorePath::from(format!("by_id/{volume_id}/volume.provenance"));
-        match store.get(&key).await {
-            Ok(data) => Ok(Some(data.bytes().await.map_err(|e| {
-                std::io::Error::other(format!("reading volume.provenance: {e}"))
-            })?)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(std::io::Error::other(format!(
-                "downloading volume.provenance: {e}"
-            ))),
-        }
+        let data = store.get(&key).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => std::io::Error::other(format!(
+                "volume.provenance not found in store for volume {volume_id}"
+            )),
+            e => std::io::Error::other(format!("downloading volume.provenance: {e}")),
+        })?;
+        data.bytes()
+            .await
+            .map_err(|e| std::io::Error::other(format!("reading volume.provenance: {e}")))
     })?;
 
     // Write the skeleton.
@@ -1381,33 +1372,27 @@ fn pull_one_readonly(
     .write(&vol_dir)?;
     std::fs::write(vol_dir.join("volume.readonly"), "")?;
     std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
-    if let Some(bytes) = &provenance_bytes {
-        std::fs::write(
-            vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
-            bytes,
-        )?;
-    }
+    std::fs::write(
+        vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
+        &provenance_bytes,
+    )?;
     // Empty index/ so discover_volumes queues the volume for prefetch.
     std::fs::create_dir_all(vol_dir.join("index"))?;
 
     // Parse the downloaded provenance to find the parent ULID (if any).
     // Signature is verified against the just-written `volume.pub`.
-    let parent_ulid = if provenance_bytes.is_some() {
-        match elide_core::signing::read_lineage_verifying_signature(
-            &vol_dir,
-            elide_core::signing::VOLUME_PUB_FILE,
-            elide_core::signing::VOLUME_PROVENANCE_FILE,
-        ) {
-            Ok(lineage) => lineage.parent.map(|p| p.volume_ulid),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&vol_dir);
-                return Err(std::io::Error::other(format!(
-                    "verifying provenance for {volume_id}: {e}"
-                )));
-            }
+    let parent_ulid = match elide_core::signing::read_lineage_verifying_signature(
+        &vol_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    ) {
+        Ok(lineage) => lineage.parent.map(|p| p.volume_ulid),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&vol_dir);
+            return Err(std::io::Error::other(format!(
+                "verifying provenance for {volume_id}: {e}"
+            )));
         }
-    } else {
-        None
     };
 
     Ok(parent_ulid)

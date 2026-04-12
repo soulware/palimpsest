@@ -250,20 +250,19 @@ fn tampered_provenance_rejected_by_walker() {
     walk_ancestors(&grandchild_dir, &by_id).expect("untampered walk should succeed");
 
     // Tamper with the child's provenance by flipping one character in the
-    // hostname line. The file stays parseable (parse_provenance only requires
-    // `hostname: <value>\n`) but the recorded signing input no longer matches,
-    // so the Ed25519 signature check must fail.
+    // `parent:` line. The file stays parseable but the recorded signing
+    // input no longer matches the signature, so the Ed25519 check must
+    // fail at the walker.
     let child_provenance = child_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
     let original = std::fs::read_to_string(&child_provenance).unwrap();
-    let tampered = if let Some(rest) = original.strip_prefix("hostname: ") {
-        let newline = rest.find('\n').unwrap();
-        let (host, after) = rest.split_at(newline);
-        // Prepend an "x" to the hostname; still valid UTF-8, still parseable,
-        // definitely different from what was signed.
-        format!("hostname: x{host}{after}")
-    } else {
-        panic!("provenance file did not start with hostname line");
-    };
+    // Flip the first character of the parent ULID to a different valid
+    // ULID crockford character ('0' → '1'): stays parseable, definitely
+    // different from what was signed.
+    let tampered = original.replacen("parent: 0", "parent: 1", 1);
+    assert_ne!(
+        tampered, original,
+        "expected to flip one char in the parent line"
+    );
     std::fs::write(&child_provenance, tampered).unwrap();
 
     let err = match walk_ancestors(&grandchild_dir, &by_id) {

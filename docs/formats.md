@@ -561,20 +561,21 @@ All volumes use a flat layout with fixed filenames directly in the volume direct
 
 ```
 <vol_dir>/volume.pub        — Ed25519 public key (32 bytes; uploaded to S3; present on all volumes)
-<vol_dir>/volume.provenance — hostname + canonical path + Ed25519 signature (local only; present on all volumes)
+<vol_dir>/volume.provenance — Signed lineage (parent + extent_index) + Ed25519 signature (uploaded to S3; present on all volumes)
 <vol_dir>/volume.key        — Ed25519 private key (32 bytes; never uploaded; absent on readonly volumes)
 ```
 
-S3 location of the public key:
+S3 locations:
 ```
 by_id/<volume-ulid>/volume.pub
+by_id/<volume-ulid>/volume.provenance
 ```
 
 **Readonly volumes have no private key.** `elide-import` generates an ephemeral keypair in memory, uses it to sign all segments and the provenance file, writes `volume.pub` and `volume.provenance` to disk, then discards the private key. `volume.key` is never written. Since a readonly volume can never accept new writes, the private key has no use after import completes.
 
-**`volume.provenance`** records the hostname and canonical directory path at creation or import time, signed by the private key (or ephemeral key for imports). It is local-only and never uploaded. `serve-volume` verifies this file against `volume.pub` on every open — readonly and writable alike — as a sanity check that catches accidental directory copies or coordinator misconfiguration. The `--force-origin` flag bypasses this check after an intentional move.
+**`volume.provenance`** is the signed lineage statement for the volume: which fork parent (if any) it branched from, and which snapshots feed its extent index for dedup / delta compression. Signed by the private key (or ephemeral key for imports) at creation/import time. Uploaded to S3 alongside `volume.pub` so that `remote pull` can materialise the ancestor chain on another host. `serve-volume` verifies the signature against `volume.pub` on every open — readonly and writable alike.
 
-The S3 copy of `volume.pub` enables a pulling host to verify ancestor segments it does not own. It is not authoritative — a compromised S3 bucket could substitute a different key. Locally-pinned public keys (see Verification below) are more trustworthy.
+The S3 copies of `volume.pub` and `volume.provenance` enable a pulling host to verify ancestor segments and walk the lineage chain for volumes it does not own. They are not authoritative against a compromised S3 bucket — locally-pinned public keys (see Verification below) are more trustworthy.
 
 ### Signing
 

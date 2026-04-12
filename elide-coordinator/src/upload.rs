@@ -216,16 +216,29 @@ pub async fn drain_pending(
     Ok(DrainResult { uploaded, failed })
 }
 
-/// Upload volume metadata: public key, manifest.toml, names/<name> entry,
-/// snapshot markers, and filemaps.
+/// Upload volume metadata: public key, signed provenance, manifest.toml,
+/// names/<name> entry, snapshot markers, and filemaps.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
     if pub_key_path.exists()
-        && let Err(e) = upload_pub_key(&pub_key_path, volume_id, store).await
+        && let Err(e) = upload_small_file(&pub_key_path, volume_id, "volume.pub", store).await
     {
         warn!("pub key upload failed: {e:#}");
+    }
+
+    let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
+    if provenance_path.exists()
+        && let Err(e) = upload_small_file(
+            &provenance_path,
+            volume_id,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            store,
+        )
+        .await
+    {
+        warn!("provenance upload failed: {e:#}");
     }
 
     if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
@@ -237,19 +250,20 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
     }
 }
 
-async fn upload_pub_key(
-    pub_key_path: &Path,
+async fn upload_small_file(
+    local_path: &Path,
     volume_id: &str,
+    remote_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let data = tokio::fs::read(pub_key_path)
+    let data = tokio::fs::read(local_path)
         .await
-        .with_context(|| format!("reading pub key: {}", pub_key_path.display()))?;
-    let key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
+        .with_context(|| format!("reading {}", local_path.display()))?;
+    let key = StorePath::from(format!("by_id/{volume_id}/{remote_name}"));
     store
         .put(&key, Bytes::from(data).into())
         .await
-        .with_context(|| format!("uploading pub key to {key}"))?;
+        .with_context(|| format!("uploading {remote_name} to {key}"))?;
     Ok(())
 }
 

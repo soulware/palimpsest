@@ -2847,21 +2847,11 @@ fn parse_lineage_entry<'a>(
 /// A volume with no `volume.provenance` is treated as root (empty chain).
 /// All other provenance read errors propagate — in particular, a missing
 /// or malformed file on a volume that had lineage is a loud failure.
-///
-/// Verification is opt-in at the walker layer via `load_verified_lineage`
-/// when the caller can afford a host/path match check; volume-open paths
-/// that need to survive host moves use `read_lineage_unchecked` (below).
 fn load_lineage_or_empty(fork_dir: &Path) -> io::Result<crate::signing::ProvenanceLineage> {
     let provenance_path = fork_dir.join(crate::signing::VOLUME_PROVENANCE_FILE);
     if !provenance_path.exists() {
         return Ok(crate::signing::ProvenanceLineage::default());
     }
-    // Walkers run on both the current volume and on ancestor volumes in
-    // other `by_id/<ulid>/` directories. Ancestors do not necessarily live
-    // on the same host path as they did when their provenance was signed,
-    // so walkers verify the signature but deliberately skip the host/path
-    // match check that `verify_provenance` performs. The signature still
-    // anchors lineage integrity against tampering.
     crate::signing::read_lineage_verifying_signature(
         fork_dir,
         crate::signing::VOLUME_PUB_FILE,

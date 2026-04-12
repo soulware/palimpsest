@@ -1,10 +1,10 @@
 // Ed25519 keypair management and signed provenance.
 //
-// `volume.provenance` is the single signed statement of what a volume is:
-// where it lives, and what other volumes it is related to. All lineage
-// relationships (fork parent, extent-index sources) are carried in the
-// same file, under the same signature, so tampering with lineage is
-// detectable with the volume's own public key.
+// `volume.provenance` is the signed statement of a volume's lineage:
+// which other volumes it is related to via fork parent and extent-index
+// sources. Both relationships are carried in the same file, under the
+// same signature, so tampering with lineage is detectable with the
+// volume's own public key.
 //
 // Key file naming convention (all volumes, flat layout):
 //   volume.key / volume.pub / volume.provenance  (under <by_id>/<ulid>/)
@@ -12,11 +12,9 @@
 // File contents:
 //   *.key         — Ed25519 private key (32 raw bytes, never uploaded)
 //   *.pub         — Ed25519 public key (64 lowercase hex chars + newline, uploaded to S3)
-//   *.provenance  — plaintext host + path + lineage + signature (local only)
+//   *.provenance  — signed lineage (parent + extent_index), uploaded to S3
 //
 // provenance file format:
-//   hostname: <value>
-//   path: <canonical absolute path>
 //   parent: <volume-ulid>/<snapshot-ulid>              (empty string if none)
 //   parent_pubkey: <64 lowercase hex chars>            (empty string if no parent)
 //   extent_index:
@@ -39,8 +37,7 @@
 // embedded value is authoritative for the life of the child.
 //
 // Signing input (NUL-separated, fixed field order):
-//   hostname ‖ NUL ‖ path ‖ NUL ‖ parent_or_empty ‖ NUL ‖
-//   parent_pubkey_hex_or_empty ‖ NUL ‖
+//   parent_or_empty ‖ NUL ‖ parent_pubkey_hex_or_empty ‖ NUL ‖
 //   extent_entry_1 ‖ NUL ‖ extent_entry_2 ‖ NUL ‖ … ‖ extent_entry_N
 //
 // An empty extent_index contributes zero trailing entries (the signing
@@ -192,14 +189,6 @@ pub struct ProvenanceLineage {
     pub extent_index: Vec<String>,
 }
 
-/// The full verified contents of a `volume.provenance` file.
-#[derive(Clone, Debug)]
-pub struct Provenance {
-    pub hostname: String,
-    pub path: String,
-    pub lineage: ProvenanceLineage,
-}
-
 /// Set up a readonly volume's identity and return a signer for segment writing.
 ///
 /// Generates an ephemeral Ed25519 keypair, writes `volume.pub` and
@@ -222,96 +211,30 @@ pub fn setup_readonly_identity(
 
 // --- provenance files ---
 
-/// Write a signed provenance file recording hostname, canonical path, and lineage.
-///
-/// `dir` must already exist — `canonicalize` requires the path to be present.
-/// `provenance_file` is the filename within `dir`.
+/// Write a signed provenance file recording the volume's lineage.
 pub fn write_provenance(
     dir: &Path,
     key: &SigningKey,
     provenance_file: &str,
     lineage: &ProvenanceLineage,
 ) -> io::Result<()> {
-    let hostname = get_hostname()?;
-    let canonical = std::fs::canonicalize(dir)?;
-    let path_str = canonical
-        .to_str()
-        .ok_or_else(|| io::Error::other("dir path is not valid UTF-8"))?
-        .to_owned();
-
-    let sig = sign_provenance(key, &hostname, &path_str, lineage);
-    let content = serialize_provenance(&hostname, &path_str, lineage, &sig);
+    let sig = sign_provenance(key, lineage);
+    let content = serialize_provenance(lineage, &sig);
     crate::segment::write_file_atomic(&dir.join(provenance_file), content.as_bytes())
 }
 
-/// Verify a provenance file and return the recorded lineage.
+/// Read lineage from a volume's provenance, verifying the Ed25519
+/// signature against `pub_file` sitting in the same directory.
 ///
-/// Checks: file readable, parseable, recorded hostname matches the current
-/// host, recorded path matches the current canonical path, signature valid
-/// under `pub_file`. Returns the full parsed `Provenance` on success.
-pub fn verify_provenance(
-    dir: &Path,
-    pub_file: &str,
-    provenance_file: &str,
-) -> io::Result<Provenance> {
-    let content = std::fs::read_to_string(dir.join(provenance_file)).map_err(|e| {
-        io::Error::other(format!(
-            "{provenance_file} not readable (was this volume created with an older version?): {e}"
-        ))
-    })?;
-
-    let (hostname, path, lineage, sig_bytes) = parse_provenance(&content, provenance_file)?;
-
-    let current_hostname = get_hostname()?;
-    let canonical = std::fs::canonicalize(dir)?;
-    let current_path = canonical
-        .to_str()
-        .ok_or_else(|| io::Error::other("dir path is not valid UTF-8"))?;
-
-    if hostname != current_hostname {
-        return Err(io::Error::other(format!(
-            "{provenance_file} hostname mismatch: recorded {hostname:?}, \
-             current host is {current_hostname:?}"
-        )));
-    }
-    if path != current_path {
-        return Err(io::Error::other(format!(
-            "{provenance_file} path mismatch: recorded {path:?}, \
-             current canonical path is {current_path:?}"
-        )));
-    }
-
-    let verifying_key = load_verifying_key(dir, pub_file)?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        io::Error::other(format!(
-            "{provenance_file} sig wrong length (expected 64 bytes)"
-        ))
-    })?;
-    let signature = Signature::from_bytes(&sig_arr);
-
-    let msg = provenance_signing_input(&hostname, &path, &lineage);
-    verifying_key.verify(&msg, &signature).map_err(|_| {
-        io::Error::other(format!(
-            "{provenance_file} signature invalid — {provenance_file} or {pub_file} may have been tampered with"
-        ))
-    })?;
-
-    Ok(Provenance {
-        hostname,
-        path,
-        lineage,
-    })
-}
-
-/// Verify `volume.provenance` and return the lineage without re-reading on
-/// the caller side. Small convenience for read-only open paths that only
-/// care about parent / extent_index after verification.
-pub fn load_verified_lineage(
+/// Used by the current volume's open path and by ancestor walks that
+/// don't have a caller-supplied trust anchor yet.
+pub fn read_lineage_verifying_signature(
     dir: &Path,
     pub_file: &str,
     provenance_file: &str,
 ) -> io::Result<ProvenanceLineage> {
-    Ok(verify_provenance(dir, pub_file, provenance_file)?.lineage)
+    let verifying_key = load_verifying_key(dir, pub_file)?;
+    read_lineage_with_key(dir, &verifying_key, provenance_file)
 }
 
 /// Read lineage from an ancestor volume's provenance, verifying the
@@ -320,8 +243,6 @@ pub fn load_verified_lineage(
 /// `Volume::open` ancestor walk, where the trust anchor for each step is
 /// the `parent_pubkey` embedded in the child's signed provenance — not
 /// whatever `volume.pub` happens to be on disk at the ancestor path.
-///
-/// Host/path checks are skipped (ancestors may have moved).
 pub fn read_lineage_with_key(
     dir: &Path,
     verifying_key: &VerifyingKey,
@@ -333,49 +254,14 @@ pub fn read_lineage_with_key(
             dir.display()
         ))
     })?;
-    let (hostname, path, lineage, sig_bytes) = parse_provenance(&content, provenance_file)?;
+    let (lineage, sig_bytes) = parse_provenance(&content, provenance_file)?;
     let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
         io::Error::other(format!(
             "{provenance_file} sig wrong length (expected 64 bytes)"
         ))
     })?;
     let signature = Signature::from_bytes(&sig_arr);
-    let msg = provenance_signing_input(&hostname, &path, &lineage);
-    verifying_key.verify(&msg, &signature).map_err(|_| {
-        io::Error::other(format!(
-            "{provenance_file} in {} signature invalid under supplied key",
-            dir.display()
-        ))
-    })?;
-    Ok(lineage)
-}
-
-/// Read lineage from an ancestor volume's provenance, verifying the Ed25519
-/// signature against its `volume.pub` but **skipping** the host and path
-/// match checks. Used by `walk_ancestors` / `walk_extent_ancestors` on
-/// ancestor volumes that may have been created on a different host or at a
-/// different path. Still enforces integrity: the signature chain protects
-/// lineage from tampering even across host moves.
-pub fn read_lineage_verifying_signature(
-    dir: &Path,
-    pub_file: &str,
-    provenance_file: &str,
-) -> io::Result<ProvenanceLineage> {
-    let content = std::fs::read_to_string(dir.join(provenance_file)).map_err(|e| {
-        io::Error::other(format!(
-            "{provenance_file} in {} not readable: {e}",
-            dir.display()
-        ))
-    })?;
-    let (hostname, path, lineage, sig_bytes) = parse_provenance(&content, provenance_file)?;
-    let verifying_key = load_verifying_key(dir, pub_file)?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        io::Error::other(format!(
-            "{provenance_file} sig wrong length (expected 64 bytes)"
-        ))
-    })?;
-    let signature = Signature::from_bytes(&sig_arr);
-    let msg = provenance_signing_input(&hostname, &path, &lineage);
+    let msg = provenance_signing_input(&lineage);
     verifying_key.verify(&msg, &signature).map_err(|_| {
         io::Error::other(format!(
             "{provenance_file} in {} signature invalid",
@@ -387,24 +273,17 @@ pub fn read_lineage_verifying_signature(
 
 // --- internal helpers ---
 
-fn sign_provenance(
-    key: &SigningKey,
-    hostname: &str,
-    path: &str,
-    lineage: &ProvenanceLineage,
-) -> [u8; 64] {
-    key.sign(&provenance_signing_input(hostname, path, lineage))
-        .to_bytes()
+fn sign_provenance(key: &SigningKey, lineage: &ProvenanceLineage) -> [u8; 64] {
+    key.sign(&provenance_signing_input(lineage)).to_bytes()
 }
 
 /// Signing input (NUL-separated, fixed field order):
-///   hostname || NUL || path || NUL || parent_or_empty || NUL ||
-///   parent_pubkey_hex_or_empty || NUL ||
+///   parent_or_empty || NUL || parent_pubkey_hex_or_empty || NUL ||
 ///   entry_1 || NUL || entry_2 || NUL || … || entry_N
 ///
 /// Empty `extent_index` contributes zero trailing entries (the input ends
 /// after the parent_pubkey field's terminating NUL).
-fn provenance_signing_input(hostname: &str, path: &str, lineage: &ProvenanceLineage) -> Vec<u8> {
+fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
     let parent_pubkey_hex = lineage
@@ -412,22 +291,11 @@ fn provenance_signing_input(hostname: &str, path: &str, lineage: &ProvenanceLine
         .as_ref()
         .map(|p| encode_hex(&p.pubkey))
         .unwrap_or_default();
-    let mut total = hostname.len()
-        + 1
-        + path.len()
-        + 1
-        + parent_str.len()
-        + 1
-        + parent_pubkey_hex.len()
-        + lineage.extent_index.len();
+    let mut total = parent_str.len() + 1 + parent_pubkey_hex.len() + lineage.extent_index.len();
     for entry in &lineage.extent_index {
         total += entry.len();
     }
     let mut msg = Vec::with_capacity(total);
-    msg.extend_from_slice(hostname.as_bytes());
-    msg.push(0u8);
-    msg.extend_from_slice(path.as_bytes());
-    msg.push(0u8);
     msg.extend_from_slice(parent_str.as_bytes());
     msg.push(0u8);
     msg.extend_from_slice(parent_pubkey_hex.as_bytes());
@@ -438,12 +306,7 @@ fn provenance_signing_input(hostname: &str, path: &str, lineage: &ProvenanceLine
     msg
 }
 
-fn serialize_provenance(
-    hostname: &str,
-    path: &str,
-    lineage: &ProvenanceLineage,
-    sig: &[u8; 64],
-) -> String {
+fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
     let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
     let parent_pubkey_hex = lineage
@@ -452,12 +315,6 @@ fn serialize_provenance(
         .map(|p| encode_hex(&p.pubkey))
         .unwrap_or_default();
     let mut content = String::new();
-    content.push_str("hostname: ");
-    content.push_str(hostname);
-    content.push('\n');
-    content.push_str("path: ");
-    content.push_str(path);
-    content.push('\n');
     content.push_str("parent: ");
     content.push_str(parent_str);
     content.push('\n');
@@ -484,9 +341,7 @@ fn serialize_provenance(
 fn parse_provenance(
     content: &str,
     provenance_file: &str,
-) -> io::Result<(String, String, ProvenanceLineage, Vec<u8>)> {
-    let mut hostname: Option<String> = None;
-    let mut path: Option<String> = None;
+) -> io::Result<(ProvenanceLineage, Vec<u8>)> {
     let mut parent_str: Option<Option<String>> = None;
     let mut parent_pubkey_str: Option<Option<String>> = None;
     let mut extent_index: Option<Vec<String>> = None;
@@ -494,11 +349,7 @@ fn parse_provenance(
 
     let mut lines = content.lines().peekable();
     while let Some(line) = lines.next() {
-        if let Some(v) = line.strip_prefix("hostname: ") {
-            hostname = Some(v.to_owned());
-        } else if let Some(v) = line.strip_prefix("path: ") {
-            path = Some(v.to_owned());
-        } else if let Some(v) = line.strip_prefix("parent_pubkey: ") {
+        if let Some(v) = line.strip_prefix("parent_pubkey: ") {
             parent_pubkey_str = Some(if v.is_empty() {
                 None
             } else {
@@ -536,10 +387,6 @@ fn parse_provenance(
         }
     }
 
-    let hostname = hostname
-        .ok_or_else(|| io::Error::other(format!("{provenance_file} missing hostname line")))?;
-    let path =
-        path.ok_or_else(|| io::Error::other(format!("{provenance_file} missing path line")))?;
     let parent_str = parent_str
         .ok_or_else(|| io::Error::other(format!("{provenance_file} missing parent line")))?;
     let parent_pubkey_str = parent_pubkey_str
@@ -594,8 +441,6 @@ fn parse_provenance(
     };
 
     Ok((
-        hostname,
-        path,
         ProvenanceLineage {
             parent,
             extent_index,
@@ -788,22 +633,12 @@ pub(crate) fn write_raw_provenance_for_test(
     extent_index: &[String],
 ) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let hostname = get_hostname()?;
-    let canonical = std::fs::canonicalize(dir)?;
-    let path_str = canonical
-        .to_str()
-        .ok_or_else(|| io::Error::other("dir path is not valid UTF-8"))?
-        .to_owned();
 
     let key = SigningKey::generate(&mut OsRng);
     let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
     crate::segment::write_file_atomic(&dir.join(VOLUME_PUB_FILE), pub_hex.as_bytes())?;
 
     let mut msg = Vec::new();
-    msg.extend_from_slice(hostname.as_bytes());
-    msg.push(0);
-    msg.extend_from_slice(path_str.as_bytes());
-    msg.push(0);
     msg.extend_from_slice(raw_parent.as_bytes());
     msg.push(0);
     msg.extend_from_slice(raw_parent_pubkey_hex.as_bytes());
@@ -814,12 +649,6 @@ pub(crate) fn write_raw_provenance_for_test(
     let sig = key.sign(&msg).to_bytes();
 
     let mut content = String::new();
-    content.push_str("hostname: ");
-    content.push_str(&hostname);
-    content.push('\n');
-    content.push_str("path: ");
-    content.push_str(&path_str);
-    content.push('\n');
     content.push_str("parent: ");
     content.push_str(raw_parent);
     content.push('\n');
@@ -837,13 +666,6 @@ pub(crate) fn write_raw_provenance_for_test(
     content.push('\n');
 
     crate::segment::write_file_atomic(&dir.join(VOLUME_PROVENANCE_FILE), content.as_bytes())
-}
-
-fn get_hostname() -> io::Result<String> {
-    nix::unistd::gethostname()
-        .map_err(io::Error::from)?
-        .into_string()
-        .map_err(|_| io::Error::other("hostname is not valid UTF-8"))
 }
 
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {

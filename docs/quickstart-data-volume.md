@@ -84,7 +84,7 @@ elide_data/by_id/<ulid>/
   volume.size       — "1073741824"
   volume.key        — Ed25519 signing key (never uploaded)
   volume.pub        — Ed25519 public key
-  volume.provenance — hostname + path + signature (local sanity check)
+  volume.provenance — signed lineage (parent + extent_index); uploaded to S3
   volume.pid        — PID of running volume process
   nbd.port          — "10809"
   control.sock      — volume IPC socket

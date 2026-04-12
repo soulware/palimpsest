@@ -95,7 +95,7 @@ elide_data/                           — single root (default --data-dir)
       volume.readonly                 — present = permanently readonly (imported/frozen)
       volume.size                     — volume size in bytes (plain text)
       volume.pub                      — Ed25519 public key (uploaded to S3)
-      volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
+      volume.provenance               — signed lineage (parent + extent_index); uploaded to S3
       manifest.toml                   — name, size, OCI source metadata
       pending/                        — segments awaiting S3 upload (volume-written)
       index/                          — volume-written LBA index files (01JQXXXXX.idx)
@@ -108,7 +108,7 @@ elide_data/                           — single root (default --data-dir)
       volume.size
       volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
       volume.pub
-      volume.provenance               — signed: host + path + parent="01JQAAAAAAA/snapshots/01JQXXXXX" + empty extent_index
+      volume.provenance               — signed: parent="01JQAAAAAAA/snapshots/01JQXXXXX" + empty extent_index
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
@@ -136,14 +136,13 @@ elide_data/                           — single root (default --data-dir)
     server-2-experiment  ->  ../by_id/01JQDDDDDDD
 ```
 
-Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` / `volume.extent_index` files. Provenance is a single signed document recording hostname + canonical path + both lineage relationships under one Ed25519 signature. Tampering with lineage is detectable with the volume's own public key, and the file format is extensible — adding new lineage fields in the future means extending the signed payload rather than dropping more unsigned files into the directory.
+Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` / `volume.extent_index` files. Provenance is a single signed document recording both lineage relationships under one Ed25519 signature. Tampering with lineage is detectable with the volume's own public key, and the file format is extensible — adding new lineage fields in the future means extending the signed payload rather than dropping more unsigned files into the directory. `volume.provenance` is uploaded to S3 alongside `volume.pub` so that `remote pull` can materialise a signed, verifiable skeleton on another host.
 
 Provenance file format:
 
 ```
-hostname: build-host-42
-path: /var/elide/by_id/01JQ…
 parent: 01JQAAA…/snapshots/01JQX…    # empty string if no fork parent
+parent_pubkey: <64 hex chars>         # embedded parent verifying key (empty if no parent)
 extent_index:
   01JQBBB…/snapshots/01JQY…
   01JQCCC…/snapshots/01JQZ…
@@ -156,9 +155,9 @@ sig: <hex-encoded 64-byte Ed25519 signature>
 
 The `extent_index` list is **flat because it is computed at import time, not resolved at attach time**. When a new volume is imported with `--extents-from X`, the coordinator reads `X`'s own provenance (verifying its signature), inherits every entry from `X`'s `extent_index` field, appends `X` itself at its latest snapshot, dedupes by source ULID, and signs the result into the new volume's provenance. Multiple `--extents-from` values contribute their already-flat lists in order. The total is capped at `MAX_EXTENT_INDEX_SOURCES = 32` to bound attach-time cost. When the expanded list exceeds the cap: **explicit sources** (passed directly via `--extents-from`) are sacred and kept in full — if the explicit count alone exceeds the cap, the import is rejected; **inherited entries** fill the remaining slots via "oldest + most recent" pruning, keeping the first-added entry (the base, likely the largest reusable pool) plus as many recently-added entries as fit. Middle inherited entries are dropped with a warning.
 
-Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the signature of each volume's provenance before reading its lineage fields, using the volume's own `volume.pub`. Host and path match are **not** required on ancestor volumes (they may have been pulled from a different host), but the Ed25519 signature still anchors lineage integrity against tampering.
+Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the signature of each volume's provenance before reading its lineage fields, using the volume's own `volume.pub`. The Ed25519 signature anchors lineage integrity against tampering.
 
-**S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/manifest.toml` and `by_id/<volume-ulid>/volume.pub`. Volume names are indexed at `names/<name>` (plain text ULID), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
+**S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/manifest.toml`, `by_id/<volume-ulid>/volume.pub`, and `by_id/<volume-ulid>/volume.provenance`. Volume names are indexed at `names/<name>` (plain text ULID), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
 
 **Name resolution:** the CLI accepts human-readable names in all commands. `by_name/<name>` is a symlink → O(1) resolution via `readlink`. Names must be unique within a `data_dir` — the CLI refuses to create a volume whose name would duplicate an existing `by_name/` entry. The uniqueness constraint is local only; different hosts sharing the same S3 bucket may assign different names to the same ULID.
 
@@ -171,7 +170,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
 - `volume.pub` present in every volume — readonly volumes have only `volume.pub` (no `volume.key`); `serve-volume` verifies provenance against it on every open, writable or not
 - `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
-- `volume.provenance` present in every volume — hostname + canonical path + lineage (`parent`, `extent_index`) + Ed25519 signature over all of them; signed by the volume's private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open. Lineage is never stored outside provenance; there are no standalone `volume.parent` / `volume.extent_index` files.
+- `volume.provenance` present in every volume — signed lineage (`parent`, `extent_index`) + Ed25519 signature; signed by the volume's private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open. Uploaded to S3 so `remote pull` can rehydrate the lineage chain. Lineage is never stored outside provenance; there are no standalone `volume.parent` / `volume.extent_index` files.
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
 - `parent` field set → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`; parent is merged into both the LBA map and the extent index
 - `extent_index` field non-empty → volume lists a flat union of source snapshots; one `<source-ulid>/snapshots/<snapshot-ulid>` per entry; each source is merged into the extent index only, **never** into the LBA map (no read-path fall-through, no data leak); bounded at `MAX_EXTENT_INDEX_SOURCES` entries
