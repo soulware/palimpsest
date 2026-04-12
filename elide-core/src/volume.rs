@@ -2991,7 +2991,7 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
 /// Read the flat extent-index source list from `volume.provenance`.
 ///
 /// The `extent_index` field is a flat list of
-/// `<source-ulid>/snapshots/<snapshot-ulid>` entries, each naming a snapshot
+/// `<source-ulid>/<snapshot-ulid>` entries, each naming a snapshot
 /// whose extents populate this volume's `ExtentIndex` (for dedup and delta
 /// compression source lookups) but are **never** merged into the LBA map.
 /// The child is born with an empty LBA map; hashes from these sources are

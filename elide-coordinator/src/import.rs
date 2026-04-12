@@ -108,7 +108,7 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
 
         for entry in source_lineage.extent_index {
             let ulid_key = entry
-                .rsplit_once("/snapshots/")
+                .split_once('/')
                 .and_then(|(u, s)| {
                     Ulid::from_string(u).ok()?;
                     Ulid::from_string(s).ok()?;
@@ -131,7 +131,7 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
             ))
         })?;
         if seen_ulids.insert(source_ulid_str.to_owned()) {
-            explicit.push(format!("{source_ulid}/snapshots/{snapshot}"));
+            explicit.push(format!("{source_ulid}/{snapshot}"));
         }
     }
 

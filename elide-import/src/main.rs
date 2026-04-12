@@ -60,13 +60,12 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     save_flat: Option<PathBuf>,
 
-    /// Extent-index source entry, in the canonical
-    /// `<source-ulid>/snapshots/<snapshot-ulid>` form. Repeat for each
-    /// source. The coordinator is the normal producer of this list; it
-    /// resolves `--extents-from <name>` flags to source directories,
-    /// flattens the union, applies the eviction cap, and passes the
-    /// resolved entries here.
-    #[arg(long = "extent-source", value_name = "ULID/snapshots/ULID")]
+    /// Extent-index source entry, in the canonical `<source-ulid>/<snapshot-ulid>`
+    /// form. Repeat for each source. The coordinator is the normal producer of
+    /// this list; it resolves `--extents-from <name>` flags to source
+    /// directories, flattens the union, applies the eviction cap, and passes
+    /// the resolved entries here.
+    #[arg(long = "extent-source", value_name = "ULID/ULID")]
     extent_sources: Vec<String>,
 }
 
