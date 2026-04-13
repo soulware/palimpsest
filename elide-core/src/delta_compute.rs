@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
 
+use crate::block_reader::BlockReader;
 use crate::extentindex::{self, ExtentIndex, ExtentLocation};
 use crate::filemap::{self, Filemap};
 use crate::segment::{
@@ -453,9 +454,174 @@ fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::other(format!("lz4 decompression failed: {e}")))
 }
 
-#[derive(Default)]
-struct SegmentDeltaStats {
-    entries_converted: usize,
-    original_body_bytes: u64,
-    delta_body_bytes: u64,
+#[derive(Default, Debug)]
+pub struct SegmentDeltaStats {
+    pub entries_converted: usize,
+    pub original_body_bytes: u64,
+    pub delta_body_bytes: u64,
+}
+
+/// Rewrite one post-snapshot pending segment, converting single-block
+/// `Data` entries to thin `Delta` entries whenever the prior sealed
+/// snapshot holds a same-LBA extent that compresses well as a zstd
+/// dictionary.
+///
+/// `prior` must be a snapshot-pinned `BlockReader` opened against the
+/// latest sealed snapshot. For each single-block `Data` entry in
+/// `seg_path`, we resolve `prior.hash_for_lba(lba)` to find the
+/// candidate source hash, read the full source plaintext via
+/// `prior.read_extent_body`, and compress the child body with that
+/// source as the zstd dictionary. Conversions with `delta_len >=
+/// stored_length` are skipped; multi-block entries are left alone (a
+/// Tier 2 refinement relaxes that).
+///
+/// Returns the rewritten entries (with their fresh `stored_offset`
+/// values from the in-place rewrite), the new `body_section_start`, and
+/// a stats struct. The caller is responsible for updating the in-memory
+/// extent index — this function only touches the segment file.
+///
+/// Tmp + rename in place (same ULID), same crash-recovery story as
+/// `Volume::repack`.
+pub fn rewrite_post_snapshot_with_prior(
+    seg_path: &Path,
+    prior: &BlockReader,
+    signer: &dyn SegmentSigner,
+    vk: &VerifyingKey,
+) -> io::Result<Option<(Vec<SegmentEntry>, u64, SegmentDeltaStats)>> {
+    let (body_section_start, mut entries) = read_and_verify_segment_index(seg_path, vk)?;
+
+    // Early out: does any single-block Data entry have a same-LBA prior hash?
+    let any_candidate = entries.iter().any(|e| {
+        e.kind == EntryKind::Data && e.lba_length == 1 && prior.hash_for_lba(e.start_lba).is_some()
+    });
+    if !any_candidate {
+        return Ok(None);
+    }
+
+    // Load all Data bodies — both the ones we might convert and the
+    // ones we need to re-emit verbatim. Same pattern as
+    // `maybe_rewrite_segment`.
+    read_extent_bodies(
+        seg_path,
+        body_section_start,
+        &mut entries,
+        [EntryKind::Data],
+        &[],
+    )?;
+
+    let mut delta_body: Vec<u8> = Vec::new();
+    let mut stats = SegmentDeltaStats::default();
+    let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
+
+    for entry in entries.iter_mut() {
+        if entry.kind != EntryKind::Data || entry.lba_length != 1 {
+            continue;
+        }
+        let Some(source_hash) = prior.hash_for_lba(entry.start_lba) else {
+            continue;
+        };
+        if source_hash == entry.hash {
+            // Same content as prior snapshot — dedup handles this via
+            // hash equality; nothing to delta.
+            continue;
+        }
+        let Some(stored) = entry.data.as_deref() else {
+            continue;
+        };
+
+        // Fetch source plaintext (cached per source hash — a hot file
+        // being rewritten at multiple LBAs shares its dictionary).
+        let source_plain = match source_plain_cache.get(&source_hash) {
+            Some(v) => v,
+            None => {
+                let plain = match prior.read_extent_body(&source_hash) {
+                    Ok(p) => p,
+                    // Source body missing locally (e.g. evicted and no
+                    // fetcher configured). Skip this entry — delta is
+                    // best-effort.
+                    Err(_) => continue,
+                };
+                source_plain_cache.entry(source_hash).or_insert(plain)
+            }
+        };
+
+        let child_plain_owned: Vec<u8>;
+        let child_plain: &[u8] = if entry.compressed {
+            child_plain_owned = decompress_lz4(stored)?;
+            &child_plain_owned
+        } else {
+            stored
+        };
+
+        let delta_blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, source_plain)
+            .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
+            .compress(child_plain)
+            .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
+
+        if delta_blob.len() >= entry.stored_length as usize {
+            continue;
+        }
+
+        let delta_offset = delta_body.len() as u64;
+        let delta_length = delta_blob.len() as u32;
+        delta_body.extend_from_slice(&delta_blob);
+
+        stats.original_body_bytes += entry.stored_length as u64;
+        stats.delta_body_bytes += delta_length as u64;
+        stats.entries_converted += 1;
+
+        entry.kind = EntryKind::Delta;
+        entry.stored_offset = 0;
+        entry.stored_length = 0;
+        entry.data = None;
+        entry.compressed = false;
+        entry.delta_options.push(DeltaOption {
+            source_hash,
+            delta_offset,
+            delta_length,
+        });
+    }
+
+    if stats.entries_converted == 0 {
+        return Ok(None);
+    }
+
+    // Remaining Data entries must have their body bytes loaded so
+    // write_segment_with_delta_body can emit them. Inline entries live
+    // in the inline section and need a separate pass.
+    for entry in entries.iter() {
+        if entry.kind == EntryKind::Data && entry.data.is_none() {
+            return Err(io::Error::other(format!(
+                "post-snapshot segment {} has Data entry with no body bytes loaded",
+                seg_path.display()
+            )));
+        }
+    }
+    let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+    if has_inline {
+        let inline_bytes = read_inline_section(seg_path, &entries)?;
+        read_extent_bodies(
+            seg_path,
+            body_section_start,
+            &mut entries,
+            [EntryKind::Inline],
+            &inline_bytes,
+        )?;
+    }
+
+    let tmp_path = {
+        let mut name = seg_path
+            .file_name()
+            .ok_or_else(|| io::Error::other("segment path has no filename"))?
+            .to_owned();
+        name.push(".delta.tmp");
+        seg_path.with_file_name(name)
+    };
+    let _ = fs::remove_file(&tmp_path);
+    let new_body_section_start =
+        write_segment_with_delta_body(&tmp_path, &mut entries, &delta_body, signer)?;
+    fs::rename(&tmp_path, seg_path)?;
+    segment::fsync_dir(seg_path)?;
+
+    Ok(Some((entries, new_body_section_start, stats)))
 }

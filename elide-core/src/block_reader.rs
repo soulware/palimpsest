@@ -320,6 +320,76 @@ impl BlockReader {
         Ok(block)
     }
 
+    /// Read the full plaintext bytes of the extent with content hash `hash`.
+    ///
+    /// Returns the decompressed body of the whole extent — not a 4 KiB slice.
+    /// Fails if `hash` is not known to this reader's extent index, or if the
+    /// underlying body is evicted and no fetcher is configured.
+    ///
+    /// Delta repack uses this to obtain the dictionary source for a prior
+    /// snapshot's extent when building Tier 1 deltas.
+    pub fn read_extent_body(&self, hash: &blake3::Hash) -> io::Result<Vec<u8>> {
+        let loc = self
+            .extent_index
+            .lookup(hash)
+            .ok_or_else(|| io::Error::other(format!("extent {hash} not in index")))?
+            .clone();
+
+        if let Some(ref idata) = loc.inline_data {
+            return if loc.compressed {
+                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
+            } else {
+                Ok(idata.to_vec())
+            };
+        }
+
+        if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
+            let (index_dir, body_dir) =
+                self.find_dirs_for_segment(loc.segment_id)
+                    .unwrap_or_else(|| {
+                        (
+                            self.primary_index_dir.clone(),
+                            self.primary_cache_dir.clone(),
+                        )
+                    });
+            let present_path = body_dir.join(format!("{}.present", loc.segment_id));
+            if !segment::check_present_bit(&present_path, entry_idx)? {
+                match &self.fetcher {
+                    Some(fetcher) => fetcher.fetch_extent(
+                        loc.segment_id,
+                        &index_dir,
+                        &body_dir,
+                        &segment::ExtentFetch {
+                            body_section_start: loc.body_section_start,
+                            body_offset: loc.body_offset,
+                            body_length: loc.body_length,
+                            entry_idx,
+                        },
+                    )?,
+                    None => {
+                        return Err(io::Error::other(format!(
+                            "extent {}[{}] not cached and no fetcher configured",
+                            loc.segment_id, entry_idx
+                        )));
+                    }
+                }
+            }
+        }
+
+        let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
+        let is_body = path.extension().is_some_and(|e| e == "body");
+        let file_base = if is_body { 0 } else { loc.body_section_start };
+        let mut f = fs::File::open(path)?;
+        f.seek(SeekFrom::Start(file_base + loc.body_offset))?;
+        let mut buf = vec![0u8; loc.body_length as usize];
+        f.read_exact(&mut buf)?;
+        if loc.compressed {
+            lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
+        } else {
+            Ok(buf)
+        }
+    }
+
     fn find_dirs_for_segment(&self, segment_id: ulid::Ulid) -> Option<(PathBuf, PathBuf)> {
         let sid = segment_id.to_string();
         for dir in &self.search_dirs {

@@ -163,6 +163,23 @@ fn handle_connection(
                 let _ = writeln!(writer, "err invalid ratio: {ratio_str}");
             }
         }
+    } else if line == "delta_repack" {
+        match handle.delta_repack_post_snapshot() {
+            Ok(s) => {
+                let _ = writeln!(
+                    writer,
+                    "ok {} {} {} {} {}",
+                    s.segments_scanned,
+                    s.segments_rewritten,
+                    s.entries_converted,
+                    s.original_body_bytes,
+                    s.delta_body_bytes,
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        }
     } else if line == "snapshot" {
         match handle.snapshot() {
             Ok(ulid) => {

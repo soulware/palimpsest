@@ -31,8 +31,8 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
 use crate::volume::{
-    AncestorLayer, CompactionStats, FileCache, NoopSkipStats, Volume, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, Volume,
+    find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,9 @@ pub(crate) enum VolumeRequest {
     Repack {
         min_live_ratio: f64,
         reply: Sender<io::Result<CompactionStats>>,
+    },
+    DeltaRepackPostSnapshot {
+        reply: Sender<io::Result<DeltaRepackStats>>,
     },
     GcCheckpoint {
         reply: Sender<io::Result<(Ulid, Ulid)>>,
@@ -248,6 +251,13 @@ impl VolumeActor {
                         VolumeRequest::Repack { min_live_ratio, reply } => {
                             let result = self.volume.repack(min_live_ratio);
                             if matches!(&result, Ok(s) if s.segments_compacted > 0) {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
+                        }
+                        VolumeRequest::DeltaRepackPostSnapshot { reply } => {
+                            let result = self.volume.delta_repack_post_snapshot();
+                            if matches!(&result, Ok(s) if s.entries_converted > 0) {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
@@ -460,6 +470,19 @@ impl VolumeHandle {
                 min_live_ratio,
                 reply: reply_tx,
             })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Rewrite post-snapshot pending segments with zstd-dictionary deltas
+    /// against same-LBA extents from the latest sealed snapshot.  Blocks
+    /// until the actor replies.
+    pub fn delta_repack_post_snapshot(&self) -> io::Result<DeltaRepackStats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::DeltaRepackPostSnapshot { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
