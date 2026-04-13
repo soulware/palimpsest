@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod block_reader;
 pub mod config;
 pub mod delta_compute;
 pub mod ext4_scan;
