@@ -479,18 +479,15 @@ pub async fn apply_done_handoffs(
                 .await
                 .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
-            // Promote: IPC → volume copies gc/<new> → cache/<new>.body + .present.
+            // Promote: IPC → volume writes index/<new>.idx, copies gc/<new>
+            // to cache/<new>.body + .present, deletes stale index/<old>.idx
+            // files, and deletes the gc/<new> body (now safely in cache/).
             // If volume is down, defer: leave gc/<new> in place, retry next tick.
             let new_ulid = handoff.ulid;
             if !crate::control::promote_segment(fork_dir, new_ulid).await {
                 warn!("[gc] promote {new_ulid_str}: volume not running; will retry next tick");
                 continue;
             }
-
-            // Coordinator deletes gc/<new> after promote succeeds.
-            tokio::fs::remove_file(&gc_body)
-                .await
-                .with_context(|| format!("removing gc/{new_ulid_str}"))?;
         }
         // else: seg_promoted or tombstone/removal-only — proceed to S3 deletes.
 
@@ -513,14 +510,17 @@ pub async fn apply_done_handoffs(
             }
         }
 
-        // Rename .applied → .done.
-        let done_path = gc_dir.join(
-            handoff
-                .with_state(elide_core::gc::GcHandoffState::Done)
-                .filename(),
-        );
-        fs::rename(entry.path(), &done_path)
-            .with_context(|| format!("renaming {name} to .done"))?;
+        // Finalize: ask the volume to rename .applied → .done. Routing this
+        // through the volume actor keeps every `gc/` mutation serialised
+        // with the actor's idle-tick apply path, so we never race the actor
+        // on a filename in `gc/`. This MUST happen after the S3 deletes
+        // above — a crash between rename and S3 delete would otherwise
+        // orphan old-segment objects in S3, since the `.done` state is
+        // terminal and `apply_done_handoffs` only retries on `.applied`.
+        if !crate::control::finalize_gc_handoff(fork_dir, handoff.ulid).await {
+            warn!("[gc] finalize {new_ulid_str}: volume not running; will retry next tick");
+            continue;
+        }
 
         count += 1;
     }
@@ -1328,10 +1328,16 @@ mod tests {
                             let body = cache.join(format!("{ulid_str}.body"));
                             let present = cache.join(format!("{ulid_str}.present"));
                             elide_core::segment::promote_to_cache(&src, &body, &present).ok();
-                            if is_drain {
-                                std::fs::remove_file(&src).ok();
-                            }
+                            // Real volume deletes src after promote in both
+                            // drain and GC paths (cache holds the body now).
+                            std::fs::remove_file(&src).ok();
                         }
+                        let _ = is_drain;
+                    } else if let Some(ulid_str) = line.strip_prefix("finalize_gc_handoff ") {
+                        let ulid_str = ulid_str.to_owned();
+                        let applied = dir.join("gc").join(format!("{ulid_str}.applied"));
+                        let done = dir.join("gc").join(format!("{ulid_str}.done"));
+                        std::fs::rename(&applied, &done).ok();
                     }
                     w.write_all(b"ok\n").await.ok();
                 });
@@ -1537,6 +1543,7 @@ mod tests {
         let applied_path = gc_dir.join(format!("{new_ulid}.applied"));
         fs::write(&applied_path, &content).unwrap();
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let store = make_store();
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
@@ -1570,6 +1577,7 @@ mod tests {
         let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
@@ -1594,6 +1602,7 @@ mod tests {
         let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
@@ -1623,6 +1632,7 @@ mod tests {
         let content = format_handoff_file(HandoffLine::Remove { hash, old_ulid });
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
@@ -1667,6 +1677,7 @@ mod tests {
         ]);
         fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
@@ -1696,6 +1707,7 @@ mod tests {
             fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
         }
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
@@ -2000,6 +2012,7 @@ mod tests {
         );
         fs::write(gc_dir.join(format!("{handoff_ulid}.applied")), content).unwrap();
 
+        let _mock = spawn_mock_socket(tmp.path().to_owned()).await;
         let n = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();

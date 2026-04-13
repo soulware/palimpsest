@@ -249,6 +249,20 @@ fn handle_connection(
                 let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
             }
         }
+    } else if let Some(ulid_str) = line.strip_prefix("finalize_gc_handoff ") {
+        match ulid::Ulid::from_string(ulid_str.trim()) {
+            Ok(ulid) => match handle.finalize_gc_handoff(ulid) {
+                Ok(()) => {
+                    let _ = writeln!(writer, "ok");
+                }
+                Err(e) => {
+                    let _ = writeln!(writer, "err {e}");
+                }
+            },
+            Err(_) => {
+                let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
+            }
+        }
     } else if line == "connected" {
         let connected = nbd_connected.load(Ordering::Relaxed);
         let _ = writeln!(writer, "ok {connected}");

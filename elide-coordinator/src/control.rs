@@ -200,6 +200,32 @@ pub async fn promote_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
     }
 }
 
+/// Finalize a completed GC handoff by asking the volume to rename
+/// `gc/<ulid>.applied` → `gc/<ulid>.done`.
+///
+/// Called by `apply_done_handoffs` after the new segment has been promoted
+/// and the old S3 objects have been deleted. Routing the rename through the
+/// volume actor keeps every `gc/` mutation serialised with the idle-tick
+/// `apply_gc_handoffs` path, so there is no race between the coordinator
+/// renaming a `.applied` file and the actor trying to read it.
+///
+/// Returns `true` on success.  Returns `false` if the socket is absent or
+/// the call fails; the coordinator retries on the next tick.
+pub async fn finalize_gc_handoff(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
+    let req = format!("finalize_gc_handoff {ulid}");
+    match call(fork_dir, &req).await {
+        Some(resp) if resp.trim() == "ok" => true,
+        Some(resp) => {
+            warn!(
+                "[control] finalize_gc_handoff {ulid} for {} returned unexpected response: {resp:?}",
+                fork_dir.display()
+            );
+            false
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

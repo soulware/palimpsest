@@ -121,6 +121,10 @@ pub(crate) enum VolumeRequest {
         ulid: Ulid,
         reply: Sender<io::Result<()>>,
     },
+    FinalizeGcHandoff {
+        ulid: Ulid,
+        reply: Sender<io::Result<()>>,
+    },
     Snapshot {
         reply: Sender<io::Result<String>>,
     },
@@ -295,6 +299,9 @@ impl VolumeActor {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
+                        }
+                        VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
+                            let _ = reply.send(self.volume.finalize_gc_handoff(ulid));
                         }
                         VolumeRequest::Snapshot { reply } => {
                             let result = self.volume.snapshot().map(|u| u.to_string());
@@ -582,6 +589,24 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::Promote {
+                ulid,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Finalize a GC handoff by renaming `gc/<ulid>.applied` → `.done`
+    /// via the actor.  Routing the rename through the actor keeps every
+    /// mutation of `gc/` serialised with the idle-tick apply path, so the
+    /// coordinator never races the volume on `gc/` filenames.  Blocks until
+    /// the actor replies.
+    pub fn finalize_gc_handoff(&self, ulid: Ulid) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::FinalizeGcHandoff {
                 ulid,
                 reply: reply_tx,
             })

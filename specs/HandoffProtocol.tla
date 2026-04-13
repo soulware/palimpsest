@@ -40,14 +40,22 @@
            Skipped for removal-only and tombstone handoffs.
         b. IPC → volume: "promote <ulid>".
            Volume copies gc/<ulid> body → cache/<ulid>.body, writes all-present
-           cache/<ulid>.present, and responds ok.
-           Skipped for removal-only and tombstone handoffs.
-        c. Coordinator deletes gc/<ulid>.
+           cache/<ulid>.present, deletes gc/<ulid>, and responds ok.  The body
+           delete is inside the promote IPC (not a separate coordinator fs op)
+           so that every mutation of gc/ is serialised with the actor's idle-
+           tick apply_gc_handoffs path — the coordinator never races the
+           volume on gc/ filenames.
            Skipped for removal-only and tombstone handoffs.
 
         Step 3 Part B — Delete old S3 objects and finalise:
-        d. Deletes old S3 objects.  A 404 means already gone; treat as success.
-        e. Renames gc/<ulid>.applied → gc/<ulid>.done.
+        c. Deletes old S3 objects.  A 404 means already gone; treat as success.
+        d. IPC → volume: "finalize_gc_handoff <ulid>".
+           Volume renames gc/<ulid>.applied → gc/<ulid>.done.  Routed through
+           the actor for the same reason as the body delete above: single
+           writer on gc/.  MUST happen after (c) — a crash between the S3
+           delete and the rename would otherwise leak old-segment objects in
+           S3 forever, since `.done` is terminal and apply_done_handoffs only
+           retries on `.applied`.
 
         BUG HISTORY: an earlier implementation combined Part A and Part B into a
         single atomic cleanup that deleted old S3 objects but did NOT delete
@@ -234,10 +242,19 @@ VARIABLES
   old_idx_present, \* TRUE iff index/<old>.idx exists on disk.
                    \* Invariant: old_idx_present => old_present
                    \* (the .idx file may only exist while the S3 object exists).
-                   \* Set FALSE by VolumeFinishApply (before .applied rename).
+                   \* Set FALSE by VolumeFinishApply (before .applied rename) in the
+                   \* model.  NOTE: the implementation currently defers this delete
+                   \* to promote_segment (invoked from CoordPromote) rather than
+                   \* doing it in apply_gc_handoffs — a pre-existing divergence from
+                   \* the spec.  Invariants still hold because promote_segment runs
+                   \* before CoordApplyDone's S3 delete, so ~old_idx_present holds
+                   \* by the time the S3 object is removed in either ordering.
 
   gc_seg_present, \* TRUE iff gc/<ulid> body is present (coordinator- or volume-signed).
-                  \* Set FALSE by CoordPromote (Step 3 Part A) after promote IPC succeeds.
+                  \* Set FALSE by CoordPromote (Step 3 Part A) as a side effect of the
+                  \* promote IPC: the volume deletes gc/<ulid> inside the actor after
+                  \* copying it into cache/, so every mutation of gc/ is serialised
+                  \* with the actor's idle-tick apply_gc_handoffs path.
   gc_seg_signed,  \* TRUE iff the gc/<ulid> body has been re-signed by the volume.
                   \* FALSE until VolumeReSigns fires; stays TRUE until gc_seg_present = FALSE.
                   \* Extent index entries pointing at "gc" are only readable once this is TRUE.
@@ -347,18 +364,22 @@ CoordUploadGc ==
   /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
-  Step 3 Part A-2: Coordinator calls promote IPC; volume responds by writing
-  cache/<ulid>.body and cache/<ulid>.present; coordinator then deletes gc/<ulid>.
+  Step 3 Part A-2: Coordinator calls promote IPC; volume writes
+  cache/<ulid>.body + cache/<ulid>.present AND deletes gc/<ulid> before
+  replying ok.  Both mutations live inside the actor's promote handler so
+  the body delete is serialised with the idle-tick apply_gc_handoffs path;
+  the coordinator never touches gc/<ulid> directly.
 
   Requires vol_up: the promote IPC round-trip requires the volume to be running.
   If the volume is down, this action is blocked; the coordinator retries on the
   next GC tick once the volume is back.  gc_seg_present stays TRUE during this
   window (gc/<ulid> is not deleted until promote succeeds).
 
-  Modelled as one atomic step (promote + gc deletion): once promote returns ok,
-  the coordinator immediately deletes gc/<ulid>.  A crash before promote (while
-  vol_up = FALSE or between ticks) simply leaves the window open; gc_s3_uploaded
-  stays TRUE so CoordUploadGc does not re-run, and CoordPromote retries.
+  Modelled as one atomic step (promote + gc deletion): the implementation
+  matches this exactly — both effects are now side effects of a single IPC.
+  A crash before promote (while vol_up = FALSE or between ticks) simply
+  leaves the window open; gc_s3_uploaded stays TRUE so CoordUploadGc does
+  not re-run, and CoordPromote retries.
 
   A coordinator crash resets gc_s3_uploaded = FALSE (see CoordCrash), so on
   restart CoordUploadGc re-runs the idempotent S3 upload before CoordPromote.
@@ -373,7 +394,7 @@ CoordPromote ==
   /\ Carried # {}        \* repack handoffs only; removal-only/tombstone have no body
   /\ ~new_seg_present    \* idempotency guard
   /\ new_seg_present'    = TRUE   \* volume writes cache/<new>.body + .present
-  /\ gc_seg_present'     = FALSE  \* coordinator deletes gc/<ulid>
+  /\ gc_seg_present'     = FALSE  \* volume deletes gc/<ulid> inside the promote IPC
   /\ gc_seg_signed'      = FALSE
   /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_s3_uploaded, old_cache_present, snapshot_published, coord_up, vol_up>>
 
@@ -400,6 +421,15 @@ CoordPromote ==
   A 404 on the old S3 delete means the object is already gone (e.g. coordinator
   crashed after delete but before rename); treated as success so the step is
   idempotent.
+
+  The .applied → .done rename itself is performed by the volume, not the
+  coordinator: the coordinator issues a `finalize_gc_handoff <ulid>` IPC
+  after the S3 deletes complete, and the volume renames inside its actor
+  loop.  Routing through the actor keeps every mutation of gc/ serialised
+  with the idle-tick apply_gc_handoffs path, closing the race where the
+  coordinator's direct fs::rename could land between the actor's read_dir
+  listing of gc/ and its subsequent read_to_string of a .applied file.
+  Requires vol_up; otherwise the coordinator retries next tick.
 *)
 CoordApplyDone ==
   /\ coord_up

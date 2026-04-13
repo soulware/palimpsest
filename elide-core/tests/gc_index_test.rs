@@ -93,7 +93,7 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     }
 
     // Simulate coordinator: promote IPC → writes index/<new>.idx, cache/<new>.{body,present},
-    // deletes index/<old>.idx (by reading .applied handoff), deletes pending/<new>.
+    // deletes index/<old>.idx (by reading .applied handoff), deletes gc/<new> body.
     vol.promote_segment(produced_ulid).unwrap();
 
     // index/<new>.idx now present (written by promote_segment).
@@ -111,7 +111,12 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     }
 
     assert!(cache_dir.join(format!("{new_ulid_str}.body")).exists());
-    fs::remove_file(&gc_seg_path).unwrap();
+    // gc/<new> body is deleted by promote_segment inside the actor (it is now
+    // safely in cache/). The coordinator no longer touches gc/ directly.
+    assert!(
+        !gc_seg_path.exists(),
+        "promote_segment must delete gc/<new> body"
+    );
 
     // Evict cache/<old>.* (actor calls evict_applied_gc_cache after publish).
     vol.evict_applied_gc_cache();

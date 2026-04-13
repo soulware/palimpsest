@@ -466,13 +466,33 @@ async fn snapshot_volume(
         Err(e) => return format!("err drain: {e:#}"),
     }
 
-    // 3. Pick snap_ulid: the max ULID in index/, or a fresh ULID if empty.
+    // 3. Drain any outstanding GC handoffs so `index/` is in a stable
+    //    post-GC state before the manifest is signed. Without this, an
+    //    `.applied` handoff left over from a prior tick still references
+    //    segments that `promote_segment` is about to delete from `index/`
+    //    (and from S3 via `apply_done_handoffs`). The signed manifest
+    //    would then point at segments that vanish seconds later, and any
+    //    reader — delta_repack, fork, restart — would fail with ENOENT
+    //    on the missing `.idx` file.
+    //
+    //    Safe under the snapshot lock: the tick loop's GC path
+    //    `try_lock`s the same lock and skips the tick while we hold it,
+    //    so there is no race with a concurrent apply_done_handoffs.
+    let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
+    if let Err(e) = elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store).await {
+        return format!("err draining gc handoffs: {e:#}");
+    }
+
+    // 4. Pick snap_ulid: the max ULID in index/. Empty forks cannot be
+    //    snapshotted — the coordinator must never mint ULIDs, so there
+    //    is no valid tag for a snapshot over zero segments.
     let snap_ulid = match pick_snapshot_ulid(&fork_dir) {
-        Ok(u) => u,
+        Ok(Some(u)) => u,
+        Ok(None) => return format!("err volume '{vol_name}' has no segments to snapshot"),
         Err(e) => return format!("err picking snap_ulid: {e}"),
     };
 
-    // 4. Tell the volume to sign and write the manifest + marker.
+    // 5. Tell the volume to sign and write the manifest + marker.
     if !elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await {
         return format!("err sign_snapshot_manifest {snap_ulid} failed");
     }
@@ -535,9 +555,12 @@ async fn generate_snapshot_filemap(
     .map_err(|e| std::io::Error::other(format!("filemap join: {e}")))?
 }
 
-/// Pick a snapshot ULID: the max ULID in `fork_dir/index/`, or a fresh one
-/// if `index/` is empty.
-fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
+/// Pick a snapshot ULID as the max ULID in `fork_dir/index/`.
+///
+/// Returns `None` when `index/` is empty or missing — the coordinator must
+/// never mint ULIDs, so an empty fork has no valid snapshot tag and the
+/// caller rejects the snapshot request.
+fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
     let index_dir = fork_dir.join("index");
     let mut latest: Option<ulid::Ulid> = None;
     match std::fs::read_dir(&index_dir) {
@@ -558,11 +581,7 @@ fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    // `Ulid::new()` mints a fresh ULID — not the default (zero) Ulid that
-    // `unwrap_or_default` would produce. Both clippy lints point at the same
-    // spot, so suppress the unwrap_or_default one locally.
-    #[allow(clippy::unwrap_or_default)]
-    Ok(latest.unwrap_or_else(ulid::Ulid::new))
+    Ok(latest)
 }
 
 // ── Volume status ─────────────────────────────────────────────────────────────

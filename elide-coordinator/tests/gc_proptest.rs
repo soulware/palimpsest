@@ -245,44 +245,42 @@ proptest! {
                     // apply_done_handoffs skips the upload+promote branch.
                     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
 
-                    if let Ok(stats) = gc_stats {
-                        if stats.strategy != GcStrategy::None {
-                            // After GC, index/ should have ≤1 .idx file from
-                            // the compacted set, plus any segments that
-                            // gc_checkpoint wrote this tick (they were excluded
-                            // from compaction because their cache body is not
-                            // yet present and will be drained next tick).
-                            let idx_after: usize = fs::read_dir(&index_dir)
-                                .map(|d| d.flatten().count())
-                                .unwrap_or(0);
-                            let idx_max = 1 + checkpoint_extra;
-                            prop_assert!(
-                                idx_after <= idx_max,
-                                "after GcSweep on {} segments, {} .idx files remain \
-                                 (expected ≤{}: 1 GC output + {} checkpoint segment(s))",
-                                idx_before,
-                                idx_after,
-                                idx_max,
-                                checkpoint_extra
-                            );
-                            // cache/ .body files: same count as .idx files.
-                            let bodies_after: usize = fs::read_dir(&cache_dir)
-                                .map(|d| {
-                                    d.flatten()
-                                        .filter(|e| {
-                                            e.path()
-                                                .extension()
-                                                .is_some_and(|x| x == "body")
-                                        })
-                                        .count()
-                                })
-                                .unwrap_or(0);
-                            prop_assert!(
-                                bodies_after <= 1,
-                                "after GcSweep, {} .body files remain in cache/ (expected ≤1)",
-                                bodies_after
-                            );
-                        }
+                    if let Ok(stats) = gc_stats
+                        && stats.strategy != GcStrategy::None
+                    {
+                        // After GC, index/ should have ≤1 .idx file from
+                        // the compacted set, plus any segments that
+                        // gc_checkpoint wrote this tick (they were excluded
+                        // from compaction because their cache body is not
+                        // yet present and will be drained next tick).
+                        let idx_after: usize = fs::read_dir(&index_dir)
+                            .map(|d| d.flatten().count())
+                            .unwrap_or(0);
+                        let idx_max = 1 + checkpoint_extra;
+                        prop_assert!(
+                            idx_after <= idx_max,
+                            "after GcSweep on {} segments, {} .idx files remain \
+                             (expected ≤{}: 1 GC output + {} checkpoint segment(s))",
+                            idx_before,
+                            idx_after,
+                            idx_max,
+                            checkpoint_extra
+                        );
+                        // cache/ .body files: same count as .idx files.
+                        let bodies_after: usize = fs::read_dir(&cache_dir)
+                            .map(|d| {
+                                d.flatten()
+                                    .filter(|e| {
+                                        e.path().extension().is_some_and(|x| x == "body")
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        prop_assert!(
+                            bodies_after <= 1,
+                            "after GcSweep, {} .body files remain in cache/ (expected ≤1)",
+                            bodies_after
+                        );
                     }
                 }
                 SimOp::Restart => {

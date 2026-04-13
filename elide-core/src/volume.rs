@@ -1804,8 +1804,10 @@ impl Volume {
     /// **GC path** (`gc/<ulid>` exists): also deletes `index/<old>.idx` for each
     /// segment consumed by the GC handoff (read from `gc/<ulid>.applied`).  This
     /// happens after writing the new idx so there is never a window where no idx
-    /// covers the affected LBAs.  The coordinator deletes `gc/<ulid>` itself after
-    /// receiving `ok`.
+    /// covers the affected LBAs.  The `gc/<ulid>` body file is also deleted here
+    /// — it has already been copied into `cache/<ulid>.body`, and deleting it
+    /// inside the actor (rather than from the coordinator) keeps every mutation
+    /// of `gc/` serialised with the idle-tick `apply_gc_handoffs` path.
     ///
     /// Idempotent: if `cache/<ulid>.body` already exists the function returns
     /// `Ok(())` without re-writing.
@@ -1947,8 +1949,31 @@ impl Volume {
                     let _ = fs::remove_file(index_dir.join(format!("{old_str}.idx")));
                 }
             }
+            let _ = fs::remove_file(&src_path);
         }
         Ok(())
+    }
+
+    /// Finalize a completed GC handoff by renaming `gc/<ulid>.applied`
+    /// to `gc/<ulid>.done`.
+    ///
+    /// Called by the coordinator after the new segment has been uploaded to
+    /// S3, `promote_segment` has moved it into the local cache, and the old
+    /// segments have been deleted from S3. The `.done` rename is the last
+    /// step in the handoff lifecycle and must happen AFTER the S3 delete so
+    /// that a crash between the two cannot leak old-segment objects in S3 —
+    /// the `.applied` state keeps `apply_done_handoffs` eligible to retry the
+    /// delete, and only `.done` removes that eligibility.
+    ///
+    /// Routing through the actor (rather than letting the coordinator rename
+    /// `.applied` directly) keeps every mutation of `gc/` serialised with the
+    /// idle-tick `apply_gc_handoffs` path, so there is no race between the
+    /// coordinator renaming a file and the actor reading it.
+    pub fn finalize_gc_handoff(&mut self, ulid: Ulid) -> io::Result<()> {
+        let gc_dir = self.base_dir.join("gc");
+        let applied = gc_dir.join(format!("{ulid}.applied"));
+        let done = gc_dir.join(format!("{ulid}.done"));
+        fs::rename(&applied, &done)
     }
 
     /// Hole-punch hash-dead DATA entries in `pending/<ulid>` in place, so
