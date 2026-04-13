@@ -1012,6 +1012,19 @@ fn handle_volume_connection(
 
             NBD_CMD_DISC => {
                 println!("[reads: {}, writes: {}]", reads, writes);
+                if let Ok(s) = volume.noop_stats()
+                    && (s.skipped_writes > 0 || s.check_reads_bytes > 0)
+                {
+                    let saved_ratio = if s.check_reads_bytes > 0 {
+                        s.skipped_bytes as f64 / s.check_reads_bytes as f64
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "[noop-skip: {} writes, {} bytes saved, {} bytes read for compare, {:.2}x saved/read]",
+                        s.skipped_writes, s.skipped_bytes, s.check_reads_bytes, saved_ratio,
+                    );
+                }
                 break;
             }
 

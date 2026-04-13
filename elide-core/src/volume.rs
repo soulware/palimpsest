@@ -327,6 +327,23 @@ pub struct Volume {
     /// (WAL filename or max segment). Used for all WAL and compaction outputs
     /// to guarantee strict ordering regardless of host clock behaviour.
     mint: UlidMint,
+    /// Stats for the no-op write skip path (`try_read_local` + byte compare).
+    /// See `docs/design-noop-write-skip.md`.
+    noop_stats: NoopSkipStats,
+}
+
+/// Counters for the no-op write skip path. Reset to zero on `Volume::open`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopSkipStats {
+    /// Number of `write()` calls short-circuited because existing local
+    /// content equals the incoming data.
+    pub skipped_writes: u64,
+    /// Total bytes of incoming data the skip avoided writing to the WAL.
+    pub skipped_bytes: u64,
+    /// Total bytes read from local segments to perform the compare,
+    /// across both hits and misses. Non-zero `check_reads` with zero
+    /// `skipped` means the read was paid but did not lead to a skip.
+    pub check_reads_bytes: u64,
 }
 
 impl Volume {
@@ -488,6 +505,7 @@ impl Volume {
             verifying_key,
             fetcher: None,
             mint,
+            noop_stats: NoopSkipStats::default(),
         })
     }
 
@@ -514,6 +532,21 @@ impl Volume {
             ));
         }
         let lba_length = (data.len() / 4096) as u32;
+
+        // No-op skip: if every overlapping extent is already local, read the
+        // existing content and byte-compare. On a match, return Ok(()) without
+        // appending anything — the LBA map and segment tree already reflect
+        // the desired state. Never triggers a demand fetch (locality is
+        // checked first). See docs/design-noop-write-skip.md.
+        if let Some(existing) = self.try_read_local(lba, lba_length)? {
+            self.noop_stats.check_reads_bytes += existing.len() as u64;
+            if existing == data {
+                self.noop_stats.skipped_writes += 1;
+                self.noop_stats.skipped_bytes += data.len() as u64;
+                return Ok(());
+            }
+        }
+
         let hash = blake3::hash(data);
 
         let compressed_data = maybe_compress(data);
@@ -626,6 +659,63 @@ impl Volume {
     /// Flush buffered WAL writes and fsync to disk.
     pub fn fsync(&mut self) -> io::Result<()> {
         self.wal.fsync()
+    }
+
+    /// No-op skip counters. See `docs/design-noop-write-skip.md`.
+    pub fn noop_stats(&self) -> NoopSkipStats {
+        self.noop_stats
+    }
+
+    /// Read the current content of `[lba, lba+lba_length)` from local bodies
+    /// only — returning `Some(bytes)` if every overlapping extent resolves to
+    /// a `BodySource::Local` extent (or a `ZERO_HASH` extent), and `None`
+    /// otherwise. Never triggers a demand fetch.
+    ///
+    /// Two-pass: first a cheap locality check over `extents_in_range`, then a
+    /// reuse of the normal `read_extents` path for the actual bytes. The
+    /// caller is expected to compare against the incoming write's data; see
+    /// `Volume::write`.
+    fn try_read_local(&self, lba: u64, lba_length: u32) -> io::Result<Option<Vec<u8>>> {
+        // Pass 1: walk the range and verify every covered block resolves to
+        // a local body. Bail on any gap, remote/cached entry, or extent the
+        // index cannot resolve directly (e.g. delta-only entries).
+        let end_lba = lba + lba_length as u64;
+        let mut next_lba = lba;
+        for er in self.lbamap.extents_in_range(lba, end_lba) {
+            if er.range_start != next_lba {
+                return Ok(None); // unwritten gap at next_lba
+            }
+            if er.hash != ZERO_HASH {
+                match self.extent_index.lookup(&er.hash) {
+                    Some(loc) if matches!(loc.body_source, BodySource::Local) => {}
+                    _ => return Ok(None),
+                }
+            }
+            next_lba = er.range_end;
+        }
+        if next_lba != end_lba {
+            return Ok(None); // trailing unwritten gap
+        }
+
+        // Pass 2: reuse the normal read path. Every extent was confirmed
+        // local in pass 1, so `read_extents` will not invoke the fetcher.
+        let bytes = read_extents(
+            lba,
+            lba_length,
+            &self.lbamap,
+            &self.extent_index,
+            &self.file_cache,
+            |id, bss, idx| self.find_segment_file(id, bss, idx),
+            |id| {
+                open_delta_body_in_dirs(
+                    id,
+                    &self.base_dir,
+                    &self.ancestor_layers,
+                    self.fetcher.as_ref(),
+                )
+            },
+        )?;
+        Ok(Some(bytes))
     }
 
     /// Compact sparse segments in `pending/`.
@@ -3375,6 +3465,115 @@ mod tests {
         // Write 8 LBAs (32 KiB) as a single call.
         vol.write(10, &vec![0xabu8; 8 * 4096]).unwrap();
         assert_eq!(vol.lbamap_len(), 1);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_same_lba_same_content() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let data = vec![0x42u8; 4096];
+
+        vol.write(0, &data).unwrap();
+        let before = vol.noop_stats();
+        assert_eq!(before.skipped_writes, 0);
+        assert_eq!(before.skipped_bytes, 0);
+
+        // Same LBA, same content — should skip.
+        vol.write(0, &data).unwrap();
+        let after = vol.noop_stats();
+        assert_eq!(after.skipped_writes, 1);
+        assert_eq!(after.skipped_bytes, 4096);
+        assert_eq!(after.check_reads_bytes, 4096);
+
+        // Data still reads back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+        // LBA map still has exactly one entry.
+        assert_eq!(vol.lbamap_len(), 1);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_different_content_falls_through() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let a = vec![0x42u8; 4096];
+        let b = vec![0x99u8; 4096];
+
+        vol.write(0, &a).unwrap();
+        vol.write(0, &b).unwrap();
+        let stats = vol.noop_stats();
+        assert_eq!(stats.skipped_writes, 0);
+        // Pass-1 locality succeeded, pass-2 read happened, compare missed.
+        assert_eq!(stats.check_reads_bytes, 4096);
+        // Latest write wins.
+        assert_eq!(vol.read(0, 1).unwrap(), b);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_unwritten_range_bails_before_reading() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        // Write at LBA 0 only.
+        vol.write(0, &vec![0x42u8; 4096]).unwrap();
+        // Write to a completely unwritten range.
+        vol.write(100, &vec![0x55u8; 4096]).unwrap();
+        let stats = vol.noop_stats();
+        assert_eq!(stats.skipped_writes, 0);
+        // Pass-1 must bail on the unwritten gap without ever reading.
+        assert_eq!(stats.check_reads_bytes, 0);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_after_promotion() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let data = vec![0xaau8; 4 * 4096];
+
+        vol.write(10, &data).unwrap();
+        vol.flush_wal().unwrap(); // promote WAL → pending/
+        // Body now lives in a pending segment file (BodySource::Local).
+        vol.write(10, &data).unwrap();
+
+        let stats = vol.noop_stats();
+        assert_eq!(stats.skipped_writes, 1);
+        assert_eq!(stats.skipped_bytes, 4 * 4096);
+        assert_eq!(vol.read(10, 4).unwrap(), data);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_multi_block_same_content() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let data: Vec<u8> = (0..8 * 4096).map(|i| (i as u8).wrapping_mul(17)).collect();
+
+        vol.write(32, &data).unwrap();
+        vol.write(32, &data).unwrap();
+
+        let stats = vol.noop_stats();
+        assert_eq!(stats.skipped_writes, 1);
+        assert_eq!(stats.skipped_bytes, 8 * 4096);
+        assert_eq!(vol.read(32, 8).unwrap(), data);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_zero_extent_with_zero_data() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        // write_zeroes produces a ZERO_HASH extent with no body.
+        vol.write_zeroes(0, 2).unwrap();
+        // An incoming all-zeros write over the same range should skip:
+        // pass-1 sees ZERO_HASH (treated as local, no extent_index lookup),
+        // pass-2 read_extents returns the zero output buffer unchanged.
+        vol.write(0, &vec![0u8; 2 * 4096]).unwrap();
+
+        let stats = vol.noop_stats();
+        assert_eq!(stats.skipped_writes, 1);
+        assert_eq!(stats.skipped_bytes, 2 * 4096);
         fs::remove_dir_all(base).unwrap();
     }
 

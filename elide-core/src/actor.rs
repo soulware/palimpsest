@@ -31,7 +31,7 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
 use crate::volume::{
-    AncestorLayer, CompactionStats, FileCache, Volume, find_segment_in_dirs,
+    AncestorLayer, CompactionStats, FileCache, NoopSkipStats, Volume, find_segment_in_dirs,
     open_delta_body_in_dirs, read_extents,
 };
 
@@ -124,6 +124,9 @@ pub(crate) enum VolumeRequest {
     SignSnapshotManifest {
         snap_ulid: Ulid,
         reply: Sender<io::Result<()>>,
+    },
+    NoopStats {
+        reply: Sender<NoopSkipStats>,
     },
     Shutdown,
 }
@@ -293,6 +296,9 @@ impl VolumeActor {
                         VolumeRequest::SignSnapshotManifest { snap_ulid, reply } => {
                             let _ = reply.send(self.volume.sign_snapshot_manifest(snap_ulid));
                         }
+                        VolumeRequest::NoopStats { reply } => {
+                            let _ = reply.send(self.volume.noop_stats());
+                        }
                         VolumeRequest::Shutdown => return,
                     }
                 }
@@ -409,6 +415,18 @@ impl VolumeHandle {
     /// Trim (discard) `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
     pub fn trim(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
         self.write_zeroes(start_lba, lba_count)
+    }
+
+    /// Fetch the current no-op write skip counters from the actor.
+    /// Blocks until the actor replies. See [`NoopSkipStats`].
+    pub fn noop_stats(&self) -> io::Result<NoopSkipStats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::NoopStats { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))
     }
 
     /// Flush the WAL to a pending segment.  Blocks until the actor replies.
