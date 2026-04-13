@@ -136,6 +136,20 @@ enum SimOp {
     /// updated immediately with zeros; a subsequent Crash verifies the
     /// zero survives WAL recovery and rebuild.
     WriteZeroes { lba: u8 },
+    /// Write `[seed; 4096]` to `lba`, then immediately write the same
+    /// bytes to the same LBA again. The second write must short-circuit
+    /// via the no-op skip path (tier 1 hash compare — lbamap already
+    /// holds the hash after the first write), so `noop_stats().skipped_writes`
+    /// must strictly increase across the second call.
+    ///
+    /// Randomly interleaved with SweepPending / Repack / DrainWithRedact /
+    /// CoordGcLocal, this also covers the load-bearing case where tier 1
+    /// fires against post-transform extent state — a later SameContentWrite
+    /// on the same LBA will find lbamap still consistent after drain/GC.
+    ///
+    /// LBAs 32..40 are disjoint from Write (0..8), WriteZeroes (8..16),
+    /// PopulateFetched (16..24), WriteLarge (24..32), and ReadUnwritten (64).
+    SameContentWrite { lba: u8, seed: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -168,6 +182,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         }),
         (8u8..16).prop_map(|lba| SimOp::WriteZeroes { lba }),
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::WriteLarge { lba, seed }),
+        (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| SimOp::SameContentWrite { lba, seed }),
     ]
 }
 
@@ -542,6 +557,19 @@ proptest! {
                     let data = incompressible_block(*seed);
                     let _ = vol.write(24 + *lba as u64, &data);
                 }
+                SimOp::SameContentWrite { lba, seed } => {
+                    let data = [*seed; 4096];
+                    let actual_lba = 32 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mid = vol.noop_stats().skipped_writes;
+                    let _ = vol.write(actual_lba, &data);
+                    let after = vol.noop_stats().skipped_writes;
+                    prop_assert!(
+                        after > mid,
+                        "second same-content write at lba {actual_lba} did not skip \
+                         (skipped_writes mid={mid} after={after})"
+                    );
+                }
             }
         }
     }
@@ -684,6 +712,20 @@ proptest! {
                     block.copy_from_slice(&data);
                     oracle.insert(actual_lba, block);
                 }
+                SimOp::SameContentWrite { lba, seed } => {
+                    let data = [*seed; 4096];
+                    let actual_lba = 32 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mid = vol.noop_stats().skipped_writes;
+                    let _ = vol.write(actual_lba, &data);
+                    let after = vol.noop_stats().skipped_writes;
+                    prop_assert!(
+                        after > mid,
+                        "second same-content write at lba {actual_lba} did not skip \
+                         (skipped_writes mid={mid} after={after})"
+                    );
+                    oracle.insert(actual_lba, data);
+                }
             }
         }
     }
@@ -807,6 +849,20 @@ proptest! {
                     let mut block = [0u8; 4096];
                     block.copy_from_slice(&data);
                     oracle.insert(actual_lba, block);
+                }
+                SimOp::SameContentWrite { lba, seed } => {
+                    let data = [*seed; 4096];
+                    let actual_lba = 32 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mid = vol.noop_stats().skipped_writes;
+                    let _ = vol.write(actual_lba, &data);
+                    let after = vol.noop_stats().skipped_writes;
+                    prop_assert!(
+                        after > mid,
+                        "second same-content write at lba {actual_lba} did not skip \
+                         (skipped_writes mid={mid} after={after})"
+                    );
+                    oracle.insert(actual_lba, data);
                 }
             }
         }
