@@ -875,9 +875,9 @@ Two edge cases worth making explicit, since they test both invariants simultaneo
 
 **Delta compression** is a separate concern from dedup. See [design-delta-compression.md](design-delta-compression.md) for the full sequencing; the summary below covers the format interaction with GC, the extent index, and `lba_referenced_hashes`.
 
-**Source selection** is filemap path-matching across imported snapshots linked by `extent_index` provenance lineage (Phase 2a). For a changed file in a child import, the natural delta source is the same path in the parent import. The LBA-based PoC in `drain_pending()` is being removed as part of Phase B — filemap-based delta at upload time is the single production delta path.
+**Source selection** is filemap path-matching across imported snapshots linked by `extent_index` provenance lineage. For a changed file in a child import, the natural delta source is the same path in the parent import. Filemap-based delta, computed in-process in `elide-import` after pending segments are written but before the volume is promoted, is the single production delta path.
 
-**Proposed — thin delta entries (Phase C).** A new `EntryKind::Delta` mirrors the format-level shape of thin DedupRef: `stored_offset = 0`, `stored_length = 0`, no body bytes anywhere. The entry's content is materialised by fetching a delta blob from the segment's delta body section and decompressing it against a source extent body located via `extent_index.lookup(source_hash)`. Multiple delta options per entry act as hints; the reader picks the first whose source resolves (earliest-source preference — Phase A).
+**Thin delta entries.** `EntryKind::Delta` mirrors the format-level shape of thin DedupRef: `stored_offset = 0`, `stored_length = 0`, no body bytes anywhere. The entry's content is materialised by fetching a delta blob from the segment's delta body section and decompressing it against a source extent body located via `extent_index.lookup(source_hash)`. Multiple delta options per entry act as hints; the reader picks the first whose source resolves (earliest-source preference).
 
 - **Delta source must be a DATA entry** — never another Delta. No delta-of-delta chains.
 - **Unified across `pending/`, `cache/`, and S3**, same as DedupRef. The delta body section is preserved on disk and in S3; Delta entries contribute nothing to `body_length`.
@@ -885,14 +885,14 @@ Two edge cases worth making explicit, since they test both invariants simultaneo
 
 **Two invariants make thin Delta sound**, mirroring the DedupRef invariants:
 
-1. **Pinning invariant.** Every live Delta's source extent lives in a segment GC cannot rewrite or remove. Cross-import delta sources come from `extent_index` provenance lineage, which names only fully-snapshotted ancestors (enforced at import time by Phase 2a). Combined with the snapshot floor + first-snapshot pinning rules, the source segment is GC-stable for the lifetime of any Delta referencing it.
+1. **Pinning invariant.** Every live Delta's source extent lives in a segment GC cannot rewrite or remove. Cross-import delta sources come from `extent_index` provenance lineage, which names only fully-snapshotted ancestors (enforced at import time). Combined with the snapshot floor + first-snapshot pinning rules, the source segment is GC-stable for the lifetime of any Delta referencing it.
 2. **Canonical-presence invariant.** For every live Delta with source hash H, `extent_index.lookup(H)` returns a DATA entry. Maintained by the liveness-rule extension below.
 
 **`lba_referenced_hashes()` extension.** The set is extended to include delta source hashes for every live Delta LBA. With this folding, GC's existing rule — "keep DATA alive iff any live LBA references its hash" — automatically covers delta sources with no new code path. The rule's load-bearing property (variant (b) DedupRef correctness) is unchanged; the set simply contains more hashes per live LBA in the Delta case.
 
 **GC under Delta entries.** GC carries Delta entries through `compact_candidates_inner` unchanged, same pattern as DedupRef: a match arm that debug-asserts `stored_offset == 0, stored_length == 0`, copies the entry through to the output, and skips `fetch_live_bodies`. The delta blob stays in its source segment's delta body section across GC runs — GC does not move delta blobs between segments. Repack handoff lines are emitted only for DATA entries.
 
-Historical note: an earlier design considered delta compression as purely S3-side, with local segments carrying full extents and the coordinator computing deltas fresh at upload. Thin delta collapses this — the producer writes the delta entry thin on first promotion, so local and S3 layouts stay unified (the same "no local/S3 asymmetry" property that thin DedupRef establishes).
+Historical note: an earlier design considered delta compression as purely S3-side, with local segments carrying full extents and the coordinator computing deltas fresh at upload. Thin delta collapses this — the producer writes the delta entry thin in-process during import, so local and S3 layouts stay unified (the same "no local/S3 asymmetry" property that thin DedupRef establishes).
 
 Delta compression is compelling for point-release image updates; not worth the complexity for cross-version (major version) updates where content is genuinely different throughout.
 

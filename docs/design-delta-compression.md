@@ -1,6 +1,6 @@
 # Design: Delta compression via file-path matching
 
-Status: **Phase 1 + 2 landed; Phase 3 next.** See § Phases.
+Status: **Phases 1–3 landed; Phase 4 next.** See § Phases.
 
 Date: 2026-04-09 (updated 2026-04-13)
 
@@ -20,7 +20,7 @@ This requires:
 
 Both are produced at import time by parsing the ext4 image before writing segments.
 
-NBD live writes cannot meet these preconditions — every write lands as a fragmented 4 KiB block, and the drain-time coordinator has no LBA → path information. NBD-written volumes therefore get delta compression only via the GC repack path (Phase 7), which consults a previously generated snapshot filemap as a heuristic hint for which file used to live at a given LBA.
+NBD live writes cannot meet these preconditions — every write lands as a fragmented 4 KiB block, and the drain-time coordinator has no LBA → path information. NBD-written volumes therefore get delta compression only via the GC repack path (Phase 5), which consults a previously generated snapshot filemap as a heuristic hint for which file used to live at a given LBA.
 
 ## Filemap format
 
@@ -45,14 +45,14 @@ Keyed by path because the delta producer's workflow is path-driven: iterate the 
 
 ## File-aware import
 
-Today's import path reads the ext4 image block-by-block at 4 KiB LBA granularity, producing one SegmentEntry per block. Phase 3 rewrites this to iterate files instead of blocks:
+The import path parses the ext4 image and iterates files instead of blocks:
 
 1. Parse the ext4 superblock and inode tables, enumerate regular files
 2. For each file, collect its ext4 extent tree, read physical blocks in logical order, hash the concatenated bytes as a single extent
 3. Emit one DATA entry per contiguous LBA range (fragment) covering the file, with the fragment's own BLAKE3 as the hash
 4. Write the filemap alongside the snapshot marker
 
-The ext4 parsing infrastructure already exists in `elide-core/src/extents.rs`: superblock walkers, inode tables, extent tree traversal, `enumerate_file_hashes()`, `scan_file_extents_with_full_hash()`.
+The ext4 parsing infrastructure lives in `elide-core/src/ext4_scan.rs`: superblock walkers, inode tables, extent tree traversal, file-fragment enumeration. The filemap is written as a side effect of the import walk — there is no separate filemap generation step.
 
 **Contiguous files** (the common case for fresh `mkfs.ext4` + extract) produce exactly one DATA entry whose hash matches the filemap row. **Fragmented files** produce one DATA entry per contiguous LBA range; the segment format is unchanged. The knowledge that multiple entries belong to the same file lives only in the filemap.
 
@@ -60,11 +60,11 @@ The ext4 parsing infrastructure already exists in `elide-core/src/extents.rs`: s
 
 **Metadata and free space.** ext4 metadata (superblock, group descriptors, inode tables, directory blocks, journal) is imported block-by-block at 4 KiB granularity — small, not a dedup or delta candidate, and the read path needs it at exact LBAs. Free-space blocks (all zeros) are skipped.
 
-This is a clean break in the import output format. Existing imported volumes remain valid and readable; new imports produce the file-aware layout unconditionally.
+This was a clean break in the import output format. Previously imported volumes remain valid and readable; new imports produce the file-aware layout unconditionally.
 
 ## Thin `Delta` entry kind
 
-Naively storing the full extent body *and* the delta blob is wasteful: cold hosts pay for body bytes they would never fetch, warm hosts pay for body bytes they never need. Phase 4 introduces a new `EntryKind::Delta` mirroring thin `DedupRef` (PR #36):
+Naively storing the full extent body *and* the delta blob is wasteful: cold hosts pay for body bytes they would never fetch, warm hosts pay for body bytes they never need. `EntryKind::Delta` mirrors thin `DedupRef` (PR #36):
 
 - `stored_offset = 0, stored_length = 0` — the entry reserves no body space
 - Content is served by fetching the delta blob from the segment's delta section (or inline, via `FLAG_DELTA_INLINE`) and zstd-dict-decompressing against the source extent body, located via `extent_index.lookup(source_hash)`
@@ -88,7 +88,7 @@ Naively storing the full extent body *and* the delta blob is wasteful: cold host
 
 ## Read path
 
-`elide-fetch/src/lib.rs` currently has no delta decompression path at all — `fetch_one_extent` ignores `delta_options` entirely. Phase 4 wires this up for the first time.
+Delta decompression lives in `elide-core::volume::try_read_delta_extent` with body fetching in `elide-fetch::fetch_one_delta_body`.
 
 ### Source selection
 
@@ -140,51 +140,42 @@ No filemap. No delta. Full extents only. The read path, segment format, and GC a
 
 | # | Name | Status |
 |---|---|---|
-| 1 | Delta format + PoC drain-time producer | **done** |
+| 1 | Delta format + PoC drain-time producer | **done** (superseded) |
 | 2 | `extent_index` lineage + cross-import dedup | **done** |
-| 3 | File-aware import | **next** |
-| 4 | Thin `Delta` entry kind + delta-aware reader | after 3 |
-| 5 | Filemap delta producer at upload | after 4 |
-| 6 | Snapshot-time filemap generation | after 5 |
-| 7 | GC repack delta (heuristic LBA→path) | after 6 |
-| 8 | Content-similarity source selection | deferred |
+| 3 | File-aware import + thin Delta + filemap producer | **done** |
+| 4 | Snapshot-time filemap generation | **next** |
+| 5 | GC repack delta (heuristic LBA→path) | after 4 |
+| 6 | Content-similarity source selection | deferred |
 
-**Phase 1 — delta format + PoC.** Segment format v3 with delta table in the index, `rewrite_with_deltas()`, `compute_deltas()` with LBA-based source selection, integration into `drain_pending()`. Proof-of-concept; validated the end-to-end machinery. The savings come from later phases.
+**Phase 1 — delta format + PoC.** Segment format v3 with delta table in the index and a coordinator-side `compute_deltas()` hooked into `drain_pending()`. Proof-of-concept that validated the end-to-end machinery; removed in Phase 3. The format itself is unchanged and still in use.
 
 **Phase 2 — `extent_index` lineage.** `elide volume import --extents-from <name>` (repeatable) contributes one or more existing volumes' extents to the new volume's hash pool, carried in the signed `volume.provenance`. Blocks whose hash already exists in any source are written as `DedupRef` during the import block loop. Delivers cross-import dedup and lays the groundwork for filemap delta. Details — eviction rule, `MAX_EXTENT_INDEX_SOURCES = 32`, OCI-layer relationship — live in [architecture.md](architecture.md).
 
-**Phase 3 — file-aware import.** Parse ext4 metadata, iterate files instead of blocks (§ File-aware import). Clean break in import output format. No delta code; value is granularity (dedup becomes file-level) and making filemap hashes match segment entry hashes. Hard prerequisite for every later phase.
+**Phase 3 — file-aware import, thin Delta, and filemap producer.** Three pieces that only make sense together, landed as one unit:
 
-**Phase 4 — thin Delta entry + reader.** Two pieces that land together:
+1. **File-aware import** (§ File-aware import). `elide-core/src/import.rs` parses ext4 metadata, iterates files, and emits one DATA entry per contiguous fragment. The filemap is written as a side effect of the import walk.
+2. **Thin `EntryKind::Delta`** (§ Thin Delta entry kind). `stored_offset = 0, stored_length = 0`; GC preservation and `lba_referenced_hashes` folding mirror DedupRef; delta source must resolve to a DATA entry (no delta-of-delta). `FLAG_HAS_DELTAS` on Data entries is now format-level dead code — the table still exists but no producer sets the flag. The delta-aware reader lives in `try_read_delta_extent` (`elide-core/src/volume.rs`) and `fetch_one_delta_body` (`elide-fetch/src/lib.rs`), with `cache/<id>.delta` as the per-segment delta body file.
+3. **Filemap delta producer** (`elide-core/src/delta_compute.rs`). Runs inside `elide-import` after all pending segments are written but before `serve_promote` publishes the control socket. Loads child + source filemaps via provenance lineage, path-matches changed files, computes `zstd::compress_with_dictionary(child_bytes, source_bytes)` against locally-available source extent bodies, and rewrites pending segments so matching DATA entries become thin Delta entries. Skip heuristics: extent below a fixed threshold, `delta_length >= body_length`, or source body not locally available. Skipped extents remain as normal Data entries.
 
-1. New `EntryKind::Delta` with `stored_offset = 0, stored_length = 0` (§ Thin Delta entry kind). GC preservation and `lba_referenced_hashes` folding mirror DedupRef. No producer yet — format verified against synthetic fixtures in unit tests.
-2. First-time implementation of delta decompression in `elide-fetch` (§ Read path).
+The producer runs **in-process in `elide-import`** rather than in the coordinator upload stage: the signer stays inside the volume process, no key material crosses a boundary, and the delta work is complete before the segments are promoted to the coordinator for upload. Writable-fork drain segments bypass delta entirely — they have no filemap and no path knowledge.
 
-Lands before Phase 5 so the producer emits the final thin format directly, not an intermediate "Data + delta_options" form. `FLAG_HAS_DELTAS` on Data entries becomes format-level dead code after Phase 4: the delta options table still exists, but no producer will set the flag.
+Phase 3 also removed the Phase 1 PoC path at `elide-coordinator/src/delta.rs` and its `drain_pending()` hook. Two producers racing for the same entries with different source-selection rules was unnecessary complexity once the real path landed.
 
-**Phase 5 — filemap delta producer at upload.** The coordinator loads child + source filemaps via provenance lineage, path-matches changed files, computes `zstd::compress_with_dictionary(child_bytes, source_bytes)` against locally-available source extent bodies (read by hash from the extent index — the same path GC and materialisation already use), and emits `EntryKind::Delta` entries using the Phase 4 format. Fires only for segments produced by an **import** whose provenance lists one or more `extent_index` sources with filemaps available locally; writable-fork drain segments bypass the delta stage entirely.
-
-Skip heuristics: extent smaller than a fixed threshold (e.g. 4 KiB — overhead exceeds savings), `delta_length >= body_length` (delta made it worse), or source extent not locally available (don't fetch from S3 just to compute a delta). Skipped extents store as normal Data entries; the reader handles this transparently.
-
-This phase simultaneously **removes** the Phase 1 PoC delta path in `elide-coordinator/src/delta.rs` and its hook in `drain_pending()`. The PoC's rebuild cost per segment exceeds the marginal saving for fragmented NBD writes, and keeping two producers racing for the same entries with different source-selection rules is unnecessary complexity. The delta format machinery Phase 1 validated is unaffected and remains in use.
-
-Phase 5 is the first real producer of Delta entries; end-to-end verification runs through Phase 3's file-aware import and Phase 4's reader.
-
-**Phase 6 — snapshot-time filemap generation.** Coordinator-side background task, enqueued after the synchronous `snapshot_volume()` returns. Parses ext4 metadata from the frozen snapshot's segments through a `SnapshotBlockReader` (manifest's segment list + rebuilt LBA map + extent index) and emits `snapshots/<ulid>.filemap` using the existing hashes looked up by LBA range — no body reads, no rehashing. Strictly additive: produces a new file that consumers may use if it exists.
+**Phase 4 — snapshot-time filemap generation.** Coordinator-side background task, enqueued after the synchronous `snapshot_volume()` returns. Parses ext4 metadata from the frozen snapshot's segments through a `SnapshotBlockReader` (manifest's segment list + rebuilt LBA map + extent index) and emits `snapshots/<ulid>.filemap` using the existing hashes looked up by LBA range — no body reads, no rehashing. Strictly additive: produces a new file that consumers may use if it exists.
 
 Scope is deliberately narrow: **filemap only, no coalescing of NBD-fragmented extents into file-sized extents.** The filemap records paths and fragment layouts exactly as the existing DATA entries describe them. Non-ext4 volumes and parse failures skip cleanly. Output uses write-tmp, fsync, upload, rename — the filesystem is the queue, and restart recovery re-uploads any leftover `.tmp`.
 
-Extends filemap coverage to NBD-written volumes. Does not itself compress anything — the drain-time upload stage has no LBA → path mapping, and by the time Phase 6 runs, the segments are already sealed. Phase 7 picks up the delta opportunity.
+Extends filemap coverage to NBD-written volumes. Does not itself compress anything — the drain-time upload stage has no LBA → path mapping, and by the time Phase 4 runs, the segments are already sealed. Phase 5 picks up the delta opportunity.
 
-One small exception lands as a side-effect: after Phase 6, a new import using `--extents-from <writable-volume>` can use the writable volume's snapshot filemap as a delta source. The import walks ext4 directly (target-side knowledge), Phase 6 has already generated the source filemap (source-side knowledge), and the Phase 5 producer works unchanged. Source files appearing as a single filemap row (contiguous) participate; fragmented sources are skipped.
+One small exception lands as a side-effect: after Phase 4, a new import using `--extents-from <writable-volume>` can use the writable volume's snapshot filemap as a delta source. The import walks ext4 directly (target-side knowledge), Phase 4 has already generated the source filemap (source-side knowledge), and the Phase 3 producer works unchanged. Source files appearing as a single filemap row (contiguous) participate; fragmented sources are skipped.
 
-**Phase 7 — GC repack delta.** Extends the existing GC repack pass with a delta step, operating on **post-snapshot-floor segments** (drained since the most recent sealed snapshot, which GC already owns and rewrites in place). For each LBA in a post-floor segment, the prior snapshot's filemap (from Phase 6) is consulted as a **heuristic hint** for which file used to live at that LBA, and the prior file's extent hash is tried as a zstd dictionary against the 4 KiB target fragment.
+**Phase 5 — GC repack delta.** Extends the existing GC repack pass with a delta step, operating on **post-snapshot-floor segments** (drained since the most recent sealed snapshot, which GC already owns and rewrites in place). For each LBA in a post-floor segment, the prior snapshot's filemap (from Phase 4) is consulted as a **heuristic hint** for which file used to live at that LBA, and the prior file's extent hash is tried as a zstd dictionary against the 4 KiB target fragment.
 
 The heuristic is right for in-place file modification (the dominant case: package upgrades, config edits, log writes at fixed offsets) and silently wrong for delete-then-reallocate, metadata blocks, and fresh allocations. zstd dictionary compression is always correct regardless of dictionary — the heuristic only affects compression ratio, never reconstructed bytes. The existing `delta_length >= body_length` size check catches every miss by emitting a raw DATA entry. Correctness story: **always correct, sometimes no benefit.**
 
-No new lifecycle: post-floor segments are already GC-rewriteable, repacked outputs supersede the originals through GC's cleanup path, and the sealed snapshot providing the source filemap is read-only. Published snapshots remain immutable — Phase 7 never crosses the snapshot floor. This is the step that delivers filemap-based delta for writable volumes and closes the drain-time LBA → path knowledge gap.
+No new lifecycle: post-floor segments are already GC-rewriteable, repacked outputs supersede the originals through GC's cleanup path, and the sealed snapshot providing the source filemap is read-only. Published snapshots remain immutable — Phase 5 never crosses the snapshot floor. This is the step that delivers filemap-based delta for writable volumes and closes the drain-time LBA → path knowledge gap.
 
-**Phase 8 — content-similarity source selection.** Filesystem-agnostic delta via content fingerprinting. Marginal benefit over path matching for the primary workload; significantly more complex. Deferred.
+**Phase 6 — content-similarity source selection.** Filesystem-agnostic delta via content fingerprinting. Marginal benefit over path matching for the primary workload; significantly more complex. Deferred.
 
 ## Open questions
 
