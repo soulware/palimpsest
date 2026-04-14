@@ -2003,7 +2003,7 @@ impl Volume {
     ///
     /// Fast path: if no hash-dead DATA entries exist, the function opens
     /// nothing and returns immediately.
-    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<()> {
+    pub fn redact_segment(&mut self, ulid: Ulid) -> io::Result<()> {
         let ulid_str = ulid.to_string();
         let pending_dir = self.base_dir.join("pending");
         let seg_path = pending_dir.join(&ulid_str);
@@ -2029,6 +2029,7 @@ impl Volume {
         let mut out = fs::OpenOptions::new().write(true).open(&seg_path)?;
         let mut punched = 0usize;
         let mut punched_bytes: u64 = 0;
+        let mut punched_hashes: Vec<blake3::Hash> = Vec::new();
         for entry in &entries {
             if entry.kind != EntryKind::Data || entry.stored_length == 0 {
                 continue;
@@ -2044,9 +2045,27 @@ impl Volume {
             )?;
             punched += 1;
             punched_bytes += entry.stored_length as u64;
+            punched_hashes.push(entry.hash);
         }
         out.sync_data()?;
         drop(out);
+
+        // Invalidate extent-index entries for every hash whose body we just
+        // destroyed, but only if the index still points at this segment. A
+        // later GC/repack may have moved the canonical location elsewhere,
+        // in which case another segment holds the real body.
+        //
+        // Without this, the dedup write shortcut (`write_commit`) would see
+        // a surviving extent-index entry for the punched hash and emit a
+        // thin DedupRef whose canonical body is now zeros.
+        if !punched_hashes.is_empty() {
+            let index = Arc::make_mut(&mut self.extent_index);
+            for hash in &punched_hashes {
+                if index.lookup(hash).is_some_and(|loc| loc.segment_id == ulid) {
+                    index.remove(hash);
+                }
+            }
+        }
 
         log::info!(
             "redact {ulid_str}: punched {punched} hash-dead DATA regions ({punched_bytes} bytes)"
@@ -5195,6 +5214,54 @@ mod tests {
             body.iter().all(|&b| b == 0),
             "redact must punch body of fully-dead entry (both LBA and hash dead)"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn redact_invalidates_extent_index_for_punched_hash() {
+        // Regression: after redact punches a hash-dead DATA body, a later write
+        // whose content hashes to the same value must not use the dedup
+        // shortcut — the canonical body bytes are gone. Before the fix, the
+        // surviving extent-index entry caused `write_commit` to emit a thin
+        // DedupRef pointing at zero-punched bytes, so subsequent reads of the
+        // new LBA returned zeros.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // High-entropy payloads so they stay in the body section (no inline).
+        let payload_a: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+        let payload_b: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
+
+        // Seed LBA 28 with payload_A, flush so it lives in pending/.
+        vol.write(28, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_ulids(&base);
+        assert_eq!(ulids.len(), 1);
+        let seg_ulid = ulids[0];
+
+        // Overwrite LBA 28 with payload_B. Hash of payload_A is now LBA-dead
+        // and no other LBA references it — hash-fully-dead.
+        vol.write(28, &payload_b).unwrap();
+
+        // Drain: redact (punches payload_A body bytes in place) then promote
+        // to index/ + cache/. This mirrors the coordinator upload flow.
+        vol.redact_segment(seg_ulid).unwrap();
+        vol.promote_segment(seg_ulid).unwrap();
+
+        // A fresh write with content matching payload_A. Without the fix, the
+        // surviving extent-index entry for H_A makes `write_commit` emit a
+        // DedupRef pointing at the (now zero) location in cache/<seg>.body.
+        vol.write(100, &payload_a).unwrap();
+
+        assert_eq!(
+            vol.read(100, 2).unwrap(),
+            payload_a,
+            "new write of redacted content must read back correctly"
+        );
+        // Existing reads unaffected.
+        assert_eq!(vol.read(28, 2).unwrap(), payload_b, "LBA 28 (overwrite)");
 
         fs::remove_dir_all(base).unwrap();
     }
