@@ -65,6 +65,12 @@ enum ActorOp {
     /// Simulate a crash: shut down the actor, reopen the Volume (triggering
     /// WAL recovery), and assert all oracle LBAs are still readable.
     Crash,
+    /// Drive the three-phase alias-merge reclaim primitive through the
+    /// actor handle — exercises the ReclaimSnapshot + ReclaimCommit message
+    /// path including the pointer-identity precondition check and the
+    /// post-commit snapshot republish. After the call, every oracle LBA
+    /// must still read back its written value (reclaim preserves content).
+    Reclaim { start_lba: u8, lba_count: u8 },
 }
 
 fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
@@ -76,6 +82,8 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
         1 => Just(ActorOp::SweepPending),
         1 => Just(ActorOp::Repack),
         1 => Just(ActorOp::Crash),
+        1 => (0u8..8, 1u8..8u8)
+            .prop_map(|(start_lba, lba_count)| ActorOp::Reclaim { start_lba, lba_count }),
     ]
 }
 
@@ -203,6 +211,23 @@ proptest! {
                             actual.as_slice(),
                             expected.as_slice(),
                             "lba {} wrong after repack via actor",
+                            lba
+                        );
+                    }
+                }
+                ActorOp::Reclaim { start_lba, lba_count } => {
+                    // Drive the three-phase primitive through the actor
+                    // channel — phase 1 & 3 as channel messages, phase 2 on
+                    // the caller (this) thread reading via the snapshot.
+                    let _ = handle.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
+                    // Reclaim preserves observable content — every oracle
+                    // LBA must still read back its last-written value.
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after reclaim_alias_merge via actor",
                             lba
                         );
                     }

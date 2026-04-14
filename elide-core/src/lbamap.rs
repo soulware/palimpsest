@@ -301,6 +301,27 @@ impl LbaMap {
             .collect()
     }
 
+    /// Return all `(start_lba, lba_length, payload_block_offset)` runs
+    /// whose hash equals `target`.
+    ///
+    /// Extent reclamation uses this for two checks:
+    /// - **Containment**: every run must fall inside a given target range
+    ///   before we can safely rewrite the hash (otherwise a rewrite in
+    ///   isolation would strand out-of-range references on the bloated
+    ///   body).
+    /// - **Bloat detection**: any run with `payload_block_offset != 0`
+    ///   is evidence that a prior write split the original payload, and
+    ///   dead bytes exist inside the stored body.
+    ///
+    /// Linear scan over the full map.
+    pub fn runs_for_hash(&self, target: &blake3::Hash) -> Vec<(u64, u32, u32)> {
+        self.inner
+            .iter()
+            .filter(|(_, e)| &e.hash == target)
+            .map(|(&lba, e)| (lba, e.lba_length, e.payload_block_offset))
+            .collect()
+    }
+
     /// Return the content hash mapped to `lba`, if any entry covers it.
     ///
     /// Used by GC to check whether a dedup-ref entry is still live: the ref

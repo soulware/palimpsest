@@ -31,8 +31,9 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, Volume,
-    find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, ReclaimOutcome,
+    ReclaimPlan, ReclaimProposed, Volume, find_segment_in_dirs, open_delta_body_in_dirs,
+    read_extents,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,6 +135,23 @@ pub(crate) enum VolumeRequest {
     },
     NoopStats {
         reply: Sender<NoopSkipStats>,
+    },
+    /// Phase 1 of extent reclamation: capture an LBA map snapshot over a
+    /// target range. Returns a `ReclaimPlan` the caller carries through
+    /// the off-actor heavy work. See `docs/design-extent-reclamation.md`.
+    ReclaimSnapshot {
+        start_lba: u64,
+        lba_length: u32,
+        reply: Sender<io::Result<ReclaimPlan>>,
+    },
+    /// Phase 3 of extent reclamation: verify the plan's snapshot is still
+    /// valid and commit each proposed rewrite via internal-origin writes.
+    /// The precondition check is pointer-equality on the captured
+    /// `Arc<LbaMap>`, so a single short critical section suffices.
+    ReclaimCommit {
+        plan: ReclaimPlan,
+        proposed: Vec<ReclaimProposed>,
+        reply: Sender<io::Result<ReclaimOutcome>>,
     },
     Shutdown,
 }
@@ -315,6 +333,31 @@ impl VolumeActor {
                         }
                         VolumeRequest::NoopStats { reply } => {
                             let _ = reply.send(self.volume.noop_stats());
+                        }
+                        VolumeRequest::ReclaimSnapshot {
+                            start_lba,
+                            lba_length,
+                            reply,
+                        } => {
+                            // Phase 1 is a cheap O(log n) range query + Arc::clone.
+                            // No fallible work on the actor path.
+                            let plan = self.volume.reclaim_snapshot(start_lba, lba_length);
+                            let _ = reply.send(Ok(plan));
+                        }
+                        VolumeRequest::ReclaimCommit {
+                            plan,
+                            proposed,
+                            reply,
+                        } => {
+                            let result = self.volume.reclaim_commit(plan, proposed);
+                            // Only republish when at least one rewrite committed.
+                            // A discard or empty commit leaves the map identical
+                            // to the pre-call state, so reissuing the snapshot
+                            // would bump flush_gen for nothing.
+                            if matches!(&result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Shutdown => return,
                     }
@@ -651,6 +694,72 @@ impl VolumeHandle {
     /// Signal the actor to shut down and drain remaining requests.
     pub fn shutdown(&self) {
         let _ = self.tx.send(VolumeRequest::Shutdown);
+    }
+
+    /// Alias-merge extent reclamation over `[lba, lba + lba_length)`.
+    ///
+    /// This is the volume-side primitive that rewrites aliased runs of a
+    /// single hash inside the target range as fresh compact entries,
+    /// leaving the old bloated body orphaned for coordinator GC to
+    /// eventually drop. Preserves content boundaries — never merges
+    /// across different hashes. Safe on any volume.
+    ///
+    /// Three phases bracket the heavy work with two short actor messages:
+    /// 1. `ReclaimSnapshot` — actor thread, microseconds. Captures an
+    ///    `Arc<LbaMap>` clone + the clipped in-range entries.
+    /// 2. Phase 2 — **this thread**, millisecond-scale. Walks the plan
+    ///    off-actor, reads live bytes via `VolumeHandle::read`, hashes
+    ///    each contiguous same-hash run, emits rewrite proposals.
+    /// 3. `ReclaimCommit` — actor thread, microseconds. Pointer-equality
+    ///    precondition check; on success commits each proposal through
+    ///    `Volume::write_internal` (tier-1 noop skip active, tier-2
+    ///    bypassed). On mismatch returns a clean discard.
+    ///
+    /// Heavy work between phases never holds any lock and does not block
+    /// writes queued behind it on the actor channel. A concurrent mutation
+    /// causes a discard — not a retry here — and the caller is free to
+    /// try again later.
+    ///
+    /// See `docs/design-extent-reclamation.md`.
+    pub fn reclaim_alias_merge(&self, lba: u64, lba_length: u32) -> io::Result<ReclaimOutcome> {
+        let plan = self.reclaim_snapshot(lba, lba_length)?;
+        let proposed = plan.compute_rewrites(|start, len| self.read(start, len))?;
+        if proposed.is_empty() {
+            return Ok(ReclaimOutcome::default());
+        }
+        self.reclaim_commit(plan, proposed)
+    }
+
+    fn reclaim_snapshot(&self, lba: u64, lba_length: u32) -> io::Result<ReclaimPlan> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::ReclaimSnapshot {
+                start_lba: lba,
+                lba_length,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    fn reclaim_commit(
+        &self,
+        plan: ReclaimPlan,
+        proposed: Vec<ReclaimProposed>,
+    ) -> io::Result<ReclaimOutcome> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::ReclaimCommit {
+                plan,
+                proposed,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 }
 
