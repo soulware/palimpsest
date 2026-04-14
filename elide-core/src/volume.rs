@@ -477,6 +477,176 @@ impl ReclaimPlan {
     }
 }
 
+/// Per-hash thresholds controlling which hashes the reclamation scanner
+/// proposes as worth rewriting. All defaults are placeholders pending
+/// empirical tuning on real aged volumes — see the open questions in
+/// `docs/design-extent-reclamation.md § Measurement before mechanism`.
+#[derive(Debug, Clone, Copy)]
+pub struct ReclaimThresholds {
+    /// Minimum number of 4K blocks detectably dead inside a hash's stored
+    /// payload before the hash is a candidate. Small waste isn't worth the
+    /// rewrite cost.
+    pub min_dead_blocks: u32,
+    /// Minimum `dead / total` ratio. `payload_block_offset` aliasing
+    /// already serves reads without decompress-to-discard below this
+    /// ratio, so rewriting is pure write amplification.
+    pub min_dead_ratio: f64,
+    /// Minimum stored body size. Rewriting a tiny entry amortises badly
+    /// over the WAL-append + extent_index-update overhead.
+    pub min_stored_bytes: u64,
+}
+
+impl Default for ReclaimThresholds {
+    fn default() -> Self {
+        Self {
+            min_dead_blocks: 8,
+            min_dead_ratio: 0.3,
+            min_stored_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// A single reclamation candidate identified by the scanner. The caller
+/// passes `(start_lba, lba_length)` to
+/// [`crate::actor::VolumeHandle::reclaim_alias_merge`].
+///
+/// The range is chosen to tightly cover every LBA map run for this
+/// hash. The primitive's containment check therefore always succeeds
+/// for this hash — but the range may also sweep in other, unrelated
+/// hashes that happen to sit between this hash's runs; those are left
+/// alone by the primitive's own per-hash containment check.
+#[derive(Debug, Clone, Copy)]
+pub struct ReclaimCandidate {
+    pub start_lba: u64,
+    pub lba_length: u32,
+    /// Detectable dead block count for this hash's stored payload.
+    pub dead_blocks: u32,
+    /// Sum of live block lengths across all runs that reference this hash.
+    pub live_blocks: u32,
+    /// Stored body length in bytes (compressed if the payload was compressed).
+    pub stored_bytes: u64,
+    /// `true` if the stored payload is compressed and the dead count is
+    /// a lower bound rather than exact (we can't know trailing-dead bytes
+    /// inside a compressed payload without decompressing).
+    pub dead_count_is_lower_bound: bool,
+}
+
+/// Walk the LBA map, fold per-hash run lists, and emit reclamation
+/// candidates that clear all three thresholds in `ReclaimThresholds`.
+///
+/// The scanner is read-only and takes `&LbaMap` / `&ExtentIndex` so it
+/// can run on a [`crate::actor::VolumeHandle`] snapshot without any
+/// actor round-trip. Returned candidates are sorted by `dead_blocks`
+/// descending (the most wasteful rewrites first).
+///
+/// **Dead-block detection:** for each hash H we compute
+/// `live_blocks = sum(run.length)` and
+/// `max_payload_end = max(run.offset + run.length)` across all runs.
+/// For uncompressed payloads the exact logical length is
+/// `body_length / 4096` and `dead_blocks = logical_length - live_blocks`.
+/// For compressed payloads the exact logical length is unknown without
+/// decompressing, so we use `max_payload_end - live_blocks` — a lower
+/// bound that never produces false positives but may miss dead bytes
+/// past the last observed run. Zero-extents, hashes absent from the
+/// extent index, and delta-source hashes are skipped.
+pub fn scan_reclaim_candidates(
+    lbamap: &lbamap::LbaMap,
+    extent_index: &extentindex::ExtentIndex,
+    thresholds: ReclaimThresholds,
+) -> Vec<ReclaimCandidate> {
+    // Per-hash aggregate: (min_lba, max_lba_end, sum_live_blocks, max_offset_end)
+    #[derive(Clone, Copy)]
+    struct HashAgg {
+        min_lba: u64,
+        max_lba_end: u64,
+        live_blocks: u64,
+        max_offset_end: u64,
+    }
+
+    let mut per_hash: HashMap<blake3::Hash, HashAgg> = HashMap::new();
+    for (lba, length, hash, offset) in lbamap.iter_entries() {
+        if hash == ZERO_HASH {
+            continue;
+        }
+        let lba_end = lba + length as u64;
+        let offset_end = offset as u64 + length as u64;
+        per_hash
+            .entry(hash)
+            .and_modify(|agg| {
+                if lba < agg.min_lba {
+                    agg.min_lba = lba;
+                }
+                if lba_end > agg.max_lba_end {
+                    agg.max_lba_end = lba_end;
+                }
+                agg.live_blocks += length as u64;
+                if offset_end > agg.max_offset_end {
+                    agg.max_offset_end = offset_end;
+                }
+            })
+            .or_insert(HashAgg {
+                min_lba: lba,
+                max_lba_end: lba_end,
+                live_blocks: length as u64,
+                max_offset_end: offset_end,
+            });
+    }
+
+    let mut candidates = Vec::new();
+    for (hash, agg) in &per_hash {
+        let Some(loc) = extent_index.lookup(hash) else {
+            continue;
+        };
+        // Inline entries are small by construction and do not benefit
+        // from compaction — their bytes already live in the .idx, not
+        // the body section.
+        if loc.inline_data.is_some() {
+            continue;
+        }
+
+        // Determine the payload's logical block count. For uncompressed
+        // payloads it's exact; for compressed we use the highest observed
+        // payload offset as a lower bound.
+        let (logical_blocks, is_lower_bound) = if loc.compressed {
+            (agg.max_offset_end, true)
+        } else {
+            (loc.body_length as u64 / 4096, false)
+        };
+        if logical_blocks < agg.live_blocks {
+            // Can happen for compressed payloads when max_offset_end
+            // underestimates — treat as "no detectable bloat".
+            continue;
+        }
+        let dead_blocks = logical_blocks - agg.live_blocks;
+        if dead_blocks < u64::from(thresholds.min_dead_blocks) {
+            continue;
+        }
+        if (loc.body_length as u64) < thresholds.min_stored_bytes {
+            continue;
+        }
+        let dead_ratio = dead_blocks as f64 / logical_blocks as f64;
+        if dead_ratio < thresholds.min_dead_ratio {
+            continue;
+        }
+        let lba_length = agg.max_lba_end - agg.min_lba;
+        if lba_length > u32::MAX as u64 {
+            // Pathological: wouldn't fit in a single reclaim call. Skip.
+            continue;
+        }
+        candidates.push(ReclaimCandidate {
+            start_lba: agg.min_lba,
+            lba_length: lba_length as u32,
+            dead_blocks: dead_blocks.min(u32::MAX as u64) as u32,
+            live_blocks: agg.live_blocks.min(u32::MAX as u64) as u32,
+            stored_bytes: loc.body_length as u64,
+            dead_count_is_lower_bound: is_lower_bound,
+        });
+    }
+
+    candidates.sort_unstable_by(|a, b| b.dead_blocks.cmp(&a.dead_blocks));
+    candidates
+}
+
 /// Counters for the no-op write skip path. Reset to zero on `Volume::open`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopSkipStats {
@@ -4276,6 +4446,182 @@ mod tests {
             .compute_rewrites(|lba, len| vol.read(lba, len))
             .unwrap();
         assert!(proposed.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ---------- reclaim candidate scanner ----------
+
+    fn scanner_thresholds_permissive() -> crate::volume::ReclaimThresholds {
+        // Loose thresholds so tests can use small payloads while still
+        // exercising the scanner's detection logic.
+        crate::volume::ReclaimThresholds {
+            min_dead_blocks: 1,
+            min_dead_ratio: 0.0,
+            min_stored_bytes: 0,
+        }
+    }
+
+    /// A clean volume with a single compact write produces no candidates.
+    #[test]
+    fn scan_reclaim_candidates_no_bloat() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(100, &reclaim_payload(0x11, 8)).unwrap();
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            candidates.is_empty(),
+            "fresh compact entry should not be a candidate, got {candidates:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Write an 8-block entry, overwrite the middle 2 blocks with a
+    /// 2-block entry. The original's payload now has dead bytes (blocks
+    /// 3..4 are LBA-overwritten). The scanner should flag exactly one
+    /// candidate covering the full extent of the original hash's
+    /// surviving runs.
+    #[test]
+    fn scan_reclaim_candidates_flags_split_entry() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Big incompressible 8-block write so payload lives in the body.
+        vol.write(200, &reclaim_payload(0x22, 8)).unwrap();
+        // Overwrite the middle 2 blocks with unrelated content.
+        let hole: Vec<u8> = (0..2).flat_map(|_| [0x77u8; 4096]).collect();
+        vol.write(203, &hole).unwrap();
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one candidate for the bloated hash, got {candidates:?}"
+        );
+        let c = candidates[0];
+        // Tight LBA bound: the hash's first live run starts at 200, its
+        // last live run ends at 208.
+        assert_eq!(c.start_lba, 200);
+        assert_eq!(c.lba_length, 8);
+        // Live: 3 prefix + 3 tail = 6. Dead: 2 (the hole in the middle).
+        assert_eq!(c.live_blocks, 6);
+        assert_eq!(c.dead_blocks, 2);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Thresholds are respected: bumping `min_dead_blocks` above the
+    /// actual dead count drops the candidate.
+    #[test]
+    fn scan_reclaim_candidates_respects_min_dead_blocks() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(300, &reclaim_payload(0x33, 8)).unwrap();
+        vol.write(303, &[0x99u8; 4096]).unwrap(); // 1 block hole
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+
+        // With min_dead_blocks=1 the 1-block hole qualifies.
+        let loose = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            crate::volume::ReclaimThresholds {
+                min_dead_blocks: 1,
+                min_dead_ratio: 0.0,
+                min_stored_bytes: 0,
+            },
+        );
+        assert_eq!(loose.len(), 1);
+
+        // With min_dead_blocks=2 it does not.
+        let strict = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            crate::volume::ReclaimThresholds {
+                min_dead_blocks: 2,
+                min_dead_ratio: 0.0,
+                min_stored_bytes: 0,
+            },
+        );
+        assert!(strict.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Candidates produced by the scanner must always be valid inputs
+    /// to `reclaim_alias_merge` — round-trip through the primitive
+    /// rewrites the hash and a rescan produces no further candidates
+    /// for it.
+    #[test]
+    fn scan_reclaim_candidates_round_trip_through_primitive() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(400, &reclaim_payload(0x44, 8)).unwrap();
+        vol.write(404, &[0x11u8; 4096]).unwrap();
+
+        // Oracle: bytes at [400, 408) after the second write.
+        let expected = {
+            let mut buf = vec![0u8; 8 * 4096];
+            let orig = reclaim_payload(0x44, 8);
+            buf[..4 * 4096].copy_from_slice(&orig[..4 * 4096]);
+            buf[4 * 4096..5 * 4096].fill(0x11);
+            buf[5 * 4096..].copy_from_slice(&orig[5 * 4096..]);
+            buf
+        };
+        assert_eq!(vol.read(400, 8).unwrap(), expected);
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert_eq!(candidates.len(), 1);
+        let c = candidates[0];
+
+        // Drop the snapshot clones before mutating Volume state, so
+        // Arc::make_mut in the primitive doesn't reallocate.
+        drop(lbamap);
+        drop(extent_index);
+
+        let plan = vol.reclaim_snapshot(c.start_lba, c.lba_length);
+        let proposed = plan
+            .compute_rewrites(|lba, len| vol.read(lba, len))
+            .unwrap();
+        assert!(!proposed.is_empty());
+        let outcome = vol.reclaim_commit(plan, proposed).unwrap();
+        assert!(!outcome.discarded);
+        assert!(outcome.runs_rewritten > 0);
+
+        // Content preserved.
+        assert_eq!(vol.read(400, 8).unwrap(), expected);
+
+        // Rescan: the old hash is gone from the LBA map, the new
+        // compact ones have no bloat — zero candidates.
+        let (lbamap2, extent_index2) = vol.snapshot_maps();
+        let candidates2 = crate::volume::scan_reclaim_candidates(
+            &lbamap2,
+            &extent_index2,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            candidates2.is_empty(),
+            "rescan after reclaim should find nothing, got {candidates2:?}"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }

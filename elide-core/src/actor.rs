@@ -31,9 +31,9 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, ReclaimOutcome,
-    ReclaimPlan, ReclaimProposed, Volume, find_segment_in_dirs, open_delta_body_in_dirs,
-    read_extents,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, ReclaimCandidate,
+    ReclaimOutcome, ReclaimPlan, ReclaimProposed, ReclaimThresholds, Volume, find_segment_in_dirs,
+    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -694,6 +694,20 @@ impl VolumeHandle {
     /// Signal the actor to shut down and drain remaining requests.
     pub fn shutdown(&self) {
         let _ = self.tx.send(VolumeRequest::Shutdown);
+    }
+
+    /// Scan the current LBA map + extent index for hashes worth rewriting.
+    ///
+    /// Read-only. Runs entirely against the current `ReadSnapshot` with
+    /// no actor round-trip and no file I/O. Returned candidates are
+    /// sorted by dead-block count descending — feed them to
+    /// [`VolumeHandle::reclaim_alias_merge`] in order for
+    /// "most-wasteful-first" reclamation.
+    ///
+    /// See [`scan_reclaim_candidates`] for the detection logic.
+    pub fn reclaim_candidates(&self, thresholds: ReclaimThresholds) -> Vec<ReclaimCandidate> {
+        let snap = self.snapshot.load();
+        scan_reclaim_candidates(&snap.lbamap, &snap.extent_index, thresholds)
     }
 
     /// Alias-merge extent reclamation over `[lba, lba + lba_length)`.

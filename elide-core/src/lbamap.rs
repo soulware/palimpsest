@@ -290,6 +290,16 @@ impl LbaMap {
         self.delta_source_hashes.insert(source_hash);
     }
 
+    /// Iterate every entry in the map as
+    /// `(start_lba, lba_length, hash, payload_block_offset)`, sorted by
+    /// `start_lba`. Used by the extent-reclamation candidate scanner to
+    /// fold LBA map state into per-hash run lists in a single O(n) pass.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u64, u32, blake3::Hash, u32)> + '_ {
+        self.inner
+            .iter()
+            .map(|(&lba, e)| (lba, e.lba_length, e.hash, e.payload_block_offset))
+    }
+
     /// Return all (start_lba, lba_length) ranges whose hash equals `target`.
     ///
     /// Used for diagnostics only (linear scan).
