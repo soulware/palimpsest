@@ -174,6 +174,34 @@ impl ExtentIndex {
         }
     }
 
+    /// Compare-and-replace: overwrite the entry for `hash` only if the current
+    /// location matches `(expected_segment_id, expected_body_offset)`. Returns
+    /// `true` if the replacement happened, `false` if the precondition failed
+    /// (entry missing, or superseded by a concurrent writer / GC handoff).
+    ///
+    /// Used by the WAL promote apply phase to avoid clobbering an entry that
+    /// a later writer has already pointed at its own segment. The precondition
+    /// token is the `(wal_ulid, wal_offset)` snapshot taken before the promote
+    /// started, so any mutation after the snapshot causes the CAS to fail.
+    pub fn replace_if_matches(
+        &mut self,
+        hash: blake3::Hash,
+        expected_segment_id: Ulid,
+        expected_body_offset: u64,
+        new_location: ExtentLocation,
+    ) -> bool {
+        match self.inner.get(&hash) {
+            Some(loc)
+                if loc.segment_id == expected_segment_id
+                    && loc.body_offset == expected_body_offset =>
+            {
+                self.inner.insert(hash, new_location);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Look up the segment location for `hash`.
     pub fn lookup(&self, hash: &blake3::Hash) -> Option<&ExtentLocation> {
         self.inner.get(hash)
@@ -592,6 +620,159 @@ mod tests {
         assert_eq!(loc.body_offset, 1024);
         assert_eq!(loc.body_length, 4096);
         assert!(!loc.compressed);
+    }
+
+    #[test]
+    fn replace_if_matches_rewrites_on_exact_token() {
+        // Classic use: the WAL promote apply phase snapshots (wal_ulid,
+        // wal_offset) before the segment is written, then conditionally
+        // rewrites the extent index to segment-relative coordinates. If
+        // nothing superseded the entry, the CAS succeeds.
+        let mut index = ExtentIndex::new();
+        let hash = h(1);
+        let wal_ulid = Ulid::from_string("01JQTEST000000000000000100").unwrap();
+        let wal_offset = 4096u64;
+        index.insert(
+            hash,
+            ExtentLocation {
+                segment_id: wal_ulid,
+                body_offset: wal_offset,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+
+        let seg_ulid = Ulid::from_string("01JQTEST000000000000000200").unwrap();
+        let replaced = index.replace_if_matches(
+            hash,
+            wal_ulid,
+            wal_offset,
+            ExtentLocation {
+                segment_id: seg_ulid,
+                body_offset: 200,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 512,
+                inline_data: None,
+            },
+        );
+        assert!(replaced);
+        let loc = index.lookup(&hash).unwrap();
+        assert_eq!(loc.segment_id, seg_ulid);
+        assert_eq!(loc.body_offset, 200);
+        assert_eq!(loc.body_section_start, 512);
+    }
+
+    #[test]
+    fn replace_if_matches_leaves_superseded_entry_alone() {
+        // The hash was written to the WAL, then a later writer (or a GC
+        // handoff) pointed the extent index at a different segment before
+        // the flusher completed. The apply phase must not clobber that.
+        let mut index = ExtentIndex::new();
+        let hash = h(2);
+        let wal_ulid = Ulid::from_string("01JQTEST000000000000000100").unwrap();
+        let wal_offset = 4096u64;
+
+        // Superseding entry already in place.
+        let superseder = Ulid::from_string("01JQTEST000000000000000300").unwrap();
+        index.insert(
+            hash,
+            ExtentLocation {
+                segment_id: superseder,
+                body_offset: 9999,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 64,
+                inline_data: None,
+            },
+        );
+
+        let seg_ulid = Ulid::from_string("01JQTEST000000000000000200").unwrap();
+        let replaced = index.replace_if_matches(
+            hash,
+            wal_ulid,
+            wal_offset,
+            ExtentLocation {
+                segment_id: seg_ulid,
+                body_offset: 200,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 512,
+                inline_data: None,
+            },
+        );
+        assert!(!replaced);
+        let loc = index.lookup(&hash).unwrap();
+        assert_eq!(loc.segment_id, superseder);
+        assert_eq!(loc.body_offset, 9999);
+    }
+
+    #[test]
+    fn replace_if_matches_rejects_offset_mismatch() {
+        // Same ULID but a different body_offset — e.g. the entry was
+        // reinserted by a later code path at a different position in the
+        // same segment. CAS must fail.
+        let mut index = ExtentIndex::new();
+        let hash = h(3);
+        let wal_ulid = Ulid::from_string("01JQTEST000000000000000100").unwrap();
+        index.insert(
+            hash,
+            ExtentLocation {
+                segment_id: wal_ulid,
+                body_offset: 8192,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+
+        let replaced = index.replace_if_matches(
+            hash,
+            wal_ulid,
+            4096,
+            ExtentLocation {
+                segment_id: wal_ulid,
+                body_offset: 0,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 64,
+                inline_data: None,
+            },
+        );
+        assert!(!replaced);
+        assert_eq!(index.lookup(&hash).unwrap().body_offset, 8192);
+    }
+
+    #[test]
+    fn replace_if_matches_rejects_missing_entry() {
+        let mut index = ExtentIndex::new();
+        let hash = h(4);
+        let wal_ulid = Ulid::from_string("01JQTEST000000000000000100").unwrap();
+        let replaced = index.replace_if_matches(
+            hash,
+            wal_ulid,
+            0,
+            ExtentLocation {
+                segment_id: wal_ulid,
+                body_offset: 0,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+        assert!(!replaced);
+        assert!(index.lookup(&hash).is_none());
     }
 
     #[test]

@@ -2398,6 +2398,29 @@ impl Volume {
         }
         self.has_new_segments = true;
         self.last_segment_ulid = Some(segment_ulid);
+        // Snapshot the WAL-relative body offsets for every Data/Inline entry
+        // before `segment::promote` rewrites `stored_offset` to segment-relative.
+        // These become the CAS precondition tokens in the apply loop below: we
+        // only rewrite an extent index entry if it still points at
+        // (wal_ulid, original_wal_offset). Any later writer or GC handoff that
+        // has already superseded the entry leaves the CAS failing and its
+        // placement intact.
+        //
+        // Today the promote runs on the actor thread, so no concurrent writer
+        // can interpose between snapshot and apply — the CAS always succeeds.
+        // The machinery is wired in now so the upcoming off-actor apply phase
+        // inherits the correct precondition check.
+        let old_wal_ulid = self.wal_ulid;
+        let pre_promote_offsets: Vec<Option<u64>> = self
+            .pending_entries
+            .iter()
+            .map(|e| match e.kind {
+                EntryKind::Data | EntryKind::Inline => {
+                    self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
+                }
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
+            })
+            .collect();
         let body_section_start = segment::promote(
             &self.wal_path,
             segment_ulid,
@@ -2410,18 +2433,32 @@ impl Volume {
         // Thin DedupRef entries have no body in this segment — the extent
         // index already points to the canonical segment. Zero extents are
         // not indexed.
-        for entry in &self.pending_entries {
+        for (entry, old_wal_offset) in self
+            .pending_entries
+            .iter()
+            .zip(pre_promote_offsets.iter().copied())
+        {
             match entry.kind {
                 EntryKind::Data | EntryKind::Inline => {}
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
             }
+            let Some(old_wal_offset) = old_wal_offset else {
+                // No prior extent index entry for this hash. write_commit
+                // always inserts a Data/Inline hash before pushing the
+                // SegmentEntry, so this is only possible if something
+                // removed the entry out-of-band between the write and the
+                // flush — treat it like a failed CAS and leave it alone.
+                continue;
+            };
             let idata = if entry.kind == EntryKind::Inline {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
             };
-            Arc::make_mut(&mut self.extent_index).insert(
+            Arc::make_mut(&mut self.extent_index).replace_if_matches(
                 entry.hash,
+                old_wal_ulid,
+                old_wal_offset,
                 extentindex::ExtentLocation {
                     segment_id: segment_ulid,
                     body_offset: entry.stored_offset,

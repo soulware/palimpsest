@@ -1191,7 +1191,14 @@ pub fn read_extent_bodies(
 
 // --- promotion ---
 
-/// Promote a WAL to a committed local segment.
+/// Write a pending segment from the accumulated WAL entries and durably
+/// commit it at `pending/<ulid>`.
+///
+/// This is the "heavy middle" of a WAL promote — write `.tmp`, rename to the
+/// final name, fsync the directory — with no WAL-file delete. The caller is
+/// responsible for deleting the WAL (or, once the promote is offloaded, for
+/// deferring the delete until after the apply phase has published the new
+/// snapshot).
 ///
 /// `entries` must be the DATA and REF records accumulated during the write
 /// session. On return, each entry's `stored_offset` is set to its
@@ -1200,14 +1207,14 @@ pub fn read_extent_bodies(
 /// After returning, the caller must:
 /// 1. Update the extent index for each DATA entry: the absolute file offset is
 ///    `body_section_start + entry.stored_offset` (body entries) or the inline
-///    section (inline entries, not yet implemented).
-/// 2. Open a fresh WAL.
+///    section.
+/// 2. Delete the original WAL file (or defer to the apply phase).
+/// 3. Open a fresh WAL.
 ///
 /// Returns `body_section_start` so the caller can compute absolute offsets.
-pub fn promote(
-    wal_path: &Path,
-    ulid: ulid::Ulid,
+pub fn write_and_commit(
     pending_dir: &Path,
+    ulid: ulid::Ulid,
     entries: &mut [SegmentEntry],
     signer: &dyn SegmentSigner,
 ) -> io::Result<u64> {
@@ -1219,12 +1226,29 @@ pub fn promote(
 
     // Atomic rename — COMMIT POINT.
     fs::rename(&tmp_path, &final_path)?;
-    // Fsync the directory so the rename is durable before we delete the WAL.
+    // Fsync the directory so the rename is durable before the caller acts
+    // on the committed segment.
     fsync_dir(&final_path)?;
 
+    Ok(body_section_start)
+}
+
+/// Promote a WAL to a committed local segment and delete the WAL file.
+///
+/// Thin wrapper around [`write_and_commit`]: commits the segment, then
+/// deletes the WAL atomically with respect to the rest of the promote.
+/// Callers that need to defer the WAL delete until after the apply phase
+/// (e.g. the off-actor flusher path) should call `write_and_commit` directly.
+pub fn promote(
+    wal_path: &Path,
+    ulid: ulid::Ulid,
+    pending_dir: &Path,
+    entries: &mut [SegmentEntry],
+    signer: &dyn SegmentSigner,
+) -> io::Result<u64> {
+    let body_section_start = write_and_commit(pending_dir, ulid, entries, signer)?;
     // WAL is now redundant; segment is the sole copy.
     fs::remove_file(wal_path)?;
-
     Ok(body_section_start)
 }
 
