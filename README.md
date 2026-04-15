@@ -23,5 +23,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/design-delta-compression.md](docs/design-delta-compression.md) | Design: delta compression via file-path matching, file-aware import, snapshot filemaps |
 | [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes — architecture, sequencing, open work |
 | [docs/design-oci-export.md](docs/design-oci-export.md) | Exploration: squashed OCI export, dual publish via referrers, elide-snapshotter for containerd |
+| [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |
+| [docs/promote-offload-plan.md](docs/promote-offload-plan.md) | Plan: offload WAL promotion onto a dedicated flusher thread (first step of actor-offload-plan) |
 
 Start with [docs/overview.md](docs/overview.md).
