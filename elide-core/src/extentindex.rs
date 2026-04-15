@@ -280,7 +280,8 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         // Include GC handoff bodies in .applied state (volume-signed, in gc/
         // awaiting coordinator upload to S3).
-        paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
+        let bare_gc_paths = segment::collect_gc_applied_segment_files(fork_dir)?;
+        paths.extend(bare_gc_paths.iter().cloned());
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {
@@ -292,8 +293,33 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             });
         }
 
+        // Each bare GC body declares the input segments it superseded via the
+        // segment header's `inputs` field. Their `index/<input>.idx` files are
+        // stale: any entry the bare body deliberately omitted (a Removed entry)
+        // would be re-introduced into the rebuilt extent index by
+        // insert_if_absent, leaving a dangling reference once the coordinator
+        // finishes apply_done_handoffs and deletes the input segments.
+        // Skip those .idx files entirely. Found by HandoffProtocol.tla.
+        let mut consumed_inputs: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
+        for bare_path in &bare_gc_paths {
+            if let Ok((_, _, inputs)) = segment::read_segment_index(bare_path) {
+                for input in inputs {
+                    consumed_inputs.insert(input);
+                }
+            }
+        }
+
         let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
         cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+        cache_paths.retain(|p| {
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                return true;
+            };
+            match Ulid::from_string(stem) {
+                Ok(ulid) => !consumed_inputs.contains(&ulid),
+                Err(_) => true,
+            }
+        });
         if let Some(cutoff) = branch_ulid {
             cache_paths.retain(|p| {
                 p.file_stem()

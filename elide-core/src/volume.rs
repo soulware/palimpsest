@@ -7659,6 +7659,163 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// Build a `.staged` GC output that compacts two input segments. Carries
+    /// only the entries from `seg_b_ulid` (the live ones); entries from
+    /// `seg_a_ulid` are intentionally omitted, so they become "removed"
+    /// hashes from the apply path's perspective. Inputs list = [a, b] sorted.
+    ///
+    /// Used by the regression test below to set up a handoff with both
+    /// Carried and Removed entries so we can crash-and-restart between
+    /// `VolumeFinishApply` and `CoordPromote`.
+    fn simulate_coord_gc_staged_two_inputs(
+        vol: &mut Volume,
+        fork_dir: &Path,
+        seg_a_ulid: &str,
+        seg_b_ulid: &str,
+    ) -> String {
+        use crate::{segment, signing};
+
+        // Read entries from seg_b only — these become Carried.
+        let idx_b = fork_dir.join("index").join(format!("{seg_b_ulid}.idx"));
+        let body_b = fork_dir.join("cache").join(format!("{seg_b_ulid}.body"));
+        let (_old_bss, mut entries, _) =
+            segment::read_and_verify_segment_index(&idx_b, &vol.verifying_key).unwrap();
+        let inline_bytes = segment::read_inline_section(&idx_b).unwrap();
+        segment::read_extent_bodies(
+            &body_b,
+            0,
+            &mut entries,
+            [segment::EntryKind::Data, segment::EntryKind::Inline],
+            &inline_bytes,
+        )
+        .unwrap();
+
+        let (new_ulid, _) = vol.gc_checkpoint().unwrap();
+        let new_ulid_str = new_ulid.to_string();
+
+        let gc_dir = fork_dir.join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+
+        let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
+        let mut inputs = vec![
+            Ulid::from_string(seg_a_ulid).unwrap(),
+            Ulid::from_string(seg_b_ulid).unwrap(),
+        ];
+        inputs.sort();
+        let tmp_path = gc_dir.join(format!("{new_ulid_str}.staged.tmp"));
+        segment::write_gc_segment(&tmp_path, &mut entries, &inputs, ephemeral_signer.as_ref())
+            .unwrap();
+        fs::rename(&tmp_path, gc_dir.join(format!("{new_ulid_str}.staged"))).unwrap();
+
+        new_ulid_str
+    }
+
+    #[test]
+    fn gc_staged_crash_in_bare_phase_drops_removed_extents() {
+        // Regression for a bug found by the TLA+ model (HandoffProtocol.tla):
+        //
+        // Sequence:
+        //   1. Write D0 to lba 0, drain → seg_a with hash h0.
+        //   2. Overwrite lba 0 with D1, drain → seg_b with hash h1.
+        //      h0 is now LBA-dead; extent_index still has h0 → seg_a.
+        //   3. Stage a GC output that carries h1 only. h0 is "removed".
+        //   4. apply_gc_handoffs commits bare gc/<new>; in-memory
+        //      extent_index now has h1 → new_ulid and h0 removed entirely.
+        //   5. Crash + reopen. Rebuild reconstructs the extent_index from
+        //      on-disk state — bare gc/<new> + index/<seg_a>.idx + index/<seg_b>.idx.
+        //
+        // Bug: rebuild uses insert_if_absent in pass order [bare, idx]. The
+        // bare body inserts h1 → new_ulid (winning the later seg_b.idx).
+        // But h0 is NOT in the bare body, so when the rebuild processes
+        // index/<seg_a>.idx, it inserts h0 → seg_a — re-introducing the
+        // entry the apply path explicitly removed.
+        //
+        // Fix: extentindex::rebuild reads the inputs field of every bare
+        // gc/<ulid> file and skips the .idx files for those input segments.
+        //
+        // This test asserts the fixed behaviour: after restart, the
+        // in-memory extent_index has no entry for h0.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let d0: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+        let h0 = blake3::hash(&d0);
+        vol.write(0, &d0).unwrap();
+        vol.promote_for_test().unwrap();
+        let pending_dir = base.join("pending");
+        let seg_a_ulid = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        simulate_upload(&mut vol);
+
+        let d1: Vec<u8> = (0..8192).map(|i| (i * 11 + 17) as u8).collect();
+        let h1 = blake3::hash(&d1);
+        vol.write(0, &d1).unwrap();
+        vol.promote_for_test().unwrap();
+        let seg_b_ulid = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        simulate_upload(&mut vol);
+
+        // Sanity: both hashes are in the extent_index, h0 → seg_a, h1 → seg_b.
+        assert!(
+            vol.extent_index.lookup(&h0).is_some(),
+            "h0 should be in extent_index pre-GC"
+        );
+        assert!(
+            vol.extent_index.lookup(&h1).is_some(),
+            "h1 should be in extent_index pre-GC"
+        );
+
+        // Stage a GC output that carries h1 and "removes" h0 (by omitting it).
+        let _new_ulid =
+            simulate_coord_gc_staged_two_inputs(&mut vol, &base, &seg_a_ulid, &seg_b_ulid);
+
+        // Apply: the in-memory extent_index now has h1 → new and h0 removed.
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            vol.extent_index.lookup(&h0).is_none(),
+            "h0 should be removed from extent_index after apply"
+        );
+        assert!(
+            vol.extent_index.lookup(&h1).is_some(),
+            "h1 should still be in extent_index after apply"
+        );
+
+        // Crash + reopen. Rebuild from disk.
+        drop(vol);
+        let vol = Volume::open(&base, &base).unwrap();
+
+        // h1 must still be in the extent_index (carried by the bare GC body).
+        assert!(
+            vol.extent_index.lookup(&h1).is_some(),
+            "h1 should be in extent_index after restart"
+        );
+
+        // h0 must NOT be in the extent_index. Before the fix, the rebuild
+        // would re-introduce it via index/<seg_a>.idx because insert_if_absent
+        // doesn't know that seg_a was consumed by the bare GC body.
+        assert!(
+            vol.extent_index.lookup(&h0).is_none(),
+            "h0 must be gone after restart — was a Removed entry in the GC handoff. \
+             A stale entry here means index/<seg_a>.idx was processed without consulting \
+             the bare gc body's `inputs` field. See HandoffProtocol.tla counterexample."
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn gc_handoff_idempotent_after_crash() {
         // Simulate a crash between coordinator writing `.staged` and the
