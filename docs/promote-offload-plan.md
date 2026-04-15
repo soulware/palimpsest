@@ -356,9 +356,13 @@ The work breaks into roughly three landings. Within each landing the steps are s
 ### Landing 2 — recovery replay of all WALs
 
 4. **Replay all WAL files in `Volume::open_impl`**, promoting non-latest WALs to fresh segments. Keeps the legacy same-ULID dedup-retain loop. Lands independently — no offload yet, no concurrency, but future-proofs recovery for the offload work. Covered by unit test 2.
-5. **Switch the in-process `flush_wal_to_pending` to mint a fresh segment ULID and defer WAL delete until after `publish_snapshot`.** Still runs on the actor, still synchronous. Validates the fresh-ULID pattern under the existing concurrency model. Covered by unit test 1 and existing tests.
+5. **Switch the in-process `flush_wal_to_pending` to mint a fresh segment ULID.** Still runs on the actor, still synchronous. Validates the fresh-ULID pattern under the existing concurrency model. Covered by unit test 1 and existing tests.
 
-Landing 2 is self-contained: it fixes the latent cold-cache race and the recovery assumption without introducing any cross-thread coordination. Could be released on its own.
+**Deferring the WAL delete — not in Landing 2.** The earlier draft of step 5 also required deferring the old-WAL unlink until after `publish_snapshot`, so that a pre-publish reader holding a stale extent index entry could still cold-open `wal/<old_wal_ulid>` during the publish window. That deferral is the natural shape of Landing 3 (the flusher's apply phase runs after publish by construction), but retrofitting it onto the inline actor path required (a) a persistent `pending_wal_cleanup` stash on `Volume`, (b) a public `finalize_wal_cleanup` entry point for the actor to call after its `publish_snapshot`, and (c) either changing the public `flush_wal` / `gc_checkpoint` / `snapshot` contract or threading a defer-vs-finalize flag through them — the latter touching ~100 test sites across `elide-core` and `elide-coordinator`.
+
+The correctness benefit of deferring on the inline path is narrow: with the fresh segment ULID alone, the cold-cache race turns from "silent wrong bytes via `pending/<same_ulid>`" into "`NotFound` during the brief delete window" — an error, not corruption. Deferring the unlink further shrinks that `NotFound` window but does not close it, because a reader that loaded the pre-publish snapshot and opens the file *after* the eventual unlink still gets `NotFound`. We accept the narrow window for Landing 2; Landing 3 fixes it for free via the off-actor structure. The comment on the inline unlink at the end of `flush_wal_to_pending_as` calls this out so the next reader knows where the deferral will slot in.
+
+Landing 2 is self-contained: it fixes the latent cold-cache race (wrong-bytes → error) and the recovery assumption without introducing any cross-thread coordination. Could be released on its own.
 
 ### Landing 3 — the offload itself
 

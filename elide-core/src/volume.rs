@@ -802,6 +802,86 @@ impl Volume {
             .unwrap_or(Ulid::from_parts(0, 0));
         let mut mint = UlidMint::new(segment_floor.max(wal_floor));
 
+        // Promote every non-latest WAL to a fresh segment so the volume
+        // returns to its "one active WAL" invariant before we open the
+        // actor. This path fires when a crash or the off-actor flusher
+        // (Landing 3) leaves multiple WAL files behind; in normal single-
+        // WAL operation the loop body never executes.
+        //
+        // The freshly-minted segment ULID is strictly > any wal_floor or
+        // segment_floor (mint monotonicity), so it never collides with an
+        // existing file. Entries use the same CAS apply path as the online
+        // `flush_wal_to_pending_as` flow — safe even when an orphan pending
+        // segment from the pre-crash flusher has already repopulated the
+        // same hashes.
+        let wal_files_to_promote: Vec<PathBuf> = if wal_files.len() > 1 {
+            let split = wal_files.len() - 1;
+            let rest = wal_files.split_off(split);
+            std::mem::replace(&mut wal_files, rest)
+        } else {
+            Vec::new()
+        };
+        for wal_path in wal_files_to_promote {
+            let (old_wal_ulid, _valid_size, mut entries) =
+                replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
+            if entries.is_empty() {
+                fs::remove_file(&wal_path)?;
+                continue;
+            }
+            // Snapshot pre-promote WAL offsets for the CAS apply, matching
+            // `flush_wal_to_pending_as`.
+            let pre_promote_offsets: Vec<Option<u64>> = entries
+                .iter()
+                .map(|e| match e.kind {
+                    EntryKind::Data | EntryKind::Inline => {
+                        extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
+                })
+                .collect();
+            let segment_ulid = mint.next();
+            let body_section_start = segment::write_and_commit(
+                &pending_dir,
+                segment_ulid,
+                &mut entries,
+                signer.as_ref(),
+            )?;
+            for (entry, old_wal_offset) in entries.iter().zip(pre_promote_offsets.iter().copied()) {
+                match entry.kind {
+                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                }
+                let Some(old_wal_offset) = old_wal_offset else {
+                    continue;
+                };
+                let idata = if entry.kind == EntryKind::Inline {
+                    entry.data.clone().map(Vec::into_boxed_slice)
+                } else {
+                    None
+                };
+                extent_index.replace_if_matches(
+                    entry.hash,
+                    old_wal_ulid,
+                    old_wal_offset,
+                    extentindex::ExtentLocation {
+                        segment_id: segment_ulid,
+                        body_offset: entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                        body_source: BodySource::Local,
+                        body_section_start,
+                        inline_data: idata,
+                    },
+                );
+            }
+            // Bump last_segment_ulid so the first-snapshot pinning invariant
+            // (see `Volume::snapshot`) covers this recovery-promoted segment.
+            if last_segment_ulid < Some(segment_ulid) {
+                last_segment_ulid = Some(segment_ulid);
+            }
+            fs::remove_file(&wal_path)?;
+        }
+
         // recover_wal does the single WAL scan: truncates any partial tail,
         // replays records into the LBA map, and rebuilds pending_entries.
         let (wal, wal_ulid, wal_path, pending_entries) =
@@ -2378,11 +2458,23 @@ impl Volume {
 
     /// Does NOT open a new WAL — the caller is responsible for that.
     fn flush_wal_to_pending(&mut self) -> io::Result<()> {
-        self.flush_wal_to_pending_as(self.wal_ulid)
+        // Mint a fresh segment ULID distinct from `self.wal_ulid` so
+        // `wal/<old_wal_ulid>` and `pending/<segment_ulid>` never collide
+        // on the same path. With a shared ULID, a stale cold-cache reader
+        // that loaded the pre-promote snapshot could look up the old WAL
+        // ULID, fall through to `pending/<same_ulid>`, and read WAL-relative
+        // offsets as if they were segment-relative — silent wrong bytes.
+        // A distinct segment ULID turns that cold-cache race into NotFound.
+        //
+        // Wastes one mint when the WAL is empty (the early return below
+        // skips the segment write). The mint is cheap and monotonic; the
+        // extra advance is harmless.
+        let segment_ulid = self.mint.next();
+        self.flush_wal_to_pending_as(segment_ulid)
     }
 
-    /// Like `flush_wal_to_pending`, but names the output segment `segment_ulid`
-    /// rather than the WAL's own ULID.
+    /// Like `flush_wal_to_pending`, but uses the caller-provided `segment_ulid`
+    /// rather than minting a fresh one.
     ///
     /// Used by `gc_checkpoint` to give the flushed WAL segment a ULID that has
     /// been pre-minted above the GC output ULIDs, so that the pending segment
@@ -2399,12 +2491,12 @@ impl Volume {
         self.has_new_segments = true;
         self.last_segment_ulid = Some(segment_ulid);
         // Snapshot the WAL-relative body offsets for every Data/Inline entry
-        // before `segment::promote` rewrites `stored_offset` to segment-relative.
-        // These become the CAS precondition tokens in the apply loop below: we
-        // only rewrite an extent index entry if it still points at
-        // (wal_ulid, original_wal_offset). Any later writer or GC handoff that
-        // has already superseded the entry leaves the CAS failing and its
-        // placement intact.
+        // before `segment::write_and_commit` rewrites `stored_offset` to
+        // segment-relative. These become the CAS precondition tokens in the
+        // apply loop below: we only rewrite an extent index entry if it still
+        // points at (wal_ulid, original_wal_offset). Any later writer or GC
+        // handoff that has already superseded the entry leaves the CAS failing
+        // and its placement intact.
         //
         // Today the promote runs on the actor thread, so no concurrent writer
         // can interpose between snapshot and apply — the CAS always succeeds.
@@ -2421,10 +2513,9 @@ impl Volume {
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
             })
             .collect();
-        let body_section_start = segment::promote(
-            &self.wal_path,
-            segment_ulid,
+        let body_section_start = segment::write_and_commit(
             &self.base_dir.join("pending"),
+            segment_ulid,
             &mut self.pending_entries,
             self.signer.as_ref(),
         )?;
@@ -2490,14 +2581,23 @@ impl Volume {
         }
         self.pending_entries.clear();
         // index/<ulid>.idx is written later by the promote_segment IPC handler,
-        // after the coordinator confirms S3 upload.  Until then pending/<ulid>
+        // after the coordinator confirms S3 upload. Until then pending/<ulid>
         // is the authoritative body source for both reads and crash recovery.
-        // Evict the promoted WAL from the file handle cache.  After promotion
-        // the body offsets in the extent index point into the new segment file;
-        // any cached fd for this ULID would use the old WAL byte layout.
-        // The cache key is the WAL's original ULID (the file that was deleted),
-        // not segment_ulid — the cache is keyed by the path that was open.
-        self.evict_cached_segment(self.wal_ulid);
+        //
+        // Delete the old WAL file. `segment::write_and_commit` leaves the WAL
+        // alone so the off-actor flusher (Landing 3) can defer this delete
+        // until after the actor's publish_snapshot; on the current actor-
+        // inline path we just delete immediately. With a fresh segment ULID
+        // (not reusing `old_wal_ulid`), a stale cold-cache reader that still
+        // holds the pre-promote snapshot either finds `wal/<old_wal_ulid>`
+        // at its expected path (before this unlink) or gets NotFound (after)
+        // — never a silent read of wrong bytes through `pending/<same_ulid>`.
+        fs::remove_file(&self.wal_path)?;
+        // Evict any cached fd for the deleted WAL so subsequent lookups of
+        // `old_wal_ulid` re-open rather than reuse a handle to the deleted
+        // inode. The cache is keyed by the path that was open, so we pass
+        // the WAL's original ULID — not `segment_ulid`.
+        self.evict_cached_segment(old_wal_ulid);
         Ok(())
     }
 
@@ -3857,31 +3957,30 @@ pub fn fork_volume_at(
 
 // --- WAL helpers ---
 
-/// Scan an existing WAL, replay its records into `lbamap`, rebuild
-/// `pending_entries`, and reopen the WAL for continued appending.
+/// Scan a WAL file and replay its records into `lbamap` + `extent_index`,
+/// returning the WAL ULID, the valid (non-partial) tail size, and the
+/// reconstructed pending_entries list.
 ///
-/// This is the single WAL scan on startup — it both updates the LBA map
-/// (WAL is more recent than any segment) and recovers the pending_entries
-/// list needed for the next promotion.
+/// Shared between:
+/// - [`recover_wal`], which also reopens the file for continued appending
+///   (latest WAL case).
+/// - [`Volume::open_impl`]'s recovery-time promote loop, which promotes
+///   each non-latest WAL to a fresh segment and deletes the WAL file
+///   rather than reopening it.
 ///
 /// `writelog::scan` truncates any partial-tail record before returning.
-fn recover_wal(
-    path: PathBuf,
+fn replay_wal_records(
+    path: &Path,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-) -> io::Result<(
-    writelog::WriteLog,
-    Ulid,
-    PathBuf,
-    Vec<segment::SegmentEntry>,
-)> {
+) -> io::Result<(Ulid, u64, Vec<segment::SegmentEntry>)> {
     let ulid_str = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::other("bad WAL filename"))?;
     let ulid = Ulid::from_string(ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
 
-    let (records, valid_size) = writelog::scan(&path)?;
+    let (records, valid_size) = writelog::scan(path)?;
 
     let mut pending_entries = Vec::new();
     for record in records {
@@ -3944,6 +4043,26 @@ fn recover_wal(
         }
     }
 
+    Ok((ulid, valid_size, pending_entries))
+}
+
+/// Scan an existing WAL, replay its records into `lbamap`, rebuild
+/// `pending_entries`, and reopen the WAL for continued appending.
+///
+/// This is the single WAL scan on startup — it both updates the LBA map
+/// (WAL is more recent than any segment) and recovers the pending_entries
+/// list needed for the next promotion.
+fn recover_wal(
+    path: PathBuf,
+    lbamap: &mut lbamap::LbaMap,
+    extent_index: &mut extentindex::ExtentIndex,
+) -> io::Result<(
+    writelog::WriteLog,
+    Ulid,
+    PathBuf,
+    Vec<segment::SegmentEntry>,
+)> {
+    let (ulid, valid_size, pending_entries) = replay_wal_records(&path, lbamap, extent_index)?;
     let wal = writelog::WriteLog::reopen(&path, valid_size)?;
     Ok((wal, ulid, path, pending_entries))
 }
@@ -5023,6 +5142,96 @@ mod tests {
             !base.join("wal").join(&ulid).exists(),
             "stale WAL was not removed"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn recovery_replays_all_wals_promoting_non_latest() {
+        // Multiple WAL files on disk — e.g. left by a crash between
+        // `segment::write_and_commit` and the old-WAL unlink, or
+        // produced by the upcoming off-actor flusher — must be
+        // collapsed back to a single active WAL before `Volume::open`
+        // returns. Every non-latest WAL is promoted to a fresh pending
+        // segment; the highest-ULID WAL stays active.
+        let base = keyed_temp_dir();
+
+        // Bootstrap to create the standard directory layout + keypair.
+        // The bootstrap open leaves an empty WAL that we then strip so
+        // we can build our own two-WAL state from scratch.
+        {
+            let _vol = Volume::open(&base, &base).unwrap();
+        }
+        let wal_dir = base.join("wal");
+        for entry in fs::read_dir(&wal_dir).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+
+        // Two ULIDs with a strict ordering. Fixed strings keep the
+        // test deterministic independently of the system clock.
+        let low_ulid = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let high_ulid = Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        assert!(low_ulid < high_ulid);
+
+        // Low WAL: one DATA record covering LBA 0.
+        let payload_low = vec![0x11u8; 4096];
+        let hash_low = blake3::hash(&payload_low);
+        {
+            let mut wl = writelog::WriteLog::create(&wal_dir.join(low_ulid.to_string())).unwrap();
+            wl.append_data(0, 1, &hash_low, writelog::WalFlags::empty(), &payload_low)
+                .unwrap();
+            wl.fsync().unwrap();
+        }
+
+        // High WAL: one DATA record covering LBA 1.
+        let payload_high = vec![0x22u8; 4096];
+        let hash_high = blake3::hash(&payload_high);
+        {
+            let mut wl = writelog::WriteLog::create(&wal_dir.join(high_ulid.to_string())).unwrap();
+            wl.append_data(1, 1, &hash_high, writelog::WalFlags::empty(), &payload_high)
+                .unwrap();
+            wl.fsync().unwrap();
+        }
+
+        // Reopen — recovery must promote `low_ulid` to a fresh segment
+        // and keep `high_ulid` as the active WAL.
+        let vol = Volume::open(&base, &base).unwrap();
+
+        // Exactly one WAL remains: the high one.
+        let wal_files: Vec<_> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
+            .collect();
+        assert_eq!(
+            wal_files.len(),
+            1,
+            "expected one active WAL after recovery, got {wal_files:?}"
+        );
+        assert_eq!(wal_files[0], high_ulid.to_string());
+
+        // Exactly one segment in pending/ — the recovery-promoted low
+        // WAL, at a freshly-minted ULID strictly above the wal floor.
+        let pending_files: Vec<_> = fs::read_dir(base.join("pending"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
+            .filter(|n| !n.ends_with(".tmp"))
+            .collect();
+        assert_eq!(
+            pending_files.len(),
+            1,
+            "expected one recovery-promoted segment in pending/, got {pending_files:?}"
+        );
+        let seg_ulid = Ulid::from_string(&pending_files[0]).unwrap();
+        assert!(
+            seg_ulid > high_ulid,
+            "recovery-promoted segment ULID {seg_ulid} must sort above wal floor {high_ulid}"
+        );
+
+        // Both LBAs read back correctly. LBA 0 comes from the promoted
+        // segment; LBA 1 from the active WAL's pending_entries.
+        assert_eq!(vol.read(0, 1).unwrap(), payload_low);
+        assert_eq!(vol.read(1, 1).unwrap(), payload_high);
+        assert_eq!(vol.lbamap_len(), 2);
 
         fs::remove_dir_all(base).unwrap();
     }
