@@ -1151,10 +1151,25 @@ async fn compact_segments(
     // into segments/.  This ensures segments/ always contains only volume-signed
     // files and extentindex::rebuild never needs to skip verification for
     // in-transit coordinator output.
+    //
+    // `inputs` is the list of source segment ULIDs consumed by this compaction.
+    // Sorted for determinism so identical candidate sets produce byte-identical
+    // output headers. The volume's apply path reads this field to derive
+    // extent-index updates directly from the segment itself (see the
+    // self-describing GC handoff design).
+    let mut inputs: Vec<Ulid> = candidates
+        .iter()
+        .map(|c| Ulid::from_string(&c.ulid_str).context("parsing candidate ulid"))
+        .collect::<Result<Vec<_>>>()?;
+    inputs.sort();
     let (ephemeral_signer, _) = elide_core::signing::generate_ephemeral_signer();
-    let new_body_section_start =
-        segment::write_segment(&tmp_path, &mut new_entries, ephemeral_signer.as_ref())
-            .context("writing compacted segment")?;
+    let new_body_section_start = segment::write_gc_segment(
+        &tmp_path,
+        &mut new_entries,
+        &inputs,
+        ephemeral_signer.as_ref(),
+    )
+    .context("writing compacted segment")?;
 
     // Stage in gc/<ulid> so apply_gc_handoffs can re-sign it and move it into
     // segments/.  S3 upload happens in apply_done_handoffs, after the volume
@@ -2134,6 +2149,83 @@ mod tests {
             vol.read(1, 1).unwrap().as_slice(),
             &content,
             "lba 1 must read back [0xAA; 4096] after GC + crash + reopen"
+        );
+    }
+
+    /// Step 2 of the self-describing GC handoff: the compacted segment's
+    /// index section must carry the sorted list of source segment ULIDs that
+    /// fed this output, so the volume can later derive the apply set from
+    /// the segment itself without consulting a sidecar manifest.
+    #[tokio::test]
+    async fn gc_output_records_input_ulids() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        // Two distinct payloads so each drain produces its own segment.
+        vol.write(0, &[0x11u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+
+        vol.write(1, &[0x22u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drop(vol);
+
+        // Capture the input segment ULIDs from index/ before GC runs — those
+        // are the candidates gc_fork will sweep.
+        let index_dir = dir.join("index");
+        let mut expected_inputs: Vec<Ulid> = fs::read_dir(&index_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name();
+                let name = name.to_str()?;
+                let stem = name.strip_suffix(".idx")?;
+                Ulid::from_string(stem).ok()
+            })
+            .collect();
+        expected_inputs.sort();
+        assert!(
+            expected_inputs.len() >= 2,
+            "two drained segments expected, got {}",
+            expected_inputs.len()
+        );
+
+        // Sweep both under a permissive density threshold.
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            small_segment_bytes: u64::MAX,
+            interval_secs: 0,
+        };
+        let sweep_ulid = Ulid::new();
+        let repack_ulid = Ulid::new();
+        gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
+            .await
+            .unwrap();
+
+        // Find the staged GC output body in gc/.
+        let gc_dir = dir.join("gc");
+        let gc_body = fs::read_dir(&gc_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_none())
+            .expect("gc/ must contain a body file");
+        let (_bss, _entries, inputs) = elide_core::segment::read_segment_index(&gc_body).unwrap();
+
+        assert_eq!(
+            inputs, expected_inputs,
+            "gc output must list all swept source ulids in sorted order"
         );
     }
 
