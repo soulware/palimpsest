@@ -1475,17 +1475,17 @@ impl SegmentBodyLayout {
 ///
 ///   1. `wal/<id>`                       — live, being written
 ///   2. `pending/<id>`                   — sealed, awaiting upload
-///   3. `gc/<id>` iff `gc/<id>.applied`  — GC output, awaiting upload
+///   3. `gc/<id>` (bare, no suffix)      — GC output, awaiting upload
 ///   4. `cache/<id>.body`                — drained or demand-fetched
 ///
 /// Returns `None` if the segment body is not present in any of those
 /// locations. Does not consult `.present` bits, ancestor forks, or
 /// fetchers — callers layer those concerns on top.
 ///
-/// The `.applied` marker is the gate on `gc/<id>`. A bare `gc/<id>` (or
-/// one with only `.pending`) is coordinator-staged and not yet safe to
-/// read; the volume's re-sign step writes `.applied` exactly when the
-/// body becomes readable under its new ULID.
+/// Under the self-describing GC handoff protocol a bare `gc/<id>` means
+/// "volume-applied, awaiting coordinator upload"; a `gc/<id>.staged`
+/// (coordinator-staged, not yet volume-applied) has the `.staged`
+/// extension and is naturally excluded by the bare-name match.
 pub fn locate_segment_body(
     base_dir: &Path,
     segment_id: ulid::Ulid,
@@ -1500,7 +1500,7 @@ pub fn locate_segment_body(
         return Some((pending, SegmentBodyLayout::FullSegment));
     }
     let gc_body = base_dir.join("gc").join(&sid);
-    if gc_body.exists() && base_dir.join("gc").join(format!("{sid}.applied")).exists() {
+    if gc_body.exists() {
         return Some((gc_body, SegmentBodyLayout::FullSegment));
     }
     let cache_body = base_dir.join("cache").join(format!("{sid}.body"));
@@ -1535,15 +1535,17 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Collect volume-signed GC output bodies from `gc/` that are in `.applied`
 /// state (awaiting coordinator upload to S3).
 ///
-/// These are segments that the volume has re-signed in-place within `gc/` and
-/// acknowledged (`.applied` marker written), but that the coordinator has not
-/// yet uploaded to S3 and written `index/<new>.idx` for.  They must be included
-/// in LBA map and extent index rebuild at lower priority than `index/*.idx`
-/// entries so the original input segments (still in `index/`) win for any LBA
-/// they cover.
+/// These are segments that the volume has applied and re-signed within `gc/`
+/// but that the coordinator has not yet uploaded to S3 and written
+/// `index/<new>.idx` for. They must be included in LBA map and extent index
+/// rebuild at lower priority than `index/*.idx` entries so the original input
+/// segments (still in `index/`) win for any LBA they cover.
 ///
-/// Bodies with `.pending` markers (coordinator-signed, not yet volume-applied)
-/// are excluded — the old input segments referenced by `index/` are still authoritative.
+/// Under the self-describing GC handoff protocol, a bare `gc/<id>` means
+/// "volume-applied, awaiting coordinator upload." Bodies with a `.pending`
+/// sibling (legacy coordinator-signed staged state) or a `.staged` sibling
+/// (step 4 coordinator-staged state) are excluded — the old input segments
+/// referenced by `index/` are still authoritative until the volume applies.
 pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let gc_dir = fork_dir.join("gc");
     match fs::read_dir(&gc_dir) {
@@ -1553,7 +1555,7 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
             let mut paths = Vec::new();
             for entry in entries {
                 let path = entry?.path();
-                // Skip sidecar files (.pending, .applied, .done, .tmp).
+                // Skip sidecar files (.pending, .applied, .done, .staged, .tmp).
                 if path.extension().is_some() {
                     continue;
                 }
@@ -1564,10 +1566,16 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
                 if ulid::Ulid::from_string(name).is_err() {
                     continue;
                 }
-                // Only include bodies that the volume has re-signed (.applied present).
-                if gc_dir.join(format!("{name}.applied")).exists() {
-                    paths.push(path);
+                // Exclude bodies still in a coordinator-staged state:
+                // `.pending` (legacy manifest path) or `.staged` (step 4
+                // derive path). Either sibling means the volume has not yet
+                // re-signed the body.
+                if gc_dir.join(format!("{name}.pending")).exists()
+                    || gc_dir.join(format!("{name}.staged")).exists()
+                {
+                    continue;
                 }
+                paths.push(path);
             }
             Ok(paths)
         }
@@ -2694,10 +2702,11 @@ mod tests {
     }
 
     #[test]
-    fn locate_segment_body_precedence_and_gc_gate() {
+    fn locate_segment_body_precedence_and_gc_bare() {
         // Confirms the canonical lifecycle precedence
-        //   wal → pending → gc/.applied → cache/.body
-        // and that `gc/<id>` is ignored without the `.applied` marker.
+        //   wal → pending → gc/ bare → cache/.body
+        // and that `gc/<id>.staged` is naturally excluded (extension
+        // filter) while bare `gc/<id>` is accepted without any sidecar.
         let dir = temp_dir();
         for sub in ["wal", "pending", "gc", "cache"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
@@ -2716,24 +2725,25 @@ mod tests {
             Some((cache_body.clone(), SegmentBodyLayout::BodyOnly))
         );
 
-        // gc/<id> without .applied is ignored → still cache.
-        let gc_body = dir.join("gc").join(&sid_s);
-        fs::write(&gc_body, b"gc-staged").unwrap();
+        // `.staged` alone is not readable — the `.staged` extension means
+        // "coordinator-staged, awaiting volume apply" and `locate_segment_body`
+        // matches only the bare name.
+        let staged = dir.join("gc").join(format!("{sid_s}.staged"));
+        fs::write(&staged, b"coordinator-staged").unwrap();
         assert_eq!(
             locate_segment_body(&dir, sid),
             Some((cache_body.clone(), SegmentBodyLayout::BodyOnly))
         );
 
-        // .applied marker flips gc/ into play → FullSegment hit,
-        // ranking above cache/.body.
-        let applied = dir.join("gc").join(format!("{sid_s}.applied"));
-        fs::write(&applied, b"").unwrap();
+        // Bare gc/<id> → FullSegment hit, ranking above cache/.body.
+        let gc_body = dir.join("gc").join(&sid_s);
+        fs::write(&gc_body, b"gc-bare").unwrap();
         assert_eq!(
             locate_segment_body(&dir, sid),
             Some((gc_body.clone(), SegmentBodyLayout::FullSegment))
         );
 
-        // pending/ wins over gc/.applied.
+        // pending/ wins over gc/ bare.
         let pending = dir.join("pending").join(&sid_s);
         fs::write(&pending, b"pending").unwrap();
         assert_eq!(
