@@ -430,7 +430,7 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             .chain(cache_paths.iter())
             .chain(pending_paths.iter())
         {
-            let (_bss, entries) = match segment::read_and_verify_segment_index(path, &vk) {
+            let (_bss, entries, _inputs) = match segment::read_and_verify_segment_index(path, &vk) {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     warn!(

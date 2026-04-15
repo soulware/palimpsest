@@ -253,7 +253,7 @@ fn maybe_rewrite_segment(
     signer: &dyn SegmentSigner,
     vk: &VerifyingKey,
 ) -> io::Result<SegmentDeltaStats> {
-    let (body_section_start, mut entries) = read_and_verify_segment_index(seg_path, vk)?;
+    let (body_section_start, mut entries, _inputs) = read_and_verify_segment_index(seg_path, vk)?;
 
     let any_match = entries
         .iter()
@@ -474,7 +474,7 @@ pub fn rewrite_post_snapshot_with_prior(
     signer: &dyn SegmentSigner,
     vk: &VerifyingKey,
 ) -> io::Result<Option<(Vec<SegmentEntry>, u64, SegmentDeltaStats)>> {
-    let (body_section_start, mut entries) = read_and_verify_segment_index(seg_path, vk)?;
+    let (body_section_start, mut entries, _inputs) = read_and_verify_segment_index(seg_path, vk)?;
 
     // Early out: does any single-block Data entry have a same-LBA prior hash?
     let any_candidate = entries.iter().any(|e| {

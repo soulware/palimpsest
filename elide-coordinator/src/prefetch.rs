@@ -388,7 +388,7 @@ mod tests {
         assert!(idx_path.exists(), ".idx file should exist");
 
         // Verify it is parseable as a segment index.
-        let (_, entries) = elide_core::segment::read_segment_index(&idx_path).unwrap();
+        let (_, entries, _) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, hash);
 
@@ -537,7 +537,7 @@ mod tests {
         let idx_path = root_dir.join("index").join(format!("{seg_ulid}.idx"));
         assert!(idx_path.exists(), ".idx file should exist in root's index/");
 
-        let (_, entries) = elide_core::segment::read_segment_index(&idx_path).unwrap();
+        let (_, entries, _) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, hash);
     }

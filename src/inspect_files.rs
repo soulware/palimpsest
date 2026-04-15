@@ -18,7 +18,7 @@ use elide_core::writelog;
 // --- inspect-segment ---
 
 pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
-    let (body_section_start, entries) = segment::read_segment_index(path)?;
+    let (body_section_start, entries, inputs) = segment::read_segment_index(path)?;
 
     // Detect whether this is a full segment or an index-only .idx file.
     // For .idx files, file_size == body_section_start (see idx_body_section_start).
@@ -78,6 +78,12 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             String::new()
         }
     );
+    if !inputs.is_empty() {
+        println!("gc_inputs:          {} segment(s)", inputs.len());
+        for input in &inputs {
+            println!("  {input}");
+        }
+    }
 
     let data_entries: Vec<_> = entries.iter().collect();
     if data_entries.is_empty() {

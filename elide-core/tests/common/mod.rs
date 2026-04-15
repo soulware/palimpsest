@@ -189,7 +189,7 @@ fn compact_candidates_inner(
     let mut removed: Vec<(blake3::Hash, Ulid)> = Vec::new();
 
     for (ulid, path) in &candidates {
-        let Ok((bss_header, mut entries)) = segment::read_and_verify_segment_index(path, &vk)
+        let Ok((bss_header, mut entries, _)) = segment::read_and_verify_segment_index(path, &vk)
         else {
             continue;
         };

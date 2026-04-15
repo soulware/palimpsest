@@ -448,7 +448,7 @@ pub async fn apply_done_handoffs(
                 elide_core::signing::VOLUME_PUB_FILE,
             )
             .context("loading volume verifying key")?;
-            let (_, gc_entries) = segment::read_and_verify_segment_index(&gc_body, &vk)
+            let (_, gc_entries, _) = segment::read_and_verify_segment_index(&gc_body, &vk)
                 .with_context(|| {
                     format!("signature verification failed for compacted segment {new_ulid_str}")
                 })?;
@@ -705,7 +705,7 @@ fn collect_stats(
         // idx_size == body_section_start: the .idx file is exactly the
         // [0, body_section_start) prefix of the full S3 segment.
         let idx_size = segment::idx_body_section_start(&idx_path)?;
-        let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
+        let (_, entries, _) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
         // Read inline section from .idx for any inline entries.
         let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);

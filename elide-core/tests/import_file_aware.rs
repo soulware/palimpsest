@@ -139,7 +139,7 @@ fn read_all_pending_entries(vol_dir: &Path) -> Vec<(String, segment::SegmentEntr
     let mut out = Vec::new();
     for seg_path in segs {
         let ulid = seg_path.file_name().unwrap().to_str().unwrap().to_owned();
-        let (_, entries) = segment::read_segment_index(&seg_path).unwrap();
+        let (_, entries, _) = segment::read_segment_index(&seg_path).unwrap();
         for e in entries {
             out.push((ulid.clone(), e));
         }

@@ -1137,7 +1137,7 @@ impl Volume {
                 continue;
             }
 
-            let (body_section_start, mut entries) =
+            let (body_section_start, mut entries, _inputs) =
                 match segment::read_and_verify_segment_index(&seg_path, &self.verifying_key) {
                     Ok(v) => v,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -1493,7 +1493,7 @@ impl Volume {
             }
 
             let file_size = fs::metadata(seg_path)?.len();
-            let (body_section_start, mut entries) =
+            let (body_section_start, mut entries, _inputs) =
                 segment::read_and_verify_segment_index(seg_path, &self.verifying_key)?;
 
             let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
@@ -1800,7 +1800,7 @@ impl Volume {
             // .pending handoffs: re-sign the coordinator-staged body with the volume key.
             // .applied handoffs: already volume-signed; skip re-signing.
             if !is_already_applied && gc_seg_path.try_exists()? {
-                let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
+                let (bss, mut entries, _inputs) = segment::read_segment_index(&gc_seg_path)?;
                 let gc_inline = segment::read_inline_section(&gc_seg_path)?;
                 segment::read_extent_bodies(
                     &gc_seg_path,
@@ -1860,7 +1860,7 @@ impl Volume {
             // if we cancel mid-apply the index would be left in a partially
             // updated state.
             let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
-            if let Some((_, ref entries)) = segment_index {
+            if let Some((_, ref entries, _)) = segment_index {
                 for e in entries {
                     if e.kind != EntryKind::DedupRef {
                         carried_hashes.insert(e.hash);
@@ -1951,7 +1951,7 @@ impl Volume {
             // mutations did happen, so the coordinator can distinguish genuine
             // restart recovery from a redundant steady-state re-check.
             let mut index_mutated = false;
-            if let Some((body_section_start, ref entries)) = segment_index {
+            if let Some((body_section_start, ref entries, _)) = segment_index {
                 // Read inline section for any inline entries in the GC output.
                 let handoff_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
                     body_path
@@ -2224,7 +2224,7 @@ impl Volume {
             // BodyOnly cache files ignore it (SegmentLayout::BodyOnly path),
             // but demand-fetch needs the original value to compute the S3
             // range-GET offset.
-            let (promote_bss, entries) =
+            let (promote_bss, entries, _inputs) =
                 segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
             // Read inline section for any inline entries being promoted.
             let promote_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
@@ -2361,7 +2361,7 @@ impl Volume {
         let pending_dir = self.base_dir.join("pending");
         let seg_path = pending_dir.join(&ulid_str);
 
-        let (body_section_start, entries) =
+        let (body_section_start, entries, _inputs) =
             segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
 
         // Cheap pre-scan: is there any DATA entry whose LBA no longer maps
@@ -4769,7 +4769,7 @@ mod tests {
             .next()
             .expect("expected one pending segment");
 
-        let (_, entries) = segment::read_segment_index(&seg_path).unwrap();
+        let (_, entries, _) = segment::read_segment_index(&seg_path).unwrap();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.kind, segment::EntryKind::Zero);
@@ -5743,7 +5743,7 @@ mod tests {
         );
 
         use std::io::{Read, Seek, SeekFrom};
-        let (bss, entries) =
+        let (bss, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let dead_entry = entries
             .iter()
@@ -5797,7 +5797,7 @@ mod tests {
             "index/<ulid>.idx must exist after promote"
         );
 
-        let (_, idx_entries) =
+        let (_, idx_entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         assert!(
             idx_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
@@ -5953,7 +5953,7 @@ mod tests {
         // in the in-place pending file.
         use std::io::{Read as _, Seek as _, SeekFrom};
         let seg_path = base.join("pending").join(seg_ulid.to_string());
-        let (bss, entries) =
+        let (bss, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
@@ -5999,7 +5999,7 @@ mod tests {
 
         use std::io::{Read as _, Seek as _, SeekFrom};
         let seg_path = base.join("pending").join(seg_ulid.to_string());
-        let (bss, entries) =
+        let (bss, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
@@ -6319,7 +6319,7 @@ mod tests {
                     let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
                     let mut source_ulids: Vec<Ulid> = Vec::new();
                     for (ulid, path) in &candidates {
-                        let Ok((_bss, mut seg_entries)) =
+                        let Ok((_bss, mut seg_entries, _)) =
                             segment::read_and_verify_segment_index(path, &vk)
                         else {
                             continue;
@@ -7531,7 +7531,7 @@ mod tests {
         // (body bytes starting at offset 0).
         let idx_path = fork_dir.join("index").join(format!("{old_ulid}.idx"));
         let body_path = fork_dir.join("cache").join(format!("{old_ulid}.body"));
-        let (_old_bss, mut entries) =
+        let (_old_bss, mut entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         // Read inline data from .idx for inline entries.
         let inline_bytes = segment::read_inline_section(&idx_path).unwrap();
@@ -8152,7 +8152,7 @@ mod tests {
             .next()
             .unwrap()
             .path();
-        let (bss, _) =
+        let (bss, _, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let file_len = fs::metadata(&seg_path).unwrap().len();
         assert_eq!(file_len, bss, "all-inline segment should have no body");

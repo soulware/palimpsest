@@ -157,7 +157,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
     // ── Re-read the rewritten pending segment and assert the entry is
     // now a thin Delta with source_hash = parent_hash.
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
-    let (_, entries) = segment::read_segment_index(&rewritten).unwrap();
+    let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries.len(), 1);
     let e = &entries[0];
     assert_eq!(e.kind, EntryKind::Delta);
@@ -273,7 +273,7 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
     assert_eq!(stats.entries_converted, 1);
 
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
-    let (_, entries) = segment::read_segment_index(&rewritten).unwrap();
+    let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries[0].kind, EntryKind::Delta);
     assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
 }
@@ -375,7 +375,7 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
     );
 
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
-    let (_, entries) = segment::read_segment_index(&rewritten).unwrap();
+    let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries[0].kind, EntryKind::Delta);
     assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
 }
@@ -461,7 +461,7 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     assert_eq!(stats.entries_converted, 1);
 
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
-    let (_, entries) = segment::read_segment_index(&rewritten).unwrap();
+    let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries[0].kind, EntryKind::Delta);
     assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
 }
@@ -517,7 +517,7 @@ fn rewrite_pending_with_deltas_skips_unchanged_hashes() {
     assert_eq!(stats.entries_converted, 0);
 
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
-    let (_, entries) = segment::read_segment_index(&rewritten).unwrap();
+    let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(
         entries[0].kind,
         EntryKind::Data,

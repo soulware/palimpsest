@@ -319,7 +319,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             let segment_id =
                 Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
 
-            let (body_section_start, entries) =
+            let (body_section_start, entries, _inputs) =
                 match segment::read_and_verify_segment_index(path, &vk) {
                     Ok(v) => v,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -425,7 +425,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             let delta_length = layout.delta_length;
 
             let entries = match segment::read_and_verify_segment_index(path, &vk) {
-                Ok((_, entries)) => entries,
+                Ok((_, entries, _)) => entries,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     warn!(
                         "segment vanished during rebuild (GC race): {}",

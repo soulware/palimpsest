@@ -250,7 +250,7 @@ async fn fetch_one_extent(
     let present_path = body_dir.join(format!("{segment_id}.present"));
 
     // Read the full index so we can scan ahead for adjacent absent entries.
-    let (_, entries) = segment::read_segment_index(&idx_path)?;
+    let (_, entries, _) = segment::read_segment_index(&idx_path)?;
     let start = extent.entry_idx as usize;
     if start >= entries.len() {
         return Err(io::Error::other(format!(
