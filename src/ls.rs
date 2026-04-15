@@ -38,7 +38,7 @@ pub fn run(dir: &Path, fs_path: &str) -> io::Result<()> {
 
 /// Open a live `BlockReader` for `dir`, wiring an `ObjectStoreFetcher` from
 /// `fetch.toml` if one is present alongside the `by_id/` directory.
-fn open_live_reader(dir: &Path) -> io::Result<BlockReader> {
+pub fn open_live_reader(dir: &Path) -> io::Result<BlockReader> {
     BlockReader::open_live(dir, Box::new(object_store_fetcher_factory))
 }
 
@@ -148,6 +148,45 @@ mod tests {
         let mut vol = Volume::open(vol_dir, by_id).unwrap();
         vol.write(lba, &[byte; 4096]).unwrap();
         vol.snapshot().unwrap();
+    }
+
+    /// classify_lba returns Data for a written block, Unmapped for a hole,
+    /// and Zero for an explicitly-zeroed block — mirroring read_block's
+    /// dispatch without touching bytes.
+    #[test]
+    fn classify_lba_covers_data_zero_and_unmapped() {
+        use elide_core::block_reader::LbaBacking;
+
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = new_vol_dir(tmp.path());
+        let mut vol = Volume::open(&vol_dir, tmp.path()).unwrap();
+        vol.write(0, &[0x42u8; 4096]).unwrap();
+        vol.write_zeroes(1, 1).unwrap();
+        drop(vol);
+
+        let reader = open_live_reader(&vol_dir).unwrap();
+
+        match reader.classify_lba(0) {
+            LbaBacking::Data {
+                body_length,
+                inline,
+                ..
+            } => {
+                assert!(body_length > 0, "data extent must have a body length");
+                // Inline threshold is 0 today, so this should be on-disk data.
+                assert!(!inline, "expected on-disk data for a 4 KiB write");
+            }
+            other => panic!("lba 0 should classify as Data, got {other:?}"),
+        }
+
+        assert!(
+            matches!(reader.classify_lba(1), LbaBacking::Zero),
+            "lba 1 should classify as Zero after write_zero"
+        );
+        assert!(
+            matches!(reader.classify_lba(2), LbaBacking::Unmapped),
+            "unwritten lba should classify as Unmapped"
+        );
     }
 
     /// BlockReader::open_live can read blocks from a flat volume's WAL.

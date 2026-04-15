@@ -15,6 +15,7 @@ tracing-log        = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono         = { version = "0.4", default-features = false, features = ["clock"] }
 clap           = { version = "4", features = ["derive", "env"] }
+crossterm      = "0.28"
 ctrlc          = "3"
 elide-core        = { path = "elide-core" }
 elide-coordinator = { path = "elide-coordinator" }
@@ -24,6 +25,7 @@ libc           = "0.2"
 lz4_flex       = "0.11"
 futures        = "0.3"
 object_store   = { version = "0.11", features = ["aws"] }
+ratatui        = "0.29"
 serde          = { version = "1", features = ["derive"] }
 tokio          = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 toml           = { version = "0.8", default-features = false, features = ["parse", "display"] }

@@ -22,6 +22,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use elide_core::block_reader::BlockReader;
 use elide_core::volume::Volume;
 
 mod common;
@@ -219,4 +220,90 @@ fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
             "promote_segment must delete index/{s}.idx"
         );
     }
+}
+
+/// A live `BlockReader` must serve reads from `gc/<new>` once `.applied` is
+/// written, even before `promote_segment` has moved the body into `cache/`.
+/// The `.applied` marker is what flips the LBA/extent index to route reads
+/// at the new segment — if reads can't then find the body, the invariant is
+/// broken and live tooling (ls, TUI inspector) fails with "segment not found".
+///
+/// Regression for a bug where `find_segment_file` only searched
+/// `wal/`, `pending/`, `cache/<sid>.body` and never `gc/<sid>`.
+#[test]
+fn live_reader_serves_blocks_from_gc_applied_before_promote() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    let block_a = [0xAA; 4096];
+    let block_b = [0xBB; 4096];
+    vol.write(0, &block_a).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_redact(&mut vol);
+
+    vol.write(1, &block_b).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_redact(&mut vol);
+
+    // Compact the two committed segments into one GC output, then have the
+    // volume re-sign it and patch the LBA/extent index via apply_gc_handoffs.
+    // Crucially: do NOT call promote_segment. That leaves the fork in the
+    // exact state a live reader hits when a GC pass has run but the
+    // coordinator hasn't yet uploaded + promoted the new segment.
+    let (new_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (consumed_ulids, produced_ulid, _) =
+        common::simulate_coord_gc_local(&fork_dir, new_ulid, 2).unwrap();
+    vol.apply_gc_handoffs().unwrap();
+
+    let gc_dir = fork_dir.join("gc");
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    let new_ulid_str = produced_ulid.to_string();
+
+    assert!(
+        gc_dir.join(&new_ulid_str).exists(),
+        "gc/<new> body must exist pre-promote"
+    );
+    assert!(
+        gc_dir.join(format!("{new_ulid_str}.applied")).exists(),
+        "gc/<new>.applied must exist pre-promote"
+    );
+    assert!(
+        !index_dir.join(format!("{new_ulid_str}.idx")).exists(),
+        "index/<new>.idx must NOT exist pre-promote"
+    );
+    assert!(
+        !cache_dir.join(format!("{new_ulid_str}.body")).exists(),
+        "cache/<new>.body must NOT exist pre-promote"
+    );
+
+    // Delete the old cache bodies so reads cannot silently fall back to
+    // the pre-GC canonical locations. `apply_gc_handoffs` already flips the
+    // extent index to point at gc/<new>, but insert_if_absent means the old
+    // idx entries still exist — without this step, a broken find_segment_file
+    // could be masked by the old cache bodies. Leaving the old .idx files
+    // alone (promote hasn't run yet) keeps the test aligned with the exact
+    // pre-promote state a live reader can encounter.
+    for old in &consumed_ulids {
+        let s = old.to_string();
+        fs::remove_file(cache_dir.join(format!("{s}.body"))).unwrap();
+        fs::remove_file(cache_dir.join(format!("{s}.present"))).unwrap();
+    }
+
+    // Drop the Volume so open_live sees filesystem state only.
+    drop(vol);
+
+    let reader = BlockReader::open_live(&fork_dir, Box::new(|_| None)).unwrap();
+    assert_eq!(
+        reader.read_block(0).unwrap(),
+        block_a,
+        "lba 0 must read through gc/<new> body"
+    );
+    assert_eq!(
+        reader.read_block(1).unwrap(),
+        block_b,
+        "lba 1 must read through gc/<new> body"
+    );
 }

@@ -10,7 +10,7 @@ use elide_core::volume;
 
 use elide::{
     coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size, resolve_volume_dir,
-    resolve_volume_size, validate_volume_name,
+    resolve_volume_size, tui, validate_volume_name,
 };
 
 /// Elide volume management and analysis tools.
@@ -31,6 +31,12 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Interactively inspect a volume's ext4 filesystem and its backing extents
+    Tui {
+        /// Volume name
+        name: String,
+    },
+
     /// Manage volumes
     Volume {
         #[command(subcommand)]
@@ -413,6 +419,18 @@ fn main() {
     let by_id_dir = args.data_dir.join("by_id");
 
     match args.command {
+        Command::Tui { name } => {
+            if let Err(e) = validate_volume_name(&name) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+            if let Err(e) = tui::run(&vol_dir, &name) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+
         Command::Volume { command } => match command {
             VolumeCommand::List { readonly, all } => {
                 let filter = if all {

@@ -30,6 +30,44 @@ use crate::{extentindex, lbamap, segment, signing, volume, writelog};
 /// `ObjectStoreFetcher`) must reverse locally.
 pub type FetcherFactory<'a> = dyn FnOnce(&[PathBuf]) -> Option<Box<dyn SegmentFetcher>> + 'a;
 
+/// How a single LBA is backed, without reading any body bytes.
+///
+/// Returned by `BlockReader::classify_lba` and used by inspection tools to
+/// render "what kind of entry stores this block". Each variant carries just
+/// the metadata the extent/lba indices already know — no payload, no hash
+/// verification.
+#[derive(Debug, Clone)]
+pub enum LbaBacking {
+    /// LBA has never been written (lbamap miss).
+    Unmapped,
+    /// LBA was explicitly zeroed.
+    Zero,
+    /// LBA resolves to a Data or Inline extent. `inline` is `true` when the
+    /// payload is held in memory (`ExtentLocation::inline_data`), `false` when
+    /// it lives in a segment file on disk.
+    Data {
+        hash: blake3::Hash,
+        segment_id: ulid::Ulid,
+        body_offset: u64,
+        body_length: u32,
+        compressed: bool,
+        inline: bool,
+        body_source: BodySource,
+    },
+    /// LBA resolves to a Delta extent. The payload is reconstructed at read
+    /// time by zstd-decompressing a delta blob against a source extent.
+    Delta {
+        hash: blake3::Hash,
+        segment_id: ulid::Ulid,
+        option_count: usize,
+        body_source: DeltaBodySource,
+    },
+    /// Hash present in the lba map but not in the extent index (neither data
+    /// nor delta). Indicates corruption or an incomplete rebuild — surfaced as
+    /// a classification variant rather than an error so tooling can render it.
+    Missing { hash: blake3::Hash },
+}
+
 /// Block-level reader over a volume's merged fork + ancestor state.
 pub struct BlockReader {
     /// Search path for segment files: fork dir first, then ancestors.
@@ -241,6 +279,41 @@ impl BlockReader {
     /// filemap row matches the segment entry without rehashing.
     pub fn hash_for_lba(&self, lba: u64) -> Option<blake3::Hash> {
         self.lbamap.lookup(lba).map(|(h, _)| h)
+    }
+
+    /// Classify what backs `lba` without reading any body bytes.
+    ///
+    /// Mirrors the dispatch in `read_block` but returns a descriptive enum
+    /// instead of the 4 KiB payload. Used by inspection tooling to show how
+    /// each LBA is actually stored (data, inline, delta, zero, unmapped,
+    /// or corrupt/missing).
+    pub fn classify_lba(&self, lba: u64) -> LbaBacking {
+        let Some((hash, _block_offset)) = self.lbamap.lookup(lba) else {
+            return LbaBacking::Unmapped;
+        };
+        if hash == volume::ZERO_HASH {
+            return LbaBacking::Zero;
+        }
+        if let Some(loc) = self.extent_index.lookup(&hash) {
+            return LbaBacking::Data {
+                hash,
+                segment_id: loc.segment_id,
+                body_offset: loc.body_offset,
+                body_length: loc.body_length,
+                compressed: loc.compressed,
+                inline: loc.inline_data.is_some(),
+                body_source: loc.body_source,
+            };
+        }
+        if let Some(delta_loc) = self.extent_index.lookup_delta(&hash) {
+            return LbaBacking::Delta {
+                hash,
+                segment_id: delta_loc.segment_id,
+                option_count: delta_loc.options.len(),
+                body_source: delta_loc.body_source,
+            };
+        }
+        LbaBacking::Missing { hash }
     }
 
     /// Read the 4 KiB block at `lba`.
@@ -631,6 +704,15 @@ fn find_segment_file(
     for dir in search_dirs {
         if let Some(hit) = crate::segment::locate_segment_body(dir, segment_id) {
             return Ok(hit);
+        }
+        // A gc/<sid> body is only a legitimate read source once the volume
+        // has re-signed it and written gc/<sid>.applied — that marker is
+        // what flips the LBA map / extent index to route reads here, and
+        // it's the same precondition `collect_gc_applied_segment_files`
+        // uses when seeding the extent index during rebuild.
+        let gc_body = dir.join("gc").join(&sid);
+        if gc_body.exists() && dir.join("gc").join(format!("{sid}.applied")).exists() {
+            return Ok(gc_body);
         }
     }
     Err(io::Error::other(format!(
