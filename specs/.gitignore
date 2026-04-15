@@ -5,3 +5,4 @@ states/
 # TLC trace exploration files (generated on invariant/liveness violations)
 *_TTrace_*.tla
 *_TTrace_*.bin
+*_trace_*.tlc
