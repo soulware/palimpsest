@@ -61,7 +61,7 @@ The volume's crash-recovery model is verified with [proptest](https://proptest-r
 | `PopulateFetched` | writes 3-file demand-fetch cache format (`.idx` + `.body` + `.present`) |
 | `ReadUnwritten` | reads LBA 64 (always outside write range); must be zero |
 
-`CoordGcLocal` picks the `n` oldest S3-confirmed segments, writes an output with `ULID = max(inputs).increment()`, writes a `.pending` handoff, and calls `vol.apply_gc_handoffs()` to exercise the volume's handoff path — the same algorithm as `elide-coordinator/src/gc.rs`.
+`CoordGcLocal` picks the `n` oldest S3-confirmed segments, writes a self-describing GC output to `gc/<ulid>.staged` (with the consumed input ULID list embedded in the segment header, no manifest sidecar), and calls `vol.apply_gc_handoffs()` to exercise the volume's handoff path — the same algorithm as `elide-coordinator/src/gc.rs`.
 
 ### Extending the tests
 
@@ -99,11 +99,11 @@ Each entry below has a named deterministic regression test; see the listed file 
 
 **Coordinator layer** (`gc_proptest.rs`, `gc_test.rs`):
 
-- Bug A: DEDUP_REF-only input segments were never deleted (no Repack/Remove line named them). Fix: emit a `Dead` handoff line for every consumed input.
-- Bug B: a write between `gc_checkpoint()` and `apply_gc_handoffs()` could revive a hash GC had marked dead, and `apply_gc_handoffs` would then remove the now-live hash. Fix: re-check `lba_referenced_hashes()` in `apply_gc_handoffs` and cancel the pass if any carried-dead hash is live.
+- Bug A: DEDUP_REF-only input segments were never deleted (no handoff line named them). Fix in the manifest era: emit a `Dead` line for every consumed input. Under the self-describing protocol every input ULID is in the new segment's header so this class of bug cannot recur.
+- Bug B: a write between `gc_checkpoint()` and `apply_gc_handoffs()` could revive a hash GC had marked dead, and `apply_gc_handoffs` would then remove the now-live hash. Fix: re-check `lba_referenced_hashes()` inside `apply_gc_handoffs` and cancel the pass if any not-carried hash is live.
 - Bug C: `gc_checkpoint` did not open a new WAL when the existing WAL was empty, so its ULID stayed below the freshly-minted GC output ULIDs. Fix: always open a new WAL after minting.
 - Bug D: `gc_checkpoint` flushed a non-empty WAL under its old (pre-mint) ULID. Fix: pre-mint `u_repack`, `u_sweep`, `u_wal` before any I/O and flush the WAL under `u_wal`.
-- Bug E: on restart, `apply_gc_handoffs` only processed `.pending` files; `.applied` files left the in-memory extent index stale once `apply_done_handoffs` removed old segments. Fix: process `.applied` files idempotently, and have the coordinator call `apply_gc_handoffs` before `apply_done_handoffs` on every tick.
+- Bug E: on restart, the extent index was rebuilt from on-disk `.idx` files which still pointed at old segments, leaving the system stale once `apply_done_handoffs` removed them. Fix in the manifest era: re-apply `.applied` handoffs on restart. Under the self-describing protocol the bare `gc/<new>` body is picked up by `collect_gc_applied_segment_files` during rebuild and feeds the extent index at low priority — so the bug is resolved structurally and no explicit re-apply is needed.
 - GC compactor converted DEDUP_REF entries to DATA entries with `stored_length=0`, producing a zero-length body record that caused EIO on rebuild. Fix: check `is_dedup_ref` and emit `new_dedup_ref` in the coordinator GC path. This bug was invisible to `elide-core`'s proptest because the test helper was a *separate reimplementation* of GC that happened to handle DEDUP_REFs correctly — which is why `gc_proptest.rs` exists in the coordinator crate, calling the real code.
 
 ### Known gaps
@@ -145,13 +145,13 @@ Key additions over the volume-level proptest:
 
 `elide-core/tests/concurrent_test.rs` enforces the ordering invariant between the coordinator and volume that neither proptest can cover: a live reader must never observe `segment not found` during a concurrent GC pass. The proptest suites are single-threaded by design, so the window between file deletion and extent-index update never opens there.
 
-**The invariant:** the coordinator must not delete old local segment files until the volume has renamed `gc/<ulid>.pending` to `gc/<ulid>.applied`. That rename is the volume's signal that its extent index now points at the new segment.
+**The invariant:** the coordinator must not delete old local segment files until the volume has renamed `gc/<ulid>.staged` to bare `gc/<ulid>` (the atomic commit point of the self-describing handoff). The bare file's appearance is the volume's signal that its extent index now points at the new segment, and the bare file itself is what the coordinator's `apply_done_handoffs` walks.
 
 The test seeds two segments, then runs a reader thread (500 read-all iterations) concurrently with a coordinator thread running one GC pass, asserting the reader's error list stays empty. The failure mode was confirmed by running once with inline deletion (before handoff apply), which reproduced `segment not found` for cold LBAs; the fix — returning paths for deferred deletion — made it pass.
 
 ## Formal model: TLA+ handoff protocol
 
-`specs/HandoffProtocol.tla` is a TLA+ model of the GC handoff protocol, checked with TLC. The handoff is a three-state file lifecycle (`absent → pending → applied → done`) driven by two actors that can crash and restart at any point. Proptest exercises this in-process and single-threaded; TLA+ covers correctness under all possible interleavings and crash points, including concurrent writes that supersede GC results.
+`specs/HandoffProtocol.tla` is a TLA+ model of the GC handoff protocol, checked with TLC. The model still describes the pre-self-describing three-state lifecycle (`absent → pending → applied → done`) and remains an accurate model of the safety invariants — the new on-disk shape is `absent → staged → bare → absent` but the same correctness properties hold (no segment is deleted without acknowledgment, no extent references a missing segment). Updating the TLA+ model to the new lifecycle is tracked as an open item.
 
 **Safety invariants:**
 

@@ -270,7 +270,7 @@ async fn drain_pending_to_store(
 }
 
 fn drain_pending(fork_dir: &std::path::Path) {
-    const HEADER_LEN: usize = 96;
+    const HEADER_LEN: usize = elide_core::segment::HEADER_LEN as usize;
     let pending_dir = fork_dir.join("pending");
     let index_dir = fork_dir.join("index");
     let cache_dir = fork_dir.join("cache");
@@ -913,14 +913,19 @@ fn gc_restart_safety_applied_handoff() {
     drop(vol);
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
 
-    // Step 6 (the fix): call apply_gc_handoffs on the reopened volume.  With
-    // the fix it detects the .applied file and re-applies the extent index
-    // update (idempotently, without re-signing or renaming).
+    // Step 6: call apply_gc_handoffs on the reopened volume. Under the
+    // self-describing GC handoff protocol, after step 4 the volume already
+    // renamed `gc/<new>.staged` to bare `gc/<new>`, and Volume::open's
+    // extent index rebuild picks the bare file up via
+    // collect_gc_applied_segment_files at high priority — so the extent
+    // index points to the new segment without any explicit re-apply. The
+    // second call therefore has nothing to do (returns 0). Bug E is now
+    // resolved structurally rather than by re-running the apply path.
     let re_applied = vol.apply_gc_handoffs().unwrap();
     assert_eq!(
-        re_applied, 1,
-        "apply_gc_handoffs must re-apply the .applied handoff after restart \
-         (Bug E: previously returned 0 here)"
+        re_applied, 0,
+        "after restart, the bare gc/<new> file feeds the extent index via \
+         rebuild — no re-apply needed"
     );
 
     // Step 7: apply_done_handoffs — deletes old segment bodies and .idx files,

@@ -1,6 +1,7 @@
 # Design: self-describing GC handoff (no manifest sidecar)
 
-Status: **proposed**
+Status: **accepted**, implemented in commits `196735f..cd9c4f9` on
+branch `gc-self-describing-handoff` (April 2026).
 
 Date: 2026-04-15
 
@@ -83,45 +84,72 @@ format evolution, no parse step.
 ### Normal path
 
 1. **Coordinator**: compacts old segments → writes
+   `gc/<ulid>.staged.tmp`, fsyncs, renames to
    `gc/<ulid>.staged` (body with the new `inputs` field in the
    header, coordinator-signed pending volume re-sign).
 2. **Volume** (inside `apply_gc_handoffs`):
    - Reads `gc/<ulid>.staged` entries + inputs list.
    - Reads each input's index, computes repack/remove actions.
    - Updates extent index in memory.
-   - Re-signs the body in place (overwrites header signature with
-     volume key).
-   - `rename(gc/<ulid>.staged, gc/<ulid>)` ← **atomic commit point**.
+   - Writes a re-signed copy to `gc/<ulid>.tmp` (volume key over
+     the same header+index bytes — deterministic).
+   - `rename(gc/<ulid>.tmp, gc/<ulid>)` ← **atomic commit point**:
+     the bare name appears.
+   - `remove(gc/<ulid>.staged)` — cleanup (idempotent).
 3. **Coordinator**: polls for bare-name presence, uploads to S3,
    writes `index/<ulid>.idx`, deletes `gc/<ulid>`.
 
-### Restart recovery
+### Crash recovery
 
-On volume restart, walk `gc/` and take action per filename state:
+The only filename states on disk are `.staged.tmp`, `.staged`,
+`.tmp`, and bare. Every other distinction (which key signed the
+header, whether S3 has the object) is resolved from content and is
+idempotent under re-execution.
 
-- `gc/<ulid>.staged` exists → handoff not applied yet.
-  Re-run apply (steps 2a–2e above). Idempotent: if the body was
-  already re-signed but the rename failed, verifying with the
-  volume key either succeeds (proceed to rename) or fails
-  (re-sign then rename). The commit-point rename is the crash
-  boundary.
-- `gc/<ulid>` exists (bare) → handoff already applied. No volume
-  action. The extent index rebuild picks it up via
-  `collect_gc_applied_segment_files` (renamed accordingly —
-  probably `collect_gc_bare_segment_files` or fold into the main
-  `collect_segment_files`).
-- Anything else (`.staged` with a vanished `inputs` entry, partial
-  files) → warn-and-skip, same as today.
+| # | When crash happens | On-disk state | Recovery |
+|---|---|---|---|
+| 1 | coordinator mid-write (before staged rename) | `.staged.tmp` | sweep stale tmps at startup |
+| 2 | coordinator wrote `.staged`; volume hasn't applied | `.staged` (coordinator-signed) | volume's next apply tick picks it up |
+| 3 | volume mid-apply, re-signed file not yet written | `.staged` | re-run apply — idempotent (extent index is rebuilt from disk on boot anyway) |
+| 4 | volume mid-write of `.tmp` | `.staged` + partial `.tmp` | sweep stale `.tmp`, re-run apply |
+| 5 | volume post-rename, pre-remove-staged | `.staged` + bare | bare wins; remove `.staged` |
+| 6 | volume post-cleanup | bare | coordinator picks it up |
+| 7 | coordinator post-upload, pre-delete | bare + S3 object | idempotent re-upload + delete on next tick |
+| 8 | steady state | (gone) | — |
 
-On coordinator restart, walk `gc/` and take action per filename:
+Why this works without intermediate filename states:
 
-- `.staged` → wait; the volume either hasn't applied yet or is
-  mid-apply. Not the coordinator's turn.
+- **Re-apply is deterministic.** Inputs list + input `.idx` files +
+  new segment's entries produce the same apply set on every run.
+  Extent index updates are from fixed content, not clock or PRNG.
+- **Re-sign is deterministic.** The hash input is
+  `header[0..36] || index_bytes`, both fixed on disk. A torn or
+  partial `.tmp` is discarded; a fresh `.tmp` regenerates byte-
+  identical output.
+- **Rename is the only commit.** No in-place mutation of
+  `.staged`. Either `.tmp` was renamed to bare or it wasn't; there
+  is no "half-committed" state in between.
+
+Recovery rules (volume startup, walking `gc/`):
+
+- `.staged.tmp` or `<ulid>.tmp` → remove (stale from crash).
+- `.staged` only → re-run apply.
+- `.staged` + bare → bare wins; remove `.staged`.
+- bare only → already applied, no volume action; extent index
+  rebuild picks it up.
+- `.staged` with a vanished input `.idx` → warn-and-skip, same as
+  today.
+
+Recovery rules (coordinator startup, walking `gc/`):
+
+- `.staged.tmp` → remove (stale from crash).
+- `.staged` → wait; not the coordinator's turn.
 - bare → queue for upload if not already uploaded (idempotent by
   S3 object existence or a coordinator-local cursor).
 
-The current `.done` state disappears entirely: "done" is "file
-deleted after upload succeeds."
+The current `.applied` and `.done` states disappear entirely.
+"Applied" is "file is bare-named"; "done" is "file deleted after
+upload succeeds."
 
 ## What changes
 
@@ -153,10 +181,13 @@ is acceptable since volumes are reproducible from their source data.
 - Walk `gc/` for `.staged` entries (not `.pending` files).
 - For each: read the `.staged` body, extract `inputs`, compute the
   apply set from input/new segment diffs, update extent index,
-  re-sign body, rename `.staged → bare`.
-- Commit point moves from the manifest rename to the body rename.
-- Restart recovery runs the same walk — `.staged` means "not
-  applied yet, re-run apply"; bare means "already applied".
+  write a volume-signed copy to `<ulid>.tmp`, rename
+  `<ulid>.tmp → <ulid>`, remove `<ulid>.staged`.
+- Commit point is the tmp→bare rename. `.staged` is never mutated
+  in place — re-apply on crash regenerates a byte-identical `.tmp`.
+- Crash recovery: see the table in "Crash recovery" above.
+  Summary: stale `.tmp` or `.staged.tmp` → remove; `.staged` alone
+  → re-run apply; `.staged` + bare → bare wins.
 
 ### Coordinator GC (`elide-coordinator/src/gc.rs`)
 

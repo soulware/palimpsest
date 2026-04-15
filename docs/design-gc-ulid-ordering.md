@@ -6,6 +6,18 @@ LBA-dead extent cleanup; actor GcCheckpoint handler fixed to use volume mint)
 
 Date: 2026-03-30
 
+> **Note (April 2026):** the historical handoff filename references in
+> this document — `.pending`, `.applied`, `.done`, removal-only handoffs
+> as plaintext manifest lines — are out of date. The self-describing GC
+> handoff protocol (see `docs/design-gc-self-describing-handoff.md`)
+> replaces the manifest sidecar entirely; the on-disk lifecycle is now
+> `gc/<ulid>.staged` → bare `gc/<ulid>` → deleted, with the consumed
+> input ULID list carried in the segment header. The ULID ordering
+> invariants this document records are unchanged: GC outputs still get
+> `max(inputs).increment()` and `gc_checkpoint` still pre-mints
+> `(u_repack, u_sweep, u_wal)` in one shot for crash-recovery
+> correctness.
+
 ---
 
 ## Context

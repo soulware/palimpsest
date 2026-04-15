@@ -187,7 +187,7 @@ enum ReclaimHint {
 - If the hint file is lost, the coordinator re-scans and re-emits on its next pass.
 - If a hint is processed twice, tier 1 catches the second attempt.
 
-This is a qualitatively different contract from anything else the coordinator tells the volume: `HandoffLine::Repack` and `.applied` markers are durability-critical state. Hints sit in a new, looser bucket.
+This is a qualitatively different contract from anything else the coordinator tells the volume: GC handoffs (`gc/<ulid>.staged` → bare → finalised) are durability-critical state. Hints sit in a new, looser bucket.
 
 **Hint sources.**
 

@@ -156,7 +156,7 @@ Each GC tick runs three passes per fork:
 
 Repack and sweep run on disjoint inputs. Per-tick work is bounded: dead pre-pass is O(1) per segment, repack processes one, sweep caps at 32 MiB.
 
-**Liveness** — an entry is live only if both (a) the reconstructed extent index still points to this input segment for that hash, and (b) `lbamap.hash_at(lba) == Some(hash)`. LBA-dead entries are recorded as `remove` lines in the handoff. The coordinator rebuilds liveness from on-disk files only — in-memory WAL entries are not visible. Worst case is a small space leak (an extent carried into the output that will be dead once the WAL flushes), never corruption. Dedup-ref entries are carried only if the start LBA still maps to the hash — unconditional carry or drop both corrupt data (see `docs/testing.md` bug E). Snapshot-floor segments are skipped.
+**Liveness** — an entry is live only if both (a) the reconstructed extent index still points to this input segment for that hash, and (b) `lbamap.hash_at(lba) == Some(hash)`. The coordinator rebuilds liveness from on-disk files only — in-memory WAL entries are not visible. Worst case is a small space leak (an extent carried into the output that will be dead once the WAL flushes), never corruption. Dedup-ref entries are carried only if the start LBA still maps to the hash — unconditional carry or drop both corrupt data (see `docs/testing.md` bug E). Snapshot-floor segments are skipped. LBA-dead extents that aren't carried into the output are simply absent from the new segment; the volume's apply path sees them in the input `.idx` files but not in the output and removes the corresponding extent-index entries.
 
 ### `gc_checkpoint` — the pre-mint pattern
 
@@ -164,41 +164,77 @@ Before each GC pass the coordinator calls `gc_checkpoint` on the volume. The vol
 
 The GC output ULID is `max(inputs).increment()`. Because input segments have already drained (timestamps seconds to minutes behind wall-clock), any concurrent write gets a ULID far ahead of the output and wins at rebuild — no locking needed, and a missed concurrent write is at worst a space leak.
 
-### Handoff file format
+### Self-describing handoff
 
-`gc/<result-ulid>.pending` holds extent index patches, one per line:
+Under the self-describing GC handoff protocol (see
+`docs/design-gc-self-describing-handoff.md`) there is no separate
+manifest file. The compacted segment carries the sorted list of
+input ULIDs in its own header (`inputs_length` field at byte 32; data
+at the tail of the index section). The volume's apply path reads this
+field, walks each input's `.idx`, and derives the
+extent-index updates by diffing the input entries against the new
+segment's entries — repacks become "entry present in input idx and in
+new segment, currently extent-canonical at input → re-point to new",
+removes become "entry present in input idx, absent from new segment".
 
-```
-repack <hash_hex> <old_ulid> <new_ulid> <new_body_offset>
-remove <hash_hex> <old_ulid>
-dead   <old_ulid>
-```
+A *tombstone handoff* is a zero-entry GC output with a non-empty
+`inputs` list — a real but tiny segment file whose only purpose is to
+acknowledge that the input segments are safe to delete. A
+*removal-only handoff* (extent-index references but no live LBAs)
+collapses into the same shape: zero entries, inputs filled in.
 
-Only-`remove` is a *removal-only handoff* (no output segment, no re-sign). Only-`dead` is a *tombstone handoff*. Files may mix `repack` and `remove`.
+### Filename lifecycle
 
-Each handoff progresses through three states (`GcHandoffState` enum; `GcHandoff::from_filename` parses directory entries):
+Only two suffix states exist on disk:
 
-| File | State | Meaning |
-|---|---|---|
-| `gc/<ulid>.pending` | `Pending` | Staged; volume has not applied |
-| `gc/<ulid>.applied` | `Applied` | Volume applied; coordinator has not cleaned up |
-| `gc/<ulid>.done` | `Done` | Done; retained 7 days then pruned |
+| File | Meaning |
+|---|---|
+| `gc/<ulid>.staged` | Coordinator-staged, ephemeral-signed; volume has not applied |
+| `gc/<ulid>` (bare) | Volume-applied, volume-signed; coordinator has not uploaded |
+
+`<ulid>.tmp` and `<ulid>.staged.tmp` are transient scratch files
+written via tmp+rename. They are swept on every apply pass.
 
 ### Handoff protocol
 
 1. Coordinator `gc_checkpoint` → `(u_repack, u_sweep)`.
-2. Coordinator stages `gc/<result-ulid>` (ephemeral-signed, repack only) and `gc/<result-ulid>.pending` via tmp-rename.
-3. Volume (idle arm) re-signs `gc/<result-ulid>` with `volume.key`, writes `index/<result-ulid>.idx`, applies the patches (`repack` updates the extent location, `remove` deletes the reference, `dead` is a no-op verify), evicts old `cache/<old-ulid>.*`, renames `.pending → .applied`.
-4. Coordinator (next tick) uploads `gc/<result-ulid>` (volume-signed), deletes old S3 objects, removes old local segment files, `promote` IPC → volume writes `cache/<new>.*` and removes `gc/<new-ulid>`, then renames `.applied → .done`.
-5. Periodic TTL cleanup deletes `.done` files older than 7 days.
+2. Coordinator compacts inputs, writes `gc/<result-ulid>.staged.tmp`
+   via `write_gc_segment` (ephemeral-signed, with `inputs = sorted
+   candidate ULIDs`), renames to `gc/<result-ulid>.staged`.
+3. Volume (idle arm, `apply_gc_handoffs`) reads the staged body, walks
+   each input's `.idx`, derives the extent-index updates, evicts
+   `cache/<old-ulid>.*` for each input, writes a re-signed copy to
+   `gc/<result-ulid>.tmp`, renames `<result-ulid>.tmp → <result-ulid>`
+   (the bare name; this rename is the **atomic commit point**), then
+   removes `gc/<result-ulid>.staged`.
+4. Coordinator (next tick, `apply_done_handoffs`) sees the bare file,
+   uploads it to S3, sends a `promote` IPC. The volume's
+   `promote_segment` handler writes `index/<new>.idx`,
+   `cache/<new>.{body,present}`, and deletes `index/<old>.idx` for
+   each input (read from the new segment's `inputs` header field).
+5. Coordinator deletes the old S3 objects, then sends a
+   `finalize_gc_handoff` IPC. The volume deletes the bare
+   `gc/<result-ulid>` body. Handoff complete.
 
-A crash at any step leaves recoverable state — `.pending`/`.applied` re-process on the next tick.
+A crash at any step leaves recoverable state. The crash-recovery
+table lives in `docs/design-gc-self-describing-handoff.md`; the short
+version is: stale `.tmp` / `.staged.tmp` are swept; `.staged` alone
+re-runs apply (the apply path is deterministic, so a partial `.tmp`
+from a crashed re-sign produces the same bytes on retry); `.staged` +
+bare → bare wins, drop `.staged`; bare alone → already applied.
 
-**Restart safety.** On restart the extent index is rebuilt from on-disk `.idx` files, which still point to old segments until `apply_done_handoffs` removes them. Two mechanisms close the gap: `apply_gc_handoffs` also processes `.applied` files (re-applying the extent-index updates idempotently with the same `still_at_old` check), and the coordinator calls `apply_gc_handoffs` IPC immediately before `apply_done_handoffs` on every GC tick.
+**Restart safety.** On restart the extent index is rebuilt from on-disk
+`.idx` files. Bare `gc/<ulid>` files are also picked up by
+`collect_gc_applied_segment_files` and feed the rebuild at higher
+priority than `index/<old>.idx`, so the extent index points to the
+new segment immediately on reopen — no explicit re-apply needed.
+Tombstone outputs (zero entries) contribute nothing to the rebuild but
+their `inputs` field is still consulted by `promote_segment` to delete
+the now-superseded input idx files.
 
 **Coordinator deletion invariant — no segment is deleted without the volume's acknowledgment.** Every deletion, including all-dead segments, goes through the handoff protocol (tombstone for the all-dead case). Direct coordinator deletion is unsafe because its liveness view is rebuilt from on-disk files, which may be behind the volume's in-memory LBA map. Verified in `specs/HandoffProtocol.tla`.
 
-Only one outstanding pass per fork: new passes are deferred while any `gc/*.pending` files exist.
+Only one outstanding pass per fork: new passes are deferred while any `gc/<ulid>.staged` or bare `gc/<ulid>` files exist.
 
 ### S3 repacking (future, not implemented)
 

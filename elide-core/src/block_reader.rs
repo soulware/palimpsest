@@ -561,7 +561,8 @@ fn apply_snapshot_layer(
         let layout = segment::read_segment_layout(&idx_path)?;
         let _body_length = layout.body_length;
 
-        let (_bss, entries) = segment::read_and_verify_segment_index(&idx_path, &layer.vk)?;
+        let (_bss, entries, _inputs) =
+            segment::read_and_verify_segment_index(&idx_path, &layer.vk)?;
 
         let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
         let inline_bytes = if has_inline {

@@ -250,7 +250,7 @@ async fn fetch_one_extent(
     let present_path = body_dir.join(format!("{segment_id}.present"));
 
     // Read the full index so we can scan ahead for adjacent absent entries.
-    let (_, entries) = segment::read_segment_index(&idx_path)?;
+    let (_, entries, _) = segment::read_segment_index(&idx_path)?;
     let start = extent.entry_idx as usize;
     if start >= entries.len() {
         return Err(io::Error::other(format!(
@@ -808,8 +808,8 @@ mod tests {
         write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
 
         let mut bytes = std::fs::read(&seg_path).unwrap();
-        // Zero out the signature field at header[32..96].
-        bytes[32..96].fill(0);
+        // Zero out the signature field at header[36..100] (segment v5).
+        bytes[36..100].fill(0);
 
         let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

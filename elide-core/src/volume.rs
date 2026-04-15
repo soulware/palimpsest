@@ -37,7 +37,6 @@ use ulid::Ulid;
 
 use crate::{
     extentindex::{self, BodySource},
-    gc::{GcHandoff, GcHandoffState, HandoffLine},
     lbamap,
     segment::{self, EntryKind},
     ulid_mint::UlidMint,
@@ -123,6 +122,17 @@ enum SegmentLayout {
     /// A `.body` cache file (cache/<id>.body). Contains only body bytes
     /// starting at offset 0 — body-relative offsets are file offsets directly.
     BodyOnly,
+}
+
+/// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedApply {
+    /// The staged segment was applied; extent index updated, body re-signed
+    /// and renamed to bare, `.staged` file removed.
+    Applied,
+    /// The apply was cancelled (e.g. stale-liveness check) and the staged
+    /// file was removed. Extent index is unchanged.
+    Cancelled,
 }
 
 impl SegmentLayout {
@@ -1137,7 +1147,7 @@ impl Volume {
                 continue;
             }
 
-            let (body_section_start, mut entries) =
+            let (body_section_start, mut entries, _inputs) =
                 match segment::read_and_verify_segment_index(&seg_path, &self.verifying_key) {
                     Ok(v) => v,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -1493,7 +1503,7 @@ impl Volume {
             }
 
             let file_size = fs::metadata(seg_path)?.len();
-            let (body_section_start, mut entries) =
+            let (body_section_start, mut entries, _inputs) =
                 segment::read_and_verify_segment_index(seg_path, &self.verifying_key)?;
 
             let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
@@ -1722,382 +1732,277 @@ impl Volume {
     /// no idx is never mistaken for an S3-confirmed segment.
     ///
     /// **`.pending` handoffs** (normal path):
-    /// Re-signs the coordinator-staged segment body with the volume key, applies
-    /// extent index updates, then renames the file to `.applied` to signal the
-    /// coordinator that it is safe to upload.
+    /// Walks `gc/` for `.staged` entries and applies each via the
+    /// derive-at-apply path: read `inputs` from the segment header, diff
+    /// each input's `.idx` against the new segment's entries to build the
+    /// extent-index updates, re-sign the body with the volume key, rename
+    /// `<ulid>.tmp → <ulid>` (atomic commit), then remove `<ulid>.staged`
+    /// and evict input cache files.
     ///
-    /// **`.applied` handoffs** (restart-safety path):
-    /// Re-applies extent index updates without re-signing or renaming.  On restart,
-    /// `Volume::open` rebuilds the extent index from `gc/*.applied` (via
-    /// `collect_gc_applied_segment_files`) which correctly shadows any stale
-    /// `index/<old>.idx` entries still on disk.  The `still_at_old` check makes
-    /// this re-application idempotent.
-    ///
-    /// Returns the number of handoff files processed.  Returns `Ok(0)` if the
-    /// `gc/` directory does not exist yet (coordinator has not run).
+    /// Returns the number of handoff files processed. Returns `Ok(0)` if
+    /// the `gc/` directory does not exist yet.
     pub fn apply_gc_handoffs(&mut self) -> io::Result<usize> {
         let gc_dir = self.base_dir.join("gc");
+        self.apply_all_staged_handoffs(&gc_dir)
+    }
+
+    /// Walk `gc/` for `.staged` entries and apply each via the
+    /// self-describing derive-at-apply path.
+    ///
+    /// Also handles crash-recovery filename states:
+    /// - `<ulid>.tmp` / `<ulid>.staged.tmp` — stale from a crashed write.
+    ///   Remove on sight.
+    /// - `<ulid>.staged` alone — apply normally.
+    /// - `<ulid>.staged` + bare `<ulid>` — bare wins (previous apply
+    ///   committed before cleanup); remove the `.staged`.
+    /// - bare `<ulid>` alone — already applied, no action.
+    fn apply_all_staged_handoffs(&mut self, gc_dir: &Path) -> io::Result<usize> {
         if !gc_dir.try_exists()? {
             return Ok(0);
         }
 
-        let mut pending: Vec<(String, GcHandoff)> = fs::read_dir(&gc_dir)?
+        // Pass 1: sweep stale `.tmp` files (incomplete writes).
+        for entry in fs::read_dir(gc_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+
+        // Pass 2: collect `.staged` files.
+        let mut staged: Vec<(String, Ulid)> = fs::read_dir(gc_dir)?
             .filter_map(|e| {
                 let e = e.ok()?;
                 let name = e.file_name().into_string().ok()?;
-                let handoff = GcHandoff::from_filename(&name)?;
-                handoff.state.needs_apply().then_some((name, handoff))
+                let stem = name.strip_suffix(".staged")?;
+                let ulid = Ulid::from_string(stem).ok()?;
+                Some((name, ulid))
             })
             .collect();
+        staged.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-        if pending.is_empty() {
-            return Ok(0);
-        }
+        let mut count = 0usize;
+        for (staged_name, new_ulid) in staged {
+            let staged_path = gc_dir.join(&staged_name);
+            let bare_path = gc_dir.join(new_ulid.to_string());
 
-        // Process oldest-first so the extent index is correct after a partial run.
-        pending.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        let mut count = 0;
-
-        for (name, handoff) in &pending {
-            let new_ulid = handoff.ulid;
-            let new_ulid_str = new_ulid.to_string();
-            let is_already_applied = handoff.state == GcHandoffState::Applied;
-
-            // Parse the .pending / .applied file into typed HandoffLines.
-            //
-            // old_ulid_by_hash maps each hash to the old segment it came from
-            // so the extent index can be updated only when it still points at
-            // the old segment.  Dead lines carry no hash — they are a no-op
-            // from the volume's perspective (just an acknowledgment).
-            let pending_content = fs::read_to_string(gc_dir.join(name))?;
-            let mut old_ulid_by_hash: HashMap<blake3::Hash, Ulid> = HashMap::new();
-            let mut dead_ulids: Vec<Ulid> = Vec::new();
-            let mut is_tombstone = false;
-            for line in pending_content.lines() {
-                match HandoffLine::parse(line) {
-                    Some(HandoffLine::Repack { hash, old_ulid, .. })
-                    | Some(HandoffLine::Remove { hash, old_ulid }) => {
-                        old_ulid_by_hash.insert(hash, old_ulid);
-                    }
-                    Some(HandoffLine::Dead { old_ulid }) => {
-                        dead_ulids.push(old_ulid);
-                        is_tombstone = true;
-                    }
-                    None => {}
-                }
+            // Crash recovery: `.staged` + bare → bare wins, drop `.staged`.
+            if bare_path.try_exists()? {
+                let _ = fs::remove_file(&staged_path);
+                count += 1;
+                continue;
             }
 
-            // The coordinator stages its output in gc/<ulid> with an ephemeral
-            // key.  Re-sign it in-place with the volume's key (write to
-            // gc/<ulid>.tmp, rename over gc/<ulid>).  The body stays in gc/
-            // until the coordinator uploads it to S3 and writes index/<ulid>.idx
-            // + cache/<ulid>.{body,present}, then deletes gc/<ulid>.
-            //
-            // Idempotency: re-signing is a pure function of the segment content;
-            // if we crash mid-rename and retry, the output is identical.
-            let gc_seg_path = gc_dir.join(&new_ulid_str);
-            // .pending handoffs: re-sign the coordinator-staged body with the volume key.
-            // .applied handoffs: already volume-signed; skip re-signing.
-            if !is_already_applied && gc_seg_path.try_exists()? {
-                let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
-                let gc_inline = segment::read_inline_section(&gc_seg_path)?;
-                segment::read_extent_bodies(
-                    &gc_seg_path,
-                    bss,
-                    &mut entries,
-                    [EntryKind::Data, EntryKind::DedupRef, EntryKind::Inline],
-                    &gc_inline,
-                )?;
-                let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
-                segment::write_segment(&tmp_path, &mut entries, self.signer.as_ref())?;
-                fs::rename(&tmp_path, &gc_seg_path)?;
-            }
-
-            // Locate the segment for index reads: normally gc/ (the volume-signed
-            // body); after a restart where the coordinator already uploaded and
-            // deleted gc/<ulid>, fall back to index/<ulid>.idx — it contains the
-            // same header+index section and is sufficient for read_and_verify_segment_index.
-            let body_path: Option<PathBuf> = if gc_seg_path.try_exists()? {
-                Some(gc_seg_path.clone())
-            } else if is_already_applied {
-                let idx_path = self
-                    .base_dir
-                    .join("index")
-                    .join(format!("{new_ulid_str}.idx"));
-                idx_path.try_exists()?.then_some(idx_path)
-            } else {
-                None
-            };
-            let segment_exists = body_path.is_some();
-
-            // If the new segment doesn't exist locally, only some handoff
-            // types can proceed without it:
-            //   tombstone — no segment ever exists; just acknowledge.
-            //   removal-only — no segment needed; just clean extent index.
-            //   repack — needs the segment for extent index updates;
-            //            defer until available (e.g. fetched from S3).
-            if !segment_exists {
-                let has_carried = pending_content
-                    .lines()
-                    .any(|l| matches!(HandoffLine::parse(l), Some(HandoffLine::Repack { .. })));
-                if !is_tombstone && (has_carried || old_ulid_by_hash.is_empty()) {
-                    continue;
+            match self.apply_staged_handoff(gc_dir, &staged_path, new_ulid)? {
+                StagedApply::Applied => count += 1,
+                StagedApply::Cancelled => {
+                    // Stale-liveness cancel already removed `.staged` inside.
                 }
             }
-
-            // Read the (now volume-signed) compacted segment's index.  This
-            // is done once and reused for both the carried_hashes scan and the
-            // extent index update, avoiding a second signature verification.
-            let segment_index = body_path
-                .as_ref()
-                .map(|bp| segment::read_and_verify_segment_index(bp, &self.verifying_key))
-                .transpose()?;
-
-            // First pass: build carried_hashes WITHOUT touching the extent
-            // index.  We must know the full set before the Bug B check below,
-            // because the check must run before any extent index mutations —
-            // if we cancel mid-apply the index would be left in a partially
-            // updated state.
-            let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
-            if let Some((_, ref entries)) = segment_index {
-                for e in entries {
-                    if e.kind != EntryKind::DedupRef {
-                        carried_hashes.insert(e.hash);
-                    }
-                }
-            }
-
-            // Bug B: a DEDUP_REF written after gc_checkpoint makes a hash H
-            // live again in the LBA map, but the coordinator's liveness view
-            // (built at gc_fork time) did not see it.  H is therefore absent
-            // from carried_hashes, yet deleting the old segment would
-            // permanently lose H's data — the extent index entry for H still
-            // points to the old segment, which apply_done_handoffs would
-            // delete.
-            //
-            // Detection: any hash in old_ulid_by_hash that is (a) not
-            // carried into the GC output and (b) still referenced by an LBA.
-            //
-            // Resolution: cancel this GC pass by deleting the .pending file
-            // (and the stale body if present) so gc_fork can re-run with
-            // current liveness data on the next tick.  The old segment
-            // remains until the corrected GC pass handles it safely.
-            //
-            // This check MUST precede any extent index mutations (second pass
-            // below) so there is nothing to undo if we cancel.
-            //
-            // For .applied handoffs: skip this check.  The stale-liveness
-            // detection already ran (and passed) before the .applied marker
-            // was created.  Re-running it after a restart would incorrectly
-            // cancel a committed handoff — the .applied state means the volume
-            // already acknowledged that deleting the old segment is safe.
-            let live = self.lbamap.lba_referenced_hashes();
-            if !is_already_applied {
-                let stale: Vec<blake3::Hash> = old_ulid_by_hash
-                    .keys()
-                    .filter(|h| !carried_hashes.contains(h) && live.contains(h))
-                    .copied()
-                    .collect();
-                if !stale.is_empty() {
-                    let details: Vec<String> = stale
-                        .iter()
-                        .map(|h| {
-                            let lbas = self.lbamap.lbas_for_hash(h);
-                            let in_pending = self.pending_entries.iter().any(|e| &e.hash == h);
-                            let seg = self
-                                .extent_index
-                                .lookup(h)
-                                .map(|loc| {
-                                    format!("seg={} off={}", loc.segment_id, loc.body_offset)
-                                })
-                                .unwrap_or_else(|| "not-in-extent-index".to_string());
-                            let old_ulid = old_ulid_by_hash
-                                .get(h)
-                                .map(|u| u.to_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            format!(
-                                "{}: lbas={:?} in_pending_entries={} {} old_ulid={}",
-                                &h.to_hex()[..12],
-                                lbas,
-                                in_pending,
-                                seg,
-                                old_ulid,
-                            )
-                        })
-                        .collect();
-                    log::warn!(
-                        "GC handoff {name}: stale-liveness cancellation — {} hash(es) live \
-                         in volume but absent from coordinator output; re-running next tick.\n  {}",
-                        stale.len(),
-                        details.join("\n  "),
-                    );
-                    let _ = fs::remove_file(gc_dir.join(name)); // .pending
-                    if gc_seg_path.try_exists()? {
-                        let _ = fs::remove_file(&gc_seg_path); // body
-                    }
-                    continue;
-                }
-            }
-
-            // Second pass: apply extent index updates for carried hashes.
-            // Safe to mutate the index now — stale_liveness was clear above.
-            //
-            // `index_mutated` tracks whether this pass actually changed the
-            // extent index.  For `.applied` handoffs (restart-recovery path)
-            // the idle tick has usually already applied the same mutations, so
-            // `still_at_old` will be false for every entry and nothing changes.
-            // We only count an `.applied` handoff toward the return value when
-            // mutations did happen, so the coordinator can distinguish genuine
-            // restart recovery from a redundant steady-state re-check.
-            let mut index_mutated = false;
-            if let Some((body_section_start, ref entries)) = segment_index {
-                // Read inline section for any inline entries in the GC output.
-                let handoff_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
-                    body_path
-                        .as_ref()
-                        .map(|p| segment::read_inline_section(p))
-                        .transpose()?
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                for (i, e) in entries.iter().enumerate() {
-                    if e.kind == EntryKind::DedupRef {
-                        continue;
-                    }
-                    // Only update if the extent index still points at the old
-                    // segment that GC consumed.  If a newer write has
-                    // superseded it, the current entry is more recent and must
-                    // not be overwritten.
-                    let still_at_old = match (
-                        self.extent_index.lookup(&e.hash),
-                        old_ulid_by_hash.get(&e.hash),
-                    ) {
-                        (Some(loc), Some(old_ulid)) => loc.segment_id == *old_ulid,
-                        _ => false,
-                    };
-                    if !still_at_old {
-                        continue;
-                    }
-                    let idata = if e.kind == EntryKind::Inline {
-                        let start = e.stored_offset as usize;
-                        let end = start + e.stored_length as usize;
-                        if end <= handoff_inline.len() {
-                            Some(handoff_inline[start..end].into())
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        None
-                    };
-                    Arc::make_mut(&mut self.extent_index).insert(
-                        e.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: new_ulid,
-                            body_offset: e.stored_offset,
-                            body_length: e.stored_length,
-                            compressed: e.compressed,
-                            body_source: BodySource::Cached(i as u32),
-                            body_section_start,
-                            inline_data: idata,
-                        },
-                    );
-                    index_mutated = true;
-                }
-            }
-
-            // Remove extent index entries for hashes that were in the
-            // consumed segments but filtered out of the GC output (LBA-dead
-            // extents).  Without this, the extent index would retain a
-            // dangling reference to the old segment file which is about to
-            // be deleted.
-            for (hash, old_ulid) in &old_ulid_by_hash {
-                if carried_hashes.contains(hash) {
-                    continue;
-                }
-                // Defense-in-depth: stale_liveness above ensures no live hash
-                // reaches this point, but guard here as well.
-                if live.contains(hash) {
-                    continue;
-                }
-                if self
-                    .extent_index
-                    .lookup(hash)
-                    .is_some_and(|loc| loc.segment_id == *old_ulid)
-                {
-                    Arc::make_mut(&mut self.extent_index).remove(hash);
-                    index_mutated = true;
-                }
-            }
-
-            // For .pending handoffs: commit the GC handoff:
-            //
-            //   1. Delete pending/<old> for each consumed input (best-effort;
-            //      these files are normally already gone since consumed segments
-            //      were S3-confirmed and thus already promoted).
-            //   1b. For tombstone/remove-only handoffs (no GC output body):
-            //      delete index/<old>.idx here, since promote_segment will
-            //      never run (there is no new body to promote).  For regular
-            //      repacks, idx deletion is deferred to the promote_segment IPC
-            //      handler (after the coordinator confirms S3 upload).
-            //   2. Rename .pending → .applied to signal the coordinator.
-            //
-            //   For regular repacks: index/<new>.idx write and index/<old>.idx
-            //   deletion are deferred to the promote_segment IPC handler, which
-            //   runs after the coordinator confirms S3 upload of the new segment.
-            //   This preserves the invariant: idx present ↔ segment in S3.
-            //
-            //   cache/<old>.{body,present} are NOT deleted here.  Concurrent
-            //   readers may hold a snapshot that still references old_ulid; the
-            //   actor loop calls evict_applied_gc_cache() AFTER publishing the
-            //   new snapshot, eliminating the read-error window.
-            //
-            // For .applied handoffs: the above steps already ran; skip them.
-            if !is_already_applied {
-                // Step 1: clean up any stale pending/ files for consumed segments.
-                let pending_dir = self.base_dir.join("pending");
-                let mut old_ulids: Vec<Ulid> = old_ulid_by_hash.values().copied().collect();
-                old_ulids.extend_from_slice(&dead_ulids);
-                old_ulids.sort_unstable();
-                old_ulids.dedup();
-                for old_ulid in &old_ulids {
-                    let _ = fs::remove_file(pending_dir.join(old_ulid.to_string()));
-                }
-
-                // Step 1b: tombstone/remove-only — no GC body exists so
-                // promote_segment will never run; delete old idx here instead.
-                if !segment_exists {
-                    let index_dir = self.base_dir.join("index");
-                    for old_ulid in &old_ulids {
-                        let _ = fs::remove_file(index_dir.join(format!("{}.idx", old_ulid)));
-                    }
-                }
-
-                // Step 2: rename .pending → .applied.
-                let applied_path =
-                    gc_dir.join(handoff.with_state(GcHandoffState::Applied).filename());
-                fs::rename(gc_dir.join(name), &applied_path)?;
-            }
-
-            // Count every handoff that was successfully processed: both normal
-            // .pending applications and .applied re-applications on restart.
-            // Volume::open already incorporates gc/*.applied during rebuild so
-            // the extent index is already correct on the restart path — count
-            // the handoff regardless of whether mutations occurred.
-            let _ = index_mutated; // tracked above but no longer drives the count
-            count += 1;
         }
 
         Ok(count)
     }
 
+    /// Apply one `.staged` GC output by deriving the action set from the
+    /// segment's own inputs field + each input's `.idx` file.
+    ///
+    /// Commit protocol: writes a re-signed copy to `<ulid>.tmp`, renames to
+    /// bare `<ulid>` (the atomic commit point), then removes `<ulid>.staged`.
+    /// A crash between rename and remove is handled by the caller (bare wins).
+    fn apply_staged_handoff(
+        &mut self,
+        gc_dir: &Path,
+        staged_path: &Path,
+        new_ulid: Ulid,
+    ) -> io::Result<StagedApply> {
+        // Read staged segment (entries + inputs). Unverified: the coordinator
+        // signs with an ephemeral key we don't verify against, same as the
+        // legacy path; the volume re-signs with its own key before the
+        // commit rename.
+        let (bss, mut entries, inputs) = segment::read_segment_index(staged_path)?;
+
+        // Empty inputs list means this isn't a GC output — reject.
+        if inputs.is_empty() {
+            log::warn!(
+                "gc staged file {} has no inputs; removing",
+                staged_path.display()
+            );
+            let _ = fs::remove_file(staged_path);
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // Hashes the new segment carries (DATA/Inline — body-owning kinds).
+        let carried_hashes: HashSet<blake3::Hash> = entries
+            .iter()
+            .filter(|e| e.kind != EntryKind::DedupRef)
+            .map(|e| e.hash)
+            .collect();
+
+        // Walk each input's idx and partition body-owning hashes into
+        // (move, remove, stale) buckets against the current extent index.
+        //
+        // An entry contributes only if the extent index currently points at
+        // the input segment for that hash — otherwise a newer write has
+        // already superseded it and we must not touch it.
+        let index_dir = self.base_dir.join("index");
+        let live = self.lbamap.lba_referenced_hashes();
+        let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
+        let mut stale_cancel: Vec<blake3::Hash> = Vec::new();
+        for input_ulid in &inputs {
+            let idx_path = index_dir.join(format!("{input_ulid}.idx"));
+            let parsed = match segment::read_segment_index(&idx_path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let (_, old_entries, _) = parsed;
+            for e in &old_entries {
+                // Body-owning kinds only. DedupRef/Zero/Delta carry no
+                // responsibility for this segment's body cleanup.
+                if !matches!(e.kind, EntryKind::Data | EntryKind::Inline) {
+                    continue;
+                }
+                // Only touch entries still pointed at by the extent index.
+                let still_at_input = self
+                    .extent_index
+                    .lookup(&e.hash)
+                    .is_some_and(|loc| loc.segment_id == *input_ulid);
+                if !still_at_input {
+                    continue;
+                }
+                if carried_hashes.contains(&e.hash) {
+                    // will be updated in the second pass below
+                    continue;
+                }
+                // Not carried: will be removed. If LBA-live, cancel.
+                if live.contains(&e.hash) {
+                    stale_cancel.push(e.hash);
+                }
+                to_remove.push((e.hash, *input_ulid));
+            }
+        }
+
+        if !stale_cancel.is_empty() {
+            log::warn!(
+                "gc staged {}: stale-liveness cancellation — {} hash(es) live in \
+                 volume but absent from coordinator output; removing staged file",
+                staged_path.display(),
+                stale_cancel.len(),
+            );
+            let _ = fs::remove_file(staged_path);
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // Re-sign: read body + inline + delta bytes into memory, write a fresh
+        // segment with the volume's key, rename tmp → bare as the commit point.
+        //
+        // TODO(step 4 follow-up): pipe delta_body through — current path
+        // omits the delta body section, which is fine for GC outputs that
+        // don't carry delta entries (the common case) but will need to be
+        // preserved when delta-rewrite interacts with GC compaction.
+        let handoff_inline = segment::read_inline_section(staged_path)?;
+        segment::read_extent_bodies(
+            staged_path,
+            bss,
+            &mut entries,
+            [EntryKind::Data, EntryKind::DedupRef, EntryKind::Inline],
+            &handoff_inline,
+        )?;
+        let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+        segment::write_gc_segment(&tmp_path, &mut entries, &inputs, self.signer.as_ref())?;
+
+        // Update extent index for carried hashes (pass through entries again,
+        // now that we have the freshly-written body_section_start).
+        let (new_bss, _, _) =
+            segment::read_and_verify_segment_index(&tmp_path, &self.verifying_key)?;
+        for (i, e) in entries.iter().enumerate() {
+            if e.kind == EntryKind::DedupRef {
+                continue;
+            }
+            // Only update if still pointed at one of the inputs.
+            let still_at_input = self
+                .extent_index
+                .lookup(&e.hash)
+                .is_some_and(|loc| inputs.contains(&loc.segment_id));
+            if !still_at_input {
+                continue;
+            }
+            let idata = if e.kind == EntryKind::Inline {
+                let start = e.stored_offset as usize;
+                let end = start + e.stored_length as usize;
+                if end <= handoff_inline.len() {
+                    Some(handoff_inline[start..end].into())
+                } else {
+                    continue;
+                }
+            } else {
+                None
+            };
+            Arc::make_mut(&mut self.extent_index).insert(
+                e.hash,
+                extentindex::ExtentLocation {
+                    segment_id: new_ulid,
+                    body_offset: e.stored_offset,
+                    body_length: e.stored_length,
+                    compressed: e.compressed,
+                    body_source: BodySource::Cached(i as u32),
+                    body_section_start: new_bss,
+                    inline_data: idata,
+                },
+            );
+        }
+
+        // Remove extent index entries for inputs' hashes that are no longer
+        // carried — the old segment files will be deleted by the coordinator
+        // once this bare-named handoff is uploaded.
+        for (hash, old_ulid) in &to_remove {
+            if self
+                .extent_index
+                .lookup(hash)
+                .is_some_and(|loc| loc.segment_id == *old_ulid)
+            {
+                Arc::make_mut(&mut self.extent_index).remove(hash);
+            }
+        }
+
+        // Clean up any stale pending/ files for consumed inputs.
+        let pending_dir = self.base_dir.join("pending");
+        for input in &inputs {
+            let _ = fs::remove_file(pending_dir.join(input.to_string()));
+        }
+
+        // Commit: rename tmp → bare. From this point on, the handoff is
+        // applied; the `.staged` file is cleanup.
+        let bare_path = gc_dir.join(new_ulid.to_string());
+        fs::rename(&tmp_path, &bare_path)?;
+        let _ = fs::remove_file(staged_path);
+
+        // Evict input cache bodies. By this point the extent index no
+        // longer references any old hash that the new segment doesn't
+        // carry, so no concurrent reader can still resolve via the old
+        // cache.
+        let cache_dir = self.base_dir.join("cache");
+        for input in &inputs {
+            let s = input.to_string();
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+        }
+
+        Ok(StagedApply::Applied)
+    }
+
+    // --- self-describing GC handoff support (step 4a) ---
+
     /// Evict old cache files for completed GC handoffs.
     ///
     /// Called by the actor AFTER publishing the new snapshot (which redirects
-    /// all new reads to the GC output segment).  Scans gc/*.applied files and
-    /// deletes cache/<old>.{body,present} for each consumed input ULID.
+    /// all new reads to the GC output segment). Walks `gc/` for bare
+    /// volume-applied handoffs, reads each one's `inputs` field from the
+    /// segment header, and deletes `cache/<input>.{body,present}` for each
+    /// consumed input ULID.
     ///
     /// Safe to call multiple times — file deletions are best-effort and
     /// silently skip already-absent files.
@@ -2112,29 +2017,20 @@ impl Volume {
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            let Some(handoff) = crate::gc::GcHandoff::from_filename(name_str) else {
-                continue;
-            };
-            if handoff.state != crate::gc::GcHandoffState::Applied {
+            // Bare gc/<ulid>: a volume-applied handoff awaiting upload.
+            if name_str.contains('.') {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(entry.path()) else {
+            if Ulid::from_string(name_str).is_err() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok((_, _, inputs)) =
+                segment::read_and_verify_segment_index(&path, &self.verifying_key)
+            else {
                 continue;
             };
-            let mut old_ulids: Vec<Ulid> = Vec::new();
-            for line in content.lines() {
-                match crate::gc::HandoffLine::parse(line) {
-                    Some(crate::gc::HandoffLine::Repack { old_ulid, .. })
-                    | Some(crate::gc::HandoffLine::Remove { old_ulid, .. })
-                    | Some(crate::gc::HandoffLine::Dead { old_ulid }) => {
-                        old_ulids.push(old_ulid);
-                    }
-                    None => {}
-                }
-            }
-            old_ulids.sort_unstable();
-            old_ulids.dedup();
-            for old_ulid in old_ulids {
+            for old_ulid in &inputs {
                 let s = old_ulid.to_string();
                 let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
                 let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
@@ -2186,6 +2082,22 @@ impl Volume {
             )));
         };
 
+        // Tombstone GC outputs (zero entries, non-empty inputs list) carry no
+        // body and leave no idx — they exist only to acknowledge that the
+        // input segments are safe to delete. Detect them up front so we skip
+        // the idx + cache writes entirely and just clean up the input idxs.
+        if !is_drain {
+            let (_, gc_entries, gc_inputs) =
+                segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
+            if gc_entries.is_empty() && !gc_inputs.is_empty() {
+                let index_dir = self.base_dir.join("index");
+                for old_ulid in &gc_inputs {
+                    let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
+                }
+                return Ok(());
+            }
+        }
+
         // Write index/<ulid>.idx now — after confirmed S3 upload — so that
         // idx presence ↔ segment confirmed in S3 (restored invariant).
         // This must happen before deleting old idx files (GC path below) so
@@ -2224,7 +2136,7 @@ impl Volume {
             // BodyOnly cache files ignore it (SegmentLayout::BodyOnly path),
             // but demand-fetch needs the original value to compute the S3
             // range-GET offset.
-            let (promote_bss, entries) =
+            let (promote_bss, entries, _inputs) =
                 segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
             // Read inline section for any inline entries being promoted.
             let promote_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
@@ -2278,31 +2190,21 @@ impl Volume {
             let _ = fs::remove_file(&delta_path);
             fs::remove_file(&pending_path)?;
         } else {
-            // GC path: delete index/<old>.idx for each segment consumed by this
-            // handoff, then delete the gc/<new> body. The body is safe to
-            // remove now because it has already been copied to cache/<new>.body
-            // above.  Deleting it here — inside the actor, under the same lock
-            // that the idle-tick apply_gc_handoffs runs under — means no
-            // out-of-band coordinator fs op races the actor on gc/.
-            let applied_path = self.base_dir.join("gc").join(format!("{ulid_str}.applied"));
-            if let Ok(content) = fs::read_to_string(&applied_path) {
-                let mut old_ulids: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for line in content.lines() {
-                    match crate::gc::HandoffLine::parse(line) {
-                        Some(crate::gc::HandoffLine::Repack { old_ulid, .. })
-                        | Some(crate::gc::HandoffLine::Remove { old_ulid, .. })
-                        | Some(crate::gc::HandoffLine::Dead { old_ulid }) => {
-                            old_ulids.insert(old_ulid.to_string());
-                        }
-                        None => {}
-                    }
-                }
-                for old_str in &old_ulids {
-                    let _ = fs::remove_file(index_dir.join(format!("{old_str}.idx")));
-                }
+            // GC path: delete index/<old>.idx for each consumed input segment.
+            // The list of consumed inputs is read from the new segment's own
+            // `inputs` field (written by the coordinator in `compact_segments`)
+            // — no sidecar manifest to parse.
+            //
+            // The gc/<new> body itself is NOT deleted here. Under the
+            // self-describing handoff protocol it is deleted by the
+            // coordinator's `apply_done_handoffs` after S3 upload + this
+            // promote + old-S3 deletes all succeed. Legacy `.applied` files
+            // (from the manifest path) are cleaned up separately.
+            let (_, _, inputs) =
+                segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
+            for old_ulid in &inputs {
+                let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
-            let _ = fs::remove_file(&src_path);
         }
         Ok(())
     }
@@ -2318,15 +2220,31 @@ impl Volume {
     /// the `.applied` state keeps `apply_done_handoffs` eligible to retry the
     /// delete, and only `.done` removes that eligibility.
     ///
-    /// Routing through the actor (rather than letting the coordinator rename
-    /// `.applied` directly) keeps every mutation of `gc/` serialised with the
+    /// Routing through the actor (rather than letting the coordinator unlink
+    /// `gc/<ulid>` directly) keeps every mutation of `gc/` serialised with the
     /// idle-tick `apply_gc_handoffs` path, so there is no race between the
-    /// coordinator renaming a file and the actor reading it.
+    /// coordinator removing a file and the actor reading it.
+    ///
+    /// Under the self-describing GC handoff protocol this deletes the bare
+    /// `gc/<ulid>` file — the file whose presence previously signalled
+    /// "volume applied, coordinator upload pending." Once the coordinator has
+    /// uploaded the segment to S3, invoked `promote_segment` (which populates
+    /// `cache/<ulid>.body` + `index/<ulid>.idx`), and deleted the old S3
+    /// objects, this call reclaims the last on-disk copy.
     pub fn finalize_gc_handoff(&mut self, ulid: Ulid) -> io::Result<()> {
         let gc_dir = self.base_dir.join("gc");
-        let applied = gc_dir.join(format!("{ulid}.applied"));
-        let done = gc_dir.join(format!("{ulid}.done"));
-        fs::rename(&applied, &done)
+        let bare = gc_dir.join(ulid.to_string());
+        match fs::remove_file(&bare) {
+            Ok(()) => {}
+            // Idempotent: already removed by a previous finalize or a
+            // promote that ran before we flipped the protocol.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        // Best-effort cleanup of any stray `.staged` sibling left over from
+        // a crash between the bare rename and `.staged` removal.
+        let _ = fs::remove_file(gc_dir.join(format!("{ulid}.staged")));
+        Ok(())
     }
 
     /// Hole-punch hash-dead DATA entries in `pending/<ulid>` in place, so
@@ -2361,7 +2279,7 @@ impl Volume {
         let pending_dir = self.base_dir.join("pending");
         let seg_path = pending_dir.join(&ulid_str);
 
-        let (body_section_start, entries) =
+        let (body_section_start, entries, _inputs) =
             segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
 
         // Cheap pre-scan: is there any DATA entry whose LBA no longer maps
@@ -4769,7 +4687,7 @@ mod tests {
             .next()
             .expect("expected one pending segment");
 
-        let (_, entries) = segment::read_segment_index(&seg_path).unwrap();
+        let (_, entries, _) = segment::read_segment_index(&seg_path).unwrap();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.kind, segment::EntryKind::Zero);
@@ -5743,7 +5661,7 @@ mod tests {
         );
 
         use std::io::{Read, Seek, SeekFrom};
-        let (bss, entries) =
+        let (bss, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let dead_entry = entries
             .iter()
@@ -5797,7 +5715,7 @@ mod tests {
             "index/<ulid>.idx must exist after promote"
         );
 
-        let (_, idx_entries) =
+        let (_, idx_entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         assert!(
             idx_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
@@ -5953,7 +5871,7 @@ mod tests {
         // in the in-place pending file.
         use std::io::{Read as _, Seek as _, SeekFrom};
         let seg_path = base.join("pending").join(seg_ulid.to_string());
-        let (bss, entries) =
+        let (bss, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
@@ -5999,7 +5917,7 @@ mod tests {
 
         use std::io::{Read as _, Seek as _, SeekFrom};
         let seg_path = base.join("pending").join(seg_ulid.to_string());
-        let (bss, entries) =
+        let (bss, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
@@ -6317,9 +6235,8 @@ mod tests {
 
                     // Read and compact
                     let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
-                    let mut source_ulids: Vec<Ulid> = Vec::new();
                     for (ulid, path) in &candidates {
-                        let Ok((_bss, mut seg_entries)) =
+                        let Ok((_bss, mut seg_entries, _)) =
                             segment::read_and_verify_segment_index(path, &vk)
                         else {
                             continue;
@@ -6345,38 +6262,24 @@ mod tests {
                                 .lookup(&e.hash)
                                 .is_some_and(|loc| loc.segment_id == *ulid);
                             if lba_live || extent_live {
-                                source_ulids.push(*ulid);
                                 all_entries.push(e);
                             }
                         }
                     }
 
                     if !all_entries.is_empty() {
-                        let tmp = gc_dir.join(format!("{gc_ulid}.tmp"));
-                        let final_path = gc_dir.join(gc_ulid.to_string());
-                        let new_bss = segment::write_segment(
+                        let mut inputs: Vec<Ulid> = candidates.iter().map(|(u, _)| *u).collect();
+                        inputs.sort();
+                        let tmp = gc_dir.join(format!("{gc_ulid}.staged.tmp"));
+                        let staged = gc_dir.join(format!("{gc_ulid}.staged"));
+                        segment::write_gc_segment(
                             &tmp,
                             &mut all_entries,
+                            &inputs,
                             ephemeral_signer.as_ref(),
                         )
                         .unwrap();
-                        fs::rename(&tmp, &final_path).unwrap();
-
-                        let handoff_lines: Vec<HandoffLine> = all_entries
-                            .iter()
-                            .zip(source_ulids.iter())
-                            .filter(|(e, _)| e.kind != EntryKind::DedupRef)
-                            .map(|(e, src)| HandoffLine::Repack {
-                                hash: e.hash,
-                                old_ulid: *src,
-                                new_ulid: gc_ulid,
-                                new_offset: new_bss + e.stored_offset,
-                            })
-                            .collect();
-                        let _ = fs::write(
-                            gc_dir.join(format!("{gc_ulid}.pending")),
-                            crate::gc::format_handoff_file(handoff_lines),
-                        );
+                        fs::rename(&tmp, &staged).unwrap();
                     }
 
                     candidates
@@ -7518,24 +7421,104 @@ mod tests {
     //   write → flush → drain (pending→cache + index) → coordinator compacts
     //   into new segment + writes gc/*.pending → volume applies handoff.
 
-    /// Simulate one coordinator GC pass: read the given uploaded segment (from
-    /// index/ + cache/), write a compacted copy to gc/<new_ulid> (signed with
-    /// an ephemeral key, as the real coordinator would), and write gc/<new>.pending.
-    ///
-    /// The volume re-signs the staged segment when apply_gc_handoffs is called.
-    /// Does NOT delete the old cache/ body or index/.idx.
-    fn simulate_coord_gc(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
+    #[test]
+    fn gc_handoff_applies_and_renames() {
+        // End-to-end: stage a GC output, apply it (volume re-signs and
+        // commits to bare), promote it (coordinator writes new idx and
+        // deletes old idx via the inputs field), evict caches.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let pending_dir = base.join("pending");
+        let old_ulid = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        simulate_upload(&mut vol);
+
+        let new_ulid = simulate_coord_gc_staged(&mut vol, &base, &old_ulid);
+
+        // Apply the handoff: volume re-signs `gc/<new>.staged` to `gc/<new>`.
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+
+        let gc_dir = base.join("gc");
+        assert!(
+            !gc_dir.join(format!("{new_ulid}.staged")).exists(),
+            "staged file must be removed after commit"
+        );
+        assert!(
+            gc_dir.join(&new_ulid).exists(),
+            "bare gc/<new> must exist after commit"
+        );
+
+        // After apply_gc_handoffs the old idx is still present — promote_segment
+        // is the step that deletes it (after the coordinator confirms upload).
+        let cache_dir = base.join("cache");
+        let index_dir = base.join("index");
+        assert!(
+            index_dir.join(format!("{old_ulid}.idx")).exists(),
+            "old idx must persist until promote_segment runs"
+        );
+        assert!(
+            !index_dir.join(format!("{new_ulid}.idx")).exists(),
+            "new idx must not exist before promote_segment (not yet S3-confirmed)"
+        );
+
+        // Promote: coordinator confirms upload and asks the volume to write
+        // index/<new>.idx + cache/<new>.body. promote_segment derives the
+        // list of input ulids from the new segment's header and deletes
+        // their idx files.
+        let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
+        vol.promote_segment(new_ulid_parsed).unwrap();
+
+        assert!(
+            index_dir.join(format!("{new_ulid}.idx")).exists(),
+            "promote_segment must write index/<new>.idx"
+        );
+        assert!(
+            !index_dir.join(format!("{old_ulid}.idx")).exists(),
+            "promote_segment must delete index/<old>.idx for each input"
+        );
+
+        // Reads still work via cache/<new>.body.
+        assert_eq!(vol.read(0, 2).unwrap(), data);
+
+        // Coordinator finalize: deletes the bare gc/<new> file.
+        vol.finalize_gc_handoff(new_ulid_parsed).unwrap();
+        assert!(
+            !gc_dir.join(&new_ulid).exists(),
+            "finalize_gc_handoff must delete bare gc/<new>"
+        );
+        // Reads still work — cache/<new>.body covers it.
+        assert_eq!(vol.read(0, 2).unwrap(), data);
+
+        // Note: under the new protocol cache/<old>.* is dropped by
+        // promote_segment's input cleanup path, not by a separate evict step.
+        let _ = cache_dir;
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Simulate a step 4 coordinator GC pass: read the old segment, build
+    /// the compacted entries, write a `.staged` GC segment with the input
+    /// ULID list embedded in the header (no sidecar manifest).
+    fn simulate_coord_gc_staged(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
         use crate::{segment, signing};
 
-        // Read index from .idx (header+index section); read body from cache/.body
-        // (body bytes starting at offset 0).
         let idx_path = fork_dir.join("index").join(format!("{old_ulid}.idx"));
         let body_path = fork_dir.join("cache").join(format!("{old_ulid}.body"));
-        let (_old_bss, mut entries) =
+        let (_old_bss, mut entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
-        // Read inline data from .idx for inline entries.
         let inline_bytes = segment::read_inline_section(&idx_path).unwrap();
-        // Cache .body files start at byte 0 of the body section.
         segment::read_extent_bodies(
             &body_path,
             0,
@@ -7551,35 +7534,22 @@ mod tests {
         let gc_dir = fork_dir.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
 
-        // Coordinator uses an ephemeral signer; the volume re-signs on handoff.
         let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
-        let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
-        let new_bss =
-            segment::write_segment(&tmp_path, &mut entries, ephemeral_signer.as_ref()).unwrap();
-        fs::rename(&tmp_path, gc_dir.join(&new_ulid_str)).unwrap();
-
         let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
-        let handoff_lines: Vec<HandoffLine> = entries
-            .iter()
-            .filter(|e| e.kind != segment::EntryKind::DedupRef)
-            .map(|e| HandoffLine::Repack {
-                hash: e.hash,
-                old_ulid: old_ulid_parsed,
-                new_ulid,
-                new_offset: new_bss + e.stored_offset,
-            })
-            .collect();
-        fs::write(
-            gc_dir.join(format!("{new_ulid_str}.pending")),
-            crate::gc::format_handoff_file(handoff_lines),
-        )
-        .unwrap();
+        let inputs = vec![old_ulid_parsed];
+        let tmp_path = gc_dir.join(format!("{new_ulid_str}.staged.tmp"));
+        segment::write_gc_segment(&tmp_path, &mut entries, &inputs, ephemeral_signer.as_ref())
+            .unwrap();
+        fs::rename(&tmp_path, gc_dir.join(format!("{new_ulid_str}.staged"))).unwrap();
 
         new_ulid_str
     }
 
     #[test]
-    fn gc_handoff_applies_and_renames() {
+    fn gc_staged_handoff_applies_and_commits_bare() {
+        // Step 4a: derive-at-apply path. Coordinator writes gc/<ulid>.staged
+        // with inputs in the segment header; volume walks `.staged`, re-signs,
+        // commits by renaming tmp → bare, removes `.staged`.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -7587,8 +7557,6 @@ mod tests {
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
 
-        // Drain: simulate coordinator upload + promote IPC.
-        // promote_segment writes index/<ulid>.idx, copies body to cache/, deletes pending/.
         let pending_dir = base.join("pending");
         let old_ulid = fs::read_dir(&pending_dir)
             .unwrap()
@@ -7600,99 +7568,104 @@ mod tests {
             .unwrap();
         simulate_upload(&mut vol);
 
-        // Coordinator GC: compact into new segment, write .pending.
-        let new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
+        let new_ulid = simulate_coord_gc_staged(&mut vol, &base, &old_ulid);
 
-        // Apply the handoff.
         let count = vol.apply_gc_handoffs().unwrap();
         assert_eq!(count, 1);
 
-        // .pending was renamed to .applied.
         let gc_dir = base.join("gc");
-        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
-        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
-
-        // After apply_gc_handoffs: old idx still present (not deleted until promote),
-        // new idx not yet written (written by promote_segment after S3 upload).
-        let cache_dir = base.join("cache");
-        let index_dir = base.join("index");
         assert!(
-            index_dir.join(format!("{old_ulid}.idx")).exists(),
-            "old idx must persist until promote_segment runs"
+            !gc_dir.join(format!("{new_ulid}.staged")).exists(),
+            "`.staged` must be removed after commit"
         );
         assert!(
-            !index_dir.join(format!("{new_ulid}.idx")).exists(),
-            "new idx must not exist before promote_segment (not yet S3-confirmed)"
+            gc_dir.join(&new_ulid).exists(),
+            "bare <ulid> must exist after commit"
         );
 
-        // Simulate coordinator: upload gc/<new> to S3, then send promote IPC.
-        // promote_segment writes index/<new>.idx, cache/<new>.body+.present,
-        // reads the .applied handoff to find old ULIDs, and deletes index/<old>.idx.
-        let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
-        vol.promote_segment(new_ulid_parsed).unwrap();
-
-        assert!(
-            index_dir.join(format!("{new_ulid}.idx")).exists(),
-            "promote_segment must write index/<new>.idx"
-        );
-        assert!(
-            !index_dir.join(format!("{old_ulid}.idx")).exists(),
-            "promote_segment must delete index/<old>.idx"
-        );
-
-        // cache/<old>.* is evicted by evict_applied_gc_cache() AFTER snapshot publish
-        // (called from actor loop); calling it explicitly here simulates that step.
-        vol.evict_applied_gc_cache();
-        assert!(
-            !cache_dir.join(format!("{old_ulid}.body")).exists(),
-            "evict_applied_gc_cache must delete cache/<old>.body"
-        );
-        assert!(
-            !cache_dir.join(format!("{old_ulid}.present")).exists(),
-            "evict_applied_gc_cache must delete cache/<old>.present"
-        );
-        // Reads still work via cache/<new>.body.
+        // Reads go through the extent index → new segment.
         assert_eq!(vol.read(0, 2).unwrap(), data);
+
+        // Re-running is a no-op: bare exists, nothing to apply.
+        let again = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(again, 0);
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn gc_handoff_skips_missing_segment() {
-        // gc/*.pending exists but the new segment body has not yet been fetched
-        // locally.  apply_gc_handoffs must skip the file and return Ok(0) so
-        // the next idle tick retries when the segment is available.
+    fn gc_staged_crash_recovery_bare_wins() {
+        // Crash state: rename tmp→bare succeeded, but `.staged` removal
+        // failed. On next apply: detect the bare file, drop `.staged`,
+        // count the handoff as recovered.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
+        let data: Vec<u8> = (0..8192).map(|i| (i * 5 + 17) as u8).collect();
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let pending_dir = base.join("pending");
+        let old_ulid = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        simulate_upload(&mut vol);
+
+        // Stage + commit once to produce a bare file.
+        let new_ulid = simulate_coord_gc_staged(&mut vol, &base, &old_ulid);
+        vol.apply_gc_handoffs().unwrap();
+
+        // Inject the crash state: re-create a `.staged` next to the bare file.
+        let gc_dir = base.join("gc");
+        let bare_path = gc_dir.join(&new_ulid);
+        let staged_path = gc_dir.join(format!("{new_ulid}.staged"));
+        fs::copy(&bare_path, &staged_path).unwrap();
+
+        // Apply: bare wins, `.staged` is removed, count=1 (crash-recovered).
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+        assert!(bare_path.exists());
+        assert!(!staged_path.exists());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_staged_sweeps_stale_tmp_files() {
+        // Stray `<ulid>.tmp` and `<ulid>.staged.tmp` files from crashed writes
+        // are removed at the start of the apply pass.
+        let base = keyed_temp_dir();
+        let vol = Volume::open(&base, &base).unwrap();
         let gc_dir = base.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
 
-        // Use a plausible ULID that has no matching segment file.
-        let phantom_ulid = Ulid::new().to_string();
-        let pending_path = gc_dir.join(format!("{phantom_ulid}.pending"));
-        fs::write(&pending_path, "").unwrap();
+        let ulid = Ulid::new();
+        let tmp1 = gc_dir.join(format!("{ulid}.tmp"));
+        let tmp2 = gc_dir.join(format!("{ulid}.staged.tmp"));
+        fs::write(&tmp1, b"garbage").unwrap();
+        fs::write(&tmp2, b"garbage").unwrap();
 
+        let mut vol = vol;
         let count = vol.apply_gc_handoffs().unwrap();
         assert_eq!(count, 0);
-
-        // File must still be present — not renamed or deleted.
-        assert!(pending_path.exists());
+        assert!(!tmp1.exists(), ".tmp must be swept");
+        assert!(!tmp2.exists(), ".staged.tmp must be swept");
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
     fn gc_handoff_idempotent_after_crash() {
-        // Simulate a crash between coordinator writing .pending and the volume
-        // processing it.  The coordinator-staged segment is in gc/<new_ulid>;
-        // the old segment body remains in cache/ until apply_gc_handoffs renames
-        // .pending → .applied (signalling the coordinator it is safe to delete).
-        //
-        // After reopen, the extent index is rebuilt from index/*.idx (old segment
-        // still has its .idx), so reads are correct before the handoff is applied.
-        // apply_gc_handoffs re-signs gc/<new_ulid> in-place, updates the extent
-        // index, and renames .pending → .applied.
+        // Simulate a crash between coordinator writing `.staged` and the
+        // volume processing it. After reopen, the extent index is rebuilt
+        // from index/*.idx (old segment still has its .idx), so reads are
+        // correct before the handoff is applied. apply_gc_handoffs then
+        // commits the bare `gc/<new>` and updates the extent index.
         let base = keyed_temp_dir();
 
         let old_ulid;
@@ -7704,7 +7677,6 @@ mod tests {
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
 
-            // Drain: simulate coordinator upload + promote IPC.
             let pending_dir = base.join("pending");
             old_ulid = fs::read_dir(&pending_dir)
                 .unwrap()
@@ -7716,29 +7688,21 @@ mod tests {
                 .unwrap();
             simulate_upload(&mut vol);
 
-            // Coordinator GC: staged segment in gc/<new_ulid> + .pending written.
-            // Old segment body intentionally NOT deleted — coordinator waits for .applied.
-            new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
+            new_ulid = simulate_coord_gc_staged(&mut vol, &base, &old_ulid);
 
             // "Crash" — drop the volume before apply_gc_handoffs runs.
         }
 
-        // Reopen: rebuild scans index/ and finds the old segment's .idx.  Reads
-        // work via cache/ even though the coordinator has already produced a replacement.
         let mut vol = Volume::open(&base, &base).unwrap();
         assert_eq!(vol.read(0, 2).unwrap(), data);
 
-        // Apply the pending handoff: re-signs gc/<new_ulid> in-place,
-        // updates extent index, renames .pending → .applied.
         let count = vol.apply_gc_handoffs().unwrap();
         assert_eq!(count, 1);
 
         let gc_dir = base.join("gc");
-        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
-        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
+        assert!(!gc_dir.join(format!("{new_ulid}.staged")).exists());
+        assert!(gc_dir.join(&new_ulid).exists());
 
-        // After apply_gc_handoffs: old idx still present, new idx not yet written.
-        let cache_dir = base.join("cache");
         let index_dir = base.join("index");
         assert!(
             index_dir.join(format!("{old_ulid}.idx")).exists(),
@@ -7749,7 +7713,6 @@ mod tests {
             "new idx must not exist before promote_segment"
         );
 
-        // Simulate coordinator: upload gc/<new> to S3, then send promote IPC.
         let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
         vol.promote_segment(new_ulid_parsed).unwrap();
 
@@ -7759,97 +7722,10 @@ mod tests {
         );
         assert!(
             !index_dir.join(format!("{old_ulid}.idx")).exists(),
-            "promote_segment must delete index/<old>.idx"
-        );
-
-        // cache/<old>.* evicted by actor after snapshot publish; simulate here.
-        vol.evict_applied_gc_cache();
-        assert!(
-            !cache_dir.join(format!("{old_ulid}.body")).exists(),
-            "evict_applied_gc_cache must delete cache/<old>.body"
-        );
-        assert!(
-            !cache_dir.join(format!("{old_ulid}.present")).exists(),
-            "evict_applied_gc_cache must delete cache/<old>.present"
+            "promote_segment must delete index/<old>.idx for each input"
         );
 
         // Reads still correct: extent index points to new_ulid, body in cache/.
-        assert_eq!(vol.read(0, 2).unwrap(), data);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn gc_handoff_idempotent_after_partial_resign() {
-        // Simulate a crash between the in-place re-sign rename completing
-        // (gc/<new_ulid>.tmp → gc/<new_ulid>) and the .pending → .applied rename.
-        // State: gc/<new_ulid> holds the volume-signed segment; .pending still
-        // exists; no .applied yet.
-        //
-        // apply_gc_handoffs must succeed on retry: it re-signs gc/<new_ulid>
-        // idempotently, updates the extent index, and renames .pending → .applied.
-        // The body stays in gc/ — the coordinator uploads it to S3 and writes
-        // index/<new>.idx + cache/<new>.{body,present} after confirmed upload.
-        let base = keyed_temp_dir();
-
-        let old_ulid;
-        let new_ulid;
-        let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
-
-        {
-            let mut vol = Volume::open(&base, &base).unwrap();
-            vol.write(0, &data).unwrap();
-            vol.promote_for_test().unwrap();
-
-            let pending_dir = base.join("pending");
-            old_ulid = fs::read_dir(&pending_dir)
-                .unwrap()
-                .flatten()
-                .next()
-                .unwrap()
-                .file_name()
-                .into_string()
-                .unwrap();
-            simulate_upload(&mut vol);
-
-            new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
-        }
-
-        // Run apply once to produce the re-signed gc/<new_ulid> and .applied.
-        {
-            let mut vol = Volume::open(&base, &base).unwrap();
-            vol.apply_gc_handoffs().unwrap();
-        }
-
-        // Restore crash state: rename .applied back to .pending.
-        // gc/<new_ulid> is already volume-signed and still present — this
-        // represents a crash after the in-place rename but before .applied was
-        // written.
-        let gc_dir = base.join("gc");
-        fs::rename(
-            gc_dir.join(format!("{new_ulid}.applied")),
-            gc_dir.join(format!("{new_ulid}.pending")),
-        )
-        .unwrap();
-        assert!(
-            gc_dir.join(&new_ulid).exists(),
-            "gc/<ulid> must still exist (body stays in gc/ until coordinator moves it)"
-        );
-
-        // Retry: apply_gc_handoffs re-signs gc/<new_ulid> idempotently and
-        // renames .pending → .applied.
-        let mut vol = Volume::open(&base, &base).unwrap();
-        let count = vol.apply_gc_handoffs().unwrap();
-        assert_eq!(count, 1);
-
-        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
-        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
-        assert!(
-            gc_dir.join(&new_ulid).exists(),
-            "gc/<ulid> stays until coordinator uploads it and promotes to cache/"
-        );
-
-        // Data still correct.
         assert_eq!(vol.read(0, 2).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
@@ -8152,7 +8028,7 @@ mod tests {
             .next()
             .unwrap()
             .path();
-        let (bss, _) =
+        let (bss, _, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let file_len = fs::metadata(&seg_path).unwrap().len();
         assert_eq!(file_len, bss, "all-inline segment should have no body");

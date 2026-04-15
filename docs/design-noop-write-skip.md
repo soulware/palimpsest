@@ -45,7 +45,7 @@ Tier 1 cannot fire when the LBA map covers the incoming range with **multiple en
 
 `try_read_local` walks `extents_in_range`, verifies every covered block is **on host** (not just indexed), and reads the existing bytes via the normal `read_extents` path:
 
-- `Local` extent → on host (WAL, `pending/`, `gc/*.applied`).
+- `Local` extent → on host (WAL, `pending/`, bare `gc/<ulid>` files).
 - `Cached(n)` extent → on host iff `cache/<id>.present` has bit `n` set, in either the current fork's cache or any ancestor's cache.
 - Unwritten gap, missing extent index entry, delta-only entry, or `Cached(n)` with the present bit clear → bail.
 

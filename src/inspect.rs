@@ -356,7 +356,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                 .to_owned();
             let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             match segment::read_segment_index(&path) {
-                Ok((_body_start, entries)) => {
+                Ok((_body_start, entries, _inputs)) => {
                     let dedup_ref_count = entries
                         .iter()
                         .filter(|e| e.kind == EntryKind::DedupRef)
@@ -456,7 +456,7 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
 }
 
 fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Result<CacheInfo> {
-    let (_body_start, entries) = segment::read_segment_index(idx_path)
+    let (_body_start, entries, _inputs) = segment::read_segment_index(idx_path)
         .map_err(|e| io::Error::other(format!("reading index: {e}")))?;
 
     let mut data_count = 0usize;

@@ -208,27 +208,28 @@ Each segment is a **single file** both locally and in S3. The same format is use
 ### File layout
 
 ```
-[Header: 96 bytes]
-  magic          (8 bytes)  — "ELIDSEG\x04"
+[Header: 100 bytes]
+  magic          (8 bytes)  — "ELIDSEG\x05"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
   body_length    (8 bytes)  — byte length of full extent body (u64 le)
   delta_length   (4 bytes)  — byte length of delta body (u32 le); 0 if no deltas
+  inputs_length  (4 bytes)  — byte length of inputs table (u32 le); multiple of 16
   signature      (64 bytes) — Ed25519 signature (see Fork ownership and signing below)
 
-[Index section]             — starts at byte 96; length = index_length
-[Inline section]            — starts at byte 96 + index_length; length = inline_length
-[Full body]                 — starts at byte 96 + index_length + inline_length; length = body_length
-[Delta body]                — starts at byte 96 + index_length + inline_length + body_length; length = delta_length
+[Index section]             — starts at byte 100; length = index_length
+[Inline section]            — starts at byte 100 + index_length; length = inline_length
+[Full body]                 — starts at byte 100 + index_length + inline_length; length = body_length
+[Delta body]                — starts at byte 100 + index_length + inline_length + body_length; length = delta_length
 ```
 
 Derived section offsets (computable from the header alone):
 ```
-index_offset  = 96
-inline_offset = 96 + index_length
-body_offset   = 96 + index_length + inline_length
-delta_offset  = 96 + index_length + inline_length + body_length
+index_offset  = 100
+inline_offset = 100 + index_length
+body_offset   = 100 + index_length + inline_length
+delta_offset  = 100 + index_length + inline_length + body_length
 ```
 
 **The full body** is raw concatenated extent data — DATA-record and REF-record extents, clean bytes, no framing. ZERO-record extents contribute nothing to the body (reads return zeros directly). All navigation is via the index section.
@@ -285,7 +286,16 @@ Per entry with deltas:
     delta_length  (4 bytes)  — byte length in delta body (u32 le)
 ```
 
-The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64)`. Readers that don't need delta info (LBA map rebuild, extent index rebuild) read only the first `entry_count × 64` bytes.
+The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64) - inputs_length`.
+
+**Inputs table** (appended after the delta table, at the tail of the index section):
+
+```
+inputs_length / 16 entries, 16 bytes each:
+  input_ulid    (16 bytes) — ULID of a source segment consumed to produce this output
+```
+
+Populated only for GC outputs (the coordinator's `compact_segments` writes the sorted list of swept input ULIDs into this region). Empty for normal WAL-promote segments and demand-fetch results. The volume's apply path reads this field to derive extent-index updates from the segment itself, without consulting any sidecar manifest — the whole self-describing GC handoff protocol is built on top of this. Because the inputs table is the tail of the index section, the existing signature `Ed25519(BLAKE3(header[0..36] || index_bytes))` authenticates it without a second hash region.
 
 `lba_length × 4096` always gives the uncompressed extent size. `stored_length` gives the stored (possibly compressed) size.
 
@@ -423,7 +433,7 @@ Benefits of this layout:
 
 ### Retrieval strategies
 
-The header is 96 bytes; all section offsets are computable from it. This drives three distinct retrieval patterns:
+The header is 100 bytes; all section offsets are computable from it. This drives three distinct retrieval patterns:
 
 **Cold start** (no local data — cannot use deltas):
 ```

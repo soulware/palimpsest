@@ -57,37 +57,30 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
     }
 }
 
-/// Simulate the coordinator promote IPC for each pending gc output:
-/// copies gc/<new> → cache/<new>.{body,present}, then deletes gc/<new>.
-/// This mirrors what the volume process does when it receives "promote <ulid>".
+/// Simulate the coordinator promote+finalize sequence for each volume-applied
+/// gc output: under the self-describing handoff protocol, those are the bare
+/// `gc/<ulid>` files (no extension). promote_segment writes index/<new>.idx
+/// and cache/<new>.body; finalize_gc_handoff deletes the bare body.
 fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     let gc_dir = dir.join("gc");
     let Ok(entries) = fs::read_dir(&gc_dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        // Only promote .applied files' new ULID (the gc body, not the marker).
-        if !name_str.ends_with(".applied") {
-            continue;
-        }
-        let Some(ulid_str) = name_str.strip_suffix(".applied") else {
-            continue;
-        };
-        let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
-            continue;
-        };
-        let gc_body = gc_dir.join(ulid_str);
-        if !gc_body.exists() {
-            continue;
-        }
-        // promote_segment: copies gc/<ulid> → cache/<ulid>.{body,present}.
+    let mut bare: Vec<ulid::Ulid> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            if name.contains('.') {
+                return None;
+            }
+            ulid::Ulid::from_string(name).ok()
+        })
+        .collect();
+    bare.sort();
+    for ulid in bare {
         let _ = vol.promote_segment(ulid);
-        // Coordinator deletes gc/<ulid> after promote succeeds.
-        let _ = fs::remove_file(&gc_body);
+        let _ = vol.finalize_gc_handoff(ulid);
     }
 }
 

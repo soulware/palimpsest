@@ -40,9 +40,10 @@ pub struct PrefetchResult {
     pub failed: usize,
 }
 
-/// Segment file header constants (matches elide-core/src/segment.rs).
-const HEADER_LEN: usize = 96;
-const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x04";
+// Segment file header constants are re-exported from elide-core/src/segment.rs
+// so prefetch's manual header parsing stays in sync with the canonical format.
+use elide_core::segment::{HEADER_LEN as SEGMENT_HEADER_LEN, MAGIC as SEGMENT_MAGIC};
+const HEADER_LEN: usize = SEGMENT_HEADER_LEN as usize;
 
 /// Prefetch the index section (`.idx`) for all segments in `fork_dir` and its
 /// ancestors that are not present locally.
@@ -388,7 +389,7 @@ mod tests {
         assert!(idx_path.exists(), ".idx file should exist");
 
         // Verify it is parseable as a segment index.
-        let (_, entries) = elide_core::segment::read_segment_index(&idx_path).unwrap();
+        let (_, entries, _) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, hash);
 
@@ -537,7 +538,7 @@ mod tests {
         let idx_path = root_dir.join("index").join(format!("{seg_ulid}.idx"));
         assert!(idx_path.exists(), ".idx file should exist in root's index/");
 
-        let (_, entries) = elide_core::segment::read_segment_index(&idx_path).unwrap();
+        let (_, entries, _) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, hash);
     }
