@@ -33,9 +33,10 @@ use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, GcHandoffJob,
-    GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, ReclaimCandidate, ReclaimOutcome,
-    ReclaimPlan, ReclaimProposed, ReclaimThresholds, Volume, WorkerJob, WorkerResult,
-    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob,
+    PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
+    ReclaimThresholds, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
+    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -413,6 +414,16 @@ impl VolumeActor {
                     self.handoff_in_flight = false;
                     warn!("worker gc handoff failed during shutdown: {e}");
                 }
+                Ok(WorkerResult::PromoteSegment(_)) => {
+                    // Step 2 of the promote_segment offload: the variant
+                    // exists and the worker can execute the job, but the
+                    // actor has not yet wired in dispatch or parking, so
+                    // no PromoteSegment jobs are ever sent to the worker
+                    // from the actor path in-tree today. This arm is a
+                    // placeholder for exhaustiveness; routing + apply
+                    // lands in step 4.
+                    warn!("unexpected PromoteSegment worker result during shutdown");
+                }
                 Err(_) => {
                     // Channel closed — worker exited unexpectedly.
                     break;
@@ -680,6 +691,12 @@ impl VolumeActor {
                             {
                                 let _ = reply.send(Err(e));
                             }
+                        }
+                        Ok(WorkerResult::PromoteSegment(_)) => {
+                            // See the shutdown_worker arm for context:
+                            // PromoteSegment jobs are never dispatched
+                            // from the actor yet (step 4 wires that up).
+                            warn!("unexpected PromoteSegment worker result");
                         }
                         Err(_) => {
                             warn!("worker result channel closed unexpectedly");
@@ -1099,7 +1116,7 @@ impl VolumeHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Flusher thread
+// Worker thread
 // ---------------------------------------------------------------------------
 
 /// Long-lived worker thread that processes off-actor jobs (WAL promotes,
@@ -1113,6 +1130,9 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
         let msg = match job {
             WorkerJob::Promote(job) => WorkerResult::Promote(execute_promote(job)),
             WorkerJob::GcHandoff(job) => WorkerResult::GcHandoff(execute_gc_handoff(job)),
+            WorkerJob::PromoteSegment(job) => {
+                WorkerResult::PromoteSegment(execute_promote_segment(job))
+            }
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -1135,6 +1155,63 @@ fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
         body_section_start,
         entries: job.entries,
         pre_promote_offsets: job.pre_promote_offsets,
+    })
+}
+
+/// Execute a `promote_segment` job: read + verify the source segment
+/// index once, write `index/<ulid>.idx` + `cache/<ulid>.{body,present}`
+/// (both idempotent), and return the parsed state the actor's apply
+/// phase needs for extent-index updates.
+///
+/// Also reachable from the inline (on-actor) `Volume::promote_segment`
+/// path so that the two execution sites share one parse/verify pass.
+pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<PromoteSegmentResult> {
+    let (bss, entries, inputs) =
+        segment::read_and_verify_segment_index(&job.src_path, &job.verifying_key)?;
+
+    // Tombstone shortcut: GC output with zero entries + non-empty inputs
+    // exists only to acknowledge that the input segments are safe to
+    // delete. No idx or body is written; the apply phase handles the
+    // input-idx cleanup.
+    if !job.is_drain && entries.is_empty() && !inputs.is_empty() {
+        return Ok(PromoteSegmentResult {
+            ulid: job.ulid,
+            is_drain: job.is_drain,
+            body_section_start: bss,
+            entries,
+            inputs,
+            inline: Vec::new(),
+            tombstone: true,
+        });
+    }
+
+    // Both writes are idempotent: extract_idx early-returns when idx_path
+    // exists; promote_to_cache early-returns when body_path exists. This
+    // covers the mid-apply crash retry window described in
+    // docs/promote-segment-offload-plan.md — the source survives, prep
+    // picks it up, the worker re-parses (cheap) and the file writes
+    // short-circuit.
+    segment::extract_idx(&job.src_path, &job.idx_path)?;
+    segment::promote_to_cache(&job.src_path, &job.body_path, &job.present_path)?;
+
+    // Inline section is only needed by the drain-path apply to build
+    // `inline_data` for `BodySource::Cached` entries whose kind is
+    // `Inline`. The GC apply phase never touches the extent index so
+    // the read would be wasted there.
+    let inline = if job.is_drain && entries.iter().any(|e| e.kind == segment::EntryKind::Inline) {
+        segment::read_inline_section(&job.src_path)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(PromoteSegmentResult {
+        ulid: job.ulid,
+        is_drain: job.is_drain,
+        body_section_start: bss,
+        entries,
+        inputs,
+        inline,
+        tombstone: false,
     })
 }
 
