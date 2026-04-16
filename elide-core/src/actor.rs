@@ -32,10 +32,10 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, NoopSkipStats,
-    PromoteJob, PromoteResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
-    ReclaimThresholds, Volume, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
-    scan_reclaim_candidates,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, GcHandoffJob,
+    GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, ReclaimCandidate, ReclaimOutcome,
+    ReclaimPlan, ReclaimProposed, ReclaimThresholds, Volume, WorkerJob, WorkerResult,
+    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ pub(crate) enum VolumeRequest {
     DeltaRepackPostSnapshot {
         reply: Sender<io::Result<DeltaRepackStats>>,
     },
-    /// Promote the current WAL to a `pending/` segment via the flusher
+    /// Promote the current WAL to a `pending/` segment via the worker
     /// thread.  Reply is sent once `pending/<ulid>` is on disk.
     /// No-op (immediate reply) if the WAL is empty.
     PromoteWal {
@@ -181,24 +181,24 @@ pub struct VolumeActor {
     /// embedded into the next `ReadSnapshot` store so that handles see a
     /// consistent (generation, extent_index) pair from a single atomic load.
     flush_gen: u64,
-    /// Sender for dispatching promote jobs to the flusher thread.
+    /// Sender for dispatching jobs to the worker thread.
     /// `Option` so shutdown can `take()` it, dropping the sender to signal
-    /// the flusher to exit.
-    flusher_tx: Option<Sender<PromoteJob>>,
-    /// Receiver for promote results from the flusher thread.
+    /// the worker to exit.
+    worker_tx: Option<Sender<WorkerJob>>,
+    /// Receiver for results from the worker thread.
     /// Third arm in the `select!` loop.
-    flusher_rx: Receiver<io::Result<PromoteResult>>,
-    /// Join handle for the flusher thread, joined on shutdown.
-    flusher_handle: Option<JoinHandle<()>>,
+    worker_rx: Receiver<WorkerResult>,
+    /// Join handle for the worker thread, joined on shutdown.
+    worker_handle: Option<JoinHandle<()>>,
     /// Number of promote jobs dispatched but not yet applied.
     promotes_in_flight: usize,
     /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting for
-    /// the GC promote (`u_flush`) to complete on the flusher.  `None`
+    /// the GC promote (`u_flush`) to complete on the worker.  `None`
     /// when no GC checkpoint is in progress.
     parked_gc: Option<ParkedGcCheckpoint>,
     /// Parked `PromoteWal` replies waiting for their specific promote to
     /// complete.  Multiple can be parked if several `PromoteWal` requests
-    /// arrive while the flusher is busy.
+    /// arrive while the worker is busy.
     parked_promote_wal: Vec<ParkedPromoteWal>,
 }
 
@@ -241,10 +241,10 @@ impl VolumeActor {
         }));
     }
 
-    /// Dispatch a promote job to the flusher thread.
+    /// Dispatch a promote job to the worker thread.
     ///
     /// Calls [`Volume::prepare_promote`] to snapshot the WAL state and open
-    /// a fresh WAL, then sends the job to the flusher.  No-op if the WAL
+    /// a fresh WAL, then sends the job to the worker.  No-op if the WAL
     /// is empty.  Logs and returns on error.
     fn dispatch_promote(&mut self) {
         let job = match self.volume.prepare_promote() {
@@ -255,16 +255,16 @@ impl VolumeActor {
                 return;
             }
         };
-        if let Some(tx) = &self.flusher_tx {
-            if let Err(e) = tx.send(job) {
-                warn!("flusher channel closed: {e}");
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::Promote(job)) {
+                warn!("worker channel closed: {e}");
                 return;
             }
             self.promotes_in_flight += 1;
         }
     }
 
-    /// Run the GC checkpoint prep and dispatch the promote to the flusher.
+    /// Run the GC checkpoint prep and dispatch the promote to the worker.
     ///
     /// Mints ULIDs, opens the fresh WAL immediately (writes resume),
     /// and dispatches the GC promote.  If the WAL is empty, completes
@@ -288,19 +288,19 @@ impl VolumeActor {
         } = prep;
 
         if let Some(job) = job {
-            // Dispatch to flusher, park the reply.
+            // Dispatch to worker, park the reply.
             self.parked_gc = Some(ParkedGcCheckpoint {
                 u_repack,
                 u_sweep,
                 u_flush,
                 reply,
             });
-            if let Some(tx) = &self.flusher_tx {
-                if let Err(e) = tx.send(job) {
-                    warn!("flusher channel closed during gc_checkpoint: {e}");
+            if let Some(tx) = &self.worker_tx {
+                if let Err(e) = tx.send(WorkerJob::Promote(job)) {
+                    warn!("worker channel closed during gc_checkpoint: {e}");
                     if let Some(parked) = self.parked_gc.take() {
                         let _ = parked.reply.send(Err(io::Error::other(
-                            "flusher channel closed during gc_checkpoint",
+                            "worker channel closed during gc_checkpoint",
                         )));
                     }
                     return;
@@ -314,37 +314,41 @@ impl VolumeActor {
         }
     }
 
-    /// Drain in-flight promotes and join the flusher thread.
+    /// Drain in-flight promotes and join the worker thread.
     ///
     /// Called on shutdown (explicit or handle-drop).  Drops the job sender
-    /// to signal the flusher to exit, then drains all pending results,
+    /// to signal the worker to exit, then drains all pending results,
     /// applying successful promotes so that the extent index is up to date
     /// before the volume is closed.
-    fn shutdown_flusher(&mut self) {
-        // Drop the sender — flusher's recv() will return Disconnected.
-        self.flusher_tx.take();
+    fn shutdown_worker(&mut self) {
+        // Drop the sender — worker's recv() will return Disconnected.
+        self.worker_tx.take();
 
         // Drain remaining results.
         while self.promotes_in_flight > 0 {
-            match self.flusher_rx.recv() {
-                Ok(Ok(result)) => {
+            match self.worker_rx.recv() {
+                Ok(WorkerResult::Promote(Ok(result))) => {
                     self.promotes_in_flight -= 1;
                     self.volume.apply_promote(&result);
                     self.publish_snapshot();
                 }
-                Ok(Err(e)) => {
+                Ok(WorkerResult::Promote(Err(e))) => {
                     self.promotes_in_flight -= 1;
-                    warn!("flusher promote failed during shutdown: {e}");
+                    warn!("worker promote failed during shutdown: {e}");
+                }
+                Ok(WorkerResult::GcHandoff(_)) => {
+                    // GC handoff results during shutdown — drop silently.
+                    // The handoff will be re-applied on next startup.
                 }
                 Err(_) => {
-                    // Channel closed — flusher exited unexpectedly.
+                    // Channel closed — worker exited unexpectedly.
                     break;
                 }
             }
         }
 
-        // Join the flusher thread.
-        if let Some(handle) = self.flusher_handle.take() {
+        // Join the worker thread.
+        if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
     }
@@ -358,7 +362,7 @@ impl VolumeActor {
                         Ok(r) => r,
                         Err(_) => {
                             // All handles dropped — drain and exit.
-                            self.shutdown_flusher();
+                            self.shutdown_worker();
                             return;
                         }
                     };
@@ -387,14 +391,14 @@ impl VolumeActor {
                         }
                         VolumeRequest::PromoteWal { reply } => {
                             // Promote the WAL to a pending/ segment via the
-                            // flusher.  Reply once the segment is on disk.
+                            // worker.  Reply once the segment is on disk.
                             match self.volume.prepare_promote() {
                                 Ok(Some(job)) => {
                                     let ulid = job.segment_ulid;
-                                    if let Some(tx) = &self.flusher_tx {
-                                        if let Err(e) = tx.send(job) {
+                                    if let Some(tx) = &self.worker_tx {
+                                        if let Err(e) = tx.send(WorkerJob::Promote(job)) {
                                             let _ = reply.send(Err(io::Error::other(
-                                                format!("flusher channel closed: {e}"),
+                                                format!("worker channel closed: {e}"),
                                             )));
                                         } else {
                                             self.promotes_in_flight += 1;
@@ -522,51 +526,51 @@ impl VolumeActor {
                             let _ = reply.send(result);
                         }
                         VolumeRequest::Shutdown => {
-                            self.shutdown_flusher();
+                            self.shutdown_worker();
                             return;
                         }
                     }
                 }
-                recv(self.flusher_rx) -> msg => {
-                    let completed_ulid = match msg {
-                        Ok(Ok(result)) => {
+                // Worker thread results (promote completions, GC handoffs).
+                recv(self.worker_rx) -> msg => {
+                    match msg {
+                        Ok(WorkerResult::Promote(Ok(result))) => {
                             self.promotes_in_flight -= 1;
                             let ulid = result.segment_ulid;
                             self.volume.apply_promote(&result);
                             self.publish_snapshot();
-                            Some(ulid)
+
+                            // Complete any parked operations waiting for this ULID.
+                            // GC checkpoint.
+                            let is_gc = self
+                                .parked_gc
+                                .as_ref()
+                                .is_some_and(|p| ulid == p.u_flush);
+                            if is_gc {
+                                let parked = self.parked_gc.take().unwrap();
+                                let _ =
+                                    parked.reply.send(Ok((parked.u_repack, parked.u_sweep)));
+                            }
+                            // PromoteWal callers.
+                            let mut i = 0;
+                            while i < self.parked_promote_wal.len() {
+                                if self.parked_promote_wal[i].segment_ulid == ulid {
+                                    let parked = self.parked_promote_wal.swap_remove(i);
+                                    let _ = parked.reply.send(Ok(()));
+                                } else {
+                                    i += 1;
+                                }
+                            }
                         }
-                        Ok(Err(e)) => {
+                        Ok(WorkerResult::Promote(Err(e))) => {
                             self.promotes_in_flight -= 1;
-                            warn!("flusher promote failed: {e}");
-                            None
+                            warn!("worker promote failed: {e}");
+                        }
+                        Ok(WorkerResult::GcHandoff(_result)) => {
+                            // TODO: apply GC handoff result (step 5 of offload plan)
                         }
                         Err(_) => {
-                            warn!("flusher result channel closed unexpectedly");
-                            None
-                        }
-                    };
-                    // Complete any parked operations waiting for this ULID.
-                    if let Some(ulid) = completed_ulid {
-                        // GC checkpoint.
-                        let is_gc = self
-                            .parked_gc
-                            .as_ref()
-                            .is_some_and(|p| ulid == p.u_flush);
-                        if is_gc {
-                            let parked = self.parked_gc.take().unwrap();
-                            let _ =
-                                parked.reply.send(Ok((parked.u_repack, parked.u_sweep)));
-                        }
-                        // PromoteWal callers.
-                        let mut i = 0;
-                        while i < self.parked_promote_wal.len() {
-                            if self.parked_promote_wal[i].segment_ulid == ulid {
-                                let parked = self.parked_promote_wal.swap_remove(i);
-                                let _ = parked.reply.send(Ok(()));
-                            } else {
-                                i += 1;
-                            }
+                            warn!("worker result channel closed unexpectedly");
                         }
                     }
                 }
@@ -994,34 +998,101 @@ impl VolumeHandle {
 // Flusher thread
 // ---------------------------------------------------------------------------
 
-/// Long-lived thread that processes [`PromoteJob`]s from the actor.
+/// Long-lived worker thread that processes off-actor jobs (WAL promotes,
+/// GC handoff re-signs, etc.).
 ///
-/// Receives jobs via `job_rx`, calls [`segment::write_and_commit`] for each,
-/// and sends the result back on `result_tx`.  Exits when `job_rx` disconnects
-/// (actor dropped the sender) or `result_tx` disconnects (actor gone).
-fn flusher_thread(job_rx: Receiver<PromoteJob>, result_tx: Sender<io::Result<PromoteResult>>) {
-    while let Ok(mut job) = job_rx.recv() {
-        let outcome = segment::write_and_commit(
-            &job.pending_dir,
-            job.segment_ulid,
-            &mut job.entries,
-            job.signer.as_ref(),
-        );
-        let msg = match outcome {
-            Ok(body_section_start) => Ok(PromoteResult {
-                segment_ulid: job.segment_ulid,
-                old_wal_ulid: job.old_wal_ulid,
-                old_wal_path: job.old_wal_path,
-                body_section_start,
-                entries: job.entries,
-                pre_promote_offsets: job.pre_promote_offsets,
-            }),
-            Err(e) => Err(e),
+/// Receives jobs via `job_rx`, executes each, and sends the result back on
+/// `result_tx`.  Exits when `job_rx` disconnects (actor dropped the sender)
+/// or `result_tx` disconnects (actor gone).
+fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
+    while let Ok(job) = job_rx.recv() {
+        let msg = match job {
+            WorkerJob::Promote(job) => WorkerResult::Promote(execute_promote(job)),
+            WorkerJob::GcHandoff(job) => WorkerResult::GcHandoff(execute_gc_handoff(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
         }
     }
+}
+
+/// Execute a WAL promote job: write the segment to `pending/`.
+fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
+    let body_section_start = segment::write_and_commit(
+        &job.pending_dir,
+        job.segment_ulid,
+        &mut job.entries,
+        job.signer.as_ref(),
+    )?;
+    Ok(PromoteResult {
+        segment_ulid: job.segment_ulid,
+        old_wal_ulid: job.old_wal_ulid,
+        old_wal_path: job.old_wal_path,
+        body_section_start,
+        entries: job.entries,
+        pre_promote_offsets: job.pre_promote_offsets,
+    })
+}
+
+/// Execute a GC handoff job: read the staged segment, read input `.idx`
+/// files, re-sign with the volume key, and write to `gc/<ulid>.tmp`.
+fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
+    // 1. Read staged segment.
+    let (bss, mut entries, inputs) = segment::read_segment_index(&job.staged_path)?;
+    if inputs.is_empty() {
+        return Err(io::Error::other(
+            "gc staged file has no inputs; not a GC output",
+        ));
+    }
+
+    // 2. Collect body-owning entries from each input's .idx file.
+    let mut input_old_entries = Vec::new();
+    for input_ulid in &inputs {
+        let idx_path = job.index_dir.join(format!("{input_ulid}.idx"));
+        let parsed = match segment::read_segment_index(&idx_path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let (_, old_entries, _) = parsed;
+        for e in &old_entries {
+            if matches!(
+                e.kind,
+                segment::EntryKind::Data | segment::EntryKind::Inline
+            ) {
+                input_old_entries.push((e.hash, e.kind, *input_ulid));
+            }
+        }
+    }
+
+    // 3. Read inline + body data from the staged segment.
+    let handoff_inline = segment::read_inline_section(&job.staged_path)?;
+    segment::read_extent_bodies(
+        &job.staged_path,
+        bss,
+        &mut entries,
+        [
+            segment::EntryKind::Data,
+            segment::EntryKind::DedupRef,
+            segment::EntryKind::Inline,
+        ],
+        &handoff_inline,
+    )?;
+
+    // 4. Re-sign and write gc/<ulid>.tmp.
+    let tmp_path = job.gc_dir.join(format!("{}.tmp", job.new_ulid));
+    let new_bss = segment::write_gc_segment(&tmp_path, &mut entries, &inputs, job.signer.as_ref())?;
+
+    Ok(GcHandoffResult {
+        new_ulid: job.new_ulid,
+        staged_path: job.staged_path,
+        gc_dir: job.gc_dir,
+        new_bss,
+        entries,
+        inputs,
+        input_old_entries,
+        handoff_inline,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,8 +1104,8 @@ fn flusher_thread(job_rx: Receiver<PromoteJob>, result_tx: Sender<io::Result<Pro
 /// The caller must spawn a thread and call `actor.run()` on it.  The
 /// `VolumeHandle` can be cloned freely; each clone is intended for one thread.
 ///
-/// Also spawns a flusher thread for off-actor WAL promotion.  The flusher
-/// exits when the actor shuts down and drops its job sender.
+/// Also spawns a worker thread for off-actor I/O (WAL promotion, etc.).
+/// The worker exits when the actor shuts down and drops its job sender.
 pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     let (lbamap, extent_index) = volume.snapshot_maps();
     let initial = Arc::new(ReadSnapshot {
@@ -1054,23 +1125,22 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     // while still providing backpressure if the actor falls behind.
     let (tx, rx) = bounded(64);
 
-    // Flusher channels: job channel bounded at 4 (~128 MiB of WAL data),
-    // result channel bounded at 4 (matching job capacity).
-    let (flusher_job_tx, flusher_job_rx) = bounded::<PromoteJob>(4);
-    let (flusher_result_tx, flusher_result_rx) = bounded::<io::Result<PromoteResult>>(4);
-    let flusher_handle = std::thread::Builder::new()
-        .name("volume-flusher".into())
-        .spawn(move || flusher_thread(flusher_job_rx, flusher_result_tx))
-        .expect("failed to spawn flusher thread");
+    // Worker channels: job channel bounded at 4, result channel matched.
+    let (worker_job_tx, worker_job_rx) = bounded::<WorkerJob>(4);
+    let (worker_result_tx, worker_result_rx) = bounded::<WorkerResult>(4);
+    let worker_handle = std::thread::Builder::new()
+        .name("volume-worker".into())
+        .spawn(move || worker_thread(worker_job_rx, worker_result_tx))
+        .expect("failed to spawn worker thread");
 
     let actor = VolumeActor {
         volume,
         snapshot: Arc::clone(&snapshot),
         rx,
         flush_gen: 0,
-        flusher_tx: Some(flusher_job_tx),
-        flusher_rx: flusher_result_rx,
-        flusher_handle: Some(flusher_handle),
+        worker_tx: Some(worker_job_tx),
+        worker_rx: worker_result_rx,
+        worker_handle: Some(worker_handle),
         promotes_in_flight: 0,
         parked_gc: None,
         parked_promote_wal: Vec::new(),

@@ -292,9 +292,9 @@ fn evict_reopen_demand_fetch() {
 }
 
 /// Same as `evict_reopen_demand_fetch` but exercises the actor path
-/// (flusher-based promote) rather than inline `Volume::flush_wal`.
+/// (worker-based promote) rather than inline `Volume::flush_wal`.
 ///
-/// This catches regressions in the `prepare_promote` → flusher →
+/// This catches regressions in the `prepare_promote` → worker →
 /// `apply_promote` → coordinator `promote_segment` pipeline that the
 /// direct-Volume test cannot see.
 #[test]

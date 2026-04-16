@@ -358,13 +358,13 @@ pub struct Volume {
 }
 
 // ---------------------------------------------------------------------------
-// Promote offload types
+// Worker offload types
 // ---------------------------------------------------------------------------
 
-/// Data needed by the flusher thread to write a pending segment.
+/// Data needed by the worker thread to write a pending segment.
 ///
 /// Produced by [`Volume::prepare_promote`] on the actor thread, consumed by
-/// the flusher thread which calls [`segment::write_and_commit`].  All fields
+/// the worker thread which calls [`segment::write_and_commit`].  All fields
 /// are `Send` so the struct can cross a thread boundary.
 pub struct PromoteJob {
     pub segment_ulid: Ulid,
@@ -378,7 +378,7 @@ pub struct PromoteJob {
     pub pending_dir: PathBuf,
 }
 
-/// Result returned by the flusher thread after writing the segment.
+/// Result returned by the worker thread after writing the segment.
 ///
 /// Consumed by [`Volume::apply_promote`] on the actor thread.
 pub struct PromoteResult {
@@ -393,7 +393,7 @@ pub struct PromoteResult {
 /// Result of the GC checkpoint prep phase.
 ///
 /// Carries the pre-minted ULIDs and an optional promote job.  The actor
-/// dispatches the job to the flusher and stashes the reply.  When `job`
+/// dispatches the job to the worker and stashes the reply.  When `job`
 /// is `None` the WAL was empty and the checkpoint completes immediately.
 pub struct GcCheckpointPrep {
     pub u_repack: Ulid,
@@ -402,6 +402,57 @@ pub struct GcCheckpointPrep {
     /// GC promote's `PromoteComplete` among other in-flight promotes.
     pub u_flush: Ulid,
     pub job: Option<PromoteJob>,
+}
+
+/// Data needed by the worker thread to re-sign a GC handoff segment.
+///
+/// Produced by the actor's scan phase (directory listing of `gc/*.staged`).
+/// The worker reads the staged segment, reads each input's `.idx` file,
+/// re-signs the segment with the volume key, and returns a
+/// [`GcHandoffResult`] for the actor to apply.
+pub struct GcHandoffJob {
+    pub staged_path: PathBuf,
+    pub new_ulid: Ulid,
+    pub gc_dir: PathBuf,
+    pub index_dir: PathBuf,
+    pub signer: Arc<dyn segment::SegmentSigner>,
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+}
+
+/// Result returned by the worker thread after re-signing a GC handoff.
+///
+/// The actor derives the action set (to_remove, stale_cancel, carried
+/// updates) against the **current** extent index and lbamap — not the
+/// state at dispatch time — to handle concurrent writes correctly.
+pub struct GcHandoffResult {
+    pub new_ulid: Ulid,
+    pub staged_path: PathBuf,
+    pub gc_dir: PathBuf,
+    pub new_bss: u64,
+    pub entries: Vec<segment::SegmentEntry>,
+    pub inputs: Vec<Ulid>,
+    /// Body-owning entries from each input's `.idx` file.
+    /// `(hash, kind, input_ulid)` — used by the apply phase to build the
+    /// to_remove and stale_cancel sets against the current extent index.
+    pub input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)>,
+    /// Inline bytes from the staged segment, needed for building
+    /// `inline_data` in extent locations during the apply phase.
+    pub handoff_inline: Vec<u8>,
+}
+
+/// Job dispatched from the actor to the worker thread.
+pub enum WorkerJob {
+    Promote(PromoteJob),
+    GcHandoff(GcHandoffJob),
+}
+
+/// Result returned by the worker thread to the actor.
+///
+/// Each variant wraps its own `io::Result` so the actor can distinguish
+/// which job type failed.
+pub enum WorkerResult {
+    Promote(io::Result<PromoteResult>),
+    GcHandoff(io::Result<GcHandoffResult>),
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
@@ -851,7 +902,7 @@ impl Volume {
 
         // Promote every non-latest WAL to a fresh segment so the volume
         // returns to its "one active WAL" invariant before we open the
-        // actor. This path fires when a crash or the off-actor flusher
+        // actor. This path fires when a crash or the off-actor worker
         // (Landing 3) leaves multiple WAL files behind; in normal single-
         // WAL operation the loop body never executes.
         //
@@ -859,7 +910,7 @@ impl Volume {
         // segment_floor (mint monotonicity), so it never collides with an
         // existing file. Entries use the same CAS apply path as the online
         // `flush_wal_to_pending_as` flow — safe even when an orphan pending
-        // segment from the pre-crash flusher has already repopulated the
+        // segment from the pre-crash worker has already repopulated the
         // same hashes.
         let wal_files_to_promote: Vec<PathBuf> = if wal_files.len() > 1 {
             let split = wal_files.len() - 1;
@@ -2632,7 +2683,7 @@ impl Volume {
         // is the authoritative body source for both reads and crash recovery.
         //
         // Delete the old WAL file. `segment::write_and_commit` leaves the WAL
-        // alone so the off-actor flusher (Landing 3) can defer this delete
+        // alone so the off-actor worker (Landing 3) can defer this delete
         // until after the actor's publish_snapshot; on the current actor-
         // inline path we just delete immediately. With a fresh segment ULID
         // (not reusing `old_wal_ulid`), a stale cold-cache reader that still
@@ -3077,7 +3128,7 @@ impl Volume {
     /// WAL.  Returns `None` if the WAL is empty (nothing to promote).
     ///
     /// After this call the volume is ready to accept new writes on the
-    /// fresh WAL.  The returned [`PromoteJob`] is sent to the flusher
+    /// fresh WAL.  The returned [`PromoteJob`] is sent to the worker
     /// thread for the heavy segment-write work.
     pub fn prepare_promote(&mut self) -> io::Result<Option<PromoteJob>> {
         if self.pending_entries.is_empty() {
@@ -3123,7 +3174,7 @@ impl Volume {
     }
 
     /// Apply phase of the off-actor promote.  Runs on the actor thread
-    /// after the flusher has written the segment.
+    /// after the worker has written the segment.
     ///
     /// Updates the extent index (CAS), deletes the old WAL, and evicts
     /// the cached file descriptor.  The caller must call `publish_snapshot`
@@ -5415,7 +5466,7 @@ mod tests {
     fn recovery_replays_all_wals_promoting_non_latest() {
         // Multiple WAL files on disk — e.g. left by a crash between
         // `segment::write_and_commit` and the old-WAL unlink, or
-        // produced by the upcoming off-actor flusher — must be
+        // produced by the upcoming off-actor worker — must be
         // collapsed back to a single active WAL before `Volume::open`
         // returns. Every non-latest WAL is promoted to a fresh pending
         // segment; the highest-ULID WAL stays active.

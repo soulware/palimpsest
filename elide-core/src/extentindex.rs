@@ -671,7 +671,7 @@ mod tests {
     fn replace_if_matches_leaves_superseded_entry_alone() {
         // The hash was written to the WAL, then a later writer (or a GC
         // handoff) pointed the extent index at a different segment before
-        // the flusher completed. The apply phase must not clobber that.
+        // the worker completed. The apply phase must not clobber that.
         let mut index = ExtentIndex::new();
         let hash = h(2);
         let wal_ulid = Ulid::from_string("01JQTEST000000000000000100").unwrap();

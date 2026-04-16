@@ -1238,7 +1238,7 @@ pub fn write_and_commit(
 /// Thin wrapper around [`write_and_commit`]: commits the segment, then
 /// deletes the WAL atomically with respect to the rest of the promote.
 /// Callers that need to defer the WAL delete until after the apply phase
-/// (e.g. the off-actor flusher path) should call `write_and_commit` directly.
+/// (e.g. the off-actor worker path) should call `write_and_commit` directly.
 pub fn promote(
     wal_path: &Path,
     ulid: ulid::Ulid,
