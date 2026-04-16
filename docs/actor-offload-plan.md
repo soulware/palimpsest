@@ -1,8 +1,8 @@
 # Plan: offload heavy work from the volume actor
 
-**Status:** Partially landed. Steps 1–3 (CAS inserts + WAL promote offload + `apply_gc_handoffs` offload) are merged. Steps 4–6 are not started.
+**Status:** Partially landed. Steps 1–3 (CAS inserts + WAL promote offload + `apply_gc_handoffs` offload) are merged; step 6 (`promote_segment`) is landed on branch `promote-segment-offload`, out-of-sequence with the original plan because write-tail latency on a live dd workload prioritised the per-upload actor stalls over the segment-index cache. Steps 4–5 are not started.
 
-The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote` and `GcHandoff`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
+The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, and `PromoteSegment`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
 
 ## Problem
 
@@ -79,11 +79,11 @@ Heavy bits: `read_and_verify_segment_index`, `read_inline_section`, `read_extent
 
 The liveness set is computed at prep time and is necessarily a *subset* of true liveness at apply time (concurrent writes can only add references). This is conservative in the safe direction — we might keep a now-dead hash alive for one more cycle, never the reverse.
 
-### 5. `promote_segment` *(not started)*
+### 5. `promote_segment` *(LANDED on branch `promote-segment-offload`)*
 
-Heavy bits: `extract_idx` and `promote_to_cache` are both pure file-to-file copies. There's also a potentially wasteful re-read — the parsing done in promote_segment may duplicate work already done by whoever produced the segment.
+See [promote-segment-offload-plan.md](promote-segment-offload-plan.md) for the full design and landing breakdown.
 
-**Offload shape:** trivially hoistable. **Free work reduction available first:** plumb the parsed segment index through the producing path so `promote_segment` doesn't re-parse and re-verify.
+Prep phase on the actor picks the source (`pending/<ulid>` > `gc/<ulid>` > body-exists early-return) and builds a `PromoteSegmentJob`. Worker thread reads + verifies the index once, handles the GC tombstone shortcut, writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}` (both idempotent on retry), and returns parsed entries + bss + inline bytes. Apply phase on the actor runs the extent-index CAS (Local → Cached) + `pending/<ulid>` delete for the drain path, or input-idx cleanup for the GC path. `WorkerResult::PromoteSegment` carries the ULID out-of-band so errors map to the right parked caller. Single-parse collapse folded in — the previous triple parse is now one `read_and_verify_segment_index` shared across tombstone check, idx extract, body copy, and apply-phase CAS.
 
 ### 6. `snapshot` *(not started)*
 
@@ -100,9 +100,10 @@ Several of these ops call `segment::read_and_verify_segment_index` on segments t
 1. **Make `extent_index` inserts conditional.** LANDED (PR #51). `replace_if_matches` on `ExtentIndex`.
 2. **Introduce a single worker thread and offload WAL promote.** LANDED (PRs #55, #56, #57). Dedicated bounded channels, three-arm `select!`, multi-promote queuing, GC checkpoint routing. See [promote-offload-plan.md](promote-offload-plan.md).
 3. **Offload `apply_gc_handoffs`.** LANDED (PR #58). Generalized the worker to carry a `WorkerJob` enum and added the `GcHandoff` variant.
-4. **Land the segment-index cache.** Orthogonal but by this point it's clearly paying for itself across several call sites.
-5. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Delta_repack is the first op where per-segment parallelism (a small worker pool rather than a single worker) is clearly worth it.
-6. **Offload `promote_segment` (and fix the re-parse).** Snapshot falls out as a composite of the pieces above.
+4. **Offload `promote_segment` (and fix the re-parse).** LANDED on branch `promote-segment-offload` (out-of-sequence with the original plan). Added `WorkerJob::PromoteSegment` + parked-reply dispatch. See [promote-segment-offload-plan.md](promote-segment-offload-plan.md).
+5. **Land the segment-index cache.** Orthogonal but by this point it's clearly paying for itself across several call sites.
+6. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Delta_repack is the first op where per-segment parallelism (a small worker pool rather than a single worker) is clearly worth it.
+7. **Offload `snapshot`.** Falls out as a composite of the pieces above.
 
 After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the worker `select!` arm. No new primitives, no new locks, no read-path changes.
 

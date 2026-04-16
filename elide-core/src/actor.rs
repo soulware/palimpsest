@@ -34,8 +34,8 @@ use crate::segment::{self, BoxFetcher};
 use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, GcHandoffJob,
     GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob,
-    PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
-    ReclaimThresholds, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
+    PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan,
+    ReclaimProposed, ReclaimThresholds, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
     open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
@@ -201,6 +201,11 @@ pub struct VolumeActor {
     /// complete.  Multiple can be parked if several `PromoteWal` requests
     /// arrive while the worker is busy.
     parked_promote_wal: Vec<ParkedPromoteWal>,
+    /// Parked `Promote` (promote_segment) replies waiting for their
+    /// specific segment promote to complete on the worker.
+    parked_promote_segments: Vec<ParkedPromoteSegment>,
+    /// Number of `promote_segment` jobs dispatched but not yet applied.
+    promote_segments_in_flight: usize,
     /// In-progress GC handoff batch.  At most one batch at a time.
     /// `None` when no handoff processing is active.
     parked_handoffs: Option<ParkedGcHandoffs>,
@@ -211,6 +216,12 @@ pub struct VolumeActor {
 /// State stashed while a `PromoteWal` promote is in flight.
 struct ParkedPromoteWal {
     segment_ulid: Ulid,
+    reply: Sender<io::Result<()>>,
+}
+
+/// State stashed while a `promote_segment` job is on the worker thread.
+struct ParkedPromoteSegment {
+    ulid: Ulid,
     reply: Sender<io::Result<()>>,
 }
 
@@ -256,6 +267,22 @@ impl VolumeActor {
             extent_index,
             flush_gen: self.flush_gen,
         }));
+    }
+
+    /// Forward the result of a completed `promote_segment` job to the
+    /// matching parked reply, if any.  Matched by ULID — callers receive
+    /// the apply-phase outcome, not the worker outcome (those only differ
+    /// when apply itself fails, which is rare: both success paths imply
+    /// the segment is fully promoted and the extent index is up to date).
+    fn reply_parked_promote_segment(&mut self, ulid: Ulid, result: io::Result<()>) {
+        if let Some(idx) = self
+            .parked_promote_segments
+            .iter()
+            .position(|p| p.ulid == ulid)
+        {
+            let parked = self.parked_promote_segments.swap_remove(idx);
+            let _ = parked.reply.send(result);
+        }
     }
 
     /// Dispatch a promote job to the worker thread.
@@ -391,7 +418,10 @@ impl VolumeActor {
         self.worker_tx.take();
 
         // Drain remaining results (promotes and any in-flight handoff).
-        while self.promotes_in_flight > 0 || self.handoff_in_flight {
+        while self.promotes_in_flight > 0
+            || self.handoff_in_flight
+            || self.promote_segments_in_flight > 0
+        {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
                     self.promotes_in_flight -= 1;
@@ -414,15 +444,21 @@ impl VolumeActor {
                     self.handoff_in_flight = false;
                     warn!("worker gc handoff failed during shutdown: {e}");
                 }
-                Ok(WorkerResult::PromoteSegment(_)) => {
-                    // Step 2 of the promote_segment offload: the variant
-                    // exists and the worker can execute the job, but the
-                    // actor has not yet wired in dispatch or parking, so
-                    // no PromoteSegment jobs are ever sent to the worker
-                    // from the actor path in-tree today. This arm is a
-                    // placeholder for exhaustiveness; routing + apply
-                    // lands in step 4.
-                    warn!("unexpected PromoteSegment worker result during shutdown");
+                Ok(WorkerResult::PromoteSegment { ulid, result }) => {
+                    self.promote_segments_in_flight -= 1;
+                    match result {
+                        Ok(r) => {
+                            let apply_result = self.volume.apply_promote_segment_result(r);
+                            if apply_result.is_ok() {
+                                self.publish_snapshot();
+                            }
+                            self.reply_parked_promote_segment(ulid, apply_result);
+                        }
+                        Err(e) => {
+                            warn!("worker promote_segment for {ulid} failed during shutdown: {e}");
+                            self.reply_parked_promote_segment(ulid, Err(e));
+                        }
+                    }
                 }
                 Err(_) => {
                     // Channel closed — worker exited unexpectedly.
@@ -567,11 +603,37 @@ impl VolumeActor {
                             let _ = reply.send(self.volume.redact_segment(ulid));
                         }
                         VolumeRequest::Promote { ulid, reply } => {
-                            let result = self.volume.promote_segment(ulid);
-                            if result.is_ok() {
-                                self.publish_snapshot();
+                            // Prep on the actor: cheap directory stat +
+                            // job build. Dispatch to worker, park reply.
+                            match self.volume.prepare_promote_segment(ulid) {
+                                Ok(PromoteSegmentPrep::AlreadyPromoted) => {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Ok(PromoteSegmentPrep::Job(job)) => {
+                                    if let Some(tx) = &self.worker_tx {
+                                        match tx.send(WorkerJob::PromoteSegment(*job)) {
+                                            Ok(()) => {
+                                                self.promote_segments_in_flight += 1;
+                                                self.parked_promote_segments.push(
+                                                    ParkedPromoteSegment { ulid, reply },
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let _ = reply.send(Err(io::Error::other(
+                                                    format!("worker channel closed: {e}"),
+                                                )));
+                                            }
+                                        }
+                                    } else {
+                                        let _ = reply.send(Err(io::Error::other(
+                                            "worker channel closed",
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
                             let _ = reply.send(self.volume.finalize_gc_handoff(ulid));
@@ -692,11 +754,24 @@ impl VolumeActor {
                                 let _ = reply.send(Err(e));
                             }
                         }
-                        Ok(WorkerResult::PromoteSegment(_)) => {
-                            // See the shutdown_worker arm for context:
-                            // PromoteSegment jobs are never dispatched
-                            // from the actor yet (step 4 wires that up).
-                            warn!("unexpected PromoteSegment worker result");
+                        Ok(WorkerResult::PromoteSegment { ulid, result }) => {
+                            self.promote_segments_in_flight -= 1;
+                            match result {
+                                Ok(r) => {
+                                    let apply_result =
+                                        self.volume.apply_promote_segment_result(r);
+                                    if apply_result.is_ok() {
+                                        self.publish_snapshot();
+                                    }
+                                    self.reply_parked_promote_segment(ulid, apply_result);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "worker promote_segment for {ulid} failed: {e}"
+                                    );
+                                    self.reply_parked_promote_segment(ulid, Err(e));
+                                }
+                            }
                         }
                         Err(_) => {
                             warn!("worker result channel closed unexpectedly");
@@ -1131,7 +1206,9 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
             WorkerJob::Promote(job) => WorkerResult::Promote(execute_promote(job)),
             WorkerJob::GcHandoff(job) => WorkerResult::GcHandoff(execute_gc_handoff(job)),
             WorkerJob::PromoteSegment(job) => {
-                WorkerResult::PromoteSegment(execute_promote_segment(job))
+                let ulid = job.ulid;
+                let result = execute_promote_segment(job);
+                WorkerResult::PromoteSegment { ulid, result }
             }
         };
         if result_tx.send(msg).is_err() {
@@ -1325,6 +1402,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         promotes_in_flight: 0,
         parked_gc: None,
         parked_promote_wal: Vec::new(),
+        parked_promote_segments: Vec::new(),
+        promote_segments_in_flight: 0,
         parked_handoffs: None,
         handoff_in_flight: false,
     };

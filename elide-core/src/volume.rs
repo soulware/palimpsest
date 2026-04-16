@@ -506,11 +506,16 @@ pub enum WorkerJob {
 /// Result returned by the worker thread to the actor.
 ///
 /// Each variant wraps its own `io::Result` so the actor can distinguish
-/// which job type failed.
+/// which job type failed.  `PromoteSegment` carries the target ULID
+/// out-of-band so the actor can match a failed job to its parked reply
+/// (the `Err` path otherwise has no ULID to match on).
 pub enum WorkerResult {
     Promote(io::Result<PromoteResult>),
     GcHandoff(io::Result<GcHandoffResult>),
-    PromoteSegment(io::Result<PromoteSegmentResult>),
+    PromoteSegment {
+        ulid: Ulid,
+        result: io::Result<PromoteSegmentResult>,
+    },
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a

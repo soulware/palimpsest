@@ -1,6 +1,6 @@
 # Plan: offload `promote_segment` off the volume actor
 
-**Status:** Proposed. Step 6 of [actor-offload-plan.md](actor-offload-plan.md). Reuses the worker-thread infrastructure established by [promote-offload-plan.md](promote-offload-plan.md) and extended by PR #58.
+**Status:** Landed on branch `promote-segment-offload`. Step 6 of [actor-offload-plan.md](actor-offload-plan.md). Reuses the worker-thread infrastructure established by [promote-offload-plan.md](promote-offload-plan.md) and extended by PR #58.
 
 ## Goal
 
@@ -185,12 +185,12 @@ If the worker returns an error:
 
 ## Landing sequence
 
-Single landing, in this order:
+All landed on branch `promote-segment-offload`:
 
-1. Land the two tests (`promote_segment_recovers_mid_apply_crash` + `HalfPromotePending` SimOp with `assert_promote_recovery` invariant). Establishes the regression guard before the offload.
-2. Introduce `WorkerJob::PromoteSegment` / `WorkerResult::PromoteSegment` and `PromoteSegmentJob` / `PromoteSegmentResult`. No wiring yet.
-3. Split `Volume::promote_segment` into `prepare_promote_segment` + `apply_promote_segment_result`. Keep the old `promote_segment` calling both inline for one commit — proves the split is correct without changing concurrency. Tests must still pass.
-4. Add the worker dispatch path: actor-side parking, `select!` arm for the result. Route `VolumeRequest::Promote` through the worker. Delete the old inline `promote_segment` body. Tests must still pass — a failure here means the prep logic accidentally early-returned on body-exists instead of preferring the source-present path.
+1. **Landed (`d861b21`).** Two tests: `promote_segment_recovers_mid_apply_crash` unit test + `HalfPromotePending` SimOp with `assert_promote_recovery` invariant. Regression guards.
+2. **Landed (`63f7db1`, combined with step 3).** `WorkerJob::PromoteSegment` / `WorkerResult::PromoteSegment` variants and `PromoteSegmentJob` / `PromoteSegmentResult` / `PromoteSegmentPrep` types.
+3. **Landed (`63f7db1`).** Split `Volume::promote_segment` into `prepare_promote_segment` + `actor::execute_promote_segment` + `apply_promote_segment_result`. The inline method still calls all three in sequence on the actor; the worker fn is exercised identically whether it runs inline (direct-Volume callers) or on the worker thread (offload). Single-parse collapse folded in — one `read_and_verify_segment_index` covers the tombstone check, idx extract, body copy, and apply-phase CAS, replacing the previous triple parse.
+4. **Landed (this landing).** Route `VolumeRequest::Promote` through the worker: prep on the actor, dispatch `WorkerJob::PromoteSegment` with a parked reply, apply on result receipt, match reply by ULID. `WorkerResult::PromoteSegment` carries the ULID out-of-band so errors also map to the right parked caller (FIFO fallback would mis-attribute under concurrent promotes). `Volume::promote_segment` inline is retained as the direct-Volume entry point for tests that bypass the actor.
 
 ## Open questions
 
