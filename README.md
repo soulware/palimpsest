@@ -25,5 +25,6 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/design-oci-export.md](docs/design-oci-export.md) | Exploration: squashed OCI export, dual publish via referrers, elide-snapshotter for containerd |
 | [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |
 | [docs/promote-offload-plan.md](docs/promote-offload-plan.md) | Plan: offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
+| [docs/promote-segment-offload-plan.md](docs/promote-segment-offload-plan.md) | Plan: offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
 
 Start with [docs/overview.md](docs/overview.md).

@@ -168,6 +168,14 @@ enum SimOp {
     /// its oracle value, both immediately and across subsequent
     /// GC/crash combinations.
     ReclaimRange { start_lba: u8, lba_count: u8 },
+    /// Simulate a crash between `promote_segment`'s worker-phase file I/O
+    /// (extract_idx + promote_to_cache) and its actor-phase apply
+    /// (extent-index CAS + pending delete). Runs only the file writes for
+    /// one pending segment, leaving the volume in the mid-apply state a
+    /// process crash would produce under the planned promote_segment
+    /// offload. Exercised against a subsequent `Crash` + rebuild so the
+    /// crash-recovery invariants fire on this specific shape.
+    HalfPromotePending,
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -207,6 +215,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             start_lba,
             lba_count,
         }),
+        Just(SimOp::HalfPromotePending),
     ]
 }
 
@@ -709,6 +718,11 @@ proptest! {
                         .unwrap_or_default();
                     let _ = vol.reclaim_commit(plan, proposed);
                 }
+                SimOp::HalfPromotePending => {
+                    // Produces no new ULIDs — idx + cache body keep the
+                    // original pending ULID. Nothing to assert for monotonicity.
+                    let _ = common::half_promote_first_pending(fork_dir);
+                }
             }
         }
     }
@@ -804,6 +818,12 @@ proptest! {
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
                     pending_gc = None;
+                    // For any pending/<ulid> whose cache/<ulid>.body survived
+                    // (a HalfPromotePending before this crash), retrying
+                    // promote_segment must finish the apply: delete pending,
+                    // transition extent-index entries to Cached. The retry
+                    // runs inline with prop_assert via the helper.
+                    common::assert_promote_recovery(&mut vol, fork_dir);
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -827,6 +847,12 @@ proptest! {
                 SimOp::Snapshot => {
                     // Snapshot does not change readable data; no oracle update.
                     let _ = vol.snapshot();
+                }
+                SimOp::HalfPromotePending => {
+                    // Simulates the mid-apply crash state; the invariant check
+                    // that verifies recovery runs inside the next `Crash`
+                    // handler (before the oracle read-back loop).
+                    let _ = common::half_promote_first_pending(fork_dir);
                 }
                 SimOp::PopulateFetched { lba, seed } => {
                     // Simulate a demand-fetch from S3: write one segment directly to
@@ -989,6 +1015,8 @@ proptest! {
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
                     pending_gc = None;
+                    // See crash_recovery_oracle for rationale.
+                    common::assert_promote_recovery(&mut vol, fork_dir);
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1009,6 +1037,9 @@ proptest! {
                 }
                 SimOp::Snapshot => {
                     let _ = vol.snapshot();
+                }
+                SimOp::HalfPromotePending => {
+                    let _ = common::half_promote_first_pending(fork_dir);
                 }
                 SimOp::PopulateFetched { lba, seed } => {
                     // Skip if already populated — see crash_recovery_oracle for rationale.

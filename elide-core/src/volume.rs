@@ -8917,6 +8917,89 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// Simulates a crash window in `promote_segment`: the segment's cache body
+    /// and idx have been committed on disk, but the extent-index CAS + pending
+    /// delete have not run (in the offloaded design these live in a separate
+    /// actor-side apply phase). The next `promote_segment` call for the same
+    /// ULID must complete the half-done work — delete `pending/<ulid>` and
+    /// transition extent-index entries to `BodySource::Cached` — not silently
+    /// early-return.
+    ///
+    /// Today (synchronous in-actor `promote_segment`) the window is narrow but
+    /// still observable because `extract_idx` and `promote_to_cache` commit
+    /// their files via atomic rename before the pending delete runs. Under the
+    /// planned worker offload the window widens, so this test is also a
+    /// regression guard for the offload landing.
+    #[test]
+    fn promote_segment_recovers_mid_apply_crash() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = [42u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let pending_dir = base.join("pending");
+        let ulid_str = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .find_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                (!name.contains('.')).then_some(name)
+            })
+            .unwrap();
+        let ulid = Ulid::from_string(&ulid_str).unwrap();
+        let pending_path = pending_dir.join(&ulid_str);
+
+        // Perform only the "worker" half of promote_segment — extract_idx +
+        // promote_to_cache. Skip the extent-index CAS + pending delete.
+        let cache_dir = base.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let body_path = cache_dir.join(format!("{ulid_str}.body"));
+        let present_path = cache_dir.join(format!("{ulid_str}.present"));
+        let index_dir = base.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+        let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+        segment::extract_idx(&pending_path, &idx_path).unwrap();
+        segment::promote_to_cache(&pending_path, &body_path, &present_path).unwrap();
+
+        assert!(pending_path.exists(), "precondition: pending survives");
+        assert!(body_path.exists(), "precondition: cache body committed");
+        assert!(idx_path.exists(), "precondition: idx committed");
+
+        // Simulate the process crash: drop and reopen.
+        drop(vol);
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Coordinator retries promote_segment on its next tick.
+        vol.promote_segment(ulid).unwrap();
+
+        // Invariant 1: pending/<ulid> is gone after the retry.
+        assert!(
+            !pending_path.exists(),
+            "pending/<ulid> survived retry — half-done promote not recovered",
+        );
+
+        // Invariant 2: the extent-index entry for the written hash now points
+        // at Cached, not Local.
+        let hash = blake3::hash(&data);
+        let loc = vol
+            .extent_index
+            .lookup(&hash)
+            .expect("hash still present in extent index");
+        assert!(
+            matches!(loc.body_source, BodySource::Cached(_)),
+            "extent-index entry still BodySource::Local after retry: {:?}",
+            loc.body_source
+        );
+
+        // Invariant 3: data still reads back correctly.
+        let actual = vol.read(0, 1).unwrap();
+        assert_eq!(actual.as_slice(), data.as_slice(), "data readback wrong");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn all_inline_segment_readable() {
         // A segment where every entry is inline (body_length = 0).

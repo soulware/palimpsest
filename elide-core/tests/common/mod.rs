@@ -68,6 +68,64 @@ pub fn drain_via_handle(handle: &VolumeHandle, base_dir: &Path) {
     }
 }
 
+/// Simulate a crash between the worker-phase file I/O of `promote_segment`
+/// and its actor-phase apply, for the lowest-ULID pending segment (if any).
+///
+/// Runs only `segment::extract_idx` (writes `index/<ulid>.idx`) and
+/// `segment::promote_to_cache` (writes `cache/<ulid>.{body,present}`) — both
+/// idempotent, both tmp+rename-committed. Does **not** run the extent-index
+/// CAS or the `pending/<ulid>` delete. Leaves the volume in the state a
+/// process crash between worker completion and actor apply would produce
+/// under the planned promote_segment offload.
+///
+/// No-op when no pending segment exists. Returns the chosen ULID for
+/// diagnostics, or `None` if nothing was done.
+pub fn half_promote_first_pending(base_dir: &Path) -> Option<Ulid> {
+    let ulid = *pending_ulids(base_dir).first()?;
+    let ulid_str = ulid.to_string();
+    let pending_path = base_dir.join("pending").join(&ulid_str);
+
+    let cache_dir = base_dir.join("cache");
+    let _ = fs::create_dir_all(&cache_dir);
+    let index_dir = base_dir.join("index");
+    let _ = fs::create_dir_all(&index_dir);
+
+    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+    let body_path = cache_dir.join(format!("{ulid_str}.body"));
+    let present_path = cache_dir.join(format!("{ulid_str}.present"));
+
+    if segment::extract_idx(&pending_path, &idx_path).is_err() {
+        return None;
+    }
+    if segment::promote_to_cache(&pending_path, &body_path, &present_path).is_err() {
+        return None;
+    }
+    Some(ulid)
+}
+
+/// Retry `promote_segment` for every ULID whose `cache/<ulid>.body` exists
+/// alongside a surviving `pending/<ulid>` — the mid-apply crash shape. Each
+/// retry must leave `pending/<ulid>` gone. Used as a crash-recovery
+/// invariant in proptest `Crash` handlers.
+///
+/// Panics if any retry fails or leaves a stale pending file.
+pub fn assert_promote_recovery(vol: &mut elide_core::volume::Volume, base_dir: &Path) {
+    let cache_dir = base_dir.join("cache");
+    let pending_dir = base_dir.join("pending");
+    let stale: Vec<Ulid> = pending_ulids(base_dir)
+        .into_iter()
+        .filter(|u| cache_dir.join(format!("{u}.body")).exists())
+        .collect();
+    for ulid in stale {
+        vol.promote_segment(ulid)
+            .expect("promote_segment retry failed");
+        assert!(
+            !pending_dir.join(ulid.to_string()).exists(),
+            "pending/{ulid} survived promote_segment retry after crash",
+        );
+    }
+}
+
 /// Collect sorted ULIDs of full segment files in pending/.
 pub fn pending_ulids(base_dir: &Path) -> Vec<Ulid> {
     let pending_dir = base_dir.join("pending");
