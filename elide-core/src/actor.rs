@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -29,11 +30,12 @@ use ulid::Ulid;
 
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
-use crate::segment::BoxFetcher;
+use crate::segment::{self, BoxFetcher};
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, ReclaimCandidate,
-    ReclaimOutcome, ReclaimPlan, ReclaimProposed, ReclaimThresholds, Volume, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, PromoteJob,
+    PromoteResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
+    ReclaimThresholds, Volume, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
+    scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -173,6 +175,18 @@ pub struct VolumeActor {
     /// embedded into the next `ReadSnapshot` store so that handles see a
     /// consistent (generation, extent_index) pair from a single atomic load.
     flush_gen: u64,
+    /// Sender for dispatching promote jobs to the flusher thread.
+    /// `Option` so shutdown can `take()` it, dropping the sender to signal
+    /// the flusher to exit.
+    flusher_tx: Option<Sender<PromoteJob>>,
+    /// Receiver for promote results from the flusher thread.
+    /// Third arm in the `select!` loop.
+    flusher_rx: Receiver<io::Result<PromoteResult>>,
+    /// Join handle for the flusher thread, joined on shutdown.
+    flusher_handle: Option<JoinHandle<()>>,
+    /// Number of promote jobs dispatched but not yet applied.
+    /// Used by the future GC drain gate (step 8).
+    promotes_in_flight: usize,
 }
 
 /// Idle period after which the actor promotes a non-empty WAL to a pending
@@ -200,6 +214,64 @@ impl VolumeActor {
         }));
     }
 
+    /// Dispatch a promote job to the flusher thread.
+    ///
+    /// Calls [`Volume::prepare_promote`] to snapshot the WAL state and open
+    /// a fresh WAL, then sends the job to the flusher.  No-op if the WAL
+    /// is empty.  Logs and returns on error.
+    fn dispatch_promote(&mut self) {
+        let job = match self.volume.prepare_promote() {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("promote prep failed: {e}");
+                return;
+            }
+        };
+        if let Some(tx) = &self.flusher_tx {
+            if let Err(e) = tx.send(job) {
+                warn!("flusher channel closed: {e}");
+                return;
+            }
+            self.promotes_in_flight += 1;
+        }
+    }
+
+    /// Drain in-flight promotes and join the flusher thread.
+    ///
+    /// Called on shutdown (explicit or handle-drop).  Drops the job sender
+    /// to signal the flusher to exit, then drains all pending results,
+    /// applying successful promotes so that the extent index is up to date
+    /// before the volume is closed.
+    fn shutdown_flusher(&mut self) {
+        // Drop the sender — flusher's recv() will return Disconnected.
+        self.flusher_tx.take();
+
+        // Drain remaining results.
+        while self.promotes_in_flight > 0 {
+            match self.flusher_rx.recv() {
+                Ok(Ok(result)) => {
+                    self.promotes_in_flight -= 1;
+                    self.volume.apply_promote(&result);
+                    self.publish_snapshot();
+                }
+                Ok(Err(e)) => {
+                    self.promotes_in_flight -= 1;
+                    warn!("flusher promote failed during shutdown: {e}");
+                }
+                Err(_) => {
+                    // Channel closed — flusher exited unexpectedly.
+                    break;
+                }
+            }
+        }
+
+        // Join the flusher thread.
+        if let Some(handle) = self.flusher_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
     pub fn run(mut self) {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
@@ -207,7 +279,11 @@ impl VolumeActor {
                 recv(self.rx) -> msg => {
                     let req = match msg {
                         Ok(r) => r,
-                        Err(_) => return, // all handles dropped
+                        Err(_) => {
+                            // All handles dropped — drain and exit.
+                            self.shutdown_flusher();
+                            return;
+                        }
                     };
                     match req {
                         VolumeRequest::Write { lba, data, reply } => {
@@ -220,24 +296,16 @@ impl VolumeActor {
                                     flush_gen: self.flush_gen,
                                 }));
                             }
-                            // Reply before promoting: the write caller is unblocked
-                            // immediately after the WAL append.  The promote cost
-                            // (fsync + segment write) is paid before the next
-                            // queued message is processed, not by this caller.
                             let _ = reply.send(result);
                             if self.volume.needs_promote() {
-                                if let Err(e) = self.volume.flush_wal() {
-                                    warn!("threshold-triggered promote failed: {e}");
-                                } else {
-                                    self.publish_snapshot();
-                                }
+                                self.dispatch_promote();
                             }
                         }
                         VolumeRequest::Flush { reply } => {
-                            let result = self.volume.flush_wal();
-                            if result.is_ok() {
-                                self.publish_snapshot();
-                            }
+                            // Flush = WAL fsync only.  Durability barrier for
+                            // data already appended to the WAL.  Promotion is
+                            // triggered asynchronously by threshold / idle tick.
+                            let result = self.volume.wal_fsync();
                             let _ = reply.send(result);
                         }
                         VolumeRequest::Trim {
@@ -256,11 +324,7 @@ impl VolumeActor {
                             }
                             let _ = reply.send(result);
                             if self.volume.needs_promote() {
-                                if let Err(e) = self.volume.flush_wal() {
-                                    warn!("threshold-triggered promote after trim failed: {e}");
-                                } else {
-                                    self.publish_snapshot();
-                                }
+                                self.dispatch_promote();
                             }
                         }
                         VolumeRequest::SweepPending { reply } => {
@@ -293,10 +357,6 @@ impl VolumeActor {
                                     extent_index,
                                     flush_gen: self.flush_gen,
                                 }));
-                                // Evict old cache files AFTER publishing the new snapshot.
-                                // Readers that loaded the old snapshot may still be accessing
-                                // cache/<old>.body; evicting after publish ensures all new
-                                // reads use the updated extent index (pointing to new_ulid).
                                 self.volume.evict_applied_gc_cache();
                             }
                             let _ = reply.send(result);
@@ -339,8 +399,6 @@ impl VolumeActor {
                             lba_length,
                             reply,
                         } => {
-                            // Phase 1 is a cheap O(log n) range query + Arc::clone.
-                            // No fallible work on the actor path.
                             let plan = self.volume.reclaim_snapshot(start_lba, lba_length);
                             let _ = reply.send(Ok(plan));
                         }
@@ -350,31 +408,38 @@ impl VolumeActor {
                             reply,
                         } => {
                             let result = self.volume.reclaim_commit(plan, proposed);
-                            // Only republish when at least one rewrite committed.
-                            // A discard or empty commit leaves the map identical
-                            // to the pre-call state, so reissuing the snapshot
-                            // would bump flush_gen for nothing.
                             if matches!(&result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
                         }
-                        VolumeRequest::Shutdown => return,
+                        VolumeRequest::Shutdown => {
+                            self.shutdown_flusher();
+                            return;
+                        }
+                    }
+                }
+                recv(self.flusher_rx) -> msg => {
+                    match msg {
+                        Ok(Ok(result)) => {
+                            self.promotes_in_flight -= 1;
+                            self.volume.apply_promote(&result);
+                            self.publish_snapshot();
+                        }
+                        Ok(Err(e)) => {
+                            self.promotes_in_flight -= 1;
+                            warn!("flusher promote failed: {e}");
+                        }
+                        Err(_) => {
+                            warn!("flusher result channel closed unexpectedly");
+                        }
                     }
                 }
                 recv(idle_tick) -> _ => {
-                    // Promote any unflushed WAL data that has been sitting idle.
-                    // No-op if the WAL is empty.  Errors are logged and not fatal:
-                    // the data is safe in the WAL; the next write or explicit
-                    // flush will retry.
-                    match self.volume.flush_wal() {
-                        Ok(()) => self.publish_snapshot(),
-                        Err(e) => warn!("idle flush failed: {e}"),
-                    }
+                    // Dispatch a promote if the WAL has unflushed data.
+                    // prepare_promote handles the empty-WAL case internally.
+                    self.dispatch_promote();
                     // Apply any GC handoff files written by the coordinator.
-                    // No flush_gen bump: GC is a segment-to-segment move; body
-                    // offsets remain absolute and the fd cache's segment-id
-                    // mismatch detection handles eviction naturally.
                     match self.volume.apply_gc_handoffs() {
                         Ok(0) => {}
                         Ok(_) => {
@@ -778,6 +843,40 @@ impl VolumeHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Flusher thread
+// ---------------------------------------------------------------------------
+
+/// Long-lived thread that processes [`PromoteJob`]s from the actor.
+///
+/// Receives jobs via `job_rx`, calls [`segment::write_and_commit`] for each,
+/// and sends the result back on `result_tx`.  Exits when `job_rx` disconnects
+/// (actor dropped the sender) or `result_tx` disconnects (actor gone).
+fn flusher_thread(job_rx: Receiver<PromoteJob>, result_tx: Sender<io::Result<PromoteResult>>) {
+    while let Ok(mut job) = job_rx.recv() {
+        let outcome = segment::write_and_commit(
+            &job.pending_dir,
+            job.segment_ulid,
+            &mut job.entries,
+            job.signer.as_ref(),
+        );
+        let msg = match outcome {
+            Ok(body_section_start) => Ok(PromoteResult {
+                segment_ulid: job.segment_ulid,
+                old_wal_ulid: job.old_wal_ulid,
+                old_wal_path: job.old_wal_path,
+                body_section_start,
+                entries: job.entries,
+                pre_promote_offsets: job.pre_promote_offsets,
+            }),
+            Err(e) => Err(e),
+        };
+        if result_tx.send(msg).is_err() {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -786,8 +885,8 @@ impl VolumeHandle {
 /// The caller must spawn a thread and call `actor.run()` on it.  The
 /// `VolumeHandle` can be cloned freely; each clone is intended for one thread.
 ///
-/// `volume_size` is the block-device size in bytes, forwarded to the handle
-/// for NBD/ublk export info.
+/// Also spawns a flusher thread for off-actor WAL promotion.  The flusher
+/// exits when the actor shuts down and drops its job sender.
 pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     let (lbamap, extent_index) = volume.snapshot_maps();
     let initial = Arc::new(ReadSnapshot {
@@ -807,11 +906,24 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     // while still providing backpressure if the actor falls behind.
     let (tx, rx) = bounded(64);
 
+    // Flusher channels: job channel bounded at 4 (~128 MiB of WAL data),
+    // result channel bounded at 4 (matching job capacity).
+    let (flusher_job_tx, flusher_job_rx) = bounded::<PromoteJob>(4);
+    let (flusher_result_tx, flusher_result_rx) = bounded::<io::Result<PromoteResult>>(4);
+    let flusher_handle = std::thread::Builder::new()
+        .name("volume-flusher".into())
+        .spawn(move || flusher_thread(flusher_job_rx, flusher_result_tx))
+        .expect("failed to spawn flusher thread");
+
     let actor = VolumeActor {
         volume,
         snapshot: Arc::clone(&snapshot),
         rx,
         flush_gen: 0,
+        flusher_tx: Some(flusher_job_tx),
+        flusher_rx: flusher_result_rx,
+        flusher_handle: Some(flusher_handle),
+        promotes_in_flight: 0,
     };
 
     let handle = VolumeHandle {

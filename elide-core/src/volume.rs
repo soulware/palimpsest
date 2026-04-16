@@ -357,6 +357,39 @@ pub struct Volume {
     noop_stats: NoopSkipStats,
 }
 
+// ---------------------------------------------------------------------------
+// Promote offload types
+// ---------------------------------------------------------------------------
+
+/// Data needed by the flusher thread to write a pending segment.
+///
+/// Produced by [`Volume::prepare_promote`] on the actor thread, consumed by
+/// the flusher thread which calls [`segment::write_and_commit`].  All fields
+/// are `Send` so the struct can cross a thread boundary.
+pub struct PromoteJob {
+    pub segment_ulid: Ulid,
+    pub old_wal_ulid: Ulid,
+    pub old_wal_path: PathBuf,
+    pub entries: Vec<segment::SegmentEntry>,
+    /// CAS precondition tokens: the `body_offset` each Data/Inline entry
+    /// had in the extent index at prep time.  `None` for DedupRef/Zero/Delta.
+    pub pre_promote_offsets: Vec<Option<u64>>,
+    pub signer: Arc<dyn segment::SegmentSigner>,
+    pub pending_dir: PathBuf,
+}
+
+/// Result returned by the flusher thread after writing the segment.
+///
+/// Consumed by [`Volume::apply_promote`] on the actor thread.
+pub struct PromoteResult {
+    pub segment_ulid: Ulid,
+    pub old_wal_ulid: Ulid,
+    pub old_wal_path: PathBuf,
+    pub body_section_start: u64,
+    pub entries: Vec<segment::SegmentEntry>,
+    pub pre_promote_offsets: Vec<Option<u64>>,
+}
+
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
 /// clone of the current `Arc<LbaMap>` (used as the precondition token in
 /// phase 3 and as the read source for bloat detection in phase 2), and
@@ -3009,6 +3042,147 @@ impl Volume {
 
     pub fn promote_for_test(&mut self) -> io::Result<()> {
         self.promote()
+    }
+
+    // ------------------------------------------------------------------
+    // Off-actor promote: prep + apply
+    // ------------------------------------------------------------------
+
+    /// Fsync the WAL without promoting.
+    ///
+    /// Used by the actor's `Flush` handler to satisfy the NBD durability
+    /// contract without blocking on segment serialization.
+    pub fn wal_fsync(&mut self) -> io::Result<()> {
+        self.wal.fsync()
+    }
+
+    /// Prep phase of the off-actor promote.  Runs on the actor thread.
+    ///
+    /// Fsyncs the WAL, snapshots CAS precondition tokens, takes ownership
+    /// of `pending_entries`, mints a fresh segment ULID, and opens a new
+    /// WAL.  Returns `None` if the WAL is empty (nothing to promote).
+    ///
+    /// After this call the volume is ready to accept new writes on the
+    /// fresh WAL.  The returned [`PromoteJob`] is sent to the flusher
+    /// thread for the heavy segment-write work.
+    pub fn prepare_promote(&mut self) -> io::Result<Option<PromoteJob>> {
+        if self.pending_entries.is_empty() {
+            return Ok(None);
+        }
+        self.wal.fsync()?;
+
+        let old_wal_ulid = self.wal_ulid;
+        let old_wal_path = self.wal_path.clone();
+
+        // Snapshot CAS tokens before write_and_commit rewrites stored_offset.
+        let pre_promote_offsets: Vec<Option<u64>> = self
+            .pending_entries
+            .iter()
+            .map(|e| match e.kind {
+                EntryKind::Data | EntryKind::Inline => {
+                    self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
+                }
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
+            })
+            .collect();
+
+        let entries = std::mem::take(&mut self.pending_entries);
+        let segment_ulid = self.mint.next();
+        let pending_dir = self.base_dir.join("pending");
+
+        // Open fresh WAL — new writes start flowing immediately.
+        let (wal, wal_ulid, wal_path, _) =
+            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
+        self.wal = wal;
+        self.wal_ulid = wal_ulid;
+        self.wal_path = wal_path;
+
+        Ok(Some(PromoteJob {
+            segment_ulid,
+            old_wal_ulid,
+            old_wal_path,
+            entries,
+            pre_promote_offsets,
+            signer: Arc::clone(&self.signer),
+            pending_dir,
+        }))
+    }
+
+    /// Apply phase of the off-actor promote.  Runs on the actor thread
+    /// after the flusher has written the segment.
+    ///
+    /// Updates the extent index (CAS), deletes the old WAL, and evicts
+    /// the cached file descriptor.  The caller must call `publish_snapshot`
+    /// after this to make the changes visible to readers.
+    pub fn apply_promote(&mut self, result: &PromoteResult) {
+        self.has_new_segments = true;
+        self.last_segment_ulid = Some(result.segment_ulid);
+
+        // CAS loop: rewrite extent index entries from WAL-relative to
+        // segment-relative offsets, but only if the entry hasn't been
+        // superseded by a concurrent write or GC handoff.
+        for (entry, old_wal_offset) in result
+            .entries
+            .iter()
+            .zip(result.pre_promote_offsets.iter().copied())
+        {
+            match entry.kind {
+                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+            }
+            let Some(old_wal_offset) = old_wal_offset else {
+                continue;
+            };
+            let idata = if entry.kind == EntryKind::Inline {
+                entry.data.clone().map(Vec::into_boxed_slice)
+            } else {
+                None
+            };
+            Arc::make_mut(&mut self.extent_index).replace_if_matches(
+                entry.hash,
+                result.old_wal_ulid,
+                old_wal_offset,
+                extentindex::ExtentLocation {
+                    segment_id: result.segment_ulid,
+                    body_offset: entry.stored_offset,
+                    body_length: entry.stored_length,
+                    compressed: entry.compressed,
+                    body_source: BodySource::Local,
+                    body_section_start: result.body_section_start,
+                    inline_data: idata,
+                },
+            );
+        }
+
+        // Log entry counts.
+        {
+            let (mut data, mut refs, mut zero, mut inline, mut delta) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            for e in &result.entries {
+                match e.kind {
+                    EntryKind::Data => data += 1,
+                    EntryKind::DedupRef => refs += 1,
+                    EntryKind::Zero => zero += 1,
+                    EntryKind::Inline => inline += 1,
+                    EntryKind::Delta => delta += 1,
+                }
+            }
+            log::info!(
+                "flush {}: {data} data, {inline} inline, {refs} dedup-ref, \
+                 {zero} zero, {delta} delta ({} entries total)",
+                result.segment_ulid,
+                result.entries.len()
+            );
+        }
+
+        // Delete old WAL — only after the extent index is updated.
+        if let Err(e) = fs::remove_file(&result.old_wal_path) {
+            log::warn!(
+                "failed to delete old WAL {}: {e}",
+                result.old_wal_path.display()
+            );
+        }
+        self.evict_cached_segment(result.old_wal_ulid);
     }
 }
 

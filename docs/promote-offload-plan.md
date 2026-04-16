@@ -47,11 +47,6 @@ The segment file reuses the WAL's ULID (`segment_ulid == self.wal_ulid`). `find_
 ### Data structures
 
 ```rust
-enum VolumeRequest {
-    // ... existing variants ...
-    PromoteComplete(PromoteResult),
-}
-
 struct PromoteJob {
     segment_ulid: Ulid,                  // fresh, distinct from the WAL ulid
     old_wal_ulid: Ulid,
@@ -60,7 +55,6 @@ struct PromoteJob {
     pre_promote_offsets: Vec<Option<u64>>, // CAS tokens snapshotted at prep time
     signer: Arc<dyn SegmentSigner>,
     pending_dir: PathBuf,
-    reply_tx: Sender<VolumeRequest>,     // actor's main channel, for PromoteComplete
 }
 
 struct PromoteResult {
@@ -70,13 +64,14 @@ struct PromoteResult {
     body_section_start: u64,
     entries: Vec<SegmentEntry>,          // returned; `stored_offset` now segment-relative
     pre_promote_offsets: Vec<Option<u64>>,
-    result: io::Result<()>,
 }
 ```
 
-The flusher is a single long-lived thread owning one crossbeam receiver for `PromoteJob`. The actor owns the sender. On shutdown the actor drops its sender; the flusher exits when `recv()` returns `Disconnected`. `PromoteComplete` messages come back on the actor's main `VolumeRequest` channel so they're processed inline with writes and other requests.
+The flusher is a single long-lived thread owning one crossbeam receiver for `PromoteJob`. The actor owns the sender. On shutdown the actor drops its sender; the flusher exits when `recv()` returns `Disconnected`.
 
-Multiple promotes can be in flight simultaneously. Each `PromoteJob` carries all the data the flusher needs; the flusher processes jobs in FIFO order and sends `PromoteComplete` back in the same order. The actor applies completions in arrival order.
+Results come back on a **separate dedicated channel** (`Sender<io::Result<PromoteResult>>`), not the actor's main `VolumeRequest` channel. The actor's `select!` loop gains a third arm for this channel. This avoids the flusher holding a clone of the actor's sender, which would prevent the main channel from disconnecting when all `VolumeHandle`s are dropped — the actor relies on that disconnection for shutdown detection.
+
+Multiple promotes can be in flight simultaneously. Each `PromoteJob` carries all the data the flusher needs; the flusher processes jobs in FIFO order and sends results back in the same order. The actor applies completions in arrival order.
 
 ### Sequencing: normal write-path promote
 
