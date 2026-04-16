@@ -126,7 +126,7 @@ enum SegmentLayout {
 
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StagedApply {
+pub enum StagedApply {
     /// The staged segment was applied; extent index updated, body re-signed
     /// and renamed to bare, `.staged` file removed.
     Applied,
@@ -1922,6 +1922,203 @@ impl Volume {
     pub fn apply_gc_handoffs(&mut self) -> io::Result<usize> {
         let gc_dir = self.base_dir.join("gc");
         self.apply_all_staged_handoffs(&gc_dir)
+    }
+
+    /// Build a [`GcHandoffJob`] for dispatch to the worker thread.
+    pub fn build_gc_handoff_job(&self, staged_path: PathBuf, new_ulid: Ulid) -> GcHandoffJob {
+        GcHandoffJob {
+            staged_path,
+            new_ulid,
+            gc_dir: self.base_dir.join("gc"),
+            index_dir: self.base_dir.join("index"),
+            signer: Arc::clone(&self.signer),
+            verifying_key: self.verifying_key,
+        }
+    }
+
+    /// Scan `gc/` for staged handoff files that need processing.
+    ///
+    /// Sweeps stale `.tmp` files, applies bare-wins shortcuts, and returns
+    /// a list of `(staged_path, new_ulid)` pairs to dispatch to the worker.
+    /// Also returns a count of handoffs that were already applied (bare wins).
+    ///
+    /// This is the prep phase of the GC handoff offload — cheap directory
+    /// listing that runs on the actor thread.
+    pub fn scan_staged_handoffs(&self) -> io::Result<(Vec<(PathBuf, Ulid)>, usize)> {
+        let gc_dir = self.base_dir.join("gc");
+        if !gc_dir.try_exists()? {
+            return Ok((Vec::new(), 0));
+        }
+
+        // Pass 1: sweep stale `.tmp` files (incomplete writes).
+        for entry in fs::read_dir(&gc_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+
+        // Pass 2: collect `.staged` files.
+        let mut staged: Vec<(String, Ulid)> = fs::read_dir(&gc_dir)?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().into_string().ok()?;
+                let stem = name.strip_suffix(".staged")?;
+                let ulid = Ulid::from_string(stem).ok()?;
+                Some((name, ulid))
+            })
+            .collect();
+        staged.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let mut to_process = Vec::new();
+        let mut already_applied = 0usize;
+        for (staged_name, new_ulid) in staged {
+            let staged_path = gc_dir.join(&staged_name);
+            let bare_path = gc_dir.join(new_ulid.to_string());
+
+            // Crash recovery: `.staged` + bare → bare wins, drop `.staged`.
+            if bare_path.try_exists()? {
+                let _ = fs::remove_file(&staged_path);
+                already_applied += 1;
+                continue;
+            }
+
+            to_process.push((staged_path, new_ulid));
+        }
+
+        Ok((to_process, already_applied))
+    }
+
+    /// Apply a GC handoff result that was processed by the worker thread.
+    ///
+    /// Re-derives the action set (to_remove, stale_cancel, carried updates)
+    /// against the **current** extent index and lbamap to handle concurrent
+    /// writes that may have arrived while the worker was running.
+    ///
+    /// Returns `Applied` if the handoff was committed, `Cancelled` if the
+    /// stale-liveness check failed.
+    pub fn apply_gc_handoff_result(&mut self, result: &GcHandoffResult) -> io::Result<StagedApply> {
+        use std::collections::HashSet;
+
+        // Build carried_hashes: body-owning entries in the GC output.
+        let carried_hashes: HashSet<blake3::Hash> = result
+            .entries
+            .iter()
+            .filter(|e| e.kind != segment::EntryKind::DedupRef)
+            .map(|e| e.hash)
+            .collect();
+
+        // Walk input old entries, check extent index for each.
+        let live = self.lbamap.lba_referenced_hashes();
+        let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
+        let mut stale_cancel: Vec<blake3::Hash> = Vec::new();
+
+        for &(hash, kind, input_ulid) in &result.input_old_entries {
+            if !matches!(kind, segment::EntryKind::Data | segment::EntryKind::Inline) {
+                continue;
+            }
+            let still_at_input = self
+                .extent_index
+                .lookup(&hash)
+                .is_some_and(|loc| loc.segment_id == input_ulid);
+            if !still_at_input {
+                continue;
+            }
+            if carried_hashes.contains(&hash) {
+                continue; // will be updated below
+            }
+            // Not carried: will be removed. If LBA-live, cancel.
+            if live.contains(&hash) {
+                stale_cancel.push(hash);
+            }
+            to_remove.push((hash, input_ulid));
+        }
+
+        if !stale_cancel.is_empty() {
+            log::warn!(
+                "gc staged {}: stale-liveness cancellation — {} hash(es) live in \
+                 volume but absent from coordinator output; removing staged file \
+                 and tmp",
+                result.staged_path.display(),
+                stale_cancel.len(),
+            );
+            let _ = fs::remove_file(&result.staged_path);
+            let tmp_path = result.gc_dir.join(format!("{}.tmp", result.new_ulid));
+            let _ = fs::remove_file(&tmp_path);
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // Update extent index for carried entries.
+        for (i, e) in result.entries.iter().enumerate() {
+            if e.kind == segment::EntryKind::DedupRef {
+                continue;
+            }
+            let still_at_input = self
+                .extent_index
+                .lookup(&e.hash)
+                .is_some_and(|loc| result.inputs.contains(&loc.segment_id));
+            if !still_at_input {
+                continue;
+            }
+            let idata = if e.kind == segment::EntryKind::Inline {
+                let start = e.stored_offset as usize;
+                let end = start + e.stored_length as usize;
+                if end <= result.handoff_inline.len() {
+                    Some(result.handoff_inline[start..end].into())
+                } else {
+                    continue;
+                }
+            } else {
+                None
+            };
+            Arc::make_mut(&mut self.extent_index).insert(
+                e.hash,
+                extentindex::ExtentLocation {
+                    segment_id: result.new_ulid,
+                    body_offset: e.stored_offset,
+                    body_length: e.stored_length,
+                    compressed: e.compressed,
+                    body_source: BodySource::Cached(i as u32),
+                    body_section_start: result.new_bss,
+                    inline_data: idata,
+                },
+            );
+        }
+
+        // Remove extent index entries for hashes no longer carried.
+        for (hash, old_ulid) in &to_remove {
+            if self
+                .extent_index
+                .lookup(hash)
+                .is_some_and(|loc| loc.segment_id == *old_ulid)
+            {
+                Arc::make_mut(&mut self.extent_index).remove(hash);
+            }
+        }
+
+        // Clean up pending/ files for consumed inputs.
+        let pending_dir = self.base_dir.join("pending");
+        for input in &result.inputs {
+            let _ = fs::remove_file(pending_dir.join(input.to_string()));
+        }
+
+        // Commit: rename tmp → bare.
+        let tmp_path = result.gc_dir.join(format!("{}.tmp", result.new_ulid));
+        let bare_path = result.gc_dir.join(result.new_ulid.to_string());
+        fs::rename(&tmp_path, &bare_path)?;
+        let _ = fs::remove_file(&result.staged_path);
+
+        // Evict cache for consumed inputs.
+        let cache_dir = self.base_dir.join("cache");
+        for input in &result.inputs {
+            let s = input.to_string();
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+        }
+
+        Ok(StagedApply::Applied)
     }
 
     /// Walk `gc/` for `.staged` entries and apply each via the

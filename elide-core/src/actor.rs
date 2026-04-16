@@ -200,6 +200,11 @@ pub struct VolumeActor {
     /// complete.  Multiple can be parked if several `PromoteWal` requests
     /// arrive while the worker is busy.
     parked_promote_wal: Vec<ParkedPromoteWal>,
+    /// In-progress GC handoff batch.  At most one batch at a time.
+    /// `None` when no handoff processing is active.
+    parked_handoffs: Option<ParkedGcHandoffs>,
+    /// Whether a GC handoff job is currently on the worker thread.
+    handoff_in_flight: bool,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -214,6 +219,17 @@ struct ParkedGcCheckpoint {
     u_sweep: Ulid,
     u_flush: Ulid,
     reply: Sender<io::Result<(Ulid, Ulid)>>,
+}
+
+/// State for an in-progress batch of GC handoff applications.
+///
+/// The actor dispatches one handoff at a time to the worker thread.
+/// On each completion it applies the result, then dispatches the next.
+/// When the list is exhausted, the reply (if any) is sent.
+struct ParkedGcHandoffs {
+    remaining: Vec<(PathBuf, Ulid)>,
+    reply: Option<Sender<io::Result<usize>>>,
+    applied_count: usize,
 }
 
 /// Idle period after which the actor promotes a non-empty WAL to a pending
@@ -314,18 +330,67 @@ impl VolumeActor {
         }
     }
 
-    /// Drain in-flight promotes and join the worker thread.
+    /// Scan for staged GC handoffs and begin dispatching them to the worker.
+    ///
+    /// If `reply` is `Some`, the reply is sent when all handoffs have been
+    /// applied (or immediately if there are none).  If `None` (idle tick),
+    /// results are applied silently.
+    fn start_gc_handoffs(&mut self, reply: Option<Sender<io::Result<usize>>>) {
+        let (to_process, already_applied) = match self.volume.scan_staged_handoffs() {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(e));
+                } else {
+                    warn!("gc handoff scan failed: {e}");
+                }
+                return;
+            }
+        };
+
+        if to_process.is_empty() {
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(already_applied));
+            }
+            return;
+        }
+
+        let mut parked = ParkedGcHandoffs {
+            remaining: to_process,
+            reply,
+            applied_count: already_applied,
+        };
+
+        self.dispatch_next_handoff(&mut parked);
+        self.parked_handoffs = Some(parked);
+    }
+
+    /// Pop the next staged handoff from the parked batch and dispatch it.
+    fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
+        if let Some((staged_path, new_ulid)) = parked.remaining.pop() {
+            let job = self.volume.build_gc_handoff_job(staged_path, new_ulid);
+            if let Some(tx) = &self.worker_tx {
+                if let Err(e) = tx.send(WorkerJob::GcHandoff(job)) {
+                    warn!("worker channel closed during gc handoff: {e}");
+                    return;
+                }
+                self.handoff_in_flight = true;
+            }
+        }
+    }
+
+    /// Drain in-flight jobs and join the worker thread.
     ///
     /// Called on shutdown (explicit or handle-drop).  Drops the job sender
     /// to signal the worker to exit, then drains all pending results,
-    /// applying successful promotes so that the extent index is up to date
+    /// applying successful ones so that the extent index is up to date
     /// before the volume is closed.
     fn shutdown_worker(&mut self) {
         // Drop the sender — worker's recv() will return Disconnected.
         self.worker_tx.take();
 
-        // Drain remaining results.
-        while self.promotes_in_flight > 0 {
+        // Drain remaining results (promotes and any in-flight handoff).
+        while self.promotes_in_flight > 0 || self.handoff_in_flight {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
                     self.promotes_in_flight -= 1;
@@ -336,9 +401,17 @@ impl VolumeActor {
                     self.promotes_in_flight -= 1;
                     warn!("worker promote failed during shutdown: {e}");
                 }
-                Ok(WorkerResult::GcHandoff(_)) => {
-                    // GC handoff results during shutdown — drop silently.
-                    // The handoff will be re-applied on next startup.
+                Ok(WorkerResult::GcHandoff(Ok(result))) => {
+                    self.handoff_in_flight = false;
+                    if let Ok(crate::volume::StagedApply::Applied) =
+                        self.volume.apply_gc_handoff_result(&result)
+                    {
+                        self.publish_snapshot();
+                    }
+                }
+                Ok(WorkerResult::GcHandoff(Err(e))) => {
+                    self.handoff_in_flight = false;
+                    warn!("worker gc handoff failed during shutdown: {e}");
                 }
                 Err(_) => {
                     // Channel closed — worker exited unexpectedly.
@@ -346,6 +419,9 @@ impl VolumeActor {
                 }
             }
         }
+        // Drop any remaining parked handoff state (remaining items
+        // will be re-applied on next startup).
+        self.parked_handoffs.take();
 
         // Join the worker thread.
         if let Some(handle) = self.worker_handle.take() {
@@ -458,17 +534,13 @@ impl VolumeActor {
                             let _ = reply.send(result);
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
-                            let result = self.volume.apply_gc_handoffs();
-                            if matches!(&result, Ok(n) if *n > 0) {
-                                let (lbamap, extent_index) = self.volume.snapshot_maps();
-                                self.snapshot.store(Arc::new(ReadSnapshot {
-                                    lbamap,
-                                    extent_index,
-                                    flush_gen: self.flush_gen,
-                                }));
-                                self.volume.evict_applied_gc_cache();
+                            if self.parked_handoffs.is_some() {
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent apply_gc_handoffs not allowed",
+                                )));
+                            } else {
+                                self.start_gc_handoffs(Some(reply));
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::GcCheckpoint { reply } => {
                             if self.parked_gc.is_some() {
@@ -566,8 +638,48 @@ impl VolumeActor {
                             self.promotes_in_flight -= 1;
                             warn!("worker promote failed: {e}");
                         }
-                        Ok(WorkerResult::GcHandoff(_result)) => {
-                            // TODO: apply GC handoff result (step 5 of offload plan)
+                        Ok(WorkerResult::GcHandoff(Ok(result))) => {
+                            self.handoff_in_flight = false;
+                            match self.volume.apply_gc_handoff_result(&result) {
+                                Ok(crate::volume::StagedApply::Applied) => {
+                                    self.publish_snapshot();
+                                    if let Some(ref mut parked) = self.parked_handoffs {
+                                        parked.applied_count += 1;
+                                    }
+                                }
+                                Ok(crate::volume::StagedApply::Cancelled) => {
+                                    // Stale-liveness cancel — logged inside
+                                    // apply_gc_handoff_result, continue to next.
+                                }
+                                Err(e) => {
+                                    warn!("gc handoff apply failed: {e}");
+                                    if let Some(parked) = self.parked_handoffs.take()
+                                        && let Some(reply) = parked.reply
+                                    {
+                                        let _ = reply.send(Err(e));
+                                    }
+                                }
+                            }
+                            // Dispatch next handoff or complete the batch.
+                            if let Some(mut parked) = self.parked_handoffs.take() {
+                                if parked.remaining.is_empty() {
+                                    if let Some(reply) = parked.reply {
+                                        let _ = reply.send(Ok(parked.applied_count));
+                                    }
+                                } else {
+                                    self.dispatch_next_handoff(&mut parked);
+                                    self.parked_handoffs = Some(parked);
+                                }
+                            }
+                        }
+                        Ok(WorkerResult::GcHandoff(Err(e))) => {
+                            self.handoff_in_flight = false;
+                            warn!("worker gc handoff failed: {e}");
+                            if let Some(parked) = self.parked_handoffs.take()
+                                && let Some(reply) = parked.reply
+                            {
+                                let _ = reply.send(Err(e));
+                            }
                         }
                         Err(_) => {
                             warn!("worker result channel closed unexpectedly");
@@ -578,18 +690,10 @@ impl VolumeActor {
                     // Dispatch a promote if the WAL has unflushed data.
                     // prepare_promote handles the empty-WAL case internally.
                     self.dispatch_promote();
-                    // Apply any GC handoff files written by the coordinator.
-                    match self.volume.apply_gc_handoffs() {
-                        Ok(0) => {}
-                        Ok(_) => {
-                            let (lbamap, extent_index) = self.volume.snapshot_maps();
-                            self.snapshot.store(Arc::new(ReadSnapshot {
-                                lbamap,
-                                extent_index,
-                                flush_gen: self.flush_gen,
-                            }));
-                        }
-                        Err(e) => warn!("gc handoff apply failed: {e}"),
+                    // Scan for GC handoff files and dispatch if not already
+                    // processing a batch.
+                    if self.parked_handoffs.is_none() {
+                        self.start_gc_handoffs(None);
                     }
                 }
             }
@@ -1144,6 +1248,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         promotes_in_flight: 0,
         parked_gc: None,
         parked_promote_wal: Vec::new(),
+        parked_handoffs: None,
+        handoff_in_flight: false,
     };
 
     let handle = VolumeHandle {
