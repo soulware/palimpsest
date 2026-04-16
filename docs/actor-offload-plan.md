@@ -1,6 +1,8 @@
 # Plan: offload heavy work from the volume actor
 
-**Status:** Partially landed. Steps 1–2 (CAS inserts + WAL promote offload) are merged. Steps 3–6 are not started.
+**Status:** Partially landed. Steps 1–3 (CAS inserts + WAL promote offload + `apply_gc_handoffs` offload) are merged. Steps 4–6 are not started.
+
+The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote` and `GcHandoff`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
 
 ## Problem
 
@@ -27,7 +29,7 @@ Each maintenance op decomposes cleanly into three phases:
 2. **Heavy middle** (pure, off actor): read segments, verify signatures, decompress, write new segments, fsync, compute deltas, sign manifests. A pure function of the prep snapshot plus filesystem paths; touches no mutable `Volume` state.
 3. **Apply** (on actor): update `extent_index`, evict `file_cache`, publish snapshot, rename/delete files.
 
-Only (1) and (3) need the actor. (2) can run on a dedicated flusher/worker thread and deliver its result back through a channel. No new locks, no new synchronization primitives.
+Only (1) and (3) need the actor. (2) can run on the shared worker thread and deliver its result back through a channel. No new locks, no new synchronization primitives.
 
 ## Prerequisite: conditional inserts on `extent_index` — LANDED
 
@@ -47,7 +49,7 @@ The **insert** path in `sweep_pending`, `repack`, and `delta_repack_post_snapsho
 
 The flush/promote separation is fully implemented. See [promote-offload-plan.md](promote-offload-plan.md) for the complete design and implementation details.
 
-Summary: `VolumeRequest::Flush` is now a WAL fsync + immediate reply. Promotion is triggered asynchronously by the threshold check and idle tick, dispatched to a dedicated flusher thread. Results arrive on a dedicated bounded crossbeam channel (not a `VolumeRequest` variant). The actor's `select!` loop has three arms: `VolumeRequest`, flusher results, and idle tick.
+Summary: `VolumeRequest::Flush` is now a WAL fsync + immediate reply. Promotion is triggered asynchronously by the threshold check and idle tick, dispatched to the worker thread as a `WorkerJob::Promote`. Results arrive on a dedicated bounded crossbeam channel (not a `VolumeRequest` variant). The actor's `select!` loop has three arms: `VolumeRequest`, worker results, and idle tick.
 
 ## Op-by-op analysis
 
@@ -55,13 +57,13 @@ Summary: `VolumeRequest::Flush` is now a WAL fsync + immediate reply. Promotion 
 
 **Landed in PRs #51, #55, #56, #57.** See [promote-offload-plan.md](promote-offload-plan.md).
 
-The flusher is a single long-lived thread with bounded channels (capacity 4). Multiple promotes can be in flight. `gc_checkpoint` routes through the same flusher with a parked reply. The apply phase uses CAS (`replace_if_matches`) to handle concurrent writes.
+The worker is a single long-lived thread with bounded channels (capacity 4). Multiple promotes can be in flight. `gc_checkpoint` routes through the same worker with a parked reply. The apply phase uses CAS (`replace_if_matches`) to handle concurrent writes.
 
-### 2. `apply_gc_handoffs` *(not started)*
+### 2. `apply_gc_handoffs` *(LANDED)*
 
-Heavy bits: the re-sign (read the coordinator-staged body, rewrite with the volume key) and the segment-index verify.
+**Landed in PR #58.** The re-sign (read the coordinator-staged body, read the inputs' `.idx` files, rewrite with the volume key) now runs on the worker thread as `WorkerJob::GcHandoff`.
 
-**Offload shape:** per-handoff job. Worker input is `(gc_seg_path, signer, verifying_key)`; worker output is `(new_entries, body_section_start, inline_bytes)`. Apply phase does extent-index updates (already conditional) and the file rename/cleanup.
+Prep phase on the actor enumerates `gc/*.staged` files and builds a `GcHandoffJob` per entry. The worker reads the staged segment, collects body-owning entries from each input's `.idx`, reads inline + body data, re-signs, and writes `gc/<ulid>.tmp`. Apply phase on the actor runs `Volume::apply_gc_handoff_result`: conditional extent-index rewrites (CAS-compatible), rename `.tmp` → `.applied`, `publish_snapshot`. Batches dispatch one handoff at a time; the next is sent after the previous result applies.
 
 ### 3. `delta_repack_post_snapshot` *(not started)*
 
@@ -96,13 +98,13 @@ Several of these ops call `segment::read_and_verify_segment_index` on segments t
 ## Sequencing
 
 1. **Make `extent_index` inserts conditional.** LANDED (PR #51). `replace_if_matches` on `ExtentIndex`.
-2. **Introduce a single flusher thread and offload WAL promote.** LANDED (PRs #55, #56, #57). Dedicated bounded channels, three-arm `select!`, multi-promote queuing, GC checkpoint routing. See [promote-offload-plan.md](promote-offload-plan.md).
-3. **Offload `apply_gc_handoffs`.** Reuses the flusher thread with a new job variant. Lowest risk after promote.
+2. **Introduce a single worker thread and offload WAL promote.** LANDED (PRs #55, #56, #57). Dedicated bounded channels, three-arm `select!`, multi-promote queuing, GC checkpoint routing. See [promote-offload-plan.md](promote-offload-plan.md).
+3. **Offload `apply_gc_handoffs`.** LANDED (PR #58). Generalized the worker to carry a `WorkerJob` enum and added the `GcHandoff` variant.
 4. **Land the segment-index cache.** Orthogonal but by this point it's clearly paying for itself across several call sites.
-5. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Delta_repack is the first op where per-segment parallelism (a small worker pool rather than a single flusher) is clearly worth it.
+5. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Delta_repack is the first op where per-segment parallelism (a small worker pool rather than a single worker) is clearly worth it.
 6. **Offload `promote_segment` (and fix the re-parse).** Snapshot falls out as a composite of the pieces above.
 
-After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the flusher `select!` arm. No new primitives, no new locks, no read-path changes.
+After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the worker `select!` arm. No new primitives, no new locks, no read-path changes.
 
 ## Non-goals
 

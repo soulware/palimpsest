@@ -2,6 +2,8 @@
 
 **Status:** Landed. All three landings merged. Depends on [actor-offload-plan.md](actor-offload-plan.md) — this was the first landing step for that broader plan.
 
+**Post-landing evolution.** PR #58 generalized the flusher thread into a shared worker thread that dispatches jobs via a `WorkerJob` enum (currently `Promote` and `GcHandoff`). No behavior change for promotes. Terminology throughout this doc uses "flusher" for historical continuity with the PRs it describes; the current code calls it `worker_thread` and the channels carry `WorkerJob` / `WorkerResult`.
+
 ## Goal
 
 Move the expensive part of `Volume::flush_wal_to_pending` off the actor thread onto a dedicated flusher thread, so that a write burst large enough to trigger promotion does not stall subsequent writes for the 10–500 ms it takes to serialize a 32 MiB segment and fsync it.

@@ -117,3 +117,17 @@ Internal rewrite paths should use a write entry point that runs tier 1 but bypas
 - **Internal-origin write** — caller wanted the representation to change even though observable bytes are unchanged; only tier 1 fires.
 
 This split is intentional design surface, not an edge case: it is the mechanism that lets reclamation reuse the full write pipeline (compression, dedup lookup, WAL append, LBA map update) with a single switch.
+
+## Revisit: tier-2 cost on the actor thread
+
+`try_read_local` runs synchronously on the `VolumeActor` thread as part of `Volume::write`. Every client write that doesn't short-circuit at tier 1 and whose overlap is fully on-host pays a `read_extents` call before the write is accepted. On incompressible / random workloads tier 1 never fires, so tier 2 runs on every write and almost never hits, making it pure overhead — and the read contends with the same actor thread that is processing writes.
+
+Observed in a `dd if=/dev/urandom` session (128 MiB × 2 onto a fresh ext4-on-NBD volume): tier-2 read ~690 MiB to save ~50 MiB of write work. Nearly all the savings were on ext4 metadata blocks (journal frames, group descriptors, unchanged bitmaps) which tier 1 caught; tier 2's incremental contribution on the random file payload was ~zero.
+
+Options worth exploring when we revisit:
+
+- **Tighter gating.** Only run tier 2 when tier 1's LBA-map probe found *multiple overlapping entries* (the fragmented-match case tier 2 is designed for). Whole-extent misses at tier 1 — the dominant shape for random-data writes — skip tier 2 entirely.
+- **Size cap.** Skip tier 2 above some write size where the read cost dominates any plausible hit rate.
+- **Off-actor.** Move the tier-2 read onto the worker thread, with a CAS-style apply. Heavier machinery; only worth it if gating isn't enough.
+
+Related: [actor-offload-plan.md](actor-offload-plan.md) — tier 2 is a latent source of write-tail latency even after every maintenance op has been offloaded.
