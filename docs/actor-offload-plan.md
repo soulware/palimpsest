@@ -42,9 +42,20 @@ Today's code already does this check on the **remove** path:
 
 But the **insert** path in `sweep_pending` (`volume.rs:1254`, `1268`) and `repack` (`volume.rs:892`, `906`) and `delta_repack_post_snapshot` (`volume.rs:1031`, `1045`) unconditionally overwrites. This is safe today only because everything runs atomically under the actor lock. Making these inserts conditional is a small, local change and is the first landing piece.
 
+## Flush vs promote
+
+Today `flush_wal()` conflates two distinct operations:
+
+- **Flush** = `wal.fsync()`. Durability barrier. The WAL is the durability boundary — after fsync, data survives a crash. This is what `NBD_CMD_FLUSH` requires.
+- **Promote** = serialize WAL entries into a `pending/<ulid>` segment, update the extent index, delete the old WAL, open a fresh WAL. Housekeeping for the segment lifecycle.
+
+The offload separates these. `VolumeRequest::Flush` becomes a WAL fsync + immediate reply. Promotion is triggered asynchronously by the threshold check and idle tick. Callers that need data in `pending/` (snapshot, `gc_checkpoint`) wait for promote completion via their own IPC verbs.
+
+See [promote-offload-plan.md](promote-offload-plan.md) for the full separation.
+
 ## Op-by-op analysis
 
-### 1. `flush_wal_to_pending` — `volume.rs:2090` *(biggest win)*
+### 1. WAL promote — `volume.rs:2090` *(biggest win)*
 
 Heavy bit: `segment::promote` at `2111` serialises the in-memory `pending_entries` into a signed segment file and fsyncs.
 
@@ -53,7 +64,7 @@ Heavy bit: `segment::promote` at `2111` serialises the in-memory `pending_entrie
 **Offload shape:**
 - Actor: `wal.fsync()`, `std::mem::take(&mut self.pending_entries)`, open the fresh WAL (new writes start flowing immediately), send `PromoteJob { ulid, entries, signer }` to the flusher thread.
 - Worker: write `pending/<ulid>` + fsync.
-- Actor on completion: flip `extent_index` entries from WAL-relative to segment-relative offsets (the loop at `2123-2145`), bump `flush_gen`, publish snapshot, delete old WAL file.
+- Actor on completion: flip `extent_index` entries from WAL-relative to segment-relative offsets, bump `flush_gen`, publish snapshot, delete old WAL file.
 
 **Correctness wrinkle:** during the window between "fresh WAL opened" and "apply phase runs," readers may resolve `extent_index.segment_id == wal_ulid` and open the old WAL file. The old WAL must stay on disk until the apply phase — at the cost of transient double-storage. `flush_gen` bump at apply time evicts reader `file_cache` entries so the next read picks up the new segment.
 
@@ -85,9 +96,9 @@ Heavy bits: `extract_idx` at `1847` and `promote_to_cache` at `1854` are both pu
 
 ### 6. `snapshot` — `volume.rs:2210`
 
-Combined op: flush_wal + loop of `promote_segment` + directory enumerations + manifest signing + marker write.
+Combined op: promote + loop of `promote_segment` + directory enumerations + manifest signing + marker write. Requires all WAL data in `pending/` before proceeding, so it waits for any in-flight promote to complete before starting.
 
-Falls out of the other offloads: the flush_wal phase reuses (1), the promote loop reuses (5), and the manifest signing at `2323` is pure crypto on in-memory content — the simplest possible worker job.
+Falls out of the other offloads: the promote phase reuses (1), the promote loop reuses (5), and the manifest signing at `2323` is pure crypto on in-memory content — the simplest possible worker job.
 
 ## Shared optimization: segment-index cache
 
