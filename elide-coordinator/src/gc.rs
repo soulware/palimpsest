@@ -186,7 +186,16 @@ pub async fn gc_fork(
 
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
-    let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
+    let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
+
+    // Replay any in-progress WAL files into the LBA map so that hashes
+    // referenced by post-checkpoint writes are visible to the liveness
+    // check.  Without this, a DedupRef written to the WAL after
+    // gc_checkpoint would be invisible to the coordinator — the hash
+    // would appear dead, be excluded from the GC output, and the
+    // volume's stale-liveness check would reject the handoff in a loop.
+    replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lbamap)?;
+
     let live_hashes = lbamap.lba_referenced_hashes();
 
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
@@ -1069,6 +1078,63 @@ fn has_pending_results(gc_dir: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Replay WAL records into `lbamap` so that the coordinator's liveness
+/// view includes writes that arrived after `gc_checkpoint`.
+///
+/// `gc_checkpoint` flushes the WAL to `pending/`, but new writes can
+/// arrive to a fresh WAL before the coordinator runs GC.  If those
+/// writes include DedupRef entries pointing to hashes in GC input
+/// segments, the coordinator would consider those hashes dead (they're
+/// not in `pending/` or `index/`).  The volume's stale-liveness check
+/// then rejects the GC output, causing an infinite retry loop.
+///
+/// Reading the WAL here closes that gap: the coordinator sees all
+/// writes the volume has accepted, including in-flight WAL data.
+fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
+    let entries = match fs::read_dir(wal_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let (records, _complete) = match elide_core::writelog::scan_readonly(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("skipping unreadable WAL {}: {e}", path.display());
+                continue;
+            }
+        };
+        for record in records {
+            match record {
+                elide_core::writelog::LogRecord::Data {
+                    hash,
+                    start_lba,
+                    lba_length,
+                    ..
+                }
+                | elide_core::writelog::LogRecord::Ref {
+                    hash,
+                    start_lba,
+                    lba_length,
+                } => {
+                    lbamap.insert(start_lba, lba_length, hash);
+                }
+                elide_core::writelog::LogRecord::Zero {
+                    start_lba,
+                    lba_length,
+                } => {
+                    lbamap.insert(start_lba, lba_length, elide_core::volume::ZERO_HASH);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

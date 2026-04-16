@@ -12,10 +12,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use elide_core::actor::VolumeHandle;
+use elide_core::volume::ZERO_HASH;
 use elide_core::{
     extentindex, lbamap,
     segment::{self, EntryKind},
-    signing,
+    signing, writelog,
 };
 use ulid::Ulid;
 
@@ -300,7 +301,8 @@ pub fn simulate_coord_gc_local(
     let candidates = candidates[..n].to_vec();
 
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-    let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    let mut lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lba_map);
     let live_hashes = lba_map.lba_referenced_hashes();
     let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
 
@@ -359,7 +361,8 @@ pub fn simulate_coord_gc_both_local(
 
     // Rebuild liveness snapshot once — shared by both passes.
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-    let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    let mut lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lba_map);
     let live_hashes = lba_map.lba_referenced_hashes();
     let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
 
@@ -387,4 +390,45 @@ pub fn simulate_coord_gc_both_local(
     )?;
 
     Some((repack, sweep))
+}
+
+/// Replay WAL records into `lbamap` so that post-checkpoint writes are
+/// visible to the GC liveness check.  Mirrors the coordinator's
+/// `replay_wal_into_lbamap` fix.
+pub fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut lbamap::LbaMap) {
+    let Ok(entries) = fs::read_dir(wal_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Ok((records, _)) = writelog::scan_readonly(&path) else {
+            continue;
+        };
+        for record in records {
+            match record {
+                writelog::LogRecord::Data {
+                    hash,
+                    start_lba,
+                    lba_length,
+                    ..
+                }
+                | writelog::LogRecord::Ref {
+                    hash,
+                    start_lba,
+                    lba_length,
+                } => {
+                    lbamap.insert(start_lba, lba_length, hash);
+                }
+                writelog::LogRecord::Zero {
+                    start_lba,
+                    lba_length,
+                } => {
+                    lbamap.insert(start_lba, lba_length, ZERO_HASH);
+                }
+            }
+        }
+    }
 }

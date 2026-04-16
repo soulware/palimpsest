@@ -227,6 +227,141 @@ impl SegmentFetcher for LocalStoreFetcher {
     }
 }
 
+/// After eviction + reopen, demand-fetch must recover data.
+///
+/// This is the full lifecycle: write → flush → drain → evict bodies →
+/// close → reopen → attach fetcher → read.  On reopen the extent index
+/// is rebuilt from `index/*.idx` with `BodySource::Cached`, and the
+/// fetcher must be consulted for every evicted body.
+#[test]
+fn evict_reopen_demand_fetch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+
+    let store_dir = fork_dir.join("test_store");
+    fs::create_dir_all(&store_dir).unwrap();
+
+    let block_a = vec![0xABu8; 4096];
+    let block_b = vec![0xCDu8; 4096];
+
+    // Phase 1: write, flush, drain (promote to cache + idx).
+    {
+        let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+        vol.write(0, &block_a).unwrap();
+        vol.write(1, &block_b).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Copy pending segments to the store before drain deletes them.
+        let pending_dir = fork_dir.join("pending");
+        for entry in fs::read_dir(&pending_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().contains('.') {
+                continue;
+            }
+            fs::copy(entry.path(), store_dir.join(&name)).unwrap();
+        }
+
+        common::drain_with_redact(&mut vol);
+    }
+
+    // Phase 2: evict all cache bodies + present files.
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext == Some("body") || ext == Some("present") {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    // Phase 3: reopen + attach fetcher + verify reads.
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.lbamap_len(), 2, "LBA map must survive evict+reopen");
+
+    vol.set_fetcher(Arc::new(LocalStoreFetcher {
+        store_dir: store_dir.clone(),
+    }));
+
+    let got_a = vol.read(0, 1).unwrap();
+    let got_b = vol.read(1, 1).unwrap();
+    assert_eq!(got_a.as_slice(), &block_a, "LBA 0 after evict+reopen");
+    assert_eq!(got_b.as_slice(), &block_b, "LBA 1 after evict+reopen");
+}
+
+/// Same as `evict_reopen_demand_fetch` but exercises the actor path
+/// (flusher-based promote) rather than inline `Volume::flush_wal`.
+///
+/// This catches regressions in the `prepare_promote` → flusher →
+/// `apply_promote` → coordinator `promote_segment` pipeline that the
+/// direct-Volume test cannot see.
+#[test]
+fn evict_reopen_demand_fetch_via_actor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+
+    let store_dir = fork_dir.join("test_store");
+    fs::create_dir_all(&store_dir).unwrap();
+
+    let block_a = vec![0xABu8; 4096];
+    let block_b = vec![0xCDu8; 4096];
+
+    // Phase 1: write via actor, promote_wal + drain via handle.
+    {
+        let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+        let (actor, handle) = elide_core::actor::spawn(vol);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        handle.write(0, block_a.clone()).unwrap();
+        handle.write(1, block_b.clone()).unwrap();
+        handle.promote_wal().unwrap();
+
+        // Copy pending segments to store before drain deletes them.
+        let pending_dir = fork_dir.join("pending");
+        for entry in fs::read_dir(&pending_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().contains('.') {
+                continue;
+            }
+            fs::copy(entry.path(), store_dir.join(&name)).unwrap();
+        }
+
+        // Drain: redact + promote each pending segment via actor.
+        common::drain_via_handle(&handle, &fork_dir);
+
+        drop(handle);
+        actor_thread.join().unwrap();
+    }
+
+    // Phase 2: evict all cache bodies + present files.
+    let cache_dir = fork_dir.join("cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext == Some("body") || ext == Some("present") {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    // Phase 3: reopen + attach fetcher + verify reads.
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.lbamap_len(), 2, "LBA map must survive evict+reopen");
+
+    vol.set_fetcher(Arc::new(LocalStoreFetcher {
+        store_dir: store_dir.clone(),
+    }));
+
+    let got_a = vol.read(0, 1).unwrap();
+    let got_b = vol.read(1, 1).unwrap();
+    assert_eq!(got_a.as_slice(), &block_a, "LBA 0 after actor evict+reopen");
+    assert_eq!(got_b.as_slice(), &block_b, "LBA 1 after actor evict+reopen");
+}
+
 /// After promote (drain path), the in-memory extent index must transition
 /// entries from `BodySource::Local` to `BodySource::Cached`.  Without this,
 /// evicting the cache body bypasses demand-fetch and reads fail with

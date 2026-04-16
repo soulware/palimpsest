@@ -100,6 +100,14 @@ enum SimOp {
     /// Simulate coordinator GC running both repack and sweep in the same tick.
     /// Requires ≥ 3 segments in index/; no-ops otherwise.
     CoordGcLocalBoth,
+    /// Phase 1 of split GC: flush WAL, mint GC ULIDs, open fresh WAL.
+    /// Stashes ULIDs — any Write/Flush ops before the matching GcApply
+    /// model writes that arrive during the coordinator's GC window.
+    GcCheckpoint,
+    /// Phase 2 of split GC: build liveness snapshot (including WAL replay),
+    /// compact, apply handoffs. Requires a prior GcCheckpoint; no-ops if
+    /// no checkpoint is pending.
+    GcApply { n: usize },
     /// Simulate a crash: drop the Volume, reopen it (triggering WAL recovery),
     /// and assert all oracle LBAs read back their last-written values.
     Crash,
@@ -181,6 +189,8 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::DrainWithRedact),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::CoordGcLocalBoth),
+        Just(SimOp::GcCheckpoint),
+        (2usize..=5).prop_map(|n| SimOp::GcApply { n }),
         Just(SimOp::Crash),
         Just(SimOp::ReadUnwritten),
         Just(SimOp::Snapshot),
@@ -427,6 +437,8 @@ proptest! {
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         // Tracks the latest snapshot ULID; segments at or below this are frozen.
         let mut snapshot_floor: Option<Ulid> = None;
+        // Pending GcCheckpoint ULIDs awaiting GcApply.
+        let mut pending_gc: Option<(Ulid, Ulid)> = None;
 
         for op in &ops {
             let ulids_before = all_segment_ulids(fork_dir);
@@ -588,9 +600,39 @@ proptest! {
                         }
                     }
                 }
+                SimOp::GcCheckpoint => {
+                    let (u1, u2) = vol.gc_checkpoint().unwrap();
+                    pending_gc = Some((u1, u2));
+                }
+                SimOp::GcApply { n } => {
+                    // Apply the stashed checkpoint. Between GcCheckpoint and
+                    // here, proptest may have injected Write/DedupWrite/Flush
+                    // ops — this is the interleaving we want to exercise.
+                    //
+                    // No ULID ordering assertion: the checkpoint ULIDs were
+                    // minted earlier, so segments created between checkpoint
+                    // and apply may have higher ULIDs. The stale-liveness
+                    // check inside apply_gc_handoffs is the real guard.
+                    if let Some((gc_ulid, _)) = pending_gc.take() {
+                        let to_delete = if let Some((_, _, paths)) =
+                            common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                        {
+                            paths
+                        } else {
+                            vec![]
+                        };
+                        let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                        if applied > 0 {
+                            for path in &to_delete {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                    }
+                }
                 SimOp::Crash => {
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    pending_gc = None;
                     // No assertion here: the next Flush or SweepPending
                     // will verify that the mint was correctly reseeded.
                 }
@@ -685,6 +727,7 @@ proptest! {
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
+        let mut pending_gc: Option<(Ulid, Ulid)> = None;
 
         for op in &ops {
             match op {
@@ -714,11 +757,6 @@ proptest! {
                     } else {
                         vec![]
                     };
-                    // Apply handoffs before deleting consumed segments — mirrors
-                    // the real coordinator protocol (volume acknowledges first,
-                    // then coordinator deletes).  Only delete when the handoff was
-                    // applied (returned > 0); Bug B cancellation leaves consumed
-                    // files in place for the next GC tick.
                     let applied = vol.apply_gc_handoffs().unwrap_or(0);
                     if applied > 0 {
                         for path in &to_delete {
@@ -741,9 +779,31 @@ proptest! {
                         }
                     }
                 }
+                SimOp::GcCheckpoint => {
+                    let (u1, u2) = vol.gc_checkpoint().unwrap();
+                    pending_gc = Some((u1, u2));
+                }
+                SimOp::GcApply { n } => {
+                    if let Some((gc_ulid, _)) = pending_gc.take() {
+                        let to_delete = if let Some((_, _, paths)) =
+                            common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                        {
+                            paths
+                        } else {
+                            vec![]
+                        };
+                        let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                        if applied > 0 {
+                            for path in &to_delete {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                    }
+                }
                 SimOp::Crash => {
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    pending_gc = None;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -852,6 +912,7 @@ proptest! {
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
+        let mut pending_gc: Option<(Ulid, Ulid)> = None;
 
         for op in &ops {
             match op {
@@ -903,9 +964,31 @@ proptest! {
                         }
                     }
                 }
+                SimOp::GcCheckpoint => {
+                    let (u1, u2) = vol.gc_checkpoint().unwrap();
+                    pending_gc = Some((u1, u2));
+                }
+                SimOp::GcApply { n } => {
+                    if let Some((gc_ulid, _)) = pending_gc.take() {
+                        let to_delete = if let Some((_, _, paths)) =
+                            common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                        {
+                            paths
+                        } else {
+                            vec![]
+                        };
+                        let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                        if applied > 0 {
+                            for path in &to_delete {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                    }
+                }
                 SimOp::Crash => {
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    pending_gc = None;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
