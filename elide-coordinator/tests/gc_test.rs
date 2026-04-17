@@ -229,11 +229,10 @@ async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
 }
 
 fn make_gc_config() -> GcConfig {
-    // density_threshold=0.0 ensures any dead segment is compacted.
-    // small_segment_bytes=MAX ensures all segments qualify for sweep.
+    // density_threshold=0.0 admits every segment to sweep; the test segments
+    // are well below SWEEP_SMALL_THRESHOLD so they pack via tier 1.
     GcConfig {
         density_threshold: 0.0,
-        small_segment_bytes: u64::MAX,
         interval_secs: 0,
     }
 }

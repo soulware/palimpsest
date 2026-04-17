@@ -140,9 +140,11 @@ proptest! {
     /// Segment cleanup: after GC runs, every consumed input segment must be
     /// deleted from segments/.
     ///
-    /// With test config (density_threshold=0.0, small_segment_bytes=MAX), the
-    /// sweep pass always compacts ALL segments into one when ≥2 exist.  After
-    /// apply_done_handoffs, segments/ must contain ≤1 file.
+    /// With density_threshold=0.0 every segment is admitted to sweep; the
+    /// proptest writes are short enough that all segments fit under
+    /// SWEEP_SMALL_THRESHOLD, so the sweep pass packs them all into one
+    /// output when ≥2 exist. After apply_done_handoffs, segments/ must
+    /// contain ≤1 file.
     ///
     /// Catches Bug A: DEDUP_REF-only segments were never deleted because
     /// compact_segments emitted no handoff line for them.
@@ -168,7 +170,6 @@ proptest! {
 
         let gc_config = GcConfig {
             density_threshold: 0.0,
-            small_segment_bytes: u64::MAX,
             interval_secs: 0,
         };
 
@@ -316,7 +317,6 @@ proptest! {
 
         let gc_config = GcConfig {
             density_threshold: 0.0,
-            small_segment_bytes: u64::MAX,
             interval_secs: 0,
         };
 
@@ -460,7 +460,6 @@ fn gc_oracle_repro_bug_h() {
 
     let gc_config = GcConfig {
         density_threshold: 0.0,
-        small_segment_bytes: u64::MAX,
         interval_secs: 0,
     };
 

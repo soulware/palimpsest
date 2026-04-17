@@ -144,3 +144,14 @@ After step 2 every subsequent step reuses the same infrastructure — bounded cr
 - Any change to the read path. Reads are already lock-free.
 - Parallelising the actor. There is still exactly one actor thread applying mutations; the offload is into stateless workers whose results are re-applied serially on the actor.
 - Persistent job state across crashes. Every offloaded job is idempotent from on-disk state — if a worker is mid-flight when the process dies, the next startup re-scans `pending/` / `gc/` and retries from scratch.
+
+## Related: coordinator-side blocking GC *(out of scope, follow-up)*
+
+The coordinator's per-fork GC tick (`elide-coordinator/src/gc.rs::gc_fork`) is `async fn` but performs blocking IO inline (index rebuild, segment reads, S3 round-trips) on the per-fork tokio task — *not* via `spawn_blocking`. The TODO at `gc.rs:55-57` notes this is fine while passes stay short and to switch when they grow long enough to stall other coordinator tasks.
+
+This is a separate concern from the volume-actor offload tracked above:
+
+- The volume actor's offload protects **writes**. The coordinator's `gc_fork` never serves writes; its latency concern is starving the runtime / other forks scheduled on the same task pool.
+- It is structurally already isolated from the volume — coordinator and volume are different processes.
+
+When this needs work the fix is mechanical (`tokio::task::spawn_blocking` around the synchronous body of `gc_fork`), not a worker-thread architecture like this plan describes.

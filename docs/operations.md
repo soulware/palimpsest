@@ -31,8 +31,7 @@ interval_secs      = 5
 scan_interval_secs = 30
 
 [gc]
-density_threshold   = 0.70           # compact segments below this density
-small_segment_bytes = 8_388_608      # also compact segments smaller than this
+density_threshold   = 0.70           # repack rewrites segments below this density
 interval_secs       = 30
 ```
 
@@ -136,9 +135,14 @@ Two read-only commands inspect raw on-disk formats:
 
 ### Pending compaction (volume, automatic)
 
-The `serve-volume` actor runs a compaction pass on `pending/` in its idle arm after `flush_wal()` — never delaying a write. Candidates are segments with any dead extents, or any segment below 8 MB; the pass merges their live extents into new `pending/` segments split at 32 MB and deletes the originals. A single small segment with no dead extents is skipped (rewriting would produce identical content).
+The `serve-volume` actor runs a compaction pass on `pending/` in its idle arm after `flush_wal()` — never delaying a write. The pass bin-packs pending segments toward a 32 MiB live-bytes target output:
 
-> **TODO — opportunistic packing.** The current candidate test (`size < 8 MiB`) lets the merged output land just above the threshold (e.g. two 7 MiB segments → 14 MiB), at which point the result is permanently ineligible. This produces a long tail of segments slightly larger than 8 MiB that never get merged further. Revisit candidate selection to include larger segments that still have headroom — the goal is to *fill* output segments toward 32 MiB, not just to evict the very-small ones. Likely shape: pick the smallest eligible segment as a seed, then opportunistically pull in any other segment whose `live_bytes` fits in the remaining headroom of the target output.
+- **Tier 1 — smalls.** Every segment with `live_bytes ≤ 16 MiB` (half the target) is sorted ascending by live bytes and greedy-included into the output bucket while it fits.
+- **Tier 2 — one filler.** If the bucket has at least one small and budget remains, pick the largest segment with `live_bytes > 16 MiB` that still fits the remaining headroom and add it. (One filler per pass — the gain from a second filler in the same bucket is bounded by remaining headroom and not worth the rewrite cost.)
+
+Selection is purely about packing. Dead-data removal is repack's job (gated on density); sweep clears any dead entries inside its selected inputs as a side-effect of the rewrite, but does not select on that signal. A single-segment bucket is skipped — single rewrites either accomplish nothing (no-dead) or are repack's domain (has-dead).
+
+The 16 MiB threshold is half the 32 MiB target, so two smalls always combine to fit and the merged output exits the small set permanently — no infinite re-pack loop.
 
 Snapshot-floor segments (at or below the latest snapshot ULID) are frozen and never touched. Data written then deleted before the drain runs never hits S3 — compacting locally is much cheaper than uploading dead bytes and paying coordinator GC later.
 
@@ -154,9 +158,11 @@ Each GC tick runs three passes per fork:
 
 - **Dead pre-pass** — segments with no live entries are tombstoned in a `dead`-only handoff. No fetch, no write, just DELETE. If it fires, repack is skipped this tick (shares `repack_ulid`).
 - **Repack** — finds the single least-dense segment; if its density is below `density_threshold` (default 0.70) it is compacted to one output.
-- **Sweep** — merges segments below `small_segment_bytes` (default 8 MiB) with density ≥ threshold, oldest-first, up to 32 MiB total live bytes. Skipped with fewer than 2 candidates.
+- **Sweep** — bin-packs high-density segments toward 32 MiB live bytes per output, using the same tier 1 / tier 2 algorithm as the volume's pending compaction. Density ≥ `density_threshold` to be eligible (low-density goes to repack); within that, smalls (`live_lba_bytes ≤ 16 MiB`) sort ascending and greedy-fill the bucket, then at most one larger filler tops up the remaining headroom. Skipped with fewer than 2 candidates.
 
 Repack and sweep run on disjoint inputs. Per-tick work is bounded: dead pre-pass is O(1) per segment, repack processes one, sweep caps at 32 MiB.
+
+> **TODO — repack-multi.** Repack today rewrites a single low-density segment per tick, producing one S3 PUT/DELETE cycle per low-density input. Combining multiple low-density segments into one ≤ 32 MiB live output (same packing rule as sweep) would cut S3 churn proportionally and produce a denser result. **Verify the actual fetch cost before designing.** The intuition that repack must download whole input files is probably wrong — sweep already uses range-GETs (`RANGE_GET_MAX_BATCH`) to pull only the live body ranges, and the same code path applies to repack. If so, the per-tick fetch cost scales with **live** bytes (plus per-batch round-trip overhead), not file size, and the original cost concern goes away. Confirm this against the implementation before deciding whether multi-segment repack needs its own fetch-budget cap. Worth its own design pass alongside the broader question of whether repack and sweep should converge into one pass with a single selection rule.
 
 **Liveness** — an entry is live only if both (a) the reconstructed extent index still points to this input segment for that hash, and (b) `lbamap.hash_at(lba) == Some(hash)`. The coordinator rebuilds liveness from on-disk files only — in-memory WAL entries are not visible. Worst case is a small space leak (an extent carried into the output that will be dead once the WAL flushes), never corruption. Dedup-ref entries are carried only if the start LBA still maps to the hash — unconditional carry or drop both corrupt data (see `docs/testing.md` bug E). Snapshot-floor segments are skipped. LBA-dead extents that aren't carried into the output are simply absent from the new segment; the volume's apply path sees them in the input `.idx` files but not in the output and removes the corresponding extent-index entries.
 
