@@ -25,6 +25,7 @@ use crate::segment::{
     self, DeltaOption, EntryKind, SegmentEntry, SegmentFlags, SegmentSigner,
     read_and_verify_segment_index, read_extent_bodies, write_segment_with_delta_body,
 };
+use crate::segment_cache::SegmentIndexCache;
 use crate::signing::{self, VerifyingKey};
 use crate::volume;
 
@@ -447,6 +448,31 @@ pub struct SegmentDeltaStats {
     pub delta_body_bytes: u64,
 }
 
+/// A single entry rewritten by [`rewrite_post_snapshot_with_prior`]. Carries
+/// both the post-rewrite entry and the pre-rewrite (kind, stored_offset)
+/// pair so the apply phase can CAS against the source location.
+pub struct RewrittenEntry {
+    /// Entry kind before the rewrite.
+    pub pre_kind: EntryKind,
+    /// `stored_offset` before the rewrite (CAS key for the apply phase).
+    pub pre_stored_offset: u64,
+    /// Entry after the rewrite.
+    pub post: SegmentEntry,
+}
+
+/// Result of rewriting one segment. The apply phase uses `entries` +
+/// `new_body_section_start` + `delta_region_body_length` to update the
+/// extent index; `stats` feeds the aggregated pass stats.
+pub struct RewrittenSegment {
+    pub entries: Vec<RewrittenEntry>,
+    pub new_body_section_start: u64,
+    /// Length of the tail body region that holds the Data entries
+    /// re-emitted verbatim; the delta region starts at
+    /// `new_body_section_start + delta_region_body_length`.
+    pub delta_region_body_length: u64,
+    pub stats: SegmentDeltaStats,
+}
+
 /// Rewrite one post-snapshot pending segment, converting single-block
 /// `Data` entries to thin `Delta` entries whenever the prior sealed
 /// snapshot holds a same-LBA extent that compresses well as a zstd
@@ -473,8 +499,16 @@ pub fn rewrite_post_snapshot_with_prior(
     prior: &BlockReader,
     signer: &dyn SegmentSigner,
     vk: &VerifyingKey,
-) -> io::Result<Option<(Vec<SegmentEntry>, u64, SegmentDeltaStats)>> {
-    let (body_section_start, mut entries, _inputs) = read_and_verify_segment_index(seg_path, vk)?;
+    segment_cache: &SegmentIndexCache,
+) -> io::Result<Option<RewrittenSegment>> {
+    let parsed = segment_cache.read_and_verify(seg_path, vk)?;
+    let body_section_start = parsed.body_section_start;
+    let mut entries = parsed.entries.clone();
+    // Capture pre-rewrite (kind, stored_offset) per entry so the apply
+    // phase can CAS against the source location. Paired by index with
+    // the post-rewrite entries returned below.
+    let pre_meta: Vec<(EntryKind, u64)> =
+        entries.iter().map(|e| (e.kind, e.stored_offset)).collect();
 
     // Early out: does any single-block Data entry have a same-LBA prior hash?
     let any_candidate = entries.iter().any(|e| {
@@ -609,5 +643,30 @@ pub fn rewrite_post_snapshot_with_prior(
     fs::rename(&tmp_path, seg_path)?;
     segment::fsync_dir(seg_path)?;
 
-    Ok(Some((entries, new_body_section_start, stats)))
+    // Delta region starts at `new_body_section_start + delta_region_body_length`.
+    // Compute it from post-rewrite stored_length on Data entries; that's the
+    // same sum `write_segment_with_delta_body` used when laying out the
+    // body section.
+    let delta_region_body_length: u64 = entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Data)
+        .map(|e| e.stored_length as u64)
+        .sum();
+
+    let rewritten = entries
+        .into_iter()
+        .zip(pre_meta)
+        .map(|(post, (pre_kind, pre_stored_offset))| RewrittenEntry {
+            pre_kind,
+            pre_stored_offset,
+            post,
+        })
+        .collect();
+
+    Ok(Some(RewrittenSegment {
+        entries: rewritten,
+        new_body_section_start,
+        delta_region_body_length,
+        stats,
+    }))
 }
