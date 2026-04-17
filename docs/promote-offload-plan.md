@@ -299,7 +299,7 @@ The conditional-replace check is the load-bearing invariant. Its precondition â€
 - `VolumeRequest::Flush` fsyncs the WAL and replies immediately. It does not interact with the flusher.
 - `VolumeRequest::PromoteWal` dispatches a promote and parks the reply until the segment is on disk. Multiple can be parked simultaneously.
 - `GcCheckpoint` opens a fresh WAL immediately (no write pause), dispatches the GC promote, and parks the reply until `u_flush` completes.
-- `Snapshot` goes through the inline volume path (`volume.snapshot()`), not through the flusher.
+- The legacy single-shot `VolumeRequest::Snapshot` has been retired (no live wire sender); the coordinator drives snapshot end-to-end via `PromoteWal` / per-segment `Promote` / `ApplyGcHandoffs` / `SignSnapshotManifest`, all offloaded. Direct-`Volume::snapshot()` survives for in-process tests and never runs on the actor.
 - At most one `ParkedGcCheckpoint` at a time (second one errors).
 
 Under sustained write load, the flusher queue depth is bounded by `write_throughput / flusher_throughput`. If writes consistently outpace the flusher, the queue grows and old WAL files accumulate on disk. This is a capacity problem â€” the correct response is backpressure (future work) or a second flusher thread, not protocol complexity.

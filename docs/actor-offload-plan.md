@@ -1,6 +1,6 @@
 # Plan: offload heavy work from the volume actor
 
-**Status:** Partially landed. Steps 1–4 (CAS inserts, WAL promote offload, `apply_gc_handoffs` offload, `promote_segment` offload) are merged on `main`. Step 4 (`promote_segment`) landed out-of-sequence with the original plan because write-tail latency on a live dd workload prioritised the per-upload actor stalls over the segment-index cache. Step 5 (segment-index cache) is now fully landed — the cache covers the worker-thread `promote_segment` path, the actor-thread sweep/repack loops, and `delta_compute::rewrite_post_snapshot_with_prior` (plumbed as part of step 6c). Steps 6a (`sweep_pending` offload), 6b (`repack` offload), and 6c (`delta_repack_post_snapshot` offload) have all landed. Step 7 (snapshot offload) is not started.
+**Status:** Partially landed. Steps 1–4 (CAS inserts, WAL promote offload, `apply_gc_handoffs` offload, `promote_segment` offload) are merged on `main`. Step 4 (`promote_segment`) landed out-of-sequence with the original plan because write-tail latency on a live dd workload prioritised the per-upload actor stalls over the segment-index cache. Step 5 (segment-index cache) is now fully landed — the cache covers the worker-thread `promote_segment` path, the actor-thread sweep/repack loops, and `delta_compute::rewrite_post_snapshot_with_prior` (plumbed as part of step 6c). Steps 6a (`sweep_pending` offload), 6b (`repack` offload), and 6c (`delta_repack_post_snapshot` offload) have all landed. Step 7 (snapshot offload) is planned — scope narrowed to `sign_snapshot_manifest` only, since the rest of the coordinator-driven snapshot sequence already routes through offloaded paths; see [snapshot-offload-plan.md](snapshot-offload-plan.md).
 
 The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, `PromoteSegment`, `Sweep`, `Repack`, and `DeltaRepack`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
 
@@ -103,11 +103,13 @@ Per-segment parallelism (a small worker pool rather than a single worker) remain
 
 Prep phase on the actor picks the source (`pending/<ulid>` > `gc/<ulid>` > body-exists early-return) and builds a `PromoteSegmentJob`. Worker thread reads + verifies the index once, handles the GC tombstone shortcut, writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}` (both idempotent on retry), and returns parsed entries + bss + inline bytes. Apply phase on the actor runs the extent-index CAS (Local → Cached) + `pending/<ulid>` delete for the drain path, or input-idx cleanup for the GC path. `WorkerResult::PromoteSegment` carries the ULID out-of-band so errors map to the right parked caller. Single-parse collapse folded in — the previous triple parse is now one `read_and_verify_segment_index` shared across tombstone check, idx extract, body copy, and apply-phase CAS.
 
-### 5. `snapshot` *(not started)*
+### 5. `snapshot` *(planned — scope: `sign_snapshot_manifest` only)*
 
-Combined op: promote + loop of `promote_segment` + directory enumerations + manifest signing + marker write. Requires all WAL data in `pending/` before proceeding, so it waits for any in-flight promote to complete before starting.
+The original framing ("composite of the pieces above") assumed `Volume::snapshot()` was still the hot production path. It isn't: the coordinator decomposes snapshot into `promote_wal` + `drain_pending` (per-segment `promote`) + `apply_gc_handoffs` + `sign_snapshot_manifest`, and the first three steps already route through the worker. Only `sign_snapshot_manifest` still blocks the actor — `index/` enumeration + Ed25519 sign + atomic manifest write (fsync) + marker write.
 
-Falls out of the other offloads: the promote phase reuses (1), the promote loop reuses (4), and the manifest signing is pure crypto on in-memory content — the simplest possible worker job.
+The dead `VolumeRequest::Snapshot` arm (no wire sender; `src/control.rs:200` is the only handler and the CLI now goes through the coordinator) is deleted in the same landing. `Volume::snapshot()` the method stays for in-process tests and never runs on the actor.
+
+See [snapshot-offload-plan.md](snapshot-offload-plan.md) for the design.
 
 ## Shared optimization: segment-index cache *(LANDED)*
 
@@ -142,7 +144,7 @@ Cache invalidation is file-length-based: tmp+rename rewrites change the entry co
    - **6a (LANDED):** `sweep_pending`. Added `WorkerJob::Sweep` + parked-reply dispatch. Apply uses `replace_if_matches` for carried-live entries and the new `remove_if_matches` for dead entries, both keyed on the source `(segment_id, body_offset)`.
    - **6b (LANDED):** `repack`. Added `WorkerJob::Repack` + `parked_repack` slot. Per-segment rewrite with output ULID = input ULID; apply uses `replace_if_matches` / `remove_if_matches` keyed on the source `(seg_id, body_offset)` captured before `write_segment` reassigned offsets.
    - **6c (LANDED):** `delta_repack_post_snapshot`. Added `WorkerJob::DeltaRepack` + `parked_delta_repack` slot. Worker constructs the snapshot-pinned `BlockReader` off the actor; `rewrite_post_snapshot_with_prior` now takes the shared `SegmentIndexCache`. Apply pairs each rewritten entry with its pre-rewrite `(kind, stored_offset)` and CAS-updates the extent index via `replace_if_matches` / `remove_if_matches` / `insert_delta_if_absent` depending on the kind transition.
-7. **Offload `snapshot`.** Falls out as a composite of the pieces above.
+7. **Offload `sign_snapshot_manifest` + delete dead `VolumeRequest::Snapshot`.** See [snapshot-offload-plan.md](snapshot-offload-plan.md). Production's coordinator-driven snapshot already decomposes into `promote_wal` / per-segment `promote` / `apply_gc_handoffs` / `sign_snapshot_manifest`, and the first three are already offloaded. Only the manifest signing remains on the actor, and the legacy single-shot `VolumeRequest::Snapshot` arm is dead wire.
 
 After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the worker `select!` arm. No new primitives, no new locks, no read-path changes.
 

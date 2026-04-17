@@ -20,10 +20,6 @@
 //     Compact sparse pending segments below the given ratio.
 //     Returns "ok <segments_compacted> <bytes_freed> <extents_removed>".
 //
-//   snapshot
-//     Flush WAL and write a snapshot marker.
-//     Returns "ok <snapshot_ulid>".
-//
 //   gc_checkpoint
 //     Flush WAL and return two ULIDs for GC output segments.
 //     Returns "ok <repack_ulid> <sweep_ulid>".
@@ -192,15 +188,6 @@ fn handle_connection(
                     s.original_body_bytes,
                     s.delta_body_bytes,
                 );
-            }
-            Err(e) => {
-                let _ = writeln!(writer, "err {e}");
-            }
-        }
-    } else if line == "snapshot" {
-        match handle.snapshot() {
-            Ok(ulid) => {
-                let _ = writeln!(writer, "ok {ulid}");
             }
             Err(e) => {
                 let _ = writeln!(writer, "err {e}");

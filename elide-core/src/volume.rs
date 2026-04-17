@@ -662,6 +662,25 @@ pub struct DeltaRepackResult {
     pub segments: Vec<DeltaRepackedSegment>,
 }
 
+/// Inputs for signing and writing a `snapshots/<snap_ulid>.manifest`
+/// file plus its `snapshots/<snap_ulid>` marker.
+///
+/// Produced by [`Volume::prepare_sign_snapshot_manifest`] on the actor
+/// thread. The worker enumerates `index/` itself — keeping the
+/// `read_dir` off the actor is the whole point of the offload.
+pub struct SignSnapshotManifestJob {
+    pub snap_ulid: Ulid,
+    pub base_dir: PathBuf,
+    pub signer: Arc<dyn segment::SegmentSigner>,
+}
+
+/// Result of a [`SignSnapshotManifestJob`]. Consumed by
+/// [`Volume::apply_sign_snapshot_manifest_result`] on the actor thread
+/// to flip the `has_new_segments` flag.
+pub struct SignSnapshotManifestResult {
+    pub snap_ulid: Ulid,
+}
+
 /// Job dispatched from the actor to the worker thread.
 pub enum WorkerJob {
     Promote(PromoteJob),
@@ -670,6 +689,7 @@ pub enum WorkerJob {
     Sweep(SweepJob),
     Repack(RepackJob),
     DeltaRepack(DeltaRepackJob),
+    SignSnapshotManifest(SignSnapshotManifestJob),
 }
 
 /// Result returned by the worker thread to the actor.
@@ -688,6 +708,7 @@ pub enum WorkerResult {
     Sweep(io::Result<SweepResult>),
     Repack(io::Result<RepackResult>),
     DeltaRepack(io::Result<DeltaRepackResult>),
+    SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
@@ -3163,40 +3184,37 @@ impl Volume {
     /// The caller selects `snap_ulid` — typically the max ULID in `index/`
     /// at the moment the lock is acquired, or a fresh ULID if `index/` is
     /// empty. The volume does not validate the choice.
+    /// Synchronous wrapper around the offloadable prep / execute / apply
+    /// trio. The actor uses [`Self::prepare_sign_snapshot_manifest`],
+    /// [`crate::actor::execute_sign_snapshot_manifest`], and
+    /// [`Self::apply_sign_snapshot_manifest_result`] directly so the
+    /// worker thread runs the heavy middle — `index/` enumeration,
+    /// Ed25519 sign, manifest fsync, marker write — off the request
+    /// channel. This wrapper exists for tests and any inline callers.
     pub fn sign_snapshot_manifest(&mut self, snap_ulid: Ulid) -> io::Result<()> {
-        let index_dir = self.base_dir.join("index");
-        let mut seg_ulids: Vec<Ulid> = Vec::new();
-        match fs::read_dir(&index_dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let Some(s) = name.to_str() else { continue };
-                    let Some(stem) = s.strip_suffix(".idx") else {
-                        continue;
-                    };
-                    if let Ok(u) = Ulid::from_string(stem) {
-                        seg_ulids.push(u);
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-
-        let snapshots_dir = self.base_dir.join("snapshots");
-        fs::create_dir_all(&snapshots_dir)?;
-
-        crate::signing::write_snapshot_manifest(
-            &self.base_dir,
-            self.signer.as_ref(),
-            &snap_ulid,
-            &seg_ulids,
-        )?;
-
-        // Write the marker last — partial sequences leave no snapshot visible.
-        fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
-        self.has_new_segments = false;
+        let job = self.prepare_sign_snapshot_manifest(snap_ulid);
+        let result = crate::actor::execute_sign_snapshot_manifest(job)?;
+        self.apply_sign_snapshot_manifest_result(result);
         Ok(())
+    }
+
+    /// Prep phase of `sign_snapshot_manifest` — runs on the actor
+    /// thread. Cheap: clones the signer `Arc` and captures the base dir
+    /// and target ULID.
+    pub fn prepare_sign_snapshot_manifest(&self, snap_ulid: Ulid) -> SignSnapshotManifestJob {
+        SignSnapshotManifestJob {
+            snap_ulid,
+            base_dir: self.base_dir.clone(),
+            signer: Arc::clone(&self.signer),
+        }
+    }
+
+    /// Apply phase of `sign_snapshot_manifest` — runs on the actor
+    /// thread after the worker has written the manifest and marker.
+    /// Clears `has_new_segments` so subsequent snapshot attempts with
+    /// no new data reuse the marker instead of re-signing.
+    pub fn apply_sign_snapshot_manifest_result(&mut self, _result: SignSnapshotManifestResult) {
+        self.has_new_segments = false;
     }
 
     /// Locate the segment body file for `segment_id` within this fork's

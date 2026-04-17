@@ -37,9 +37,9 @@ use crate::volume::{
     NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep,
     PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
     ReclaimThresholds, RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry,
-    RepackedSegment, SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry, Volume, WorkerJob,
-    WorkerResult, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
-    scan_reclaim_candidates,
+    RepackedSegment, SignSnapshotManifestJob, SignSnapshotManifestResult, SweepJob, SweepResult,
+    SweptDeadEntry, SweptLiveEntry, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
+    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,9 +138,6 @@ pub(crate) enum VolumeRequest {
         ulid: Ulid,
         reply: Sender<io::Result<()>>,
     },
-    Snapshot {
-        reply: Sender<io::Result<String>>,
-    },
     SignSnapshotManifest {
         snap_ulid: Ulid,
         reply: Sender<io::Result<()>>,
@@ -229,6 +226,12 @@ pub struct VolumeActor {
     /// rewrite.  `None` when no delta_repack is in progress;
     /// concurrent requests are rejected with an error.
     parked_delta_repack: Option<Sender<io::Result<DeltaRepackStats>>>,
+    /// Reply channel for an in-flight `SignSnapshotManifest` request,
+    /// parked while the worker thread enumerates `index/`, signs, and
+    /// writes the manifest + marker.  `None` when none is in flight;
+    /// concurrent requests are rejected (the coordinator's per-volume
+    /// snapshot lock already prevents them in production).
+    parked_sign_snapshot_manifest: Option<Sender<io::Result<()>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -502,6 +505,27 @@ impl VolumeActor {
         }
     }
 
+    /// Run the snapshot-manifest prep on the actor and dispatch the
+    /// heavy middle (`index/` enumeration + signing + manifest/marker
+    /// writes) to the worker.  Reply is parked until
+    /// [`crate::volume::SignSnapshotManifestResult`] arrives and the
+    /// `has_new_segments` flag is flipped on the actor.
+    fn start_sign_snapshot_manifest(&mut self, snap_ulid: Ulid, reply: Sender<io::Result<()>>) {
+        let job = self.volume.prepare_sign_snapshot_manifest(snap_ulid);
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::SignSnapshotManifest(job)) {
+                warn!("worker channel closed during sign_snapshot_manifest: {e}");
+                let _ = reply.send(Err(io::Error::other(
+                    "worker channel closed during sign_snapshot_manifest",
+                )));
+                return;
+            }
+            self.parked_sign_snapshot_manifest = Some(reply);
+        } else {
+            let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
     /// Pop the next staged handoff from the parked batch and dispatch it.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
         if let Some((staged_path, new_ulid)) = parked.remaining.pop() {
@@ -533,6 +557,7 @@ impl VolumeActor {
             || self.parked_sweep.is_some()
             || self.parked_repack.is_some()
             || self.parked_delta_repack.is_some()
+            || self.parked_sign_snapshot_manifest.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -622,6 +647,22 @@ impl VolumeActor {
                         }
                         Err(e) => {
                             warn!("worker delta_repack failed during shutdown: {e}");
+                            Err(e)
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                Ok(WorkerResult::SignSnapshotManifest(result)) => {
+                    let reply = self.parked_sign_snapshot_manifest.take();
+                    let outcome = match result {
+                        Ok(r) => {
+                            self.volume.apply_sign_snapshot_manifest_result(r);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            warn!("worker sign_snapshot_manifest failed during shutdown: {e}");
                             Err(e)
                         }
                     };
@@ -811,15 +852,14 @@ impl VolumeActor {
                         VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
                             let _ = reply.send(self.volume.finalize_gc_handoff(ulid));
                         }
-                        VolumeRequest::Snapshot { reply } => {
-                            let result = self.volume.snapshot().map(|u| u.to_string());
-                            if result.is_ok() {
-                                self.publish_snapshot();
-                            }
-                            let _ = reply.send(result);
-                        }
                         VolumeRequest::SignSnapshotManifest { snap_ulid, reply } => {
-                            let _ = reply.send(self.volume.sign_snapshot_manifest(snap_ulid));
+                            if self.parked_sign_snapshot_manifest.is_some() {
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent sign_snapshot_manifest not allowed",
+                                )));
+                            } else {
+                                self.start_sign_snapshot_manifest(snap_ulid, reply);
+                            }
                         }
                         VolumeRequest::NoopStats { reply } => {
                             let _ = reply.send(self.volume.noop_stats());
@@ -996,6 +1036,22 @@ impl VolumeActor {
                                 }
                                 Err(e) => {
                                     warn!("worker delta_repack failed: {e}");
+                                    Err(e)
+                                }
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                        Ok(WorkerResult::SignSnapshotManifest(result)) => {
+                            let reply = self.parked_sign_snapshot_manifest.take();
+                            let outcome = match result {
+                                Ok(r) => {
+                                    self.volume.apply_sign_snapshot_manifest_result(r);
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    warn!("worker sign_snapshot_manifest failed: {e}");
                                     Err(e)
                                 }
                             };
@@ -1302,18 +1358,6 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Write a snapshot marker for the current volume state.
-    /// Flushes the WAL first.  Returns the snapshot ULID string.
-    pub fn snapshot(&self) -> io::Result<String> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::Snapshot { reply: reply_tx })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
-    }
-
     /// Sign and write a `snapshots/<snap_ulid>.manifest` file plus the
     /// marker file. Called by the coordinator after a synchronous drain has
     /// moved every in-flight segment from `pending/` to `index/`.
@@ -1444,6 +1488,9 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
             WorkerJob::Sweep(job) => WorkerResult::Sweep(execute_sweep(job)),
             WorkerJob::Repack(job) => WorkerResult::Repack(execute_repack(job)),
             WorkerJob::DeltaRepack(job) => WorkerResult::DeltaRepack(execute_delta_repack(job)),
+            WorkerJob::SignSnapshotManifest(job) => {
+                WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
+            }
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -2085,6 +2132,50 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
     Ok(DeltaRepackResult { stats, segments })
 }
 
+/// Execute a snapshot-manifest sign job: enumerate `index/`, Ed25519
+/// sign the manifest, atomic-write it, write the marker last.
+///
+/// `snapshots/` is created on demand. A `NotFound` on `index/` is
+/// treated as an empty list — matches the inline behaviour.
+pub(crate) fn execute_sign_snapshot_manifest(
+    job: SignSnapshotManifestJob,
+) -> io::Result<SignSnapshotManifestResult> {
+    let SignSnapshotManifestJob {
+        snap_ulid,
+        base_dir,
+        signer,
+    } = job;
+
+    let index_dir = base_dir.join("index");
+    let mut seg_ulids: Vec<Ulid> = Vec::new();
+    match std::fs::read_dir(&index_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                let Some(stem) = s.strip_suffix(".idx") else {
+                    continue;
+                };
+                if let Ok(u) = Ulid::from_string(stem) {
+                    seg_ulids.push(u);
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let snapshots_dir = base_dir.join("snapshots");
+    std::fs::create_dir_all(&snapshots_dir)?;
+
+    crate::signing::write_snapshot_manifest(&base_dir, signer.as_ref(), &snap_ulid, &seg_ulids)?;
+
+    // Marker last — partial sequences leave no snapshot visible.
+    std::fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
+
+    Ok(SignSnapshotManifestResult { snap_ulid })
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -2141,6 +2232,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         parked_sweep: None,
         parked_repack: None,
         parked_delta_repack: None,
+        parked_sign_snapshot_manifest: None,
     };
 
     let handle = VolumeHandle {
