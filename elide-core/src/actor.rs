@@ -1139,8 +1139,9 @@ impl VolumeHandle {
     ///    each contiguous same-hash run, emits rewrite proposals.
     /// 3. `ReclaimCommit` — actor thread, microseconds. Pointer-equality
     ///    precondition check; on success commits each proposal through
-    ///    `Volume::write_internal` (tier-1 noop skip active, tier-2
-    ///    bypassed). On mismatch returns a clean discard.
+    ///    `Volume::write_with_hash` (the noop-skip hash check makes
+    ///    re-running reclamation over an already-merged range idempotent).
+    ///    On mismatch returns a clean discard.
     ///
     /// Heavy work between phases never holds any lock and does not block
     /// writes queued behind it on the actor channel. A concurrent mutation

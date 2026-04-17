@@ -1,100 +1,80 @@
 # Design: skip no-op writes
 
-**Status:** Implemented.
+**Status:** Implemented (single-tier).
 
 ## Problem
 
-`Volume::write()` (`elide-core/src/volume.rs:519`) treats every inbound block uniformly: hash, dedup-check, append WAL record, update LBA map. For a block whose content already lives at that LBA, the path still writes a ~50 byte DedupRef record and pays the durability barrier. ext4 journal replay after an unclean mount, metadata rewrites landing on identical values, page-cache double-flushes, and zero-over-zero writes during `mkfs`/`fstrim` all generate these no-op writes.
+`Volume::write()` (`elide-core/src/volume.rs`) treats every inbound block uniformly: hash, dedup-check, append WAL record, update LBA map. For a block whose content already lives at that LBA, the path still writes a ~50-byte DedupRef record and pays the durability barrier. ext4 journal replay after an unclean mount, metadata rewrites landing on identical values, and page-cache double-flushes all generate these no-op writes.
 
-## Two-tier skip
+## Skip check
 
-After computing `blake3::hash(data)`, try two checks before falling through to the normal write path. Both return `Ok(())` immediately on hit, leaving the LBA map and segment tree untouched.
+After computing `blake3::hash(data)` (which the write path needs anyway for cross-LBA dedup, the WAL header, and the LBA map insert), check the LBA map for an exact match before falling through to the normal write path.
 
 ```rust
 let hash = blake3::hash(data);
 
-// Tier 1 — hash compare. Pure LBA map lookup, zero body I/O.
 if self.lbamap.has_full_match(lba, lba_length, &hash) {
-    self.noop_stats.skipped_writes += 1;
-    self.noop_stats.skipped_bytes += data.len() as u64;
-    return Ok(());
-}
-
-// Tier 2 — opportunistic byte compare. Only fires when every overlapping
-// body is already on host (Local or Cached-present).
-if let Some(existing) = self.try_read_local(lba, lba_length)?
-    && existing == data
-{
     self.noop_stats.skipped_writes += 1;
     self.noop_stats.skipped_bytes += data.len() as u64;
     return Ok(());
 }
 ```
 
-### Tier 1 — hash compare
-
 `lbamap.has_full_match(lba, lba_length, &hash)` returns `true` iff the LBA map has an entry keyed at exactly `lba` with matching length, matching hash, and `payload_block_offset == 0`. A single `BTreeMap::get` plus three field comparisons. **Zero file I/O.**
 
-Correctness rests on BLAKE3 collision resistance: hash equality implies byte equality. We do not need to read the body, check `.present`, or know whether the bytes are local. Tier 1 fires for every `body_source` — `Local`, `Cached(present)`, `Cached(absent)`, S3-only — without touching the body file or the network.
+Correctness rests on BLAKE3 collision resistance: hash equality implies byte equality. The check does not need to read the body, check `.present`, or know whether the bytes are local. It fires for every `body_source` — `Local`, `Cached(present)`, `Cached(absent)`, S3-only — without touching the body file or the network.
 
-This is the dominant case in practice. Most no-op writes (ext4 journal replay, page-cache double-flush, metadata rewrites that land on identical values) overwrite a previously-written LBA with the same content. The LBA map already records that, and tier 1 catches it for the cost of one map lookup.
+## Why no byte-compare tier
 
-### Tier 2 — opportunistic byte compare
+An earlier version of this design included a second tier: when the hash check missed, walk the LBA map over the incoming range, verify every overlapping extent's body was on host, and byte-compare the existing content against the incoming data. The intent was to catch fragmented matches — e.g. two adjacent 4 KiB writes whose concatenation equals an 8 KiB incoming write — for which the hash check cannot fire by construction.
 
-Tier 1 cannot fire when the LBA map covers the incoming range with **multiple entries** — the new write's hash is over the whole range, and none of the per-fragment hashes match. The classic case: two adjacent 4 KiB writes at LBAs L and L+1 with different content, followed by an 8 KiB write at L whose content is exactly the concatenation. Hash-compare misses; byte-compare catches it.
+We removed it. The measurement that decided the question, taken with `dd if=/dev/urandom of=... bs=4M count=32` twice over a fresh ext4-on-NBD volume:
 
-`try_read_local` walks `extents_in_range`, verifies every covered block is **on host** (not just indexed), and reads the existing bytes via the normal `read_extents` path:
+- Tier-2 read **~690 MiB** to save **~50 MiB** of write work.
+- Almost all of those 50 MiB savings were ext4 metadata blocks (journal frames, group descriptors, unchanged bitmaps) — the hash check already caught those. Tier 2's marginal contribution on the random-data payload was ~zero.
 
-- `Local` extent → on host (WAL, `pending/`, bare `gc/<ulid>` files).
-- `Cached(n)` extent → on host iff `cache/<id>.present` has bit `n` set, in either the current fork's cache or any ancestor's cache.
-- Unwritten gap, missing extent index entry, delta-only entry, or `Cached(n)` with the present bit clear → bail.
+The cost was real for a benefit the hash check already delivered, and it ran synchronously on the `VolumeActor` thread — extending write latency on the same thread that processes writes. It also forced an API split: a parallel `write_internal` entry point existed solely to bypass tier 2 for extent-reclamation rewrites, where the incoming bytes equal the existing bytes by construction and tier 2 would have silently dropped the rewrite. Removing tier 2 collapses that split.
 
-Bailing falls through silently to the normal write path. Tier 2 never triggers a demand fetch.
+If a future workload makes fragmented-match no-ops worth catching, reintroducing tier 2 with a shape gate (only fire when the LBA map's overlap is multi-extent — never on the dominant single-extent miss case) and a streaming early-exit compare would cap the cost. But we want measured demand before paying the complexity again.
 
-The byte read is cheap when warm (the page cache holds recently-written segments), but the cost is real for cold data. Tier 2 is intentionally narrow: it only adds value for fragmented matches, and only when the bytes are already on host.
+## Coverage
 
-## Coverage matrix
+| scenario                                       | skipped? |
+| ---------------------------------------------- | -------- |
+| Whole-extent match, any `body_source`          | yes      |
+| Different content at the same LBA range        | no       |
+| Unwritten range                                | no       |
+| Fragmented match (incoming spans many extents) | no       |
+| All-zeros write over a `ZERO_HASH` extent      | no       |
 
-| scenario                                    | tier 1 | tier 2 |
-| ------------------------------------------- | ------ | ------ |
-| Whole-extent match, Local                   | hit    | -      |
-| Whole-extent match, Cached present          | hit    | -      |
-| Whole-extent match, Cached absent / S3-only | hit    | -      |
-| Fragmented match, Local                     | -      | hit    |
-| Fragmented match, Cached all present        | -      | hit    |
-| Fragmented match, any extent absent         | -      | bail   |
-| Different content                           | -      | miss   |
-| Unwritten range                             | -      | bail   |
-
-The only no-op case nothing catches is a fragmented match where at least one extent's body is absent — and that case is what we explicitly want to decline, because catching it would require a demand fetch.
+The last row is a behaviour change from the two-tier design: `blake3::hash([0; N])` is not the `ZERO_HASH` sentinel, so the hash check misses and the write commits as a normal (highly compressible) DATA record. In practice this case is rare — userspace zero-fills usually arrive as `NBD_CMD_TRIM` or `NBD_CMD_WRITE_ZEROES`, both of which bypass `write` entirely via `Volume::trim` / `Volume::write_zeroes`.
 
 ## Correctness
 
-**No body fetch, ever.** Tier 1 reads only the in-memory LBA map. Tier 2 gates on `is_extent_on_host` before calling `read_extents`, and `read_extents` uses the existing `find_segment_in_dirs` path which only invokes the fetcher if no local copy is found — by then we have already verified locality.
+**No body I/O on the write path.** The check reads only the in-memory LBA map.
 
-**Fork layering.** `open_read_state()` (`volume.rs:2880`) builds a flat `LbaMap` via `lbamap::rebuild_segments()` that walks the ancestor chain oldest-first. Parent entries are flattened into `self.lbamap` at open time; lookup does no chain walking. A child fork's LBA map already surfaces inherited parent mappings, so a no-op write against an inherited LBA hits tier 1 unconditionally and tier 2 if any ancestor still has the body cached present.
+**Fork layering.** `open_read_state()` builds a flat `LbaMap` by walking the ancestor chain oldest-first. Parent entries are flattened into `self.lbamap` at open time; lookup does no chain walking. A child fork's LBA map already surfaces inherited parent mappings, so a no-op write against an inherited LBA matches unconditionally.
 
 **Snapshots.** A skipped write produces no local segment entry. The snapshot's view of that LBA is inherited from whatever existing entry already covered it — exactly right, since the content is unchanged.
 
-**Durability.** The NBD layer routes `NBD_CMD_FLUSH` through `VolumeHandle::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
+**Durability.** `NBD_CMD_FLUSH` routes through `VolumeHandle::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
 
-**Hash collisions.** Tier 1 relies on BLAKE3 collision resistance, the same assumption already baked into the existing extent-index dedup path. No new trust.
+**Hash collisions.** Same BLAKE3 collision-resistance assumption already baked into the existing extent-index dedup path. No new trust.
+
+**Internal rewrites.** Extent reclamation (`design-extent-reclamation.md`) reuses the write pipeline for rewrites whose incoming bytes equal the existing bytes by construction. The hash check is *correct* for those: re-running reclamation over an already-merged range is supposed to be a no-op, and a hash match expresses exactly that. Reclamation calls a `write_with_hash` entry point that takes a precomputed hash (avoiding a redundant blake3 pass) and returns whether the write committed; both paths run the same skip check.
 
 ## Counters
 
-Three counters on `Volume`, exposed via `VolumeHandle::noop_stats()` and printed on NBD client disconnect:
+Two counters on `Volume`, exposed via `VolumeHandle::noop_stats()` and printed on NBD client disconnect:
 
-- `skipped_writes` — `write()` calls short-circuited (tier 1 + tier 2 combined).
+- `skipped_writes` — `write()` calls short-circuited by the hash check.
 - `skipped_bytes` — bytes the skip avoided writing to the WAL.
-- `check_reads_bytes` — bytes read by tier 2's byte compare (hit + miss). Always `0` if only tier 1 fires; non-zero only when tier 2 ran.
-
-The disconnect line prints all three after every NBD session, so any mounted workload surfaces the hit rate without extra tooling.
 
 ## Comparison: lsvd
 
 lab47/lsvd has no write-time content dedup at all. `disk.go:681` (`WriteExtent`) buffers every incoming write unconditionally; `segment.go:538` computes entropy and compression stats but no content hash. Duplicate LBA writes overwrite previous LBA map entries and stale extents are reclaimed later by GC.
 
-Elide already diverges by doing write-time content dedup (the REF-record path). This proposal extends that mechanism: the same hash that drives REF emission now also gates a free LBA-map shortcut for true no-ops, and a supplemental byte compare picks up the fragmented cases that pure hash-compare misses.
+Elide already diverges by doing write-time content dedup (the REF-record path). This skip extends that mechanism: the same hash that drives REF emission also gates a free LBA-map shortcut for true no-ops.
 
 ## Non-goals
 
@@ -102,32 +82,4 @@ Elide already diverges by doing write-time content dedup (the REF-record path). 
 - Any change to `write_zeroes` / `trim`, which already bypass hashing.
 - Any change to the REF-record path for cross-LBA dedup.
 - Per-block hashes stored in the LBA map or segment entries (rejected as too expensive for the expected hit rate).
-
-## Scope: client-intent writes only
-
-The two tiers above are a correct optimisation for writes whose *caller's intent* is to change observable LBA content — i.e. normal NBD client writes, where a same-bytes-already-present outcome is genuinely redundant work.
-
-They are **not** correct for internal rewrite paths whose caller's intent is to change the *representation* while preserving observable content. The motivating case is extent reclamation (see `design-extent-reclamation.md`): the volume reads live bytes from a fragmented or partially-dead payload and writes them back as fresh compact entries. By construction the incoming content equals the existing bytes at those LBAs, so tier 2 would classify the write as a no-op and silently drop it — defeating the whole operation.
-
-Tier 1 is safe for internal rewrites. It only fires when a map entry *already binds this exact hash directly to these LBAs with `payload_block_offset == 0`*, which is precisely the post-rematerialisation steady state. Running reclamation a second time over an already-merged range therefore hits tier 1 and skips correctly, giving idempotent convergence for free without any termination bookkeeping.
-
-Internal rewrite paths should use a write entry point that runs tier 1 but bypasses tier 2. The split encodes the distinction between the two legitimate motivations for a write:
-
-- **Client-origin write** — caller wanted observable bytes to change; both tiers fire.
-- **Internal-origin write** — caller wanted the representation to change even though observable bytes are unchanged; only tier 1 fires.
-
-This split is intentional design surface, not an edge case: it is the mechanism that lets reclamation reuse the full write pipeline (compression, dedup lookup, WAL append, LBA map update) with a single switch.
-
-## Revisit: tier-2 cost on the actor thread
-
-`try_read_local` runs synchronously on the `VolumeActor` thread as part of `Volume::write`. Every client write that doesn't short-circuit at tier 1 and whose overlap is fully on-host pays a `read_extents` call before the write is accepted. On incompressible / random workloads tier 1 never fires, so tier 2 runs on every write and almost never hits, making it pure overhead — and the read contends with the same actor thread that is processing writes.
-
-Observed in a `dd if=/dev/urandom` session (128 MiB × 2 onto a fresh ext4-on-NBD volume): tier-2 read ~690 MiB to save ~50 MiB of write work. Nearly all the savings were on ext4 metadata blocks (journal frames, group descriptors, unchanged bitmaps) which tier 1 caught; tier 2's incremental contribution on the random file payload was ~zero.
-
-Options worth exploring when we revisit:
-
-- **Tighter gating.** Only run tier 2 when tier 1's LBA-map probe found *multiple overlapping entries* (the fragmented-match case tier 2 is designed for). Whole-extent misses at tier 1 — the dominant shape for random-data writes — skip tier 2 entirely.
-- **Size cap.** Skip tier 2 above some write size where the read cost dominates any plausible hit rate.
-- **Off-actor.** Move the tier-2 read onto the worker thread, with a CAS-style apply. Heavier machinery; only worth it if gating isn't enough.
-
-Related: [actor-offload-plan.md](actor-offload-plan.md) — tier 2 is a latent source of write-tail latency even after every maintenance op has been offloaded.
+- Body byte-compares on the write path (see "Why no byte-compare tier" above).

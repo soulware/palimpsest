@@ -146,12 +146,13 @@ This dodges the concurrency window problem entirely at the coordinator/volume le
 
 ### Interaction with the no-op write skip path
 
-These writes carry bytes that by construction equal the current observable content at the target LBAs — that is precisely why they are representation changes, not content changes. The two-tier noop skip path (`design-noop-write-skip.md`) needs careful handling:
+These writes carry bytes that by construction equal the current observable content at the target LBAs — that is precisely why they are representation changes, not content changes. The noop skip path (`design-noop-write-skip.md`) interacts cleanly:
 
-- **Tier 1 (hash compare)** fires only when the LBA map already binds the incoming hash directly to the target LBAs with `payload_block_offset=0`. For this pass that is the *post-rewrite* steady state, not the pre-rewrite one. Tier 1 never fires on a first pass but reliably fires on subsequent passes, **giving idempotent convergence for free** without any termination tracking.
-- **Tier 2 (byte compare)** classifies the write as redundant because the incoming bytes equal the bytes currently at those LBAs. Running tier 2 against one of these writes always drops it — defeating the whole operation.
+The skip fires only when the LBA map already binds the incoming hash directly to the target LBAs with `payload_block_offset=0`. For a reclamation pass that is the *post-rewrite* steady state, not the pre-rewrite one. The skip never fires on a first pass but reliably fires on subsequent passes, **giving idempotent convergence for free** without any termination tracking.
 
-Rewrite writes flow through an entry point that runs tier 1 but bypasses tier 2 — an *internal-origin* write, distinct from a client-origin NBD write. Everything else in the write pipeline (compression, dedup lookup, WAL append, LBA map update) is shared. See `design-noop-write-skip.md § Scope: client-intent writes only`.
+Rewrite writes flow through `Volume::write_with_hash`, which is the same entry point used by reclamation to reuse a precomputed phase-2 hash. It runs the same hash-based skip check as `Volume::write`; nothing about the skip needs to be bypassed. The pipeline downstream of the check (compression, dedup lookup, WAL append, LBA map update) is shared between client and reclamation writes.
+
+(An earlier two-tier design added a body byte-compare tier that would have classified every reclamation rewrite as a no-op and silently dropped it, forcing an `internal-origin` API split. Tier 2 has been removed; that complication is gone with it. See `design-noop-write-skip.md § Why no byte-compare tier`.)
 
 ### Comparison: lsvd concurrency model
 
@@ -179,13 +180,13 @@ enum ReclaimHint {
 }
 ```
 
-**Hints are cache, not state.** Executing a hint is idempotent (tier-1 noop-skip), and dropping a hint is a no-op (worst case: the volume stays sub-optimally fragmented, same as the baseline). Therefore:
+**Hints are cache, not state.** Executing a hint is idempotent (the noop-skip hash check makes a re-run a no-op), and dropping a hint is a no-op (worst case: the volume stays sub-optimally fragmented, same as the baseline). Therefore:
 
 - No fsync discipline around hints.
 - No WAL for them.
 - No crash-recovery semantics.
 - If the hint file is lost, the coordinator re-scans and re-emits on its next pass.
-- If a hint is processed twice, tier 1 catches the second attempt.
+- If a hint is processed twice, the noop-skip catches the second attempt.
 
 This is a qualitatively different contract from anything else the coordinator tells the volume: GC handoffs (`gc/<ulid>.staged` → bare → finalised) are durability-critical state. Hints sit in a new, looser bucket.
 

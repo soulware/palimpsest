@@ -352,7 +352,7 @@ pub struct Volume {
     /// (WAL filename or max segment). Used for all WAL and compaction outputs
     /// to guarantee strict ordering regardless of host clock behaviour.
     mint: UlidMint,
-    /// Stats for the no-op write skip path (`try_read_local` + byte compare).
+    /// Stats for the no-op write skip path (LBA-map hash compare).
     /// See `docs/design-noop-write-skip.md`.
     noop_stats: NoopSkipStats,
 }
@@ -557,7 +557,8 @@ pub struct ReclaimOutcome {
     /// True if the phase-3 precondition failed (the LBA map was mutated
     /// between snapshot and commit) and nothing was committed.
     pub discarded: bool,
-    /// Number of rewrite proposals committed (excluding tier-1 no-op skips).
+    /// Number of rewrite proposals committed (excluding ones the noop-skip
+    /// hash check absorbed because the LBA map already records the rewrite).
     pub runs_rewritten: u32,
     /// Total bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
@@ -821,16 +822,11 @@ pub fn scan_reclaim_candidates(
 /// Counters for the no-op write skip path. Reset to zero on `Volume::open`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopSkipStats {
-    /// Number of `write()` calls short-circuited because the incoming
-    /// content already lives at the target range — either because the
-    /// LBA map's hash matches directly (tier 1) or because a byte
-    /// comparison against on-host bodies matched (tier 2).
+    /// Number of `write()` calls short-circuited because the LBA map
+    /// already records the incoming content's hash at the target range.
     pub skipped_writes: u64,
     /// Total bytes of incoming data the skip avoided writing to the WAL.
     pub skipped_bytes: u64,
-    /// Total bytes read from on-host bodies by tier 2's byte compare,
-    /// summed across both hits and misses. Zero if only tier 1 fires.
-    pub check_reads_bytes: u64,
 }
 
 impl Volume {
@@ -1098,53 +1094,26 @@ impl Volume {
                 "data length exceeds maximum write size (4 GiB − 4 KiB)",
             ));
         }
-        let lba_length = (data.len() / 4096) as u32;
         let hash = blake3::hash(data);
-
-        // No-op skip, tier 1 — hash compare. Pure LBA map lookup, zero
-        // body I/O. BLAKE3 collision resistance means hash equality
-        // implies byte equality, so this is safe regardless of where the
-        // body lives (Local, Cached present, Cached absent, or S3-only).
-        // See docs/design-noop-write-skip.md.
-        if self.lbamap.has_full_match(lba, lba_length, &hash) {
-            self.noop_stats.skipped_writes += 1;
-            self.noop_stats.skipped_bytes += data.len() as u64;
-            return Ok(());
-        }
-
-        // No-op skip, tier 2 — opportunistic byte compare. Only catches
-        // sub-extent / fragmented matches that tier 1 can't see (e.g. two
-        // adjacent 4 KiB extents whose concatenation equals an 8 KiB
-        // incoming write). Runs only when every overlapping extent's
-        // body is already on this host (Local, or Cached with the
-        // corresponding `.present` bit set). Never triggers a demand
-        // fetch — bails silently and falls through to the normal path.
-        if let Some(existing) = self.try_read_local(lba, lba_length)? {
-            self.noop_stats.check_reads_bytes += existing.len() as u64;
-            if existing == data {
-                self.noop_stats.skipped_writes += 1;
-                self.noop_stats.skipped_bytes += data.len() as u64;
-                return Ok(());
-            }
-        }
-
-        self.write_commit(lba, lba_length, data, hash)
+        self.write_with_hash(lba, data, hash).map(|_| ())
     }
 
-    /// Internal-origin write: runs tier-1 noop skip (for idempotent
-    /// convergence) but bypasses tier-2 byte compare. Used by extent
-    /// reclamation and any future path whose caller intent is to change
-    /// the representation while preserving observable content.
+    /// Like `write`, but with a caller-supplied hash. Returns `Ok(true)` if
+    /// the write was committed to the WAL, `Ok(false)` if the no-op skip
+    /// short-circuited it.
     ///
-    /// The caller-supplied `hash` must be `blake3::hash(data)`; it is
-    /// passed in to avoid recomputing on paths that have already hashed
-    /// (e.g. reclaim phase 2).
+    /// Used by callers that have already hashed `data` (notably extent
+    /// reclamation, which hashes off-actor in phase 2 and would otherwise
+    /// pay a redundant blake3 pass on the actor thread). The caller-supplied
+    /// `hash` MUST be `blake3::hash(data)`.
     ///
-    /// Returns `Ok(true)` if the write was committed to the WAL, `Ok(false)`
-    /// if it was short-circuited by the tier-1 noop skip.
-    ///
-    /// See `docs/design-noop-write-skip.md § Scope: client-intent writes only`.
-    fn write_internal(&mut self, lba: u64, data: &[u8], hash: blake3::Hash) -> io::Result<bool> {
+    /// See `docs/design-noop-write-skip.md`.
+    pub fn write_with_hash(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+        hash: blake3::Hash,
+    ) -> io::Result<bool> {
         if data.is_empty() || !data.len().is_multiple_of(4096) {
             return Err(io::Error::other(
                 "data length must be a non-zero multiple of 4096",
@@ -1157,6 +1126,11 @@ impl Volume {
         }
         let lba_length = (data.len() / 4096) as u32;
 
+        // No-op skip — pure LBA map lookup, zero body I/O. BLAKE3
+        // collision resistance means hash equality implies byte equality,
+        // so this is safe regardless of where the body lives (Local,
+        // Cached present, Cached absent, or S3-only). See
+        // `docs/design-noop-write-skip.md`.
         if self.lbamap.has_full_match(lba, lba_length, &hash) {
             self.noop_stats.skipped_writes += 1;
             self.noop_stats.skipped_bytes += data.len() as u64;
@@ -1167,9 +1141,8 @@ impl Volume {
         Ok(true)
     }
 
-    /// Shared tail of the write path after both noop-skip tiers have
-    /// decided the bytes must hit the WAL. Used by `write` (client-origin)
-    /// and `write_internal` (internal-origin reclamation rewrites).
+    /// Shared tail of the write path after the no-op skip check has
+    /// decided the bytes must hit the WAL.
     fn write_commit(
         &mut self,
         lba: u64,
@@ -1292,64 +1265,6 @@ impl Volume {
     /// No-op skip counters. See `docs/design-noop-write-skip.md`.
     pub fn noop_stats(&self) -> NoopSkipStats {
         self.noop_stats
-    }
-
-    /// Read the current content of `[lba, lba+lba_length)` from on-host
-    /// bodies only — returning `Some(bytes)` if every overlapping extent
-    /// is either `ZERO_HASH`, `BodySource::Local`, or
-    /// `BodySource::Cached(n)` with the corresponding `.present` bit
-    /// already set on this host. Returns `None` otherwise. Never
-    /// triggers a demand fetch.
-    ///
-    /// Two-pass: first a cheap locality check over `extents_in_range`
-    /// (extent index lookup + `.present` bit check for Cached entries),
-    /// then a reuse of the normal `read_extents` path for the actual
-    /// bytes. Tier 2 of the no-op write skip — see
-    /// `docs/design-noop-write-skip.md` and `Volume::write`.
-    fn try_read_local(&self, lba: u64, lba_length: u32) -> io::Result<Option<Vec<u8>>> {
-        // Pass 1: walk the range and verify every covered block resolves
-        // to a body that is already on host. Bail on any gap, missing
-        // extent-index entry (e.g. delta-only), or Cached entry whose
-        // `.present` bit is clear.
-        let end_lba = lba + lba_length as u64;
-        let mut next_lba = lba;
-        for er in self.lbamap.extents_in_range(lba, end_lba) {
-            if er.range_start != next_lba {
-                return Ok(None); // unwritten gap at next_lba
-            }
-            if er.hash != ZERO_HASH {
-                let Some(loc) = self.extent_index.lookup(&er.hash) else {
-                    return Ok(None); // delta-only or unknown
-                };
-                if !self.is_extent_on_host(loc.segment_id, loc.body_source) {
-                    return Ok(None);
-                }
-            }
-            next_lba = er.range_end;
-        }
-        if next_lba != end_lba {
-            return Ok(None); // trailing unwritten gap
-        }
-
-        // Pass 2: reuse the normal read path. Every extent was confirmed
-        // on host in pass 1, so `read_extents` will not invoke the fetcher.
-        let bytes = read_extents(
-            lba,
-            lba_length,
-            &self.lbamap,
-            &self.extent_index,
-            &self.file_cache,
-            |id, bss, idx| self.find_segment_file(id, bss, idx),
-            |id| {
-                open_delta_body_in_dirs(
-                    id,
-                    &self.base_dir,
-                    &self.ancestor_layers,
-                    self.fetcher.as_ref(),
-                )
-            },
-        )?;
-        Ok(Some(bytes))
     }
 
     /// Compact sparse segments in `pending/`.
@@ -3214,34 +3129,6 @@ impl Volume {
         )
     }
 
-    /// True if the body bytes for a specific extent are already on this
-    /// host, without triggering a fetch. Used by the tier-2 byte-compare
-    /// skip path to decide whether it is safe to read the existing bytes.
-    ///
-    /// - `Local` is always on host.
-    /// - `Cached(n)` is on host iff the `.present` bit for entry index
-    ///   `n` is set in the current fork's `cache/<id>.present` file, or
-    ///   in any ancestor fork's `cache/<id>.present`.
-    fn is_extent_on_host(&self, segment_id: Ulid, body_source: BodySource) -> bool {
-        match body_source {
-            BodySource::Local => true,
-            BodySource::Cached(idx) => {
-                let sid = segment_id.to_string();
-                let self_present = self.base_dir.join("cache").join(format!("{sid}.present"));
-                if segment::check_present_bit(&self_present, idx).unwrap_or(false) {
-                    return true;
-                }
-                for layer in self.ancestor_layers.iter().rev() {
-                    let present = layer.dir.join("cache").join(format!("{sid}.present"));
-                    if segment::check_present_bit(&present, idx).unwrap_or(false) {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
-
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
@@ -3333,7 +3220,7 @@ impl Volume {
         let mut outcome = ReclaimOutcome::default();
         for p in proposed {
             let bytes = p.data.len() as u64;
-            if self.write_internal(p.start_lba, &p.data, p.hash)? {
+            if self.write_with_hash(p.start_lba, &p.data, p.hash)? {
                 outcome.runs_rewritten += 1;
                 outcome.bytes_rewritten += bytes;
             }
@@ -4804,13 +4691,11 @@ mod tests {
         assert_eq!(before.skipped_writes, 0);
         assert_eq!(before.skipped_bytes, 0);
 
-        // Same LBA, same content — should skip via tier 1 (hash compare).
-        // Tier 1 needs no body read, so check_reads_bytes stays 0.
+        // Same LBA, same content — short-circuited by the LBA-map hash check.
         vol.write(0, &data).unwrap();
         let after = vol.noop_stats();
         assert_eq!(after.skipped_writes, 1);
         assert_eq!(after.skipped_bytes, 4096);
-        assert_eq!(after.check_reads_bytes, 0);
 
         // Data still reads back correctly.
         assert_eq!(vol.read(0, 1).unwrap(), data);
@@ -4830,25 +4715,8 @@ mod tests {
         vol.write(0, &b).unwrap();
         let stats = vol.noop_stats();
         assert_eq!(stats.skipped_writes, 0);
-        // Pass-1 locality succeeded, pass-2 read happened, compare missed.
-        assert_eq!(stats.check_reads_bytes, 4096);
         // Latest write wins.
         assert_eq!(vol.read(0, 1).unwrap(), b);
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn noop_skip_unwritten_range_bails_before_reading() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        // Write at LBA 0 only.
-        vol.write(0, &vec![0x42u8; 4096]).unwrap();
-        // Write to a completely unwritten range.
-        vol.write(100, &vec![0x55u8; 4096]).unwrap();
-        let stats = vol.noop_stats();
-        assert_eq!(stats.skipped_writes, 0);
-        // Pass-1 must bail on the unwritten gap without ever reading.
-        assert_eq!(stats.check_reads_bytes, 0);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -4887,12 +4755,14 @@ mod tests {
     }
 
     #[test]
-    fn noop_skip_fragmented_match_via_tier2() {
-        // Tier 1 (hash compare) cannot fire when the LBA map covers the
-        // incoming range with multiple entries — the new write's hash is
-        // over the whole range, none of the per-fragment hashes match.
-        // Tier 2 (byte compare) reads the concatenated existing content
-        // and matches if the user is writing exactly that concatenation.
+    fn noop_skip_does_not_fire_on_fragmented_match() {
+        // The hash check keys on a single LBA-map entry that exactly
+        // covers the incoming range. When the existing content is split
+        // into two entries whose concatenation matches, no single map
+        // entry hashes the whole range — the skip cannot fire and the
+        // write commits normally. (Earlier designs added a body
+        // byte-compare tier to catch this; see
+        // `docs/design-noop-write-skip.md § Why no byte-compare tier`.)
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         let a = vec![0xa1u8; 4096];
@@ -4901,36 +4771,17 @@ mod tests {
         vol.write(0, &a).unwrap();
         vol.write(1, &b).unwrap();
 
-        // Now write 8 KiB whose content is exactly a || b at LBA 0.
         let mut combined = Vec::with_capacity(8192);
         combined.extend_from_slice(&a);
         combined.extend_from_slice(&b);
         vol.write(0, &combined).unwrap();
 
         let stats = vol.noop_stats();
-        assert_eq!(stats.skipped_writes, 1, "tier 2 should catch the match");
-        assert_eq!(stats.skipped_bytes, 8192);
-        assert_eq!(stats.check_reads_bytes, 8192, "tier 2 reads the full range");
-        // LBA map is still split into two entries — the skip leaves
-        // existing structure untouched.
-        assert_eq!(vol.lbamap_len(), 2);
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn noop_skip_zero_extent_with_zero_data() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        // write_zeroes produces a ZERO_HASH extent with no body.
-        vol.write_zeroes(0, 2).unwrap();
-        // An incoming all-zeros write over the same range should skip:
-        // pass-1 sees ZERO_HASH (treated as local, no extent_index lookup),
-        // pass-2 read_extents returns the zero output buffer unchanged.
-        vol.write(0, &vec![0u8; 2 * 4096]).unwrap();
-
-        let stats = vol.noop_stats();
-        assert_eq!(stats.skipped_writes, 1);
-        assert_eq!(stats.skipped_bytes, 2 * 4096);
+        assert_eq!(stats.skipped_writes, 0);
+        // The fresh 8 KiB write replaces the two split entries with one.
+        assert_eq!(vol.lbamap_len(), 1);
+        // Read still returns the expected concatenation.
+        assert_eq!(vol.read(0, 2).unwrap(), combined);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -5007,7 +4858,8 @@ mod tests {
         // Readback still matches.
         assert_eq!(vol.read(100, 8).unwrap(), expected);
 
-        // Second pass is a tier-1 idempotent no-op: hashes are now stable.
+        // Second pass is an idempotent no-op: hashes are now stable, the
+        // LBA-map skip catches every rewrite the planner would propose.
         let plan2 = vol.reclaim_snapshot(100, 8);
         let proposed2 = plan2
             .compute_rewrites(|lba, len| vol.read(lba, len))
@@ -5275,10 +5127,10 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    /// Internal-origin write: tier-1 skip fires, tier-2 is bypassed.
-    /// Verified indirectly via the idempotent-convergence property — a
-    /// second alias-merge pass over already-optimal state produces no
-    /// proposals, and if any are generated they'd be tier-1-skipped.
+    /// Idempotent-convergence property: a reclaim pass over an
+    /// already-optimal range produces no proposals at all, and any that
+    /// did slip through would be absorbed by the noop-skip hash check
+    /// when committed via `write_with_hash`.
     #[test]
     fn reclaim_alias_merge_optimal_range_is_noop() {
         let base = keyed_temp_dir();

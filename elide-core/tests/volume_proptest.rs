@@ -146,12 +146,12 @@ enum SimOp {
     WriteZeroes { lba: u8 },
     /// Write `[seed; 4096]` to `lba`, then immediately write the same
     /// bytes to the same LBA again. The second write must short-circuit
-    /// via the no-op skip path (tier 1 hash compare — lbamap already
+    /// via the no-op skip path (LBA-map hash compare — lbamap already
     /// holds the hash after the first write), so `noop_stats().skipped_writes`
     /// must strictly increase across the second call.
     ///
     /// Randomly interleaved with SweepPending / Repack / DrainWithRedact /
-    /// CoordGcLocal, this also covers the load-bearing case where tier 1
+    /// CoordGcLocal, this also covers the load-bearing case where the skip
     /// fires against post-transform extent state — a later SameContentWrite
     /// on the same LBA will find lbamap still consistent after drain/GC.
     ///
@@ -720,7 +720,7 @@ proptest! {
                     );
                 }
                 SimOp::ReclaimRange { start_lba, lba_count } => {
-                    // Reclaim only writes to the WAL via write_internal; no
+                    // Reclaim only writes to the WAL via write_with_hash; no
                     // new segment ULIDs appear, so there is nothing extra
                     // to check for ULID monotonicity. The content-preservation
                     // invariant is covered by `reclaim_crash_recovery` and
