@@ -21,7 +21,6 @@
 //
 //   [gc]
 //   density_threshold  = 0.70          # compact when live_bytes/file_bytes < threshold
-//   small_segment_bytes = 8388608      # also compact segments smaller than this
 //   interval_secs      = 30            # how often GC runs per fork (seconds)
 
 use std::path::{Path, PathBuf};
@@ -179,11 +178,6 @@ pub struct GcConfig {
     #[serde(default = "default_gc_density")]
     pub density_threshold: f64,
 
-    /// Also compact segments whose file size is below this threshold (bytes).
-    /// Default: 8 MiB.
-    #[serde(default = "default_gc_small_segment")]
-    pub small_segment_bytes: u64,
-
     /// How often (seconds) to run a GC pass per fork. Default: 10.
     #[serde(default = "default_gc_interval")]
     pub interval_secs: u64,
@@ -191,9 +185,6 @@ pub struct GcConfig {
 
 fn default_gc_density() -> f64 {
     0.70
-}
-fn default_gc_small_segment() -> u64 {
-    8 * 1024 * 1024
 }
 fn default_gc_interval() -> u64 {
     10
@@ -203,7 +194,6 @@ impl Default for GcConfig {
     fn default() -> Self {
         Self {
             density_threshold: default_gc_density(),
-            small_segment_bytes: default_gc_small_segment(),
             interval_secs: default_gc_interval(),
         }
     }

@@ -1439,17 +1439,39 @@ fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
     })
 }
 
-/// Minimum segment file size below which a `pending/` segment is always a
-/// merge candidate regardless of its live ratio. See the TODO in
-/// `docs/operations.md` ("Pending compaction") about replacing this with
-/// an opportunistic-packing rule that targets *filling* output segments.
-const SWEEP_SMALL_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// Target output segment size for sweep, in live bytes. Matches the WAL
+/// `FLUSH_THRESHOLD` so swept outputs sit at the same scale as
+/// freshly-flushed segments.
+const SWEEP_TARGET_LIVE: u64 = 32 * 1024 * 1024;
 
-/// Execute a sweep job: read every `pending/` segment, partition each into
-/// live and dead extents, and merge the surviving live extents from
-/// candidates (segments with dead bytes or below
-/// [`SWEEP_SMALL_THRESHOLD`]) into a single new segment named with the
-/// max input ULID.
+/// Live-bytes threshold at or below which a pending segment is treated
+/// as a "small" sweep candidate. Picked at half the target so two smalls
+/// always combine to fit and the merged output exits the small set
+/// permanently — no infinite re-pack loop.
+const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_TARGET_LIVE / 2;
+
+/// Per-segment scratch state for sweep candidate selection.
+///
+/// `live_part` and `dead_part` are computed in the cheap scan phase
+/// using the segment-index cache; the inline section and body bytes
+/// are only fetched in the second phase, after selection has chosen
+/// which candidates actually contribute to the merged output.
+struct SweepCandidate {
+    seg_path: PathBuf,
+    seg_ulid: Ulid,
+    body_section_start: u64,
+    live_part: Vec<segment::SegmentEntry>,
+    dead_part: Vec<segment::SegmentEntry>,
+    /// Live `Data + Inline` body bytes — the budget unit.  `DedupRef`
+    /// and `Zero` are thin entries with no body cost.
+    live_bytes: u64,
+    dead_bytes: u64,
+}
+
+/// Execute a sweep job: scan every `pending/` segment for liveness,
+/// pack a bucket of candidates up to [`SWEEP_TARGET_LIVE`] live bytes,
+/// and merge their live extents into a single new segment named with
+/// the max input ULID.
 ///
 /// Pure with respect to in-memory `Volume` state — only touches the
 /// filesystem and the snapshot maps in `job`. The CAS preconditions
@@ -1458,24 +1480,19 @@ const SWEEP_SMALL_THRESHOLD: u64 = 8 * 1024 * 1024;
 /// `write_segment` reassigns offsets, so the apply phase can safely
 /// rewrite the extent index under concurrent writes.
 ///
-/// Mirrors the logic in [`Volume::sweep_pending`] but moves the heavy
-/// middle (segment reads, partitioning, write+rename+fsync_dir) off the
-/// actor thread.
+/// **Selection is purely about packing, not dead-data removal.** A
+/// segment with mostly-dead but large live bytes is *not* a sweep
+/// candidate — that's `Volume::repack`'s job, gated on density.
+/// Sweep clears any dead entries within its selected inputs as a
+/// side-effect of the rewrite, but does not select on that signal.
 pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
-    let mut seg_paths = segment::collect_segment_files(&job.pending_dir)?;
-    // ULID-ascending order so the merged output's entry ordering matches
-    // write order — rebuild applies entries in sequence and the last
-    // entry wins for each LBA.
-    seg_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
-
+    let seg_paths = segment::collect_segment_files(&job.pending_dir)?;
     let live: std::collections::HashSet<blake3::Hash> = job.lbamap.lba_referenced_hashes();
 
-    let mut stats = CompactionStats::default();
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    let mut merged_live: Vec<SweptLiveEntry> = Vec::new();
-    let mut dead_entries: Vec<SweptDeadEntry> = Vec::new();
-    let mut any_dead = false;
-
+    // Phase 1 — scan: parse + verify every non-floor segment, compute
+    // (live_part, dead_part, live_bytes). The segment cache makes the
+    // parse cheap on the second visit (apply phase doesn't re-parse).
+    let mut all: Vec<SweepCandidate> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
             .file_name()
@@ -1483,28 +1500,15 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             .ok_or_else(|| io::Error::other("bad segment filename"))?;
         let seg_ulid =
             Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
-
         if job.floor.is_some_and(|f| seg_ulid <= f) {
             continue;
         }
 
-        let file_size = std::fs::metadata(seg_path)?.len();
         let parsed = job
             .segment_cache
             .read_and_verify(seg_path, &job.verifying_key)?;
         let body_section_start = parsed.body_section_start;
         let mut entries = parsed.entries.clone();
-
-        let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
-        let is_small = file_size < SWEEP_SMALL_THRESHOLD;
-
-        if !has_dead && !is_small {
-            continue;
-        }
-        if has_dead {
-            any_dead = true;
-        }
-
         let (live_part, dead_part): (Vec<_>, Vec<_>) =
             entries.drain(..).partition(|e| match e.kind {
                 segment::EntryKind::DedupRef => {
@@ -1516,9 +1520,94 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
                 }
                 _ => live.contains(&e.hash),
             });
-
+        let live_bytes: u64 = live_part
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    segment::EntryKind::Data | segment::EntryKind::Inline
+                )
+            })
+            .map(|e| e.stored_length as u64)
+            .sum();
         let dead_bytes: u64 = dead_part.iter().map(|e| e.stored_length as u64).sum();
-        for entry in &dead_part {
+        all.push(SweepCandidate {
+            seg_path: seg_path.clone(),
+            seg_ulid,
+            body_section_start,
+            live_part,
+            dead_part,
+            live_bytes,
+            dead_bytes,
+        });
+    }
+
+    // Phase 2 — select: bin-pack toward SWEEP_TARGET_LIVE.
+    //
+    // Tier 1: smalls (live_bytes ≤ SMALL_THRESHOLD), sorted ascending so
+    // we fit the maximum count of inputs into the budget — every
+    // included input reduces the segment count of the next pass.
+    //
+    // Tier 2: at most one filler (live_bytes > SMALL_THRESHOLD) chosen
+    // best-fit against the remaining headroom. The filler trades
+    // copy-cost (rewriting a large segment) for one-fewer total
+    // segments, which is only worth it when there's already a small
+    // bucket to attach to.
+    let (smalls, fillers): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|c| c.live_bytes <= SWEEP_SMALL_THRESHOLD);
+
+    let mut smalls = smalls;
+    smalls.sort_by_key(|c| c.live_bytes);
+
+    let mut bucket: Vec<SweepCandidate> = Vec::new();
+    let mut budget = SWEEP_TARGET_LIVE;
+    for c in smalls {
+        if c.live_bytes <= budget {
+            budget -= c.live_bytes;
+            bucket.push(c);
+        }
+    }
+    if !bucket.is_empty()
+        && budget > 0
+        && let Some(pos) = fillers
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.live_bytes <= budget)
+            .max_by_key(|(_, c)| c.live_bytes)
+            .map(|(i, _)| i)
+    {
+        let mut fillers = fillers;
+        let f = fillers.remove(pos);
+        bucket.push(f);
+    }
+
+    // Single-input sweep is a no-op rewrite — skip. Repack handles
+    // single-segment dead-data cleanup.
+    if bucket.len() < 2 {
+        return Ok(SweepResult {
+            stats: CompactionStats::default(),
+            new_ulid: None,
+            new_body_section_start: 0,
+            merged_live: Vec::new(),
+            dead_entries: Vec::new(),
+            candidate_paths: Vec::new(),
+        });
+    }
+
+    // Sort selected candidates by ULID ascending so entries land in the
+    // merged output in write order — rebuild applies entries in sequence
+    // and the last entry wins for each LBA.
+    bucket.sort_by_key(|c| c.seg_ulid);
+
+    // Phase 3 — fetch and merge.
+    let mut stats = CompactionStats::default();
+    let mut merged_live: Vec<SweptLiveEntry> = Vec::new();
+    let mut dead_entries: Vec<SweptDeadEntry> = Vec::new();
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+
+    for c in &mut bucket {
+        for entry in &c.dead_part {
             // Zero/DedupRef are thin entries with no extent-index slot.
             // Delta entries live in the deltas table, not `inner`, so
             // `remove_if_matches` would always miss — skipping keeps the
@@ -1532,59 +1621,29 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             }
             dead_entries.push(SweptDeadEntry {
                 hash: entry.hash,
-                source_segment_id: seg_ulid,
+                source_segment_id: c.seg_ulid,
                 source_body_offset: entry.stored_offset,
             });
         }
-
-        let mut live_part = live_part;
-        let inline_bytes = segment::read_inline_section(seg_path)?;
+        let inline_bytes = segment::read_inline_section(&c.seg_path)?;
         segment::read_extent_bodies(
-            seg_path,
-            body_section_start,
-            &mut live_part,
+            &c.seg_path,
+            c.body_section_start,
+            &mut c.live_part,
             [segment::EntryKind::Data, segment::EntryKind::Inline],
             &inline_bytes,
         )?;
-        // Capture the source CAS preconditions BEFORE write_segment
-        // reassigns stored_offset on the merged buffer.
-        for entry in live_part {
+        for entry in std::mem::take(&mut c.live_part) {
             let source_body_offset = entry.stored_offset;
             merged_live.push(SweptLiveEntry {
                 entry,
-                source_segment_id: seg_ulid,
+                source_segment_id: c.seg_ulid,
                 source_body_offset,
             });
         }
-
-        candidate_paths.push(seg_path.clone());
+        candidate_paths.push(c.seg_path.clone());
         stats.segments_compacted += 1;
-        stats.bytes_freed += dead_bytes;
-    }
-
-    // Nothing to merge.
-    if candidate_paths.is_empty() {
-        return Ok(SweepResult {
-            stats: CompactionStats::default(),
-            new_ulid: None,
-            new_body_section_start: 0,
-            merged_live: Vec::new(),
-            dead_entries: Vec::new(),
-            candidate_paths: Vec::new(),
-        });
-    }
-
-    // A single small segment with no dead extents would rewrite to the
-    // same content — skip it. Drop everything: nothing to apply.
-    if candidate_paths.len() == 1 && !any_dead {
-        return Ok(SweepResult {
-            stats: CompactionStats::default(),
-            new_ulid: None,
-            new_body_section_start: 0,
-            merged_live: Vec::new(),
-            dead_entries: Vec::new(),
-            candidate_paths: Vec::new(),
-        });
+        stats.bytes_freed += c.dead_bytes;
     }
 
     // Use max(candidate ULIDs) as the output ULID. This guarantees the
@@ -1593,13 +1652,9 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
     // always produces a higher ULID and wins on rebuild. Using
     // mint.next() here would generate a ULID past the WAL ULID and
     // break that ordering.
-    let new_ulid = candidate_paths
+    let new_ulid = bucket
         .iter()
-        .filter_map(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|s| Ulid::from_string(s).ok())
-        })
+        .map(|c| c.seg_ulid)
         .max()
         .ok_or_else(|| io::Error::other("sweep: no valid candidate ULIDs"))?;
 

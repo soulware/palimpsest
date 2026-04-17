@@ -6134,6 +6134,79 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// Build a 4 KiB block whose first byte is `seed` and the rest are
+    /// pseudo-random — high entropy so compression stays a no-op.
+    fn unique_block(seed: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let s = seed as u64;
+        for (i, b) in buf.iter_mut().enumerate() {
+            // Distinct per-(seed,i) using a cheap hash. Coprime multipliers
+            // keep the byte distribution uniform.
+            *b = ((s.wrapping_mul(0x9E37_79B9).wrapping_add(i as u64)) ^ (i as u64 * 31)) as u8;
+        }
+        buf
+    }
+
+    /// Promote `block_count` distinct 4 KiB blocks into one pending segment.
+    fn promote_segment_with_blocks(vol: &mut Volume, base_lba: u64, block_count: u64, tag: u32) {
+        for i in 0..block_count {
+            // Mix `tag` into the seed so different segments don't dedup.
+            let block = unique_block(tag.wrapping_mul(0x10001).wrapping_add(i as u32));
+            vol.write(base_lba + i, &block).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_packs_small_with_filler() {
+        // One small (~4 KiB live) + one large filler (~17 MiB live).
+        // Tier 1 picks up the small; tier 2 sees ~32 MiB - 4 KiB headroom
+        // and pulls in the 17 MiB filler. Output is one ~17 MiB segment.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Small segment: 1 block.
+        promote_segment_with_blocks(&mut vol, 0, 1, 1);
+        // Filler: 17 MiB live (4352 blocks of 4 KiB).
+        // Above the 16 MiB SWEEP_SMALL_THRESHOLD so it's filler material,
+        // not a small. Must fit in the 32 MiB budget after the small.
+        promote_segment_with_blocks(&mut vol, 1, 4352, 2);
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 2,
+            "tier 2 must pull the filler in alongside the small"
+        );
+        assert_eq!(stats.new_segments, 1);
+
+        // Both ranges must still read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), unique_block(0x10001));
+        assert_eq!(vol.read(1, 1).unwrap(), unique_block(0x10001 * 2));
+        assert_eq!(
+            vol.read(4352, 1).unwrap(),
+            unique_block(0x10001u32.wrapping_mul(2).wrapping_add(4351))
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_skips_lone_filler() {
+        // A single filler (~17 MiB live, no small to pair with) must
+        // not be rewritten — sweep is for packing, not for moving large
+        // segments around. Repack is what handles single-segment cleanup.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        promote_segment_with_blocks(&mut vol, 0, 4352, 1);
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.new_segments, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     // --- compression helper unit tests ---
 
     /// Build a 4096-byte block where every byte is distinct (entropy = 8 bits/byte).

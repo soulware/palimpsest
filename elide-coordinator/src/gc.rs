@@ -10,11 +10,13 @@
 //     Mirrors lsvd StartGC and volume repack().
 //
 //   Sweep:
-//     Collect all segments below small_segment_bytes (excluding the repack
-//     candidate if one was selected) and batch them into one output, capping
-//     total live bytes at SWEEP_LIVE_CAP (32 MiB) to bound output size.
-//     Sweep candidates must have density >= density_threshold; lower-density
-//     small segments are owned by repack.
+//     Bin-pack high-density segments toward SWEEP_LIVE_CAP (32 MiB live).
+//     Tier 1 sorts segments with live_lba_bytes <= SWEEP_SMALL_THRESHOLD
+//     (16 MiB) ascending and greedy-includes them. Tier 2 picks at most
+//     one larger filler that fits the remaining headroom. Sweep candidates
+//     must have density >= density_threshold; lower-density segments are
+//     owned by repack and excluded here. Selection is purely about packing,
+//     not dead-data removal — repack handles that, gated on density.
 //     Mirrors lsvd SweepSmallSegments and volume sweep_pending().
 //
 // Both strategies run in the same tick if both find candidates, each producing
@@ -86,11 +88,14 @@ pub const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
 ///
 /// `compact_segments` writes a single output segment with no internal
-/// splitting, so this cap is the only bound on output size. It works correctly
-/// as long as `GcConfig::small_segment_bytes` ≤ `SWEEP_LIVE_CAP` — a single
-/// small segment can never exceed the cap. Raising `small_segment_bytes` above
-/// this value would be a misconfiguration.
+/// splitting, so this cap is the only bound on output size.
 const SWEEP_LIVE_CAP: u64 = 32 * 1024 * 1024;
+
+/// Live-bytes threshold at or below which a segment is treated as a "small"
+/// sweep candidate. Set at half of [`SWEEP_LIVE_CAP`] so two smalls always
+/// combine to fit, and the merged output exits the small set permanently —
+/// no infinite re-pack loop.
+const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_LIVE_CAP / 2;
 
 /// Maximum bytes per coalesced range-GET batch when fetching live bodies.
 /// Matches the cap used by the demand-fetch engine in elide-fetch.
@@ -277,33 +282,60 @@ pub async fn gc_fork(
         false
     };
 
-    // Sweep: batch small segments with density >= threshold up to the live cap.
-    // Segments with density < threshold are owned by repack (and removed above
-    // if selected this tick, or will be selected in a future tick).
-    let mut small: Vec<SegmentStats> = Vec::new();
-    let mut acc_live: u64 = 0;
-    for s in all_stats {
-        if s.file_size >= config.small_segment_bytes {
-            continue;
+    // Sweep: bin-pack high-density segments toward SWEEP_LIVE_CAP.
+    //
+    // Tier 1 — smalls (live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD), sorted
+    // ascending. Greedy include into the bucket until the next won't fit.
+    // Tier 2 — at most one filler (live > SWEEP_SMALL_THRESHOLD) chosen
+    // best-fit against the remaining headroom, only if the bucket already
+    // has at least one small. The filler trades the cost of rewriting a
+    // larger segment for one-fewer total segment, worth it only when
+    // there's already a small bucket to attach to.
+    //
+    // Selection is purely about packing, not dead-data removal. Repack
+    // owns dead-data (gated on `density_threshold`); low-density segments
+    // are filtered out here so they go to repack instead. Sweep clears
+    // dead entries within its selected inputs as a side-effect.
+    let (smalls, fillers): (Vec<_>, Vec<_>) = all_stats
+        .into_iter()
+        .filter(|s| s.density() >= config.density_threshold)
+        .partition(|s| s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD);
+
+    let mut smalls = smalls;
+    smalls.sort_by_key(|s| s.live_lba_bytes);
+
+    let mut bucket: Vec<SegmentStats> = Vec::new();
+    let mut budget = SWEEP_LIVE_CAP;
+    for s in smalls {
+        if s.live_lba_bytes <= budget {
+            budget -= s.live_lba_bytes;
+            bucket.push(s);
         }
-        // Exclude low-density small segments — repack owns those.
-        if s.density() < config.density_threshold {
-            continue;
-        }
-        // Always include at least one; then enforce the live-bytes cap.
-        if !small.is_empty() && acc_live + s.live_lba_bytes > SWEEP_LIVE_CAP {
-            break;
-        }
-        acc_live += s.live_lba_bytes;
-        small.push(s);
+    }
+    if !bucket.is_empty()
+        && budget > 0
+        && let Some(pos) = fillers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.live_lba_bytes <= budget)
+            .max_by_key(|(_, s)| s.live_lba_bytes)
+            .map(|(i, _)| i)
+    {
+        let mut fillers = fillers;
+        bucket.push(fillers.remove(pos));
     }
 
-    // Only sweep when ≥2 segments can be merged to reduce segment count.
-    // A single small segment with no dead space is not worth a standalone pass.
-    let ran_sweep = if small.len() >= 2 {
-        let sweep_candidates = small.len();
-        let sweep_bytes: u64 = small.iter().map(|s| s.dead_lba_bytes()).sum();
-        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid, &index)
+    // Sort the bucket back into ULID order before handing it to
+    // `compact_segments` so its rebuild-order semantics hold (when two
+    // input segments cover the same LBA the latest source wins).
+    bucket.sort_by(|a, b| a.ulid_str.cmp(&b.ulid_str));
+
+    // Single-input sweep is a no-op rewrite — skip. Repack handles
+    // single-segment dead-data cleanup.
+    let ran_sweep = if bucket.len() >= 2 {
+        let sweep_candidates = bucket.len();
+        let sweep_bytes: u64 = bucket.iter().map(|s| s.dead_lba_bytes()).sum();
+        compact_segments(bucket, &gc_dir, volume_id, store, sweep_ulid, &index)
             .await
             .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
@@ -527,7 +559,8 @@ struct SegmentStats {
     /// `body_section_start` for this segment's S3 object (== .idx file size).
     /// Used to compute absolute byte offsets for range-GETs into S3.
     body_section_start: u64,
-    /// Physical on-disk size (idx + DATA body bytes); used for small_segment_bytes threshold.
+    /// Physical on-disk size (idx + DATA body bytes); kept for diagnostics
+    /// and density logging.
     file_size: u64,
     /// Logical live bytes: lba_length * BLOCK_BYTES summed over all live entries
     /// (DATA, dedup_ref, zero_extent).  Dedup refs and zero extents are included
@@ -707,9 +740,9 @@ fn collect_stats(
             }
         }
 
-        // file_size: physical on-disk size for small_segment_bytes threshold.
-        // Uses stored (compressed) DATA and REF body bytes + idx overhead — not
-        // LBA bytes, since the threshold is about disk space, not logical coverage.
+        // file_size: physical on-disk size of the segment object. Uses
+        // stored (compressed) DATA and REF body bytes + idx overhead — not
+        // LBA bytes, since this measures disk space, not logical coverage.
         let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
@@ -1454,12 +1487,11 @@ mod tests {
         drop(vol);
 
         // Step 3: run the real coordinator GC.
-        // small_segment_bytes=u64::MAX: all segments qualify as "small" for sweep.
-        // density_threshold=0.0: all segments pass the density check.
-        // Both S1 and S2 should be swept together (small.len() >= 2).
+        // density_threshold=0.0 admits all segments to sweep; the test
+        // segments are well below SWEEP_SMALL_THRESHOLD so they pack into
+        // tier 1 directly.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            small_segment_bytes: u64::MAX,
             interval_secs: 0,
         };
         let sweep_ulid = Ulid::new();
@@ -1559,7 +1591,6 @@ mod tests {
         // Sweep both under a permissive density threshold.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            small_segment_bytes: u64::MAX,
             interval_secs: 0,
         };
         let sweep_ulid = Ulid::new();
@@ -1966,7 +1997,6 @@ mod tests {
         // GC: compact both segments.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            small_segment_bytes: u64::MAX,
             interval_secs: 0,
         };
         let sweep_ulid = Ulid::new();
