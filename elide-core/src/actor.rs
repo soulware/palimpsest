@@ -35,7 +35,8 @@ use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, GcHandoffJob,
     GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan,
-    ReclaimProposed, ReclaimThresholds, SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry,
+    ReclaimProposed, ReclaimThresholds, RepackJob, RepackResult, RepackedDeadEntry,
+    RepackedLiveEntry, RepackedSegment, SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry,
     Volume, WorkerJob, WorkerResult, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
     scan_reclaim_candidates,
 };
@@ -217,6 +218,11 @@ pub struct VolumeActor {
     /// sweep is in progress; concurrent `SweepPending` requests are
     /// rejected with an error.
     parked_sweep: Option<Sender<io::Result<CompactionStats>>>,
+    /// Reply channel for an in-flight `Repack` request, parked while
+    /// the worker thread executes the repack.  `None` when no repack
+    /// is in progress; concurrent `Repack` requests are rejected with
+    /// an error.
+    parked_repack: Option<Sender<io::Result<CompactionStats>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -430,6 +436,33 @@ impl VolumeActor {
         }
     }
 
+    /// Run the repack prep on the actor and dispatch the heavy middle
+    /// to the worker.  Reply is parked until
+    /// [`crate::volume::RepackResult`] arrives and is applied.
+    fn start_repack(&mut self, min_live_ratio: f64, reply: Sender<io::Result<CompactionStats>>) {
+        let job = match self.volume.prepare_repack(min_live_ratio) {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                let _ = reply.send(Ok(CompactionStats::default()));
+                return;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::Repack(job)) {
+                warn!("worker channel closed during repack: {e}");
+                let _ = reply.send(Err(io::Error::other("worker channel closed during repack")));
+                return;
+            }
+            self.parked_repack = Some(reply);
+        } else {
+            let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
     /// Pop the next staged handoff from the parked batch and dispatch it.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
         if let Some((staged_path, new_ulid)) = parked.remaining.pop() {
@@ -459,6 +492,7 @@ impl VolumeActor {
             || self.handoff_in_flight
             || self.promote_segments_in_flight > 0
             || self.parked_sweep.is_some()
+            || self.parked_repack.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -510,6 +544,25 @@ impl VolumeActor {
                         }
                         Err(e) => {
                             warn!("worker sweep failed during shutdown: {e}");
+                            Err(e)
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                Ok(WorkerResult::Repack(result)) => {
+                    let reply = self.parked_repack.take();
+                    let outcome = match result {
+                        Ok(r) => {
+                            let apply_result = self.volume.apply_repack_result(r);
+                            if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
+                                self.publish_snapshot();
+                            }
+                            apply_result
+                        }
+                        Err(e) => {
+                            warn!("worker repack failed during shutdown: {e}");
                             Err(e)
                         }
                     };
@@ -625,11 +678,12 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::Repack { min_live_ratio, reply } => {
-                            let result = self.volume.repack(min_live_ratio);
-                            if matches!(&result, Ok(s) if s.segments_compacted > 0) {
-                                self.publish_snapshot();
+                            if self.parked_repack.is_some() {
+                                let _ = reply
+                                    .send(Err(io::Error::other("concurrent repack not allowed")));
+                            } else {
+                                self.start_repack(min_live_ratio, reply);
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::DeltaRepackPostSnapshot { reply } => {
                             let result = self.volume.delta_repack_post_snapshot();
@@ -843,6 +897,25 @@ impl VolumeActor {
                                 }
                                 Err(e) => {
                                     warn!("worker sweep failed: {e}");
+                                    Err(e)
+                                }
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                        Ok(WorkerResult::Repack(result)) => {
+                            let reply = self.parked_repack.take();
+                            let outcome = match result {
+                                Ok(r) => {
+                                    let apply_result = self.volume.apply_repack_result(r);
+                                    if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
+                                        self.publish_snapshot();
+                                    }
+                                    apply_result
+                                }
+                                Err(e) => {
+                                    warn!("worker repack failed: {e}");
                                     Err(e)
                                 }
                             };
@@ -1289,6 +1362,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::PromoteSegment { ulid, result }
             }
             WorkerJob::Sweep(job) => WorkerResult::Sweep(execute_sweep(job)),
+            WorkerJob::Repack(job) => WorkerResult::Repack(execute_repack(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -1695,6 +1769,164 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
     })
 }
 
+/// Execute a repack job: iterate every non-floor segment in `pending/`,
+/// compute liveness against the captured `lbamap`, and rewrite (in place,
+/// reusing the input ULID) any segment whose live ratio is below
+/// `min_live_ratio`. Segments with no live entries are deleted.
+///
+/// Produces a per-segment `RepackedSegment` with CAS preconditions for
+/// every Data/Inline entry touched — the apply phase on the actor uses
+/// those to update the extent index without clobbering concurrent writes.
+pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
+    let seg_paths = segment::collect_segment_files(&job.pending_dir)?;
+    let live: std::collections::HashSet<blake3::Hash> = job.lbamap.lba_referenced_hashes();
+
+    let mut stats = CompactionStats::default();
+    let mut segments: Vec<RepackedSegment> = Vec::new();
+
+    for seg_path in &seg_paths {
+        let seg_filename = seg_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::other("bad segment filename"))?;
+        let seg_id =
+            Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
+        if job.floor.is_some_and(|f| seg_id <= f) {
+            continue;
+        }
+
+        let parsed = match job
+            .segment_cache
+            .read_and_verify(seg_path, &job.verifying_key)
+        {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let body_section_start = parsed.body_section_start;
+        let mut entries = parsed.entries.clone();
+
+        let total_bytes: u64 = entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    segment::EntryKind::Data | segment::EntryKind::Inline
+                )
+            })
+            .map(|e| e.stored_length as u64)
+            .sum();
+
+        if total_bytes == 0 {
+            continue;
+        }
+
+        let live_bytes: u64 = entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    segment::EntryKind::Data | segment::EntryKind::Inline
+                ) && live.contains(&e.hash)
+            })
+            .map(|e| e.stored_length as u64)
+            .sum();
+
+        if live_bytes as f64 / total_bytes as f64 >= job.min_live_ratio {
+            continue;
+        }
+
+        let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
+            entries.drain(..).partition(|e| match e.kind {
+                segment::EntryKind::Zero => {
+                    job.lbamap.hash_at(e.start_lba) == Some(crate::volume::ZERO_HASH)
+                }
+                segment::EntryKind::DedupRef | segment::EntryKind::Delta => {
+                    job.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                }
+                segment::EntryKind::Data | segment::EntryKind::Inline => live.contains(&e.hash),
+            });
+
+        let mut dead: Vec<RepackedDeadEntry> = Vec::new();
+        for entry in &dead_entries {
+            // Zero, DedupRef, and Delta are thin entries with no
+            // extent-index slot; the apply phase's `remove_if_matches`
+            // would always miss. Skipping keeps the dead set focused
+            // on entries apply can actually act on.
+            if matches!(
+                entry.kind,
+                segment::EntryKind::Zero | segment::EntryKind::DedupRef | segment::EntryKind::Delta
+            ) {
+                continue;
+            }
+            dead.push(RepackedDeadEntry {
+                hash: entry.hash,
+                source_body_offset: entry.stored_offset,
+            });
+        }
+
+        let mut repacked_live: Vec<RepackedLiveEntry> = Vec::new();
+        let mut new_body_section_start = 0u64;
+        let mut all_dead_deleted = false;
+
+        if !live_entries.is_empty() {
+            let inline_bytes = segment::read_inline_section(seg_path)?;
+            segment::read_extent_bodies(
+                seg_path,
+                body_section_start,
+                &mut live_entries,
+                [segment::EntryKind::Data, segment::EntryKind::Inline],
+                &inline_bytes,
+            )?;
+
+            // Capture pre-write offsets — `write_segment` reassigns
+            // `stored_offset` to the new body positions.
+            let source_offsets: Vec<u64> = live_entries.iter().map(|e| e.stored_offset).collect();
+
+            let new_ulid_str = seg_id.to_string();
+            let tmp_path = job.pending_dir.join(format!("{new_ulid_str}.tmp"));
+            let final_path = job.pending_dir.join(&new_ulid_str);
+            new_body_section_start =
+                segment::write_segment(&tmp_path, &mut live_entries, job.signer.as_ref())?;
+            std::fs::rename(&tmp_path, &final_path)?;
+            segment::fsync_dir(&final_path)?;
+            stats.new_segments += 1;
+
+            for (entry, source_body_offset) in
+                live_entries.into_iter().zip(source_offsets.into_iter())
+            {
+                repacked_live.push(RepackedLiveEntry {
+                    entry,
+                    source_body_offset,
+                });
+            }
+        } else {
+            // Every entry is dead — delete the segment file outright.
+            // Leaving it on disk would keep DedupRef bodies visible to a
+            // later drain after their canonical hashes have been
+            // dropped from the extent index by the apply phase.
+            std::fs::remove_file(seg_path)?;
+            segment::fsync_dir(seg_path)?;
+            all_dead_deleted = true;
+        }
+
+        stats.segments_compacted += 1;
+        let bytes_freed = total_bytes - live_bytes;
+        stats.bytes_freed += bytes_freed;
+
+        segments.push(RepackedSegment {
+            seg_id,
+            new_body_section_start,
+            live: repacked_live,
+            dead,
+            all_dead_deleted,
+            bytes_freed,
+        });
+    }
+
+    Ok(RepackResult { stats, segments })
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -1749,6 +1981,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         parked_handoffs: None,
         handoff_in_flight: false,
         parked_sweep: None,
+        parked_repack: None,
     };
 
     let handle = VolumeHandle {

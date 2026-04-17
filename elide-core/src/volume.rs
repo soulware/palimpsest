@@ -569,12 +569,72 @@ pub struct SweepResult {
     pub candidate_paths: Vec<PathBuf>,
 }
 
+/// Data needed by the worker to repack sparse segments in `pending/`.
+/// Produced by [`Volume::prepare_repack`] on the actor thread.
+///
+/// Same shape as [`SweepJob`] plus `min_live_ratio` — the worker iterates
+/// every non-floor segment, recomputes liveness against the `lbamap`
+/// snapshot, and rewrites (in place, reusing the input ULID) any segment
+/// whose live ratio falls below the threshold.
+pub struct RepackJob {
+    pub lbamap: Arc<lbamap::LbaMap>,
+    pub floor: Option<Ulid>,
+    pub pending_dir: PathBuf,
+    pub signer: Arc<dyn segment::SegmentSigner>,
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
+    pub min_live_ratio: f64,
+}
+
+/// A live entry carried into the repacked output, paired with the CAS
+/// precondition from its source segment. Apply uses
+/// `replace_if_matches(hash, seg_id, source_body_offset, ..)` — the
+/// output reuses the same ULID, so only `body_offset` changes on success.
+pub struct RepackedLiveEntry {
+    pub entry: segment::SegmentEntry,
+    pub source_body_offset: u64,
+}
+
+/// A dead entry dropped by repack, paired with the CAS precondition from
+/// its source segment. Apply uses `remove_if_matches`. Only Data and
+/// Inline entries appear here — Zero, DedupRef, and Delta are thin
+/// entries with no extent-index slot.
+pub struct RepackedDeadEntry {
+    pub hash: blake3::Hash,
+    pub source_body_offset: u64,
+}
+
+/// Per-segment payload from a [`RepackJob`]. One of these is produced for
+/// every segment the worker rewrote or deleted.
+///
+/// When `all_dead_deleted` is `true`, the worker has already `remove_file`d
+/// the segment; `live` is empty and `new_body_section_start` is 0. When
+/// `false`, the worker renamed a fresh `.tmp` over the original file, so
+/// `new_body_section_start` and the `live` entries (with post-write
+/// offsets) are valid.
+pub struct RepackedSegment {
+    pub seg_id: Ulid,
+    pub new_body_section_start: u64,
+    pub live: Vec<RepackedLiveEntry>,
+    pub dead: Vec<RepackedDeadEntry>,
+    pub all_dead_deleted: bool,
+    pub bytes_freed: u64,
+}
+
+/// Result of a [`RepackJob`]. Consumed by [`Volume::apply_repack_result`]
+/// on the actor thread.
+pub struct RepackResult {
+    pub stats: CompactionStats,
+    pub segments: Vec<RepackedSegment>,
+}
+
 /// Job dispatched from the actor to the worker thread.
 pub enum WorkerJob {
     Promote(PromoteJob),
     GcHandoff(GcHandoffJob),
     PromoteSegment(PromoteSegmentJob),
     Sweep(SweepJob),
+    Repack(RepackJob),
 }
 
 /// Result returned by the worker thread to the actor.
@@ -591,6 +651,7 @@ pub enum WorkerResult {
         result: io::Result<PromoteSegmentResult>,
     },
     Sweep(io::Result<SweepResult>),
+    Repack(io::Result<RepackResult>),
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
@@ -1356,178 +1417,111 @@ impl Volume {
     ///
     /// `min_live_ratio` is in [0.0, 1.0]: 0.7 compacts any segment where more
     /// than 30% of stored bytes are dead.
+    ///
+    /// Synchronous wrapper around [`Self::prepare_repack`] +
+    /// [`crate::actor::execute_repack`] + [`Self::apply_repack_result`].
+    /// The actor offloads the middle phase to the worker thread; callers
+    /// that hold a `&mut Volume` directly (tests, tools) can keep using
+    /// this wrapper.
     pub fn repack(&mut self, min_live_ratio: f64) -> io::Result<CompactionStats> {
-        use std::collections::HashSet;
+        let Some(job) = self.prepare_repack(min_live_ratio)? else {
+            return Ok(CompactionStats::default());
+        };
+        let result = crate::actor::execute_repack(job)?;
+        self.apply_repack_result(result)
+    }
 
-        let live: HashSet<blake3::Hash> = self.lbamap.lba_referenced_hashes();
-        let mut stats = CompactionStats::default();
+    /// Prep phase of `repack` — runs on the actor thread.
+    ///
+    /// Snapshots `lbamap` (used by the worker to recompute liveness),
+    /// resolves the snapshot floor, and packages the directory + signer
+    /// state into a [`RepackJob`]. Returns `None` when `pending/` is
+    /// missing or has no segments.
+    ///
+    /// All segment reads, eligibility decisions, and rewrites run in
+    /// [`crate::actor::execute_repack`]. The apply phase
+    /// [`Self::apply_repack_result`] does the conditional extent-index
+    /// updates and file-cache eviction.
+    pub fn prepare_repack(&self, min_live_ratio: f64) -> io::Result<Option<RepackJob>> {
+        let pending_dir = self.base_dir.join("pending");
+        let segs = match segment::collect_segment_files(&pending_dir) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if segs.is_empty() {
+            return Ok(None);
+        }
+        let floor = latest_snapshot(&self.base_dir)?;
+        Ok(Some(RepackJob {
+            lbamap: Arc::clone(&self.lbamap),
+            floor,
+            pending_dir,
+            signer: Arc::clone(&self.signer),
+            verifying_key: self.verifying_key,
+            segment_cache: Arc::clone(&self.segment_cache),
+            min_live_ratio,
+        }))
+    }
 
-        // Segments at or below the latest snapshot ULID are frozen: they may be
-        // referenced by child forks that branched from a snapshot in this fork.
-        // Only post-snapshot segments are eligible for compaction.
-        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?;
+    /// Apply phase of `repack` — runs on the actor thread after the
+    /// worker returns.
+    ///
+    /// For each rewritten segment: re-points live Data/Inline entries via
+    /// `replace_if_matches((hash, seg_id, source_body_offset) → new_loc)`,
+    /// where the new location reuses the same `seg_id` but with the
+    /// post-write `body_offset`. A concurrent writer that superseded the
+    /// hash between prep and apply fails the CAS and is preserved
+    /// untouched — the repacked body simply becomes unreferenced until
+    /// the next pass picks it up.
+    ///
+    /// Dead entries are dropped with `remove_if_matches` for the same
+    /// reason. File-cache eviction runs for every touched segment so a
+    /// cached fd on the old inode cannot serve stale offsets after the
+    /// rename.
+    pub fn apply_repack_result(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
+        let RepackResult {
+            mut stats,
+            segments,
+        } = result;
 
-        let all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
-
-        for seg_path in all_segs {
-            let seg_id = seg_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad segment filename"))?;
-            let seg_id = Ulid::from_string(seg_id).map_err(|e| io::Error::other(e.to_string()))?;
-
-            // Skip segments frozen by the latest snapshot.
-            if floor.is_some_and(|f| seg_id <= f) {
-                continue;
-            }
-
-            let parsed = match self
-                .segment_cache
-                .read_and_verify(&seg_path, &self.verifying_key)
-            {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            };
-            let body_section_start = parsed.body_section_start;
-            let mut entries = parsed.entries.clone();
-
-            // DATA and Inline entries have real stored bytes.
-            // DedupRef body regions are zero-filled; Zero has stored_length=0.
-            let total_bytes: u64 = entries
-                .iter()
-                .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::Inline))
-                .map(|e| e.stored_length as u64)
-                .sum();
-
-            if total_bytes == 0 {
-                continue;
-            }
-
-            let live_bytes: u64 = entries
-                .iter()
-                .filter(|e| {
-                    matches!(e.kind, EntryKind::Data | EntryKind::Inline) && live.contains(&e.hash)
-                })
-                .map(|e| e.stored_length as u64)
-                .sum();
-
-            if live_bytes as f64 / total_bytes as f64 >= min_live_ratio {
-                continue;
-            }
-
-            let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
-                entries.drain(..).partition(|e| match e.kind {
-                    EntryKind::Zero => self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH),
-                    EntryKind::DedupRef | EntryKind::Delta => {
-                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
-                    }
-                    EntryKind::Data | EntryKind::Inline => live.contains(&e.hash),
-                });
-
-            // Remove dead entries from the extent index (only those pointing at
-            // this segment — entries pointing elsewhere belong to another copy).
-            // Thin DedupRef, Zero, and Delta entries are not in the extent index.
-            let mut removed = 0usize;
-            for entry in &dead_entries {
-                if matches!(
-                    entry.kind,
-                    EntryKind::Zero | EntryKind::DedupRef | EntryKind::Delta
+        for seg in &segments {
+            for dead in &seg.dead {
+                if Arc::make_mut(&mut self.extent_index).remove_if_matches(
+                    &dead.hash,
+                    seg.seg_id,
+                    dead.source_body_offset,
                 ) {
-                    continue;
-                }
-                if self
-                    .extent_index
-                    .lookup(&entry.hash)
-                    .map(|loc| loc.segment_id == seg_id)
-                    .unwrap_or(false)
-                {
-                    Arc::make_mut(&mut self.extent_index).remove(&entry.hash);
-                    removed += 1;
+                    stats.extents_removed += 1;
                 }
             }
 
-            // Evict the old segment from the file handle cache before
-            // replacing or deleting it.
-            self.evict_cached_segment(seg_id);
+            self.evict_cached_segment(seg.seg_id);
 
-            if !live_entries.is_empty() {
-                // Read body bytes for live entries (Data) and inline data (Inline).
-                // DedupRef regions are zero-filled placeholders in pending/ and are
-                // re-emitted as zeros by write_segment.
-                let inline_bytes = segment::read_inline_section(&seg_path)?;
-                segment::read_extent_bodies(
-                    &seg_path,
-                    body_section_start,
-                    &mut live_entries,
-                    [EntryKind::Data, EntryKind::Inline],
-                    &inline_bytes,
-                )?;
-
-                // Reuse the source segment's own ULID for the output.  This
-                // guarantees the output ULID < the current WAL ULID (all segments
-                // predate the current WAL), so a subsequent WAL flush always
-                // produces a higher ULID and wins on rebuild.  Using mint.next()
-                // here would generate a ULID past the WAL ULID and break that
-                // ordering — the same bug fixed in sweep_pending.
-                let new_ulid = seg_id;
-                let new_ulid_str = new_ulid.to_string();
-                let pending_dir = self.base_dir.join("pending");
-                let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
-                let final_path = pending_dir.join(&new_ulid_str);
-                // write_segment reassigns stored_offset in live_entries to new positions.
-                let new_bss =
-                    segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_ref())?;
-                // Atomically replaces the original segment file.
-                fs::rename(&tmp_path, &final_path)?;
-                segment::fsync_dir(&final_path)?;
-                stats.new_segments += 1;
-
-                for entry in &live_entries {
-                    match entry.kind {
-                        EntryKind::Data => {
-                            Arc::make_mut(&mut self.extent_index).insert(
-                                entry.hash,
-                                extentindex::ExtentLocation {
-                                    segment_id: new_ulid,
-                                    body_offset: entry.stored_offset,
-                                    body_length: entry.stored_length,
-                                    compressed: entry.compressed,
-                                    body_source: BodySource::Local,
-                                    body_section_start: new_bss,
-                                    inline_data: None,
-                                },
-                            );
-                        }
-                        EntryKind::Inline => {
-                            Arc::make_mut(&mut self.extent_index).insert(
-                                entry.hash,
-                                extentindex::ExtentLocation {
-                                    segment_id: new_ulid,
-                                    body_offset: entry.stored_offset,
-                                    body_length: entry.stored_length,
-                                    compressed: entry.compressed,
-                                    body_source: BodySource::Local,
-                                    body_section_start: new_bss,
-                                    inline_data: entry.data.clone().map(Vec::into_boxed_slice),
-                                },
-                            );
-                        }
-                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {}
-                    }
+            if !seg.all_dead_deleted {
+                for live in &seg.live {
+                    let entry = &live.entry;
+                    let inline_data = match entry.kind {
+                        EntryKind::Data => None,
+                        EntryKind::Inline => entry.data.clone().map(Vec::into_boxed_slice),
+                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                    };
+                    Arc::make_mut(&mut self.extent_index).replace_if_matches(
+                        entry.hash,
+                        seg.seg_id,
+                        live.source_body_offset,
+                        extentindex::ExtentLocation {
+                            segment_id: seg.seg_id,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start: seg.new_body_section_start,
+                            inline_data,
+                        },
+                    );
                 }
-            } else {
-                // All entries are dead — delete the segment file. Without
-                // this, a subsequent drain would try to process DedupRef
-                // entries whose canonical hashes we just removed from the
-                // extent index.
-                fs::remove_file(&seg_path)?;
-                segment::fsync_dir(&seg_path)?;
             }
-
-            stats.segments_compacted += 1;
-            stats.bytes_freed += total_bytes - live_bytes;
-            stats.extents_removed += removed;
         }
 
         Ok(stats)
