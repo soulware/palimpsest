@@ -35,8 +35,9 @@ use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, GcHandoffJob,
     GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan,
-    ReclaimProposed, ReclaimThresholds, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    ReclaimProposed, ReclaimThresholds, SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry,
+    Volume, WorkerJob, WorkerResult, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
+    scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,6 +212,11 @@ pub struct VolumeActor {
     parked_handoffs: Option<ParkedGcHandoffs>,
     /// Whether a GC handoff job is currently on the worker thread.
     handoff_in_flight: bool,
+    /// Reply channel for an in-flight `SweepPending` request, parked
+    /// while the worker thread executes the sweep.  `None` when no
+    /// sweep is in progress; concurrent `SweepPending` requests are
+    /// rejected with an error.
+    parked_sweep: Option<Sender<io::Result<CompactionStats>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -393,6 +399,37 @@ impl VolumeActor {
         self.parked_handoffs = Some(parked);
     }
 
+    /// Run the sweep prep on the actor and dispatch the heavy middle to
+    /// the worker.  Reply is parked until [`crate::volume::SweepResult`]
+    /// arrives and is applied.
+    ///
+    /// Reply is sent immediately with default stats when the prep
+    /// returns `None` (no `pending/` segments to consider) or when the
+    /// dispatch fails because the worker channel has closed.
+    fn start_sweep(&mut self, reply: Sender<io::Result<CompactionStats>>) {
+        let job = match self.volume.prepare_sweep() {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                let _ = reply.send(Ok(CompactionStats::default()));
+                return;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::Sweep(job)) {
+                warn!("worker channel closed during sweep: {e}");
+                let _ = reply.send(Err(io::Error::other("worker channel closed during sweep")));
+                return;
+            }
+            self.parked_sweep = Some(reply);
+        } else {
+            let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
     /// Pop the next staged handoff from the parked batch and dispatch it.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
         if let Some((staged_path, new_ulid)) = parked.remaining.pop() {
@@ -421,6 +458,7 @@ impl VolumeActor {
         while self.promotes_in_flight > 0
             || self.handoff_in_flight
             || self.promote_segments_in_flight > 0
+            || self.parked_sweep.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -458,6 +496,25 @@ impl VolumeActor {
                             warn!("worker promote_segment for {ulid} failed during shutdown: {e}");
                             self.reply_parked_promote_segment(ulid, Err(e));
                         }
+                    }
+                }
+                Ok(WorkerResult::Sweep(result)) => {
+                    let reply = self.parked_sweep.take();
+                    let outcome = match result {
+                        Ok(r) => {
+                            let apply_result = self.volume.apply_sweep_result(r);
+                            if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
+                                self.publish_snapshot();
+                            }
+                            apply_result
+                        }
+                        Err(e) => {
+                            warn!("worker sweep failed during shutdown: {e}");
+                            Err(e)
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
                     }
                 }
                 Err(_) => {
@@ -560,11 +617,12 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::SweepPending { reply } => {
-                            let result = self.volume.sweep_pending();
-                            if matches!(&result, Ok(s) if s.segments_compacted > 0) {
-                                self.publish_snapshot();
+                            if self.parked_sweep.is_some() {
+                                let _ = reply
+                                    .send(Err(io::Error::other("concurrent sweep_pending not allowed")));
+                            } else {
+                                self.start_sweep(reply);
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::Repack { min_live_ratio, reply } => {
                             let result = self.volume.repack(min_live_ratio);
@@ -771,6 +829,25 @@ impl VolumeActor {
                                     );
                                     self.reply_parked_promote_segment(ulid, Err(e));
                                 }
+                            }
+                        }
+                        Ok(WorkerResult::Sweep(result)) => {
+                            let reply = self.parked_sweep.take();
+                            let outcome = match result {
+                                Ok(r) => {
+                                    let apply_result = self.volume.apply_sweep_result(r);
+                                    if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
+                                        self.publish_snapshot();
+                                    }
+                                    apply_result
+                                }
+                                Err(e) => {
+                                    warn!("worker sweep failed: {e}");
+                                    Err(e)
+                                }
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
                             }
                         }
                         Err(_) => {
@@ -1211,6 +1288,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 let result = execute_promote_segment(job);
                 WorkerResult::PromoteSegment { ulid, result }
             }
+            WorkerJob::Sweep(job) => WorkerResult::Sweep(execute_sweep(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -1361,6 +1439,207 @@ fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
     })
 }
 
+/// Minimum segment file size below which a `pending/` segment is always a
+/// merge candidate regardless of its live ratio. See the TODO in
+/// `docs/operations.md` ("Pending compaction") about replacing this with
+/// an opportunistic-packing rule that targets *filling* output segments.
+const SWEEP_SMALL_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Execute a sweep job: read every `pending/` segment, partition each into
+/// live and dead extents, and merge the surviving live extents from
+/// candidates (segments with dead bytes or below
+/// [`SWEEP_SMALL_THRESHOLD`]) into a single new segment named with the
+/// max input ULID.
+///
+/// Pure with respect to in-memory `Volume` state — only touches the
+/// filesystem and the snapshot maps in `job`. The CAS preconditions
+/// returned in [`SweepResult::merged_live`] / [`SweepResult::dead_entries`]
+/// are the source `(segment_id, body_offset)` pairs, captured before
+/// `write_segment` reassigns offsets, so the apply phase can safely
+/// rewrite the extent index under concurrent writes.
+///
+/// Mirrors the logic in [`Volume::sweep_pending`] but moves the heavy
+/// middle (segment reads, partitioning, write+rename+fsync_dir) off the
+/// actor thread.
+pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
+    let mut seg_paths = segment::collect_segment_files(&job.pending_dir)?;
+    // ULID-ascending order so the merged output's entry ordering matches
+    // write order — rebuild applies entries in sequence and the last
+    // entry wins for each LBA.
+    seg_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let live: std::collections::HashSet<blake3::Hash> = job.lbamap.lba_referenced_hashes();
+
+    let mut stats = CompactionStats::default();
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    let mut merged_live: Vec<SweptLiveEntry> = Vec::new();
+    let mut dead_entries: Vec<SweptDeadEntry> = Vec::new();
+    let mut any_dead = false;
+
+    for seg_path in &seg_paths {
+        let seg_filename = seg_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::other("bad segment filename"))?;
+        let seg_ulid =
+            Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
+
+        if job.floor.is_some_and(|f| seg_ulid <= f) {
+            continue;
+        }
+
+        let file_size = std::fs::metadata(seg_path)?.len();
+        let parsed = job
+            .segment_cache
+            .read_and_verify(seg_path, &job.verifying_key)?;
+        let body_section_start = parsed.body_section_start;
+        let mut entries = parsed.entries.clone();
+
+        let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
+        let is_small = file_size < SWEEP_SMALL_THRESHOLD;
+
+        if !has_dead && !is_small {
+            continue;
+        }
+        if has_dead {
+            any_dead = true;
+        }
+
+        let (live_part, dead_part): (Vec<_>, Vec<_>) =
+            entries.drain(..).partition(|e| match e.kind {
+                segment::EntryKind::DedupRef => {
+                    // A dedup ref is only live if the LBA still maps to
+                    // this hash. If the LBA was overwritten with different
+                    // data, carrying the stale ref would reintroduce the
+                    // old mapping after crash + rebuild.
+                    job.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                }
+                _ => live.contains(&e.hash),
+            });
+
+        let dead_bytes: u64 = dead_part.iter().map(|e| e.stored_length as u64).sum();
+        for entry in &dead_part {
+            // Zero/DedupRef are thin entries with no extent-index slot.
+            // Delta entries live in the deltas table, not `inner`, so
+            // `remove_if_matches` would always miss — skipping keeps the
+            // dead set focused on entries the apply phase can actually
+            // remove.
+            if matches!(
+                entry.kind,
+                segment::EntryKind::Zero | segment::EntryKind::DedupRef | segment::EntryKind::Delta
+            ) {
+                continue;
+            }
+            dead_entries.push(SweptDeadEntry {
+                hash: entry.hash,
+                source_segment_id: seg_ulid,
+                source_body_offset: entry.stored_offset,
+            });
+        }
+
+        let mut live_part = live_part;
+        let inline_bytes = segment::read_inline_section(seg_path)?;
+        segment::read_extent_bodies(
+            seg_path,
+            body_section_start,
+            &mut live_part,
+            [segment::EntryKind::Data, segment::EntryKind::Inline],
+            &inline_bytes,
+        )?;
+        // Capture the source CAS preconditions BEFORE write_segment
+        // reassigns stored_offset on the merged buffer.
+        for entry in live_part {
+            let source_body_offset = entry.stored_offset;
+            merged_live.push(SweptLiveEntry {
+                entry,
+                source_segment_id: seg_ulid,
+                source_body_offset,
+            });
+        }
+
+        candidate_paths.push(seg_path.clone());
+        stats.segments_compacted += 1;
+        stats.bytes_freed += dead_bytes;
+    }
+
+    // Nothing to merge.
+    if candidate_paths.is_empty() {
+        return Ok(SweepResult {
+            stats: CompactionStats::default(),
+            new_ulid: None,
+            new_body_section_start: 0,
+            merged_live: Vec::new(),
+            dead_entries: Vec::new(),
+            candidate_paths: Vec::new(),
+        });
+    }
+
+    // A single small segment with no dead extents would rewrite to the
+    // same content — skip it. Drop everything: nothing to apply.
+    if candidate_paths.len() == 1 && !any_dead {
+        return Ok(SweepResult {
+            stats: CompactionStats::default(),
+            new_ulid: None,
+            new_body_section_start: 0,
+            merged_live: Vec::new(),
+            dead_entries: Vec::new(),
+            candidate_paths: Vec::new(),
+        });
+    }
+
+    // Use max(candidate ULIDs) as the output ULID. This guarantees the
+    // output sorts below the current WAL ULID (all pending segments were
+    // created before the WAL was opened), so a subsequent WAL flush
+    // always produces a higher ULID and wins on rebuild. Using
+    // mint.next() here would generate a ULID past the WAL ULID and
+    // break that ordering.
+    let new_ulid = candidate_paths
+        .iter()
+        .filter_map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| Ulid::from_string(s).ok())
+        })
+        .max()
+        .ok_or_else(|| io::Error::other("sweep: no valid candidate ULIDs"))?;
+
+    let mut new_body_section_start = 0u64;
+    let new_ulid_out = if merged_live.is_empty() {
+        // Every input was fully dead — no segment to write, but the
+        // dead-removal + candidate deletion still need to run.
+        None
+    } else {
+        // write_segment reassigns each entry's stored_offset to its
+        // new position. Operate on a borrowed buffer of SegmentEntry,
+        // then read the new offsets back into our SweptLiveEntry list.
+        let mut entries: Vec<segment::SegmentEntry> =
+            merged_live.iter().map(|e| e.entry.clone()).collect();
+        let new_ulid_str = new_ulid.to_string();
+        let tmp_path = job.pending_dir.join(format!("{new_ulid_str}.tmp"));
+        let final_path = job.pending_dir.join(&new_ulid_str);
+        new_body_section_start =
+            segment::write_segment(&tmp_path, &mut entries, job.signer.as_ref())?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        segment::fsync_dir(&final_path)?;
+        stats.new_segments += 1;
+        // Replace the cloned entry on each SweptLiveEntry with the
+        // post-write copy so the apply phase sees the new offsets.
+        for (sw, written) in merged_live.iter_mut().zip(entries.into_iter()) {
+            sw.entry = written;
+        }
+        Some(new_ulid)
+    };
+
+    Ok(SweepResult {
+        stats,
+        new_ulid: new_ulid_out,
+        new_body_section_start,
+        merged_live,
+        dead_entries,
+        candidate_paths,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -1414,6 +1693,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         promote_segments_in_flight: 0,
         parked_handoffs: None,
         handoff_in_flight: false,
+        parked_sweep: None,
     };
 
     let handle = VolumeHandle {

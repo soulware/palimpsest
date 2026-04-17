@@ -511,11 +511,70 @@ pub enum PromoteSegmentPrep {
     AlreadyPromoted,
 }
 
+/// Data needed by the worker to compact small / dead-bearing segments in
+/// `pending/`. Produced by [`Volume::prepare_sweep`] on the actor thread.
+///
+/// `lbamap` is an `Arc` snapshot used by the worker to make liveness
+/// decisions for `DedupRef` entries (`hash_at(lba)` queries). Concurrent
+/// writes after prep are not visible to the worker — the apply phase
+/// uses CAS on the source `(segment_id, body_offset)` pair, which makes
+/// the conservative liveness snapshot safe (we may keep a now-dead hash
+/// alive for one more cycle, never the reverse).
+pub struct SweepJob {
+    pub lbamap: Arc<lbamap::LbaMap>,
+    pub floor: Option<Ulid>,
+    pub pending_dir: PathBuf,
+    pub signer: Arc<dyn segment::SegmentSigner>,
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
+}
+
+/// A live entry carried into the swept output, paired with the CAS
+/// preconditions from its source segment. Apply uses
+/// `replace_if_matches(hash, source_segment_id, source_body_offset, ..)`
+/// so a concurrent overwrite leaves the index untouched.
+pub struct SweptLiveEntry {
+    pub entry: segment::SegmentEntry,
+    pub source_segment_id: Ulid,
+    pub source_body_offset: u64,
+}
+
+/// A dead entry dropped by sweep, paired with the CAS preconditions from
+/// its source segment. Apply uses `remove_if_matches`.
+///
+/// Only Data and Inline entries appear here — Zero, DedupRef, and Delta
+/// entries are not in the `inner` extent index.
+pub struct SweptDeadEntry {
+    pub hash: blake3::Hash,
+    pub source_segment_id: Ulid,
+    pub source_body_offset: u64,
+}
+
+/// Result of a [`SweepJob`]. Consumed by [`Volume::apply_sweep_result`]
+/// on the actor thread.
+///
+/// `new_ulid` is `None` when the merged-live set was empty (every input
+/// was fully dead) — in that case the apply phase still runs the dead
+/// removals and deletes the candidate files. `candidate_paths` lists the
+/// inputs to evict from the file cache and unlink. The candidate whose
+/// ULID equals `new_ulid` was already replaced atomically by the rename
+/// inside the worker; apply must skip its `remove_file` while still
+/// evicting its cached fd.
+pub struct SweepResult {
+    pub stats: CompactionStats,
+    pub new_ulid: Option<Ulid>,
+    pub new_body_section_start: u64,
+    pub merged_live: Vec<SweptLiveEntry>,
+    pub dead_entries: Vec<SweptDeadEntry>,
+    pub candidate_paths: Vec<PathBuf>,
+}
+
 /// Job dispatched from the actor to the worker thread.
 pub enum WorkerJob {
     Promote(PromoteJob),
     GcHandoff(GcHandoffJob),
     PromoteSegment(PromoteSegmentJob),
+    Sweep(SweepJob),
 }
 
 /// Result returned by the worker thread to the actor.
@@ -531,6 +590,7 @@ pub enum WorkerResult {
         ulid: Ulid,
         result: io::Result<PromoteSegmentResult>,
     },
+    Sweep(io::Result<SweepResult>),
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
@@ -1630,10 +1690,6 @@ impl Volume {
         Ok(stats)
     }
 
-    /// Minimum segment file size below which a `pending/` segment is always a
-    /// merge candidate regardless of its live ratio.
-    const COMPACT_SMALL_THRESHOLD: u64 = 8 * 1024 * 1024;
-
     /// Compact `pending/` segments opportunistically, before upload.
     ///
     /// Scans every segment in `pending/`. A segment is a candidate if:
@@ -1646,189 +1702,117 @@ impl Volume {
     ///
     /// Segments at or below the latest snapshot ULID are frozen and skipped.
     /// Returns immediately (no-op) if there are no candidates.
+    ///
+    /// Synchronous wrapper around the offloadable prep / execute / apply
+    /// trio. The actor uses [`Self::prepare_sweep`] +
+    /// [`crate::actor::execute_sweep`] + [`Self::apply_sweep_result`]
+    /// directly so that the worker thread runs the heavy middle phase off
+    /// the request channel; this wrapper exists for tests and any
+    /// remaining inline callers.
     pub fn sweep_pending(&mut self) -> io::Result<CompactionStats> {
-        use std::collections::HashSet;
-
-        let live: HashSet<blake3::Hash> = self.lbamap.lba_referenced_hashes();
-        let mut stats = CompactionStats::default();
-
-        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?;
-
-        let pending_dir = self.base_dir.join("pending");
-        let mut seg_paths = segment::collect_segment_files(&pending_dir)?;
-        // Sort by filename (ULID) ascending so entries appear oldest-first in
-        // the merged output.  rebuild_segments applies entries in sequence and
-        // the last entry wins for each LBA, so this guarantees the most-recent
-        // write takes precedence even when two candidates both cover the same LBA
-        // with the same data hash (hash-based liveness keeps both alive but
-        // ordering ensures the correct one survives crash+rebuild).
-        seg_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        let mut candidate_paths: Vec<std::path::PathBuf> = Vec::new();
-        let mut merged_live: Vec<segment::SegmentEntry> = Vec::new();
-        let mut any_dead = false;
-
-        for seg_path in &seg_paths {
-            let seg_filename = seg_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad segment filename"))?;
-            let seg_ulid =
-                Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
-
-            if floor.is_some_and(|f| seg_ulid <= f) {
-                continue;
-            }
-
-            let file_size = fs::metadata(seg_path)?.len();
-            let parsed = self
-                .segment_cache
-                .read_and_verify(seg_path, &self.verifying_key)?;
-            let body_section_start = parsed.body_section_start;
-            let mut entries = parsed.entries.clone();
-
-            let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
-            let is_small = file_size < Self::COMPACT_SMALL_THRESHOLD;
-
-            if !has_dead && !is_small {
-                continue;
-            }
-
-            if has_dead {
-                any_dead = true;
-            }
-
-            let (live_entries, dead_entries): (Vec<_>, Vec<_>) =
-                entries.drain(..).partition(|e| match e.kind {
-                    EntryKind::DedupRef => {
-                        // A dedup ref is only live if the LBA still maps to
-                        // this hash. If the LBA was overwritten with different
-                        // data, carrying the stale ref would reintroduce the
-                        // old mapping after crash + rebuild.
-                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
-                    }
-                    _ => live.contains(&e.hash),
-                });
-
-            let dead_bytes: u64 = dead_entries.iter().map(|e| e.stored_length as u64).sum();
-
-            for entry in &dead_entries {
-                if entry.kind == EntryKind::Zero || entry.kind == EntryKind::DedupRef {
-                    continue;
-                }
-                if self
-                    .extent_index
-                    .lookup(&entry.hash)
-                    .map(|loc| loc.segment_id == seg_ulid)
-                    .unwrap_or(false)
-                {
-                    Arc::make_mut(&mut self.extent_index).remove(&entry.hash);
-                    stats.extents_removed += 1;
-                }
-            }
-
-            let mut live_entries = live_entries;
-            let inline_bytes = segment::read_inline_section(seg_path)?;
-            segment::read_extent_bodies(
-                seg_path,
-                body_section_start,
-                &mut live_entries,
-                [EntryKind::Data, EntryKind::Inline],
-                &inline_bytes,
-            )?;
-            merged_live.extend(live_entries);
-
-            candidate_paths.push(seg_path.clone());
-            stats.segments_compacted += 1;
-            stats.bytes_freed += dead_bytes;
-        }
-
-        if candidate_paths.is_empty() {
-            return Ok(stats);
-        }
-
-        // A single small segment with no dead extents gains nothing from
-        // rewriting: the output would be the same size and content. Only
-        // merge when dead space is reclaimed or two or more small segments
-        // can be combined into one.
-        if candidate_paths.len() == 1 && !any_dead {
+        let Some(job) = self.prepare_sweep()? else {
             return Ok(CompactionStats::default());
+        };
+        let result = crate::actor::execute_sweep(job)?;
+        self.apply_sweep_result(result)
+    }
+
+    /// Prep phase of `sweep_pending` — runs on the actor thread.
+    ///
+    /// Snapshots `lbamap` (used by the worker for `DedupRef` liveness),
+    /// resolves the snapshot floor, and packages the directory + signer
+    /// state into a [`SweepJob`]. Returns `None` when `pending/` is
+    /// missing or has no segments — there is nothing for the worker to
+    /// do, so the dispatch is skipped.
+    ///
+    /// All actual segment reads, partitioning, and the rewrite happen in
+    /// [`crate::actor::execute_sweep`]. The apply phase
+    /// [`Self::apply_sweep_result`] does the conditional extent-index
+    /// updates and candidate deletion.
+    pub fn prepare_sweep(&self) -> io::Result<Option<SweepJob>> {
+        let pending_dir = self.base_dir.join("pending");
+        let segs = match segment::collect_segment_files(&pending_dir) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if segs.is_empty() {
+            return Ok(None);
         }
+        let floor = latest_snapshot(&self.base_dir)?;
+        Ok(Some(SweepJob {
+            lbamap: Arc::clone(&self.lbamap),
+            floor,
+            pending_dir,
+            signer: Arc::clone(&self.signer),
+            verifying_key: self.verifying_key,
+            segment_cache: Arc::clone(&self.segment_cache),
+        }))
+    }
 
-        // Use max(candidate ULIDs) as the output ULID. This guarantees the
-        // output sorts below the current WAL ULID (all pending segments were
-        // created before the WAL was opened, so their ULIDs are strictly less).
-        // Preserving this invariant ensures that a WAL flush always produces a
-        // segment with a higher ULID than any compact output, so rebuild always
-        // applies data in write order. Using mint.next() here would generate a
-        // ULID past the WAL ULID and break that ordering.
-        //
-        // The merged output is written as a single segment (no FLUSH_THRESHOLD
-        // split). The split served only to bound segment size, but FLUSH_THRESHOLD
-        // is a soft cap. Avoiding a split means we need only one output ULID,
-        // which is safe to derive from the inputs.
-        let new_ulid = candidate_paths
-            .iter()
-            .filter_map(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok())
-            })
-            .max()
-            .ok_or_else(|| io::Error::other("sweep_pending: no valid candidate ULIDs"))?;
-        let new_ulid_str = new_ulid.to_string();
+    /// Apply phase of `sweep_pending` — runs on the actor thread after
+    /// the worker returns.
+    ///
+    /// Drops dead Data/Inline entries from the extent index using
+    /// [`extentindex::ExtentIndex::remove_if_matches`] so a concurrent
+    /// writer that re-pointed the hash at a newer segment is left
+    /// untouched. Re-points carried-live entries with
+    /// [`extentindex::ExtentIndex::replace_if_matches`] for the same
+    /// reason — a CAS miss simply means the new write wins (apply does
+    /// not insert, leaving the body unreferenced until the next sweep,
+    /// which is the conservative direction).
+    ///
+    /// File-cache eviction and candidate deletion run last. The
+    /// candidate whose ULID equals `new_ulid` was already replaced
+    /// atomically by the worker's `tmp` → final rename; apply skips its
+    /// `remove_file` while still evicting the cached fd (the old inode
+    /// was unlinked and a surviving handle would seek into stale
+    /// offsets after the publish).
+    pub fn apply_sweep_result(&mut self, result: SweepResult) -> io::Result<CompactionStats> {
+        let SweepResult {
+            mut stats,
+            new_ulid,
+            new_body_section_start,
+            merged_live,
+            dead_entries,
+            candidate_paths,
+        } = result;
 
-        // Write the merged output, atomically replacing the max-ULID candidate.
-        if !merged_live.is_empty() {
-            let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
-            let final_path = pending_dir.join(&new_ulid_str);
-            let new_bss =
-                segment::write_segment(&tmp_path, &mut merged_live, self.signer.as_ref())?;
-            fs::rename(&tmp_path, &final_path)?;
-            segment::fsync_dir(&final_path)?;
-            stats.new_segments += 1;
-
-            for entry in &merged_live {
-                match entry.kind {
-                    EntryKind::Data => {
-                        Arc::make_mut(&mut self.extent_index).insert(
-                            entry.hash,
-                            extentindex::ExtentLocation {
-                                segment_id: new_ulid,
-                                body_offset: entry.stored_offset,
-                                body_length: entry.stored_length,
-                                compressed: entry.compressed,
-                                body_source: BodySource::Local,
-                                body_section_start: new_bss,
-                                inline_data: None,
-                            },
-                        );
-                    }
-                    EntryKind::Inline => {
-                        Arc::make_mut(&mut self.extent_index).insert(
-                            entry.hash,
-                            extentindex::ExtentLocation {
-                                segment_id: new_ulid,
-                                body_offset: entry.stored_offset,
-                                body_length: entry.stored_length,
-                                compressed: entry.compressed,
-                                body_source: BodySource::Local,
-                                body_section_start: new_bss,
-                                inline_data: entry.data.clone().map(Vec::into_boxed_slice),
-                            },
-                        );
-                    }
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {}
-                }
+        for dead in &dead_entries {
+            if Arc::make_mut(&mut self.extent_index).remove_if_matches(
+                &dead.hash,
+                dead.source_segment_id,
+                dead.source_body_offset,
+            ) {
+                stats.extents_removed += 1;
             }
         }
 
-        // Evict and delete input candidates. The max-ULID candidate was already
-        // replaced atomically by the output rename above; skip re-deleting it,
-        // but still evict its cached fd — the rename unlinked the old inode
-        // and a surviving cached handle would continue to serve bytes from
-        // the old layout, seeking with the new body_section_start into the
-        // old index section.
+        if let Some(new_ulid) = new_ulid {
+            for live in &merged_live {
+                let entry = &live.entry;
+                let inline_data = match entry.kind {
+                    EntryKind::Data => None,
+                    EntryKind::Inline => entry.data.clone().map(Vec::into_boxed_slice),
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                };
+                Arc::make_mut(&mut self.extent_index).replace_if_matches(
+                    entry.hash,
+                    live.source_segment_id,
+                    live.source_body_offset,
+                    extentindex::ExtentLocation {
+                        segment_id: new_ulid,
+                        body_offset: entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                        body_source: BodySource::Local,
+                        body_section_start: new_body_section_start,
+                        inline_data,
+                    },
+                );
+            }
+        }
+
         for seg_path in &candidate_paths {
             let seg_ulid_opt = seg_path
                 .file_name()
@@ -1837,10 +1821,16 @@ impl Volume {
             if let Some(ulid) = seg_ulid_opt {
                 self.file_cache.borrow_mut().evict(ulid);
             }
-            if seg_ulid_opt == Some(new_ulid) && !merged_live.is_empty() {
-                continue; // already replaced atomically above
+            if seg_ulid_opt == new_ulid {
+                // Already replaced atomically by the worker's rename;
+                // re-deleting would unlink the new content.
+                continue;
             }
-            fs::remove_file(seg_path)?;
+            match fs::remove_file(seg_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(stats)

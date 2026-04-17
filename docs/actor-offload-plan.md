@@ -1,8 +1,8 @@
 # Plan: offload heavy work from the volume actor
 
-**Status:** Partially landed. Steps 1–4 (CAS inserts, WAL promote offload, `apply_gc_handoffs` offload, `promote_segment` offload) are merged on `main`. Step 4 (`promote_segment`) landed out-of-sequence with the original plan because write-tail latency on a live dd workload prioritised the per-upload actor stalls over the segment-index cache. Step 5 (segment-index cache) is partially landed — the cache covers the worker-thread `promote_segment` path and the actor-thread sweep/repack loops, with `delta_compute` plumbing deferred to step 6. Steps 6–7 (sweep/repack/delta_repack offload, snapshot offload) are not started.
+**Status:** Partially landed. Steps 1–4 (CAS inserts, WAL promote offload, `apply_gc_handoffs` offload, `promote_segment` offload) are merged on `main`. Step 4 (`promote_segment`) landed out-of-sequence with the original plan because write-tail latency on a live dd workload prioritised the per-upload actor stalls over the segment-index cache. Step 5 (segment-index cache) is partially landed — the cache covers the worker-thread `promote_segment` path and the actor-thread sweep/repack loops, with `delta_compute` plumbing deferred to step 6. Step 6a (`sweep_pending` offload) has landed; `repack` and `delta_repack_post_snapshot` are still on the actor. Step 7 (snapshot offload) is not started.
 
-The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, and `PromoteSegment`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
+The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, `PromoteSegment`, and `Sweep`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
 
 ## Problem
 
@@ -71,13 +71,26 @@ Heavy bit: `delta_compute::rewrite_post_snapshot_with_prior` per segment — zst
 
 **Offload shape:** each segment is independent, so this is a candidate for **per-segment parallelism on a worker pool**, not just serialization. Inputs are `(seg_path, &BlockReader, signer, verifying_key)`; the `BlockReader` is already a pinned-snapshot read-only view with no shared mutable state. Apply phase walks the converted entries and issues conditional inserts.
 
-### 4. `sweep_pending` / `repack` *(not started)*
+### 4a. `sweep_pending` *(LANDED)*
 
 Heavy bits: `read_and_verify_segment_index`, `read_inline_section`, `read_extent_bodies`, `write_segment`, `rename`, `fsync_dir`, looped over N segments.
 
-**Offload shape:** prep snapshot is `(live_set, floor, pending_dir, signer, verifying_key)`. Worker output is `(merged_live_entries, new_ulid, body_section_start, candidate_paths_to_delete)`. Apply phase does conditional inserts, `file_cache` eviction, candidate deletion.
+Prep on the actor (`Volume::prepare_sweep`) snapshots `Arc<LbaMap>`, the snapshot floor, and signer/key state into a `SweepJob`. Worker (`actor::execute_sweep`) does the per-segment loop, partitioning, body reads, and the merged `write_segment` + rename + `fsync_dir`. The result carries each surviving live entry and each dead entry paired with its source `(segment_id, body_offset)` CAS preconditions, captured before `write_segment` reassigns offsets. Apply (`Volume::apply_sweep_result`) drops dead entries via `remove_if_matches` and re-points carried-live entries via `replace_if_matches` — concurrent overwrites between prep and apply naturally lose the CAS and survive untouched.
 
 The liveness set is computed at prep time and is necessarily a *subset* of true liveness at apply time (concurrent writes can only add references). This is conservative in the safe direction — we might keep a now-dead hash alive for one more cycle, never the reverse.
+
+`Volume::sweep_pending(&mut self)` is preserved as a thin synchronous wrapper (`prepare_sweep` + `execute_sweep` + `apply_sweep_result`) so existing tests and any inline callers still compile against the same signature; the actor uses the offload path directly with parked replies and a `parked_sweep` slot that rejects concurrent requests.
+
+**Follow-up: candidate selection.** The current `size < 8 MiB` test produces a long tail of slightly-too-large segments (two 7 MiB inputs → one 14 MiB output → permanently ineligible). Switch to an opportunistic-packing rule that targets *filling* output segments toward 32 MiB rather than just evicting the very-small ones. See the TODO under "Pending compaction" in `operations.md`.
+
+### 4b. `repack` / `delta_repack_post_snapshot` *(not started)*
+
+Same offload shape, but per-segment instead of composite:
+
+- **`repack`**: each segment rewrite is independent — prep enumerates eligible segments, dispatches one job per segment, apply runs the same CAS pattern as sweep.
+- **`delta_repack_post_snapshot`**: identical structure but the worker invokes `delta_compute::rewrite_post_snapshot_with_prior` and is the first op where a small worker pool (rather than a single worker) is clearly worth it. Per-segment cost runs into seconds on large volumes.
+
+Both depend on plumbing the `segment_cache` into the relevant `delta_compute` paths (deferred from step 5).
 
 ### 5. `promote_segment` *(LANDED)*
 
@@ -119,6 +132,8 @@ Cache invalidation is file-length-based: tmp+rename rewrites change the entry co
 4. **Offload `promote_segment` (and fix the re-parse).** LANDED (PR #59, out-of-sequence with the original plan). Added `WorkerJob::PromoteSegment` + parked-reply dispatch. See [promote-segment-offload-plan.md](promote-segment-offload-plan.md).
 5. **Land the segment-index cache.** LANDED — partial. `SegmentIndexCache` covers the worker-thread `promote_segment` path and the actor-thread `compact_pending` / `repack` loops. `delta_compute` will pick it up when step 6 plumbs the cache through.
 6. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Delta_repack is the first op where per-segment parallelism (a small worker pool rather than a single worker) is clearly worth it.
+   - **6a (LANDED):** `sweep_pending`. Added `WorkerJob::Sweep` + parked-reply dispatch. Apply uses `replace_if_matches` for carried-live entries and the new `remove_if_matches` for dead entries, both keyed on the source `(segment_id, body_offset)`.
+   - **6b / 6c:** `repack` and `delta_repack_post_snapshot` still on the actor.
 7. **Offload `snapshot`.** Falls out as a composite of the pieces above.
 
 After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the worker `select!` arm. No new primitives, no new locks, no read-path changes.

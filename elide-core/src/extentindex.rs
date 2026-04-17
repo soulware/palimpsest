@@ -239,6 +239,33 @@ impl ExtentIndex {
         self.deltas.remove(hash);
     }
 
+    /// Compare-and-remove: drop the entry for `hash` only if the current
+    /// location matches `(expected_segment_id, expected_body_offset)`.
+    /// Returns `true` if the removal happened, `false` if the precondition
+    /// failed (entry missing, or now points elsewhere).
+    ///
+    /// Sibling of [`Self::replace_if_matches`] for the case where an offload
+    /// apply phase has identified an entry as dead and wants to drop it
+    /// without clobbering a concurrent writer that has since re-pointed the
+    /// hash at a newer segment.
+    pub fn remove_if_matches(
+        &mut self,
+        hash: &blake3::Hash,
+        expected_segment_id: Ulid,
+        expected_body_offset: u64,
+    ) -> bool {
+        match self.inner.get(hash) {
+            Some(loc)
+                if loc.segment_id == expected_segment_id
+                    && loc.body_offset == expected_body_offset =>
+            {
+                self.inner.remove(hash);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Number of entries in the index.
     #[allow(dead_code)] // used in tests; available for diagnostics
     pub fn len(&self) -> usize {
@@ -772,6 +799,73 @@ mod tests {
             },
         );
         assert!(!replaced);
+        assert!(index.lookup(&hash).is_none());
+    }
+
+    #[test]
+    fn remove_if_matches_drops_on_exact_token() {
+        // Sweep apply phase identified the entry as dead at prep time,
+        // captured (segment_id, body_offset) as the precondition, and
+        // nothing has touched it since — the CAS-style remove succeeds.
+        let mut index = ExtentIndex::new();
+        let hash = h(5);
+        let seg_ulid = Ulid::from_string("01JQTEST000000000000000400").unwrap();
+        let body_offset = 4096u64;
+        index.insert(
+            hash,
+            ExtentLocation {
+                segment_id: seg_ulid,
+                body_offset,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+
+        let removed = index.remove_if_matches(&hash, seg_ulid, body_offset);
+        assert!(removed);
+        assert!(index.lookup(&hash).is_none());
+    }
+
+    #[test]
+    fn remove_if_matches_leaves_superseded_entry_alone() {
+        // Between sweep prep and apply, a concurrent writer re-pointed
+        // the hash at a newer segment. The remove precondition no longer
+        // holds, so the entry must survive untouched.
+        let mut index = ExtentIndex::new();
+        let hash = h(6);
+        let dead_ulid = Ulid::from_string("01JQTEST000000000000000400").unwrap();
+        let dead_offset = 4096u64;
+        let live_ulid = Ulid::from_string("01JQTEST000000000000000500").unwrap();
+        index.insert(
+            hash,
+            ExtentLocation {
+                segment_id: live_ulid,
+                body_offset: 8192,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Local,
+                body_section_start: 64,
+                inline_data: None,
+            },
+        );
+
+        let removed = index.remove_if_matches(&hash, dead_ulid, dead_offset);
+        assert!(!removed);
+        let loc = index.lookup(&hash).unwrap();
+        assert_eq!(loc.segment_id, live_ulid);
+        assert_eq!(loc.body_offset, 8192);
+    }
+
+    #[test]
+    fn remove_if_matches_rejects_missing_entry() {
+        let mut index = ExtentIndex::new();
+        let hash = h(7);
+        let seg_ulid = Ulid::from_string("01JQTEST000000000000000400").unwrap();
+        let removed = index.remove_if_matches(&hash, seg_ulid, 0);
+        assert!(!removed);
         assert!(index.lookup(&hash).is_none());
     }
 

@@ -138,6 +138,8 @@ Two read-only commands inspect raw on-disk formats:
 
 The `serve-volume` actor runs a compaction pass on `pending/` in its idle arm after `flush_wal()` — never delaying a write. Candidates are segments with any dead extents, or any segment below 8 MB; the pass merges their live extents into new `pending/` segments split at 32 MB and deletes the originals. A single small segment with no dead extents is skipped (rewriting would produce identical content).
 
+> **TODO — opportunistic packing.** The current candidate test (`size < 8 MiB`) lets the merged output land just above the threshold (e.g. two 7 MiB segments → 14 MiB), at which point the result is permanently ineligible. This produces a long tail of segments slightly larger than 8 MiB that never get merged further. Revisit candidate selection to include larger segments that still have headroom — the goal is to *fill* output segments toward 32 MiB, not just to evict the very-small ones. Likely shape: pick the smallest eligible segment as a seed, then opportunistically pull in any other segment whose `live_bytes` fits in the remaining headroom of the target output.
+
 Snapshot-floor segments (at or below the latest snapshot ULID) are frozen and never touched. Data written then deleted before the drain runs never hits S3 — compacting locally is much cheaper than uploading dead bytes and paying coordinator GC later.
 
 ### Scope: live leaves only
