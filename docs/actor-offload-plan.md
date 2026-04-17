@@ -49,7 +49,7 @@ The CAS primitive is `ExtentIndex::replace_if_matches(hash, expected_segment_id,
 
 The flush/promote separation is fully implemented. See [promote-offload-plan.md](promote-offload-plan.md) for the complete design and implementation details.
 
-Summary: `VolumeRequest::Flush` is now a WAL fsync + immediate reply. Promotion is triggered asynchronously by the threshold check and idle tick, dispatched to the worker thread as a `WorkerJob::Promote`. Results arrive on a dedicated bounded crossbeam channel (not a `VolumeRequest` variant). The actor's `select!` loop has three arms: `VolumeRequest`, worker results, and idle tick.
+Summary: `VolumeRequest::Flush` is now a WAL fsync of the current WAL, plus (if any promote is in flight) a park on the promote generation counter. The actor returns to the select loop immediately in both cases — queued writes keep flowing while the FLUSH caller waits for the worker's old-WAL fsync. Promotion is triggered asynchronously by the threshold check and idle tick, dispatched to the worker thread as a `WorkerJob::Promote`; the old-WAL fsync runs as the first step of the worker job rather than on the actor. Results arrive on a dedicated bounded crossbeam channel (not a `VolumeRequest` variant). The actor's `select!` loop has three arms: `VolumeRequest`, worker results, and idle tick.
 
 ## Op-by-op analysis
 

@@ -3370,7 +3370,14 @@ impl Volume {
         if self.pending_entries.is_empty() {
             return Ok(None);
         }
-        self.wal.fsync()?;
+
+        // The old WAL's fsync is deferred to the worker thread (see
+        // `execute_promote`), so that the actor returns to the select
+        // loop without blocking on disk I/O.  `VolumeActor::Flush`
+        // parks on the promote generation counter until the worker
+        // has completed any in-flight promote, preserving NBD FLUSH's
+        // durability contract while letting the actor keep processing
+        // writes in the meantime.
 
         let old_wal_ulid = self.wal_ulid;
         let old_wal_path = self.wal_path.clone();
@@ -3492,22 +3499,27 @@ impl Volume {
 
     /// Prep phase of the off-actor GC checkpoint.
     ///
-    /// Mints four ULIDs (`u_repack < u_sweep < u_flush < u_wal`), fsyncs
-    /// the WAL, snapshots CAS tokens, takes entries, builds a
-    /// [`PromoteJob`] using `u_flush` as the segment ULID, and opens
-    /// a fresh WAL at `u_wal`.  Writes resume immediately on the fresh
-    /// WAL — no deferral needed.
+    /// Mints four ULIDs (`u_repack < u_sweep < u_flush < u_wal`),
+    /// snapshots CAS tokens, takes entries, builds a [`PromoteJob`]
+    /// using `u_flush` as the segment ULID, and opens a fresh WAL at
+    /// `u_wal`.  Writes resume immediately on the fresh WAL — no
+    /// deferral needed.
+    ///
+    /// The old WAL's `fsync()` is deferred to the worker thread (see
+    /// `execute_promote`), identical to the write-path promote offload.
+    /// The parked GC reply only resolves after the worker returns, so
+    /// the caller of `GcCheckpoint` still observes a durable old WAL
+    /// before acting on `(u_repack, u_sweep)`.
     ///
     /// Returns `None` inside the `job` field if the WAL is empty (no
     /// segment to promote).  The checkpoint completes immediately in
-    /// that case.
+    /// that case — an empty WAL is just a MAGIC header with no
+    /// records to fsync before the file is deleted.
     pub fn prepare_gc_checkpoint(&mut self) -> io::Result<GcCheckpointPrep> {
         let u_repack = self.mint.next();
         let u_sweep = self.mint.next();
         let u_flush = self.mint.next();
         let u_wal = self.mint.next();
-
-        self.wal.fsync()?;
 
         if self.pending_entries.is_empty() {
             // Empty WAL — delete the WAL file, open fresh WAL at u_wal.

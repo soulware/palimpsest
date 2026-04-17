@@ -16,6 +16,7 @@
 // See docs/architecture.md — "Concurrency model" for rationale and design.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -196,6 +197,30 @@ pub struct VolumeActor {
     worker_handle: Option<JoinHandle<()>>,
     /// Number of promote jobs dispatched but not yet applied.
     promotes_in_flight: usize,
+    /// Monotonic counter, incremented on every `WorkerJob::Promote`
+    /// dispatch (post-write threshold, `PromoteWal`, `GcCheckpoint`).
+    /// Used together with `completed_gen` to park NBD `Flush` replies
+    /// until every promote dispatched *before* the flush has had its
+    /// old-WAL fsync completed by the worker.
+    promote_gen: u64,
+    /// Monotonic counter, incremented on every `WorkerResult::Promote`
+    /// (success *or* error) received from the worker.  For errors the
+    /// actor performs a fallback fsync itself before bumping the
+    /// counter, so `completed_gen >= needed_gen` always implies every
+    /// promote dispatched at or before `needed_gen` has had its old
+    /// WAL made durable.
+    completed_gen: u64,
+    /// FIFO queue of old WAL paths for promotes currently dispatched
+    /// but not yet completed.  Matches the worker's strict dispatch
+    /// order (single thread, bounded FIFO channel).  Popped on every
+    /// worker result; the error path re-fsyncs the popped path on the
+    /// actor thread as a fallback before bumping `completed_gen`.
+    inflight_old_wals: VecDeque<PathBuf>,
+    /// NBD `Flush` replies parked until `completed_gen >= needed_gen`.
+    /// Each entry records the `promote_gen` snapshot at the time the
+    /// flush arrived; as worker results come in the actor resolves any
+    /// entries whose precondition now holds.
+    parked_flushes: Vec<ParkedFlush>,
     /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting for
     /// the GC promote (`u_flush`) to complete on the worker.  `None`
     /// when no GC checkpoint is in progress.
@@ -234,6 +259,14 @@ pub struct VolumeActor {
 /// State stashed while a `PromoteWal` promote is in flight.
 struct ParkedPromoteWal {
     segment_ulid: Ulid,
+    reply: Sender<io::Result<()>>,
+}
+
+/// State stashed while an NBD `Flush` waits for an in-flight promote's
+/// old-WAL fsync to complete on the worker.  Released when
+/// `VolumeActor::completed_gen >= needed_gen`.
+struct ParkedFlush {
+    needed_gen: u64,
     reply: Sender<io::Result<()>>,
 }
 
@@ -287,6 +320,83 @@ impl VolumeActor {
         }));
     }
 
+    /// NBD `Flush` arrives.  The current WAL has already been fsynced
+    /// by the caller; here we decide whether the reply can go out
+    /// immediately or must wait for an in-flight promote's old-WAL
+    /// fsync on the worker.
+    fn park_or_resolve_flush(&mut self, reply: Sender<io::Result<()>>) {
+        if self.completed_gen >= self.promote_gen {
+            let _ = reply.send(Ok(()));
+        } else {
+            self.parked_flushes.push(ParkedFlush {
+                needed_gen: self.promote_gen,
+                reply,
+            });
+        }
+    }
+
+    /// Called after the actor has finished applying a successful
+    /// `Promote(Ok(..))` result — extent index CAS'd, old WAL deleted,
+    /// snapshot republished.  Pops the FIFO head of
+    /// `inflight_old_wals` (matching the worker's dispatch order),
+    /// bumps `completed_gen`, and resolves any parked flushes whose
+    /// precondition now holds.  The worker already fsynced the old
+    /// WAL, so no extra I/O is needed here.  Resolving *after*
+    /// `apply_promote` ensures callers of `Flush` observe the
+    /// housekeeping state (old WAL deleted, new snapshot published)
+    /// and not just the durability barrier.
+    fn on_promote_success(&mut self) {
+        self.inflight_old_wals.pop_front();
+        self.completed_gen += 1;
+        self.resolve_parked_flushes(Ok(()));
+    }
+
+    /// Called after each worker-result `Promote(Err(..))`.  The
+    /// worker may or may not have fsynced the old WAL before failing,
+    /// so we perform a best-effort fallback fsync on the actor thread
+    /// to guarantee that `completed_gen` advancing implies durability
+    /// of every write that was in the old WAL at dispatch time.
+    fn on_promote_failure(&mut self) {
+        let outcome = if let Some(path) = self.inflight_old_wals.pop_front() {
+            match std::fs::File::open(&path).and_then(|f| f.sync_data()) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    warn!("fallback fsync of {} failed: {e}", path.display());
+                    Err(io::Error::other(format!(
+                        "promote failed and fallback WAL fsync failed: {e}"
+                    )))
+                }
+            }
+        } else {
+            // Shouldn't happen — every dispatch pushes a path — but
+            // don't panic in library code.  Treat as "nothing to
+            // fsync" which is vacuously durable.
+            Ok(())
+        };
+        self.completed_gen += 1;
+        self.resolve_parked_flushes(outcome);
+    }
+
+    /// Drain `parked_flushes` of any entry whose `needed_gen` is now
+    /// satisfied by `completed_gen`, delivering `outcome` to each.
+    /// Entries whose `needed_gen` is still in the future stay parked.
+    fn resolve_parked_flushes(&mut self, outcome: io::Result<()>) {
+        let done = self.completed_gen;
+        let mut i = 0;
+        while i < self.parked_flushes.len() {
+            if self.parked_flushes[i].needed_gen <= done {
+                let parked = self.parked_flushes.swap_remove(i);
+                let reply_outcome = match &outcome {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                };
+                let _ = parked.reply.send(reply_outcome);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Forward the result of a completed `promote_segment` job to the
     /// matching parked reply, if any.  Matched by ULID — callers receive
     /// the apply-phase outcome, not the worker outcome (those only differ
@@ -318,11 +428,14 @@ impl VolumeActor {
             }
         };
         if let Some(tx) = &self.worker_tx {
+            let old_wal_path = job.old_wal_path.clone();
             if let Err(e) = tx.send(WorkerJob::Promote(job)) {
                 warn!("worker channel closed: {e}");
                 return;
             }
             self.promotes_in_flight += 1;
+            self.promote_gen += 1;
+            self.inflight_old_wals.push_back(old_wal_path);
         }
     }
 
@@ -358,6 +471,7 @@ impl VolumeActor {
                 reply,
             });
             if let Some(tx) = &self.worker_tx {
+                let old_wal_path = job.old_wal_path.clone();
                 if let Err(e) = tx.send(WorkerJob::Promote(job)) {
                     warn!("worker channel closed during gc_checkpoint: {e}");
                     if let Some(parked) = self.parked_gc.take() {
@@ -368,6 +482,8 @@ impl VolumeActor {
                     return;
                 }
                 self.promotes_in_flight += 1;
+                self.promote_gen += 1;
+                self.inflight_old_wals.push_back(old_wal_path);
             }
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
@@ -539,10 +655,12 @@ impl VolumeActor {
                     self.promotes_in_flight -= 1;
                     self.volume.apply_promote(&result);
                     self.publish_snapshot();
+                    self.on_promote_success();
                 }
                 Ok(WorkerResult::Promote(Err(e))) => {
                     self.promotes_in_flight -= 1;
                     warn!("worker promote failed during shutdown: {e}");
+                    self.on_promote_failure();
                 }
                 Ok(WorkerResult::GcHandoff(Ok(result))) => {
                     self.handoff_in_flight = false;
@@ -675,11 +793,19 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::Flush { reply } => {
-                            // Flush = WAL fsync only.  Durability barrier for
-                            // data already appended to the WAL.  Promotion is
-                            // triggered asynchronously by threshold / idle tick.
-                            let result = self.volume.wal_fsync();
-                            let _ = reply.send(result);
+                            // Flush = WAL fsync + wait for any in-flight
+                            // promote's old-WAL fsync to complete on the
+                            // worker.  The actor stays on the select loop
+                            // during the wait — new writes continue to flow
+                            // onto the fresh WAL, matching how a real block
+                            // device keeps accepting commands while a FLUSH
+                            // is in flight at the controller.
+                            match self.volume.wal_fsync() {
+                                Ok(()) => self.park_or_resolve_flush(reply),
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
+                            }
                         }
                         VolumeRequest::PromoteWal { reply } => {
                             // Promote the WAL to a pending/ segment via the
@@ -687,6 +813,7 @@ impl VolumeActor {
                             match self.volume.prepare_promote() {
                                 Ok(Some(job)) => {
                                     let ulid = job.segment_ulid;
+                                    let old_wal_path = job.old_wal_path.clone();
                                     if let Some(tx) = &self.worker_tx {
                                         if let Err(e) = tx.send(WorkerJob::Promote(job)) {
                                             let _ = reply.send(Err(io::Error::other(
@@ -694,6 +821,8 @@ impl VolumeActor {
                                             )));
                                         } else {
                                             self.promotes_in_flight += 1;
+                                            self.promote_gen += 1;
+                                            self.inflight_old_wals.push_back(old_wal_path);
                                             self.parked_promote_wal.push(
                                                 ParkedPromoteWal { segment_ulid: ulid, reply },
                                             );
@@ -857,6 +986,10 @@ impl VolumeActor {
                             let ulid = result.segment_ulid;
                             self.volume.apply_promote(&result);
                             self.publish_snapshot();
+                            // Resolve parked NBD flushes only after apply + publish
+                            // so the caller observes the old WAL deleted and the
+                            // new snapshot visible — not just the durability barrier.
+                            self.on_promote_success();
 
                             // Complete any parked operations waiting for this ULID.
                             // GC checkpoint.
@@ -883,6 +1016,7 @@ impl VolumeActor {
                         Ok(WorkerResult::Promote(Err(e))) => {
                             self.promotes_in_flight -= 1;
                             warn!("worker promote failed: {e}");
+                            self.on_promote_failure();
                         }
                         Ok(WorkerResult::GcHandoff(Ok(result))) => {
                             self.handoff_in_flight = false;
@@ -1451,8 +1585,20 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
     }
 }
 
-/// Execute a WAL promote job: write the segment to `pending/`.
+/// Execute a WAL promote job: fsync the old WAL, then write the
+/// segment to `pending/`.
+///
+/// The old-WAL fsync is the durability barrier that `prepare_promote`
+/// used to run on the actor thread.  Moving it here off-loads the
+/// 10–50 ms fsync cost from the write path: the actor keeps taking
+/// new writes onto the fresh WAL while the worker makes the old one
+/// durable in parallel — matching the way a real block device keeps
+/// accepting commands while a FLUSH is in flight.  `VolumeActor::Flush`
+/// parks on a promote-generation counter so NBD FLUSH still replies
+/// only after every prior write is durable.
 fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
+    std::fs::File::open(&job.old_wal_path)?.sync_data()?;
+
     let body_section_start = segment::write_and_commit(
         &job.pending_dir,
         job.segment_ulid,
@@ -2132,6 +2278,10 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         worker_rx: worker_result_rx,
         worker_handle: Some(worker_handle),
         promotes_in_flight: 0,
+        promote_gen: 0,
+        completed_gen: 0,
+        inflight_old_wals: VecDeque::new(),
+        parked_flushes: Vec::new(),
         parked_gc: None,
         parked_promote_wal: Vec::new(),
         parked_promote_segments: Vec::new(),
