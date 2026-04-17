@@ -405,16 +405,25 @@ pub struct PromoteResult {
 
 /// Result of the GC checkpoint prep phase.
 ///
-/// Carries the pre-minted ULIDs and an optional promote job.  The actor
-/// dispatches the job to the worker and stashes the reply.  When `job`
+/// `Ready` carries the pre-minted ULIDs and an optional promote job.  The
+/// actor dispatches the job to the worker and stashes the reply.  When `job`
 /// is `None` the WAL was empty and the checkpoint completes immediately.
-pub struct GcCheckpointPrep {
-    pub u_repack: Ulid,
-    pub u_sweep: Ulid,
-    /// Segment ULID used for the promoted WAL.  Used to identify the
-    /// GC promote's `PromoteComplete` among other in-flight promotes.
-    pub u_flush: Ulid,
-    pub job: Option<PromoteJob>,
+///
+/// `Idle` means the volume has nothing for this tick to do: the WAL is
+/// empty and no `gc/*.staged` handoffs are waiting to be applied.  No
+/// ULIDs are minted and the WAL is *not* rotated — returning `Idle` lets
+/// the coordinator skip `gc_fork` for this tick and avoids churning a
+/// fresh empty WAL file on every GC interval.
+pub enum GcCheckpointPrep {
+    Ready {
+        u_repack: Ulid,
+        u_sweep: Ulid,
+        /// Segment ULID used for the promoted WAL.  Used to identify the
+        /// GC promote's `PromoteComplete` among other in-flight promotes.
+        u_flush: Ulid,
+        job: Option<PromoteJob>,
+    },
+    Idle,
 }
 
 /// Data needed by the worker thread to re-sign a GC handoff segment.
@@ -3005,8 +3014,8 @@ impl Volume {
                 }
             }
             log::info!(
-                "flush {segment_ulid}: {data} data, {inline} inline, {refs} dedup-ref, \
-                 {zero} zero, {delta} delta ({} entries total)",
+                "flush {segment_ulid} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
+                 {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
                 self.pending_entries.len()
             );
         }
@@ -3542,9 +3551,10 @@ impl Volume {
                 }
             }
             log::info!(
-                "flush {}: {data} data, {inline} inline, {refs} dedup-ref, \
+                "flush {} (from WAL {}): {data} data, {inline} inline, {refs} dedup-ref, \
                  {zero} zero, {delta} delta ({} entries total)",
                 result.segment_ulid,
+                result.old_wal_ulid,
                 result.entries.len()
             );
         }
@@ -3577,11 +3587,26 @@ impl Volume {
     /// the caller of `GcCheckpoint` still observes a durable old WAL
     /// before acting on `(u_repack, u_sweep)`.
     ///
-    /// Returns `None` inside the `job` field if the WAL is empty (no
-    /// segment to promote).  The checkpoint completes immediately in
-    /// that case — an empty WAL is just a MAGIC header with no
-    /// records to fsync before the file is deleted.
+    /// Returns [`GcCheckpointPrep::Idle`] when the WAL is empty *and*
+    /// there are no `gc/*.staged` handoffs awaiting application — the
+    /// coordinator should skip `gc_fork` for this tick, and the WAL is
+    /// not rotated.  Returns [`GcCheckpointPrep::Ready`] with `job: None`
+    /// when the WAL is empty but staged handoffs still need a
+    /// checkpoint; the empty WAL file is deleted and replaced at `u_wal`
+    /// so subsequent GC output sorts below it.  Returns
+    /// [`GcCheckpointPrep::Ready`] with `job: Some(_)` in the normal
+    /// case where the WAL carries pending entries to promote.
     pub fn prepare_gc_checkpoint(&mut self) -> io::Result<GcCheckpointPrep> {
+        // Idle short-circuit: no WAL bytes to promote *and* no staged
+        // handoffs waiting to be applied means this tick has nothing for
+        // GC to do.  Skip minting ULIDs and rotating the WAL — the next
+        // active checkpoint will mint fresh, monotonically-greater ULIDs
+        // and rotate then, preserving the u_repack < u_sweep < u_flush <
+        // wal_ulid invariant.
+        if self.pending_entries.is_empty() && !has_staged_handoffs(&self.base_dir.join("gc"))? {
+            return Ok(GcCheckpointPrep::Idle);
+        }
+
         let u_repack = self.mint.next();
         let u_sweep = self.mint.next();
         let u_flush = self.mint.next();
@@ -3594,7 +3619,7 @@ impl Volume {
             self.wal = wal;
             self.wal_ulid = wal_ulid;
             self.wal_path = wal_path;
-            return Ok(GcCheckpointPrep {
+            return Ok(GcCheckpointPrep::Ready {
                 u_repack,
                 u_sweep,
                 u_flush,
@@ -3625,7 +3650,7 @@ impl Volume {
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
 
-        Ok(GcCheckpointPrep {
+        Ok(GcCheckpointPrep::Ready {
             u_repack,
             u_sweep,
             u_flush,
@@ -3640,6 +3665,24 @@ impl Volume {
             }),
         })
     }
+}
+
+/// Cheap, side-effect-free check for whether `gc/` contains any
+/// `<ulid>.staged` files awaiting application.  Used by the GC checkpoint
+/// idle short-circuit.  Missing directory → no handoffs.
+fn has_staged_handoffs(gc_dir: &Path) -> io::Result<bool> {
+    if !gc_dir.try_exists()? {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(gc_dir)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str()
+            && name.ends_with(".staged")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // --- helpers ---
@@ -4736,6 +4779,7 @@ fn create_fresh_wal(
 )> {
     let path = wal_dir.join(ulid.to_string());
     let wal = writelog::WriteLog::create(&path)?;
+    log::info!("new WAL {ulid}");
     Ok((wal, ulid, path, Vec::new()))
 }
 

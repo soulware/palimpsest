@@ -125,7 +125,11 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<()>>,
     },
     GcCheckpoint {
-        reply: Sender<io::Result<(Ulid, Ulid)>>,
+        /// Reply is `Ok(Some((u_repack, u_sweep)))` when a checkpoint was
+        /// established, or `Ok(None)` when the volume is idle (no WAL
+        /// bytes, no staged handoffs).  Idle responses skip the GC pass
+        /// on the coordinator without rotating the WAL.
+        reply: Sender<io::Result<Option<(Ulid, Ulid)>>>,
     },
     RedactSegment {
         ulid: Ulid,
@@ -284,7 +288,7 @@ struct ParkedGcCheckpoint {
     u_repack: Ulid,
     u_sweep: Ulid,
     u_flush: Ulid,
-    reply: Sender<io::Result<(Ulid, Ulid)>>,
+    reply: Sender<io::Result<Option<(Ulid, Ulid)>>>,
 }
 
 /// State for an in-progress batch of GC handoff applications.
@@ -449,7 +453,7 @@ impl VolumeActor {
     /// immediately.  The reply is parked until `PromoteComplete` for
     /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
     /// the coordinator runs `gc_fork`.
-    fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<(Ulid, Ulid)>>) {
+    fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<Option<(Ulid, Ulid)>>>) {
         let prep = match self.volume.prepare_gc_checkpoint() {
             Ok(prep) => prep,
             Err(e) => {
@@ -458,12 +462,21 @@ impl VolumeActor {
             }
         };
 
-        let GcCheckpointPrep {
-            u_repack,
-            u_sweep,
-            u_flush,
-            job,
-        } = prep;
+        let (u_repack, u_sweep, u_flush, job) = match prep {
+            GcCheckpointPrep::Idle => {
+                // No WAL bytes, no staged handoffs — skip the checkpoint
+                // entirely.  Coordinator interprets `None` as "nothing to
+                // GC this tick" and advances `last_gc`.
+                let _ = reply.send(Ok(None));
+                return;
+            }
+            GcCheckpointPrep::Ready {
+                u_repack,
+                u_sweep,
+                u_flush,
+                job,
+            } => (u_repack, u_sweep, u_flush, job),
+        };
 
         if let Some(job) = job {
             // Dispatch to worker, park the reply.
@@ -491,7 +504,7 @@ impl VolumeActor {
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
-            let _ = reply.send(Ok((u_repack, u_sweep)));
+            let _ = reply.send(Ok(Some((u_repack, u_sweep))));
         }
     }
 
@@ -1039,8 +1052,9 @@ impl VolumeActor {
                                 .is_some_and(|p| ulid == p.u_flush);
                             if is_gc {
                                 let parked = self.parked_gc.take().unwrap();
-                                let _ =
-                                    parked.reply.send(Ok((parked.u_repack, parked.u_sweep)));
+                                let _ = parked
+                                    .reply
+                                    .send(Ok(Some((parked.u_repack, parked.u_sweep))));
                             }
                             // PromoteWal callers.
                             let mut i = 0;
@@ -1427,10 +1441,15 @@ impl VolumeHandle {
     }
 
     /// Establish a GC checkpoint: flush the WAL and return two fresh ULIDs for
-    /// GC output segments (repack and sweep).  The two ULIDs are generated 2ms
-    /// apart on the volume side so they are strictly ordered and have distinct
-    /// timestamps.  Blocks until the actor replies.
-    pub fn gc_checkpoint(&self) -> io::Result<(Ulid, Ulid)> {
+    /// GC output segments (repack and sweep).  The two ULIDs are strictly
+    /// ordered and sort before the fresh WAL's ULID.  Blocks until the
+    /// actor replies.
+    ///
+    /// Returns `Ok(None)` when the volume is idle — no WAL bytes to
+    /// promote and no `gc/*.staged` handoffs waiting to be applied.  The
+    /// caller should treat this as "nothing to GC this tick" and skip the
+    /// GC pass.  No ULIDs are minted and the WAL is not rotated.
+    pub fn gc_checkpoint(&self) -> io::Result<Option<(Ulid, Ulid)>> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
