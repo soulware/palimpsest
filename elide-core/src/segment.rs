@@ -313,7 +313,11 @@ pub struct DeltaOption {
 ///   extent bytes and `stored_offset` is filled in by `write_segment`.
 /// - Entries read from an existing segment during startup rebuild: `data` is
 ///   empty (not needed; body lives on disk). `stored_offset` is section-relative.
-#[derive(Debug)]
+///
+/// `Clone` is supported for the segment-index cache, which hands out a fresh
+/// `Vec<SegmentEntry>` on each hit. On read-from-disk entries, `data` is
+/// `None` and the clone is a small memcpy plus one `Vec<DeltaOption>` copy.
+#[derive(Debug, Clone)]
 pub struct SegmentEntry {
     pub hash: blake3::Hash,
     pub start_lba: u64,

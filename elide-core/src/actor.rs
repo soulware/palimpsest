@@ -1244,20 +1244,22 @@ fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
 /// Also reachable from the inline (on-actor) `Volume::promote_segment`
 /// path so that the two execution sites share one parse/verify pass.
 pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<PromoteSegmentResult> {
-    let (bss, entries, inputs) =
-        segment::read_and_verify_segment_index(&job.src_path, &job.verifying_key)?;
+    let parsed = job
+        .segment_cache
+        .read_and_verify(&job.src_path, &job.verifying_key)?;
+    let bss = parsed.body_section_start;
 
     // Tombstone shortcut: GC output with zero entries + non-empty inputs
     // exists only to acknowledge that the input segments are safe to
     // delete. No idx or body is written; the apply phase handles the
     // input-idx cleanup.
-    if !job.is_drain && entries.is_empty() && !inputs.is_empty() {
+    if !job.is_drain && parsed.entries.is_empty() && !parsed.inputs.is_empty() {
         return Ok(PromoteSegmentResult {
             ulid: job.ulid,
             is_drain: job.is_drain,
             body_section_start: bss,
-            entries,
-            inputs,
+            entries: parsed.entries.clone(),
+            inputs: parsed.inputs.clone(),
             inline: Vec::new(),
             tombstone: true,
         });
@@ -1276,7 +1278,12 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
     // `inline_data` for `BodySource::Cached` entries whose kind is
     // `Inline`. The GC apply phase never touches the extent index so
     // the read would be wasted there.
-    let inline = if job.is_drain && entries.iter().any(|e| e.kind == segment::EntryKind::Inline) {
+    let inline = if job.is_drain
+        && parsed
+            .entries
+            .iter()
+            .any(|e| e.kind == segment::EntryKind::Inline)
+    {
         segment::read_inline_section(&job.src_path)?
     } else {
         Vec::new()
@@ -1286,8 +1293,8 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
         ulid: job.ulid,
         is_drain: job.is_drain,
         body_section_start: bss,
-        entries,
-        inputs,
+        entries: parsed.entries.clone(),
+        inputs: parsed.inputs.clone(),
         inline,
         tombstone: false,
     })

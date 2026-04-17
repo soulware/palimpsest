@@ -8,6 +8,7 @@ pub mod filemap;
 pub mod import;
 pub mod lbamap;
 pub mod segment;
+pub mod segment_cache;
 pub mod signing;
 pub mod ulid_mint;
 pub mod volume;
