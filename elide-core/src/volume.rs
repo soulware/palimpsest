@@ -39,6 +39,7 @@ use crate::{
     extentindex::{self, BodySource},
     lbamap,
     segment::{self, EntryKind},
+    segment_cache,
     ulid_mint::UlidMint,
     writelog,
 };
@@ -111,6 +112,13 @@ pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
 
 /// Default capacity for the segment file handle LRU cache.
 const FILE_CACHE_CAPACITY: usize = 16;
+
+/// Default capacity for the parsed segment-index LRU cache. Each cached
+/// entry holds `Vec<SegmentEntry>` for one segment (a few tens of KiB
+/// for a 32 MiB segment); 64 entries comfortably covers the working set
+/// for sweep/repack/delta_repack/promote passes without unbounded
+/// memory growth on large volumes.
+const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 
 /// The on-disk layout of a cached segment file, which determines how body
 /// offsets are interpreted.
@@ -355,6 +363,11 @@ pub struct Volume {
     /// Stats for the no-op write skip path (LBA-map hash compare).
     /// See `docs/design-noop-write-skip.md`.
     noop_stats: NoopSkipStats,
+    /// Shared LRU of parsed+verified segment indices. Keyed by
+    /// `(path, file_len)`. Cloned into worker jobs so the actor thread
+    /// and the worker thread hit the same cache. See
+    /// `segment_cache::SegmentIndexCache`.
+    segment_cache: Arc<segment_cache::SegmentIndexCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +430,7 @@ pub struct GcHandoffJob {
     pub index_dir: PathBuf,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub verifying_key: ed25519_dalek::VerifyingKey,
+    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
 }
 
 /// Result returned by the worker thread after re-signing a GC handoff.
@@ -461,6 +475,7 @@ pub struct PromoteSegmentJob {
     pub present_path: PathBuf,
     pub idx_path: PathBuf,
     pub verifying_key: ed25519_dalek::VerifyingKey,
+    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
 }
 
 /// Result returned by the worker after a `PromoteSegmentJob`.
@@ -1069,6 +1084,9 @@ impl Volume {
             fetcher: None,
             mint,
             noop_stats: NoopSkipStats::default(),
+            segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
+                SEGMENT_INDEX_CACHE_CAPACITY,
+            )),
         })
     }
 
@@ -1303,12 +1321,16 @@ impl Volume {
                 continue;
             }
 
-            let (body_section_start, mut entries, _inputs) =
-                match segment::read_and_verify_segment_index(&seg_path, &self.verifying_key) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e),
-                };
+            let parsed = match self
+                .segment_cache
+                .read_and_verify(&seg_path, &self.verifying_key)
+            {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let body_section_start = parsed.body_section_start;
+            let mut entries = parsed.entries.clone();
 
             // DATA and Inline entries have real stored bytes.
             // DedupRef body regions are zero-filled; Zero has stored_length=0.
@@ -1659,8 +1681,11 @@ impl Volume {
             }
 
             let file_size = fs::metadata(seg_path)?.len();
-            let (body_section_start, mut entries, _inputs) =
-                segment::read_and_verify_segment_index(seg_path, &self.verifying_key)?;
+            let parsed = self
+                .segment_cache
+                .read_and_verify(seg_path, &self.verifying_key)?;
+            let body_section_start = parsed.body_section_start;
+            let mut entries = parsed.entries.clone();
 
             let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
             let is_small = file_size < Self::COMPACT_SMALL_THRESHOLD;
@@ -1911,6 +1936,7 @@ impl Volume {
             index_dir: self.base_dir.join("index"),
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
+            segment_cache: Arc::clone(&self.segment_cache),
         }
     }
 
@@ -2470,6 +2496,7 @@ impl Volume {
             present_path,
             idx_path,
             verifying_key: self.verifying_key,
+            segment_cache: Arc::clone(&self.segment_cache),
         })))
     }
 
