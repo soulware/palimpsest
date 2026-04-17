@@ -32,12 +32,13 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, GcHandoffJob,
-    GcHandoffResult, NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob,
-    PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan,
-    ReclaimProposed, ReclaimThresholds, RepackJob, RepackResult, RepackedDeadEntry,
-    RepackedLiveEntry, RepackedSegment, SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry,
-    Volume, WorkerJob, WorkerResult, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
+    AncestorLayer, CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats,
+    DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcHandoffJob, GcHandoffResult,
+    NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep,
+    PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
+    ReclaimThresholds, RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry,
+    RepackedSegment, SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry, Volume, WorkerJob,
+    WorkerResult, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
     scan_reclaim_candidates,
 };
 
@@ -223,6 +224,11 @@ pub struct VolumeActor {
     /// is in progress; concurrent `Repack` requests are rejected with
     /// an error.
     parked_repack: Option<Sender<io::Result<CompactionStats>>>,
+    /// Reply channel for an in-flight `DeltaRepackPostSnapshot`
+    /// request, parked while the worker thread executes the delta
+    /// rewrite.  `None` when no delta_repack is in progress;
+    /// concurrent requests are rejected with an error.
+    parked_delta_repack: Option<Sender<io::Result<DeltaRepackStats>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -463,6 +469,39 @@ impl VolumeActor {
         }
     }
 
+    /// Run the delta_repack prep on the actor and dispatch the heavy
+    /// middle to the worker.  Reply is parked until
+    /// [`crate::volume::DeltaRepackResult`] arrives and is applied.
+    ///
+    /// Reply is sent immediately with default stats when the prep
+    /// returns `None` (no sealed snapshot) or when the dispatch fails
+    /// because the worker channel has closed.
+    fn start_delta_repack(&mut self, reply: Sender<io::Result<DeltaRepackStats>>) {
+        let job = match self.volume.prepare_delta_repack() {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                let _ = reply.send(Ok(DeltaRepackStats::default()));
+                return;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::DeltaRepack(job)) {
+                warn!("worker channel closed during delta_repack: {e}");
+                let _ = reply.send(Err(io::Error::other(
+                    "worker channel closed during delta_repack",
+                )));
+                return;
+            }
+            self.parked_delta_repack = Some(reply);
+        } else {
+            let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
     /// Pop the next staged handoff from the parked batch and dispatch it.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
         if let Some((staged_path, new_ulid)) = parked.remaining.pop() {
@@ -493,6 +532,7 @@ impl VolumeActor {
             || self.promote_segments_in_flight > 0
             || self.parked_sweep.is_some()
             || self.parked_repack.is_some()
+            || self.parked_delta_repack.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -563,6 +603,25 @@ impl VolumeActor {
                         }
                         Err(e) => {
                             warn!("worker repack failed during shutdown: {e}");
+                            Err(e)
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                Ok(WorkerResult::DeltaRepack(result)) => {
+                    let reply = self.parked_delta_repack.take();
+                    let outcome = match result {
+                        Ok(r) => {
+                            let apply_result = self.volume.apply_delta_repack_result(r);
+                            if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
+                                self.publish_snapshot();
+                            }
+                            apply_result
+                        }
+                        Err(e) => {
+                            warn!("worker delta_repack failed during shutdown: {e}");
                             Err(e)
                         }
                     };
@@ -686,11 +745,13 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::DeltaRepackPostSnapshot { reply } => {
-                            let result = self.volume.delta_repack_post_snapshot();
-                            if matches!(&result, Ok(s) if s.entries_converted > 0) {
-                                self.publish_snapshot();
+                            if self.parked_delta_repack.is_some() {
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent delta_repack not allowed",
+                                )));
+                            } else {
+                                self.start_delta_repack(reply);
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             if self.parked_handoffs.is_some() {
@@ -916,6 +977,25 @@ impl VolumeActor {
                                 }
                                 Err(e) => {
                                     warn!("worker repack failed: {e}");
+                                    Err(e)
+                                }
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                        Ok(WorkerResult::DeltaRepack(result)) => {
+                            let reply = self.parked_delta_repack.take();
+                            let outcome = match result {
+                                Ok(r) => {
+                                    let apply_result = self.volume.apply_delta_repack_result(r);
+                                    if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
+                                        self.publish_snapshot();
+                                    }
+                                    apply_result
+                                }
+                                Err(e) => {
+                                    warn!("worker delta_repack failed: {e}");
                                     Err(e)
                                 }
                             };
@@ -1363,6 +1443,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
             }
             WorkerJob::Sweep(job) => WorkerResult::Sweep(execute_sweep(job)),
             WorkerJob::Repack(job) => WorkerResult::Repack(execute_repack(job)),
+            WorkerJob::DeltaRepack(job) => WorkerResult::DeltaRepack(execute_delta_repack(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -1927,6 +2008,83 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     Ok(RepackResult { stats, segments })
 }
 
+/// Worker-thread execution of a [`DeltaRepackJob`]. Constructs the
+/// snapshot-pinned `BlockReader`, iterates every post-snapshot segment
+/// in `pending/`, and invokes
+/// [`crate::delta_compute::rewrite_post_snapshot_with_prior`] against
+/// the prior-snapshot reader.
+///
+/// Per-segment errors are logged and the segment is skipped so one bad
+/// segment can't derail the whole pass — mirrors the pre-offload
+/// behaviour. The worker never updates the extent index; that's the
+/// apply phase's job.
+pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepackResult> {
+    use crate::block_reader::BlockReader;
+    use crate::delta_compute;
+
+    let DeltaRepackJob {
+        base_dir,
+        pending_dir,
+        snap_ulid,
+        signer,
+        verifying_key,
+        segment_cache,
+    } = job;
+
+    // Snapshot-pinned reader on the prior sealed snapshot. We pass a
+    // `None` fetcher: delta repack is best-effort, and if a source body
+    // is evicted locally we skip it rather than pull bytes off S3 just
+    // to seed a dictionary.
+    let prior = BlockReader::open_snapshot(&base_dir, &snap_ulid, Box::new(|_| None))?;
+
+    let seg_paths = match segment::collect_segment_files(&pending_dir) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+
+    let mut stats = DeltaRepackStats::default();
+    let mut segments: Vec<DeltaRepackedSegment> = Vec::new();
+
+    for seg_path in seg_paths {
+        let seg_filename = seg_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::other("bad segment filename"))?;
+        let seg_id =
+            Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Skip segments at or below the latest snapshot — they are
+        // snapshot-frozen and must not be rewritten.
+        if seg_id <= snap_ulid {
+            continue;
+        }
+
+        stats.segments_scanned += 1;
+
+        let rewritten = match delta_compute::rewrite_post_snapshot_with_prior(
+            &seg_path,
+            &prior,
+            signer.as_ref(),
+            &verifying_key,
+            &segment_cache,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("delta_repack: seg {seg_id} rewrite failed: {e} — leaving segment unchanged");
+                continue;
+            }
+        };
+        let Some(rewrite) = rewritten else {
+            continue;
+        };
+
+        segments.push(DeltaRepackedSegment { seg_id, rewrite });
+    }
+
+    Ok(DeltaRepackResult { stats, segments })
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -1982,6 +2140,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         handoff_in_flight: false,
         parked_sweep: None,
         parked_repack: None,
+        parked_delta_repack: None,
     };
 
     let handle = VolumeHandle {
