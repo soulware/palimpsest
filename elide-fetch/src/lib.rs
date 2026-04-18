@@ -21,17 +21,23 @@
 //   2. Try each fork in the ancestry chain (newest first)
 //   3. On first hit: write body bytes into cache/<ulid>.body, set present bit
 //   4. On all-miss: return a NotFound error
+//
+// This crate is intentionally synchronous: the volume process owns the
+// demand-fetch path and is sync end-to-end. The S3 client is `rust-s3` with
+// the `sync` feature (attohttpc transport, no tokio). The coordinator, which
+// runs tokio for its own reasons, adapts its `object_store` to the
+// `RangeFetcher` trait when it needs to construct a fetcher.
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use elide_core::signing::VerifyingKey;
-use object_store::ObjectStore;
-use object_store::path::Path as StorePath;
+use s3::Bucket;
+use s3::creds::Credentials;
+use s3::region::Region;
 use serde::Deserialize;
-use tokio::runtime::Runtime;
 use ulid::Ulid;
 
 use elide_core::segment::{self, EntryKind, SegmentFetcher};
@@ -104,50 +110,155 @@ impl FetchConfig {
         Ok(None)
     }
 
-    pub fn build_store(&self) -> io::Result<Arc<dyn ObjectStore>> {
+    /// Build a `RangeFetcher` from this config.
+    ///
+    /// Returns a [`LocalRangeFetcher`] when `local_path` is set, otherwise an
+    /// [`S3RangeFetcher`] using the configured bucket / endpoint / region.
+    pub fn build_fetcher(&self) -> io::Result<Arc<dyn RangeFetcher>> {
         if let Some(path) = &self.local_path {
-            let store = object_store::local::LocalFileSystem::new_with_prefix(path)
-                .map_err(|e| io::Error::other(format!("local store at {path}: {e}")))?;
-            return Ok(Arc::new(store));
+            return Ok(Arc::new(LocalRangeFetcher::new(PathBuf::from(path))));
         }
         let bucket = self.bucket.as_deref().ok_or_else(|| {
             io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
         })?;
-        let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let Some(endpoint) = &self.endpoint {
-            builder = builder.with_endpoint(endpoint);
+        let fetcher =
+            S3RangeFetcher::new(bucket, self.endpoint.as_deref(), self.region.as_deref())?;
+        Ok(Arc::new(fetcher))
+    }
+}
+
+// --- range-fetcher abstraction ---
+
+/// Synchronous range-fetch interface: read a byte range from a key in some
+/// backing store. Implementations exist for S3 (`S3RangeFetcher`) and local
+/// filesystem (`LocalRangeFetcher`); the coordinator wraps its
+/// `object_store::ObjectStore` to satisfy this trait when it constructs a
+/// `RemoteFetcher`.
+///
+/// The `end` bound is exclusive (matches Rust range semantics, not HTTP
+/// `Range:` semantics — implementations translate as needed).
+///
+/// Implementations must return `io::ErrorKind::NotFound` when the key does
+/// not exist. The fetcher walks the ancestry chain on `NotFound` and treats
+/// any other error as fatal.
+pub trait RangeFetcher: Send + Sync {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>>;
+}
+
+/// `RangeFetcher` over a local directory tree. The key is appended to `root`
+/// to form a filesystem path. Used for tests and for the coordinator's
+/// default local-store mode (`elide_store/`).
+pub struct LocalRangeFetcher {
+    root: PathBuf,
+}
+
+impl LocalRangeFetcher {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl RangeFetcher for LocalRangeFetcher {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+        let path = self.root.join(key);
+        let mut f = std::fs::File::open(&path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let len = end_exclusive.saturating_sub(start) as usize;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// `RangeFetcher` backed by a `rust-s3` blocking (`sync` feature) client.
+pub struct S3RangeFetcher {
+    bucket: Box<Bucket>,
+}
+
+impl S3RangeFetcher {
+    /// Build an S3 fetcher.
+    ///
+    /// `endpoint` is optional — set it for S3-compatible stores (MinIO,
+    /// Garage, R2, …). When set, path-style addressing is used; without an
+    /// endpoint, virtual-host style is used (the AWS default).
+    ///
+    /// `region` is required by AWS but accepted as a free-form string for
+    /// custom endpoints (R2 uses `"auto"`, Garage uses `"garage"`, etc.).
+    /// Falls back to `AWS_DEFAULT_REGION`, then to `us-east-1`.
+    ///
+    /// Credentials come from `aws-creds`'s default chain (env vars, profile,
+    /// IMDS).
+    pub fn new(
+        bucket_name: &str,
+        endpoint: Option<&str>,
+        region: Option<&str>,
+    ) -> io::Result<Self> {
+        let region_name = region
+            .map(|s| s.to_owned())
+            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".to_owned());
+        let region = match endpoint {
+            Some(ep) => Region::Custom {
+                region: region_name,
+                endpoint: ep.to_owned(),
+            },
+            None => region_name
+                .parse::<Region>()
+                .map_err(|e| io::Error::other(format!("aws region '{region_name}': {e}")))?,
+        };
+        let creds = Credentials::default()
+            .map_err(|e| io::Error::other(format!("aws credentials: {e}")))?;
+        let mut bucket = Bucket::new(bucket_name, region, creds)
+            .map_err(|e| io::Error::other(format!("s3 bucket {bucket_name}: {e}")))?;
+        if endpoint.is_some() {
+            bucket = bucket.with_path_style();
         }
-        if let Some(region) = &self.region {
-            builder = builder.with_region(region);
+        Ok(Self { bucket })
+    }
+}
+
+impl RangeFetcher for S3RangeFetcher {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+        // HTTP Range is inclusive on both ends; our trait uses exclusive end.
+        let end_inclusive = end_exclusive.saturating_sub(1);
+        let resp = self
+            .bucket
+            .get_object_range(key, start, Some(end_inclusive))
+            .map_err(|e| io::Error::other(format!("s3 get_range {key}: {e}")))?;
+        match resp.status_code() {
+            200 | 206 => Ok(resp.as_slice().to_vec()),
+            404 => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{key} not found"),
+            )),
+            n => Err(io::Error::other(format!("s3 get_range {key}: status {n}"))),
         }
-        let store = builder
-            .build()
-            .map_err(|e| io::Error::other(format!("S3 store ({bucket}): {e}")))?;
-        Ok(Arc::new(store))
     }
 }
 
 // --- fetcher ---
 
-pub struct ObjectStoreFetcher {
-    store: Arc<dyn ObjectStore>,
+/// Demand-fetcher implementing `SegmentFetcher` on top of a sync
+/// [`RangeFetcher`]. Holds the ancestry chain (oldest-first) and the per-batch
+/// coalescing budget.
+pub struct RemoteFetcher {
+    store: Arc<dyn RangeFetcher>,
     /// Volume ancestry chain oldest-first: (volume_ulid, verifying_key).
     /// Searched newest-first on a cache miss; verifying key used to verify
     /// fetched segment bytes before writing to the local cache.
     chain: Vec<(String, VerifyingKey)>,
     /// Maximum bytes per coalesced range-GET batch.
     max_batch_bytes: u64,
-    rt: Runtime,
 }
 
-impl ObjectStoreFetcher {
+impl RemoteFetcher {
     /// Build a fetcher from a [`FetchConfig`] and the fork directories in the
     /// ancestry chain (oldest-first, current fork last).
     ///
     /// Each fork directory must contain a `volume.pub` file. The volume ULID
     /// is derived from the directory name.
     pub fn new(config: &FetchConfig, fork_dirs: &[PathBuf]) -> io::Result<Self> {
-        let store = config.build_store()?;
+        let store = config.build_fetcher()?;
         Self::from_store(
             store,
             fork_dirs,
@@ -157,27 +268,25 @@ impl ObjectStoreFetcher {
         )
     }
 
-    /// Build a fetcher from an already-constructed store.
+    /// Build a fetcher from an already-constructed `RangeFetcher`.
     ///
     /// Used by callers (e.g. the coordinator) that manage the store directly
     /// rather than going through [`FetchConfig`].
     pub fn from_store(
-        store: Arc<dyn ObjectStore>,
+        store: Arc<dyn RangeFetcher>,
         fork_dirs: &[PathBuf],
         max_batch_bytes: u64,
     ) -> io::Result<Self> {
         let chain = load_chain(fork_dirs)?;
-        let rt = Runtime::new().map_err(|e| io::Error::other(format!("tokio runtime: {e}")))?;
         Ok(Self {
             store,
             chain,
             max_batch_bytes,
-            rt,
         })
     }
 }
 
-impl SegmentFetcher for ObjectStoreFetcher {
+impl SegmentFetcher for RemoteFetcher {
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
@@ -185,8 +294,8 @@ impl SegmentFetcher for ObjectStoreFetcher {
         body_dir: &Path,
         extent: &segment::ExtentFetch,
     ) -> io::Result<()> {
-        self.rt.block_on(fetch_one_extent(
-            &self.store,
+        fetch_one_extent(
+            &*self.store,
             &self.chain,
             &segment_id.to_string(),
             index_dir,
@@ -196,7 +305,7 @@ impl SegmentFetcher for ObjectStoreFetcher {
                 entry_idx: extent.entry_idx,
                 max_batch_bytes: self.max_batch_bytes,
             },
-        ))
+        )
     }
 
     fn fetch_delta_body(
@@ -205,13 +314,13 @@ impl SegmentFetcher for ObjectStoreFetcher {
         index_dir: &Path,
         body_dir: &Path,
     ) -> io::Result<()> {
-        self.rt.block_on(fetch_one_delta_body(
-            &self.store,
+        fetch_one_delta_body(
+            &*self.store,
             &self.chain,
             &segment_id.to_string(),
             index_dir,
             body_dir,
-        ))
+        )
     }
 }
 
@@ -238,8 +347,8 @@ struct ExtentFetchParams {
     max_batch_bytes: u64,
 }
 
-async fn fetch_one_extent(
-    store: &Arc<dyn ObjectStore>,
+fn fetch_one_extent(
+    store: &dyn RangeFetcher,
     chain: &[(String, VerifyingKey)],
     segment_id: &str,
     index_dir: &Path,
@@ -303,13 +412,13 @@ async fn fetch_one_extent(
 
     let batch_body_start = entries[start].stored_offset;
     let batch_body_end = next_expected_offset; // = entries[batch_last].stored_offset + len
-    let range_start = (extent.body_section_start + batch_body_start) as usize;
-    let range_end = (extent.body_section_start + batch_body_end) as usize;
+    let range_start = extent.body_section_start + batch_body_start;
+    let range_end = extent.body_section_start + batch_body_end;
     let batch_count = batch_last - start + 1;
 
     for (volume_id, _) in chain.iter().rev() {
         let key = segment_key(volume_id, segment_id)?;
-        match store.get_range(&key, range_start..range_end).await {
+        match store.get_range(&key, range_start, range_end) {
             Ok(bytes) => {
                 std::fs::create_dir_all(body_dir)?;
 
@@ -370,7 +479,7 @@ async fn fetch_one_extent(
                 );
                 return Ok(());
             }
-            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(io::Error::other(format!(
                     "fetching extent {segment_id}[{}] from {volume_id}: {e}",
@@ -391,8 +500,8 @@ async fn fetch_one_extent(
 /// `delta_length`), issues one range-GET for exactly the delta region,
 /// and writes the result atomically (tmp+rename). Searches the ancestry
 /// chain newest-first on NotFound, mirroring `fetch_one_extent`.
-async fn fetch_one_delta_body(
-    store: &Arc<dyn ObjectStore>,
+fn fetch_one_delta_body(
+    store: &dyn RangeFetcher,
     chain: &[(String, VerifyingKey)],
     segment_id: &str,
     index_dir: &Path,
@@ -411,17 +520,16 @@ async fn fetch_one_delta_body(
         return Ok(());
     }
 
-    let range_start = (layout.body_section_start + layout.body_length) as usize;
-    let range_end = range_start + layout.delta_length as usize;
+    let range_start = layout.body_section_start + layout.body_length;
+    let range_end = range_start + layout.delta_length as u64;
 
     for (volume_id, _) in chain.iter().rev() {
         let key = segment_key(volume_id, segment_id)?;
-        match store.get_range(&key, range_start..range_end).await {
+        match store.get_range(&key, range_start, range_end) {
             Ok(bytes) => {
                 std::fs::create_dir_all(body_dir)?;
                 let tmp_path = body_dir.join(format!("{segment_id}.delta.tmp"));
                 {
-                    use std::io::Write;
                     let mut f = std::fs::OpenOptions::new()
                         .write(true)
                         .create(true)
@@ -438,7 +546,7 @@ async fn fetch_one_delta_body(
                 tracing::debug!(segment_id, bytes = bytes.len(), "fetched delta body");
                 return Ok(());
             }
-            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(io::Error::other(format!(
                     "fetching delta body {segment_id} from {volume_id}: {e}"
@@ -454,15 +562,13 @@ async fn fetch_one_delta_body(
 /// Build the S3 object key for a segment.
 ///
 /// Format: `by_id/<volume_id>/segments/YYYYMMDD/<segment_ulid>`
-fn segment_key(volume_id: &str, ulid_str: &str) -> io::Result<StorePath> {
+fn segment_key(volume_id: &str, ulid_str: &str) -> io::Result<String> {
     let ulid: Ulid = ulid_str
         .parse()
         .map_err(|e| io::Error::other(format!("invalid segment id '{ulid_str}': {e}")))?;
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
-    Ok(StorePath::from(format!(
-        "by_id/{volume_id}/segments/{date}/{ulid_str}"
-    )))
+    Ok(format!("by_id/{volume_id}/segments/{date}/{ulid_str}"))
 }
 
 /// Extract the volume ULID from a fork directory path.
@@ -492,7 +598,7 @@ pub fn derive_volume_id(dir: &Path) -> io::Result<String> {
 pub fn prewarm_volume_start(
     fork_dir: &Path,
     by_id_dir: &Path,
-    store: Arc<dyn ObjectStore>,
+    store: Arc<dyn RangeFetcher>,
     max_batch_bytes: u64,
 ) -> io::Result<()> {
     use elide_core::volume::{ReadonlyVolume, walk_ancestors};
@@ -502,7 +608,7 @@ pub fn prewarm_volume_start(
     let mut fork_dirs: Vec<PathBuf> = ancestors.iter().map(|l| l.dir.clone()).collect();
     fork_dirs.push(fork_dir.to_path_buf());
 
-    let fetcher = Arc::new(ObjectStoreFetcher::from_store(
+    let fetcher = Arc::new(RemoteFetcher::from_store(
         store,
         &fork_dirs,
         max_batch_bytes,
@@ -521,15 +627,22 @@ pub fn prewarm_volume_start(
 mod tests {
     use super::*;
 
+    /// Helper: write `bytes` into the local store at the given key path,
+    /// creating parent directories as needed.
+    fn put_local(root: &Path, key: &str, bytes: &[u8]) {
+        let path = root.join(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+
     /// `fetch_extent` coalesces body-adjacent absent entries into a single
     /// range-GET.  Requesting entry 0 when entries 0 and 1 are contiguous and
     /// both absent should fetch both in one call and set both present bits.
     #[test]
     fn fetch_extent_coalesces_adjacent_entries() {
         use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
-        use object_store::local::LocalFileSystem;
-        use object_store::path::Path as StorePath;
-        use std::sync::Arc;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -566,14 +679,9 @@ mod tests {
         )
         .unwrap();
 
-        // Upload the full segment to a local object store.
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(store_dir.path()).unwrap());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
-        let date = dt.format("%Y%m%d").to_string();
-        let key = StorePath::from(format!("by_id/{vol_id}/segments/{date}/{seg_id}"));
-        rt.block_on(store.put(&key, full_bytes.into())).unwrap();
+        // Upload the full segment to the local store.
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
 
         // Create a fork dir named with vol_id and write volume.pub so the
         // fetcher can load the verifying key for signature verification.
@@ -594,7 +702,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = ObjectStoreFetcher::new(&cfg, &[vol_dir]).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
 
         // Fetch entry 0 — should coalesce entries 0, 1, 2 into one range-GET.
         fetcher
@@ -632,9 +740,6 @@ mod tests {
     #[test]
     fn fetch_extent_stops_at_body_gap() {
         use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
-        use object_store::local::LocalFileSystem;
-        use object_store::path::Path as StorePath;
-        use std::sync::Arc;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -677,13 +782,8 @@ mod tests {
         elide_core::segment::set_present_bit(&cache_dir.join(format!("{seg_id}.present")), 1, 2)
             .unwrap();
 
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(store_dir.path()).unwrap());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
-        let date = dt.format("%Y%m%d").to_string();
-        let key = StorePath::from(format!("by_id/{vol_id}/segments/{date}/{seg_id}"));
-        rt.block_on(store.put(&key, full_bytes.into())).unwrap();
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
 
         // Create a fork dir named with vol_id and write volume.pub.
         let vol_dir = tmp.path().join(vol_id);
@@ -703,7 +803,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = ObjectStoreFetcher::new(&cfg, &[vol_dir]).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
 
         fetcher
             .fetch_extent(
@@ -841,8 +941,27 @@ mod tests {
 
         let key = segment_key(vol_ulid, &seg_str).unwrap();
         assert_eq!(
-            key.as_ref(),
+            key,
             format!("by_id/{vol_ulid}/segments/{expected_date}/{seg_str}")
         );
+    }
+
+    #[test]
+    fn local_range_fetcher_returns_not_found() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let f = LocalRangeFetcher::new(tmp.path().to_path_buf());
+        let err = f.get_range("missing/key", 0, 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn local_range_fetcher_reads_range() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        put_local(tmp.path(), "a/b/c", b"0123456789");
+        let f = LocalRangeFetcher::new(tmp.path().to_path_buf());
+        let bytes = f.get_range("a/b/c", 2, 6).unwrap();
+        assert_eq!(&bytes, b"2345");
     }
 }

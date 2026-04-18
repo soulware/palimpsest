@@ -574,7 +574,7 @@ async fn snapshot_volume(
 /// snapshot's segments. Runs blocking ext4 + LBA-map walk on a worker
 /// thread so the tokio reactor stays responsive.
 ///
-/// Wires an `ObjectStoreFetcher` so demand-fetch works for evicted segments
+/// Wires a `RemoteFetcher` so demand-fetch works for evicted segments
 /// — Phase 4 may run on a volume whose ext4 metadata blocks have been
 /// evicted to S3. The fetcher is constructed inside the closure (after the
 /// search-dir list is known) because each fetcher binds to a fork chain.
@@ -584,15 +584,17 @@ async fn generate_snapshot_filemap(
     store: Arc<dyn ObjectStore>,
 ) -> std::io::Result<()> {
     let fork_dir = fork_dir.to_owned();
+    let range_fetcher: Arc<dyn elide_fetch::RangeFetcher> =
+        Arc::new(elide_coordinator::range_fetcher::ObjectStoreRangeFetcher::new(store));
     tokio::task::spawn_blocking(move || {
-        let store_for_factory = store.clone();
+        let range_fetcher_for_factory = range_fetcher.clone();
         let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
             Box::new(move |search_dirs: &[PathBuf]| {
-                // ObjectStoreFetcher wants oldest-first; BlockReader hands us
+                // RemoteFetcher wants oldest-first; BlockReader hands us
                 // newest-first (fork → ancestors).
                 let oldest_first: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
-                elide_fetch::ObjectStoreFetcher::from_store(
-                    store_for_factory,
+                elide_fetch::RemoteFetcher::from_store(
+                    range_fetcher_for_factory,
                     &oldest_first,
                     elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
                 )

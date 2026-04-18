@@ -1074,8 +1074,7 @@ fn create_fork(
                 remote_pull(&config, from, data_dir, socket_path)?;
                 // remote_pull resolved the name to a ULID and pulled into
                 // readonly/<ulid>/. Find it by re-resolving the pull spec.
-                let store = config
-                    .build_store()
+                let store = elide::build_object_store(&config)
                     .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
                 let rt = tokio::runtime::Runtime::new()?;
                 let ulid_str = resolve_pull_spec(&rt, &*store, from)?;
@@ -1239,8 +1238,7 @@ fn resolve_latest_remote_snapshot(
 ) -> std::io::Result<ulid::Ulid> {
     use object_store::path::Path as StorePath;
 
-    let store = config
-        .build_store()
+    let store = elide::build_object_store(config)
         .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -1449,8 +1447,7 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
     use object_store::ObjectStore;
     use object_store::path::Path as StorePath;
 
-    let store = config
-        .build_store()
+    let store = elide::build_object_store(config)
         .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -1529,8 +1526,7 @@ fn remote_pull(
     data_dir: &Path,
     socket_path: &Path,
 ) -> std::io::Result<()> {
-    let store = config
-        .build_store()
+    let store = elide::build_object_store(config)
         .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
     let rt = tokio::runtime::Runtime::new()?;
 

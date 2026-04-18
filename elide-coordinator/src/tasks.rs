@@ -151,7 +151,9 @@ pub async fn run_volume_tasks(
 
         if did_fetch {
             let prewarm_dir = fork_dir.clone();
-            let prewarm_store = store.clone();
+            let prewarm_store: std::sync::Arc<dyn elide_fetch::RangeFetcher> = std::sync::Arc::new(
+                crate::range_fetcher::ObjectStoreRangeFetcher::new(store.clone()),
+            );
             let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
             match tokio::task::spawn_blocking(move || {
                 elide_fetch::prewarm_volume_start(

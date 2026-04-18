@@ -39,9 +39,12 @@ elide/             — volume process binary and user CLI: NBD server, analysis
                      tools (extents, inspect, ls), and volume management
                      subcommands including `volume import`. Adds:
                      clap, ext4-view, object_store, tokio (rt-multi-thread only).
-                     The async runtime is used exclusively by the demand-fetch
-                     path (ObjectStoreFetcher), which wraps block_on to satisfy
-                     the sync SegmentFetcher interface. NBD I/O remains synchronous.
+                     The async runtime is used by the embedded coordinator
+                     tasks (drain/GC/prefetch) hosted in `volume up` mode, by
+                     CLI subcommands that hit S3 directly (pull, ls, fork-from-S3),
+                     and for SIGTERM handling. NBD I/O and the demand-fetch path
+                     are synchronous. See *Async runtime scope* for the planned
+                     direction.
 
 elide-import/      — OCI import binary: pulls public OCI images from a container
                      registry, extracts a rootfs, converts to ext4, and calls
@@ -66,17 +69,17 @@ process that serves block I/O.
 
 ### Proposed: Async runtime scope
 
-The volume process carries tokio today only to satisfy `object_store`'s async trait on the demand-fetch path; NBD I/O, the volume actor, and its worker thread are all synchronous. The target state is that the volume binary carries no async runtime at all, leaving tokio confined to the coordinator (supervision, IPC, S3 mutation) and `elide-import` (OCI registry pulls).
+The volume process carries tokio today to satisfy `object_store`'s async trait on the demand-fetch path *and* to host the embedded coordinator tasks (drain, GC, prefetch) and CLI subcommands that hit S3. NBD I/O, the volume actor, and its worker thread are all synchronous. The target state is that the volume binary carries no async runtime at all, leaving tokio confined to the coordinator (supervision, IPC, S3 mutation) and `elide-import` (OCI registry pulls).
 
 Three independent changes compose to get there:
 
-1. **Sync S3 client for demand-fetch.** Replace `object_store` inside `elide-fetch` with a synchronous S3-compatible client (`rust-s3` blocking feature, or `ureq` + `aws-sigv4`). The coordinator continues to use `object_store` — its `LocalFileSystem` and `InMemory` backends are load-bearing for coordinator tests and have no sync equivalent with comparable maturity.
+1. **Sync demand-fetch.** Replace `object_store` inside `elide-fetch` with `rust-s3` (`sync` feature — uses `attohttpc`, no tokio). `elide-fetch` exposes a small sync `RangeFetcher` trait with two built-in impls (S3 via `rust-s3`, local filesystem via `std::fs`). The coordinator continues to use `object_store` for its own list/put/delete and adapts its store to `RangeFetcher` when constructing a fetcher (cheap wrapper, runs on a `spawn_blocking` thread).
 2. **Sync ublk queue threads.** ublk integration follows the existing actor model: one synchronous thread per ublk queue, each holding a `VolumeHandle`, blocking on `crossbeam-channel` into the actor. io_uring is used as the kernel↔userspace transport only, not as an async programming model. Demand-fetch misses can block the queue thread initially; a blocking fetch-thread pool can be introduced later if the miss pattern justifies it without changing the queue model.
-3. **Drop `tokio` from `elide/Cargo.toml`.** Follows mechanically once (1) and (2) are in place.
+3. **Drop `tokio` from `elide/Cargo.toml`.** Requires (1), (2), *and* relocating the embedded coordinator-tasks loop and the CLI's S3 subcommands (`pull`, `ls`, fork-from-S3) out of the volume binary — either into `elide-coordinator` (the daemon) or behind a thin sync RPC to it.
 
 **Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping it synchronous matches its I/O model (NBD today, ublk later — both sync at the interface) and removes the only external dependency forcing an async runtime into it. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
 
-This is a direction, not a commitment. None of the three steps are required for current functionality; they are sequenced as the volume binary's dependencies are revisited.
+This is a direction, not a commitment. None of the three steps are required for current functionality; they are sequenced as the volume binary's dependencies are revisited. Step (1) is in progress: `elide-fetch` is being converted to a tokio-free crate even though the volume binary continues to depend on tokio for unrelated reasons.
 
 ## Correctness foundations
 
