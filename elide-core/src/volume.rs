@@ -1183,7 +1183,10 @@ impl Volume {
             let pre_promote_offsets: Vec<Option<u64>> = entries
                 .iter()
                 .map(|e| match e.kind {
-                    EntryKind::Data | EntryKind::Inline => {
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {
                         extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                     }
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -1198,13 +1201,17 @@ impl Volume {
             )?;
             for (entry, old_wal_offset) in entries.iter().zip(pre_promote_offsets.iter().copied()) {
                 match entry.kind {
-                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {}
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                 }
                 let Some(old_wal_offset) = old_wal_offset else {
                     continue;
                 };
-                let idata = if entry.kind == EntryKind::Inline {
+                let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline)
+                {
                     entry.data.clone().map(Vec::into_boxed_slice)
                 } else {
                     None
@@ -1559,8 +1566,10 @@ impl Volume {
                 for live in &seg.live {
                     let entry = &live.entry;
                     let inline_data = match entry.kind {
-                        EntryKind::Data => None,
-                        EntryKind::Inline => entry.data.clone().map(Vec::into_boxed_slice),
+                        EntryKind::Data | EntryKind::CanonicalData => None,
+                        EntryKind::Inline | EntryKind::CanonicalInline => {
+                            entry.data.clone().map(Vec::into_boxed_slice)
+                        }
                         EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                     };
                     Arc::make_mut(&mut self.extent_index).replace_if_matches(
@@ -1895,8 +1904,10 @@ impl Volume {
             for live in &merged_live {
                 let entry = &live.entry;
                 let inline_data = match entry.kind {
-                    EntryKind::Data => None,
-                    EntryKind::Inline => entry.data.clone().map(Vec::into_boxed_slice),
+                    EntryKind::Data | EntryKind::CanonicalData => None,
+                    EntryKind::Inline | EntryKind::CanonicalInline => {
+                        entry.data.clone().map(Vec::into_boxed_slice)
+                    }
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                 };
                 Arc::make_mut(&mut self.extent_index).replace_if_matches(
@@ -2909,7 +2920,10 @@ impl Volume {
             .pending_entries
             .iter()
             .map(|e| match e.kind {
-                EntryKind::Data | EntryKind::Inline => {
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {
                     self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                 }
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -2932,7 +2946,10 @@ impl Volume {
             .zip(pre_promote_offsets.iter().copied())
         {
             match entry.kind {
-                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {}
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
             }
             let Some(old_wal_offset) = old_wal_offset else {
@@ -2943,7 +2960,7 @@ impl Volume {
                 // flush — treat it like a failed CAS and leave it alone.
                 continue;
             };
-            let idata = if entry.kind == EntryKind::Inline {
+            let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
@@ -2964,8 +2981,8 @@ impl Volume {
             );
         }
         {
-            let (mut data, mut refs, mut zero, mut inline, mut delta) =
-                (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
+                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
             for e in &self.pending_entries {
                 match e.kind {
                     EntryKind::Data => data += 1,
@@ -2973,8 +2990,10 @@ impl Volume {
                     EntryKind::Zero => zero += 1,
                     EntryKind::Inline => inline += 1,
                     EntryKind::Delta => delta += 1,
+                    EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
                 }
             }
+            let _ = canonical; // unused in this flush-path log (user writes never produce canonicals); present to keep the match exhaustive.
             log::info!(
                 "flush {segment_ulid} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
                  {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
@@ -3424,7 +3443,10 @@ impl Volume {
             .pending_entries
             .iter()
             .map(|e| match e.kind {
-                EntryKind::Data | EntryKind::Inline => {
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {
                     self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                 }
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -3472,13 +3494,16 @@ impl Volume {
             .zip(result.pre_promote_offsets.iter().copied())
         {
             match entry.kind {
-                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {}
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
             }
             let Some(old_wal_offset) = old_wal_offset else {
                 continue;
             };
-            let idata = if entry.kind == EntryKind::Inline {
+            let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
@@ -3501,8 +3526,8 @@ impl Volume {
 
         // Log entry counts.
         {
-            let (mut data, mut refs, mut zero, mut inline, mut delta) =
-                (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
+                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
             for e in &result.entries {
                 match e.kind {
                     EntryKind::Data => data += 1,
@@ -3510,8 +3535,10 @@ impl Volume {
                     EntryKind::Zero => zero += 1,
                     EntryKind::Inline => inline += 1,
                     EntryKind::Delta => delta += 1,
+                    EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
                 }
             }
+            let _ = canonical;
             log::info!(
                 "flush {} (from WAL {}): {data} data, {inline} inline, {refs} dedup-ref, \
                  {zero} zero, {delta} delta ({} entries total)",
@@ -3587,7 +3614,10 @@ impl Volume {
             .pending_entries
             .iter()
             .map(|e| match e.kind {
-                EntryKind::Data | EntryKind::Inline => {
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {
                     self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                 }
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,

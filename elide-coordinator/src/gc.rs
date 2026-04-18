@@ -852,10 +852,9 @@ fn collect_stats(
             } else if matching_blocks == 0 {
                 if extent_live && live_hashes.contains(&entry.hash) {
                     // Fully LBA-dead but hash still externally live.
-                    entry.canonical_only = true;
-                    entry.start_lba = 0;
-                    entry.lba_length = 0;
-                    live_entries.push(entry);
+                    // Demote the source entry into its canonical variant —
+                    // body preserved for dedup resolution, LBA claim dropped.
+                    live_entries.push(entry.into_canonical());
                     live_entry_indices.push(entry_idx);
                 } else if extent_live {
                     // Fully dead.
@@ -1248,40 +1247,34 @@ async fn compact_segments(
                     e.lba_length,
                 ));
             }
-            EntryKind::Data => {
+            EntryKind::Data | EntryKind::Inline => {
                 let flags = if e.compressed {
                     segment::SegmentFlags::COMPRESSED
                 } else {
                     segment::SegmentFlags::empty()
                 };
-                let mut new = SegmentEntry::new_data(
+                // `new_data` chooses Data vs Inline based on stored size.
+                new_entries.push(SegmentEntry::new_data(
                     e.hash,
                     e.start_lba,
                     e.lba_length,
                     flags,
                     e.data.take().unwrap_or_default(),
-                );
-                // Preserve the canonical-body-only demotion from collect_stats:
-                // the body survives for dedup resolution via extent_index, but
-                // the entry makes no LBA claim on rebuild.
-                new.canonical_only = e.canonical_only;
-                new_entries.push(new);
+                ));
             }
-            EntryKind::Inline => {
+            EntryKind::CanonicalData | EntryKind::CanonicalInline => {
+                // Canonical-body-only: preserve the body for dedup resolution,
+                // no LBA claim on rebuild. Built from a Data/Inline entry via
+                // `new_data` (which picks Data vs Inline based on stored size)
+                // and then demoted via `into_canonical`.
                 let flags = if e.compressed {
                     segment::SegmentFlags::COMPRESSED
                 } else {
                     segment::SegmentFlags::empty()
                 };
-                let mut new = SegmentEntry::new_data(
-                    e.hash,
-                    e.start_lba,
-                    e.lba_length,
-                    flags,
-                    e.data.take().unwrap_or_default(),
-                );
-                new.canonical_only = e.canonical_only;
-                new_entries.push(new);
+                let body = e.data.take().unwrap_or_default();
+                let built = SegmentEntry::new_data(e.hash, 0, 0, flags, body);
+                new_entries.push(built.into_canonical());
             }
             EntryKind::Delta => {
                 // Delta entries carry no body bytes in the thin format.
@@ -1349,16 +1342,15 @@ async fn compact_segments(
     let mut delta = 0usize;
     let mut canonical = 0usize;
     for e in &new_entries {
-        if e.canonical_only {
-            canonical += 1;
-            continue;
-        }
         match e.kind {
             segment::EntryKind::Data => data += 1,
             segment::EntryKind::Inline => inline += 1,
             segment::EntryKind::DedupRef => refs += 1,
             segment::EntryKind::Zero => zero += 1,
             segment::EntryKind::Delta => delta += 1,
+            segment::EntryKind::CanonicalData | segment::EntryKind::CanonicalInline => {
+                canonical += 1
+            }
         }
     }
     tracing::info!(
@@ -2318,7 +2310,7 @@ mod tests {
             ) {
                 continue;
             }
-            if entry.canonical_only || entry.lba_length == 0 {
+            if entry.kind.is_canonical_only() || entry.lba_length == 0 {
                 continue;
             }
             let end = entry.start_lba + entry.lba_length as u64;
@@ -2342,7 +2334,7 @@ mod tests {
         // Invariant 2: no loss.
         let mut claimed = std::collections::HashSet::new();
         for entry in &s1_stats.live_entries {
-            if entry.canonical_only || entry.hash != original_hash {
+            if entry.kind.is_canonical_only() || entry.hash != original_hash {
                 continue;
             }
             if !matches!(
@@ -2516,7 +2508,6 @@ mod tests {
             stored_length,
             data: None,
             delta_options: Vec::new(),
-            canonical_only: false,
         }
     }
 

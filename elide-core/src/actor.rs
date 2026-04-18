@@ -2097,7 +2097,10 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .filter(|e| {
                 matches!(
                     e.kind,
-                    segment::EntryKind::Data | segment::EntryKind::Inline
+                    segment::EntryKind::Data
+                        | segment::EntryKind::Inline
+                        | segment::EntryKind::CanonicalData
+                        | segment::EntryKind::CanonicalInline
                 )
             })
             .map(|e| e.stored_length as u64)
@@ -2112,7 +2115,10 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .filter(|e| {
                 matches!(
                     e.kind,
-                    segment::EntryKind::Data | segment::EntryKind::Inline
+                    segment::EntryKind::Data
+                        | segment::EntryKind::Inline
+                        | segment::EntryKind::CanonicalData
+                        | segment::EntryKind::CanonicalInline
                 ) && live.contains(&e.hash)
             })
             .map(|e| e.stored_length as u64)
@@ -2131,6 +2137,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                     job.lbamap.hash_at(e.start_lba) == Some(e.hash)
                 }
                 segment::EntryKind::Data | segment::EntryKind::Inline => live.contains(&e.hash),
+                segment::EntryKind::CanonicalData | segment::EntryKind::CanonicalInline => {
+                    // Canonical-only entries carry body for dedup resolution;
+                    // kept whenever their hash is still referenced anywhere.
+                    live.contains(&e.hash)
+                }
             });
 
         let mut dead: Vec<RepackedDeadEntry> = Vec::new();
@@ -2161,7 +2172,12 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 seg_path,
                 body_section_start,
                 &mut live_entries,
-                [segment::EntryKind::Data, segment::EntryKind::Inline],
+                [
+                    segment::EntryKind::Data,
+                    segment::EntryKind::Inline,
+                    segment::EntryKind::CanonicalData,
+                    segment::EntryKind::CanonicalInline,
+                ],
                 &inline_bytes,
             )?;
 

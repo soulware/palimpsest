@@ -125,6 +125,8 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             EntryKind::DedupRef => "dedup",
             EntryKind::Zero => "zero",
             EntryKind::Delta => "delta",
+            EntryKind::CanonicalData => "canon-data",
+            EntryKind::CanonicalInline => "canon-inline",
         };
         println!(
             "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  {}",

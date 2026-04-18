@@ -510,11 +510,11 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
                     Err(e) => return Err(e),
                 };
             for entry in entries {
-                // CanonicalBody entries carry a body for dedup resolution
-                // via the extent index but make no LBA claim on rebuild.
-                // Skip them here so their stale start_lba (zeroed by the
-                // emitter) never mutates the map.  See SegmentFlags::CANONICAL_ONLY.
-                if entry.canonical_only {
+                // CanonicalData / CanonicalInline entries carry a body for
+                // dedup resolution via the extent index but make no LBA claim
+                // on rebuild. Skip them so their zeroed start_lba never
+                // mutates the map.
+                if entry.kind.is_canonical_only() {
                     continue;
                 }
                 if entry.kind == segment::EntryKind::Delta {

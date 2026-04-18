@@ -564,7 +564,9 @@ fn apply_snapshot_layer(
         let (_bss, entries, _inputs) =
             segment::read_and_verify_segment_index(&idx_path, &layer.vk)?;
 
-        let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+        let has_inline = entries
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::Inline | EntryKind::CanonicalInline));
         let inline_bytes = if has_inline {
             segment::read_inline_section(&idx_path)?
         } else {
@@ -572,17 +574,24 @@ fn apply_snapshot_layer(
         };
 
         for (raw_idx, entry) in entries.iter().enumerate() {
-            // LBA map: every entry contributes its range → content hash.
-            if entry.kind == EntryKind::Delta {
-                let sources: std::sync::Arc<[blake3::Hash]> =
-                    entry.delta_options.iter().map(|o| o.source_hash).collect();
-                lbamap.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
-            } else {
-                lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+            // LBA map: every non-canonical entry contributes its range →
+            // content hash. Canonical entries carry body for dedup resolution
+            // only and make no LBA claim.
+            if !entry.kind.is_canonical_only() {
+                if entry.kind == EntryKind::Delta {
+                    let sources: std::sync::Arc<[blake3::Hash]> =
+                        entry.delta_options.iter().map(|o| o.source_hash).collect();
+                    lbamap.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
+                } else {
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                }
             }
 
             match entry.kind {
-                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {}
                 EntryKind::DedupRef | EntryKind::Zero => continue,
                 EntryKind::Delta => {
                     extent_index.insert_delta_if_absent(
@@ -597,7 +606,7 @@ fn apply_snapshot_layer(
                 }
             }
 
-            let idata = if entry.kind == EntryKind::Inline {
+            let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
                 let start = entry.stored_offset as usize;
                 let end = start + entry.stored_length as usize;
                 if end <= inline_bytes.len() {

@@ -433,7 +433,10 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 
             for (raw_idx, entry) in entries.iter().enumerate() {
                 match entry.kind {
-                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {}
                     EntryKind::DedupRef | EntryKind::Zero => continue,
                     EntryKind::Delta => {
                         index.insert_delta_if_absent(
@@ -447,7 +450,8 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         continue;
                     }
                 }
-                let idata = if entry.kind == EntryKind::Inline {
+                let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline)
+                {
                     let start = entry.stored_offset as usize;
                     let end = start + entry.stored_length as usize;
                     if end <= inline_bytes.len() {

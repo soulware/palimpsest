@@ -140,7 +140,6 @@ mod tests {
             kind: EntryKind::Data,
             data: Some(vec![0xAB; 8]),
             delta_options: Vec::new(),
-            canonical_only: false,
         }
     }
 

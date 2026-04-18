@@ -464,6 +464,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let mut zero_count = 0usize;
     let mut inline_count = 0usize;
     let mut delta_count = 0usize;
+    let mut canonical_count = 0usize;
     let mut data_body_bytes = 0u64;
     for e in &entries {
         match e.kind {
@@ -471,12 +472,18 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
                 data_count += 1;
                 data_body_bytes += e.stored_length as u64;
             }
+            EntryKind::CanonicalData => {
+                canonical_count += 1;
+                data_body_bytes += e.stored_length as u64;
+            }
             EntryKind::DedupRef => dedup_ref_count += 1,
             EntryKind::Zero => zero_count += 1,
             EntryKind::Inline => inline_count += 1,
+            EntryKind::CanonicalInline => canonical_count += 1,
             EntryKind::Delta => delta_count += 1,
         }
     }
+    let _ = canonical_count;
 
     // `promote_to_cache` sets `.present` bits only for Data entries, so the
     // set-bit count is exactly the number of Data entries with bodies cached
