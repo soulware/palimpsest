@@ -104,13 +104,16 @@ The in-memory runtime `lbamap` and the rebuild-from-disk `lbamap` now produce th
 
 ### What this does not do
 
-- **It does not reclaim storage.** A segment with even one partial-LBA-death entry is permanently ineligible for GC compaction until either the entry becomes fully dead (entire range overwritten) or something rewrites the bloated entry into compact sub-runs.
-- **Rewriting the bloated entry into compact sub-runs is the job of alias-merge** (`design-extent-reclamation.md`). That primitive is already implemented but is currently only invoked by the `elide volume reclaim` CLI — it is not run automatically. Automating it is a separate concern tracked there.
-- **Reclamation's hint system remains advisory**, which is safe only if correctness does not depend on a hint being processed. With this fix in place, correctness never depends on alias-merge running.
+A segment with a partial-LBA-death entry stays on disk indefinitely. It carries its dead bytes with it until either:
+
+- Later writes happen to overwrite the surviving sub-ranges, making the entry fully dead — at which point GC compacts it normally.
+- The segment is rewritten out of existence by some future cleanup pass.
+
+There is no cleanup pass today. Reclaiming the dead storage in such segments is a separate, unplanned problem. Whether it needs a solution depends on how often the shape occurs on real workloads — measurement first, before any mechanism.
 
 ## How `canonical_only` narrows
 
-With the skip rule in place, `canonical_only` is only reached when `matching_bytes == 0` — the entire entry range is LBA-dead. That is the shape it was designed for: whole entry overwritten (or the surviving alias-merge-produced orphan hash case). The incorrect head-overlap demotion never triggers because the skip rule catches partial-LBA-death first.
+With the skip rule in place, `canonical_only` is only reached when `matching_bytes == 0` — the entire entry range is LBA-dead. That is the shape it was designed for: whole entry overwritten while the hash remains live via a DedupRef at some other LBA. The incorrect head-overlap demotion never triggers because the skip rule catches partial-LBA-death first.
 
 ## Testing
 
@@ -121,14 +124,3 @@ Unit tests at the `collect_stats` level exercise each shape:
 - **Head overwrite**: same, but the 1-LBA write hits `LBA 100`. Assert the loss invariant (every LBA within the original range that still resolves to `H` is claimed by some emitted non-canonical-only entry). Before the fix, `LBA 101` fails the loss invariant.
 
 A proptest SimOp variant `MultiLbaWriteThenOverwrite { start, len, overlap_off, seed }` drives the full GC round-trip; `gc_oracle` holds because the bloated segment stays put and `lbamap` rebuilds correctly.
-
-## Relationship to reclamation
-
-The reclamation doc (`design-extent-reclamation.md`) describes the volume-side primitive that *rewrites* bloated multi-LBA entries into compact sub-run entries and the automated scheduling layer around it. That is about reducing fragmentation and reclaiming storage, not about correctness.
-
-This fix is complementary:
-
-- Without reclamation running: GC correctly preserves bloated entries in place. Storage is not reclaimed for those segments but reads are correct.
-- With reclamation running: alias-merge rewrites the bloated entry. The original hash becomes fully orphaned in `lbamap`. A subsequent GC pass sees `matching_bytes == 0` for the orphan, routes through `canonical_only` (if hash still live) or removes it. Storage is now reclaimed.
-
-Neither pass depends on the other for correctness. Reclamation is purely an optimization.
