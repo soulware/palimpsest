@@ -602,6 +602,10 @@ struct SegmentStats {
     has_body_entries: bool,
     /// Live entries (data field not yet populated for DATA entries).
     live_entries: Vec<SegmentEntry>,
+    /// Per-entry position in the source segment's index section, parallel to
+    /// `live_entries`. Used to index into `cache/<ulid>.present` when checking
+    /// whether an entry's body bytes are available locally.
+    live_entry_indices: Vec<u32>,
     /// Hashes that are in the extent index but not reachable from the LBA map.
     /// The volume must remove these from its extent index when applying the
     /// handoff, since the old segment files will be deleted.
@@ -693,9 +697,11 @@ fn collect_stats(
         let mut total_lba_bytes: u64 = 0;
         let mut physical_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
+        let mut live_entry_indices: Vec<u32> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
-        for mut entry in entries {
+        for (entry_idx, mut entry) in entries.into_iter().enumerate() {
+            let entry_idx = entry_idx as u32;
             // Pre-populate inline entry data from the .idx inline section.
             // compact_segments needs this data to write the output segment.
             if entry.kind == EntryKind::Inline {
@@ -720,6 +726,7 @@ fn collect_stats(
                 if lba_live {
                     live_lba_bytes += lba_bytes;
                     live_entries.push(entry);
+                    live_entry_indices.push(entry_idx);
                 }
                 continue;
             }
@@ -741,6 +748,7 @@ fn collect_stats(
                 if lba_live {
                     live_lba_bytes += lba_bytes;
                     live_entries.push(entry);
+                    live_entry_indices.push(entry_idx);
                 } else if extent_live {
                     removed_hashes.push(entry.hash);
                 }
@@ -760,6 +768,7 @@ fn collect_stats(
             if lba_live || (extent_live && live_hashes.contains(&entry.hash)) {
                 live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
+                live_entry_indices.push(entry_idx);
             } else if extent_live {
                 // Extent-index-live but not LBA-map-live: the LBA was
                 // overwritten with different data.  Record so the volume
@@ -780,6 +789,7 @@ fn collect_stats(
             live_lba_bytes,
             total_lba_bytes,
             live_entries,
+            live_entry_indices,
             removed_hashes,
         });
     }
@@ -807,6 +817,83 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Read live extent bodies from `cache/<ulid>.body` if every entry in
+/// `body_indices` has its `.present` bit set. Returns:
+///
+/// - `Ok(true)` if every live DATA body was populated from the local cache.
+/// - `Ok(false)` if any byte is missing locally (body file absent, any
+///   required `.present` bit unset, or a read error that looks like a cache
+///   miss) — caller should fall back to S3.
+///
+/// Never mutates `candidate` on the `Ok(false)` return, so S3 fallback can
+/// populate the same entries safely.
+fn try_fetch_live_bodies_local(
+    candidate: &mut SegmentStats,
+    fork_dir: &Path,
+    body_indices: &[usize],
+) -> Result<bool> {
+    let cache_dir = fork_dir.join("cache");
+    let body_path = cache_dir.join(format!("{}.body", candidate.ulid_str));
+    let present_path = cache_dir.join(format!("{}.present", candidate.ulid_str));
+
+    // Body file present? If not, definitely a miss.
+    match body_path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(_) => return Ok(false),
+    }
+
+    // Present bitmap: every required entry_idx must have its bit set.
+    // Reading the file once is cheaper than N calls to check_present_bit
+    // which re-read it each time.
+    let present_bytes = match fs::read(&present_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Ok(false),
+    };
+    for &i in body_indices {
+        let entry_idx = candidate.live_entry_indices[i];
+        let byte_idx = (entry_idx / 8) as usize;
+        let bit = entry_idx % 8;
+        let bit_set = present_bytes
+            .get(byte_idx)
+            .is_some_and(|b| b & (1 << bit) != 0);
+        if !bit_set {
+            return Ok(false);
+        }
+    }
+
+    // All required bits set. Read body file once and slice each entry out.
+    // cache/<ulid>.body uses body-section-relative offsets (BodyOnly layout)
+    // — `stored_offset` is already the right offset into this file.
+    let body = match fs::read(&body_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+    for &i in body_indices {
+        let e = &candidate.live_entries[i];
+        let start = e.stored_offset as usize;
+        let end = start + e.stored_length as usize;
+        if end > body.len() {
+            // Body file truncated mid-eviction or torn write. Bail.
+            return Ok(false);
+        }
+        candidate.live_entries[i].data = Some(body[start..end].to_vec());
+    }
+
+    let total_local: u64 = body_indices
+        .iter()
+        .map(|&i| candidate.live_entries[i].stored_length as u64)
+        .sum();
+    tracing::info!(
+        "[gc] fetch {}: local cache hit, read {} body bytes from cache/{}.body",
+        candidate.ulid_str,
+        total_local,
+        candidate.ulid_str,
+    );
+    Ok(true)
+}
+
 /// Fetch live extent body bytes from S3 into `candidate.live_entries[].data`.
 ///
 /// Computes coalesced range-GET batches for the live body entries, then decides
@@ -814,9 +901,17 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 /// The heuristic: range-GETs are worthwhile when the wasted bytes they avoid
 /// exceed `MIN_WASTE_PER_RANGE_GET` per batch; otherwise a single GET is
 /// cheaper despite downloading dead bytes.
+///
+/// Local short-circuit: if every live DATA body is already present in
+/// `cache/<ulid>.body` (checked via the `.present` bitmap), we read from
+/// the local cache and skip S3 entirely. This is safe because cache/ is
+/// append-only from the volume's perspective (the coordinator is the sole
+/// deleter) and `.present` bits are durable before they are published —
+/// observed bytes are guaranteed to match the S3 object's body.
 async fn fetch_live_bodies(
     candidate: &mut SegmentStats,
     volume_id: &str,
+    fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     // Collect indices of live entries that carry body bytes.
@@ -831,6 +926,11 @@ async fn fetch_live_bodies(
         .collect();
 
     if body_indices.is_empty() {
+        return Ok(());
+    }
+
+    // Try the local cache first. On any miss or error, fall through to S3.
+    if try_fetch_live_bodies_local(candidate, fork_dir, &body_indices)? {
         return Ok(());
     }
 
@@ -978,14 +1078,21 @@ async fn compact_segments(
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
 
-    // For each candidate: fetch live extent bodies from S3 directly into
-    // memory.  Zero extents carry no body data, so candidates with only zero
-    // extents skip the S3 fetch entirely.
-    // removed_hashes are already fully populated from collect_stats and need no fetch.
+    // fork_dir is the parent of gc_dir; used to locate `cache/<ulid>.body`
+    // when resolving bodies locally instead of from S3.
+    let fork_dir = gc_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("gc_dir has no parent"))?;
+
+    // For each candidate: try the local cache first (cache/<ulid>.body with
+    // all required `.present` bits set), falling through to S3 on any miss.
+    // Zero extents carry no body data, so candidates with only zero extents
+    // skip the fetch entirely. removed_hashes are already fully populated
+    // from collect_stats and need no fetch.
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
     let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
     for candidate in &mut candidates {
-        fetch_live_bodies(candidate, volume_id, store)
+        fetch_live_bodies(candidate, volume_id, fork_dir, store)
             .await
             .with_context(|| format!("fetching bodies for {}", candidate.ulid_str))?;
 
@@ -1348,6 +1455,7 @@ mod tests {
                 total_lba_bytes,
                 has_body_entries: true,
                 live_entries: vec![data_entry()],
+                live_entry_indices: vec![0],
                 removed_hashes: Vec::new(),
             }
         }
@@ -1371,6 +1479,7 @@ mod tests {
             total_lba_bytes: 1024 * 1024,
             has_body_entries: true,
             live_entries: Vec::new(),
+            live_entry_indices: Vec::new(),
             removed_hashes: Vec::new(),
         };
         assert_eq!(s.dead_lba_bytes(), 224 * 1024);
@@ -1389,6 +1498,7 @@ mod tests {
                 total_lba_bytes: 100,
                 has_body_entries: true,
                 live_entries: Vec::new(),
+                live_entry_indices: Vec::new(),
                 removed_hashes: Vec::new(),
             }
         }
@@ -1794,9 +1904,11 @@ mod tests {
                 SegmentEntry::new_zero(0, 1),
                 SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1),
             ],
+            live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
         };
-        fetch_live_bodies(&mut candidate, "vol", &store)
+        let tmp = TempDir::new().unwrap();
+        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
             .await
             .unwrap();
         // No data populated (dedup_ref and zero have no body).
@@ -1827,10 +1939,12 @@ mod tests {
                 stub_entry(EntryKind::Data, 0, 4096),
                 stub_entry(EntryKind::Data, 4096, 4096),
             ],
+            live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
         };
 
-        fetch_live_bodies(&mut candidate, "vol", &store)
+        let tmp = TempDir::new().unwrap();
+        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
             .await
             .unwrap();
 
@@ -1887,12 +2001,14 @@ mod tests {
                 stub_entry(EntryKind::Data, 0, 4096),
                 stub_entry(EntryKind::Data, 900_000, 4096),
             ],
+            live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
         };
 
         // Waste = 1MB - 8192 ≈ 1MB. Two batches (entries are far apart).
         // Waste per batch = ~512KB >> 128KB threshold → range-GETs.
-        fetch_live_bodies(&mut candidate, "vol", &store)
+        let tmp = TempDir::new().unwrap();
+        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
             .await
             .unwrap();
 
@@ -1948,11 +2064,13 @@ mod tests {
                 stub_entry(EntryKind::Data, 0, 4096),
                 stub_entry(EntryKind::Data, 4096, 4096),
             ],
+            live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
         };
 
         // Waste ≈ 1MB, 1 batch (adjacent → coalesced) → waste/batch ≈ 1MB >> 128KB.
-        fetch_live_bodies(&mut candidate, "vol", &store)
+        let tmp = TempDir::new().unwrap();
+        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
             .await
             .unwrap();
 
@@ -1987,16 +2105,137 @@ mod tests {
             // filter in fetch_live_bodies now gates on `kind == Data` so
             // the length check is redundant but left for robustness.
             live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 0)],
+            live_entry_indices: vec![0],
             removed_hashes: Vec::new(),
         };
 
-        fetch_live_bodies(&mut candidate, "vol", &store)
+        let tmp = TempDir::new().unwrap();
+        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
             .await
             .unwrap();
 
         assert!(
             candidate.live_entries[0].data.is_none(),
             "DedupRef entries must not have body bytes fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_reads_from_local_cache_when_fully_present() {
+        // Build a cache/<ulid>.body file with all required DATA extents and
+        // a `.present` bitmap with the matching bits set. The in-memory store
+        // is empty — if fetch_live_bodies tried to fall back to S3 it would
+        // error. The local path must serve the bodies without any S3 GETs.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(2000, 1).to_string();
+        let tmp = TempDir::new().unwrap();
+        let fork_dir = tmp.path();
+        let cache_dir = fork_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Body layout: entry_idx 0 at offset 0 (4096 bytes of 0xEE),
+        //              entry_idx 1 at offset 4096 (4096 bytes of 0xFF).
+        let body_section_start: u64 = 512;
+        let mut body = vec![0u8; 8192];
+        body[0..4096].fill(0xEE);
+        body[4096..8192].fill(0xFF);
+        std::fs::write(cache_dir.join(format!("{ulid_str}.body")), &body).unwrap();
+
+        // Entry indices 0 and 1 in a 2-entry segment: a single byte with
+        // both low bits set.
+        std::fs::write(cache_dir.join(format!("{ulid_str}.present")), [0b0000_0011]).unwrap();
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + 8192,
+            live_lba_bytes: 8192,
+            total_lba_bytes: 8192,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 4096, 4096),
+            ],
+            live_entry_indices: vec![0, 1],
+            removed_hashes: Vec::new(),
+        };
+
+        fetch_live_bodies(&mut candidate, "vol", fork_dir, &store)
+            .await
+            .unwrap();
+
+        assert!(
+            candidate.live_entries[0]
+                .data
+                .as_deref()
+                .is_some_and(|d| d.iter().all(|&b| b == 0xEE))
+        );
+        assert!(
+            candidate.live_entries[1]
+                .data
+                .as_deref()
+                .is_some_and(|d| d.iter().all(|&b| b == 0xFF))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_falls_back_to_s3_when_present_bit_unset() {
+        // cache/<ulid>.body exists but the `.present` bit for entry 1 is not
+        // set — a partially demand-fetched segment. fetch_live_bodies must
+        // fall through to S3 rather than serve torn bytes.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(2000, 2).to_string();
+        let tmp = TempDir::new().unwrap();
+        let fork_dir = tmp.path();
+        let cache_dir = fork_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // S3 body: byte-distinctive so we can verify it was used, not cache.
+        let body_section_start: u64 = 512;
+        let mut s3_body = vec![0u8; 8192];
+        s3_body[0..4096].fill(0x11);
+        s3_body[4096..8192].fill(0x22);
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &s3_body).await;
+
+        // Local cache: body bytes are *wrong* (0xDE) — present bit is unset
+        // so they must never be used. If we accidentally read from the cache,
+        // the assertions below will fail.
+        let local_body = vec![0xDEu8; 8192];
+        std::fs::write(cache_dir.join(format!("{ulid_str}.body")), &local_body).unwrap();
+        // Only entry 0 is marked present; entry 1 is missing.
+        std::fs::write(cache_dir.join(format!("{ulid_str}.present")), [0b0000_0001]).unwrap();
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + 8192,
+            live_lba_bytes: 8192,
+            total_lba_bytes: 8192,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 4096, 4096),
+            ],
+            live_entry_indices: vec![0, 1],
+            removed_hashes: Vec::new(),
+        };
+
+        fetch_live_bodies(&mut candidate, "vol", fork_dir, &store)
+            .await
+            .unwrap();
+
+        // Both bodies must have come from S3, not the local cache.
+        assert!(
+            candidate.live_entries[0]
+                .data
+                .as_deref()
+                .is_some_and(|d| d.iter().all(|&b| b == 0x11))
+        );
+        assert!(
+            candidate.live_entries[1]
+                .data
+                .as_deref()
+                .is_some_and(|d| d.iter().all(|&b| b == 0x22))
         );
     }
 
