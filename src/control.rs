@@ -195,11 +195,8 @@ fn handle_connection(
         }
     } else if line == "gc_checkpoint" {
         match handle.gc_checkpoint() {
-            Ok(Some((u1, u2))) => {
+            Ok((u1, u2)) => {
                 let _ = writeln!(writer, "ok {u1} {u2}");
-            }
-            Ok(None) => {
-                let _ = writeln!(writer, "ok idle");
             }
             Err(e) => {
                 let _ = writeln!(writer, "err {e}");

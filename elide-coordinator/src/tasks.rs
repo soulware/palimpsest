@@ -303,6 +303,21 @@ pub async fn run_volume_tasks(
 
         // Step 5: GC pass (rate-limited to gc_interval).
         if last_gc.elapsed() >= gc_interval {
+            // Finalize outstanding bare `gc/<ulid>` files first, independent
+            // of `gc_checkpoint` and `drain_ok`. A bare file is a handoff the
+            // volume already committed (`.staged` → bare) but which the
+            // coordinator has not yet uploaded + promoted. If the coordinator
+            // crashes between those steps on a quiescent volume, the next
+            // `gc_checkpoint` returns `Idle` (WAL empty + no `.staged`), and
+            // gating cleanup behind the checkpoint would strand the bare file
+            // indefinitely — `has_pending_results` would then also block
+            // every future `gc_fork` pass. Always run this.
+            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {
+                Ok(0) => {}
+                Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
+                Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
+            }
+
             if !drain_ok {
                 continue;
             }
@@ -315,12 +330,6 @@ pub async fn run_volume_tasks(
             let handoffs_applied = control::apply_gc_handoffs(&fork_dir).await;
             if handoffs_applied > 0 {
                 info!("[gc {volume_id}] volume applied {handoffs_applied} GC handoff(s)");
-            }
-
-            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {
-                Ok(0) => {}
-                Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
-                Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
             }
 
             match gc::gc_fork(

@@ -172,8 +172,7 @@ proptest! {
                 ActorOp::CoordGcLocal { n } => {
                     // Checkpoint: flush WAL and obtain a ULID for the GC
                     // output, matching the real coordinator's gc_checkpoint.
-                    // `Ok(None)` means the volume is idle — nothing to GC.
-                    let Ok(Some((gc_ulid, _))) = handle.gc_checkpoint() else {
+                    let Ok((gc_ulid, _)) = handle.gc_checkpoint() else {
                         continue;
                     };
                     // Simulate one coordinator GC pass (writes gc/*.pending).
@@ -388,7 +387,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
 
     // Step 4: CoordGcLocal{2} — gc_checkpoint flushes DEDUP_REF to pending/u_flush1;
     //   index/ is empty so simulate_coord_gc_local returns None (no candidates yet).
-    let (gc_ulid, _) = handle.gc_checkpoint().unwrap().unwrap();
+    let (gc_ulid, _) = handle.gc_checkpoint().unwrap();
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -414,7 +413,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     //   compacts them into gc/u_repack2, writes gc/u_repack2.pending.
     //   apply_gc_handoffs re-signs and renames to .applied; updates extent_index.
     //   to_delete removes index/S1.idx + index/u_flush1.idx.
-    let (gc_ulid2, _) = handle.gc_checkpoint().unwrap().unwrap();
+    let (gc_ulid2, _) = handle.gc_checkpoint().unwrap();
     let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();

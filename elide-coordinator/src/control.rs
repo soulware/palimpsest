@@ -109,17 +109,11 @@ pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackSt
 /// Call gc_checkpoint on the volume process for `fork_dir`.
 ///
 /// Returns `Some((repack_ulid, sweep_ulid))` on success.
-/// Returns `None` when the volume is idle ("ok idle" response) — no WAL
-/// bytes to promote and no staged handoffs waiting to be applied — or
-/// when the socket is absent / the call fails for any reason (a warning
-/// is logged in the latter cases).  In every `None` case the caller
-/// should skip the GC pass for this tick.
+/// Returns `None` and logs a warning if the socket is absent (volume not
+/// running) or if the call fails for any reason.
 pub async fn gc_checkpoint(fork_dir: &Path) -> Option<(Ulid, Ulid)> {
     let response = call(fork_dir, "gc_checkpoint").await?;
     let rest = response.strip_prefix("ok ")?;
-    if rest.trim() == "idle" {
-        return None;
-    }
     let mut parts = rest.splitn(2, ' ');
     let u1 = parts.next()?.trim();
     let u2 = parts.next()?.trim();
