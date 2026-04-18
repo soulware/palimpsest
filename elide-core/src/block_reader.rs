@@ -27,7 +27,7 @@ use crate::{extentindex, lbamap, segment, signing, volume, writelog};
 ///
 /// The factory receives the reader's search directories in **newest-first**
 /// order (fork first, ancestors after). Callers that need oldest-first (e.g.
-/// `ObjectStoreFetcher`) must reverse locally.
+/// `RemoteFetcher`) must reverse locally.
 pub type FetcherFactory<'a> = dyn FnOnce(&[PathBuf]) -> Option<Box<dyn SegmentFetcher>> + 'a;
 
 /// Block-level reader over a volume's merged fork + ancestor state.

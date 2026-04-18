@@ -12,6 +12,39 @@ pub mod verify;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use elide_fetch::FetchConfig;
+use object_store::ObjectStore;
+
+/// Build an `object_store` client from a [`FetchConfig`].
+///
+/// The volume binary uses this for CLI subcommands that hit S3 directly
+/// (`pull`, `ls`, fork-from-S3) and for the embedded coordinator tasks loop
+/// (`volume up`). The async `object_store` API is needed there because that
+/// code already runs inside tokio. The demand-fetch hot path uses
+/// `elide_fetch::FetchConfig::build_fetcher()` instead — sync, no tokio.
+pub fn build_object_store(config: &FetchConfig) -> io::Result<Arc<dyn ObjectStore>> {
+    if let Some(path) = &config.local_path {
+        let store = object_store::local::LocalFileSystem::new_with_prefix(path)
+            .map_err(|e| io::Error::other(format!("local store at {path}: {e}")))?;
+        return Ok(Arc::new(store));
+    }
+    let bucket = config.bucket.as_deref().ok_or_else(|| {
+        io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
+    })?;
+    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some(endpoint) = &config.endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if let Some(region) = &config.region {
+        builder = builder.with_region(region);
+    }
+    let store = builder
+        .build()
+        .map_err(|e| io::Error::other(format!("S3 store ({bucket}): {e}")))?;
+    Ok(Arc::new(store))
+}
 
 /// Resolve a volume name to its directory via `<data_dir>/by_name/<name>`.
 ///

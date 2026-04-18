@@ -12,7 +12,7 @@ use ext4_view::{Ext4, FileType, PathBuf as Ext4PathBuf};
 use elide_core::block_reader::BlockReader;
 use elide_core::segment::SegmentFetcher;
 
-use elide_fetch::{FetchConfig, ObjectStoreFetcher};
+use elide_fetch::{FetchConfig, RemoteFetcher};
 
 pub fn run(dir: &Path, fs_path: &str) -> io::Result<()> {
     let reader = open_live_reader(dir)?;
@@ -36,19 +36,19 @@ pub fn run(dir: &Path, fs_path: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Open a live `BlockReader` for `dir`, wiring an `ObjectStoreFetcher` from
+/// Open a live `BlockReader` for `dir`, wiring a `RemoteFetcher` from
 /// `fetch.toml` if one is present alongside the `by_id/` directory.
 fn open_live_reader(dir: &Path) -> io::Result<BlockReader> {
-    BlockReader::open_live(dir, Box::new(object_store_fetcher_factory))
+    BlockReader::open_live(dir, Box::new(remote_fetcher_factory))
 }
 
-fn object_store_fetcher_factory(search_dirs: &[PathBuf]) -> Option<Box<dyn SegmentFetcher>> {
+fn remote_fetcher_factory(search_dirs: &[PathBuf]) -> Option<Box<dyn SegmentFetcher>> {
     let dir0 = search_dirs.first()?;
     let by_id_dir = dir0.parent()?;
     let data_dir = by_id_dir.parent().unwrap_or(by_id_dir);
     let cfg = FetchConfig::load(data_dir).ok().flatten()?;
     let fork_dirs: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
-    ObjectStoreFetcher::new(&cfg, &fork_dirs)
+    RemoteFetcher::new(&cfg, &fork_dirs)
         .ok()
         .map(|f| Box::new(f) as Box<dyn SegmentFetcher>)
 }
