@@ -483,91 +483,32 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
     let mut map = LbaMap::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Read pending/ and gc/ *before* index/ to close a narrow race: when a
-        // volume is live (e.g. external tools like `block_reader::open_live`
-        // call this while the flusher may be promoting a segment), promote
-        // writes `index/<ulid>.idx` and then removes the source file in
-        // `pending/<ulid>` or `gc/<ulid>`. If index/ is listed first and the
-        // source dir last, a segment could be missed from both lists — it
-        // wasn't in index/ at the first read and had been removed from its
-        // source by the time the second read happened.
-        //
-        // Reading the source dirs first is sufficient: the source file is only
-        // removed *after* the .idx has been written, so any segment captured
-        // by neither the first read (still in source) nor the second (now in
-        // index) is impossible by construction.
-        //
-        // Matches the ordering in `extentindex::rebuild` for the same reason.
-        //
-        // pending/: in-flight WAL flushes (highest priority — most recent writes).
-        let mut pending_paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
-        pending_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+        // `discover_fork_segments` handles the race-safe listing order
+        // (pending → gc → index) and returns segments in the correct
+        // rebuild *processing* order (gc → index → pending). See the
+        // helper's doc comment for why both orderings matter.
+        let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
-        // gc/*.applied: GC output bodies awaiting coordinator upload to S3.
-        // These are produced BEFORE the WAL flush that follows gc_checkpoint
-        // (u_repack < u_flush), so they are lower priority than index/*.idx
-        // entries — a WAL flush promoted to index/ after GC ran must win.
-        let mut gc_paths = segment::collect_gc_applied_segment_files(fork_dir)?;
-        gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        // index/*.idx: committed segments (evicted to two-file format; permanent LBA index).
-        let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
-        cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
-        if let Some(cutoff) = branch_ulid {
-            cache_paths.retain(|p| {
-                p.file_stem()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-        }
-
-        if let Some(cutoff) = branch_ulid {
-            gc_paths.retain(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-            pending_paths.retain(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-        }
-
-        if cache_paths.is_empty() && gc_paths.is_empty() && pending_paths.is_empty() {
+        if segments.is_empty() {
             continue;
         }
 
         // Load the verifying key only when this layer has segments to check.
         let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
 
-        // Process in priority order (last write wins):
-        //   1. gc/*.applied  — lowest: GC-compacted data, ULID < the following WAL flush
-        //   2. index/*.idx   — middle: committed segments promoted from pending/
-        //   3. pending/      — highest: in-flight WAL flushes, always most recent
-        //
-        // This ordering ensures that a pending-then-promoted segment (index/*.idx)
-        // with a higher ULID than the GC output correctly shadows the GC entry
-        // for any overlapping LBA.
-        for path in gc_paths
-            .iter()
-            .chain(cache_paths.iter())
-            .chain(pending_paths.iter())
-        {
-            let (_bss, entries, _inputs) = match segment::read_and_verify_segment_index(path, &vk) {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warn!(
-                        "segment vanished during rebuild (GC race): {}",
-                        path.display()
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+        for sref in &segments {
+            let (_bss, entries, _inputs) =
+                match segment::read_and_verify_segment_index(&sref.path, &vk) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        warn!(
+                            "segment vanished during rebuild (GC race): {}",
+                            sref.path.display()
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             for entry in entries {
                 // CanonicalBody entries carry a body for dedup resolution
                 // via the extent index but make no LBA claim on rebuild.

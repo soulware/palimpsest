@@ -322,83 +322,53 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in forks {
-        // Process pending/ and gc/*.applied first (absolute offsets, full
-        // segment files still on disk).  index/*.idx is processed second
-        // (body-relative offsets for cache/.body files).  Both loops use
-        // insert_if_absent (first-write-wins = lowest ULID canonical).
+        // Discover all segments in race-safe listing order (pending → gc →
+        // index) and rebuild-processing order (gc → index → pending). Both
+        // `lbamap::rebuild_segments` and this function share the helper.
         //
-        // When the same segment appears in both pending/ and index/ (crash
-        // recovery: coordinator wrote index/ but didn't delete pending/),
-        // the pending/ entry goes in first and the index/ entry is skipped.
-        // The read path checks pending/ before cache/, so the stored
-        // absolute offsets match the file that will actually be opened.
-        let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
-        // Include GC handoff bodies in .applied state (volume-signed, in gc/
-        // awaiting coordinator upload to S3).
-        let bare_gc_paths = segment::collect_gc_applied_segment_files(fork_dir)?;
-        paths.extend(bare_gc_paths.iter().cloned());
-        segment::sort_for_rebuild(fork_dir, &mut paths);
+        // Insert semantics are per-tier: `insert_if_absent` is used
+        // throughout (first-write-wins = lowest ULID canonical). Because
+        // we iterate tiers in gc → index → pending order and each tier in
+        // ULID order, the first insert for any hash comes from the
+        // lowest-ULID segment holding it — matching the documented rule.
+        let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
-        if let Some(cutoff) = branch_ulid {
-            paths.retain(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-        }
-
-        // Each bare GC body declares the input segments it superseded via the
-        // segment header's `inputs` field. Their `index/<input>.idx` files are
-        // stale: any entry the bare body deliberately omitted (a Removed entry)
-        // would be re-introduced into the rebuilt extent index by
-        // insert_if_absent, leaving a dangling reference once the coordinator
-        // finishes apply_done_handoffs and deletes the input segments.
-        // Skip those .idx files entirely. Found by HandoffProtocol.tla.
+        // Each bare GC body declares the input segments it superseded via
+        // its `inputs` field. Those inputs' `index/<input>.idx` files are
+        // stale: any entry the bare body deliberately omitted (a Removed
+        // entry) would be re-introduced here by `insert_if_absent`, leaving
+        // a dangling reference once the coordinator finishes
+        // `apply_done_handoffs` and deletes the input segments.
+        // Skip those index entries entirely. Found by HandoffProtocol.tla.
         let mut consumed_inputs: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
-        for bare_path in &bare_gc_paths {
-            if let Ok((_, _, inputs)) = segment::read_segment_index(bare_path) {
+        for sref in &segments {
+            if sref.tier == segment::SegmentTier::GcApplied
+                && let Ok((_, _, inputs)) = segment::read_segment_index(&sref.path)
+            {
                 for input in inputs {
                     consumed_inputs.insert(input);
                 }
             }
         }
 
-        let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
-        cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
-        cache_paths.retain(|p| {
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-                return true;
-            };
-            match Ulid::from_string(stem) {
-                Ok(ulid) => !consumed_inputs.contains(&ulid),
-                Err(_) => true,
-            }
-        });
-        if let Some(cutoff) = branch_ulid {
-            cache_paths.retain(|p| {
-                p.file_stem()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n <= cutoff.as_str())
-                    .unwrap_or(false)
-            });
-        }
+        // Filter out the stale Index entries consumed by bare GC outputs.
+        let segments: Vec<segment::SegmentRef> = segments
+            .into_iter()
+            .filter(|s| {
+                !(s.tier == segment::SegmentTier::Index && consumed_inputs.contains(&s.ulid))
+            })
+            .collect();
 
-        if cache_paths.is_empty() && paths.is_empty() {
+        if segments.is_empty() {
             continue;
         }
 
         // Load the verifying key only when this fork has segments to check.
         let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
 
-        for path in &paths {
-            let segment_id = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad segment filename"))?;
-            // Validate as ULID.
-            let segment_id =
-                Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
+        for sref in &segments {
+            let segment_id = sref.ulid;
+            let path = &sref.path;
 
             let (body_section_start, entries, _inputs) =
                 match segment::read_and_verify_segment_index(path, &vk) {
@@ -421,34 +391,59 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 Vec::new()
             };
 
-            // Capture the segment's body_length so Delta entries can
-            // record their delta body offset relative to the body
-            // section. Only needed when at least one Delta entry is
-            // present.
-            let delta_body_length = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
-                Some(segment::read_segment_layout(path)?.body_length)
-            } else {
-                None
+            // Per-tier body wiring.
+            //
+            // Pending/GcApplied: the full segment file is still on disk at
+            // its pending/ or gc/ path; body offsets are absolute within
+            // that file, and Delta body resolution uses the header's
+            // `body_length` + `body_section_start` to locate the delta
+            // body section inside the same file.
+            //
+            // Index: the segment lives in the two-file cache format
+            // (`cache/<ulid>.body` + `<ulid>.idx`). Body offsets are
+            // body-section-relative (the `.body` file starts at byte 0 of
+            // the body section); Delta body resolution uses
+            // `DeltaBodySource::Cached`, which checks for a separate
+            // `cache/<ulid>.delta` file and demand-fetches if missing.
+            let (body_src_builder, delta_body_source): (
+                Box<dyn Fn(u32) -> BodySource>,
+                DeltaBodySource,
+            ) = match sref.tier {
+                segment::SegmentTier::Pending | segment::SegmentTier::GcApplied => {
+                    // Capture body_length for DeltaBodySource::Full; only
+                    // needed if Delta entries are present.
+                    let body_length = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
+                        segment::read_segment_layout(path)?.body_length
+                    } else {
+                        0
+                    };
+                    (
+                        Box::new(|_idx: u32| BodySource::Local),
+                        DeltaBodySource::Full {
+                            body_section_start,
+                            body_length,
+                        },
+                    )
+                }
+                segment::SegmentTier::Index => (
+                    Box::new(|idx: u32| BodySource::Cached(idx)),
+                    DeltaBodySource::Cached,
+                ),
             };
 
-            for entry in entries {
+            for (raw_idx, entry) in entries.iter().enumerate() {
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline => {}
                     EntryKind::DedupRef | EntryKind::Zero => continue,
                     EntryKind::Delta => {
-                        if let Some(body_length) = delta_body_length {
-                            index.insert_delta_if_absent(
-                                entry.hash,
-                                DeltaLocation {
-                                    segment_id,
-                                    body_source: DeltaBodySource::Full {
-                                        body_section_start,
-                                        body_length,
-                                    },
-                                    options: entry.delta_options.clone(),
-                                },
-                            );
-                        }
+                        index.insert_delta_if_absent(
+                            entry.hash,
+                            DeltaLocation {
+                                segment_id,
+                                body_source: delta_body_source,
+                                options: entry.delta_options.clone(),
+                            },
+                        );
                         continue;
                     }
                 }
@@ -471,105 +466,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
-                        body_source: BodySource::Local,
-                        body_section_start,
-                        inline_data: idata,
-                    },
-                );
-            }
-        }
-
-        for path in &cache_paths {
-            let segment_id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad cache idx filename"))?;
-            let segment_id =
-                Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
-
-            // .idx file size == body_section_start (the file is exactly the
-            // [0, body_section_start) prefix of the full segment).
-            let body_section_start = segment::idx_body_section_start(path)?;
-
-            let layout = match segment::read_segment_layout(path) {
-                Ok(l) => l,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warn!(
-                        "segment vanished during rebuild (GC race): {}",
-                        path.display()
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let body_length = layout.body_length;
-            let delta_length = layout.delta_length;
-
-            let entries = match segment::read_and_verify_segment_index(path, &vk) {
-                Ok((_, entries, _)) => entries,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warn!(
-                        "segment vanished during rebuild (GC race): {}",
-                        path.display()
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            // Read inline section from .idx (which includes header + index + inline).
-            let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
-            let inline_bytes = if has_inline {
-                segment::read_inline_section(path)?
-            } else {
-                Vec::new()
-            };
-
-            // For cached segments, Delta entries register unconditionally:
-            // the delta body lives in a separate `cache/<id>.delta` file
-            // which may or may not be present locally. The reader
-            // (`try_read_delta_extent`) stats `.delta` before reading and
-            // demand-fetches via the attached `SegmentFetcher` when it's
-            // missing. Rebuild has no file-size check for delta presence.
-            let _ = (body_length, delta_length); // retained for future diagnostics
-
-            for (raw_idx, entry) in entries.iter().enumerate() {
-                match entry.kind {
-                    EntryKind::Data | EntryKind::Inline => {}
-                    EntryKind::DedupRef | EntryKind::Zero => continue,
-                    EntryKind::Delta => {
-                        index.insert_delta_if_absent(
-                            entry.hash,
-                            DeltaLocation {
-                                segment_id,
-                                body_source: DeltaBodySource::Cached,
-                                options: entry.delta_options.clone(),
-                            },
-                        );
-                        continue;
-                    }
-                }
-                let idata = if entry.kind == EntryKind::Inline {
-                    let start = entry.stored_offset as usize;
-                    let end = start + entry.stored_length as usize;
-                    if end <= inline_bytes.len() {
-                        Some(inline_bytes[start..end].into())
-                    } else {
-                        continue;
-                    }
-                } else {
-                    None
-                };
-                // body_offset is body-relative: the .body file starts at byte 0
-                // of the body section, so no adjustment needed.
-                // body_source and body_section_start enable per-extent range-GETs.
-                index.insert_if_absent(
-                    entry.hash,
-                    ExtentLocation {
-                        segment_id,
-                        body_offset: entry.stored_offset,
-                        body_length: entry.stored_length,
-                        compressed: entry.compressed,
-                        body_source: BodySource::Cached(raw_idx as u32),
+                        body_source: body_src_builder(raw_idx as u32),
                         body_section_start,
                         inline_data: idata,
                     },
