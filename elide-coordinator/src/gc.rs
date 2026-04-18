@@ -209,6 +209,26 @@ pub async fn gc_fork(
         .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
+    // Segments with at least one partially-LBA-dead entry are ineligible
+    // for compaction this pass: re-emitting their bloated LBA claim at the
+    // GC output's higher ULID would shadow or erase later writes on rebuild.
+    // Leave them in place at their original (low) ULID; the next rebuild
+    // applies them in order and lbamap-insert's split logic handles the
+    // overlap correctly. See `docs/design-gc-overlap-correctness.md`.
+    let (deferred, all_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
+        all_stats.into_iter().partition(|s| s.has_partial_death);
+    if !deferred.is_empty() {
+        let deferred_ulids: Vec<String> = deferred
+            .iter()
+            .map(|s| s.ulid_str[..8].to_string())
+            .collect();
+        tracing::info!(
+            "[gc] deferring {} segment(s) with partial-LBA-death entries: [{}]",
+            deferred.len(),
+            deferred_ulids.join(", ")
+        );
+    }
+
     // Pre-pass: extract fully-dead segments (no live entries, no extent index
     // refs).  These are the cheapest possible GC: the handoff is tombstone-only
     // (just `dead` lines), no S3 fetch, no segment write, no upload — the
@@ -610,6 +630,16 @@ struct SegmentStats {
     /// The volume must remove these from its extent index when applying the
     /// handoff, since the old segment files will be deleted.
     removed_hashes: Vec<blake3::Hash>,
+    /// True if at least one body-bearing entry in this segment has a partial
+    /// LBA-death — part of its claimed range is still live at its hash but
+    /// another part has been overwritten. Such segments must not be
+    /// compacted this pass (see `docs/design-gc-overlap-correctness.md`):
+    /// re-emitting the bloated (start_lba, lba_length) claim at the GC
+    /// output's higher ULID would shadow or erase the overwriter on
+    /// rebuild. Leaving the segment in place preserves correctness
+    /// because the original low-ULID claim is split correctly at
+    /// lbamap-insert time by subsequent segments.
+    has_partial_death: bool,
 }
 
 impl SegmentStats {
@@ -699,6 +729,7 @@ fn collect_stats(
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut live_entry_indices: Vec<u32> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
+        let mut has_partial_death = false;
 
         for (entry_idx, mut entry) in entries.into_iter().enumerate() {
             let entry_idx = entry_idx as u32;
@@ -763,45 +794,71 @@ fn collect_stats(
                 }
                 continue;
             }
-            // DATA / Inline entries carry both a hash (→ body) and an LBA
-            // claim.  They have three flavours of liveness:
+            // DATA / Inline / Delta entries carry both a hash (→ body) and
+            // an LBA claim. Liveness classification uses a full-range scan
+            // against the lbamap, not a point query at `start_lba`, because
+            // a multi-LBA entry's head, tail, or interior may have been
+            // overwritten by later writes while `start_lba` is unaffected
+            // (and vice versa). See `docs/design-gc-overlap-correctness.md`.
             //
-            //   1. **LBA-live**: `lbamap[start_lba] == hash`.  Keep the
-            //      entry intact — its LBA binding is authoritative.
-            //   2. **LBA-dead, hash-live elsewhere**: the entry's LBA was
-            //      overwritten with different content, but the hash is still
-            //      referenced (e.g. via a DedupRef at another LBA).  We
-            //      must preserve the body for dedup resolution, but must
-            //      NOT preserve the LBA binding — keeping it at the
-            //      original LBA would re-assert the stale mapping on
-            //      rebuild (see bug H regression in tests).  Demote to
-            //      `canonical_only`: zero the LBA fields and mark the
-            //      entry so rebuild skips the lbamap insert.
-            //   3. **LBA-dead, hash-dead**: fully orphaned.  Record the
-            //      hash for extent-index removal and drop the entry.
-            let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+            // Outcomes:
+            //   - **fully alive** (every LBA in the range maps to
+            //     `entry.hash`): keep the entry intact. Its LBA binding is
+            //     authoritative and compacts cleanly.
+            //   - **fully dead** (no LBA in the range maps to `entry.hash`):
+            //     * hash still referenced elsewhere (DedupRef / alias-merge
+            //       orphan): demote to `canonical_only`. Body survives for
+            //       extent-index resolution; no LBA claim on rebuild.
+            //     * hash orphaned entirely: record for extent-index removal
+            //       and drop.
+            //   - **partially alive** (some LBAs still live at `entry.hash`,
+            //     others overwritten): mark the segment as having partial
+            //     LBA-death. `gc_fork` excludes such segments from this
+            //     compaction pass entirely — leaving the bloated entry in
+            //     place at its original ULID so rebuild applies segments
+            //     in ULID order and `lbamap::insert`'s split logic produces
+            //     the correct final state. Re-emitting the bloated claim
+            //     at the GC output's higher ULID would shadow or erase
+            //     the overwriter.
+            let end_lba = entry.start_lba + entry.lba_length as u64;
+            let runs = lba_map.extents_in_range(entry.start_lba, end_lba);
+            let matching_blocks: u64 = runs
+                .iter()
+                .filter(|r| r.hash == entry.hash)
+                .map(|r| r.range_end - r.range_start)
+                .sum();
+            let total_blocks = entry.lba_length as u64;
             let extent_live = index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_ulid);
-            if lba_live {
+
+            if matching_blocks == total_blocks {
+                // Fully alive.
                 live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
                 live_entry_indices.push(entry_idx);
-            } else if extent_live && live_hashes.contains(&entry.hash) {
-                // Canonical body must survive for the DedupRef(s) that
-                // keep `entry.hash` live elsewhere, but this LBA's binding
-                // is dead.  Demote.
-                entry.canonical_only = true;
-                entry.start_lba = 0;
-                entry.lba_length = 0;
-                // Do NOT add to live_lba_bytes — the entry makes no LBA
-                // claim anymore, so density math treats this as reclaimed.
+            } else if matching_blocks == 0 {
+                if extent_live && live_hashes.contains(&entry.hash) {
+                    // Fully LBA-dead but hash still externally live.
+                    entry.canonical_only = true;
+                    entry.start_lba = 0;
+                    entry.lba_length = 0;
+                    live_entries.push(entry);
+                    live_entry_indices.push(entry_idx);
+                } else if extent_live {
+                    // Fully dead.
+                    removed_hashes.push(entry.hash);
+                }
+            } else {
+                // Partially alive: mark the segment ineligible for this
+                // compaction pass. Keep the original entry in live_entries
+                // so density accounting reflects reality (partial live),
+                // but `has_partial_death = true` will cause gc_fork to
+                // exclude this segment from repack/sweep.
+                live_lba_bytes += matching_blocks * BLOCK_BYTES;
                 live_entries.push(entry);
                 live_entry_indices.push(entry_idx);
-            } else if extent_live {
-                // Fully dead: LBA overwritten AND hash orphaned.  Tell the
-                // volume to drop the dangling extent-index entry.
-                removed_hashes.push(entry.hash);
+                has_partial_death = true;
             }
         }
 
@@ -819,6 +876,7 @@ fn collect_stats(
             live_entries,
             live_entry_indices,
             removed_hashes,
+            has_partial_death,
         });
     }
     Ok(result)
@@ -1519,6 +1577,7 @@ mod tests {
                 live_entries: vec![data_entry()],
                 live_entry_indices: vec![0],
                 removed_hashes: Vec::new(),
+                has_partial_death: false,
             }
         }
 
@@ -1543,6 +1602,7 @@ mod tests {
             live_entries: Vec::new(),
             live_entry_indices: Vec::new(),
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
         assert_eq!(s.dead_lba_bytes(), 224 * 1024);
         // density = 0.78 >= 0.70 threshold: repack would have caught it if below.
@@ -1562,6 +1622,7 @@ mod tests {
                 live_entries: Vec::new(),
                 live_entry_indices: Vec::new(),
                 removed_hashes: Vec::new(),
+                has_partial_death: false,
             }
         }
         let stats = vec![make(80), make(90), make(100)];
@@ -2181,6 +2242,253 @@ mod tests {
         }
     }
 
+    /// Helper: drain pending/ into index/+cache/ in ULID order, return the sorted ULIDs.
+    fn drain_pending(
+        fork_dir: &std::path::Path,
+        vol: &mut elide_core::volume::Volume,
+    ) -> Vec<ulid::Ulid> {
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
+        }
+        ulids.sort();
+        for ulid in &ulids {
+            vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(*ulid).unwrap();
+        }
+        ulids
+    }
+
+    /// Helper: assert the two rebuild invariants for S1 after collect_stats.
+    ///
+    /// If `has_partial_death` is set, the segment is excluded from this
+    /// GC pass by `gc_fork`: it stays on disk with its original entries
+    /// intact, and rebuild applies it in ULID order correctly. No further
+    /// checks needed.
+    ///
+    /// Otherwise two invariants must hold over `live_entries`:
+    ///
+    /// 1. **Shadow.** Every emitted live entry's LBA claim must match the
+    ///    current lbamap across its full range. Otherwise rebuild at a
+    ///    higher ULID re-asserts a stale mapping and overwrites the
+    ///    correct binding.
+    ///
+    /// 2. **Loss.** Every LBA within S1's original range that currently
+    ///    resolves to S1's hash must be covered by some emitted
+    ///    non-canonical-only entry with that hash. Otherwise rebuild
+    ///    produces a hole where a binding used to exist (particularly
+    ///    important when the old segment is consumed and a surviving
+    ///    `payload_block_offset`-aliased tail has no first-class claim
+    ///    left on disk).
+    fn assert_no_shadow_or_loss_on_rebuild(
+        s1_stats: &SegmentStats,
+        lbamap: &elide_core::lbamap::LbaMap,
+        original_range: std::ops::Range<u64>,
+        original_hash: blake3::Hash,
+        shape: &str,
+    ) {
+        if s1_stats.has_partial_death {
+            return;
+        }
+        // Invariant 1: no shadow.
+        for entry in &s1_stats.live_entries {
+            if !matches!(
+                entry.kind,
+                EntryKind::Data | EntryKind::Inline | EntryKind::Delta
+            ) {
+                continue;
+            }
+            if entry.canonical_only || entry.lba_length == 0 {
+                continue;
+            }
+            let end = entry.start_lba + entry.lba_length as u64;
+            for lba in entry.start_lba..end {
+                assert_eq!(
+                    lbamap.hash_at(lba),
+                    Some(entry.hash),
+                    "[{shape}] shadow: S1 live entry {:?} at [{}+{}) hash={} \
+                     claims LBA {} whose current lbamap mapping is {:?} — \
+                     would shadow the correct binding on rebuild.",
+                    entry.kind,
+                    entry.start_lba,
+                    entry.lba_length,
+                    entry.hash.to_hex(),
+                    lba,
+                    lbamap.hash_at(lba).map(|h| h.to_hex().to_string()),
+                );
+            }
+        }
+
+        // Invariant 2: no loss.
+        let mut claimed = std::collections::HashSet::new();
+        for entry in &s1_stats.live_entries {
+            if entry.canonical_only || entry.hash != original_hash {
+                continue;
+            }
+            if !matches!(
+                entry.kind,
+                EntryKind::Data | EntryKind::Inline | EntryKind::Delta
+            ) {
+                continue;
+            }
+            for lba in entry.start_lba..(entry.start_lba + entry.lba_length as u64) {
+                claimed.insert(lba);
+            }
+        }
+        for lba in original_range {
+            if lbamap.hash_at(lba) == Some(original_hash) {
+                assert!(
+                    claimed.contains(&lba),
+                    "[{shape}] loss: LBA {} still resolves to hash {} but no \
+                     emitted S1 entry claims it — rebuild would lose this binding \
+                     once S1's input segment is consumed.",
+                    lba,
+                    original_hash.to_hex(),
+                );
+            }
+        }
+    }
+
+    /// Scenario for a multi-LBA Data entry overlapped by a later single-LBA
+    /// write at position `overlap_off`.
+    ///
+    /// S1 writes 4 LBAs of high-entropy content at LBA 100 → one DATA entry
+    /// with lba_length=4, hash=H.
+    /// S2 writes 1 LBA of different content at LBA (100 + overlap_off).
+    /// After both, lbamap splits S1's entry into sub-runs via
+    /// `payload_block_offset` aliasing. No later segment on disk ever
+    /// re-records the surviving H sub-run(s) as first-class claims.
+    ///
+    /// Bug: `collect_stats` sees S1's entry, point-queries hash_at(100)
+    /// (still H except when overlap_off=0), and either keeps the whole
+    /// (100, 4, H) claim intact or demotes to canonical_only. In both
+    /// cases the GC output at a higher ULID shadows the correct binding
+    /// on rebuild.
+    fn run_multi_lba_overlap_scenario(overlap_off: u64, shape: &'static str) {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+
+        // 4 LBAs worth of high-entropy content, one hash.
+        let mut h_bytes = vec![0u8; 4 * 4096];
+        for (i, b) in h_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let h = blake3::hash(&h_bytes);
+
+        // Single-LBA overwriting content, distinct hash.
+        let mut w_bytes = [0u8; 4096];
+        for (i, b) in w_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(59).wrapping_add(11);
+        }
+        let w = blake3::hash(&w_bytes);
+        assert_ne!(h, w, "test precondition: H and W must differ");
+
+        // S1: multi-LBA Data at LBA 100..104.
+        vol.write(100, &h_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S2: single-LBA Data at LBA (100 + overlap_off).
+        vol.write(100 + overlap_off, &w_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        let ulids = drain_pending(fork_dir, &mut vol);
+        let s1_ulid = ulids[0].to_string();
+
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.lba_referenced_hashes();
+
+        // Preconditions: S2 landed at its LBA with hash w, and at least one
+        // LBA in S1's range still resolves to h.
+        assert_eq!(
+            lbamap.hash_at(100 + overlap_off),
+            Some(w),
+            "[{shape}] LBA {} must be w",
+            100 + overlap_off
+        );
+        let mut surviving_h = 0;
+        for lba in 100u64..104 {
+            if lbamap.hash_at(lba) == Some(h) {
+                surviving_h += 1;
+            }
+        }
+        assert!(
+            surviving_h > 0,
+            "[{shape}] test precondition: at least one LBA of S1's range must still resolve to h"
+        );
+
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        let s1_stats = stats
+            .iter()
+            .find(|s| s.ulid_str == s1_ulid)
+            .expect("S1 must be in collect_stats output");
+
+        assert_no_shadow_or_loss_on_rebuild(s1_stats, &lbamap, 100..104, h, shape);
+    }
+
+    /// Bug (tail overwrite): S1 has DATA H at [100, 4). S2 overwrites LBA
+    /// 103 with W. `hash_at(100) = H` → point query says LIVE → S1's
+    /// whole entry kept intact → GC output at higher ULID re-asserts
+    /// (100, 4, H), shadowing S2's W at LBA 103 on rebuild.
+    ///
+    /// Expected (post-fix): S1 is skipped (partially alive; segment
+    /// ineligible for this compaction pass) OR the emitted claim
+    /// covers only the surviving LBAs 100-102.
+    #[test]
+    fn collect_stats_skips_entry_with_tail_overwrite() {
+        run_multi_lba_overlap_scenario(3, "tail");
+    }
+
+    /// Bug (interior overwrite): S1 has DATA H at [100, 4). S2 overwrites
+    /// LBA 102 with W. `hash_at(100) = H` → point query says LIVE → whole
+    /// entry kept intact → GC output shadows S2 on rebuild.
+    ///
+    /// Expected (post-fix): S1 is skipped or its emitted claim covers only
+    /// LBAs whose current mapping is H.
+    #[test]
+    fn collect_stats_skips_entry_with_interior_overwrite() {
+        run_multi_lba_overlap_scenario(2, "interior");
+    }
+
+    /// Bug (head overwrite): S1 has DATA H at [100, 4). S2 overwrites LBA
+    /// 100 with W. `hash_at(100) = W` → point query says DEAD → falls into
+    /// `canonical_only` demotion (because H is still live via the surviving
+    /// tail 101..104). S1's disk segment is consumed. The surviving tail
+    /// [101, 3, H) existed only as a runtime `payload_block_offset` alias
+    /// inside S1's original entry — with S1 gone and no new segment
+    /// re-asserting the tail claim, rebuild reads LBAs 101-103 as zero.
+    /// Silent data loss.
+    ///
+    /// Expected (post-fix): S1 is skipped (partially alive; keep the
+    /// bloated entry on disk so rebuild's ULID-order application still
+    /// splits it correctly via the existing lbamap split-on-overwrite).
+    #[test]
+    fn collect_stats_skips_entry_with_head_overwrite() {
+        run_multi_lba_overlap_scenario(0, "head");
+    }
+
     // --- fetch_live_bodies tests ---
 
     /// Helper: build a SegmentEntry with given kind, stored_offset, stored_length,
@@ -2235,6 +2543,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
         let tmp = TempDir::new().unwrap();
         fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
@@ -2270,6 +2579,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -2332,6 +2642,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
 
         // Waste = 1MB - 8192 ≈ 1MB. Two batches (entries are far apart).
@@ -2395,6 +2706,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
 
         // Waste ≈ 1MB, 1 batch (adjacent → coalesced) → waste/batch ≈ 1MB >> 128KB.
@@ -2436,6 +2748,7 @@ mod tests {
             live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 0)],
             live_entry_indices: vec![0],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -2487,6 +2800,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
 
         fetch_live_bodies(&mut candidate, "vol", fork_dir, &store)
@@ -2547,6 +2861,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            has_partial_death: false,
         };
 
         fetch_live_bodies(&mut candidate, "vol", fork_dir, &store)
