@@ -125,6 +125,22 @@ enum SimOp {
         inner_off: u8,
         seed: u8,
     },
+    /// Write a multi-LBA Data entry `[seed_big; span * 4096]` to
+    /// `start_lba`, flush, then write a single-LBA `[seed_small; 4096]` to
+    /// `start_lba + overlap_off` and flush. The second write punches a
+    /// hole at head / tail / interior depending on `overlap_off`, leaving
+    /// the first segment with a bloated multi-LBA claim whose live range
+    /// has splits. `collect_stats` must mark the segment has_partial_death
+    /// and exclude it from compaction; otherwise the re-emitted claim at
+    /// the GC output's higher ULID shadows or erases the overwriter on
+    /// rebuild. See docs/design-gc-overlap-correctness.md.
+    MultiLbaWriteThenOverwrite {
+        start_lba: u8,
+        span: u8,
+        overlap_off: u8,
+        seed_big: u8,
+        seed_small: u8,
+    },
     /// Flush the WAL to a pending/ segment.
     Flush,
     /// Run the full real coordinator GC round-trip, then assert the oracle.
@@ -166,6 +182,17 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
                 span,
                 inner_off,
                 seed,
+            },
+        ),
+        2 => (0u8..4, 2u8..=4, 0u8..=3, any::<u8>(), any::<u8>()).prop_map(
+            |(start_lba, span, overlap_off, seed_big, seed_small)| {
+                SimOp::MultiLbaWriteThenOverwrite {
+                    start_lba,
+                    span,
+                    overlap_off,
+                    seed_big,
+                    seed_small,
+                }
             },
         ),
         2 => Just(SimOp::Flush),
@@ -249,6 +276,21 @@ proptest! {
                     let _ = vol.write(inner, &[*seed; 4096]);
                     let _ = vol.flush_wal();
                 }
+                SimOp::MultiLbaWriteThenOverwrite {
+                    start_lba,
+                    span,
+                    overlap_off,
+                    seed_big,
+                    seed_small,
+                } => {
+                    let big = vec![*seed_big; *span as usize * 4096];
+                    let _ = vol.write(*start_lba as u64, &big);
+                    let _ = vol.flush_wal();
+                    let hit =
+                        (*start_lba as u64) + (*overlap_off as u64).min(*span as u64 - 1);
+                    let _ = vol.write(hit, &[*seed_small; 4096]);
+                    let _ = vol.flush_wal();
+                }
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
                 }
@@ -306,21 +348,28 @@ proptest! {
                         // the compacted set, plus any segments that
                         // gc_checkpoint wrote this tick (they were excluded
                         // from compaction because their cache body is not
-                        // yet present and will be drained next tick).
+                        // yet present and will be drained next tick), plus
+                        // any segments held back by the partial-LBA-death
+                        // deferral (see design-gc-overlap-correctness.md —
+                        // bloated multi-LBA entries stay on disk at their
+                        // original ULID).
                         let idx_after: usize = fs::read_dir(&index_dir)
                             .map(|d| d.flatten().count())
                             .unwrap_or(0);
-                        let idx_max = 1 + checkpoint_extra;
+                        let idx_max = 1 + checkpoint_extra + stats.deferred;
                         prop_assert!(
                             idx_after <= idx_max,
                             "after GcSweep on {} segments, {} .idx files remain \
-                             (expected ≤{}: 1 GC output + {} checkpoint segment(s))",
+                             (expected ≤{}: 1 GC output + {} checkpoint segment(s) \
+                             + {} deferred)",
                             idx_before,
                             idx_after,
                             idx_max,
-                            checkpoint_extra
+                            checkpoint_extra,
+                            stats.deferred,
                         );
-                        // cache/ .body files: same count as .idx files.
+                        // cache/ .body files: 1 GC output + any deferred
+                        // segments (their bodies are still in cache/).
                         let bodies_after: usize = fs::read_dir(&cache_dir)
                             .map(|d| {
                                 d.flatten()
@@ -331,9 +380,12 @@ proptest! {
                             })
                             .unwrap_or(0);
                         prop_assert!(
-                            bodies_after <= 1,
-                            "after GcSweep, {} .body files remain in cache/ (expected ≤1)",
-                            bodies_after
+                            bodies_after <= 1 + stats.deferred,
+                            "after GcSweep, {} .body files remain in cache/ \
+                             (expected ≤{}: 1 GC output + {} deferred)",
+                            bodies_after,
+                            1 + stats.deferred,
+                            stats.deferred,
                         );
                     }
                 }
@@ -421,6 +473,28 @@ proptest! {
                     let _ = vol.write(inner, &data);
                     let _ = vol.flush_wal();
                     oracle.insert(inner, data);
+                }
+                SimOp::MultiLbaWriteThenOverwrite {
+                    start_lba,
+                    span,
+                    overlap_off,
+                    seed_big,
+                    seed_small,
+                } => {
+                    let big = vec![*seed_big; *span as usize * 4096];
+                    let _ = vol.write(*start_lba as u64, &big);
+                    let _ = vol.flush_wal();
+                    let end = *start_lba as u64 + *span as u64;
+                    let big_block = [*seed_big; 4096];
+                    for lba in (*start_lba as u64)..end {
+                        oracle.insert(lba, big_block);
+                    }
+                    let hit =
+                        (*start_lba as u64) + (*overlap_off as u64).min(*span as u64 - 1);
+                    let small = [*seed_small; 4096];
+                    let _ = vol.write(hit, &small);
+                    let _ = vol.flush_wal();
+                    oracle.insert(hit, small);
                 }
                 SimOp::Flush => {
                     let _ = vol.flush_wal();

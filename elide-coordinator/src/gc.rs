@@ -126,6 +126,10 @@ pub struct GcStats {
     pub total_segments: usize,
     /// Number of fully-dead segments cleaned up in the pre-pass.
     pub dead_cleaned: usize,
+    /// Number of segments held back because they have at least one
+    /// partially-LBA-dead body-bearing entry. See
+    /// `docs/design-gc-overlap-correctness.md`.
+    pub deferred: usize,
 }
 
 impl GcStats {
@@ -135,6 +139,7 @@ impl GcStats {
             candidates: 0,
             bytes_freed: 0,
             dead_cleaned: 0,
+            deferred: 0,
             total_segments,
         }
     }
@@ -217,6 +222,7 @@ pub async fn gc_fork(
     // overlap correctly. See `docs/design-gc-overlap-correctness.md`.
     let (deferred, all_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
+    let deferred_count = deferred.len();
     if !deferred.is_empty() {
         let deferred_ulids: Vec<String> = deferred
             .iter()
@@ -224,7 +230,7 @@ pub async fn gc_fork(
             .collect();
         tracing::info!(
             "[gc] deferring {} segment(s) with partial-LBA-death entries: [{}]",
-            deferred.len(),
+            deferred_count,
             deferred_ulids.join(", ")
         );
     }
@@ -364,12 +370,15 @@ pub async fn gc_fork(
     };
 
     match (ran_repack, ran_sweep) {
-        (false, None) if dead_count == 0 => Ok(GcStats::none(total_segments)),
+        (false, None) if dead_count == 0 && deferred_count == 0 => {
+            Ok(GcStats::none(total_segments))
+        }
         (false, None) => Ok(GcStats {
             strategy: GcStrategy::None,
             candidates: 0,
             bytes_freed: 0,
             dead_cleaned: dead_count,
+            deferred: deferred_count,
             total_segments,
         }),
         (true, None) => Ok(GcStats {
@@ -377,6 +386,7 @@ pub async fn gc_fork(
             candidates: 1,
             bytes_freed: repack_bytes,
             dead_cleaned: dead_count,
+            deferred: deferred_count,
             total_segments,
         }),
         (false, Some((n, sweep_bytes))) => Ok(GcStats {
@@ -384,6 +394,7 @@ pub async fn gc_fork(
             candidates: n,
             bytes_freed: sweep_bytes,
             dead_cleaned: dead_count,
+            deferred: deferred_count,
             total_segments,
         }),
         (true, Some((n, sweep_bytes))) => Ok(GcStats {
@@ -391,6 +402,7 @@ pub async fn gc_fork(
             candidates: 1 + n,
             bytes_freed: repack_bytes + sweep_bytes,
             dead_cleaned: dead_count,
+            deferred: deferred_count,
             total_segments,
         }),
     }
