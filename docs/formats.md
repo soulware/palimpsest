@@ -247,6 +247,7 @@ delta_offset  = 100 + index_length + inline_length + body_length
 - `0x08` `FLAG_DEDUP_REF` — dedup reference; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry layout is the same 64 bytes as DATA. See § Segment File Format — FLAG_DEDUP_REF below.
 - `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
 - `0x20` `FLAG_DELTA` — thin delta entry; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry implies `FLAG_HAS_DELTAS` and must have at least one delta option; the content is served by fetching a delta blob from the segment's delta body section and decompressing it against the `source_hash` extent body located via the extent index. See § Segment File Format — FLAG_DELTA below.
+- `0x40` `FLAG_CANONICAL_ONLY` — canonical-body-only entry. Co-exists with DATA (body in body section) or `FLAG_INLINE` (body in inline section); incompatible with `FLAG_DEDUP_REF`, `FLAG_ZERO`, `FLAG_DELTA`. The entry carries body bytes (its hash is canonical in this segment, resolvable via `extent_index.lookup`) but makes **no LBA claim**: `start_lba` and `lba_length` are serialised as zero and the entry is skipped by `lbamap::rebuild_segments`. Emitted by GC when a DATA/INLINE entry's original LBA has been overwritten (LBA-dead) but its hash is still referenced elsewhere via a DedupRef. Preserves the canonical body for dedup resolution without re-asserting the stale LBA→hash binding on rebuild. See § Segment File Format — FLAG_CANONICAL_ONLY below.
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
@@ -343,6 +344,18 @@ The **`lba_referenced_hashes()`** set is extended to include delta source hashes
 In `cache/`, `promote_to_cache` treats Delta entries the same as DedupRef entries: `.present` bit unset (delta blob is served from the delta body section, not the `.body` file), no contribution to `.body` size.
 
 **FLAG_ZERO entries** carry only the LBA mapping with ZERO_HASH. No extent index lookup is performed for these entries — the read path returns zeros directly. Zero entries must be present in the segment index (and in the serialised manifest) to correctly mask ancestor data; they are never omitted even though they have no body bytes.
+
+**FLAG_CANONICAL_ONLY entries (canonical body without an LBA claim).** Same 64-byte index layout as DATA/INLINE and the body is stored the same way — in the body section (bare `FLAG_CANONICAL_ONLY`) or the inline section (`FLAG_CANONICAL_ONLY | FLAG_INLINE`). The only differences are:
+
+- `start_lba` and `lba_length` are serialised as **zero** (enforced on write).
+- `lbamap::rebuild_segments` **skips** the entry: it contributes nothing to the LBA map.
+- `extent_index::rebuild` treats it exactly like DATA/INLINE: the entry *is* canonical for its hash, and `extent_index.lookup(hash)` resolves to its location in this segment.
+
+Emitted only by GC, never by the write path. The trigger: `collect_stats` encounters a DATA/INLINE entry whose original `start_lba` is LBA-dead (`lbamap[start_lba] != hash`) but whose hash is still referenced elsewhere via a DedupRef (`live_hashes.contains(&hash)`). Preserving the entry at its original LBA would re-assert the stale LBA→hash binding on rebuild with a higher ULID than whatever wrote the live content — silently shadowing the correct mapping (bug H; see `elide-coordinator/src/gc.rs::tests::collect_stats_preserves_dead_lba_entry_when_hash_live_elsewhere` for the regression test). Demoting to `FLAG_CANONICAL_ONLY` carries the canonical body forward for DedupRef / Delta source resolution while cleanly dropping the dead LBA claim.
+
+**Compatible with**: DATA (body in body section) or INLINE (body in inline section), with optional `FLAG_COMPRESSED`. **Incompatible with**: `FLAG_DEDUP_REF` (thin, no body), `FLAG_ZERO` (sentinel hash), `FLAG_DELTA` (thin, no body).
+
+DedupRef and Delta consumers are kind-agnostic: `extent_index.lookup(hash)` resolves to a canonical entry regardless of whether it's a plain DATA/INLINE or a `CANONICAL_ONLY`-demoted one.
 
 **FLAG_INLINE extents** store their full data in the inline section. Particularly effective for the boot path: small config files, scripts, and locale data appear frequently during boot and are naturally small. A warm-start client that fetches `[0, body_offset)` gets all inline extents with no further requests.
 

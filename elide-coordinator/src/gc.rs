@@ -715,17 +715,26 @@ fn collect_stats(
             total_lba_bytes += lba_bytes;
 
             // Zero extents have no body bytes and use ZERO_HASH as a sentinel
-            // (never in the extent index). Liveness is determined by LBA-map
-            // ownership: the entry is live if the LBA still maps to ZERO_HASH.
-            // Without this check, zero entries would fall into the DATA path,
-            // where index.lookup(ZERO_HASH) always returns None, causing live
-            // zero extents to be silently dropped from GC output — allowing
-            // ancestor data to bleed through after compaction in forked volumes.
+            // (never in the extent index). Liveness is LBA-map ownership: a
+            // sub-range of the entry is live iff the lbamap still maps it to
+            // ZERO_HASH. A Zero entry can span thousands of LBAs (e.g. whole
+            // mkfs TRIM), any subset of which may have since been overwritten
+            // by later writes. Re-emitting the original span at the GC-output
+            // ULID would shadow those later writes on rebuild — so split the
+            // entry into sub-Zeros covering only the surviving ZERO_HASH runs.
             if entry.kind == EntryKind::Zero {
-                let lba_live = lba_map.hash_at(entry.start_lba) == Some(ZERO_HASH);
-                if lba_live {
-                    live_lba_bytes += lba_bytes;
-                    live_entries.push(entry);
+                let end = entry.start_lba + entry.lba_length as u64;
+                for ext in lba_map.extents_in_range(entry.start_lba, end) {
+                    if ext.hash != ZERO_HASH {
+                        continue;
+                    }
+                    let run_len = (ext.range_end - ext.range_start) as u32;
+                    let run_bytes = run_len as u64 * BLOCK_BYTES;
+                    live_lba_bytes += run_bytes;
+                    let mut live = entry.clone();
+                    live.start_lba = ext.range_start;
+                    live.lba_length = run_len;
+                    live_entries.push(live);
                     live_entry_indices.push(entry_idx);
                 }
                 continue;
@@ -754,25 +763,44 @@ fn collect_stats(
                 }
                 continue;
             }
-            // DATA entries are content-addressed: the extent_index tracks a
-            // single canonical location per hash.  When the same hash appears
-            // in multiple segments (e.g. a regular write and a later
-            // dedup ref), only one segment is "canonical" in the
-            // extent_index — the other looks extent-dead even though its LBA
-            // mapping is still live.  Check lba_live first (same as
-            // DedupRef above) so we never drop a live LBA mapping.
+            // DATA / Inline entries carry both a hash (→ body) and an LBA
+            // claim.  They have three flavours of liveness:
+            //
+            //   1. **LBA-live**: `lbamap[start_lba] == hash`.  Keep the
+            //      entry intact — its LBA binding is authoritative.
+            //   2. **LBA-dead, hash-live elsewhere**: the entry's LBA was
+            //      overwritten with different content, but the hash is still
+            //      referenced (e.g. via a DedupRef at another LBA).  We
+            //      must preserve the body for dedup resolution, but must
+            //      NOT preserve the LBA binding — keeping it at the
+            //      original LBA would re-assert the stale mapping on
+            //      rebuild (see bug H regression in tests).  Demote to
+            //      `canonical_only`: zero the LBA fields and mark the
+            //      entry so rebuild skips the lbamap insert.
+            //   3. **LBA-dead, hash-dead**: fully orphaned.  Record the
+            //      hash for extent-index removal and drop the entry.
             let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_ulid);
-            if lba_live || (extent_live && live_hashes.contains(&entry.hash)) {
+            if lba_live {
                 live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
                 live_entry_indices.push(entry_idx);
+            } else if extent_live && live_hashes.contains(&entry.hash) {
+                // Canonical body must survive for the DedupRef(s) that
+                // keep `entry.hash` live elsewhere, but this LBA's binding
+                // is dead.  Demote.
+                entry.canonical_only = true;
+                entry.start_lba = 0;
+                entry.lba_length = 0;
+                // Do NOT add to live_lba_bytes — the entry makes no LBA
+                // claim anymore, so density math treats this as reclaimed.
+                live_entries.push(entry);
+                live_entry_indices.push(entry_idx);
             } else if extent_live {
-                // Extent-index-live but not LBA-map-live: the LBA was
-                // overwritten with different data.  Record so the volume
-                // can remove the dangling extent index entry.
+                // Fully dead: LBA overwritten AND hash orphaned.  Tell the
+                // volume to drop the dangling extent-index entry.
                 removed_hashes.push(entry.hash);
             }
         }
@@ -1156,13 +1184,18 @@ async fn compact_segments(
                 } else {
                     segment::SegmentFlags::empty()
                 };
-                new_entries.push(SegmentEntry::new_data(
+                let mut new = SegmentEntry::new_data(
                     e.hash,
                     e.start_lba,
                     e.lba_length,
                     flags,
                     e.data.take().unwrap_or_default(),
-                ));
+                );
+                // Preserve the canonical-body-only demotion from collect_stats:
+                // the body survives for dedup resolution via extent_index, but
+                // the entry makes no LBA claim on rebuild.
+                new.canonical_only = e.canonical_only;
+                new_entries.push(new);
             }
             EntryKind::Inline => {
                 let flags = if e.compressed {
@@ -1170,13 +1203,15 @@ async fn compact_segments(
                 } else {
                     segment::SegmentFlags::empty()
                 };
-                new_entries.push(SegmentEntry::new_data(
+                let mut new = SegmentEntry::new_data(
                     e.hash,
                     e.start_lba,
                     e.lba_length,
                     flags,
                     e.data.take().unwrap_or_default(),
-                ));
+                );
+                new.canonical_only = e.canonical_only;
+                new_entries.push(new);
             }
             EntryKind::Delta => {
                 // Delta entries carry no body bytes in the thin format.
@@ -1231,8 +1266,35 @@ async fn compact_segments(
     tokio::fs::rename(&tmp_path, &staged_path)
         .await
         .context("staging compacted segment in gc/")?;
+
+    // Per-kind breakdown for visibility. Mirrors the volume's flush log line
+    // (`data / inline / dedup-ref / zero / delta`) plus a `canonical-only`
+    // column: Data/Inline entries whose LBA was dead but whose hash was still
+    // live elsewhere — demoted in `collect_stats` to carry body for dedup
+    // resolution while dropping the stale LBA claim.
+    let mut data = 0usize;
+    let mut inline = 0usize;
+    let mut refs = 0usize;
+    let mut zero = 0usize;
+    let mut delta = 0usize;
+    let mut canonical = 0usize;
+    for e in &new_entries {
+        if e.canonical_only {
+            canonical += 1;
+            continue;
+        }
+        match e.kind {
+            segment::EntryKind::Data => data += 1,
+            segment::EntryKind::Inline => inline += 1,
+            segment::EntryKind::DedupRef => refs += 1,
+            segment::EntryKind::Zero => zero += 1,
+            segment::EntryKind::Delta => delta += 1,
+        }
+    }
     tracing::info!(
-        "[gc] staged output → {new_ulid_str} ({} live entries, {} inputs)",
+        "[gc] staged output → {new_ulid_str}: {data} data, {inline} inline, \
+         {refs} dedup-ref, {zero} zero, {delta} delta, {canonical} canonical-only \
+         ({} entries total, {} inputs)",
         new_entries.len(),
         inputs.len()
     );
@@ -1853,6 +1915,272 @@ mod tests {
         );
     }
 
+    /// Bug H reproduction (DIRECT collect_stats level):
+    ///
+    /// `collect_stats` keeps a DATA entry at its original `start_lba` when
+    /// the LBA has been overwritten with a different hash *and* the entry's
+    /// hash is still live somewhere else (via a DedupRef at a different
+    /// LBA). The preserved entry then carries a spurious LBA→hash binding
+    /// forward into the GC output; when the output lands in `index/` with
+    /// a ULID higher than whichever segment currently writes the correct
+    /// LBA binding, the output shadows it on rebuild — silent data loss.
+    ///
+    /// Scenario:
+    ///   - S1: DATA h2 at LBA 0. Canonical for h2.
+    ///   - S2: DedupRef h2 at LBA 1. Keeps h2 in `live_hashes`.
+    ///   - S3: DATA h1 at LBA 0 (new hash, distinct 4 KiB). Overwrites the
+    ///     LBA mapping so `lbamap[0] = h1`. S1's entry at LBA 0 is now
+    ///     **LBA-dead**.
+    ///
+    /// Expected behaviour (post-fix): S1's GC stats either:
+    ///   (a) do not include a live entry at LBA 0 with hash h2, or
+    ///   (b) include one demoted to a kind that makes no LBA claim on
+    ///       rebuild (`EntryKind::CanonicalBody`).
+    ///
+    /// Current (buggy) behaviour: S1's `live_entries` contains the DATA
+    /// entry at `start_lba=0` with hash h2. Test asserts the entry does
+    /// not carry an LBA-claiming shape — which fails today and will pass
+    /// once the fix lands.
+    #[test]
+    fn collect_stats_preserves_dead_lba_entry_when_hash_live_elsewhere() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+
+        // Use high-entropy content so writes land as DATA (not INLINE).
+        // Two distinct blocks whose hashes differ.
+        let mut h2_bytes = [0u8; 4096];
+        for (i, b) in h2_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let mut h1_bytes = [0u8; 4096];
+        for (i, b) in h1_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(59).wrapping_add(11);
+        }
+        assert_ne!(
+            blake3::hash(&h1_bytes),
+            blake3::hash(&h2_bytes),
+            "test precondition"
+        );
+
+        // S1: DATA h2 at LBA 0. Canonical for h2.
+        vol.write(0, &h2_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S2: DedupRef h2 at LBA 1. (write_commit takes the REF path since
+        // h2 is already in extent_index from S1.)
+        vol.write(1, &h2_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S3: DATA h1 at LBA 0 (distinct hash). Overwrites lbamap[0].
+        // S1's entry at LBA 0 is now LBA-dead.
+        vol.write(0, &h1_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Drain: promote each pending/<ulid> to index/+cache/.
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
+        }
+        ulids.sort();
+        for ulid in &ulids {
+            vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(*ulid).unwrap();
+        }
+        let s1_ulid = ulids[0].to_string();
+
+        // Rebuild state + compute stats.
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.lba_referenced_hashes();
+
+        // Preconditions — match the scenario assumptions.
+        let h1 = blake3::hash(&h1_bytes);
+        let h2 = blake3::hash(&h2_bytes);
+        assert_eq!(lbamap.hash_at(0), Some(h1), "LBA 0 must be h1");
+        assert_eq!(lbamap.hash_at(1), Some(h2), "LBA 1 must be h2");
+        assert!(live_hashes.contains(&h2), "h2 must be live (via LBA 1)");
+
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        // Find S1's stats.
+        let s1_stats = stats
+            .iter()
+            .find(|s| s.ulid_str == s1_ulid)
+            .expect("S1 must be in collect_stats output");
+
+        // Core assertion — for every live entry in S1, check whether it
+        // spuriously re-asserts an LBA mapping that the current lbamap
+        // doesn't agree with.  If yes, the entry would poison rebuild.
+        //
+        // Before fix: this assertion fails.  S1's live_entries contains
+        // a DATA entry with start_lba=0, lba_length=1, hash=h2, but
+        // lbamap[0]=h1 — the mapping shadows the correct one.
+        //
+        // After fix: either the entry is absent from live_entries, or
+        // it survives with a kind that rebuild skips (e.g. CanonicalBody,
+        // once added).
+        for entry in &s1_stats.live_entries {
+            if matches!(entry.kind, EntryKind::Data | EntryKind::Inline) && entry.lba_length > 0 {
+                let lba_hash = lbamap.hash_at(entry.start_lba);
+                assert_eq!(
+                    lba_hash,
+                    Some(entry.hash),
+                    "S1 live entry {:?} at start_lba={} hash={} claims an LBA \
+                     whose current mapping is {:?} — would shadow the correct \
+                     binding on rebuild (bug H).",
+                    entry.kind,
+                    entry.start_lba,
+                    entry.hash.to_hex(),
+                    lba_hash.map(|h| h.to_hex().to_string()),
+                );
+            }
+        }
+    }
+
+    /// Bug I reproduction (DIRECT collect_stats level):
+    ///
+    /// `collect_stats` samples Zero-entry liveness with a single
+    /// `hash_at(start_lba)` point query. A Zero entry written as one large
+    /// TRIM (e.g. 4096 blocks) can have its **middle** overwritten by a
+    /// later Data write while the first LBA still reads ZERO_HASH. The
+    /// current check sees the whole Zero entry as live and re-emits it
+    /// unchanged at the GC-output ULID — which is higher than both the
+    /// original Zero segment and whichever segment now carries the real
+    /// Data. On disk rebuild the re-emitted Zero shadows the real Data.
+    ///
+    /// Scenario:
+    ///   - S1: Zero[0..4096). lbamap covers 0..4096 with ZERO_HASH.
+    ///   - S2: Data h1 at LBA 2000. lbamap splits: 0..2000 → ZERO,
+    ///     2000..2001 → h1, 2001..4096 → ZERO.
+    ///
+    /// Expected (post-fix): S1's live_entries contains Zero sub-runs only
+    /// for the surviving ZERO_HASH ranges — no single entry spans LBA 2000
+    /// where the current mapping is h1.
+    ///
+    /// Current (buggy) behaviour: S1's live_entries contains one Zero
+    /// entry at start_lba=0, lba_length=4096 — covering LBA 2000 where
+    /// lbamap says h1. Test assertion fails until the fix lands.
+    #[test]
+    fn collect_stats_trims_zero_entry_to_surviving_subranges() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+
+        let mut h1_bytes = [0u8; 4096];
+        for (i, b) in h1_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(59).wrapping_add(11);
+        }
+        let h1 = blake3::hash(&h1_bytes);
+
+        // S1: large Zero covering LBAs 0..4096.
+        vol.write_zeroes(0, 4096).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S2: Data h1 at LBA 2000 — punches a hole in the middle of S1's Zero.
+        vol.write(2000, &h1_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Drain pending → index/+cache/.
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
+        }
+        ulids.sort();
+        for ulid in &ulids {
+            vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(*ulid).unwrap();
+        }
+        let s1_ulid = ulids[0].to_string();
+
+        // Rebuild state + compute stats.
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.lba_referenced_hashes();
+
+        // Preconditions.
+        assert_eq!(
+            lbamap.hash_at(0),
+            Some(elide_core::volume::ZERO_HASH),
+            "LBA 0 must still be zero"
+        );
+        assert_eq!(lbamap.hash_at(2000), Some(h1), "LBA 2000 must be h1");
+        assert_eq!(
+            lbamap.hash_at(3000),
+            Some(elide_core::volume::ZERO_HASH),
+            "LBA 3000 must still be zero"
+        );
+
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        let s1_stats = stats
+            .iter()
+            .find(|s| s.ulid_str == s1_ulid)
+            .expect("S1 must be in collect_stats output");
+
+        // For every Zero live_entry in S1, the *entire* covered range must
+        // still map to ZERO_HASH in the lbamap. Before the fix, the single
+        // Zero entry spans LBA 2000 where lbamap = h1 — assertion fails.
+        for entry in &s1_stats.live_entries {
+            if entry.kind != EntryKind::Zero {
+                continue;
+            }
+            let end = entry.start_lba + entry.lba_length as u64;
+            for lba in entry.start_lba..end {
+                assert_eq!(
+                    lbamap.hash_at(lba),
+                    Some(elide_core::volume::ZERO_HASH),
+                    "S1 Zero entry [{}+{}) covers LBA {} whose current mapping \
+                     is {:?} — would shadow the correct binding on rebuild (bug I).",
+                    entry.start_lba,
+                    entry.lba_length,
+                    lba,
+                    lbamap.hash_at(lba).map(|h| h.to_hex().to_string()),
+                );
+            }
+        }
+    }
+
     // --- fetch_live_bodies tests ---
 
     /// Helper: build a SegmentEntry with given kind, stored_offset, stored_length,
@@ -1868,6 +2196,7 @@ mod tests {
             stored_length,
             data: None,
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 

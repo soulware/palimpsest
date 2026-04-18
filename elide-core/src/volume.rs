@@ -2143,6 +2143,17 @@ impl Volume {
                 stale_cancel.len(),
                 describe_stale_cancel(&stale_cancel, &self.lbamap),
             );
+            // Diagnostic: does a fresh rebuild from disk agree with the
+            // in-memory lbamap at each cancelled LBA? If they disagree,
+            // the coordinator saw one state and the volume holds another —
+            // pinpointing whether the poison is on-disk or in-memory.
+            diagnose_stale_cancel(
+                &self.base_dir,
+                &self.ancestor_layers,
+                &self.lbamap,
+                &stale_cancel,
+                &result.input_old_entries,
+            );
             let _ = fs::remove_file(&result.staged_path);
             let tmp_path = result.gc_dir.join(format!("{}.tmp", result.new_ulid));
             let _ = fs::remove_file(&tmp_path);
@@ -2378,6 +2389,15 @@ impl Volume {
                 staged_path.display(),
                 stale_cancel.len(),
                 describe_stale_cancel(&stale_cancel, &self.lbamap),
+            );
+            // Same diagnostic as the offloaded apply path — rebuild from disk
+            // and compare against the in-memory lbamap at each cancelled LBA.
+            diagnose_stale_cancel_legacy(
+                &self.base_dir,
+                &self.ancestor_layers,
+                &self.lbamap,
+                &stale_cancel,
+                &index_dir,
             );
             let _ = fs::remove_file(staged_path);
             return Ok(StagedApply::Cancelled);
@@ -4077,6 +4097,121 @@ pub(crate) fn find_segment_in_dirs(
         return Ok(body_dir.join(format!("{sid}.body")));
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
+}
+
+/// When stale-liveness fires, rebuild the lbamap from disk and compare
+/// against the live in-memory lbamap at each cancelled LBA. The divergence
+/// (or agreement) tells us whether the "disk truth" reflects the latest
+/// writes or whether the in-memory lbamap has a write the on-disk state is
+/// missing. Logs only; never mutates volume state.
+///
+/// `input_old_entries_source` resolves each stale hash to its input LBA so
+/// we can query `lbamap.hash_at(lba)` on both sides. For the self-describing
+/// apply path, callers pass the `input_old_entries` list and we look up the
+/// per-input `.idx` to find the LBA.
+fn diagnose_stale_cancel(
+    base_dir: &Path,
+    ancestor_layers: &[AncestorLayer],
+    in_memory: &lbamap::LbaMap,
+    stale: &[(blake3::Hash, Ulid)],
+    input_old_entries: &[(blake3::Hash, segment::EntryKind, Ulid)],
+) {
+    // Build the rebuild chain: ancestors (oldest-first) + live fork (last).
+    let mut chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
+        .iter()
+        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+        .collect();
+    chain.push((base_dir.to_path_buf(), None));
+
+    let rebuilt = match lbamap::rebuild_segments(&chain) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("stale-liveness diagnostic rebuild failed: {e}");
+            return;
+        }
+    };
+
+    // Resolve each stale hash → list of (lba, lba_length) it sits at in the
+    // input segment. Cheap linear scan of input_old_entries.
+    //
+    // We already have the entries in memory from the worker result; no I/O.
+    let index_dir = base_dir.join("index");
+    for (hash, input_ulid) in stale.iter().take(8) {
+        // input_old_entries carries only (hash, kind, input_ulid) — it does
+        // not include LBAs. Pull the LBA by re-reading the input idx, which
+        // the volume still holds until apply-or-cancel completes.
+        let lbas = lbas_for_hash_in_segment(&index_dir, input_ulid, hash);
+        for (lba, len) in &lbas {
+            let mem = in_memory.hash_at(*lba);
+            let disk = rebuilt.hash_at(*lba);
+            log::warn!(
+                "stale-cancel diag: lba={lba}+{len} hash={} input={input_ulid} \
+                 in_memory={:?} disk_rebuild={:?} {}",
+                hash.to_hex(),
+                mem.map(|h| h.to_hex().to_string()),
+                disk.map(|h| h.to_hex().to_string()),
+                if mem == disk { "AGREE" } else { "DIVERGE" }
+            );
+        }
+        let _ = input_old_entries; // silence unused when loop body empty
+    }
+}
+
+/// Variant for the legacy `apply_staged_handoff` path that computed
+/// stale_cancel from input idx files directly.
+fn diagnose_stale_cancel_legacy(
+    base_dir: &Path,
+    ancestor_layers: &[AncestorLayer],
+    in_memory: &lbamap::LbaMap,
+    stale: &[(blake3::Hash, Ulid)],
+    index_dir: &Path,
+) {
+    let mut chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
+        .iter()
+        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+        .collect();
+    chain.push((base_dir.to_path_buf(), None));
+
+    let rebuilt = match lbamap::rebuild_segments(&chain) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("stale-liveness diagnostic rebuild failed: {e}");
+            return;
+        }
+    };
+
+    for (hash, input_ulid) in stale.iter().take(8) {
+        let lbas = lbas_for_hash_in_segment(index_dir, input_ulid, hash);
+        for (lba, len) in &lbas {
+            let mem = in_memory.hash_at(*lba);
+            let disk = rebuilt.hash_at(*lba);
+            log::warn!(
+                "stale-cancel diag: lba={lba}+{len} hash={} input={input_ulid} \
+                 in_memory={:?} disk_rebuild={:?} {}",
+                hash.to_hex(),
+                mem.map(|h| h.to_hex().to_string()),
+                disk.map(|h| h.to_hex().to_string()),
+                if mem == disk { "AGREE" } else { "DIVERGE" }
+            );
+        }
+    }
+}
+
+/// Read `index/<input_ulid>.idx` and return every entry matching `hash`.
+fn lbas_for_hash_in_segment(
+    index_dir: &Path,
+    input_ulid: &Ulid,
+    hash: &blake3::Hash,
+) -> Vec<(u64, u32)> {
+    let idx_path = index_dir.join(format!("{input_ulid}.idx"));
+    let Ok((_, entries, _)) = segment::read_segment_index(&idx_path) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|e| &e.hash == hash)
+        .map(|e| (e.start_lba, e.lba_length))
+        .collect()
 }
 
 /// Render a diagnostic summary of the stale-liveness hashes so the log

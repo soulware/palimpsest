@@ -42,6 +42,28 @@ The pathological case is the opposite: a 100-block body with 1 live block. Every
 
 Coordinator GC at segment level handles *whole-entry* death: an entry with zero live blocks is dropped during repack (`elide-coordinator/src/gc.rs:782`, `gc.rs:1098`). An entry with at least one live block is copied through in full, dead interior bytes and all. A single bloated entry inside an otherwise-healthy segment never trips segment-level repack. Something else has to produce "fully dead" entries for GC to act on. That something is this pass.
 
+## Overlap taxonomy and the GC shadow bug
+
+The free-aliasing trick above keeps *reads* correct regardless of how later writes overlap an existing entry. But the segment entry's own `(start_lba, lba_length)` still records its **original** claim on disk — and GC reproduces that claim verbatim in its output when the entry is judged live. When the output's ULID is higher than whichever segment now carries the overwriting write (typical, since GC outputs are fresh ULIDs), the original claim shadows the overwriting write on rebuild. The symptom: post-restart `lbamap` rebuild disagrees with the running volume's in-memory `lbamap`, even though both were built by applying the same segments.
+
+The cases depend on where the later write lands inside the entry's range. The table below uses "head / tail / interior" anchored to the *existing* entry (not the overwriter):
+
+| Overlap shape | Point query `hash_at(start_lba) == entry.hash` | `collect_stats` today | Correct? |
+|---|---|---|---|
+| Disjoint (no overlap) | LIVE | Entry kept intact | ✓ |
+| Whole entry | DEAD | `canonical_only` (if hash externally live) or dropped | ✓ |
+| **Head** (start LBA overwritten, tail survives) | DEAD | `canonical_only` — **surviving tail's LBA binding lost** | ✗ |
+| **Tail** (start survives, end LBA overwritten) | LIVE | Kept with dead tail — shadows overwriter on rebuild | ✗ |
+| **Interior** (middle overwritten, both ends survive) | LIVE | Kept whole — shadows overwriter on rebuild | ✗ |
+
+Three of the five overlap shapes are handled incorrectly today. The fix for each is structurally the same: produce compact, sub-run-scoped segment entries whose LBA claims agree with the current `lbamap`. That *is* alias-merge — GC-time liveness is just one source of hints, and the operation has to rewrite hashes (retire bloated, compute compact) which is why it must run volume-side.
+
+**Zero extents are the degenerate case.** They carry no body, are never referenced by other entries, and their "rewrite" is just "emit smaller Zero entries over the surviving `ZERO_HASH` sub-runs". That fix is local to `collect_stats` and landed under the same overlap principle — see `elide-coordinator/src/gc.rs` `EntryKind::Zero` handling. It does not require this pass.
+
+**Body-bearing entries (Data / Inline / Delta) need this pass.** Splitting a multi-LBA entry into compact sub-run entries that each reference only part of the canonical body requires either a format extension (per-entry `payload_block_offset` on the wire) or a hash retire + recompute step (new compact bodies for each surviving run). The latter is what alias-merge does, and it is why the operation lives in the volume.
+
+**`canonical_only` survives but narrows.** Post-alias-merge, multi-LBA bloated entries do not reach GC — the reclamation drain has already flattened them. The only LBA-death shape left at the GC boundary is "the whole entry's range is now LBA-dead while the hash is still referenced via an external DedupRef". `canonical_only` is exactly the right demotion for that case and is unchanged. What does change is that today it also fires on head-overlap of multi-LBA entries (incorrectly losing the tail binding); with alias-merge preceding GC, that misuse disappears.
+
 ## Two primitives
 
 Reclamation splits into two operations with different safety contracts and different knowledge requirements. They share the execution pipeline but target different situations.

@@ -1565,3 +1565,184 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     gc_sweep(&mut vol);
     verify!(vol, "GcSweep");
 }
+
+/// Bug H — `collect_stats` preserves a DATA/INLINE entry at its original
+/// LBA even when the LBA has been overwritten, if the hash is still live
+/// somewhere else via a DedupRef (`extent_live && live_hashes.contains(h)`
+/// arm at the bottom of the DATA/Inline branch). The GC output then has a
+/// higher ULID than the segment that wrote the live content at that LBA,
+/// so on rebuild the spurious entry shadows the correct one — silently
+/// returning stale bytes forever (until the offending output is itself
+/// GC'd, which can take a long time or never happen if the hash remains
+/// ref'd from some long-lived file).
+///
+/// Note: end-to-end reproduction is awkward because the coordinator's
+/// sweep will typically pick up the overwriting segment alongside the
+/// canonical, and entry-order within a single sweep output corrects the
+/// spurious binding. See the `collect_stats_preserves_dead_lba_entry`
+/// unit test in `elide-coordinator/src/gc.rs` for a direct, deterministic
+/// demonstration of the buggy arm. This end-to-end test exists as a
+/// scaffolded integration check — it currently does NOT fail, and is
+/// preserved so the shape of the scenario is visible alongside the fix.
+///
+/// The user-visible symptom on the real volume that found this: after a
+/// restart the volume read back zeros at an LBA the user believed held
+/// their data, because a GC output had carried a `DATA zero_hash at LBA N`
+/// entry forward — zeros had been written to LBA N earlier (by ext4 init /
+/// lazy itable) and the zero hash was kept live by an unrelated DedupRef
+/// elsewhere in the filesystem.
+///
+/// Minimal reproducer (no race required):
+///   1. Write h1 at LBA N → segment S0.
+///   2. Snapshot so S0 sits below the GC floor (prevents a later sweep of
+///      S0+Y' from producing a higher-ULID output that would mask the bug).
+///   3. Write h2 (distinct) at LBA N → segment X (DATA/INLINE h2 at N).
+///   4. Write h2 at LBA M → segment Y (DedupRef h2 at M, keeping h2 live).
+///   5. GC round 1: sweep X+Y → U1. U1 has `DATA/INLINE h2 at LBA N` and
+///      `DedupRef h2 at LBA M`. At this point lbamap[N]=h2 and everything
+///      is consistent.
+///   6. Write h1 at LBA N (REF path — h1 still canonical in S0) → Y'.
+///      Now lbamap[N]=h1. U1's entry at N is LBA-dead; U1's REF at M is
+///      still live.
+///   7. GC round 2: U1 density 50% → repack candidate. Y' density 100%
+///      is alone in the sweep bucket → sweep skipped. collect_stats for
+///      U1's entry at LBA N hits the buggy arm (!lba_live && extent_live
+///      && live_hashes.contains(h2) via M) and keeps the entry at LBA N.
+///      Output U_r has `DATA/INLINE h2 at LBA N`.
+///   8. Restart. Rebuild: S0 → h1 at N, Y' → h1 at N, U_r → h2 at N.
+///      U_r has highest ULID → lbamap[N] = h2. BUG.
+///
+/// Fix (forthcoming): promote-demote the stale-LBA body-bearing entry to
+/// a `CanonicalBody` kind that carries the body for extent_index lookups
+/// but makes no LBA claim on rebuild.
+#[test]
+fn gc_bug_h_canonical_body_shadows_live_lba() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // density_threshold = 0.9 selects U1 (50%) for repack and leaves
+    // everything else for sweep. See the doc comment above for why these
+    // exact numbers matter.
+    let gc_config = GcConfig {
+        density_threshold: 0.9,
+        interval_secs: 0,
+    };
+
+    // Drive GC round end-to-end: checkpoint, gc_fork, apply staged
+    // handoffs, promote each bare gc/<ulid> to index/+cache/, simulate
+    // the coord-side cache evict of consumed inputs, finalize (delete
+    // bare gc/<ulid>), drain the flushed WAL segment produced by the
+    // checkpoint.  No real coord socket — all IPC is done via direct
+    // Volume method calls so the test is deterministic.
+    let run_gc_round = |vol: &mut Volume| {
+        let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+        rt.block_on(gc_fork(
+            fork_dir,
+            "test-vol",
+            &store,
+            &gc_config,
+            repack_ulid,
+            sweep_ulid,
+        ))
+        .unwrap();
+        vol.apply_gc_handoffs().unwrap();
+
+        // Collect bare gc/<ulid> files, promote each, then finalize.
+        let gc_dir = fork_dir.join("gc");
+        let mut bare: Vec<ulid::Ulid> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&gc_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.contains('.') {
+                    continue;
+                }
+                if let Ok(u) = ulid::Ulid::from_string(s) {
+                    bare.push(u);
+                }
+            }
+        }
+        for u in &bare {
+            vol.promote_segment(*u).unwrap();
+        }
+        simulate_coord_cache_evict(fork_dir);
+        for u in &bare {
+            vol.finalize_gc_handoff(*u).unwrap();
+        }
+
+        // Drain WAL segment produced by gc_checkpoint's flush (may be empty).
+        rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
+    };
+
+    let n: u64 = 100;
+    let m: u64 = 200;
+    let h1_bytes = [0x11u8; 4096];
+    let h2_bytes = [0x22u8; 4096];
+
+    // Step 1: write h1 at LBA N → segment S0.
+    vol.write(n, &h1_bytes).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
+
+    // Step 2: snapshot. Pins S0 below the GC floor so later rounds ignore it.
+    let _snap = vol.snapshot().unwrap();
+
+    // Step 3: overwrite LBA N with h2 → segment X.
+    vol.write(n, &h2_bytes).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
+
+    // Step 4: write h2 at LBA M (REF, since h2 canonical in X) → segment Y.
+    vol.write(m, &h2_bytes).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
+
+    // Step 5: GC round 1. Sweep packs X + Y into U1.
+    run_gc_round(&mut vol);
+
+    // Step 6: rewrite LBA N with h1 (REF to S0) → segment Y'. lbamap[N]=h1.
+    vol.write(n, &h1_bytes).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
+
+    // Step 7: GC round 2. U1 density 50% → repack; Y' alone → sweep skip.
+    // The buggy `extent_live && live_hashes.contains(h2)` arm keeps U1's
+    // entry at LBA N in the repack output at u_repack > Y'.
+    run_gc_round(&mut vol);
+
+    // Step 8: restart. Rebuild now has the spurious output with higher
+    // ULID than Y', shadowing the live LBA binding.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Step 9: assert.  LBA N must return h1 (the latest user write).
+    let got_n = vol.read(n, 1).expect("read LBA N after restart");
+    assert_eq!(
+        got_n.as_slice(),
+        h1_bytes.as_slice(),
+        "LBA {n}: expected h1 (latest user write); got h2 — GC output at \
+         higher ULID spuriously shadowed the live LBA mapping"
+    );
+
+    let got_m = vol.read(m, 1).expect("read LBA M after restart");
+    assert_eq!(
+        got_m.as_slice(),
+        h2_bytes.as_slice(),
+        "LBA {m}: expected h2 (DedupRef write); got something else"
+    );
+}

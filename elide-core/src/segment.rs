@@ -253,6 +253,16 @@ bitflags! {
         /// extent index). Entries with this flag must carry `HAS_DELTAS` and
         /// have at least one delta option.
         const DELTA        = 0x20;
+        /// Canonical-body-only: this entry carries a body for its hash (read
+        /// via `extent_index.lookup`), but makes **no LBA claim** on rebuild.
+        /// `start_lba` / `lba_length` are serialised as zero and the entry is
+        /// skipped by `lbamap::rebuild_segments`. Emitted by GC when a
+        /// DATA/INLINE entry's original LBA has been overwritten but the
+        /// hash is still referenced elsewhere via a DedupRef — preserves
+        /// the canonical body without shadowing the live LBA mapping.
+        /// Co-exists with `INLINE` (body in inline section) or without it
+        /// (body in body section). See `docs/formats.md`.
+        const CANONICAL_ONLY = 0x40;
     }
 }
 
@@ -341,6 +351,14 @@ pub struct SegmentEntry {
     /// Each option provides a zstd-dictionary-compressed alternative to the
     /// full body, using a different source extent as dictionary.
     pub delta_options: Vec<DeltaOption>,
+    /// Canonical-body-only: this entry carries body bytes (its hash is
+    /// canonical in this segment) but makes **no LBA claim** on rebuild —
+    /// `lbamap::rebuild_segments` skips entries with this flag. Zeroed
+    /// `start_lba` / `lba_length` are expected (and enforced on write).
+    /// Emitted by GC when carrying forward a hash that's still referenced
+    /// elsewhere via a DedupRef after its original LBA was overwritten.
+    /// Only valid for kinds that carry body bytes: `Data` and `Inline`.
+    pub canonical_only: bool,
 }
 
 impl SegmentEntry {
@@ -371,6 +389,7 @@ impl SegmentEntry {
             stored_length,
             data: Some(data),
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 
@@ -391,6 +410,7 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 
@@ -406,6 +426,7 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 
@@ -444,6 +465,7 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options,
+            canonical_only: false,
         }
     }
 }
@@ -631,6 +653,17 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
 
 fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     let mut flags = SegmentFlags::empty();
+    if e.canonical_only {
+        debug_assert!(
+            matches!(e.kind, EntryKind::Data | EntryKind::Inline),
+            "canonical_only is only valid for body-bearing kinds (Data/Inline)"
+        );
+        debug_assert!(
+            e.start_lba == 0 && e.lba_length == 0,
+            "canonical_only entries must have zero start_lba and lba_length"
+        );
+        flags |= SegmentFlags::CANONICAL_ONLY;
+    }
     match e.kind {
         EntryKind::Inline => flags |= SegmentFlags::INLINE,
         EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
@@ -1073,6 +1106,7 @@ fn parse_index_section(
         } else {
             EntryKind::Data
         };
+        let canonical_only = flags.contains(SegmentFlags::CANONICAL_ONLY);
 
         let stored_offset = u64::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let stored_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
@@ -1088,6 +1122,7 @@ fn parse_index_section(
             stored_length,
             data: None,
             delta_options: Vec::new(),
+            canonical_only,
         });
     }
 
@@ -1798,6 +1833,106 @@ pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
     // GC outputs first (lower priority), then non-GC segments (higher priority).
     paths.extend(gc_paths);
     paths.extend(non_gc_paths);
+}
+
+// --- fork rebuild discovery ---
+
+/// Which source directory a discovered segment lives in. Dictates
+/// rebuild processing priority within a single fork:
+/// `GcApplied < Index < Pending` (last-write-wins on overlapping LBAs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentTier {
+    /// `gc/<ulid>` — volume-applied GC output awaiting coordinator upload.
+    GcApplied,
+    /// `index/<ulid>.idx` — committed, promoted segment.
+    Index,
+    /// `pending/<ulid>` — in-flight WAL flush, not yet promoted.
+    Pending,
+}
+
+/// A segment file discovered during a fork rebuild pass.
+#[derive(Debug)]
+pub struct SegmentRef {
+    pub ulid: ulid::Ulid,
+    pub tier: SegmentTier,
+    pub path: PathBuf,
+}
+
+/// Discover every segment file for a single fork, in rebuild-processing
+/// order (lowest priority first).
+///
+/// **Listing order: pending → gc → index.** A concurrent promote writes
+/// `index/<ulid>.idx` *then* removes the source (`pending/<ulid>` or
+/// `gc/<ulid>`). Listing sources first guarantees a mid-promote segment
+/// is captured by at least one list — either its source (before the
+/// removal) or the new index entry (written before the removal).
+/// Reversing the order (index first) leaves a narrow window in which a
+/// segment is absent from both lists; see `extentindex::rebuild` for
+/// the same discipline.
+///
+/// **Processing order: gc → index → pending**, each tier sorted by ULID.
+/// This is the priority ordering — later processing wins when the same
+/// LBA appears in multiple tiers.
+///
+/// `branch_ulid` applies an ULID-string cutoff used for ancestor layers
+/// in forked volumes: entries with ULID string greater than the cutoff
+/// are excluded. `None` includes everything.
+pub fn discover_fork_segments(
+    fork_dir: &Path,
+    branch_ulid: Option<&str>,
+) -> io::Result<Vec<SegmentRef>> {
+    // pending/ first (source of drain-path promote).
+    let mut pending_paths = collect_segment_files(&fork_dir.join("pending"))?;
+    pending_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    // gc/ next (source of gc-carried promote).
+    let mut gc_paths = collect_gc_applied_segment_files(fork_dir)?;
+    gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    // index/ last (destination of both promote paths).
+    let mut idx_paths = collect_idx_files(&fork_dir.join("index"))?;
+    idx_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+
+    // Build output in processing order: gc → index → pending.
+    let mut out: Vec<SegmentRef> =
+        Vec::with_capacity(gc_paths.len() + idx_paths.len() + pending_paths.len());
+
+    for p in gc_paths {
+        if let Some(sref) = segment_ref_from_path(p, SegmentTier::GcApplied, branch_ulid) {
+            out.push(sref);
+        }
+    }
+    for p in idx_paths {
+        if let Some(sref) = segment_ref_from_path(p, SegmentTier::Index, branch_ulid) {
+            out.push(sref);
+        }
+    }
+    for p in pending_paths {
+        if let Some(sref) = segment_ref_from_path(p, SegmentTier::Pending, branch_ulid) {
+            out.push(sref);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Build a `SegmentRef` from a path, applying the optional branch-ulid
+/// cutoff. Returns `None` if the filename is not a valid ULID or if the
+/// cutoff excludes it.
+fn segment_ref_from_path(
+    path: PathBuf,
+    tier: SegmentTier,
+    branch_ulid: Option<&str>,
+) -> Option<SegmentRef> {
+    // `file_stem` handles both bare ULIDs (pending/, gc/) and `<ulid>.idx`.
+    let stem = path.file_stem()?.to_str()?;
+    if let Some(cutoff) = branch_ulid
+        && stem > cutoff
+    {
+        return None;
+    }
+    let ulid = ulid::Ulid::from_string(stem).ok()?;
+    Some(SegmentRef { ulid, tier, path })
 }
 
 // --- slice read helpers ---
