@@ -9,6 +9,7 @@ pub mod inspect_files;
 pub mod ls;
 pub mod nbd;
 pub mod verify;
+pub mod volume_io;
 
 use std::io;
 use std::path::{Path, PathBuf};

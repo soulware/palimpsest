@@ -12,6 +12,7 @@ use tracing::{error, warn};
 use elide_core::volume::{ReadonlyVolume, Volume};
 
 use crate::extents::{LocatedExtent, locate_extents};
+use crate::volume_io::BlockIO;
 
 // Handshake magic
 const NBD_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
@@ -624,135 +625,6 @@ pub fn run_volume_readonly(
     serve_readonly_volume_listener(dir, size_bytes, listener, fetch_config)
 }
 
-fn handle_readonly_connection(
-    mut s: impl Read + Write,
-    volume: &ReadonlyVolume,
-    volume_size: u64,
-) -> io::Result<()> {
-    // Newstyle handshake
-    s.write_all(&NBD_MAGIC.to_be_bytes())?;
-    s.write_all(&NBD_OPTS_MAGIC.to_be_bytes())?;
-    s.write_all(&NBD_FLAG_FIXED_NEWSTYLE.to_be_bytes())?;
-
-    let _client_flags = read_u32(&mut s)?;
-
-    let tx_flags: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY;
-
-    loop {
-        let magic = read_u64(&mut s)?;
-        if magic != NBD_OPTS_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad option magic",
-            ));
-        }
-        let option = read_u32(&mut s)?;
-        let len = read_u32(&mut s)? as usize;
-        let mut data = vec![0u8; len];
-        s.read_exact(&mut data)?;
-
-        match option {
-            NBD_OPT_EXPORT_NAME => {
-                s.write_all(&volume_size.to_be_bytes())?;
-                s.write_all(&tx_flags.to_be_bytes())?;
-                s.write_all(&[0u8; 124])?;
-                break;
-            }
-            NBD_OPT_GO | NBD_OPT_INFO => {
-                let mut info = Vec::new();
-                info.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
-                info.extend_from_slice(&volume_size.to_be_bytes());
-                info.extend_from_slice(&tx_flags.to_be_bytes());
-                opt_reply(&mut s, option, NBD_REP_INFO, &info)?;
-
-                let mut bsz = Vec::new();
-                bsz.extend_from_slice(&NBD_INFO_BLOCK_SIZE.to_be_bytes());
-                bsz.extend_from_slice(&512u32.to_be_bytes());
-                bsz.extend_from_slice(&4096u32.to_be_bytes());
-                bsz.extend_from_slice(&(4u32 * 1024 * 1024).to_be_bytes());
-                opt_reply(&mut s, option, NBD_REP_INFO, &bsz)?;
-
-                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
-                if option == NBD_OPT_GO {
-                    break;
-                }
-            }
-            NBD_OPT_LIST => {
-                let mut entry = Vec::new();
-                entry.extend_from_slice(&0u32.to_be_bytes());
-                opt_reply(&mut s, option, NBD_REP_SERVER, &entry)?;
-                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
-            }
-            NBD_OPT_ABORT => {
-                opt_reply(&mut s, option, NBD_REP_ACK, &[])?;
-                return Ok(());
-            }
-            _ => {
-                opt_reply(&mut s, option, NBD_REP_ERR_UNSUP, &[])?;
-            }
-        }
-    }
-
-    let mut reads: u64 = 0;
-
-    loop {
-        let magic = read_u32(&mut s)?;
-        if magic != NBD_REQUEST_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad request magic",
-            ));
-        }
-        let _flags = read_u16(&mut s)?;
-        let cmd = read_u16(&mut s)?;
-        let handle = read_u64(&mut s)?;
-        let offset = read_u64(&mut s)?;
-        let length = read_u32(&mut s)? as usize;
-
-        match cmd {
-            NBD_CMD_READ => {
-                reads += 1;
-                let start_lba = offset / 4096;
-                let end_lba = (offset + length as u64).div_ceil(4096);
-                let lba_count = (end_lba - start_lba) as u32;
-                match volume.read(start_lba, lba_count) {
-                    Ok(blocks) => {
-                        let skip = (offset % 4096) as usize;
-                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
-                        debug_assert!(skip + length <= blocks.len());
-                        tx_reply(&mut s, 0, handle)?;
-                        s.write_all(&blocks[skip..skip + length])?;
-                    }
-                    Err(e) => {
-                        error!("[read error offset={} len={}: {}]", offset, length, e);
-                        tx_reply(&mut s, 5, handle)?; // EIO
-                    }
-                }
-            }
-            NBD_CMD_WRITE => {
-                // Drain the write payload before responding.
-                let mut buf = vec![0u8; length];
-                s.read_exact(&mut buf)?;
-                tx_reply(&mut s, 1, handle)?; // EPERM — device is read-only
-            }
-            NBD_CMD_DISC => {
-                println!("[reads: {}]", reads);
-                break;
-            }
-            NBD_CMD_FLUSH => {
-                tx_reply(&mut s, 0, handle)?; // flush is a no-op on readonly
-            }
-            NBD_CMD_TRIM => {
-                tx_reply(&mut s, 1, handle)?; // EPERM — device is read-only; no data to drain
-            }
-            _ => {
-                tx_reply(&mut s, 22, handle)?; // EINVAL
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Readonly variant of `serve_volume_listener`. Opens the fork with
 /// `ReadonlyVolume` (no WAL, no lock) and serves it read-only.
 /// Separated from `run_volume_readonly` so tests can bind port 0.
@@ -775,7 +647,7 @@ fn serve_readonly_volume_listener(
     loop {
         let (stream, peer) = listener.accept()?;
         println!("[connected: {}]", peer);
-        let result = handle_readonly_connection(stream, &volume, size_bytes);
+        let result = handle_volume_connection(stream, &volume, size_bytes);
         match result {
             Ok(()) => println!("[disconnected]"),
             Err(e) => warn!("[connection error: {}]", e),
@@ -866,9 +738,9 @@ fn serve_volume_listener(
     }
 }
 
-fn handle_volume_connection(
+fn handle_volume_connection<B: BlockIO>(
     mut s: impl Read + Write,
-    volume: &elide_core::actor::VolumeHandle,
+    io: &B,
     volume_size: u64,
 ) -> io::Result<()> {
     // Newstyle handshake
@@ -878,8 +750,11 @@ fn handle_volume_connection(
 
     let _client_flags = read_u32(&mut s)?;
 
-    let tx_flags: u16 =
-        NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES;
+    let tx_flags: u16 = if io.is_readonly() {
+        NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY
+    } else {
+        NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES
+    };
 
     // Options loop
     loop {
@@ -965,16 +840,11 @@ fn handle_volume_connection(
         match cmd {
             NBD_CMD_READ => {
                 reads += 1;
-                let start_lba = offset / 4096;
-                let end_lba = (offset + length as u64).div_ceil(4096);
-                let lba_count = (end_lba - start_lba) as u32;
-                match volume.read(start_lba, lba_count) {
-                    Ok(blocks) => {
-                        let skip = (offset % 4096) as usize;
-                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
-                        debug_assert!(skip + length <= blocks.len());
+                let mut buf = vec![0u8; length];
+                match io.read_into(offset, &mut buf) {
+                    Ok(()) => {
                         tx_reply(&mut s, 0, handle)?;
-                        s.write_all(&blocks[skip..skip + length])?;
+                        s.write_all(&buf)?;
                     }
                     Err(e) => {
                         error!("[read error offset={} len={}: {}]", offset, length, e);
@@ -987,47 +857,32 @@ fn handle_volume_connection(
                 writes += 1;
                 let mut buf = vec![0u8; length];
                 s.read_exact(&mut buf)?;
-                let start_lba = offset / 4096;
-                let end_lba = (offset + length as u64).div_ceil(4096);
-                let lba_count = (end_lba - start_lba) as u32;
-                let skip = (offset % 4096) as usize;
-                let result = if skip == 0 && length.is_multiple_of(4096) {
-                    // Already block-aligned — write directly.
-                    volume.write(start_lba, buf)
-                } else {
-                    // Sub-block write: read covering blocks, patch, write back.
-                    volume.read(start_lba, lba_count).and_then(|mut blocks| {
-                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
-                        debug_assert!(skip + length <= blocks.len());
-                        blocks[skip..skip + length].copy_from_slice(&buf);
-                        volume.write(start_lba, blocks)
-                    })
-                };
-                match result {
-                    Ok(()) => {
-                        tx_reply(&mut s, 0, handle)?;
-                    }
+                match io.write_at(offset, buf) {
+                    Ok(()) => tx_reply(&mut s, 0, handle)?,
                     Err(e) => {
-                        error!("[write error offset={} len={}: {}]", offset, length, e);
-                        tx_reply(&mut s, 5, handle)?; // EIO
+                        let code = nbd_error_code(&e);
+                        if code == 5 {
+                            error!("[write error offset={} len={}: {}]", offset, length, e);
+                        }
+                        tx_reply(&mut s, code, handle)?;
                     }
                 }
             }
 
             NBD_CMD_DISC => {
                 println!("[reads: {}, writes: {}]", reads, writes);
-                if let Ok(s) = volume.noop_stats()
-                    && s.skipped_writes > 0
+                if let Some(stats) = io.noop_stats()
+                    && stats.skipped_writes > 0
                 {
                     println!(
                         "[noop-skip: {} writes, {} bytes saved]",
-                        s.skipped_writes, s.skipped_bytes,
+                        stats.skipped_writes, stats.skipped_bytes,
                     );
                 }
                 break;
             }
 
-            NBD_CMD_FLUSH => match volume.flush() {
+            NBD_CMD_FLUSH => match io.flush() {
                 Ok(()) => tx_reply(&mut s, 0, handle)?,
                 Err(e) => {
                     error!("[fsync error: {}]", e);
@@ -1036,25 +891,18 @@ fn handle_volume_connection(
             },
 
             NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
-                // Round inward to fully-covered 4096-byte blocks.
-                // Sub-block-aligned ranges are no-ops (the filesystem will
-                // rewrite those LBAs before reading them anyway).
-                let start_lba = offset.div_ceil(4096);
-                let end_lba = (offset + length as u64) / 4096;
-                if end_lba > start_lba {
-                    let lba_count = (end_lba - start_lba) as u32;
-                    match volume.write_zeroes(start_lba, lba_count) {
-                        Ok(()) => tx_reply(&mut s, 0, handle)?,
-                        Err(e) => {
+                match io.write_zeroes_at(offset, length as u64) {
+                    Ok(()) => tx_reply(&mut s, 0, handle)?,
+                    Err(e) => {
+                        let code = nbd_error_code(&e);
+                        if code == 5 {
                             error!(
                                 "[write-zeroes error cmd={} offset={} len={}: {}]",
                                 cmd, offset, length, e
                             );
-                            tx_reply(&mut s, 5, handle)?; // EIO
                         }
+                        tx_reply(&mut s, code, handle)?;
                     }
-                } else {
-                    tx_reply(&mut s, 0, handle)?;
                 }
             }
 
@@ -1065,6 +913,14 @@ fn handle_volume_connection(
     }
 
     Ok(())
+}
+
+/// Map an `io::Error` to the NBD error code used on the wire.
+fn nbd_error_code(e: &io::Error) -> u32 {
+    match e.kind() {
+        io::ErrorKind::PermissionDenied => 1, // EPERM
+        _ => 5,                               // EIO
+    }
 }
 
 // --- Wire helpers ---
