@@ -64,6 +64,20 @@ process that serves block I/O.
 
 **Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, and streams its output to attached clients. The import process runs in two phases: a **write phase** (segments written to `pending/`) followed by a **serve phase** (the import binds `control.sock` and handles `promote` IPC from the coordinator until `pending/` is empty). The coordinator removes `import.lock` when the process exits. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume fork <name> <new-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
 
+### Proposed: Async runtime scope
+
+The volume process carries tokio today only to satisfy `object_store`'s async trait on the demand-fetch path; NBD I/O, the volume actor, and its worker thread are all synchronous. The target state is that the volume binary carries no async runtime at all, leaving tokio confined to the coordinator (supervision, IPC, S3 mutation) and `elide-import` (OCI registry pulls).
+
+Three independent changes compose to get there:
+
+1. **Sync S3 client for demand-fetch.** Replace `object_store` inside `elide-fetch` with a synchronous S3-compatible client (`rust-s3` blocking feature, or `ureq` + `aws-sigv4`). The coordinator continues to use `object_store` — its `LocalFileSystem` and `InMemory` backends are load-bearing for coordinator tests and have no sync equivalent with comparable maturity.
+2. **Sync ublk queue threads.** ublk integration follows the existing actor model: one synchronous thread per ublk queue, each holding a `VolumeHandle`, blocking on `crossbeam-channel` into the actor. io_uring is used as the kernel↔userspace transport only, not as an async programming model. Demand-fetch misses can block the queue thread initially; a blocking fetch-thread pool can be introduced later if the miss pattern justifies it without changing the queue model.
+3. **Drop `tokio` from `elide/Cargo.toml`.** Follows mechanically once (1) and (2) are in place.
+
+**Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping it synchronous matches its I/O model (NBD today, ublk later — both sync at the interface) and removes the only external dependency forcing an async runtime into it. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
+
+This is a direction, not a commitment. None of the three steps are required for current functionality; they are sequenced as the volume binary's dependencies are revisited.
+
 ## Correctness foundations
 
 Four mechanisms compose to guarantee that any read returns correct data, whether the segment body is present locally or must be demand-fetched from S3:
