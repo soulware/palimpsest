@@ -228,6 +228,45 @@ async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
     MockSocket(handle)
 }
 
+/// Walk `gc/` for bare volume-applied handoffs and delete the input
+/// `cache/<input>.{body,present}` files each carries.  This mirrors the
+/// coordinator-side cache eviction baked into `apply_done_handoffs` (see
+/// `elide-coordinator::gc::apply_done_handoffs`); tests that simulate the
+/// coordinator pipeline manually need to call it in place of the real IPC
+/// sequence.
+fn simulate_coord_cache_evict(fork_dir: &std::path::Path) {
+    let gc_dir = fork_dir.join("gc");
+    let cache_dir = fork_dir.join("cache");
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .expect("loading volume verifying key");
+    let Ok(entries) = fs::read_dir(&gc_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.contains('.') {
+            continue;
+        }
+        if ulid::Ulid::from_string(name_str).is_err() {
+            continue;
+        }
+        let Ok((_, _, inputs)) =
+            elide_core::segment::read_and_verify_segment_index(&entry.path(), &vk)
+        else {
+            continue;
+        };
+        for old in &inputs {
+            let s = old.to_string();
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+        }
+    }
+}
+
 fn make_gc_config() -> GcConfig {
     // density_threshold=0.0 admits every segment to sweep; the test segments
     // are well below SWEEP_SMALL_THRESHOLD so they pack via tier 1.
@@ -1110,7 +1149,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
                 }
             }
         }
-        vol.evict_applied_gc_cache();
+        simulate_coord_cache_evict(fork_dir);
     };
 
     // Helper: run a full GC sweep (drain + checkpoint + gc_fork + handoff +
@@ -1274,7 +1313,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
                 }
             }
         }
-        vol.evict_applied_gc_cache();
+        simulate_coord_cache_evict(fork_dir);
     };
 
     let gc_sweep = |vol: &mut Volume| {
@@ -1448,7 +1487,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
                 }
             }
         }
-        vol.evict_applied_gc_cache();
+        simulate_coord_cache_evict(fork_dir);
     };
 
     let gc_sweep = |vol: &mut Volume| {

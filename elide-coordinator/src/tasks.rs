@@ -322,11 +322,6 @@ pub async fn run_volume_tasks(
                 Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
             }
 
-            let pruned = gc::cleanup_done_handoffs(&fork_dir, gc::DONE_FILE_TTL);
-            if pruned > 0 {
-                info!("[gc {volume_id}] pruned {pruned} expired .done file(s)");
-            }
-
             match gc::gc_fork(
                 &fork_dir,
                 &volume_id,

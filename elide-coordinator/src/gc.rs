@@ -63,7 +63,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{error, warn};
 
 use anyhow::{Context, Result};
@@ -78,11 +77,6 @@ use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
 use crate::upload::segment_key;
-
-/// Legacy retention window kept for call-site compatibility with the
-/// `cleanup_done_handoffs` no-op stub. The self-describing GC handoff
-/// protocol leaves no `.done` files to prune.
-pub const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
@@ -508,6 +502,17 @@ pub async fn apply_done_handoffs(
             }
         }
 
+        // Drop each consumed input's local cache. Safe here: promote_segment
+        // already published cache/<new>.body and index/<new>.idx, and deleted
+        // index/<input>.idx, so reads for input LBAs resolve through the new
+        // segment. The volume never deletes cache/ — the coordinator is the
+        // sole deleter, so this does not race the volume's apply path.
+        for old_ulid in &inputs {
+            let old_ulid_str = old_ulid.to_string();
+            let _ = fs::remove_file(cache_dir.join(format!("{old_ulid_str}.body")));
+            let _ = fs::remove_file(cache_dir.join(format!("{old_ulid_str}.present")));
+        }
+
         // Finalize: volume deletes bare `gc/<new>` inside the actor, under
         // the same lock as `apply_gc_handoffs`. This is the "done" signal —
         // no more retries for this handoff.
@@ -521,14 +526,6 @@ pub async fn apply_done_handoffs(
     }
 
     Ok(count)
-}
-
-/// Legacy hook kept for call-site compatibility: under the self-describing
-/// GC handoff protocol, handoffs complete by deleting `gc/<ulid>`, so there
-/// are no `.done` markers to prune. Returns 0 until the caller stops
-/// invoking it.
-pub fn cleanup_done_handoffs(_fork_dir: &Path, _ttl: Duration) -> usize {
-    0
 }
 
 /// Delete any `gc/<ulid>.fetch` files left by a coordinator crash.

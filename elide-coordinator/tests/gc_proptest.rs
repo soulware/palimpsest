@@ -12,9 +12,9 @@
 // GcSweep runs the full coordinator round-trip:
 //   1. gc_fork()              — real compact_segments / collect_stats
 //   2. apply_gc_handoffs()    — volume re-signs and updates extent index
-//   3. promote_gc_outputs()   — simulates coordinator promote IPC + gc body cleanup
-//   4. evict_applied_gc_cache — volume evicts old cache files (actor step)
-//   5. apply_done_handoffs()  — uploads to InMemory store, deletes old S3 objects
+//   3. promote_gc_outputs()   — simulates coordinator promote IPC, coordinator-
+//                               side cache/<input>.* delete, and finalize IPC
+//   4. apply_done_handoffs()  — uploads to InMemory store, deletes old S3 objects
 // Then asserts all oracle LBAs are readable with correct data.
 
 use std::collections::HashMap;
@@ -60,9 +60,13 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
 /// Simulate the coordinator promote+finalize sequence for each volume-applied
 /// gc output: under the self-describing handoff protocol, those are the bare
 /// `gc/<ulid>` files (no extension). promote_segment writes index/<new>.idx
-/// and cache/<new>.body; finalize_gc_handoff deletes the bare body.
+/// and cache/<new>.body; the coordinator then deletes cache/<input>.* for
+/// every consumed input; finalize_gc_handoff deletes the bare body.
 fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     let gc_dir = dir.join("gc");
+    let cache_dir = dir.join("cache");
+    let vk = elide_core::signing::load_verifying_key(dir, elide_core::signing::VOLUME_PUB_FILE)
+        .expect("loading volume verifying key");
     let Ok(entries) = fs::read_dir(&gc_dir) else {
         return;
     };
@@ -79,7 +83,19 @@ fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
         .collect();
     bare.sort();
     for ulid in bare {
+        // Inputs list has to be read before finalize_gc_handoff deletes
+        // the bare file.
+        let bare_path = gc_dir.join(ulid.to_string());
+        let inputs: Vec<ulid::Ulid> =
+            elide_core::segment::read_and_verify_segment_index(&bare_path, &vk)
+                .map(|(_, _, inputs)| inputs)
+                .unwrap_or_default();
         let _ = vol.promote_segment(ulid);
+        for old in &inputs {
+            let s = old.to_string();
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+        }
         let _ = vol.finalize_gc_handoff(ulid);
     }
 }
@@ -226,13 +242,10 @@ proptest! {
                     // index, writes index/<new>.idx, deletes index/<old>.idx.
                     let _ = vol.apply_gc_handoffs();
 
-                    // Simulate coordinator promote IPC: copies gc/<new> → cache/<new>,
-                    // deletes gc/<new>.  In production this is an IPC round-trip;
-                    // here we call vol.promote_segment directly.
+                    // Simulate coordinator promote + cache-evict + finalize IPCs:
+                    // promote_gc_outputs covers promote, deletes cache/<input>.*
+                    // for each consumed input (coordinator-owned), then finalize.
                     promote_gc_outputs(&mut vol, fork_dir);
-
-                    // Actor step: evict old cache files after publishing the new snapshot.
-                    vol.evict_applied_gc_cache();
 
                     // Coordinator: upload new segment to S3, delete old S3 objects.
                     // cache/<new>.body already exists (seg_promoted=true), so
@@ -362,9 +375,8 @@ proptest! {
                     // Step 2: volume re-signs GC output, updates extent index.
                     let _ = vol.apply_gc_handoffs();
 
-                    // Step 3: simulate coordinator promote IPC + actor evict.
+                    // Step 3: simulate coordinator promote IPC + cache-evict + finalize.
                     promote_gc_outputs(&mut vol, fork_dir);
-                    vol.evict_applied_gc_cache();
 
                     // Step 4: upload new segment to S3, delete old S3 objects.
                     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
@@ -477,7 +489,6 @@ fn gc_oracle_repro_bug_h() {
     let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
-    vol.evict_applied_gc_cache();
     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
     // Read both LBAs to populate file cache with the pending/ segment.
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
@@ -496,7 +507,6 @@ fn gc_oracle_repro_bug_h() {
     let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
-    vol.evict_applied_gc_cache();
     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
 
     // These reads triggered "failed to fill whole buffer" before the fix.

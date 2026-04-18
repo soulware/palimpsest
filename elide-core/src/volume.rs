@@ -2019,8 +2019,9 @@ impl Volume {
     /// derive-at-apply path: read `inputs` from the segment header, diff
     /// each input's `.idx` against the new segment's entries to build the
     /// extent-index updates, re-sign the body with the volume key, rename
-    /// `<ulid>.tmp → <ulid>` (atomic commit), then remove `<ulid>.staged`
-    /// and evict input cache files.
+    /// `<ulid>.tmp → <ulid>` (atomic commit), then remove `<ulid>.staged`.
+    /// Input `cache/<input>.{body,present}` files are deleted by the
+    /// coordinator during `apply_done_handoffs`, not here.
     ///
     /// Returns the number of handoff files processed. Returns `Ok(0)` if
     /// the `gc/` directory does not exist yet.
@@ -2217,13 +2218,14 @@ impl Volume {
         fs::rename(&tmp_path, &bare_path)?;
         let _ = fs::remove_file(&result.staged_path);
 
-        // Evict cache for consumed inputs.
-        let cache_dir = self.base_dir.join("cache");
-        for input in &result.inputs {
-            let s = input.to_string();
-            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
-            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
-        }
+        // cache/<input>.{body,present} are NOT deleted here: the coordinator
+        // owns every deletion under cache/. It removes the input bodies as
+        // part of `apply_done_handoffs`, after `promote_segment` has published
+        // index/<new>.idx and cache/<new>.body. Leaving them here also means
+        // a crash between this commit and coordinator-side cleanup keeps the
+        // inputs readable via their original cache entries — on restart the
+        // extent index rebuilds from index/<input>.idx (still present until
+        // `promote_segment`), so reads still resolve correctly.
 
         Ok(StagedApply::Applied)
     }
@@ -2495,62 +2497,11 @@ impl Volume {
         fs::rename(&tmp_path, &bare_path)?;
         let _ = fs::remove_file(staged_path);
 
-        // Evict input cache bodies. By this point the extent index no
-        // longer references any old hash that the new segment doesn't
-        // carry, so no concurrent reader can still resolve via the old
-        // cache.
-        let cache_dir = self.base_dir.join("cache");
-        for input in &inputs {
-            let s = input.to_string();
-            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
-            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
-        }
+        // cache/<input>.{body,present} are not deleted here — the coordinator
+        // owns every cache/ deletion. See the same note in
+        // `apply_gc_handoff_result`.
 
         Ok(StagedApply::Applied)
-    }
-
-    // --- self-describing GC handoff support (step 4a) ---
-
-    /// Evict old cache files for completed GC handoffs.
-    ///
-    /// Called by the actor AFTER publishing the new snapshot (which redirects
-    /// all new reads to the GC output segment). Walks `gc/` for bare
-    /// volume-applied handoffs, reads each one's `inputs` field from the
-    /// segment header, and deletes `cache/<input>.{body,present}` for each
-    /// consumed input ULID.
-    ///
-    /// Safe to call multiple times — file deletions are best-effort and
-    /// silently skip already-absent files.
-    pub fn evict_applied_gc_cache(&self) {
-        let gc_dir = self.base_dir.join("gc");
-        let cache_dir = self.base_dir.join("cache");
-        let Ok(entries) = fs::read_dir(&gc_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            // Bare gc/<ulid>: a volume-applied handoff awaiting upload.
-            if name_str.contains('.') {
-                continue;
-            }
-            if Ulid::from_string(name_str).is_err() {
-                continue;
-            }
-            let path = entry.path();
-            let Ok((_, _, inputs)) =
-                segment::read_and_verify_segment_index(&path, &self.verifying_key)
-            else {
-                continue;
-            };
-            for old_ulid in &inputs {
-                let s = old_ulid.to_string();
-                let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
-                let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
-            }
-        }
     }
 
     /// Promote a segment to the local cache after confirmed S3 upload.
