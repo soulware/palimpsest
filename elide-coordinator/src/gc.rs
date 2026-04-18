@@ -1257,8 +1257,35 @@ async fn compact_segments(
     tokio::fs::rename(&tmp_path, &staged_path)
         .await
         .context("staging compacted segment in gc/")?;
+
+    // Per-kind breakdown for visibility. Mirrors the volume's flush log line
+    // (`data / inline / dedup-ref / zero / delta`) plus a `canonical-only`
+    // column: Data/Inline entries whose LBA was dead but whose hash was still
+    // live elsewhere — demoted in `collect_stats` to carry body for dedup
+    // resolution while dropping the stale LBA claim.
+    let mut data = 0usize;
+    let mut inline = 0usize;
+    let mut refs = 0usize;
+    let mut zero = 0usize;
+    let mut delta = 0usize;
+    let mut canonical = 0usize;
+    for e in &new_entries {
+        if e.canonical_only {
+            canonical += 1;
+            continue;
+        }
+        match e.kind {
+            segment::EntryKind::Data => data += 1,
+            segment::EntryKind::Inline => inline += 1,
+            segment::EntryKind::DedupRef => refs += 1,
+            segment::EntryKind::Zero => zero += 1,
+            segment::EntryKind::Delta => delta += 1,
+        }
+    }
     tracing::info!(
-        "[gc] staged output → {new_ulid_str} ({} live entries, {} inputs)",
+        "[gc] staged output → {new_ulid_str}: {data} data, {inline} inline, \
+         {refs} dedup-ref, {zero} zero, {delta} delta, {canonical} canonical-only \
+         ({} entries total, {} inputs)",
         new_entries.len(),
         inputs.len()
     );
