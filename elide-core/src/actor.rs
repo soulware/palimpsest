@@ -1759,13 +1759,7 @@ fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
 
     // 3. Read inline + body data from the staged segment.
     let handoff_inline = segment::read_inline_section(&job.staged_path)?;
-    segment::read_extent_bodies(
-        &job.staged_path,
-        bss,
-        &mut entries,
-        segment::EntryKind::ALL_WITH_BODY,
-        &handoff_inline,
-    )?;
+    segment::read_extent_bodies(&job.staged_path, bss, &mut entries, &handoff_inline)?;
 
     // 4. Re-sign and write gc/<ulid>.tmp.
     let tmp_path = job.gc_dir.join(format!("{}.tmp", job.new_ulid));
@@ -1974,7 +1968,6 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             &c.seg_path,
             c.body_section_start,
             &mut c.live_part,
-            segment::EntryKind::ALL_WITH_BODY,
             &inline_bytes,
         )?;
         // Verify each body matches its declared hash before it's carried
@@ -2154,7 +2147,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 seg_path,
                 body_section_start,
                 &mut live_entries,
-                segment::EntryKind::ALL_WITH_BODY,
                 &inline_bytes,
             )?;
 

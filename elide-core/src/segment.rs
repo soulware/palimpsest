@@ -305,25 +305,6 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    /// Entry kinds with locally-available body bytes (pending/ segments).
-    pub const LOCAL_BODY: [EntryKind; 2] = [EntryKind::Data, EntryKind::CanonicalData];
-    /// Entry kinds with body bytes in materialised/S3 segments.
-    pub const ALL_BODY: [EntryKind; 3] = [
-        EntryKind::Data,
-        EntryKind::DedupRef,
-        EntryKind::CanonicalData,
-    ];
-    /// All four body-bearing kinds. Use with `read_extent_bodies` when you
-    /// need to populate `entry.data` for every entry that carries body
-    /// bytes — e.g. re-signing a staged GC output, reading inputs for
-    /// compaction.
-    pub const ALL_WITH_BODY: [EntryKind; 4] = [
-        EntryKind::Data,
-        EntryKind::Inline,
-        EntryKind::CanonicalData,
-        EntryKind::CanonicalInline,
-    ];
-
     /// True for entries that carry no LBA claim on rebuild.
     pub fn is_canonical_only(self) -> bool {
         matches!(self, EntryKind::CanonicalData | EntryKind::CanonicalInline)
@@ -1240,46 +1221,51 @@ fn parse_delta_table(
     Ok(())
 }
 
-/// Populate `entry.data` by reading body bytes from the segment file.
+/// Populate `entry.data` for every body-bearing entry in `entries`:
+/// `Data`, `CanonicalData` bytes come from the body section of the file
+/// at `path`; `Inline`, `CanonicalInline` bytes are sliced from the
+/// pre-read `inline_bytes` buffer.
 ///
-/// `body_section_start` is the absolute file offset of the body section, as
-/// returned by `read_segment_index`.  Only entries whose `kind` is in
-/// `kinds` and whose `stored_length > 0` are read.
+/// `body_section_start` is the absolute file offset of the body section,
+/// as returned by `read_segment_index`. `inline_bytes` should be the
+/// segment's inline section (see `read_inline_section`); pass `&[]` if
+/// the caller knows the entry list contains no inline kinds, or if it
+/// deliberately wants inline entries skipped. Entries with
+/// `stored_length == 0` (DedupRef / Zero / Delta) are skipped.
 ///
-/// For `EntryKind::Inline` entries, pass the inline section bytes via
-/// `inline_bytes`.  Inline data is sliced from this buffer rather than read
-/// from the body section.  When `inline_bytes` is empty and `kinds` includes
-/// `Inline`, inline entries are silently skipped.
-///
-/// Common usage:
-/// - `&[EntryKind::Data]` — local pending/ segments where DedupRef body
-///   regions are sparse holes (not real data).
-/// - `&[EntryKind::Data, EntryKind::DedupRef]` — S3-fetched or materialised
-///   segments where all body regions are populated.
-/// - `&[EntryKind::Data, EntryKind::Inline]` — repack with inline data.
+/// Combines body-section I/O and inline slicing in one pass. Callers that
+/// only want one of the two can use `read_body_section_bodies` or
+/// `populate_inline_bodies` instead.
 pub fn read_extent_bodies(
     path: &Path,
     body_section_start: u64,
     entries: &mut [SegmentEntry],
-    kinds: impl AsRef<[EntryKind]>,
     inline_bytes: &[u8],
 ) -> io::Result<()> {
+    read_body_section_bodies(path, body_section_start, entries)?;
+    populate_inline_bodies(entries, inline_bytes);
+    Ok(())
+}
+
+/// Populate `entry.data` for `Data` / `CanonicalData` entries by reading
+/// the body section of `path`. Entries of other kinds, and entries with
+/// `stored_length == 0`, are skipped. No file I/O beyond the body section
+/// reads.
+pub fn read_body_section_bodies(
+    path: &Path,
+    body_section_start: u64,
+    entries: &mut [SegmentEntry],
+) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let kinds = kinds.as_ref();
+    if !entries
+        .iter()
+        .any(|e| e.kind.is_data() && e.stored_length > 0)
+    {
+        return Ok(());
+    }
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
-        if entry.stored_length == 0 {
-            continue;
-        }
-        if !kinds.contains(&entry.kind) {
-            continue;
-        }
-        if entry.kind.is_inline() {
-            let start = entry.stored_offset as usize;
-            let end = start + entry.stored_length as usize;
-            if end <= inline_bytes.len() {
-                entry.data = Some(inline_bytes[start..end].to_vec());
-            }
+        if entry.stored_length == 0 || !entry.kind.is_data() {
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
@@ -1288,6 +1274,24 @@ pub fn read_extent_bodies(
         entry.data = Some(buf);
     }
     Ok(())
+}
+
+/// Populate `entry.data` for `Inline` / `CanonicalInline` entries by
+/// slicing `inline_bytes`. No file I/O — `inline_bytes` is the inline
+/// section already in memory (see `read_inline_section`). Entries whose
+/// slice would overflow `inline_bytes` are silently skipped, matching
+/// the tolerance of `read_extent_bodies` for truncated inline sections.
+pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8]) {
+    for entry in entries.iter_mut() {
+        if entry.stored_length == 0 || !entry.kind.is_inline() {
+            continue;
+        }
+        let start = entry.stored_offset as usize;
+        let end = start + entry.stored_length as usize;
+        if end <= inline_bytes.len() {
+            entry.data = Some(inline_bytes[start..end].to_vec());
+        }
+    }
 }
 
 /// Verify that `body` hashes to `entry.hash`.
@@ -2682,21 +2686,14 @@ mod tests {
 
         // Body data is readable via read_extent_bodies.
         let (bss, mut entries2, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        read_extent_bodies(&path, bss, &mut entries2, [EntryKind::Data], &[]).unwrap();
+        read_body_section_bodies(&path, bss, &mut entries2).unwrap();
         assert_eq!(entries2[1].data.as_deref(), Some(large.as_slice()));
         // Inline entry data is NOT populated by body read (empty inline_bytes).
         assert!(entries2[0].data.is_none());
 
         // Now read with inline bytes too.
         let (_, mut entries3, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        read_extent_bodies(
-            &path,
-            bss,
-            &mut entries3,
-            [EntryKind::Data, EntryKind::Inline],
-            &inline_bytes,
-        )
-        .unwrap();
+        read_extent_bodies(&path, bss, &mut entries3, &inline_bytes).unwrap();
         assert_eq!(entries3[0].data.as_deref(), Some(small.as_slice()));
         assert_eq!(entries3[1].data.as_deref(), Some(large.as_slice()));
 
@@ -2833,7 +2830,7 @@ mod tests {
 
         // Body data should still be readable.
         let mut read_back = read_entries;
-        read_extent_bodies(&delta_path, bss, &mut read_back, [EntryKind::Data], &[]).unwrap();
+        read_body_section_bodies(&delta_path, bss, &mut read_back).unwrap();
         assert_eq!(read_back[0].data.as_deref(), Some(&[0xAAu8; 8192][..]));
         assert_eq!(read_back[1].data.as_deref(), Some(&[0xBBu8; 4096][..]));
 

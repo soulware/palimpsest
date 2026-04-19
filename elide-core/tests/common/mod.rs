@@ -263,15 +263,7 @@ fn compact_candidates_inner(
             (path.clone(), bss_header)
         };
         let inline_bytes = segment::read_inline_section(path).unwrap_or_default();
-        if segment::read_extent_bodies(
-            &body_path,
-            bss,
-            &mut entries,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
-            &inline_bytes,
-        )
-        .is_err()
-        {
+        if segment::read_extent_bodies(&body_path, bss, &mut entries, &inline_bytes).is_err() {
             continue;
         }
         // Mirror the production body-hash verify (PR #70 / commit 000d3b0):

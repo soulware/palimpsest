@@ -2427,13 +2427,7 @@ impl Volume {
         // don't carry delta entries (the common case) but will need to be
         // preserved when delta-rewrite interacts with GC compaction.
         let handoff_inline = segment::read_inline_section(staged_path)?;
-        segment::read_extent_bodies(
-            staged_path,
-            bss,
-            &mut entries,
-            EntryKind::ALL_WITH_BODY,
-            &handoff_inline,
-        )?;
+        segment::read_extent_bodies(staged_path, bss, &mut entries, &handoff_inline)?;
 
         // Verify each body hashes to its declared hash before re-signing.
         // Without this check, a poisoned input (e.g. zero-filled body carried
@@ -7315,14 +7309,8 @@ mod tests {
                             continue;
                         };
                         let body_path = fork_dir.join("cache").join(format!("{}.body", ulid));
-                        if segment::read_extent_bodies(
-                            &body_path,
-                            0,
-                            &mut seg_entries,
-                            segment::EntryKind::LOCAL_BODY,
-                            &[],
-                        )
-                        .is_err()
+                        if segment::read_body_section_bodies(&body_path, 0, &mut seg_entries)
+                            .is_err()
                         {
                             continue;
                         }
@@ -8592,14 +8580,7 @@ mod tests {
         let (_old_bss, mut entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         let inline_bytes = segment::read_inline_section(&idx_path).unwrap();
-        segment::read_extent_bodies(
-            &body_path,
-            0,
-            &mut entries,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
-            &inline_bytes,
-        )
-        .unwrap();
+        segment::read_extent_bodies(&body_path, 0, &mut entries, &inline_bytes).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();
@@ -8760,14 +8741,7 @@ mod tests {
         let (_old_bss, mut entries, _) =
             segment::read_and_verify_segment_index(&idx_b, &vol.verifying_key).unwrap();
         let inline_bytes = segment::read_inline_section(&idx_b).unwrap();
-        segment::read_extent_bodies(
-            &body_b,
-            0,
-            &mut entries,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
-            &inline_bytes,
-        )
-        .unwrap();
+        segment::read_extent_bodies(&body_b, 0, &mut entries, &inline_bytes).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();

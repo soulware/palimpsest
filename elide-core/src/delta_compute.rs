@@ -23,7 +23,8 @@ use crate::extentindex::{self, ExtentIndex, ExtentLocation};
 use crate::filemap::{self, Filemap};
 use crate::segment::{
     self, DeltaOption, EntryKind, SegmentEntry, SegmentFlags, SegmentSigner,
-    read_and_verify_segment_index, read_extent_bodies, write_segment_with_delta_body,
+    populate_inline_bodies, read_and_verify_segment_index, read_body_section_bodies,
+    write_segment_with_delta_body,
 };
 use crate::segment_cache::SegmentIndexCache;
 use crate::signing::{self, VerifyingKey};
@@ -263,15 +264,12 @@ fn maybe_rewrite_segment(
         return Ok(SegmentDeltaStats::default());
     }
 
-    // Load body bytes for all Data entries so the rewrite can copy
-    // unconverted bodies through verbatim.
-    read_extent_bodies(
-        seg_path,
-        body_section_start,
-        &mut entries,
-        [EntryKind::Data],
-        &[],
-    )?;
+    // Load body bytes for all body-section entries so the rewrite can copy
+    // unconverted bodies through verbatim. `DATA_KINDS` covers Data and
+    // CanonicalData; delta_compute inputs are fresh imports today so
+    // canonical variants don't appear in practice, but the filter aligns
+    // with `is_data()` so any future canonical inputs are handled.
+    read_body_section_bodies(seg_path, body_section_start, &mut entries)?;
 
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
@@ -355,13 +353,7 @@ fn maybe_rewrite_segment(
     let has_inline = entries.iter().any(|e| e.kind.is_inline());
     if has_inline {
         let inline_bytes = read_inline_section(seg_path, &entries)?;
-        read_extent_bodies(
-            seg_path,
-            body_section_start,
-            &mut entries,
-            [EntryKind::Inline],
-            &inline_bytes,
-        )?;
+        populate_inline_bodies(&mut entries, &inline_bytes);
     }
 
     // Write to a tmp sibling then rename atomically.
@@ -518,16 +510,10 @@ pub fn rewrite_post_snapshot_with_prior(
         return Ok(None);
     }
 
-    // Load all Data bodies — both the ones we might convert and the
-    // ones we need to re-emit verbatim. Same pattern as
+    // Load all body-section bodies — both the ones we might convert and
+    // the ones we need to re-emit verbatim. Same pattern as
     // `maybe_rewrite_segment`.
-    read_extent_bodies(
-        seg_path,
-        body_section_start,
-        &mut entries,
-        [EntryKind::Data],
-        &[],
-    )?;
+    read_body_section_bodies(seg_path, body_section_start, &mut entries)?;
 
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
@@ -620,13 +606,7 @@ pub fn rewrite_post_snapshot_with_prior(
     let has_inline = entries.iter().any(|e| e.kind.is_inline());
     if has_inline {
         let inline_bytes = read_inline_section(seg_path, &entries)?;
-        read_extent_bodies(
-            seg_path,
-            body_section_start,
-            &mut entries,
-            [EntryKind::Inline],
-            &inline_bytes,
-        )?;
+        populate_inline_bodies(&mut entries, &inline_bytes);
     }
 
     let tmp_path = {
