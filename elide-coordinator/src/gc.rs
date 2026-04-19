@@ -354,7 +354,22 @@ pub async fn gc_fork(
     // single-segment dead-data cleanup.
     let ran_sweep = if bucket.len() >= 2 {
         let sweep_candidates = bucket.len();
+        let sweep_live_bytes: u64 = bucket.iter().map(|s| s.live_lba_bytes).sum();
         let sweep_bytes: u64 = bucket.iter().map(|s| s.dead_lba_bytes()).sum();
+        let sweep_live_entries: usize = bucket.iter().map(|s| s.live_entries.len()).sum();
+        let sweep_removed_hashes: usize = bucket.iter().map(|s| s.removed_hashes.len()).sum();
+        let sweep_inputs: Vec<&str> = bucket.iter().map(|s| s.ulid_str.as_str()).collect();
+        tracing::info!(
+            "[gc] sweep: [{}] → {} inputs={} live_lba={} dead_lba={} \
+             live_entries={} removed_hashes={}",
+            sweep_inputs.join(", "),
+            sweep_ulid,
+            sweep_candidates,
+            sweep_live_bytes,
+            sweep_bytes,
+            sweep_live_entries,
+            sweep_removed_hashes,
+        );
         compact_segments(
             bucket,
             &gc_dir,
@@ -1095,10 +1110,10 @@ async fn compact_segments(
         .context("writing GC plan file")?;
 
     tracing::info!(
-        "[gc] plan emitted → {new_ulid_str}: {keep_count} keep, {zero_split_count} zero_split, \
-         {canonical_count} canonical, {run_count} run, {drop_count} drop ({} records total, \
-         {total_inputs} inputs)",
-        plan.outputs.len()
+        "[gc] plan emitted → {new_ulid_str}: keep={keep_count} zero_split={zero_split_count} \
+         canonical={canonical_count} run={run_count} drop={drop_count} \
+         records={} inputs={total_inputs}",
+        plan.outputs.len(),
     );
 
     Ok(())
