@@ -1922,7 +1922,10 @@ pub struct SegmentRef {
 }
 
 /// Discover every segment file for a single fork, in rebuild-processing
-/// order (lowest priority first).
+/// order (lowest priority first). Bare `gc/<new>` entries supersede the
+/// `index/<input>.idx` files listed in their `inputs` header field —
+/// those are filtered out of the returned list. See
+/// [`collect_superseded_inputs`] for the rationale.
 ///
 /// **Listing order: pending → gc → index.** A concurrent promote writes
 /// `index/<ulid>.idx` *then* removes the source (`pending/<ulid>` or
@@ -1976,7 +1979,43 @@ pub fn discover_fork_segments(
         }
     }
 
+    // Enforce the supersede rule: a bare `gc/<new>` carries a declarative
+    // `inputs` list naming the ULIDs it replaces. Any `index/<input>.idx`
+    // files still on disk are stale — `promote_segment` removes them
+    // eventually, but until it runs the rebuild must not consult them,
+    // because the bare segment may have deliberately dropped some of
+    // their entries (e.g. partial-death sub-runs re-hashed at smaller
+    // granularity). Re-inserting those entries would leave stale
+    // claims in the rebuilt view. Found by HandoffProtocol.tla.
+    let consumed = collect_superseded_inputs(&out);
+    out.retain(|s| !(s.tier == SegmentTier::Index && consumed.contains(&s.ulid)));
+
     Ok(out)
+}
+
+/// Read the `inputs` list from every bare `gc/<ulid>` segment in
+/// `segments` and return the union as a set of ULIDs. Those ULIDs are
+/// the segments those bare outputs superseded; callers that rebuild
+/// from disk must skip them in the `index/` tier.
+///
+/// Read failures on a bare gc file are silently skipped — a corrupt
+/// bare file will be caught by the next full segment verification in
+/// the rebuild loop (both `lbamap::rebuild_segments` and
+/// `extentindex::rebuild` call `read_and_verify_segment_index`).
+fn collect_superseded_inputs(segments: &[SegmentRef]) -> std::collections::HashSet<ulid::Ulid> {
+    let mut consumed: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
+    for sref in segments {
+        if sref.tier != SegmentTier::GcApplied {
+            continue;
+        }
+        let Ok((_, _, inputs)) = read_segment_index(&sref.path) else {
+            continue;
+        };
+        for input in inputs {
+            consumed.insert(input);
+        }
+    }
+    consumed
 }
 
 /// Build a `SegmentRef` from a path, applying the optional branch-ulid
