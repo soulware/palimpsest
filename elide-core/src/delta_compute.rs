@@ -35,6 +35,29 @@ use crate::volume;
 /// tradeoff between ratio and import latency.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Upper bound on the uncompressed size of a delta-dict decompression.
+/// Matches the 16 MiB segment-size cap — a single extent cannot be
+/// larger, and the decoder needs a capacity bound to protect against
+/// corrupt / adversarial delta blobs.
+pub const DELTA_DECOMPRESS_CAP: usize = 16 * 1024 * 1024;
+
+/// Apply a delta blob to its base body, reconstructing the composite
+/// body bytes. Uses the base as a zstd dictionary.
+///
+/// `base_body` is the uncompressed bytes of the source extent that the
+/// delta was computed against (via `zstd::bulk::Compressor::with_dictionary`
+/// in the write path). `delta_blob` is the compressed payload stored in
+/// the delta body section of the Delta entry's segment.
+///
+/// Decompression output is capped at [`DELTA_DECOMPRESS_CAP`].
+pub fn apply_delta(base_body: &[u8], delta_blob: &[u8]) -> io::Result<Vec<u8>> {
+    let mut decoder = zstd::bulk::Decompressor::with_dictionary(base_body)
+        .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
+    decoder
+        .decompress(delta_blob, DELTA_DECOMPRESS_CAP)
+        .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))
+}
+
 /// Summary of delta work performed for a single pending volume.
 #[derive(Debug, Default)]
 pub struct DeltaStats {

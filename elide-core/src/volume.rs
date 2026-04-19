@@ -37,6 +37,7 @@ pub use segment::BoxFetcher;
 use ulid::Ulid;
 
 use crate::{
+    delta_compute,
     extentindex::{self, BodySource},
     lbamap,
     segment::{self, EntryKind},
@@ -3950,21 +3951,10 @@ fn try_read_delta_extent(
         }
     };
 
-    // --- Decompress the delta blob using the source as the zstd dictionary. ---
-    // The decompressed length equals the Delta entry's logical size
-    // (`lba_length * 4096`). We don't have lba_length on ExtentRead
-    // directly, but `er.range_end - er.range_start` gives the number
-    // of LBAs in the portion we need, and the delta produces bytes
-    // for the full fragment regardless of which portion we want.
-    // Use a generous upper bound and slice the result.
-    let mut decoder = zstd::bulk::Decompressor::with_dictionary(&source_bytes)
-        .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
-    // Uncompressed size bound: the Delta entry describes one fragment
-    // of a file. We don't carry the exact uncompressed size here, so
-    // pass a large enough capacity (16 MiB — the segment-size cap).
-    let decompressed = decoder
-        .decompress(&delta_blob, 16 * 1024 * 1024)
-        .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))?;
+    // Reconstruct the full fragment bytes. We slice out the requested
+    // portion below; the decompressor returns every byte the delta was
+    // computed over, regardless of which LBA sub-range we want.
+    let decompressed = delta_compute::apply_delta(&source_bytes, &delta_blob)?;
 
     // Copy the requested portion into the output buffer.
     let block_count = (er.range_end - er.range_start) as usize;

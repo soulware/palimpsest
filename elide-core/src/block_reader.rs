@@ -343,13 +343,7 @@ impl BlockReader {
             opt.delta_length,
         )?;
 
-        let mut decoder = zstd::bulk::Decompressor::with_dictionary(&source_bytes)
-            .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
-        // Cap matches the segment-size cap used by the writer (16 MiB) — see
-        // `try_read_delta_extent` in volume.rs for the rationale.
-        let decompressed = decoder
-            .decompress(&delta_blob, 16 * 1024 * 1024)
-            .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))?;
+        let decompressed = crate::delta_compute::apply_delta(&source_bytes, &delta_blob)?;
 
         let src = block_offset as usize * 4096;
         let src_end = src + 4096;
