@@ -1,8 +1,12 @@
 # Design: compacting partial-LBA-death segments
 
-**Status:** Partially implemented. Data/Inline partial-death is live on the
-`docs/gc-partial-death-compaction` branch (commits `eb1b52d` and `8a1d6e1`);
-DedupRef/Delta partial-death is deferred — see [Implementation status](#implementation-status).
+**Status:** Implemented across all four entry kinds. Data/Inline landed in
+PR #78 (commits `eb1b52d`, `8a1d6e1`); DedupRef landed in `f0db17d` with the
+supporting `resolve_body_by_hash` (`96fdf35`) and shared `apply_delta`
+(`8acbf7b`) helpers; Delta landed via `read_delta_blob` plus a collect_stats
+routing gate on `source_hash` resolvability. Segments now only defer on the
+narrow case where a partial-death Delta has no resolvable
+`delta_options[i].source_hash` in the current extent index.
 
 ## Motivation
 
@@ -38,11 +42,21 @@ Partial-death compaction runs **per entry**, not per segment. For each partial-d
 
 3. **Slice into live sub-runs.** Use `lba_map.extents_in_range(start, end)` and filter to runs where `r.hash == entry.hash`. Each such run is a surviving slice of the composite body. There can be one (head / tail) or more (interior, or multiple disjoint overwriters) — emit one sub-run entry per run.
 
-4. **Emit each sub-run through the normal write path** into the compaction output segment. For each sub-run bytes `B_i`:
-   - Compute `hash(B_i)`.
-   - If `extent_index` already has that hash → emit a whole-body `DedupRef`.
-   - Otherwise → emit a fresh `Data` entry containing `B_i`.
-   - In both cases the emitted entry's `(start_lba, lba_length)` matches the surviving sub-run exactly.
+4. **Emit each sub-run** into the compaction output segment. For each
+   sub-run bytes `B_i`, compute `hash(B_i)` and emit a fresh `Data`
+   entry carrying the slice bytes. The emitted entry's
+   `(start_lba, lba_length)` matches the surviving sub-run exactly.
+
+   Always `Data`, never `DedupRef` — even when `hash(B_i)` happens to
+   already live in the extent index. A `DedupRef` would depend on the
+   target segment surviving (or being carried forward via
+   `canonical_only`) this pass, which isn't determinable at expand time:
+   the target may itself be an input, its entry may be fully dead and
+   scheduled for `removed_hashes`, and expansion runs before the pass
+   finalises those decisions. Fresh `Data` keeps the sub-run's bytes
+   self-contained. Space cost is bounded (partial-death is rare); a
+   later optimisation could re-introduce `DedupRef` emission with
+   explicit safety checks against the in-pass input set.
 
 ## Why this is correct
 
@@ -81,130 +95,64 @@ Extend the tests in [`design-gc-overlap-correctness.md`](design-gc-overlap-corre
 
 ## Implementation status
 
-### What's implemented (Data / Inline)
+`collect_stats` routes partial-death entries of all four kinds into a
+per-entry `partial_death_runs` list (parallel to `live_entries`).
+`compact_segments`'s `expand_partial_death` branches on `entry.kind` to
+acquire the composite body:
 
-`collect_stats` routes partial-death Data / Inline entries into a per-entry
-`partial_death_runs` list (parallel to `live_entries`). `compact_segments`'s
-`expand_partial_death` reads the composite body from the source segment
-(already populated by `fetch_live_bodies` for Data, or by inline pre-population
-for Inline), slices into live sub-runs, hashes each slice, and emits either a
-whole-body `DedupRef` (if the hash already exists) or a fresh `Data` entry.
-The composite hash is preserved as `CanonicalData` / `CanonicalInline` when
-externally referenced, dropped otherwise. The source segment is deleted
-(rather than deferred) once all its partial-death entries are handled.
+- **Data / Inline**: read from `entry.data` (populated by `fetch_live_bodies`
+  for Data, or inline pre-population for Inline). Decompressed if
+  `entry.compressed`.
+- **DedupRef**: fetched via `resolve_body_by_hash(entry.hash, ...)` — handles
+  the local-cache / S3 range-GET / inline tiers behind a single interface.
+- **Delta**: two-step reconstruction. Pick the first
+  `delta_options[i].source_hash` that resolves via `extent_index.lookup()`
+  (which only returns Data-body entries, so chained deltas are
+  structurally impossible). Fetch the base via `resolve_body_by_hash`;
+  fetch the delta blob via `read_delta_blob` (Full segment file →
+  `cache/<id>.delta` → S3 range-GET precedence); call `apply_delta`.
 
-Tests that cover this path:
+**Canonical-hash handling** differs by kind. Data / Inline / Delta emit a
+`CanonicalData` (or `CanonicalInline` for small Data/Inline) preserving
+the composite body when the hash is still referenced (tracked via
+`live_hashes`). For Delta specifically this is *reconstruct-and-inline*:
+the canonical body is stored uncompressed, not re-encoded as a Delta —
+trading compactness for O(1) dedup reads. DedupRef emits no canonical:
+the body lives in a segment this pass doesn't touch.
+
+The sub-run path is shared: each live run is hashed, and a fresh `Data`
+entry carries the slice bytes (always `Data`, never `DedupRef` — the
+latter would depend on the target segment surviving this pass, which
+isn't determinable at expand time).
+
+### Defer cases
+
+A segment stays deferred via `has_partial_death = true` iff it contains a
+partial-death Delta entry whose `delta_options` have *no* resolvable
+`source_hash` in the current extent index — no base body means no
+reconstruction this pass. The segment sits on disk and retries next tick,
+when a later write may re-establish a source. Every other partial-death
+shape is handled in-band.
+
+### Tests
+
 - `gc::tests::collect_stats_skips_entry_with_{head,tail,interior}_overwrite`
-  (deterministic).
-- `gc_oracle`, `gc_segment_cleanup`, `gc_oracle_repro_bug_h` (proptest).
+  (deterministic, Data/Inline).
+- `gc::tests::gc_delta_partial_death_compaction` (deterministic, Delta —
+  hand-crafts a multi-LBA Delta, overwrites one LBA, runs gc_fork +
+  apply_gc_handoffs, and verifies reads return the reconstructed
+  composite slices for surviving sub-runs plus the overwrite bytes).
+- `gc_oracle`, `gc_segment_cleanup`, `gc_oracle_repro_bug_h` and the
+  `MultiLbaDedupRefOverwrite` SimOp (proptest coverage for Data/Inline
+  and DedupRef).
 
-### What's deferred (DedupRef / Delta)
+### Follow-ups (not load-bearing)
 
-Partial-death DedupRef and Delta entries still hit the segment-level skip rule
-from PR #77: `collect_stats` sets `has_partial_death = true` for their
-segment, and `gc_fork` partitions the segment out of the current pass. Those
-segments sit on disk with dead bytes until either (a) later writes kill their
-surviving sub-ranges (which lets normal GC reclaim them), or (b) this work
-lands.
-
-The design in this doc's `## Design` section already specifies the intended
-behaviour for both: reconstruct-and-inline. The sub-run emission path is the
-same as Data / Inline. The differences are in how the composite body is
-obtained and what the canonical-hash handling looks like.
-
-#### DedupRef
-
-**Compose body source.** The DedupRef entry's segment doesn't hold the body;
-`extent_index[entry.hash]` points at the canonical segment that does. Fetch
-from there:
-- Inline case: bytes live in the canonical segment's `.idx` inline section,
-  or pre-read into `extent_location.inline_data`.
-- Data case: read from the canonical segment's body section
-  (`cache/<id>.body` or S3 range-GET via the usual demand-fetch mechanism),
-  decompress if `compressed`.
-
-**Canonical-hash handling.** None. The composite body is preserved by the
-canonical segment, which this GC pass doesn't touch. The DedupRef is dropped
-from the compacted output; sub-runs are emitted in its place.
-
-#### Delta
-
-**Composite body source.** Two-step reconstruction:
-1. Resolve the base body via `extent_index[delta_options[0].source_hash]`
-   (same fetch mechanics as DedupRef above). Pick the first `source_hash`
-   that resolves, matching the read path.
-2. Read the delta blob from this segment's delta body section at
-   `delta_options[0].delta_offset`, and zstd-dict-decompress against the
-   base body.
-
-**Canonical-hash handling.** The Delta's hash may be externally referenced
-(by a DedupRef or another Delta's `source_hash`). **Reconstruct-and-inline**:
-emit the reconstructed composite body as `CanonicalData` (or `CanonicalInline`
-if small). The delta encoding is not preserved — the canonical body is stored
-uncompressed (or LZ4-compressed by `new_data`'s usual rules), not delta-
-encoded. This avoids per-read delta reconstruction for the canonical body
-at the cost of losing its delta-compactness.
-
-The rejected alternative: extend `canonical_only` to cover Delta (a Delta
-entry with zero LBA claim that still holds delta_options + source_hash).
-Saves canonical-body storage; adds read-time reconstruction cost on every
-dedup resolution through that hash. Not worth the complexity for a rare case.
-
-### Machinery required for the deferred work
-
-1. **Cross-segment body resolution.** A coordinator-side helper that takes
-   a hash and returns the uncompressed composite body, handling both
-   locally-cached and demand-fetch paths, and both Data-section and Inline-
-   section sources. Roughly the coordinator analogue of `block_reader`'s
-   body resolution, but operating on segment files directly rather than
-   through a `Volume`. Reuses `fetch_live_bodies`'s local/S3 tiering.
-2. **Delta application.** A shared `apply_delta(base_body, delta_blob)`
-   helper. `block_reader::read_delta_block` already does this work; extract
-   it so the coordinator can call it without constructing a BlockReader.
-3. **`collect_stats` routing.** Route DedupRef/Delta partial-death into
-   `partial_death_runs` (currently only Data/Inline populate it). Drop the
-   `has_partial_death = true` branch for those kinds once the above
-   machinery exists. The remaining `has_partial_death` use cases would
-   collapse to "body fetch failed" — see below.
-4. **Expand-partial-death branching.** `expand_partial_death` currently
-   assumes the composite body is already in `entry.data`. Extend to branch
-   on `entry.kind`:
-   - Data/Inline: current path.
-   - DedupRef: call the body-resolution helper on `entry.hash`; no canonical
-     emit.
-   - Delta: resolve base via helper + apply_delta; emit canonical via
-     reconstruct-and-inline when `live_hashes.contains(&entry.hash)`.
-
-### Open questions
-
-- **Fetch failure fallback.** If the base or canonical body isn't locally
-  cached and S3 is unreachable (or slow), we can't reconstruct. The clean
-  answer is: treat this entry as "defer this pass" — set `has_partial_death`
-  on the segment and partition it out, same as today. Retry next pass.
-  Requires `collect_stats` to attempt the resolution (or at least a
-  cheap check for local availability) before routing.
-- **Dependency within a pass.** If the canonical body for a partial-death
-  DedupRef is itself a Data entry that's *also* partial-death in the same
-  pass, we read the Data body off its source segment. The fact that the
-  Data entry will be compacted doesn't affect on-disk bytes at fetch time.
-  Probably a non-issue; document and move on.
-- **`source_hash` selection for Delta.** Delta carries multiple
-  `delta_options`. Pick the first whose `source_hash` resolves via
-  `extent_index`, matching the read-path order. If none resolve, defer.
-
-### Testing for the deferred work
-
-New proptest `SimOp` variants:
-- `MultiLbaDedupRefOverwrite` — prior multi-LBA Data write (established
-  hash H), later dedup write of the same bytes producing a multi-LBA
-  DedupRef, partial overwrite on the DedupRef, GC. Expected: DedupRef's
-  segment is compacted; sub-runs emitted; canonical segment untouched;
-  surviving LBAs read correctly.
-- `MultiLbaDeltaOverwrite` — file-aware import producing a multi-LBA
-  Delta entry, partial overwrite, GC. Expected: Delta's segment compacted
-  (either to canonical reconstructed body + sub-runs, or dropped if H
-  has no external refs); read path still works for both the composite
-  hash (if externally referenced) and the surviving sub-run LBAs.
-
-Both should satisfy `gc_oracle` and leave no `has_partial_death` segments
-once the machinery is in place.
+- **Proptest `MultiLbaDeltaOverwrite` SimOp.** File-aware import
+  producing multi-LBA Delta entries, partial overwrite, GC. Larger lift
+  than the deterministic test above because it needs filemap orchestration
+  in the SimOp driver.
+- **Cheaper defer check.** `collect_stats` currently checks
+  `extent_index.lookup(source_hash)` which is a hot-path hash lookup —
+  already cheap. No further work expected unless profiling says
+  otherwise.

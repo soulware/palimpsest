@@ -214,12 +214,13 @@ pub async fn gc_fork(
         .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
-    // Segments with at least one partially-LBA-dead DedupRef or Delta
-    // entry are ineligible for compaction this pass: expanding those
-    // would require resolving the composite body from elsewhere (extent
-    // index or delta reconstruction). Data/Inline partial death is
-    // handled in-band in `compact_segments` via `expand_partial_death`
-    // and does not defer the segment. See
+    // Segments with a partial-LBA-death Delta entry whose sources don't
+    // resolve this pass are ineligible for compaction: there's no base
+    // body to reconstruct the composite against. They sit out this pass
+    // and retry next tick, when later writes may re-establish a source.
+    // Data/Inline/DedupRef partial death, and Delta with at least one
+    // resolvable source, are all handled in-band via
+    // `expand_partial_death`. See
     // `docs/design-gc-partial-death-compaction.md`.
     let (deferred, all_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
@@ -230,7 +231,7 @@ pub async fn gc_fork(
             .map(|s| s.ulid_str[..8].to_string())
             .collect();
         tracing::info!(
-            "[gc] deferring {} segment(s) with partial-LBA-death DedupRef/Delta entries: [{}]",
+            "[gc] deferring {} segment(s) with unresolvable partial-LBA-death Delta entries: [{}]",
             deferred_count,
             deferred_ulids.join(", ")
         );
@@ -630,6 +631,11 @@ struct SegmentStats {
     /// `body_section_start` for this segment's S3 object (== .idx file size).
     /// Used to compute absolute byte offsets for range-GETs into S3.
     body_section_start: u64,
+    /// Byte length of the body section (sum of DATA `stored_length`). Pulled
+    /// from the segment header. Used by the Delta partial-death expand path
+    /// to locate the delta body section (which sits at
+    /// `body_section_start + body_length` within the segment file).
+    body_section_length: u64,
     /// Physical on-disk size (idx + DATA body bytes); kept for diagnostics
     /// and density logging.
     file_size: u64,
@@ -659,13 +665,15 @@ struct SegmentStats {
     /// (when externally referenced) plus one fresh entry per sub-run. `None`
     /// for non-partial entries. See `docs/design-gc-partial-death-compaction.md`.
     partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>>,
-    /// True if at least one `DedupRef` or `Delta` entry in this segment is
-    /// partial-LBA-death. Those cases still need body resolution beyond this
-    /// segment to expand (DedupRef → canonical body elsewhere; Delta →
-    /// reconstruct against base), so the current pass defers the whole
-    /// segment via the same skip rule PR #77 introduced. Data/Inline partial
-    /// death is handled in-band via `partial_death_runs` and does not set
-    /// this flag.
+    /// True if at least one partial-LBA-death entry in this segment cannot
+    /// be expanded this pass. In the current implementation this is only
+    /// set for Delta entries where none of the `delta_options[i]
+    /// .source_hash`es resolve via the extent index — there is no base
+    /// body to reconstruct against, so the segment is deferred via the
+    /// same skip rule PR #77 introduced. Retry next pass when a later
+    /// write may re-establish a source. Data/Inline/DedupRef partial-
+    /// death is always handled in-band via `partial_death_runs` and does
+    /// not set this flag.
     has_partial_death: bool,
 }
 
@@ -740,6 +748,7 @@ fn collect_stats(
         // idx_size == body_section_start: the .idx file is exactly the
         // [0, body_section_start) prefix of the full S3 segment.
         let idx_size = segment::idx_body_section_start(&idx_path)?;
+        let layout = segment::read_segment_layout(&idx_path)?;
         let (_, entries, _) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
         // Read inline section from .idx for any inline entries.
@@ -839,8 +848,9 @@ fn collect_stats(
             //       and drop.
             //   - **partially alive** (some LBAs still live at `entry.hash`,
             //     others overwritten): route into `partial_death_runs` for
-            //     expansion in `compact_segments`, or defer the whole
-            //     segment (Delta, pending the delta-blob fetch machinery).
+            //     expansion in `compact_segments`. Delta with no
+            //     resolvable `source_hash` is the sole remaining defer
+            //     case — no base body means no reconstruction this pass.
             let end_lba = entry.start_lba + entry.lba_length as u64;
             let runs = lba_map.extents_in_range(entry.start_lba, end_lba);
             let matching_blocks: u64 = runs
@@ -889,11 +899,12 @@ fn collect_stats(
                 // `expand_partial_death`), so `compact_segments` can slice it
                 // into live sub-runs without deferring the segment.
                 //
-                // Delta still defers: the reconstructed composite body needs
-                // delta-blob fetching machinery the coordinator doesn't have
-                // yet (tracked as step 3b of
-                // `docs/design-gc-partial-death-compaction.md`'s machinery
-                // list).
+                // Delta routes through the same path provided at least one
+                // `delta_options[i].source_hash` resolves via `extent_index`
+                // (the Data-body map). If none resolve, there is no base
+                // body to reconstruct against — fall back to the segment-
+                // level defer (`has_partial_death = true`) and retry next
+                // pass, when later writes may have re-established a source.
                 live_lba_bytes += matching_blocks * BLOCK_BYTES;
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline | EntryKind::DedupRef => {
@@ -904,10 +915,22 @@ fn collect_stats(
                         partial_death_runs.push(Some(live_runs));
                     }
                     EntryKind::Delta => {
-                        live_entries.push(entry);
-                        live_entry_indices.push(entry_idx);
-                        partial_death_runs.push(None);
-                        has_partial_death = true;
+                        let has_resolvable_source = entry
+                            .delta_options
+                            .iter()
+                            .any(|opt| index.lookup(&opt.source_hash).is_some());
+                        if has_resolvable_source {
+                            let live_runs: Arc<[lbamap::ExtentRead]> =
+                                runs.into_iter().filter(|r| r.hash == entry.hash).collect();
+                            live_entries.push(entry);
+                            live_entry_indices.push(entry_idx);
+                            partial_death_runs.push(Some(live_runs));
+                        } else {
+                            live_entries.push(entry);
+                            live_entry_indices.push(entry_idx);
+                            partial_death_runs.push(None);
+                            has_partial_death = true;
+                        }
                     }
                     _ => {
                         // Zero is pre-split above; CanonicalData/CanonicalInline
@@ -930,6 +953,7 @@ fn collect_stats(
         result.push(SegmentStats {
             ulid_str,
             body_section_start: idx_size,
+            body_section_length: layout.body_length,
             has_body_entries: physical_body_bytes > 0 || has_inline,
             file_size,
             live_lba_bytes,
@@ -1359,6 +1383,96 @@ async fn read_extent_body_cached(
     Ok(bytes.to_vec())
 }
 
+/// Read the delta blob for a single `DeltaOption` out of a segment's delta
+/// body section. Used by Delta partial-death expansion to reconstruct the
+/// composite body via `apply_delta(base_body, delta_blob)`.
+///
+/// Dispatches in the same precedence order as `locate_segment_body`:
+/// 1. **Full local segment file** (`wal/<id>`, `pending/<id>`, bare
+///    `gc/<id>`): seek to `body_section_start + body_length + delta_offset`
+///    — the delta body section sits directly after the data body section
+///    within the full segment file.
+/// 2. **`cache/<id>.delta`**: evicted-segment deltas live in a separate
+///    file whose byte 0 is the start of the delta body section. Seek to
+///    `delta_offset` within that file.
+/// 3. **S3 range-GET**: fetch `delta_length` bytes at
+///    `body_section_start + body_length + delta_offset` within the S3
+///    segment object.
+///
+/// Delta blobs are never inline (unlike extent bodies); there is no
+/// `inline_data` fast path.
+// Eight arguments: the five segment-addressing fields (segment_id,
+// body_section_start, body_length, delta_offset, delta_length) plus the
+// three fetch-context fields (fork_dir, volume_id, store). Bundling them
+// would not reduce load-bearing parameters — each call site already has
+// them individually.
+#[allow(clippy::too_many_arguments)]
+async fn read_delta_blob(
+    segment_id: Ulid,
+    body_section_start: u64,
+    body_length: u64,
+    delta_offset: u64,
+    delta_length: u32,
+    fork_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let sid = segment_id.to_string();
+
+    if let Some((path, segment::SegmentBodyLayout::FullSegment)) =
+        segment::locate_segment_body(fork_dir, segment_id)
+    {
+        let seek = body_section_start + body_length + delta_offset;
+        let mut f = fs::File::open(&path)
+            .with_context(|| format!("opening local segment {}", path.display()))?;
+        f.seek(SeekFrom::Start(seek))
+            .with_context(|| format!("seeking delta body in {} to {seek}", path.display()))?;
+        let mut buf = vec![0u8; delta_length as usize];
+        f.read_exact(&mut buf).with_context(|| {
+            format!(
+                "reading delta blob from {} at {seek} length {delta_length}",
+                path.display(),
+            )
+        })?;
+        return Ok(buf);
+    }
+
+    let cache_delta = fork_dir.join("cache").join(format!("{sid}.delta"));
+    if cache_delta.exists() {
+        let mut f = fs::File::open(&cache_delta)
+            .with_context(|| format!("opening {}", cache_delta.display()))?;
+        f.seek(SeekFrom::Start(delta_offset))
+            .with_context(|| format!("seeking {} to {delta_offset}", cache_delta.display()))?;
+        let mut buf = vec![0u8; delta_length as usize];
+        f.read_exact(&mut buf).with_context(|| {
+            format!(
+                "reading {} at {delta_offset} length {delta_length}",
+                cache_delta.display(),
+            )
+        })?;
+        return Ok(buf);
+    }
+
+    let key = segment_key(volume_id, &sid).with_context(|| format!("building S3 key for {sid}"))?;
+    let start = (body_section_start + body_length + delta_offset) as usize;
+    let end = start + delta_length as usize;
+    let bytes = store.get_range(&key, start..end).await.with_context(|| {
+        format!("S3 range-GET for delta blob of segment {sid} at {start}..{end}")
+    })?;
+    Ok(bytes.to_vec())
+}
+
+/// Source segment context passed into `expand_partial_death`. Bundles the
+/// three pieces of metadata that the Delta branch needs (the ULID plus the
+/// body-section offset / length for locating the delta body region); the
+/// Data / Inline / DedupRef branches only consult `ulid`.
+struct PartialDeathSource<'a> {
+    ulid: &'a str,
+    body_section_start: u64,
+    body_section_length: u64,
+}
+
 /// Expand a partial-LBA-death entry into:
 /// 1. `CanonicalData` / `CanonicalInline` preserving the composite body
 ///    when the hash is externally referenced (any `DedupRef.hash` or
@@ -1378,24 +1492,40 @@ async fn read_extent_body_cached(
 /// - DedupRef: bytes live in a different segment pointed at by
 ///   `extent_index[entry.hash]`. Resolved via `resolve_body_by_hash`
 ///   (local cache → S3 range-GET → lz4-decompress).
-/// - Delta: not yet implemented. Callers must ensure Delta partial-
-///   death segments are deferred upstream (via `has_partial_death`)
-///   until the delta-blob fetch machinery lands.
+/// - Delta: reconstructed from a base body + delta blob. Picks the first
+///   `entry.delta_options[i]` whose `source_hash` resolves via
+///   `extent_index.lookup()` (which only returns Data-body entries, so
+///   chained deltas are structurally impossible). The base body is
+///   fetched via `resolve_body_by_hash`; the delta blob via
+///   `read_delta_blob` against the source segment's delta body section.
+///   `collect_stats` only routes a Delta entry here when at least one
+///   source resolves — if none do, the segment is deferred.
+///
+/// Canonical-body handling differs by kind:
+/// - Data / Inline: emit `CanonicalData` / `CanonicalInline` when the
+///   hash is externally referenced (the source segment owns the body).
+/// - DedupRef: no emit — the canonical body lives in a segment that
+///   isn't being compacted this pass and remains resolvable by hash.
+/// - Delta: emit the reconstructed body as a full `Data` entry (demoted
+///   to canonical) when externally referenced — **not** re-encoded as a
+///   Delta. Keeps dedup resolution through that hash O(1) rather than
+///   forcing per-read delta reconstruction.
 ///
 /// Sub-run bodies are emitted uncompressed. Compression of fresh
 /// sub-runs is a size-tuning opportunity for a follow-up; partial-death
 /// compaction is rare enough that the write-amp cost is bounded.
 ///
 /// See `docs/design-gc-partial-death-compaction.md`.
-// Nine arguments: entry + its context (source_ulid, sub_runs) plus five
+// Eight arguments: entry + its context (source, sub_runs) plus five
 // GC-pass inputs (live_hashes, extent_index, fork_dir, volume_id, store)
-// plus the &mut sink (all_live). Wrapping these into a struct would just
-// shuffle the surface; they're all load-bearing for the single call site.
+// plus the &mut sink (all_live). Segment context lives in
+// `PartialDeathSource` so the Delta branch can reach body_section_start /
+// body_section_length without expanding the signature further.
 #[allow(clippy::too_many_arguments)]
 async fn expand_partial_death(
     entry: SegmentEntry,
     sub_runs: &[lbamap::ExtentRead],
-    source_ulid: &str,
+    source: &PartialDeathSource<'_>,
     live_hashes: &HashSet<blake3::Hash>,
     extent_index: &ExtentIndex,
     fork_dir: &Path,
@@ -1403,6 +1533,7 @@ async fn expand_partial_death(
     store: &Arc<dyn ObjectStore>,
     all_live: &mut Vec<(String, SegmentEntry)>,
 ) -> Result<()> {
+    let source_ulid = source.ulid;
     let uncompressed: Vec<u8> = match entry.kind {
         EntryKind::Data | EntryKind::Inline => {
             // Owned body: `entry.data` carries the composite bytes
@@ -1439,13 +1570,67 @@ async fn expand_partial_death(
                 })?
         }
         EntryKind::Delta => {
-            return Err(anyhow::anyhow!(
-                "partial-death Delta expansion not yet implemented \
-                 (source={source_ulid}, hash={}) — delta-blob fetch machinery \
-                 is tracked as step 3b of the partial-death compaction plan; \
-                 collect_stats should have deferred this segment",
-                entry.hash.to_hex()
-            ));
+            // Pick the first delta_option whose source_hash resolves via
+            // the Data-body index. collect_stats already verified at
+            // least one resolves before routing us here (otherwise the
+            // whole segment is deferred). We re-pick here rather than
+            // carrying the index through to keep collect_stats stateless
+            // about the expansion side's choice.
+            //
+            // Chained deltas are structurally impossible: extent_index
+            // .lookup() searches only the Data-body map; Delta entries
+            // live in a separate `deltas` map and will never appear here.
+            let opt = entry
+                .delta_options
+                .iter()
+                .find(|o| extent_index.lookup(&o.source_hash).is_some())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "partial-death Delta: no source_hash resolves via extent_index \
+                         (source={source_ulid}, hash={}); collect_stats should \
+                         have deferred this segment",
+                        entry.hash.to_hex()
+                    )
+                })?;
+            let base =
+                resolve_body_by_hash(&opt.source_hash, extent_index, fork_dir, volume_id, store)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "partial-death Delta: source_hash {} vanished from extent \
+                             index between check and fetch (source={source_ulid}, \
+                             composite_hash={})",
+                            opt.source_hash.to_hex(),
+                            entry.hash.to_hex(),
+                        )
+                    })?;
+            let seg_ulid = Ulid::from_string(source_ulid)
+                .map_err(|e| anyhow::anyhow!("parsing source ULID {source_ulid}: {e}"))?;
+            let blob = read_delta_blob(
+                seg_ulid,
+                source.body_section_start,
+                source.body_section_length,
+                opt.delta_offset,
+                opt.delta_length,
+                fork_dir,
+                volume_id,
+                store,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "reading delta blob for partial-death Delta \
+                     (source={source_ulid}, composite_hash={})",
+                    entry.hash.to_hex(),
+                )
+            })?;
+            elide_core::delta_compute::apply_delta(&base, &blob).map_err(|e| {
+                anyhow::anyhow!(
+                    "applying delta for partial-death Delta \
+                     (source={source_ulid}, composite_hash={}): {e}",
+                    entry.hash.to_hex(),
+                )
+            })?
         }
         _ => {
             return Err(anyhow::anyhow!(
@@ -1470,20 +1655,24 @@ async fn expand_partial_death(
 
     // Canonical-body preservation, when needed.
     //
-    // Applies only to owned-body kinds (Data/Inline): if the composite
-    // hash is externally referenced (any `DedupRef.hash` or
+    // Applies to kinds where the source segment carries the body bytes
+    // (Data / Inline directly; Delta via reconstruction). If the
+    // composite hash is externally referenced (any `DedupRef.hash` or
     // `Delta.base_hash` equals `entry.hash`, tracked via `live_hashes`),
-    // rebuild the source-segment entry from the uncompressed body via
+    // rebuild a source-segment entry from the uncompressed body via
     // `new_data` (which picks Data or Inline based on stored size) and
     // demote via `into_canonical`. Writing as uncompressed is consistent
-    // with the sub-run path below.
+    // with the sub-run path below; for Delta specifically, this trades
+    // compactness for O(1) dedup reads through the hash.
     //
     // DedupRef partial-death emits no canonical: the canonical body lives
     // in `extent_index[entry.hash].segment_id` (a segment that isn't
     // being compacted this pass), so it remains resolvable by hash
     // without any emission from the compacted output.
-    let emit_canonical = matches!(entry.kind, EntryKind::Data | EntryKind::Inline)
-        && live_hashes.contains(&entry.hash);
+    let emit_canonical = matches!(
+        entry.kind,
+        EntryKind::Data | EntryKind::Inline | EntryKind::Delta
+    ) && live_hashes.contains(&entry.hash);
     if emit_canonical {
         let canon = SegmentEntry::new_data(
             entry.hash,
@@ -1605,6 +1794,11 @@ async fn compact_segments(
 
         let partial_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> =
             candidate.partial_death_runs.drain(..).collect();
+        let source = PartialDeathSource {
+            ulid: &candidate.ulid_str,
+            body_section_start: candidate.body_section_start,
+            body_section_length: candidate.body_section_length,
+        };
         for (entry, sub_runs) in candidate
             .live_entries
             .drain(..)
@@ -1614,7 +1808,7 @@ async fn compact_segments(
                 expand_partial_death(
                     entry,
                     &sub_runs,
-                    &candidate.ulid_str,
+                    &source,
                     live_hashes,
                     extent_index,
                     fork_dir,
@@ -1987,6 +2181,7 @@ mod tests {
             SegmentStats {
                 ulid_str: String::new(),
                 body_section_start: 0,
+                body_section_length: 0,
                 file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
@@ -2013,6 +2208,7 @@ mod tests {
         let s = SegmentStats {
             ulid_str: String::new(),
             body_section_start: 0,
+            body_section_length: 0,
             file_size: 1024 * 1024,
             live_lba_bytes: 800 * 1024,
             total_lba_bytes: 1024 * 1024,
@@ -2034,6 +2230,7 @@ mod tests {
             SegmentStats {
                 ulid_str: String::new(),
                 body_section_start: 0,
+                body_section_length: 0,
                 file_size: 100,
                 live_lba_bytes,
                 total_lba_bytes: 100,
@@ -2956,6 +3153,161 @@ mod tests {
         run_multi_lba_overlap_scenario(0, "head");
     }
 
+    /// End-to-end partial-death compaction of a multi-LBA Delta entry.
+    ///
+    /// Hand-crafts a 4-LBA Delta whose composite body deltas against a
+    /// separately-written parent DATA entry, then overwrites one interior
+    /// LBA (102). Runs gc_fork, applies the handoff on the volume side,
+    /// and verifies reads return the reconstructed composite bytes for
+    /// the surviving sub-runs and the overwrite bytes for LBA 102. No
+    /// socket handoff: the test stops before `apply_done_handoffs` so
+    /// the segment stays in bare `gc/<new>` on disk (still readable via
+    /// `locate_segment_body`).
+    ///
+    /// Without step 3b the Delta segment would be deferred
+    /// (`has_partial_death = true`) and no compaction output would be
+    /// produced — the assertions on the GC output and reconstructed
+    /// reads would both fail.
+    #[tokio::test]
+    async fn gc_delta_partial_death_compaction() {
+        use elide_core::segment::{DeltaOption, write_segment_with_delta_body};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let signer =
+            elide_core::signing::load_signer(dir, elide_core::signing::VOLUME_KEY_FILE).unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Parent body: 4 LBAs of high-entropy content. The whole body
+        // (16 KiB) serves as the zstd dictionary for the child delta.
+        let mut parent_bytes = vec![0u8; 4 * 4096];
+        for (i, b) in parent_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let parent_hash = blake3::hash(&parent_bytes);
+
+        // Child body: structurally similar to parent but with block-0
+        // bytes swapped out, so the zstd-dict delta stays small.
+        let mut child_bytes = parent_bytes.clone();
+        for b in &mut child_bytes[0..256] {
+            *b = 0xCC;
+        }
+        let child_hash = blake3::hash(&child_bytes);
+        assert_ne!(parent_hash, child_hash);
+
+        // Overwrite bytes for LBA 102.
+        let overwrite_bytes = vec![0xFFu8; 4096];
+
+        // ── S1: parent DATA at LBA 0..4, via the normal write path.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &parent_bytes).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+
+        // ── S2: multi-LBA Delta at LBA 100..104, hand-crafted. The child
+        //        body is zstd-dict compressed against the parent as
+        //        dictionary and stored as the segment's delta body.
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+        let delta_blob = compressor.compress(&child_bytes).unwrap();
+        let delta_ulid = Ulid::new();
+        let delta_pending = dir.join("pending").join(delta_ulid.to_string());
+        let opt = DeltaOption {
+            source_hash: parent_hash,
+            delta_offset: 0,
+            delta_length: delta_blob.len() as u32,
+        };
+        let mut delta_entries = vec![SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])];
+        write_segment_with_delta_body(
+            &delta_pending,
+            &mut delta_entries,
+            &delta_blob,
+            signer.as_ref(),
+        )
+        .unwrap();
+        let bytes = fs::read(&delta_pending).unwrap();
+        let key = segment_key("test-vol", &delta_ulid.to_string()).unwrap();
+        store
+            .put(&key, bytes::Bytes::from(bytes).into())
+            .await
+            .unwrap();
+        vol.promote_segment(delta_ulid).unwrap();
+
+        // ── S3: single-LBA overwrite at LBA 102, via the normal path.
+        vol.write(102, &overwrite_bytes).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+
+        drop(vol);
+
+        // ── Run coordinator GC. Must NOT defer the Delta segment.
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            interval_secs: 0,
+        };
+        let sweep_ulid = Ulid::new();
+        let repack_ulid = Ulid::new();
+        let stats = gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.deferred, 0,
+            "Delta partial-death must be expanded in-band, not deferred"
+        );
+        assert!(
+            stats.candidates >= 1,
+            "GC must compact at least the Delta segment, got candidates={}",
+            stats.candidates
+        );
+
+        // ── Apply the handoff on the volume side: .staged → bare
+        //    gc/<new>, re-signed with the volume key. This is socket-free.
+        //    Reopening the volume after apply rebuilds the index off the
+        //    bare gc/<new> file plus any remaining index/<input>.idx.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        let applied = vol.apply_gc_handoffs().unwrap();
+        assert!(applied > 0, "GC handoff must be applied");
+        drop(vol);
+
+        // ── Reopen and read. Sub-run LBAs must return the corresponding
+        //    slice of the reconstructed composite; LBA 102 must return
+        //    the overwrite bytes. Before step 3b the Delta segment was
+        //    deferred, apply_gc_handoffs was a no-op, and reads for
+        //    LBAs 100/101/103 went through the live Delta entry (which
+        //    still worked — but the GC defer blocked reclamation). This
+        //    test's value is in the `stats.deferred == 0` assertion plus
+        //    confirming reads still round-trip after the Delta segment
+        //    has been replaced by per-sub-run DATA entries.
+        let vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        assert_eq!(
+            vol.read(100, 1).unwrap().as_slice(),
+            &child_bytes[0..4096],
+            "LBA 100 must return child_bytes[0..4096]"
+        );
+        assert_eq!(
+            vol.read(101, 1).unwrap().as_slice(),
+            &child_bytes[4096..8192],
+            "LBA 101 must return child_bytes[4096..8192]"
+        );
+        assert_eq!(
+            vol.read(102, 1).unwrap().as_slice(),
+            overwrite_bytes.as_slice(),
+            "LBA 102 must return the overwrite bytes"
+        );
+        assert_eq!(
+            vol.read(103, 1).unwrap().as_slice(),
+            &child_bytes[12288..16384],
+            "LBA 103 must return child_bytes[12288..16384]"
+        );
+    }
+
     // --- fetch_live_bodies tests ---
 
     /// Helper: build a SegmentEntry with given kind, stored_offset, stored_length,
@@ -2999,6 +3351,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: Ulid::from_parts(1000, 1).to_string(),
             body_section_start: 100,
+            body_section_length: 0,
             file_size: 200,
             live_lba_bytes: 0,
             total_lba_bytes: 0,
@@ -3036,6 +3389,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
             body_section_start,
+            body_section_length: 8192,
             file_size: body_section_start + 8192,
             live_lba_bytes: 8192,
             total_lba_bytes: 8192,
@@ -3100,6 +3454,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
             body_section_start,
+            body_section_length: body_size,
             file_size: body_section_start + body_size,
             live_lba_bytes: 8192,
             total_lba_bytes: body_size,
@@ -3165,6 +3520,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
             body_section_start,
+            body_section_length: body_size,
             file_size: body_section_start + body_size,
             live_lba_bytes: 8192,
             total_lba_bytes: body_size,
@@ -3208,6 +3564,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
             body_section_start: 128,
+            body_section_length: 0,
             file_size: 128,
             live_lba_bytes: 4096,
             total_lba_bytes: 4096,
@@ -3261,6 +3618,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
             body_section_start,
+            body_section_length: 8192,
             file_size: body_section_start + 8192,
             live_lba_bytes: 8192,
             total_lba_bytes: 8192,
@@ -3323,6 +3681,7 @@ mod tests {
         let mut candidate = SegmentStats {
             ulid_str: ulid_str.clone(),
             body_section_start,
+            body_section_length: 8192,
             file_size: body_section_start + 8192,
             live_lba_bytes: 8192,
             total_lba_bytes: 8192,
