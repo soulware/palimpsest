@@ -2,6 +2,20 @@
 (*
   TLA+ model of the Elide self-describing GC handoff protocol.
 
+  TODO: STALE — this spec describes the pre-plan-handoff protocol.
+  The implementation has since moved to a plan-based handoff:
+    - coordinator writes `gc/<ulid>.plan` (plaintext declarative records),
+      not a `.staged` signed segment
+    - volume materialises bodies from the plan (resolving DedupRef
+      composites via extent_index) then signs and commits
+    - partial-death sub-runs introduce fresh hashes in the output
+    - `apply_plan_apply_result` performs a full lbamap rebuild from disk
+  The "bare supersedes inputs" invariant originally found by this spec
+  still holds (see `segment::discover_fork_segments` + its
+  `collect_superseded_inputs` helper), but the state machine and
+  actions below need rewriting to match `gc_plan.rs`, `gc_apply.rs`,
+  and `volume::apply_plan_apply_result` before any new TLC runs.
+
   BACKGROUND
   ----------
   The coordinator compacts segments and hands the result to the volume via a

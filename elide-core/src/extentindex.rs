@@ -326,6 +326,8 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
         // Discover all segments in race-safe listing order (pending → gc →
         // index) and rebuild-processing order (gc → index → pending). Both
         // `lbamap::rebuild_segments` and this function share the helper.
+        // `discover_fork_segments` filters out `index/<input>.idx` files
+        // superseded by a bare `gc/<new>` — see its doc comment.
         //
         // Insert semantics are per-tier: `insert_if_absent` is used
         // throughout (first-write-wins = lowest ULID canonical). Because
@@ -333,32 +335,6 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
         // ULID order, the first insert for any hash comes from the
         // lowest-ULID segment holding it — matching the documented rule.
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
-
-        // Each bare GC body declares the input segments it superseded via
-        // its `inputs` field. Those inputs' `index/<input>.idx` files are
-        // stale: any entry the bare body deliberately omitted (a Removed
-        // entry) would be re-introduced here by `insert_if_absent`, leaving
-        // a dangling reference once the coordinator finishes
-        // `apply_done_handoffs` and deletes the input segments.
-        // Skip those index entries entirely. Found by HandoffProtocol.tla.
-        let mut consumed_inputs: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
-        for sref in &segments {
-            if sref.tier == segment::SegmentTier::GcApplied
-                && let Ok((_, _, inputs)) = segment::read_segment_index(&sref.path)
-            {
-                for input in inputs {
-                    consumed_inputs.insert(input);
-                }
-            }
-        }
-
-        // Filter out the stale Index entries consumed by bare GC outputs.
-        let segments: Vec<segment::SegmentRef> = segments
-            .into_iter()
-            .filter(|s| {
-                !(s.tier == segment::SegmentTier::Index && consumed_inputs.contains(&s.ulid))
-            })
-            .collect();
 
         if segments.is_empty() {
             continue;
