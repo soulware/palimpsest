@@ -17,6 +17,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,7 +35,7 @@ use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats,
-    DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcHandoffJob, GcHandoffResult,
+    DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep,
     PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
     ReclaimThresholds, RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry,
@@ -231,10 +232,9 @@ pub struct VolumeActor {
     parked_promote_segments: Vec<ParkedPromoteSegment>,
     /// Number of `promote_segment` jobs dispatched but not yet applied.
     promote_segments_in_flight: usize,
-    /// In-progress GC handoff batch.  At most one batch at a time.
-    /// `None` when no handoff processing is active.
+    /// In-progress GC plan handoff batch. At most one batch at a time.
     parked_handoffs: Option<ParkedGcHandoffs>,
-    /// Whether a GC handoff job is currently on the worker thread.
+    /// Whether a GC plan handoff job is currently on the worker thread.
     handoff_in_flight: bool,
     /// Reply channel for an in-flight `SweepPending` request, parked
     /// while the worker thread executes the sweep.  `None` when no
@@ -287,11 +287,11 @@ struct ParkedGcCheckpoint {
     reply: Sender<io::Result<(Ulid, Ulid)>>,
 }
 
-/// State for an in-progress batch of GC handoff applications.
+/// State for an in-progress batch of GC plan handoff applications.
 ///
-/// The actor dispatches one handoff at a time to the worker thread.
-/// On each completion it applies the result, then dispatches the next.
-/// When the list is exhausted, the reply (if any) is sent.
+/// The actor dispatches one plan at a time to the worker thread. On each
+/// completion it applies the result, then dispatches the next. When the
+/// list is exhausted, the reply (if any) is sent.
 struct ParkedGcHandoffs {
     remaining: Vec<(PathBuf, Ulid)>,
     reply: Option<Sender<io::Result<usize>>>,
@@ -495,25 +495,30 @@ impl VolumeActor {
         }
     }
 
-    /// Scan for staged GC handoffs and begin dispatching them to the worker.
+    /// Scan for pending GC plan handoffs and dispatch them to the worker.
     ///
-    /// If `reply` is `Some`, the reply is sent when all handoffs have been
-    /// applied (or immediately if there are none).  If `None` (idle tick),
-    /// results are applied silently.
+    /// The apply path is offloaded because materialising a plan can read
+    /// many MiB of body bytes from local cache and/or demand-fetch from S3;
+    /// running it on the actor would block concurrent reads/writes. If
+    /// `reply` is `Some`, the reply fires once all handoffs in this batch
+    /// have been applied (or immediately if there are none).
     fn start_gc_handoffs(&mut self, reply: Option<Sender<io::Result<usize>>>) {
-        let (to_process, already_applied) = match self.volume.scan_staged_handoffs() {
+        let (to_process, already_applied) = match self.volume.scan_plan_handoffs() {
             Ok(v) => v,
             Err(e) => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Err(e));
                 } else {
-                    warn!("gc handoff scan failed: {e}");
+                    warn!("gc plan scan failed: {e}");
                 }
                 return;
             }
         };
 
         if to_process.is_empty() {
+            if already_applied > 0 {
+                self.publish_snapshot();
+            }
             if let Some(reply) = reply {
                 let _ = reply.send(Ok(already_applied));
             }
@@ -528,6 +533,39 @@ impl VolumeActor {
 
         self.dispatch_next_handoff(&mut parked);
         self.parked_handoffs = Some(parked);
+    }
+
+    /// Pop the next plan handoff from the parked batch and dispatch it.
+    ///
+    /// Skips entries whose `prepare_plan_apply` rejects them (parse failure,
+    /// ULID mismatch, empty inputs) — those plans were already removed
+    /// inside `prepare_plan_apply`, so the batch continues with the next.
+    fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
+        while let Some((plan_path, new_ulid)) = parked.remaining.pop() {
+            let job = match self.volume.prepare_plan_apply(plan_path, new_ulid) {
+                Ok(Some(job)) => job,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!("gc plan prepare failed for {new_ulid}: {e}");
+                    if let Some(reply) = parked.reply.take() {
+                        let _ = reply.send(Err(e));
+                    }
+                    return;
+                }
+            };
+            if let Some(tx) = &self.worker_tx {
+                if let Err(e) = tx.send(WorkerJob::GcPlan(job)) {
+                    warn!("worker channel closed during gc plan dispatch: {e}");
+                    return;
+                }
+                self.handoff_in_flight = true;
+            }
+            return;
+        }
+        // No more plans — finalise the batch.
+        if let Some(reply) = parked.reply.take() {
+            let _ = reply.send(Ok(parked.applied_count));
+        }
     }
 
     /// Run the sweep prep on the actor and dispatch the heavy middle to
@@ -642,20 +680,6 @@ impl VolumeActor {
         }
     }
 
-    /// Pop the next staged handoff from the parked batch and dispatch it.
-    fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
-        if let Some((staged_path, new_ulid)) = parked.remaining.pop() {
-            let job = self.volume.build_gc_handoff_job(staged_path, new_ulid);
-            if let Some(tx) = &self.worker_tx {
-                if let Err(e) = tx.send(WorkerJob::GcHandoff(job)) {
-                    warn!("worker channel closed during gc handoff: {e}");
-                    return;
-                }
-                self.handoff_in_flight = true;
-            }
-        }
-    }
-
     /// Drain in-flight jobs and join the worker thread.
     ///
     /// Called on shutdown (explicit or handle-drop).  Drops the job sender
@@ -666,7 +690,7 @@ impl VolumeActor {
         // Drop the sender — worker's recv() will return Disconnected.
         self.worker_tx.take();
 
-        // Drain remaining results (promotes and any in-flight handoff).
+        // Drain remaining results.
         while self.promotes_in_flight > 0
             || self.handoff_in_flight
             || self.promote_segments_in_flight > 0
@@ -687,17 +711,17 @@ impl VolumeActor {
                     warn!("worker promote failed during shutdown: {e}");
                     self.on_promote_failure();
                 }
-                Ok(WorkerResult::GcHandoff(Ok(result))) => {
+                Ok(WorkerResult::GcPlan(Ok(result))) => {
                     self.handoff_in_flight = false;
                     if let Ok(crate::volume::StagedApply::Applied) =
-                        self.volume.apply_gc_handoff_result(&result)
+                        self.volume.apply_plan_apply_result(result)
                     {
                         self.publish_snapshot();
                     }
                 }
-                Ok(WorkerResult::GcHandoff(Err(e))) => {
+                Ok(WorkerResult::GcPlan(Err(e))) => {
                     self.handoff_in_flight = false;
-                    warn!("worker gc handoff failed during shutdown: {e}");
+                    warn!("worker gc plan apply failed during shutdown: {e}");
                 }
                 Ok(WorkerResult::PromoteSegment { ulid, result }) => {
                     self.promote_segments_in_flight -= 1;
@@ -794,10 +818,6 @@ impl VolumeActor {
                 }
             }
         }
-        // Drop any remaining parked handoff state (remaining items
-        // will be re-applied on next startup).
-        self.parked_handoffs.take();
-
         // Join the worker thread.
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
@@ -924,13 +944,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
-                            if self.parked_handoffs.is_some() {
-                                let _ = reply.send(Err(io::Error::other(
-                                    "concurrent apply_gc_handoffs not allowed",
-                                )));
-                            } else {
-                                self.start_gc_handoffs(Some(reply));
-                            }
+                            self.start_gc_handoffs(Some(reply));
                         }
                         VolumeRequest::GcCheckpoint { reply } => {
                             if self.parked_gc.is_some() {
@@ -1021,6 +1035,49 @@ impl VolumeActor {
                 // Worker thread results (promote completions, GC handoffs).
                 recv(self.worker_rx) -> msg => {
                     match msg {
+                        Ok(WorkerResult::GcPlan(Ok(result))) => {
+                            self.handoff_in_flight = false;
+                            match self.volume.apply_plan_apply_result(result) {
+                                Ok(crate::volume::StagedApply::Applied) => {
+                                    self.publish_snapshot();
+                                    if let Some(ref mut parked) = self.parked_handoffs {
+                                        parked.applied_count += 1;
+                                    }
+                                }
+                                Ok(crate::volume::StagedApply::Cancelled) => {
+                                    // Cancelled in worker or stale-liveness in
+                                    // apply; plan/tmp already cleaned up inside.
+                                }
+                                Err(e) => {
+                                    warn!("gc plan apply failed: {e}");
+                                    if let Some(parked) = self.parked_handoffs.take()
+                                        && let Some(reply) = parked.reply
+                                    {
+                                        let _ = reply.send(Err(e));
+                                    }
+                                }
+                            }
+                            // Dispatch next plan in this batch, or complete.
+                            if let Some(mut parked) = self.parked_handoffs.take() {
+                                if parked.remaining.is_empty() {
+                                    if let Some(reply) = parked.reply {
+                                        let _ = reply.send(Ok(parked.applied_count));
+                                    }
+                                } else {
+                                    self.dispatch_next_handoff(&mut parked);
+                                    self.parked_handoffs = Some(parked);
+                                }
+                            }
+                        }
+                        Ok(WorkerResult::GcPlan(Err(e))) => {
+                            self.handoff_in_flight = false;
+                            warn!("worker gc plan apply failed: {e}");
+                            if let Some(parked) = self.parked_handoffs.take()
+                                && let Some(reply) = parked.reply
+                            {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
                         Ok(WorkerResult::Promote(Ok(result))) => {
                             self.promotes_in_flight -= 1;
                             let ulid = result.segment_ulid;
@@ -1057,49 +1114,6 @@ impl VolumeActor {
                             self.promotes_in_flight -= 1;
                             warn!("worker promote failed: {e}");
                             self.on_promote_failure();
-                        }
-                        Ok(WorkerResult::GcHandoff(Ok(result))) => {
-                            self.handoff_in_flight = false;
-                            match self.volume.apply_gc_handoff_result(&result) {
-                                Ok(crate::volume::StagedApply::Applied) => {
-                                    self.publish_snapshot();
-                                    if let Some(ref mut parked) = self.parked_handoffs {
-                                        parked.applied_count += 1;
-                                    }
-                                }
-                                Ok(crate::volume::StagedApply::Cancelled) => {
-                                    // Stale-liveness cancel — logged inside
-                                    // apply_gc_handoff_result, continue to next.
-                                }
-                                Err(e) => {
-                                    warn!("gc handoff apply failed: {e}");
-                                    if let Some(parked) = self.parked_handoffs.take()
-                                        && let Some(reply) = parked.reply
-                                    {
-                                        let _ = reply.send(Err(e));
-                                    }
-                                }
-                            }
-                            // Dispatch next handoff or complete the batch.
-                            if let Some(mut parked) = self.parked_handoffs.take() {
-                                if parked.remaining.is_empty() {
-                                    if let Some(reply) = parked.reply {
-                                        let _ = reply.send(Ok(parked.applied_count));
-                                    }
-                                } else {
-                                    self.dispatch_next_handoff(&mut parked);
-                                    self.parked_handoffs = Some(parked);
-                                }
-                            }
-                        }
-                        Ok(WorkerResult::GcHandoff(Err(e))) => {
-                            self.handoff_in_flight = false;
-                            warn!("worker gc handoff failed: {e}");
-                            if let Some(parked) = self.parked_handoffs.take()
-                                && let Some(reply) = parked.reply
-                            {
-                                let _ = reply.send(Err(e));
-                            }
                         }
                         Ok(WorkerResult::PromoteSegment { ulid, result }) => {
                             self.promote_segments_in_flight -= 1;
@@ -1202,11 +1216,8 @@ impl VolumeActor {
                     // Dispatch a promote if the WAL has unflushed data.
                     // prepare_promote handles the empty-WAL case internally.
                     self.dispatch_promote();
-                    // Scan for GC handoff files and dispatch if not already
-                    // processing a batch.
-                    if self.parked_handoffs.is_none() {
-                        self.start_gc_handoffs(None);
-                    }
+                    // Apply any pending GC plan handoffs inline.
+                    self.start_gc_handoffs(None);
                 }
             }
         }
@@ -1612,7 +1623,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
     while let Ok(job) = job_rx.recv() {
         let msg = match job {
             WorkerJob::Promote(job) => WorkerResult::Promote(execute_promote(job)),
-            WorkerJob::GcHandoff(job) => WorkerResult::GcHandoff(execute_gc_handoff(job)),
+            WorkerJob::GcPlan(job) => WorkerResult::GcPlan(execute_gc_plan_apply(job)),
             WorkerJob::PromoteSegment(job) => {
                 let ulid = job.ulid;
                 let result = execute_promote_segment(job);
@@ -1642,6 +1653,189 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
 /// accepting commands while a FLUSH is in flight.  `VolumeActor::Flush`
 /// parks on a promote-generation counter so NBD FLUSH still replies
 /// only after every prior write is durable.
+/// Worker: materialise a GC plan end-to-end (read bodies, reconstruct
+/// partial-death composites, assemble + sign output segment, write
+/// `<ulid>.tmp`). Does not touch the extent index; the actor's
+/// [`crate::volume::Volume::apply_plan_apply_result`] phase re-derives
+/// updates against the current extent index after the worker returns.
+///
+/// On soft cancellation (missing input, unresolvable hash, body integrity
+/// failure) the worker removes the `.plan` file and returns a result with
+/// `outcome = Cancelled`; the actor's apply phase treats this as a no-op.
+/// Hard I/O failures propagate as `Err`.
+pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResult> {
+    use crate::gc_apply;
+
+    let GcPlanApplyJob {
+        plan_path,
+        new_ulid,
+        gc_dir,
+        index_dir,
+        base_dir,
+        ancestor_layers,
+        fetcher,
+        extent_index,
+        signer,
+        verifying_key,
+        plan,
+    } = job;
+
+    // Resolver borrows the owned fields for the duration of materialise.
+    let resolver = WorkerBodyResolver {
+        base_dir: &base_dir,
+        ancestor_layers: &ancestor_layers,
+        fetcher: fetcher.as_ref(),
+    };
+    let inputs = plan.inputs();
+    let ctx = match gc_apply::MaterialiseCtx::new(&base_dir, &inputs, &extent_index, &resolver) {
+        Ok(c) => c,
+        Err(gc_apply::MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(gc_apply::MaterialiseOutcome::Cancel(e)) => {
+            log::warn!("plan {new_ulid}: prepare cancelled ({e}); removing");
+            let _ = fs::remove_file(&plan_path);
+            return Ok(cancelled_result(new_ulid, plan_path, gc_dir, inputs));
+        }
+    };
+    let materialised = match gc_apply::materialise_plan(&plan, &ctx) {
+        Ok(m) => m,
+        Err(gc_apply::MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(gc_apply::MaterialiseOutcome::Cancel(e)) => {
+            log::warn!("plan {new_ulid}: materialise cancelled ({e}); removing");
+            let _ = fs::remove_file(&plan_path);
+            return Ok(cancelled_result(new_ulid, plan_path, gc_dir, inputs));
+        }
+    };
+    drop(ctx);
+
+    let gc_apply::Materialised {
+        mut entries,
+        delta_body,
+    } = materialised;
+
+    // Collect body-owning entries from each input's `.idx` for the apply
+    // phase's to-remove / stale-cancel derivation.
+    let mut input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)> = Vec::new();
+    for input_ulid in &inputs {
+        let idx_path = index_dir.join(format!("{input_ulid}.idx"));
+        let parsed = match segment::read_segment_index(&idx_path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let (_, old_entries, _) = parsed;
+        for e in &old_entries {
+            if e.kind.has_body_bytes() {
+                input_old_entries.push((e.hash, e.kind, *input_ulid));
+            }
+        }
+    }
+
+    // Write the signed output segment to <ulid>.tmp. The actor renames it
+    // to bare <ulid> as the commit point.
+    let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+    segment::write_segment_full(
+        &tmp_path,
+        &mut entries,
+        &delta_body,
+        &inputs,
+        signer.as_ref(),
+    )?;
+
+    let (new_bss, written_entries, _) =
+        segment::read_and_verify_segment_index(&tmp_path, &verifying_key)?;
+    let handoff_inline = segment::read_inline_section(&tmp_path)?;
+
+    Ok(GcPlanApplyResult {
+        new_ulid,
+        plan_path,
+        gc_dir,
+        tmp_path: Some(tmp_path),
+        new_bss,
+        entries: written_entries,
+        inputs,
+        input_old_entries,
+        handoff_inline,
+        outcome: crate::volume::StagedApply::Applied,
+    })
+}
+
+fn cancelled_result(
+    new_ulid: Ulid,
+    plan_path: std::path::PathBuf,
+    gc_dir: std::path::PathBuf,
+    inputs: Vec<Ulid>,
+) -> GcPlanApplyResult {
+    GcPlanApplyResult {
+        new_ulid,
+        plan_path,
+        gc_dir,
+        tmp_path: None,
+        new_bss: 0,
+        entries: Vec::new(),
+        inputs,
+        input_old_entries: Vec::new(),
+        handoff_inline: Vec::new(),
+        outcome: crate::volume::StagedApply::Cancelled,
+    }
+}
+
+/// Worker-side `BodyResolver` — owns no Volume borrow. Mirrors
+/// `volume::VolumeBodyResolver` but takes owned-field references so it can
+/// run on the worker thread without an active Volume.
+struct WorkerBodyResolver<'a> {
+    base_dir: &'a std::path::Path,
+    ancestor_layers: &'a [AncestorLayer],
+    fetcher: Option<&'a BoxFetcher>,
+}
+
+impl crate::gc_apply::BodyResolver for WorkerBodyResolver<'_> {
+    fn find_segment(
+        &self,
+        segment_id: Ulid,
+        body_section_start: u64,
+        body_source: crate::extentindex::BodySource,
+    ) -> io::Result<(std::path::PathBuf, segment::SegmentBodyLayout)> {
+        let path = crate::volume::find_segment_in_dirs(
+            segment_id,
+            self.base_dir,
+            self.ancestor_layers,
+            self.fetcher,
+            body_section_start,
+            body_source,
+        )?;
+        let layout = if path.extension().is_some_and(|e| e == "body") {
+            segment::SegmentBodyLayout::BodyOnly
+        } else {
+            segment::SegmentBodyLayout::FullSegment
+        };
+        Ok((path, layout))
+    }
+
+    fn locate_segment_unchecked(
+        &self,
+        segment_id: Ulid,
+    ) -> Option<(std::path::PathBuf, segment::SegmentBodyLayout)> {
+        if let Some(hit) = segment::locate_segment_body(self.base_dir, segment_id) {
+            return Some(hit);
+        }
+        for layer in self.ancestor_layers.iter().rev() {
+            if let Some(hit) = segment::locate_segment_body(&layer.dir, segment_id) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    fn open_delta_body(&self, segment_id: Ulid) -> io::Result<fs::File> {
+        crate::volume::open_delta_body_in_dirs(
+            segment_id,
+            self.base_dir,
+            self.ancestor_layers,
+            self.fetcher,
+        )
+    }
+}
+
 fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
     std::fs::File::open(&job.old_wal_path)?.sync_data()?;
 
@@ -1722,57 +1916,6 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
         inputs: parsed.inputs.clone(),
         inline,
         tombstone: false,
-    })
-}
-
-/// Execute a GC handoff job: read the staged segment, read input `.idx`
-/// files, re-sign with the volume key, and write to `gc/<ulid>.tmp`.
-fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
-    // 1. Read staged segment.
-    let (bss, mut entries, inputs) = segment::read_segment_index(&job.staged_path)?;
-    if inputs.is_empty() {
-        return Err(io::Error::other(
-            "gc staged file has no inputs; not a GC output",
-        ));
-    }
-
-    // 2. Collect body-owning entries from each input's .idx file.
-    let mut input_old_entries = Vec::new();
-    for input_ulid in &inputs {
-        let idx_path = job.index_dir.join(format!("{input_ulid}.idx"));
-        let parsed = match segment::read_segment_index(&idx_path) {
-            Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        let (_, old_entries, _) = parsed;
-        for e in &old_entries {
-            if matches!(
-                e.kind,
-                segment::EntryKind::Data | segment::EntryKind::Inline
-            ) {
-                input_old_entries.push((e.hash, e.kind, *input_ulid));
-            }
-        }
-    }
-
-    // 3. Read inline + body data from the staged segment.
-    let handoff_inline = segment::read_inline_section(&job.staged_path)?;
-    segment::read_extent_bodies(&job.staged_path, bss, &mut entries, &handoff_inline)?;
-
-    // 4. Re-sign and write gc/<ulid>.tmp.
-    let tmp_path = job.gc_dir.join(format!("{}.tmp", job.new_ulid));
-    let new_bss = segment::write_gc_segment(&tmp_path, &mut entries, &inputs, job.signer.as_ref())?;
-
-    Ok(GcHandoffResult {
-        new_ulid: job.new_ulid,
-        staged_path: job.staged_path,
-        gc_dir: job.gc_dir,
-        new_bss,
-        entries,
-        inputs,
-        input_old_entries,
-        handoff_inline,
     })
 }
 

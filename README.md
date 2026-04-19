@@ -22,6 +22,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/design-gc-ulid-ordering.md](docs/design-gc-ulid-ordering.md) | Open design: GC ULID ordering race, single-mint invariant, proptest findings |
 | [docs/design-gc-overlap-correctness.md](docs/design-gc-overlap-correctness.md) | Design: GC skips partial-LBA-death entries to avoid shadow/loss on rebuild when multi-LBA entries have been partially overwritten |
 | [docs/design-gc-partial-death-compaction.md](docs/design-gc-partial-death-compaction.md) | Design: decouple composite body from surviving sub-runs of partial-LBA-death entries so normal GC can subsequently reclaim each piece independently |
+| [docs/design-gc-plan-handoff.md](docs/design-gc-plan-handoff.md) | Design: coordinator emits a plaintext plan; volume materialises bodies via BlockReader and signs the output — single source of truth for body resolution |
 | [docs/design-delta-compression.md](docs/design-delta-compression.md) | Design: delta compression via file-path matching, file-aware import, snapshot filemaps |
 | [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes — architecture, sequencing, open work |
 | [docs/design-oci-export.md](docs/design-oci-export.md) | Exploration: squashed OCI export, dual publish via referrers, elide-snapshotter for containerd |

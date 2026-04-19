@@ -5,6 +5,8 @@ pub mod delta_compute;
 pub mod ext4_scan;
 pub mod extentindex;
 pub mod filemap;
+pub mod gc_apply;
+pub mod gc_plan;
 pub mod import;
 pub mod lbamap;
 pub mod segment;

@@ -402,20 +402,28 @@ proptest! {
                         // deferral (see design-gc-overlap-correctness.md —
                         // bloated multi-LBA entries stay on disk at their
                         // original ULID).
-                        let idx_after: usize = fs::read_dir(&index_dir)
-                            .map(|d| d.flatten().count())
-                            .unwrap_or(0);
+                        let idx_after_names: Vec<String> = fs::read_dir(&index_dir)
+                            .map(|d| {
+                                d.flatten()
+                                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let idx_after = idx_after_names.len();
                         let idx_max = 1 + checkpoint_extra + stats.deferred;
                         prop_assert!(
                             idx_after <= idx_max,
                             "after GcSweep on {} segments, {} .idx files remain \
                              (expected ≤{}: 1 GC output + {} checkpoint segment(s) \
-                             + {} deferred)",
+                             + {} deferred); files=[{}]; strategy={:?} candidates={}",
                             idx_before,
                             idx_after,
                             idx_max,
                             checkpoint_extra,
                             stats.deferred,
+                            idx_after_names.join(", "),
+                            stats.strategy,
+                            stats.candidates,
                         );
                         // cache/ .body files: 1 GC output + any deferred
                         // segments (their bodies are still in cache/).
@@ -738,4 +746,109 @@ fn gc_oracle_repro_bug_h() {
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
     assert_eq!(&vol.read(6, 1).unwrap(), &data_235);
     assert_eq!(&vol.read(1, 1).unwrap(), &[195u8; 4096]);
+}
+
+/// Deterministic regression for a proptest failure under the plan-based
+/// GC handoff: after two `GcSweep` passes the `index/` directory should
+/// hold exactly 1 .idx (the final GC output) — but the test was finding 3.
+///
+/// Minimal input from proptest shrinking:
+///   MultiLbaDedupRefOverwrite { span: 2, overlap_off: 0, seed_big: 0, seed_small: 0 }
+///   GcSweep
+///   ZeroThenPartialWrite { start_lba: 0, span: 2, inner_off: 1, seed: 0 }
+///   GcSweep
+///
+/// Per `feedback_proptest_deterministic_repro`: materialise the minimal
+/// failing sequence as a named deterministic test so it can be debugged
+/// without re-running the full proptest shrinker.
+#[test]
+fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = GcConfig {
+        density_threshold: 0.0,
+        interval_secs: 0,
+    };
+    let index_dir = fork_dir.join("index");
+    let gc_dir = fork_dir.join("gc");
+
+    // Op 1: MultiLbaDedupRefOverwrite span=2 overlap_off=0 seed=0/0.
+    let big = vec![0u8; 2 * 4096];
+    vol.write(0, &big).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(4, &big).unwrap();
+    vol.write(4, &[0u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Op 2: GcSweep.
+    simulate_upload(&mut vol, fork_dir);
+    let (r, s) = vol.gc_checkpoint().unwrap();
+    let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
+    let applied_1 = vol.apply_gc_handoffs().unwrap();
+    eprintln!("apply_1 applied={applied_1}");
+    eprintln!("gc/ after apply_1: [{}]", list_dir(&gc_dir).join(", "));
+    promote_gc_outputs(&mut vol, fork_dir);
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+    eprintln!(
+        "index/ after sweep 1: [{}]",
+        list_dir(&index_dir).join(", ")
+    );
+
+    // Op 3: ZeroThenPartialWrite start_lba=0 span=2 inner_off=1 seed=0.
+    vol.write_zeroes(0, 2).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(1, &[0u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Op 4: GcSweep.
+    simulate_upload(&mut vol, fork_dir);
+    eprintln!(
+        "index/ before sweep 2: [{}]",
+        list_dir(&index_dir).join(", ")
+    );
+    let (r, s) = vol.gc_checkpoint().unwrap();
+    let stats_2 = rt
+        .block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s))
+        .unwrap();
+    eprintln!(
+        "stats_2: strategy={:?} candidates={} deferred={}",
+        stats_2.strategy, stats_2.candidates, stats_2.deferred
+    );
+    eprintln!("gc/ after gc_fork 2: [{}]", list_dir(&gc_dir).join(", "));
+    let applied_2 = vol.apply_gc_handoffs().unwrap();
+    eprintln!("apply_2 applied={applied_2}");
+    eprintln!("gc/ after apply_2: [{}]", list_dir(&gc_dir).join(", "));
+    promote_gc_outputs(&mut vol, fork_dir);
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+    let final_idx = list_dir(&index_dir);
+    eprintln!("index/ final: [{}]", final_idx.join(", "));
+
+    assert!(
+        final_idx.len() <= 1,
+        "expected ≤1 .idx after two sweeps, got {}: [{}]",
+        final_idx.len(),
+        final_idx.join(", "),
+    );
+}
+
+fn list_dir(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }

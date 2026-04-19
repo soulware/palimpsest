@@ -71,6 +71,7 @@ use object_store::ObjectStore;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
+use elide_core::gc_plan::{GcPlan, PlanOutput};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
@@ -90,17 +91,6 @@ const SWEEP_LIVE_CAP: u64 = 32 * 1024 * 1024;
 /// combine to fit, and the merged output exits the small set permanently —
 /// no infinite re-pack loop.
 const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_LIVE_CAP / 2;
-
-/// Maximum bytes per coalesced range-GET batch when fetching live bodies.
-/// Matches the cap used by the demand-fetch engine in elide-fetch.
-const RANGE_GET_MAX_BATCH: u64 = 4 * 1024 * 1024;
-
-/// Minimum wasted bytes per range-GET batch to justify targeted fetches over
-/// a single full body-section GET.  Each range-GET carries fixed overhead
-/// (round-trip latency, S3 request cost), so it must avoid downloading at
-/// least this many dead bytes to be worthwhile.  When `wasted_bytes /
-/// batch_count` falls below this threshold, a single full-GET is cheaper.
-const MIN_WASTE_PER_RANGE_GET: u64 = 128 * 1024;
 
 /// Which GC strategy was executed.
 #[derive(Debug, PartialEq)]
@@ -455,7 +445,7 @@ pub async fn apply_done_handoffs(
             let Some(name) = name.to_str() else {
                 return false;
             };
-            // No extension; ULID-parseable stem; no sibling `.staged`
+            // No extension; ULID-parseable stem; no sibling `.plan`
             // (would indicate mid-apply crash state that volume will
             // resolve on its next apply tick).
             if name.contains('.') {
@@ -464,7 +454,7 @@ pub async fn apply_done_handoffs(
             if Ulid::from_string(name).is_err() {
                 return false;
             }
-            !gc_dir.join(format!("{name}.staged")).exists()
+            !gc_dir.join(format!("{name}.plan")).exists()
         })
         .collect();
 
@@ -595,14 +585,14 @@ fn cleanup_fetch_files(gc_dir: &Path) {
     }
 }
 
-/// Delete any `gc/<ulid>.staged.tmp` scratch files left by a crashed
-/// `compact_segments` between the `write_gc_segment` call and the rename
-/// to `<ulid>.staged`. The next pass mints a fresh ULID so the stale
-/// scratch is inert, but it must be removed to avoid unbounded disk
-/// growth and to let `create_new` succeed on any later re-use.
+/// Delete any `gc/<ulid>.plan.tmp` scratch files left by a crashed
+/// `compact_segments` between the plan write and the rename to `<ulid>.plan`.
+/// The next pass mints a fresh ULID so the stale scratch is inert, but it
+/// must be removed to avoid unbounded disk growth and to keep subsequent
+/// plan writes free of stale interlopers.
 ///
-/// Coordinator-owned — the volume's apply-path sweeper deliberately
-/// skips this suffix to avoid racing an in-flight write.
+/// Coordinator-owned — the volume's apply-path sweeper deliberately skips
+/// this suffix to avoid racing an in-flight write.
 fn cleanup_staging_files(gc_dir: &Path) {
     let Ok(entries) = fs::read_dir(gc_dir) else {
         return;
@@ -612,10 +602,10 @@ fn cleanup_staging_files(gc_dir: &Path) {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if name_str.ends_with(".staged.tmp")
+        if name_str.ends_with(".plan.tmp")
             && let Err(e) = fs::remove_file(entry.path())
         {
-            error!("[gc] failed to delete stale staging file {name_str}: {e}");
+            error!("[gc] failed to delete stale plan scratch file {name_str}: {e}");
         }
     }
 }
@@ -628,17 +618,6 @@ const BLOCK_BYTES: u64 = 4096;
 /// Per-segment stats computed during the scan phase.
 struct SegmentStats {
     ulid_str: String,
-    /// `body_section_start` for this segment's S3 object (== .idx file size).
-    /// Used to compute absolute byte offsets for range-GETs into S3.
-    body_section_start: u64,
-    /// Byte length of the body section (sum of DATA `stored_length`). Pulled
-    /// from the segment header. Used by the Delta partial-death expand path
-    /// to locate the delta body section (which sits at
-    /// `body_section_start + body_length` within the segment file).
-    body_section_length: u64,
-    /// Physical on-disk size (idx + DATA body bytes); kept for diagnostics
-    /// and density logging.
-    file_size: u64,
     /// Logical live bytes: lba_length * BLOCK_BYTES summed over all live entries
     /// (DATA, dedup_ref, zero_extent).  Dedup refs and zero extents are included
     /// so that a segment full of live dedup refs is not treated as density=0.
@@ -649,20 +628,24 @@ struct SegmentStats {
     /// Used to distinguish zero-only segments (no physical body to reclaim) from
     /// segments with DATA or REF entries that warrant GC even when all entries are dead.
     has_body_entries: bool,
-    /// Live entries (data field not yet populated for DATA entries).
+    /// Live entries — already classified by `collect_stats` (Zero sub-splits
+    /// expanded, fully-LBA-dead-hash-live entries demoted via `into_canonical`).
+    /// The coordinator uses these plus `partial_death_runs` to emit a
+    /// [`elide_core::gc_plan::GcPlan`]; the volume materialises bodies on apply.
     live_entries: Vec<SegmentEntry>,
     /// Per-entry position in the source segment's index section, parallel to
-    /// `live_entries`. Used to index into `cache/<ulid>.present` when checking
-    /// whether an entry's body bytes are available locally.
+    /// `live_entries`. Referenced by plan outputs so the volume's materialise
+    /// path can address the original input-segment entry.
     live_entry_indices: Vec<u32>,
     /// Hashes that are in the extent index but not reachable from the LBA map.
-    /// The volume must remove these from its extent index when applying the
-    /// handoff, since the old segment files will be deleted.
+    /// The volume's apply path derives removals from its input-`.idx`-vs-
+    /// materialised-output diff, so this list is retained for stats/logging
+    /// only, not for handoff transport.
     removed_hashes: Vec<blake3::Hash>,
-    /// Parallel to `live_entries`: for Data/Inline entries with partial LBA
-    /// death, the list of live sub-runs (filtered to `r.hash == entry.hash`)
-    /// used by `compact_segments` to expand the entry into `CanonicalData`
-    /// (when externally referenced) plus one fresh entry per sub-run. `None`
+    /// Parallel to `live_entries`: for Data/Inline/DedupRef/Delta entries with
+    /// partial LBA death, the list of live sub-runs (filtered to `r.hash ==
+    /// entry.hash`). The coordinator encodes these as `PlanOutput::Partial`
+    /// runs; the volume materialises by slicing the composite body. `None`
     /// for non-partial entries. See `docs/design-gc-partial-death-compaction.md`.
     partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>>,
     /// True if at least one partial-LBA-death entry in this segment cannot
@@ -744,11 +727,6 @@ fn collect_stats(
         // Read index from .idx — the only local file we need for stats.
         // Presence of .idx means the segment is confirmed in S3 (invariant:
         // .idx is written inside promote_segment IPC, after confirmed S3 PUT).
-        //
-        // idx_size == body_section_start: the .idx file is exactly the
-        // [0, body_section_start) prefix of the full S3 segment.
-        let idx_size = segment::idx_body_section_start(&idx_path)?;
-        let layout = segment::read_segment_layout(&idx_path)?;
         let (_, entries, _) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
         // Read inline section from .idx for any inline entries.
@@ -946,16 +924,9 @@ fn collect_stats(
             }
         }
 
-        // file_size: physical on-disk size of the segment object. Uses
-        // stored (compressed) DATA and REF body bytes + idx overhead — not
-        // LBA bytes, since this measures disk space, not logical coverage.
-        let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
-            body_section_start: idx_size,
-            body_section_length: layout.body_length,
             has_body_entries: physical_body_bytes > 0 || has_inline,
-            file_size,
             live_lba_bytes,
             total_lba_bytes,
             live_entries,
@@ -989,983 +960,145 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// Read live extent bodies from `cache/<ulid>.body` if every entry in
-/// `body_indices` has its `.present` bit set. Returns:
+/// Classify each candidate's live entries and emit a `gc/<new-ulid>.plan`
+/// file describing the desired output. The volume picks up the plan on its
+/// next idle tick, resolves bodies through its own ancestor-aware BlockReader,
+/// assembles and signs the output segment, and renames tmp → bare. See
+/// `docs/design-gc-plan-handoff.md`.
 ///
-/// - `Ok(true)` if every live DATA body was populated from the local cache.
-/// - `Ok(false)` if any byte is missing locally (body file absent, any
-///   required `.present` bit unset, or a read error that looks like a cache
-///   miss) — caller should fall back to S3.
-///
-/// Never mutates `candidate` on the `Ok(false)` return, so S3 fallback can
-/// populate the same entries safely.
-fn try_fetch_live_bodies_local(
-    candidate: &mut SegmentStats,
-    fork_dir: &Path,
-    body_indices: &[usize],
-) -> Result<bool> {
-    let cache_dir = fork_dir.join("cache");
-    let body_path = cache_dir.join(format!("{}.body", candidate.ulid_str));
-    let present_path = cache_dir.join(format!("{}.present", candidate.ulid_str));
-
-    // Body file present? If not, definitely a miss.
-    match body_path.try_exists() {
-        Ok(true) => {}
-        Ok(false) => return Ok(false),
-        Err(_) => return Ok(false),
-    }
-
-    // Present bitmap: every required entry_idx must have its bit set.
-    // Reading the file once is cheaper than N calls to check_present_bit
-    // which re-read it each time.
-    let present_bytes = match fs::read(&present_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Ok(false),
-    };
-    for &i in body_indices {
-        let entry_idx = candidate.live_entry_indices[i];
-        let byte_idx = (entry_idx / 8) as usize;
-        let bit = entry_idx % 8;
-        let bit_set = present_bytes
-            .get(byte_idx)
-            .is_some_and(|b| b & (1 << bit) != 0);
-        if !bit_set {
-            return Ok(false);
-        }
-    }
-
-    // All required bits set. Read body file once and slice each entry out.
-    // cache/<ulid>.body uses body-section-relative offsets (BodyOnly layout)
-    // — `stored_offset` is already the right offset into this file.
-    let body = match fs::read(&body_path) {
-        Ok(b) => b,
-        Err(_) => return Ok(false),
-    };
-    for &i in body_indices {
-        let e = &candidate.live_entries[i];
-        let start = e.stored_offset as usize;
-        let end = start + e.stored_length as usize;
-        if end > body.len() {
-            // Body file truncated mid-eviction or torn write. Bail.
-            return Ok(false);
-        }
-        candidate.live_entries[i].data = Some(body[start..end].to_vec());
-    }
-
-    let total_local: u64 = body_indices
-        .iter()
-        .map(|&i| candidate.live_entries[i].stored_length as u64)
-        .sum();
-    tracing::info!(
-        "[gc] fetch {}: local cache hit, read {} body bytes from cache/{}.body",
-        candidate.ulid_str,
-        total_local,
-        candidate.ulid_str,
-    );
-    Ok(true)
-}
-
-/// Fetch live extent body bytes from S3 into `candidate.live_entries[].data`.
-///
-/// Computes coalesced range-GET batches for the live body entries, then decides
-/// whether targeted range-GETs or a single full body-section GET is cheaper.
-/// The heuristic: range-GETs are worthwhile when the wasted bytes they avoid
-/// exceed `MIN_WASTE_PER_RANGE_GET` per batch; otherwise a single GET is
-/// cheaper despite downloading dead bytes.
-///
-/// Local short-circuit: if every live DATA body is already present in
-/// `cache/<ulid>.body` (checked via the `.present` bitmap), we read from
-/// the local cache and skip S3 entirely. This is safe because cache/ is
-/// append-only from the volume's perspective (the coordinator is the sole
-/// deleter) and `.present` bits are durable before they are published —
-/// observed bytes are guaranteed to match the S3 object's body.
-async fn fetch_live_bodies(
-    candidate: &mut SegmentStats,
-    volume_id: &str,
-    fork_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<()> {
-    // Collect indices of live entries that carry body bytes.
-    // DedupRef entries contribute no body in the thin format
-    // (stored_length=0) — we never fetch bytes for them.
-    let body_indices: Vec<usize> = candidate
-        .live_entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.kind.is_data() && e.stored_length > 0)
-        .map(|(i, _)| i)
-        .collect();
-
-    if body_indices.is_empty() {
-        return Ok(());
-    }
-
-    // Try the local cache first. On any miss or error, fall through to S3.
-    if try_fetch_live_bodies_local(candidate, fork_dir, &body_indices)? {
-        return Ok(());
-    }
-
-    let key = segment_key(volume_id, &candidate.ulid_str)
-        .with_context(|| format!("building S3 key for {}", candidate.ulid_str))?;
-
-    // Sort live body entries by stored_offset and coalesce adjacent entries
-    // into batches.  Each batch is a contiguous byte range in the segment's
-    // body section, capped at RANGE_GET_MAX_BATCH bytes.
-    let mut sorted_indices = body_indices;
-    sorted_indices.sort_by_key(|&i| candidate.live_entries[i].stored_offset);
-
-    // batches: Vec<(batch_body_start, batch_body_end, &[sorted_index_positions])>
-    // We store start/end positions within sorted_indices rather than cloning.
-    let mut batches: Vec<(u64, u64, usize, usize)> = Vec::new(); // (body_start, body_end, si_start, si_end_inclusive)
-    {
-        let mut si = 0;
-        while si < sorted_indices.len() {
-            let first_idx = sorted_indices[si];
-            let batch_body_start = candidate.live_entries[first_idx].stored_offset;
-            let mut batch_body_end =
-                batch_body_start + candidate.live_entries[first_idx].stored_length as u64;
-            let mut si_end = si;
-
-            for (j, &idx) in sorted_indices.iter().enumerate().skip(si + 1) {
-                let e = &candidate.live_entries[idx];
-                if e.stored_offset != batch_body_end {
-                    break;
-                }
-                let new_end = batch_body_end + e.stored_length as u64;
-                if new_end - batch_body_start > RANGE_GET_MAX_BATCH {
-                    break;
-                }
-                batch_body_end = new_end;
-                si_end = j;
-            }
-
-            batches.push((batch_body_start, batch_body_end, si, si_end));
-            si = si_end + 1;
-        }
-    }
-
-    let total_body_bytes = candidate
-        .file_size
-        .saturating_sub(candidate.body_section_start);
-    let live_body_bytes: u64 = sorted_indices
-        .iter()
-        .map(|&i| candidate.live_entries[i].stored_length as u64)
-        .sum();
-    let wasted_bytes = total_body_bytes.saturating_sub(live_body_bytes);
-    let batch_count = batches.len() as u64;
-
-    let use_ranges = batch_count > 0 && wasted_bytes / batch_count >= MIN_WASTE_PER_RANGE_GET;
-
-    if use_ranges {
-        for &(batch_body_start, batch_body_end, si_start, si_end) in &batches {
-            let abs_start = (candidate.body_section_start + batch_body_start) as usize;
-            let abs_end = (candidate.body_section_start + batch_body_end) as usize;
-
-            let data = store
-                .get_range(&key, abs_start..abs_end)
-                .await
-                .with_context(|| {
-                    format!(
-                        "range-GET for {} (offset {}..{})",
-                        candidate.ulid_str, abs_start, abs_end,
-                    )
-                })?;
-
-            for &idx in &sorted_indices[si_start..=si_end] {
-                let e = &candidate.live_entries[idx];
-                let local_off = (e.stored_offset - batch_body_start) as usize;
-                let local_end = local_off + e.stored_length as usize;
-                candidate.live_entries[idx].data = Some(data[local_off..local_end].to_vec());
-            }
-        }
-
-        tracing::info!(
-            "[gc] fetch {}: range-GET {} batch(es), fetched {} of {} body bytes (saved {}, {:.0}%)",
-            candidate.ulid_str,
-            batch_count,
-            live_body_bytes,
-            total_body_bytes,
-            wasted_bytes,
-            if total_body_bytes > 0 {
-                wasted_bytes as f64 / total_body_bytes as f64 * 100.0
-            } else {
-                0.0
-            },
-        );
-    } else {
-        // Single GET for the entire body section, slice out each live entry.
-        let body_start = candidate.body_section_start as usize;
-        let body_end = candidate.file_size as usize;
-        let body = store
-            .get_range(&key, body_start..body_end)
-            .await
-            .with_context(|| format!("fetching body section for {}", candidate.ulid_str))?;
-
-        for &idx in &sorted_indices {
-            let e = &candidate.live_entries[idx];
-            let off = e.stored_offset as usize;
-            let end = off + e.stored_length as usize;
-            candidate.live_entries[idx].data = Some(body[off..end].to_vec());
-        }
-
-        let waste_per_batch = if batch_count > 0 {
-            wasted_bytes / batch_count
-        } else {
-            0
-        };
-        tracing::info!(
-            "[gc] fetch {}: full-body GET {} of {} body bytes \
-             (waste {}, {} batch(es) \u{2192} {}/batch < {} threshold)",
-            candidate.ulid_str,
-            total_body_bytes,
-            total_body_bytes,
-            wasted_bytes,
-            batch_count,
-            waste_per_batch,
-            MIN_WASTE_PER_RANGE_GET,
-        );
-    }
-
-    Ok(())
-}
-
-/// Resolve the uncompressed body bytes for `hash` by looking up
-/// `extent_index[hash]` and reading the referenced segment.
-///
-/// Returns `Ok(None)` if `hash` is not in the index. Returns `Err` on
-/// any I/O failure (local file read, S3 range-GET). Callers propagate
-/// and abort the pass; next tick retries.
-///
-/// Resolution tiers, in order:
-/// - `loc.inline_data`: bytes already in memory (inline extents).
-/// - `BodySource::Local`: read from the full local segment file located
-///   via `segment::locate_segment_body` (covers `wal/<id>`, `pending/<id>`,
-///   and bare `gc/<id>` — all complete files the coordinator reads
-///   directly). No S3 fallback: Local means the bytes must be on disk in
-///   one of those tiers.
-/// - `BodySource::Cached(entry_idx)`: check the `.present` bit; on hit
-///   slice from `cache/<seg>.body`, on miss fall back to an S3 range-GET
-///   at `[body_section_start + body_offset,
-///   body_section_start + body_offset + body_length)`.
-///
-/// LZ4-decompresses when `loc.compressed` is set. Used by partial-death
-/// compaction of DedupRef/Delta entries, where the composite body lives
-/// in a segment other than the one being compacted.
-async fn resolve_body_by_hash(
-    hash: &blake3::Hash,
-    extent_index: &ExtentIndex,
-    fork_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<Option<Vec<u8>>> {
-    let Some(loc) = extent_index.lookup(hash) else {
-        return Ok(None);
-    };
-
-    if let Some(inline) = &loc.inline_data {
-        return Ok(Some(inline.to_vec()));
-    }
-
-    let seg_ulid = loc.segment_id.to_string();
-    let stored = read_extent_body(loc, &seg_ulid, fork_dir, volume_id, store).await?;
-
-    let body = if loc.compressed {
-        lz4_flex::decompress_size_prepended(&stored).with_context(|| {
-            format!(
-                "decompressing resolved body for hash {} from segment {seg_ulid}",
-                hash.to_hex(),
-            )
-        })?
-    } else {
-        stored
-    };
-
-    Ok(Some(body))
-}
-
-/// Read the stored (possibly compressed) bytes for a single extent.
-///
-/// Dispatches on `loc.body_source`:
-/// - `Local`: the extent lives in a complete local file (`wal/<id>`,
-///   `pending/<id>`, or bare `gc/<id>`). Locate via
-///   `segment::locate_segment_body` and seek per layout. No S3 fallback:
-///   the file is authoritative at this tier.
-/// - `Cached(entry_idx)`: the extent lives in `cache/<seg>.body` with
-///   demand-fetch semantics. Check the `.present` bit; on hit slice from
-///   the local sparse file, on miss fall back to S3 range-GET.
-async fn read_extent_body(
-    loc: &extentindex::ExtentLocation,
-    seg_ulid: &str,
-    fork_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<Vec<u8>> {
-    match loc.body_source {
-        extentindex::BodySource::Local => read_extent_body_local(loc, seg_ulid, fork_dir),
-        extentindex::BodySource::Cached(entry_idx) => {
-            read_extent_body_cached(loc, seg_ulid, entry_idx, fork_dir, volume_id, store).await
-        }
-    }
-}
-
-/// Read a `Local` extent's bytes from a complete segment file
-/// (`wal/<id>`, `pending/<id>`, or bare `gc/<id>`).
-fn read_extent_body_local(
-    loc: &extentindex::ExtentLocation,
-    seg_ulid: &str,
-    fork_dir: &Path,
-) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let (path, layout) =
-        segment::locate_segment_body(fork_dir, loc.segment_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve body for segment {seg_ulid}: body_source is Local \
-             but no wal/pending/gc file exists for this segment in {}",
-                fork_dir.display(),
-            )
-        })?;
-    let seek = layout.body_seek(loc);
-    let mut f = fs::File::open(&path)
-        .with_context(|| format!("opening local segment file {}", path.display()))?;
-    f.seek(SeekFrom::Start(seek))
-        .with_context(|| format!("seeking {} to {seek}", path.display()))?;
-    let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact(&mut buf).with_context(|| {
-        format!(
-            "reading {} at offset {seek} length {}",
-            path.display(),
-            loc.body_length,
-        )
-    })?;
-    Ok(buf)
-}
-
-/// Read a `Cached` extent's bytes: local sparse body file if
-/// `.present` bit is set, otherwise S3 range-GET.
-async fn read_extent_body_cached(
-    loc: &extentindex::ExtentLocation,
-    seg_ulid: &str,
-    entry_idx: u32,
-    fork_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<Vec<u8>> {
-    let cache_dir = fork_dir.join("cache");
-    let body_path = cache_dir.join(format!("{seg_ulid}.body"));
-    let present_path = cache_dir.join(format!("{seg_ulid}.present"));
-    if segment::check_present_bit(&present_path, entry_idx)
-        .with_context(|| format!("checking .present for {seg_ulid} entry {entry_idx}"))?
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = fs::File::open(&body_path)
-            .with_context(|| format!("opening body cache {}", body_path.display()))?;
-        f.seek(SeekFrom::Start(loc.body_offset))
-            .with_context(|| format!("seeking body cache {seg_ulid}"))?;
-        let mut buf = vec![0u8; loc.body_length as usize];
-        f.read_exact(&mut buf).with_context(|| {
-            format!(
-                "reading body cache {seg_ulid} at offset {} length {}",
-                loc.body_offset, loc.body_length,
-            )
-        })?;
-        return Ok(buf);
-    }
-
-    let key = segment_key(volume_id, seg_ulid)
-        .with_context(|| format!("building S3 key for {seg_ulid}"))?;
-    let start = (loc.body_section_start + loc.body_offset) as usize;
-    let end = start + loc.body_length as usize;
-    let bytes = store
-        .get_range(&key, start..end)
-        .await
-        .with_context(|| format!("S3 range-GET for {seg_ulid} at {start}..{end}"))?;
-    Ok(bytes.to_vec())
-}
-
-/// Read the delta blob for a single `DeltaOption` out of a segment's delta
-/// body section. Used by Delta partial-death expansion to reconstruct the
-/// composite body via `apply_delta(base_body, delta_blob)`.
-///
-/// Dispatches in the same precedence order as `locate_segment_body`:
-/// 1. **Full local segment file** (`wal/<id>`, `pending/<id>`, bare
-///    `gc/<id>`): seek to `body_section_start + body_length + delta_offset`
-///    — the delta body section sits directly after the data body section
-///    within the full segment file.
-/// 2. **`cache/<id>.delta`**: evicted-segment deltas live in a separate
-///    file whose byte 0 is the start of the delta body section. Seek to
-///    `delta_offset` within that file.
-/// 3. **S3 range-GET**: fetch `delta_length` bytes at
-///    `body_section_start + body_length + delta_offset` within the S3
-///    segment object.
-///
-/// Delta blobs are never inline (unlike extent bodies); there is no
-/// `inline_data` fast path.
-// Eight arguments: the five segment-addressing fields (segment_id,
-// body_section_start, body_length, delta_offset, delta_length) plus the
-// three fetch-context fields (fork_dir, volume_id, store). Bundling them
-// would not reduce load-bearing parameters — each call site already has
-// them individually.
-#[allow(clippy::too_many_arguments)]
-async fn read_delta_blob(
-    segment_id: Ulid,
-    body_section_start: u64,
-    body_length: u64,
-    delta_offset: u64,
-    delta_length: u32,
-    fork_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let sid = segment_id.to_string();
-
-    if let Some((path, segment::SegmentBodyLayout::FullSegment)) =
-        segment::locate_segment_body(fork_dir, segment_id)
-    {
-        let seek = body_section_start + body_length + delta_offset;
-        let mut f = fs::File::open(&path)
-            .with_context(|| format!("opening local segment {}", path.display()))?;
-        f.seek(SeekFrom::Start(seek))
-            .with_context(|| format!("seeking delta body in {} to {seek}", path.display()))?;
-        let mut buf = vec![0u8; delta_length as usize];
-        f.read_exact(&mut buf).with_context(|| {
-            format!(
-                "reading delta blob from {} at {seek} length {delta_length}",
-                path.display(),
-            )
-        })?;
-        return Ok(buf);
-    }
-
-    let cache_delta = fork_dir.join("cache").join(format!("{sid}.delta"));
-    if cache_delta.exists() {
-        let mut f = fs::File::open(&cache_delta)
-            .with_context(|| format!("opening {}", cache_delta.display()))?;
-        f.seek(SeekFrom::Start(delta_offset))
-            .with_context(|| format!("seeking {} to {delta_offset}", cache_delta.display()))?;
-        let mut buf = vec![0u8; delta_length as usize];
-        f.read_exact(&mut buf).with_context(|| {
-            format!(
-                "reading {} at {delta_offset} length {delta_length}",
-                cache_delta.display(),
-            )
-        })?;
-        return Ok(buf);
-    }
-
-    let key = segment_key(volume_id, &sid).with_context(|| format!("building S3 key for {sid}"))?;
-    let start = (body_section_start + body_length + delta_offset) as usize;
-    let end = start + delta_length as usize;
-    let bytes = store.get_range(&key, start..end).await.with_context(|| {
-        format!("S3 range-GET for delta blob of segment {sid} at {start}..{end}")
-    })?;
-    Ok(bytes.to_vec())
-}
-
-/// Source segment context passed into `expand_partial_death`. Bundles the
-/// three pieces of metadata that the Delta branch needs (the ULID plus the
-/// body-section offset / length for locating the delta body region); the
-/// Data / Inline / DedupRef branches only consult `ulid`.
-struct PartialDeathSource<'a> {
-    ulid: &'a str,
-    body_section_start: u64,
-    body_section_length: u64,
-}
-
-/// Expand a partial-LBA-death entry into:
-/// 1. `CanonicalData` / `CanonicalInline` preserving the composite body
-///    when the hash is externally referenced (any `DedupRef.hash` or
-///    `Delta.base_hash` equals `entry.hash`, tracked via `live_hashes`).
-///    Applies only to Data/Inline (owned-body kinds); for DedupRef the
-///    canonical lives in a segment that isn't being compacted, so no
-///    canonical emit is needed. Delta is not yet handled here.
-/// 2. One fresh entry per live sub-run (filtered runs where
-///    `r.hash == entry.hash`). Each sub-run is hashed against
-///    `extent_index`: a matching hash produces a whole-body `DedupRef`;
-///    otherwise a fresh `Data` entry holding the slice bytes.
-///
-/// Composite body resolution per `entry.kind`:
-/// - Data / Inline: bytes are in `entry.data` (populated by
-///   `fetch_live_bodies` for Data or `collect_stats`'s inline
-///   pre-population for Inline). Decompressed if `entry.compressed`.
-/// - DedupRef: bytes live in a different segment pointed at by
-///   `extent_index[entry.hash]`. Resolved via `resolve_body_by_hash`
-///   (local cache → S3 range-GET → lz4-decompress).
-/// - Delta: reconstructed from a base body + delta blob. Picks the first
-///   `entry.delta_options[i]` whose `source_hash` resolves via
-///   `extent_index.lookup()` (which only returns Data-body entries, so
-///   chained deltas are structurally impossible). The base body is
-///   fetched via `resolve_body_by_hash`; the delta blob via
-///   `read_delta_blob` against the source segment's delta body section.
-///   `collect_stats` only routes a Delta entry here when at least one
-///   source resolves — if none do, the segment is deferred.
-///
-/// Canonical-body handling differs by kind:
-/// - Data / Inline: emit `CanonicalData` / `CanonicalInline` when the
-///   hash is externally referenced (the source segment owns the body).
-/// - DedupRef: no emit — the canonical body lives in a segment that
-///   isn't being compacted this pass and remains resolvable by hash.
-/// - Delta: emit the reconstructed body as a full `Data` entry (demoted
-///   to canonical) when externally referenced — **not** re-encoded as a
-///   Delta. Keeps dedup resolution through that hash O(1) rather than
-///   forcing per-read delta reconstruction.
-///
-/// Sub-run bodies are emitted uncompressed. Compression of fresh
-/// sub-runs is a size-tuning opportunity for a follow-up; partial-death
-/// compaction is rare enough that the write-amp cost is bounded.
-///
-/// See `docs/design-gc-partial-death-compaction.md`.
-// Eight arguments: entry + its context (source, sub_runs) plus five
-// GC-pass inputs (live_hashes, extent_index, fork_dir, volume_id, store)
-// plus the &mut sink (all_live). Segment context lives in
-// `PartialDeathSource` so the Delta branch can reach body_section_start /
-// body_section_length without expanding the signature further.
-#[allow(clippy::too_many_arguments)]
-async fn expand_partial_death(
-    entry: SegmentEntry,
-    sub_runs: &[lbamap::ExtentRead],
-    source: &PartialDeathSource<'_>,
-    live_hashes: &HashSet<blake3::Hash>,
-    extent_index: &ExtentIndex,
-    fork_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-    all_live: &mut Vec<(String, SegmentEntry)>,
-) -> Result<()> {
-    let source_ulid = source.ulid;
-    let uncompressed: Vec<u8> = match entry.kind {
-        EntryKind::Data | EntryKind::Inline => {
-            // Owned body: `entry.data` carries the composite bytes
-            // (possibly lz4-compressed).
-            let stored = entry.data.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "partial-death entry missing body bytes (source={source_ulid}, hash={})",
-                    entry.hash.to_hex()
-                )
-            })?;
-            if entry.compressed {
-                lz4_flex::decompress_size_prepended(stored).map_err(|e| {
-                    anyhow::anyhow!(
-                        "decompressing partial-death body (source={source_ulid}, hash={}): {e}",
-                        entry.hash.to_hex()
-                    )
-                })?
-            } else {
-                stored.to_vec()
-            }
-        }
-        EntryKind::DedupRef => {
-            // The canonical body lives in a different segment. Resolve
-            // via extent_index; the helper handles local-cache / S3 /
-            // inline paths and returns uncompressed bytes.
-            resolve_body_by_hash(&entry.hash, extent_index, fork_dir, volume_id, store)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "partial-death DedupRef: hash {} not in extent index \
-                         (source={source_ulid})",
-                        entry.hash.to_hex()
-                    )
-                })?
-        }
-        EntryKind::Delta => {
-            // Pick the first delta_option whose source_hash resolves via
-            // the Data-body index. collect_stats already verified at
-            // least one resolves before routing us here (otherwise the
-            // whole segment is deferred). We re-pick here rather than
-            // carrying the index through to keep collect_stats stateless
-            // about the expansion side's choice.
-            //
-            // Chained deltas are structurally impossible: extent_index
-            // .lookup() searches only the Data-body map; Delta entries
-            // live in a separate `deltas` map and will never appear here.
-            let opt = entry
-                .delta_options
-                .iter()
-                .find(|o| extent_index.lookup(&o.source_hash).is_some())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "partial-death Delta: no source_hash resolves via extent_index \
-                         (source={source_ulid}, hash={}); collect_stats should \
-                         have deferred this segment",
-                        entry.hash.to_hex()
-                    )
-                })?;
-            let base =
-                resolve_body_by_hash(&opt.source_hash, extent_index, fork_dir, volume_id, store)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "partial-death Delta: source_hash {} vanished from extent \
-                             index between check and fetch (source={source_ulid}, \
-                             composite_hash={})",
-                            opt.source_hash.to_hex(),
-                            entry.hash.to_hex(),
-                        )
-                    })?;
-            let seg_ulid = Ulid::from_string(source_ulid)
-                .map_err(|e| anyhow::anyhow!("parsing source ULID {source_ulid}: {e}"))?;
-            let blob = read_delta_blob(
-                seg_ulid,
-                source.body_section_start,
-                source.body_section_length,
-                opt.delta_offset,
-                opt.delta_length,
-                fork_dir,
-                volume_id,
-                store,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "reading delta blob for partial-death Delta \
-                     (source={source_ulid}, composite_hash={})",
-                    entry.hash.to_hex(),
-                )
-            })?;
-            elide_core::delta_compute::apply_delta(&base, &blob).map_err(|e| {
-                anyhow::anyhow!(
-                    "applying delta for partial-death Delta \
-                     (source={source_ulid}, composite_hash={}): {e}",
-                    entry.hash.to_hex(),
-                )
-            })?
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "partial-death expansion called with unsupported entry kind {:?} \
-                 (source={source_ulid}, hash={})",
-                entry.kind,
-                entry.hash.to_hex()
-            ));
-        }
-    };
-    let expected_len = entry.lba_length as usize * BLOCK_BYTES as usize;
-    if uncompressed.len() != expected_len {
-        return Err(anyhow::anyhow!(
-            "partial-death composite body size mismatch: source={source_ulid} \
-             hash={} lba_length={} got={}B expected={}B",
-            entry.hash.to_hex(),
-            entry.lba_length,
-            uncompressed.len(),
-            expected_len,
-        ));
-    }
-
-    // Canonical-body preservation, when needed.
-    //
-    // Applies to kinds where the source segment carries the body bytes
-    // (Data / Inline directly; Delta via reconstruction). If the
-    // composite hash is externally referenced (any `DedupRef.hash` or
-    // `Delta.base_hash` equals `entry.hash`, tracked via `live_hashes`),
-    // rebuild a source-segment entry from the uncompressed body via
-    // `new_data` (which picks Data or Inline based on stored size) and
-    // demote via `into_canonical`. Writing as uncompressed is consistent
-    // with the sub-run path below; for Delta specifically, this trades
-    // compactness for O(1) dedup reads through the hash.
-    //
-    // DedupRef partial-death emits no canonical: the canonical body lives
-    // in `extent_index[entry.hash].segment_id` (a segment that isn't
-    // being compacted this pass), so it remains resolvable by hash
-    // without any emission from the compacted output.
-    let emit_canonical = matches!(
-        entry.kind,
-        EntryKind::Data | EntryKind::Inline | EntryKind::Delta
-    ) && live_hashes.contains(&entry.hash);
-    if emit_canonical {
-        let canon = SegmentEntry::new_data(
-            entry.hash,
-            0,
-            0,
-            segment::SegmentFlags::empty(),
-            uncompressed.clone(),
-        );
-        all_live.push((source_ulid.to_owned(), canon.into_canonical()));
-    }
-
-    // One entry per live sub-run. Hash the slice and emit a fresh Data
-    // entry carrying the body bytes.
-    //
-    // Always Data, never DedupRef — even when the sub-run hash happens to
-    // collide with something already in `extent_index`. A DedupRef would
-    // depend on the target segment surviving (or being carried forward
-    // via canonical-only) this pass, which we can't determine here: the
-    // target may itself be an input, its entry may be fully dead and
-    // slated for `removed_hashes`, and expansion runs before the pass
-    // finalises those decisions. Emitting fresh Data keeps the sub-run's
-    // bytes self-contained in the compacted output, insulating it from
-    // concurrent removals. Space cost is bounded: partial-death is rare,
-    // and a future optimisation can re-introduce DedupRef emission with
-    // explicit safety checks against the in-pass input set and the
-    // `removed_hashes` decision.
-    for run in sub_runs {
-        let run_len = (run.range_end - run.range_start) as u32;
-        if run_len == 0 {
-            continue;
-        }
-        let start_byte = run.payload_block_offset as usize * BLOCK_BYTES as usize;
-        let end_byte = start_byte + run_len as usize * BLOCK_BYTES as usize;
-        if end_byte > uncompressed.len() {
-            return Err(anyhow::anyhow!(
-                "partial-death sub-run out of range: source={source_ulid} \
-                 composite_hash={} run=[{}..{}) payload_offset={} run_len={}B body_len={}B",
-                entry.hash.to_hex(),
-                run.range_start,
-                run.range_end,
-                run.payload_block_offset,
-                run_len as usize * BLOCK_BYTES as usize,
-                uncompressed.len(),
-            ));
-        }
-        let slice = &uncompressed[start_byte..end_byte];
-        let run_hash = blake3::hash(slice);
-        all_live.push((
-            source_ulid.to_owned(),
-            SegmentEntry::new_data(
-                run_hash,
-                run.range_start,
-                run_len,
-                segment::SegmentFlags::empty(),
-                slice.to_vec(),
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
-/// Read live extent bodies from each candidate, write a compacted self-
-/// describing segment to `gc/<new-ulid>.staged` (with the consumed input
-/// ULID list embedded in the segment header — the volume's apply path
-/// derives the extent-index updates from this field, no manifest sidecar).
-///
-/// For each candidate, the full segment is downloaded from S3 to a temporary
-/// `gc/<ulid>.fetch` file. This guarantees the body is complete regardless of
-/// demand-fetch state, and keeps the fetch consistent with other full-segment
-/// files in gc/. The `.fetch` file is deleted after the body is read.
 async fn compact_segments(
-    mut candidates: Vec<SegmentStats>,
+    candidates: Vec<SegmentStats>,
     gc_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
+    _volume_id: &str,
+    _store: &Arc<dyn ObjectStore>,
     new_ulid: Ulid,
-    extent_index: &ExtentIndex,
+    _extent_index: &ExtentIndex,
     live_hashes: &HashSet<blake3::Hash>,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
 
-    // fork_dir is the parent of gc_dir; used to locate `cache/<ulid>.body`
-    // when resolving bodies locally instead of from S3.
-    let fork_dir = gc_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("gc_dir has no parent"))?;
+    let mut outputs: Vec<PlanOutput> = Vec::new();
+    let mut total_inputs = 0usize;
 
-    // For each candidate: try the local cache first (cache/<ulid>.body with
-    // all required `.present` bits set), falling through to S3 on any miss.
-    // Zero extents carry no body data, so candidates with only zero extents
-    // skip the fetch entirely. removed_hashes are already fully populated
-    // from collect_stats and need no fetch.
-    let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
-    let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
-    for candidate in &mut candidates {
-        fetch_live_bodies(candidate, volume_id, fork_dir, store)
-            .await
-            .with_context(|| format!("fetching bodies for {}", candidate.ulid_str))?;
+    // Per-kind counters for the visibility log line.
+    let mut keep_count = 0usize;
+    let mut zero_split_count = 0usize;
+    let mut canonical_count = 0usize;
+    let mut run_count = 0usize;
+    let mut drop_count = 0usize;
 
-        // Verify every fetched body hashes to its declared hash before we
-        // carry it forward. A mismatch indicates an already-poisoned input
-        // segment (e.g. from the pre-308f778 stale-liveness bug) — propagating
-        // it would corrupt the compacted output and, once inputs are dropped,
-        // any surviving LBA that resolves to this hash.
-        for entry in &candidate.live_entries {
-            if entry.kind.has_body_bytes()
-                && let Some(bytes) = entry.data.as_deref()
-            {
-                segment::verify_body_hash(entry, bytes).with_context(|| {
-                    format!(
-                        "body integrity check failed for input segment {}",
-                        candidate.ulid_str
-                    )
-                })?;
-            }
+    for candidate in &candidates {
+        let input_ulid = Ulid::from_string(&candidate.ulid_str)
+            .with_context(|| format!("parsing candidate ulid {}", candidate.ulid_str))?;
+        total_inputs += 1;
+
+        // Fully-dead input with nothing to preserve and nothing explicitly
+        // removed — it still needs to be consumed so its .idx is walked at
+        // apply time. Emit a `drop` record so the input appears in the plan's
+        // derived inputs list.
+        let has_any_live = !candidate.live_entries.is_empty();
+        let has_any_removed = !candidate.removed_hashes.is_empty();
+        if !has_any_live && !has_any_removed {
+            outputs.push(PlanOutput::Drop { input: input_ulid });
+            drop_count += 1;
+            continue;
+        }
+        // Tombstone-style input: no kept entries but hashes to remove.
+        // Signal with a Drop so the input is listed; the apply path
+        // derives the removals from the input's .idx.
+        if !has_any_live {
+            outputs.push(PlanOutput::Drop { input: input_ulid });
+            drop_count += 1;
+            continue;
         }
 
-        let partial_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> =
-            candidate.partial_death_runs.drain(..).collect();
-        let source = PartialDeathSource {
-            ulid: &candidate.ulid_str,
-            body_section_start: candidate.body_section_start,
-            body_section_length: candidate.body_section_length,
-        };
-        for (entry, sub_runs) in candidate
-            .live_entries
-            .drain(..)
-            .zip(partial_runs.into_iter())
-        {
-            if let Some(sub_runs) = sub_runs {
-                expand_partial_death(
-                    entry,
-                    &sub_runs,
-                    &source,
-                    live_hashes,
-                    extent_index,
-                    fork_dir,
-                    volume_id,
-                    store,
-                    &mut all_live,
-                )
-                .await?;
-            } else {
-                all_live.push((candidate.ulid_str.clone(), entry));
-            }
-        }
-        for hash in candidate.removed_hashes.drain(..) {
-            all_removed.push((hash, candidate.ulid_str.clone()));
-        }
-    }
+        for (i, entry) in candidate.live_entries.iter().enumerate() {
+            let entry_idx = candidate.live_entry_indices[i];
+            let sub_runs = &candidate.partial_death_runs[i];
 
-    // Self-describing GC handoff (step 4b): one unified code path for live,
-    // removal-only and tombstone compactions. The output segment carries the
-    // sorted list of input ULIDs in its header so the volume's apply path can
-    // derive the extent-index updates directly from the segment. Tombstones
-    // and removal-only handoffs produce a zero-entries segment with only the
-    // inputs field populated — tiny but valid.
-    let _ = &all_removed; // consumed implicitly by the volume's derive path
-
-    fs::create_dir_all(gc_dir).context("creating gc dir")?;
-    let tmp_path = gc_dir.join(format!("{new_ulid_str}.staged.tmp"));
-
-    let mut new_entries: Vec<SegmentEntry> = Vec::with_capacity(all_live.len());
-    for (_, e) in &mut all_live {
-        match e.kind {
-            EntryKind::Zero => {
-                new_entries.push(SegmentEntry::new_zero(e.start_lba, e.lba_length));
-            }
-            EntryKind::DedupRef => {
-                // DedupRef entries carry no body bytes in the thin format.
-                // Pass them through the compactor unchanged: the canonical
-                // DATA lives elsewhere (maintained by the canonical-presence
-                // invariant) and reads resolve via the extent index.
-                new_entries.push(SegmentEntry::new_dedup_ref(
-                    e.hash,
-                    e.start_lba,
-                    e.lba_length,
-                ));
-            }
-            EntryKind::Data | EntryKind::Inline => {
-                let flags = if e.compressed {
-                    segment::SegmentFlags::COMPRESSED
-                } else {
-                    segment::SegmentFlags::empty()
-                };
-                // `new_data` chooses Data vs Inline based on stored size.
-                new_entries.push(SegmentEntry::new_data(
-                    e.hash,
-                    e.start_lba,
-                    e.lba_length,
-                    flags,
-                    e.data.take().unwrap_or_default(),
-                ));
-            }
-            EntryKind::CanonicalData | EntryKind::CanonicalInline => {
-                // Canonical-body-only: preserve the body for dedup resolution,
-                // no LBA claim on rebuild. Built from a Data/Inline entry via
-                // `new_data` (which picks Data vs Inline based on stored size)
-                // and then demoted via `into_canonical`.
-                let flags = if e.compressed {
-                    segment::SegmentFlags::COMPRESSED
-                } else {
-                    segment::SegmentFlags::empty()
-                };
-                let body = e.data.take().unwrap_or_default();
-                let built = SegmentEntry::new_data(e.hash, 0, 0, flags, body);
-                new_entries.push(built.into_canonical());
-            }
-            EntryKind::Delta => {
-                // Delta entries carry no body bytes in the thin format.
-                // Pass them through the compactor unchanged: the delta blob
-                // stays in this segment's delta body section (carried by
-                // rewrite_with_deltas elsewhere) and the source_hash is kept
-                // alive via the lba_referenced_hashes fold. Reads resolve
-                // via extent_index.lookup(source_hash) then zstd-dict
-                // decompress.
-                debug_assert!(
-                    e.stored_offset == 0 && e.stored_length == 0,
-                    "Delta entry must have zero stored_offset and stored_length"
-                );
-                new_entries.push(SegmentEntry::new_delta(
-                    e.hash,
-                    e.start_lba,
-                    e.lba_length,
-                    e.delta_options.clone(),
-                ));
+            match (sub_runs, entry.kind) {
+                (Some(runs), _) => {
+                    // Partial-LBA-death: one optional `canonical` + one
+                    // `run` per surviving sub-run. `emit_canonical` mirrors
+                    // the former `expand_partial_death` decision — owned-
+                    // body kinds (Data / Inline / Delta) emit a canonical
+                    // when the composite hash is still LBA-live, preserving
+                    // the composite body for dedup resolution. DedupRef
+                    // never emits a canonical (body lives in a segment this
+                    // pass doesn't touch).
+                    let emit_canonical = matches!(
+                        entry.kind,
+                        EntryKind::Data | EntryKind::Inline | EntryKind::Delta
+                    ) && live_hashes.contains(&entry.hash);
+                    if emit_canonical {
+                        outputs.push(PlanOutput::Canonical {
+                            input: input_ulid,
+                            entry_idx,
+                        });
+                        canonical_count += 1;
+                    }
+                    for r in runs.iter() {
+                        outputs.push(PlanOutput::Run {
+                            input: input_ulid,
+                            entry_idx,
+                            payload_block_offset: r.payload_block_offset,
+                            start_lba: r.range_start,
+                            lba_length: (r.range_end - r.range_start) as u32,
+                        });
+                        run_count += 1;
+                    }
+                }
+                (None, EntryKind::Zero) => {
+                    // `collect_stats` pre-splits multi-LBA Zero entries into
+                    // surviving sub-runs by cloning the entry with adjusted
+                    // `(start_lba, lba_length)`. Emit a `ZeroSplit` for every
+                    // such sub-run — the materialise path discards the source
+                    // entry's original span and honours the planned span.
+                    outputs.push(PlanOutput::ZeroSplit {
+                        input: input_ulid,
+                        entry_idx,
+                        start_lba: entry.start_lba,
+                        lba_length: entry.lba_length,
+                    });
+                    zero_split_count += 1;
+                }
+                (None, EntryKind::CanonicalData | EntryKind::CanonicalInline) => {
+                    // `collect_stats` demotes fully-LBA-dead hash-live entries
+                    // by calling `into_canonical()`, which flips the kind.
+                    // Emit as `Canonical` — the materialise side reads the
+                    // stored bytes and writes a `Canonical*` in the output.
+                    outputs.push(PlanOutput::Canonical {
+                        input: input_ulid,
+                        entry_idx,
+                    });
+                    canonical_count += 1;
+                }
+                (None, _) => {
+                    // Fully-alive Data / Inline / DedupRef / Delta — pass
+                    // through unchanged. For Delta, the materialise path will
+                    // also carry the delta blob across into the output's
+                    // delta body section.
+                    outputs.push(PlanOutput::Keep {
+                        input: input_ulid,
+                        entry_idx,
+                    });
+                    keep_count += 1;
+                }
             }
         }
     }
 
-    // The coordinator does not hold the volume's private key, so it signs the
-    // compacted segment with an ephemeral key. The volume re-signs it with its
-    // own key inside apply_gc_handoffs, producing a bare `gc/<ulid>` body.
-    // That rename (performed by the volume) is the atomic commit point;
-    // until then the file stays at `gc/<ulid>.staged`.
-    //
-    // `inputs` is the list of source segment ULIDs consumed by this compaction,
-    // sorted for determinism so identical candidate sets produce byte-identical
-    // output headers. The volume's apply path reads this field to derive
-    // extent-index updates directly from the segment itself.
-    let mut inputs: Vec<Ulid> = candidates
-        .iter()
-        .map(|c| Ulid::from_string(&c.ulid_str).context("parsing candidate ulid"))
-        .collect::<Result<Vec<_>>>()?;
-    inputs.sort();
-    let (ephemeral_signer, _) = elide_core::signing::generate_ephemeral_signer();
-    let _new_body_section_start = segment::write_gc_segment(
-        &tmp_path,
-        &mut new_entries,
-        &inputs,
-        ephemeral_signer.as_ref(),
-    )
-    .context("writing compacted segment")?;
+    let plan = GcPlan { new_ulid, outputs };
+    let plan_path = gc_dir.join(format!("{new_ulid_str}.plan"));
+    plan.write_atomic(&plan_path)
+        .context("writing GC plan file")?;
 
-    // Stage at `gc/<ulid>.staged` via rename. Volume apply will detect this,
-    // derive the action set from `inputs` + each input's `.idx`, re-sign
-    // into `<ulid>.tmp`, and rename to bare `<ulid>` as the commit point.
-    let staged_path = gc_dir.join(format!("{new_ulid_str}.staged"));
-    tokio::fs::rename(&tmp_path, &staged_path)
-        .await
-        .context("staging compacted segment in gc/")?;
-
-    // Per-kind breakdown for visibility. Mirrors the volume's flush log line
-    // (`data / inline / dedup-ref / zero / delta`) plus a `canonical-only`
-    // column: Data/Inline entries whose LBA was dead but whose hash was still
-    // live elsewhere — demoted in `collect_stats` to carry body for dedup
-    // resolution while dropping the stale LBA claim.
-    let mut data = 0usize;
-    let mut inline = 0usize;
-    let mut refs = 0usize;
-    let mut zero = 0usize;
-    let mut delta = 0usize;
-    let mut canonical = 0usize;
-    for e in &new_entries {
-        match e.kind {
-            segment::EntryKind::Data => data += 1,
-            segment::EntryKind::Inline => inline += 1,
-            segment::EntryKind::DedupRef => refs += 1,
-            segment::EntryKind::Zero => zero += 1,
-            segment::EntryKind::Delta => delta += 1,
-            segment::EntryKind::CanonicalData | segment::EntryKind::CanonicalInline => {
-                canonical += 1
-            }
-        }
-    }
     tracing::info!(
-        "[gc] staged output → {new_ulid_str}: {data} data, {inline} inline, \
-         {refs} dedup-ref, {zero} zero, {delta} delta, {canonical} canonical-only \
-         ({} entries total, {} inputs)",
-        new_entries.len(),
-        inputs.len()
+        "[gc] plan emitted → {new_ulid_str}: {keep_count} keep, {zero_split_count} zero_split, \
+         {canonical_count} canonical, {run_count} run, {drop_count} drop ({} records total, \
+         {total_inputs} inputs)",
+        plan.outputs.len()
     );
 
     Ok(())
@@ -1974,11 +1107,11 @@ async fn compact_segments(
 /// Returns true if any in-flight GC handoffs exist in `gc_dir`.
 ///
 /// An in-flight handoff is either:
-/// - a `.staged` file (coordinator wrote it, volume has not yet applied), or
-/// - a bare `gc/<ulid>` file (volume applied, coordinator upload pending).
+/// - a `.plan` file (coordinator emitted it, volume has not yet materialised), or
+/// - a bare `gc/<ulid>` file (volume materialised + signed, coordinator upload pending).
 ///
 /// A new GC pass is deferred while any of these exist — the coordinator
-/// should finish the current batch before staging another.
+/// should finish the current batch before emitting another plan.
 fn has_pending_results(gc_dir: &Path) -> Result<bool> {
     if !gc_dir.exists() {
         return Ok(false);
@@ -1987,7 +1120,7 @@ fn has_pending_results(gc_dir: &Path) -> Result<bool> {
         let entry = entry.context("reading gc dir entry")?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.ends_with(".staged") {
+        if name.ends_with(".plan") {
             return Ok(true);
         }
         if !name.contains('.') && Ulid::from_string(name).is_ok() {
@@ -2136,14 +1269,14 @@ mod tests {
     }
 
     #[test]
-    fn detects_staged_result_file() {
+    fn detects_plan_result_file() {
         // `has_pending_results` returns true while any handoff is in flight:
-        // either a coordinator-staged `.staged` file or a volume-applied bare
-        // `gc/<ulid>` waiting for upload.
+        // either a coordinator-emitted `.plan` file or a volume-materialised
+        // bare `gc/<ulid>` waiting for upload.
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged"), "").unwrap();
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan"), "").unwrap();
         assert!(has_pending_results(&gc_dir).unwrap());
     }
 
@@ -2180,9 +1313,6 @@ mod tests {
         fn make(total_lba_bytes: u64, live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
-                body_section_start: 0,
-                body_section_length: 0,
-                file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
                 has_body_entries: true,
@@ -2207,9 +1337,6 @@ mod tests {
         // Verify dead_lba_bytes() is available for the ≥2 case.
         let s = SegmentStats {
             ulid_str: String::new(),
-            body_section_start: 0,
-            body_section_length: 0,
-            file_size: 1024 * 1024,
             live_lba_bytes: 800 * 1024,
             total_lba_bytes: 1024 * 1024,
             has_body_entries: true,
@@ -2229,9 +1356,6 @@ mod tests {
         fn make(live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
-                body_section_start: 0,
-                body_section_length: 0,
-                file_size: 100,
                 live_lba_bytes,
                 total_lba_bytes: 100,
                 has_body_entries: true,
@@ -2495,20 +1619,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Find the staged GC output body in gc/. Under the self-describing
-        // protocol the coordinator writes `gc/<ulid>.staged`.
+        // Find the emitted GC plan in gc/. Under the plan handoff protocol
+        // the coordinator writes `gc/<ulid>.plan` instead of a signed
+        // staged segment.
         let gc_dir = dir.join("gc");
-        let gc_body = fs::read_dir(&gc_dir)
+        let plan_path = fs::read_dir(&gc_dir)
             .unwrap()
             .flatten()
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("staged"))
-            .expect("gc/ must contain a .staged file");
-        let (_bss, _entries, inputs) = elide_core::segment::read_segment_index(&gc_body).unwrap();
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("plan"))
+            .expect("gc/ must contain a .plan file");
+        let plan = elide_core::gc_plan::GcPlan::read(&plan_path).unwrap();
 
         assert_eq!(
-            inputs, expected_inputs,
-            "gc output must list all swept source ulids in sorted order"
+            plan.inputs(),
+            expected_inputs,
+            "gc plan must list all swept source ulids in sorted order"
         );
     }
 
@@ -3305,413 +2431,6 @@ mod tests {
             vol.read(103, 1).unwrap().as_slice(),
             &child_bytes[12288..16384],
             "LBA 103 must return child_bytes[12288..16384]"
-        );
-    }
-
-    // --- fetch_live_bodies tests ---
-
-    /// Helper: build a SegmentEntry with given kind, stored_offset, stored_length,
-    /// but empty data (fetch_live_bodies will populate it).
-    fn stub_entry(kind: EntryKind, stored_offset: u64, stored_length: u32) -> SegmentEntry {
-        SegmentEntry {
-            hash: blake3::hash(&stored_offset.to_le_bytes()),
-            start_lba: 0,
-            lba_length: 1,
-            compressed: false,
-            kind,
-            stored_offset,
-            stored_length,
-            data: None,
-            delta_options: Vec::new(),
-        }
-    }
-
-    /// Put a fake segment object in the store: `body_section_start` bytes of
-    /// zeros (index prefix) followed by `body` bytes.
-    async fn put_fake_segment(
-        store: &Arc<dyn ObjectStore>,
-        volume_id: &str,
-        ulid_str: &str,
-        body_section_start: u64,
-        body: &[u8],
-    ) {
-        let key = segment_key(volume_id, ulid_str).unwrap();
-        let mut data = vec![0u8; body_section_start as usize];
-        data.extend_from_slice(body);
-        store
-            .put(&key, bytes::Bytes::from(data).into())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_no_body_entries_skips_fetch() {
-        let store = make_store();
-        // No object in store — would fail if fetch_live_bodies tried to GET.
-        let mut candidate = SegmentStats {
-            ulid_str: Ulid::from_parts(1000, 1).to_string(),
-            body_section_start: 100,
-            body_section_length: 0,
-            file_size: 200,
-            live_lba_bytes: 0,
-            total_lba_bytes: 0,
-            has_body_entries: false,
-            live_entries: vec![
-                SegmentEntry::new_zero(0, 1),
-                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1),
-            ],
-            live_entry_indices: vec![0, 1],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-        let tmp = TempDir::new().unwrap();
-        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
-            .await
-            .unwrap();
-        // No data populated (dedup_ref and zero have no body).
-        assert!(candidate.live_entries.iter().all(|e| e.data.is_none()));
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_full_get_when_waste_below_threshold() {
-        // Scenario: body section has 2 live entries that are nearly contiguous,
-        // so waste per batch is small → full-body GET is chosen.
-        let store = make_store();
-        let ulid_str = Ulid::from_parts(1000, 2).to_string();
-        let body_section_start: u64 = 256;
-
-        // Body: 8192 bytes total, two live entries of 4096 each at offsets 0 and 4096.
-        // No waste at all → full-GET path.
-        let body = vec![0xABu8; 8192];
-        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
-
-        let mut candidate = SegmentStats {
-            ulid_str: ulid_str.clone(),
-            body_section_start,
-            body_section_length: 8192,
-            file_size: body_section_start + 8192,
-            live_lba_bytes: 8192,
-            total_lba_bytes: 8192,
-            has_body_entries: true,
-            live_entries: vec![
-                stub_entry(EntryKind::Data, 0, 4096),
-                stub_entry(EntryKind::Data, 4096, 4096),
-            ],
-            live_entry_indices: vec![0, 1],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-
-        let tmp = TempDir::new().unwrap();
-        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
-            .await
-            .unwrap();
-
-        assert_eq!(candidate.live_entries[0].data.as_ref().unwrap().len(), 4096);
-        assert_eq!(candidate.live_entries[1].data.as_ref().unwrap().len(), 4096);
-        assert!(
-            candidate.live_entries[0]
-                .data
-                .as_ref()
-                .unwrap()
-                .iter()
-                .all(|&b| b == 0xAB)
-        );
-        assert!(
-            candidate.live_entries[1]
-                .data
-                .as_ref()
-                .unwrap()
-                .iter()
-                .all(|&b| b == 0xAB)
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_range_get_when_waste_above_threshold() {
-        // Scenario: body section is large (1MB), but live entries are small and
-        // separated by large dead gaps → range-GETs are chosen.
-        let store = make_store();
-        let ulid_str = Ulid::from_parts(1000, 3).to_string();
-        let body_section_start: u64 = 256;
-        let body_size: u64 = 1024 * 1024; // 1MB body section
-
-        // Fill body with position-dependent bytes so we can verify slicing.
-        let mut body = vec![0u8; body_size as usize];
-        // Live entry A: 4096 bytes at offset 0
-        for b in &mut body[0..4096] {
-            *b = 0xAA;
-        }
-        // Dead gap: offsets 4096..900_000
-        // Live entry B: 4096 bytes at offset 900_000
-        for b in &mut body[900_000..900_000 + 4096] {
-            *b = 0xBB;
-        }
-        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
-
-        let mut candidate = SegmentStats {
-            ulid_str: ulid_str.clone(),
-            body_section_start,
-            body_section_length: body_size,
-            file_size: body_section_start + body_size,
-            live_lba_bytes: 8192,
-            total_lba_bytes: body_size,
-            has_body_entries: true,
-            live_entries: vec![
-                stub_entry(EntryKind::Data, 0, 4096),
-                stub_entry(EntryKind::Data, 900_000, 4096),
-            ],
-            live_entry_indices: vec![0, 1],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-
-        // Waste = 1MB - 8192 ≈ 1MB. Two batches (entries are far apart).
-        // Waste per batch = ~512KB >> 128KB threshold → range-GETs.
-        let tmp = TempDir::new().unwrap();
-        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
-            .await
-            .unwrap();
-
-        assert_eq!(candidate.live_entries[0].data.as_ref().unwrap().len(), 4096);
-        assert_eq!(candidate.live_entries[1].data.as_ref().unwrap().len(), 4096);
-        assert!(
-            candidate.live_entries[0]
-                .data
-                .as_ref()
-                .unwrap()
-                .iter()
-                .all(|&b| b == 0xAA)
-        );
-        assert!(
-            candidate.live_entries[1]
-                .data
-                .as_ref()
-                .unwrap()
-                .iter()
-                .all(|&b| b == 0xBB)
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_coalesces_adjacent_entries() {
-        // Two adjacent entries should land in the same range-GET batch.
-        // We verify by checking that both get correct data from a large body
-        // with a big dead gap after them.
-        let store = make_store();
-        let ulid_str = Ulid::from_parts(1000, 4).to_string();
-        let body_section_start: u64 = 256;
-        let body_size: u64 = 1024 * 1024;
-
-        let mut body = vec![0u8; body_size as usize];
-        // Two adjacent entries at offset 0: 4096 + 4096 = 8192 bytes.
-        for b in &mut body[0..4096] {
-            *b = 0xCC;
-        }
-        for b in &mut body[4096..8192] {
-            *b = 0xDD;
-        }
-        // Rest is dead gap.
-        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
-
-        let mut candidate = SegmentStats {
-            ulid_str: ulid_str.clone(),
-            body_section_start,
-            body_section_length: body_size,
-            file_size: body_section_start + body_size,
-            live_lba_bytes: 8192,
-            total_lba_bytes: body_size,
-            has_body_entries: true,
-            live_entries: vec![
-                stub_entry(EntryKind::Data, 0, 4096),
-                stub_entry(EntryKind::Data, 4096, 4096),
-            ],
-            live_entry_indices: vec![0, 1],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-
-        // Waste ≈ 1MB, 1 batch (adjacent → coalesced) → waste/batch ≈ 1MB >> 128KB.
-        let tmp = TempDir::new().unwrap();
-        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            candidate.live_entries[0].data.as_deref(),
-            Some(vec![0xCCu8; 4096].as_slice())
-        );
-        assert_eq!(
-            candidate.live_entries[1].data.as_deref(),
-            Some(vec![0xDDu8; 4096].as_slice())
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_skips_dedup_ref() {
-        // DedupRef entries carry no body bytes in the thin format — they
-        // must be skipped by fetch_live_bodies entirely, regardless of
-        // their `stored_length` field. The canonical Data lives elsewhere
-        // and is fetched separately (if at all) when its own segment is
-        // in the candidate set.
-        let store = make_store();
-        let ulid_str = Ulid::from_parts(1000, 5).to_string();
-
-        let mut candidate = SegmentStats {
-            ulid_str: ulid_str.clone(),
-            body_section_start: 128,
-            body_section_length: 0,
-            file_size: 128,
-            live_lba_bytes: 4096,
-            total_lba_bytes: 4096,
-            has_body_entries: false,
-            // stored_length=0 matches the real thin-DedupRef format; the
-            // filter in fetch_live_bodies now gates on `kind == Data` so
-            // the length check is redundant but left for robustness.
-            live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 0)],
-            live_entry_indices: vec![0],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-
-        let tmp = TempDir::new().unwrap();
-        fetch_live_bodies(&mut candidate, "vol", tmp.path(), &store)
-            .await
-            .unwrap();
-
-        assert!(
-            candidate.live_entries[0].data.is_none(),
-            "DedupRef entries must not have body bytes fetched"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_reads_from_local_cache_when_fully_present() {
-        // Build a cache/<ulid>.body file with all required DATA extents and
-        // a `.present` bitmap with the matching bits set. The in-memory store
-        // is empty — if fetch_live_bodies tried to fall back to S3 it would
-        // error. The local path must serve the bodies without any S3 GETs.
-        let store = make_store();
-        let ulid_str = Ulid::from_parts(2000, 1).to_string();
-        let tmp = TempDir::new().unwrap();
-        let fork_dir = tmp.path();
-        let cache_dir = fork_dir.join("cache");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-
-        // Body layout: entry_idx 0 at offset 0 (4096 bytes of 0xEE),
-        //              entry_idx 1 at offset 4096 (4096 bytes of 0xFF).
-        let body_section_start: u64 = 512;
-        let mut body = vec![0u8; 8192];
-        body[0..4096].fill(0xEE);
-        body[4096..8192].fill(0xFF);
-        std::fs::write(cache_dir.join(format!("{ulid_str}.body")), &body).unwrap();
-
-        // Entry indices 0 and 1 in a 2-entry segment: a single byte with
-        // both low bits set.
-        std::fs::write(cache_dir.join(format!("{ulid_str}.present")), [0b0000_0011]).unwrap();
-
-        let mut candidate = SegmentStats {
-            ulid_str: ulid_str.clone(),
-            body_section_start,
-            body_section_length: 8192,
-            file_size: body_section_start + 8192,
-            live_lba_bytes: 8192,
-            total_lba_bytes: 8192,
-            has_body_entries: true,
-            live_entries: vec![
-                stub_entry(EntryKind::Data, 0, 4096),
-                stub_entry(EntryKind::Data, 4096, 4096),
-            ],
-            live_entry_indices: vec![0, 1],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-
-        fetch_live_bodies(&mut candidate, "vol", fork_dir, &store)
-            .await
-            .unwrap();
-
-        assert!(
-            candidate.live_entries[0]
-                .data
-                .as_deref()
-                .is_some_and(|d| d.iter().all(|&b| b == 0xEE))
-        );
-        assert!(
-            candidate.live_entries[1]
-                .data
-                .as_deref()
-                .is_some_and(|d| d.iter().all(|&b| b == 0xFF))
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_live_bodies_falls_back_to_s3_when_present_bit_unset() {
-        // cache/<ulid>.body exists but the `.present` bit for entry 1 is not
-        // set — a partially demand-fetched segment. fetch_live_bodies must
-        // fall through to S3 rather than serve torn bytes.
-        let store = make_store();
-        let ulid_str = Ulid::from_parts(2000, 2).to_string();
-        let tmp = TempDir::new().unwrap();
-        let fork_dir = tmp.path();
-        let cache_dir = fork_dir.join("cache");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-
-        // S3 body: byte-distinctive so we can verify it was used, not cache.
-        let body_section_start: u64 = 512;
-        let mut s3_body = vec![0u8; 8192];
-        s3_body[0..4096].fill(0x11);
-        s3_body[4096..8192].fill(0x22);
-        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &s3_body).await;
-
-        // Local cache: body bytes are *wrong* (0xDE) — present bit is unset
-        // so they must never be used. If we accidentally read from the cache,
-        // the assertions below will fail.
-        let local_body = vec![0xDEu8; 8192];
-        std::fs::write(cache_dir.join(format!("{ulid_str}.body")), &local_body).unwrap();
-        // Only entry 0 is marked present; entry 1 is missing.
-        std::fs::write(cache_dir.join(format!("{ulid_str}.present")), [0b0000_0001]).unwrap();
-
-        let mut candidate = SegmentStats {
-            ulid_str: ulid_str.clone(),
-            body_section_start,
-            body_section_length: 8192,
-            file_size: body_section_start + 8192,
-            live_lba_bytes: 8192,
-            total_lba_bytes: 8192,
-            has_body_entries: true,
-            live_entries: vec![
-                stub_entry(EntryKind::Data, 0, 4096),
-                stub_entry(EntryKind::Data, 4096, 4096),
-            ],
-            live_entry_indices: vec![0, 1],
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-
-        fetch_live_bodies(&mut candidate, "vol", fork_dir, &store)
-            .await
-            .unwrap();
-
-        // Both bodies must have come from S3, not the local cache.
-        assert!(
-            candidate.live_entries[0]
-                .data
-                .as_deref()
-                .is_some_and(|d| d.iter().all(|&b| b == 0x11))
-        );
-        assert!(
-            candidate.live_entries[1]
-                .data
-                .as_deref()
-                .is_some_and(|d| d.iter().all(|&b| b == 0x22))
         );
     }
 

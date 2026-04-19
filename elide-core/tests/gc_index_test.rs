@@ -74,8 +74,8 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     let gc_seg_path = gc_dir.join(&new_ulid_str);
     assert!(gc_seg_path.exists(), "bare gc/<new> must exist after apply");
     assert!(
-        !gc_dir.join(format!("{new_ulid_str}.staged")).exists(),
-        "apply_gc_handoffs must remove the .staged sibling"
+        !gc_dir.join(format!("{new_ulid_str}.plan")).exists(),
+        "apply_gc_handoffs must remove the .plan sibling"
     );
 
     // index/<new>.idx must NOT be present yet — only written at promote time.
@@ -178,8 +178,8 @@ fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
         "bare gc/<new> must be present after apply_gc_handoffs"
     );
     assert!(
-        !gc_dir.join(format!("{new_ulid_str}.staged")).exists(),
-        "apply_gc_handoffs must remove the .staged sibling"
+        !gc_dir.join(format!("{new_ulid_str}.plan")).exists(),
+        "apply_gc_handoffs must remove the .plan sibling"
     );
     // index/<old>.idx must still be present — not yet deleted by promote_segment.
     for old_ulid in &consumed_ulids {

@@ -200,7 +200,7 @@ pub fn populate_cache(fork_dir: &Path, ulid: Ulid, lba: u64, seed: u8) {
 fn sort_candidates(candidates: &mut [(Ulid, PathBuf)], gc_dir: &Path) {
     let is_gc = |u: &Ulid| {
         let name = u.to_string();
-        gc_dir.join(&name).exists() || gc_dir.join(format!("{name}.staged")).exists()
+        gc_dir.join(&name).exists() || gc_dir.join(format!("{name}.plan")).exists()
     };
     candidates.sort_by(|(ua, _), (ub, _)| match (is_gc(ua), is_gc(ub)) {
         (true, false) => std::cmp::Ordering::Less,
@@ -212,16 +212,15 @@ fn sort_candidates(candidates: &mut [(Ulid, PathBuf)], gc_dir: &Path) {
 /// Result of a single GC compaction pass: `(consumed_ulids, produced_ulid, paths_to_delete)`.
 pub type CompactResult = (Vec<Ulid>, Ulid, Vec<PathBuf>);
 
-/// Compact a pre-selected set of candidates using a pre-built liveness snapshot.
+/// Compact a pre-selected set of candidates using a pre-built liveness
+/// snapshot and emit a `gc/<new_ulid>.plan` file.
 ///
-/// Reads live entries from each candidate, filters them against the shared
-/// lba_map + extent_index snapshot, writes a merged output segment with
-/// `new_ulid`, and stages it as `gc/<new_ulid>.staged` with the consumed
-/// candidate ULIDs in the segment header (self-describing handoff).
+/// For each candidate entry the helper decides whether to keep it (LBA
+/// still live, or extent-canonical-and-live-hash). Kept entries become
+/// `PlanOutput::Keep` records in the plan.
 ///
 /// Returns `(consumed_ulids, new_ulid, paths_to_delete)` if the pass
-/// produced output, or if there were extent-index entries to remove.
-/// Returns `None` only if the candidates list is empty.
+/// produced output, or `None` if the candidates list is empty.
 fn compact_candidates_inner(
     fork_dir: &Path,
     candidates: Vec<(Ulid, PathBuf)>,
@@ -230,60 +229,22 @@ fn compact_candidates_inner(
     extent_index: &extentindex::ExtentIndex,
     new_ulid: Ulid,
 ) -> Option<CompactResult> {
+    use elide_core::gc_plan::{GcPlan, PlanOutput};
+
     if candidates.is_empty() {
         return None;
     }
 
     let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE).ok()?;
-
-    // The coordinator uses an ephemeral signer — it doesn't have the volume's
-    // private key. The volume re-signs the output segment with its own key
-    // inside apply_gc_handoffs, so this signature is discarded.
-    let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
-
     let gc_dir = fork_dir.join("gc");
+    let _ = fs::create_dir_all(&gc_dir);
 
-    let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
-
+    let mut outputs: Vec<PlanOutput> = Vec::new();
     for (ulid, path) in &candidates {
-        let Ok((bss_header, mut entries, _)) = segment::read_and_verify_segment_index(path, &vk)
-        else {
+        let Ok((_bss, entries, _)) = segment::read_and_verify_segment_index(path, &vk) else {
             continue;
         };
-        // For .idx files (committed segments), bodies are in cache/<ulid>.body at offset 0.
-        // For full segment files (pending/, gc/), bodies are in the same file at bss_header.
-        let is_idx = path.extension().is_some_and(|e| e == "idx");
-        let (body_path, bss) = if is_idx {
-            let ulid_str = ulid.to_string();
-            (
-                fork_dir.join("cache").join(format!("{ulid_str}.body")),
-                0u64,
-            )
-        } else {
-            (path.clone(), bss_header)
-        };
-        let inline_bytes = segment::read_inline_section(path).unwrap_or_default();
-        if segment::read_extent_bodies(&body_path, bss, &mut entries, &inline_bytes).is_err() {
-            continue;
-        }
-        // Mirror the production body-hash verify (PR #70 / commit 000d3b0):
-        // every Data/Inline body read from an input segment must hash to
-        // its declared hash before we carry it forward.  Abort the whole
-        // pass on mismatch — the real coordinator (compact_segments) and
-        // volume (apply_staged_handoff) both cancel on this, so the
-        // oracle must too or it would silently disagree on bad inputs.
-        for entry in &entries {
-            if matches!(entry.kind, EntryKind::Data | EntryKind::Inline)
-                && let Some(body) = entry.data.as_deref()
-                && segment::verify_body_hash(entry, body).is_err()
-            {
-                return None;
-            }
-        }
-        for entry in entries.drain(..) {
-            // Liveness check: keep when the LBA still maps to this hash, or
-            // when this segment is still the extent-canonical location for a
-            // hash that is referenced by an LBA somewhere.
+        for (entry_idx, entry) in entries.iter().enumerate() {
             let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = extent_index
                 .lookup(&entry.hash)
@@ -293,33 +254,33 @@ fn compact_candidates_inner(
                 _ => lba_live || (extent_live && live_hashes.contains(&entry.hash)),
             };
             if keep {
-                all_entries.push(entry);
+                outputs.push(PlanOutput::Keep {
+                    input: *ulid,
+                    entry_idx: entry_idx as u32,
+                });
             }
         }
     }
 
-    let _ = fs::create_dir_all(&gc_dir);
-
-    // Inputs list: sorted candidate ULIDs. The volume's apply path reads
-    // this from the segment header to derive the extent-index updates.
     let mut inputs: Vec<Ulid> = candidates.iter().map(|(u, _)| *u).collect();
     inputs.sort();
 
-    let tmp_path = gc_dir.join(format!("{new_ulid}.staged.tmp"));
-    let staged_path = gc_dir.join(format!("{new_ulid}.staged"));
-    if segment::write_gc_segment(
-        &tmp_path,
-        &mut all_entries,
-        &inputs,
-        ephemeral_signer.as_ref(),
-    )
-    .is_err()
-    {
-        return None;
+    // Emit a `drop` record for any input that contributed no output — the
+    // apply path still needs to walk its .idx to evict removed hashes.
+    let mut referenced: std::collections::HashSet<Ulid> =
+        outputs.iter().map(|o| o.input()).collect();
+    for input_ulid in &inputs {
+        if !referenced.contains(input_ulid) {
+            outputs.push(elide_core::gc_plan::PlanOutput::Drop { input: *input_ulid });
+            referenced.insert(*input_ulid);
+        }
     }
-    fs::rename(&tmp_path, &staged_path).ok()?;
 
-    let consumed: Vec<Ulid> = inputs.clone();
+    let plan = GcPlan { new_ulid, outputs };
+    plan.write_atomic(&gc_dir.join(format!("{new_ulid}.plan")))
+        .ok()?;
+
+    let consumed: Vec<Ulid> = inputs;
     let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
     Some((consumed, new_ulid, to_delete))
 }
