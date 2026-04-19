@@ -60,7 +60,7 @@ fn gc_cleanup_deletes_old_idx_before_evict() {
     );
 
     // GC pass.
-    let (new_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (new_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
     let (consumed_ulids, produced_ulid, _paths_to_delete) =
         common::simulate_coord_gc_local(&fork_dir, new_ulid, 2).unwrap();
     assert_eq!(produced_ulid, new_ulid);
@@ -164,7 +164,7 @@ fn apply_gc_handoffs_deletes_old_idx_atomically_with_applied_rename() {
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
 
-    let (new_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (new_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
     let (consumed_ulids, produced_ulid, _) =
         common::simulate_coord_gc_local(&fork_dir, new_ulid, 2).unwrap();
 

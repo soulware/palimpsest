@@ -534,7 +534,7 @@ proptest! {
                     // rebuild-ordering invariant in
                     // docs/design-gc-ulid-ordering.md.
                     pending_gc = None;
-                    let (gc_ulid, gc_ulid2) = vol.gc_checkpoint().unwrap();
+                    let (gc_ulid, gc_ulid2) = vol.gc_checkpoint_for_test().unwrap();
                     // Core invariant: the volume mint must have advanced past both
                     // GC ULIDs, so the next WAL flush produces a segment that sorts
                     // above them.  This is the property the pre-fix bug violated —
@@ -582,7 +582,7 @@ proptest! {
                     // See `CoordGcLocal` — one GC pass invalidates any
                     // previously-stashed `GcCheckpoint` ULIDs.
                     pending_gc = None;
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
                     // Same mint-advancement invariant as CoordGcLocal — diff against
                     // post-checkpoint state so only W_new2 (> sweep_ulid) appears.
                     let ulids_after_checkpoint = all_segment_ulids(fork_dir);
@@ -623,7 +623,7 @@ proptest! {
                     }
                 }
                 SimOp::GcCheckpoint => {
-                    let (u1, u2) = vol.gc_checkpoint().unwrap();
+                    let (u1, u2) = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some((u1, u2));
                 }
                 SimOp::GcApply { n } => {
@@ -682,7 +682,7 @@ proptest! {
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
                     // Bits 6-4 encode lba (0..7), bits 3-0 vary within the lba slot.
                     let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
-                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    let (ulid, _) = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, 16 + *lba as u64, effective_seed);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
@@ -779,7 +779,7 @@ proptest! {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
                     // pass invalidates any stashed `GcCheckpoint`.
                     pending_gc = None;
-                    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+                    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -796,7 +796,7 @@ proptest! {
                 }
                 SimOp::CoordGcLocalBoth => {
                     pending_gc = None;
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
                     let gc_result =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
                     let _ = vol.apply_gc_handoffs().unwrap_or(0);
@@ -811,7 +811,7 @@ proptest! {
                     }
                 }
                 SimOp::GcCheckpoint => {
-                    let (u1, u2) = vol.gc_checkpoint().unwrap();
+                    let (u1, u2) = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some((u1, u2));
                 }
                 SimOp::GcApply { n } => {
@@ -888,7 +888,7 @@ proptest! {
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
                     // Bits 6-4 encode lba (0..7), bits 3-0 vary within the lba slot.
                     let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
-                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    let (ulid, _) = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
                     oracle.insert(actual_lba, [effective_seed; 4096]);
                 }
@@ -980,7 +980,7 @@ proptest! {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
                     // pass invalidates any stashed `GcCheckpoint`.
                     pending_gc = None;
-                    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+                    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -997,7 +997,7 @@ proptest! {
                 }
                 SimOp::CoordGcLocalBoth => {
                     pending_gc = None;
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
                     let gc_result =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
                     let _ = vol.apply_gc_handoffs().unwrap_or(0);
@@ -1012,7 +1012,7 @@ proptest! {
                     }
                 }
                 SimOp::GcCheckpoint => {
-                    let (u1, u2) = vol.gc_checkpoint().unwrap();
+                    let (u1, u2) = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some((u1, u2));
                 }
                 SimOp::GcApply { n } => {
@@ -1071,7 +1071,7 @@ proptest! {
                     // effective_seed always has bit 7 set (128..=255) so it never
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
                     let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
-                    let (ulid, _) = vol.gc_checkpoint().unwrap();
+                    let (ulid, _) = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
                     oracle.insert(actual_lba, [effective_seed; 4096]);
                 }

@@ -44,7 +44,7 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
     common::drain_with_redact(&mut vol);
 
     // Take GC checkpoint (flushes WAL, advances mint).
-    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
 
     // Live overwrite of LBAs 0-3 *before* GC runs.
     for lba in 0u64..4 {
@@ -116,7 +116,7 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
 
     // GC checkpoint then GC pass — no overwrites yet so GC output contains
     // 0xAA for LBAs 0-3 and 0xBB for LBAs 4-7.
-    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
     let (_, _, to_delete) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)
         .expect("GC should compact the two seeded segments");
 
@@ -201,7 +201,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     common::drain_with_redact(&mut vol);
 
     // GC pass 1: compact S1+S2 into G1.
-    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
     let (_, _, to_delete) =
         common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2).expect("GC should compact S1+S2");
     let applied = vol.apply_gc_handoffs().unwrap();
@@ -222,7 +222,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
 
     // GC pass 2: gc_checkpoint flushes WAL (creates S4 with DedupRef for
     // LBA 1→H101), then GC finds nothing in index/ (no candidates).
-    let (gc_ulid2, _) = vol.gc_checkpoint().unwrap();
+    let (gc_ulid2, _) = vol.gc_checkpoint_for_test().unwrap();
     let _ = common::simulate_coord_gc_local(&fork_dir, gc_ulid2, 2);
     let _ = vol.apply_gc_handoffs();
 
@@ -234,7 +234,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     // GC pass 3: compact S3+S4.
     // Bug: S3's DATA entry is not extent-canonical (extent says H101→S4), so
     // without the lba_live fix it's dropped.  G2 only carries LBA 1→H101.
-    let (gc_ulid3, _) = vol.gc_checkpoint().unwrap();
+    let (gc_ulid3, _) = vol.gc_checkpoint_for_test().unwrap();
     let to_delete3 =
         if let Some((_, _, paths)) = common::simulate_coord_gc_local(&fork_dir, gc_ulid3, 2) {
             let applied3 = vol.apply_gc_handoffs().unwrap();
@@ -332,7 +332,7 @@ fn gc_preserves_canonical_when_only_sibling_dedup_ref_keeps_hash_alive() {
 
     // GC pass: compact the drained segment and any others. The canonical
     // DATA for H must be carried through — dropping it would break LBA 1.
-    let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
     if let Some((_, _, to_delete)) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 1) {
         vol.apply_gc_handoffs().unwrap();
         for path in &to_delete {

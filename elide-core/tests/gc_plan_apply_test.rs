@@ -57,7 +57,7 @@ fn plan_keep_two_data_entries_round_trips() {
     // Mint a fresh ULID for the new GC output (must be > all inputs so
     // rebuild ordering keeps the new entries authoritative). Use
     // `gc_checkpoint` so the volume's ULID mint advances consistently.
-    let (new_ulid, _sweep) = vol.gc_checkpoint().unwrap();
+    let (new_ulid, _sweep) = vol.gc_checkpoint_for_test().unwrap();
 
     let plan = GcPlan {
         new_ulid,
@@ -212,7 +212,7 @@ fn plan_partial_death_data_reconstructs_sub_runs() {
     // (parent_hash is still LBA-live via surviving sub-runs, so the
     // stale-liveness check requires the hash to be carried) plus two
     // `run` lines — [0..2) and [3..4).
-    let (new_ulid, _sweep) = vol.gc_checkpoint().unwrap();
+    let (new_ulid, _sweep) = vol.gc_checkpoint_for_test().unwrap();
     let plan = GcPlan {
         new_ulid,
         outputs: vec![

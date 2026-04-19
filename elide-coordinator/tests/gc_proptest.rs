@@ -358,7 +358,7 @@ proptest! {
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
 
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
 
                     let idx_before: usize = fs::read_dir(&index_dir)
                         .map(|d| d.flatten().count())
@@ -593,7 +593,7 @@ proptest! {
                     // (u_wal > u_sweep) and returns (u_repack, u_sweep) from
                     // the volume's own mint, so future WAL segments always sort
                     // above GC outputs on rebuild.
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
 
                     // Step 1: real GC compaction (no-ops if nothing to compact).
                     let _ = rt.block_on(gc_fork(
@@ -718,7 +718,7 @@ fn gc_oracle_repro_bug_h() {
     // a no-op.  The oracle read here populates the file cache with
     // (S1, is_body=false, fd→pending/S1).
     simulate_upload(&mut vol, fork_dir);
-    let (r, s) = vol.gc_checkpoint().unwrap();
+    let (r, s) = vol.gc_checkpoint_for_test().unwrap();
     let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
@@ -736,7 +736,7 @@ fn gc_oracle_repro_bug_h() {
     // .materialized segment.  Without the Bug H fix, the file cache still
     // holds the stale fd to pending/S1.
     simulate_upload(&mut vol, fork_dir);
-    let (r, s) = vol.gc_checkpoint().unwrap();
+    let (r, s) = vol.gc_checkpoint_for_test().unwrap();
     let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
@@ -794,7 +794,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
 
     // Op 2: GcSweep.
     simulate_upload(&mut vol, fork_dir);
-    let (r, s) = vol.gc_checkpoint().unwrap();
+    let (r, s) = vol.gc_checkpoint_for_test().unwrap();
     let _ = rt.block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s));
     let applied_1 = vol.apply_gc_handoffs().unwrap();
     eprintln!("apply_1 applied={applied_1}");
@@ -818,7 +818,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         "index/ before sweep 2: [{}]",
         list_dir(&index_dir).join(", ")
     );
-    let (r, s) = vol.gc_checkpoint().unwrap();
+    let (r, s) = vol.gc_checkpoint_for_test().unwrap();
     let stats_2 = rt
         .block_on(gc_fork(fork_dir, "test-vol", &store, &gc_config, r, s))
         .unwrap();
