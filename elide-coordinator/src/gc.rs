@@ -1207,15 +1207,163 @@ async fn fetch_live_bodies(
     Ok(())
 }
 
-/// Read live extent bodies from each candidate, write a compacted self-
-/// describing segment to `gc/<new-ulid>.staged` (with the consumed input
-/// ULID list embedded in the segment header — the volume's apply path
-/// derives the extent-index updates from this field, no manifest sidecar).
+/// Resolve the uncompressed body bytes for `hash` by looking up
+/// `extent_index[hash]` and reading the referenced segment.
 ///
-/// For each candidate, the full segment is downloaded from S3 to a temporary
-/// `gc/<ulid>.fetch` file. This guarantees the body is complete regardless of
-/// demand-fetch state, and keeps the fetch consistent with other full-segment
-/// files in gc/. The `.fetch` file is deleted after the body is read.
+/// Returns `Ok(None)` if `hash` is not in the index. Returns `Err` on
+/// any I/O failure (local file read, S3 range-GET). Callers propagate
+/// and abort the pass; next tick retries.
+///
+/// Resolution tiers, in order:
+/// - `loc.inline_data`: bytes already in memory (inline extents).
+/// - `BodySource::Local`: read from the full local segment file located
+///   via `segment::locate_segment_body` (covers `wal/<id>`, `pending/<id>`,
+///   and bare `gc/<id>` — all complete files the coordinator reads
+///   directly). No S3 fallback: Local means the bytes must be on disk in
+///   one of those tiers.
+/// - `BodySource::Cached(entry_idx)`: check the `.present` bit; on hit
+///   slice from `cache/<seg>.body`, on miss fall back to an S3 range-GET
+///   at `[body_section_start + body_offset,
+///   body_section_start + body_offset + body_length)`.
+///
+/// LZ4-decompresses when `loc.compressed` is set. Used by partial-death
+/// compaction of DedupRef/Delta entries, where the composite body lives
+/// in a segment other than the one being compacted.
+// Callers land in a follow-up commit that wires DedupRef/Delta partial-
+// death through expand_partial_death.
+#[allow(dead_code)]
+async fn resolve_body_by_hash(
+    hash: &blake3::Hash,
+    extent_index: &ExtentIndex,
+    fork_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(loc) = extent_index.lookup(hash) else {
+        return Ok(None);
+    };
+
+    if let Some(inline) = &loc.inline_data {
+        return Ok(Some(inline.to_vec()));
+    }
+
+    let seg_ulid = loc.segment_id.to_string();
+    let stored = read_extent_body(loc, &seg_ulid, fork_dir, volume_id, store).await?;
+
+    let body = if loc.compressed {
+        lz4_flex::decompress_size_prepended(&stored).with_context(|| {
+            format!(
+                "decompressing resolved body for hash {} from segment {seg_ulid}",
+                hash.to_hex(),
+            )
+        })?
+    } else {
+        stored
+    };
+
+    Ok(Some(body))
+}
+
+/// Read the stored (possibly compressed) bytes for a single extent.
+///
+/// Dispatches on `loc.body_source`:
+/// - `Local`: the extent lives in a complete local file (`wal/<id>`,
+///   `pending/<id>`, or bare `gc/<id>`). Locate via
+///   `segment::locate_segment_body` and seek per layout. No S3 fallback:
+///   the file is authoritative at this tier.
+/// - `Cached(entry_idx)`: the extent lives in `cache/<seg>.body` with
+///   demand-fetch semantics. Check the `.present` bit; on hit slice from
+///   the local sparse file, on miss fall back to S3 range-GET.
+#[allow(dead_code)]
+async fn read_extent_body(
+    loc: &extentindex::ExtentLocation,
+    seg_ulid: &str,
+    fork_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Vec<u8>> {
+    match loc.body_source {
+        extentindex::BodySource::Local => read_extent_body_local(loc, seg_ulid, fork_dir),
+        extentindex::BodySource::Cached(entry_idx) => {
+            read_extent_body_cached(loc, seg_ulid, entry_idx, fork_dir, volume_id, store).await
+        }
+    }
+}
+
+/// Read a `Local` extent's bytes from a complete segment file
+/// (`wal/<id>`, `pending/<id>`, or bare `gc/<id>`).
+fn read_extent_body_local(
+    loc: &extentindex::ExtentLocation,
+    seg_ulid: &str,
+    fork_dir: &Path,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (path, layout) =
+        segment::locate_segment_body(fork_dir, loc.segment_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve body for segment {seg_ulid}: body_source is Local \
+             but no wal/pending/gc file exists for this segment in {}",
+                fork_dir.display(),
+            )
+        })?;
+    let seek = layout.body_seek(loc);
+    let mut f = fs::File::open(&path)
+        .with_context(|| format!("opening local segment file {}", path.display()))?;
+    f.seek(SeekFrom::Start(seek))
+        .with_context(|| format!("seeking {} to {seek}", path.display()))?;
+    let mut buf = vec![0u8; loc.body_length as usize];
+    f.read_exact(&mut buf).with_context(|| {
+        format!(
+            "reading {} at offset {seek} length {}",
+            path.display(),
+            loc.body_length,
+        )
+    })?;
+    Ok(buf)
+}
+
+/// Read a `Cached` extent's bytes: local sparse body file if
+/// `.present` bit is set, otherwise S3 range-GET.
+async fn read_extent_body_cached(
+    loc: &extentindex::ExtentLocation,
+    seg_ulid: &str,
+    entry_idx: u32,
+    fork_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Vec<u8>> {
+    let cache_dir = fork_dir.join("cache");
+    let body_path = cache_dir.join(format!("{seg_ulid}.body"));
+    let present_path = cache_dir.join(format!("{seg_ulid}.present"));
+    if segment::check_present_bit(&present_path, entry_idx)
+        .with_context(|| format!("checking .present for {seg_ulid} entry {entry_idx}"))?
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = fs::File::open(&body_path)
+            .with_context(|| format!("opening body cache {}", body_path.display()))?;
+        f.seek(SeekFrom::Start(loc.body_offset))
+            .with_context(|| format!("seeking body cache {seg_ulid}"))?;
+        let mut buf = vec![0u8; loc.body_length as usize];
+        f.read_exact(&mut buf).with_context(|| {
+            format!(
+                "reading body cache {seg_ulid} at offset {} length {}",
+                loc.body_offset, loc.body_length,
+            )
+        })?;
+        return Ok(buf);
+    }
+
+    let key = segment_key(volume_id, seg_ulid)
+        .with_context(|| format!("building S3 key for {seg_ulid}"))?;
+    let start = (loc.body_section_start + loc.body_offset) as usize;
+    let end = start + loc.body_length as usize;
+    let bytes = store
+        .get_range(&key, start..end)
+        .await
+        .with_context(|| format!("S3 range-GET for {seg_ulid} at {start}..{end}"))?;
+    Ok(bytes.to_vec())
+}
+
 /// Expand a Data/Inline entry with partial LBA-death into:
 /// 1. `CanonicalData` / `CanonicalInline` preserving the composite body
 ///    when the hash is externally referenced (any `DedupRef.hash` or
@@ -1332,6 +1480,15 @@ fn expand_partial_death(
     Ok(())
 }
 
+/// Read live extent bodies from each candidate, write a compacted self-
+/// describing segment to `gc/<new-ulid>.staged` (with the consumed input
+/// ULID list embedded in the segment header — the volume's apply path
+/// derives the extent-index updates from this field, no manifest sidecar).
+///
+/// For each candidate, the full segment is downloaded from S3 to a temporary
+/// `gc/<ulid>.fetch` file. This guarantees the body is complete regardless of
+/// demand-fetch state, and keeps the fetch consistent with other full-segment
+/// files in gc/. The `.fetch` file is deleted after the body is read.
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
