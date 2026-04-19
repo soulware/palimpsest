@@ -1763,11 +1763,7 @@ fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
         &job.staged_path,
         bss,
         &mut entries,
-        [
-            segment::EntryKind::Data,
-            segment::EntryKind::DedupRef,
-            segment::EntryKind::Inline,
-        ],
+        segment::EntryKind::ALL_WITH_BODY,
         &handoff_inline,
     )?;
 
@@ -2094,15 +2090,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
         let total_bytes: u64 = entries
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    segment::EntryKind::Data
-                        | segment::EntryKind::Inline
-                        | segment::EntryKind::CanonicalData
-                        | segment::EntryKind::CanonicalInline
-                )
-            })
+            .filter(|e| e.kind.has_body_bytes())
             .map(|e| e.stored_length as u64)
             .sum();
 
@@ -2112,15 +2100,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
         let live_bytes: u64 = entries
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    segment::EntryKind::Data
-                        | segment::EntryKind::Inline
-                        | segment::EntryKind::CanonicalData
-                        | segment::EntryKind::CanonicalInline
-                ) && live.contains(&e.hash)
-            })
+            .filter(|e| e.kind.has_body_bytes() && live.contains(&e.hash))
             .map(|e| e.stored_length as u64)
             .sum();
 
@@ -2136,12 +2116,14 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 segment::EntryKind::DedupRef | segment::EntryKind::Delta => {
                     job.lbamap.hash_at(e.start_lba) == Some(e.hash)
                 }
-                segment::EntryKind::Data | segment::EntryKind::Inline => live.contains(&e.hash),
-                segment::EntryKind::CanonicalData | segment::EntryKind::CanonicalInline => {
-                    // Canonical-only entries carry body for dedup resolution;
-                    // kept whenever their hash is still referenced anywhere.
-                    live.contains(&e.hash)
-                }
+                // Body-bearing kinds (Data, Inline, CanonicalData,
+                // CanonicalInline): kept whenever their hash is still
+                // referenced anywhere in the volume. Canonical-only entries
+                // already have no LBA claim; non-canonical entries might
+                // have been LBA-overwritten but their body still backs a
+                // DedupRef or Delta source somewhere.
+                k if k.has_body_bytes() => live.contains(&e.hash),
+                _ => unreachable!("EntryKind::{:?} not covered in partition", e.kind),
             });
 
         let mut dead: Vec<RepackedDeadEntry> = Vec::new();
@@ -2172,12 +2154,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 seg_path,
                 body_section_start,
                 &mut live_entries,
-                [
-                    segment::EntryKind::Data,
-                    segment::EntryKind::Inline,
-                    segment::EntryKind::CanonicalData,
-                    segment::EntryKind::CanonicalInline,
-                ],
+                segment::EntryKind::ALL_WITH_BODY,
                 &inline_bytes,
             )?;
 

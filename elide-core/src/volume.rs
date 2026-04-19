@@ -1210,8 +1210,7 @@ impl Volume {
                 let Some(old_wal_offset) = old_wal_offset else {
                     continue;
                 };
-                let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline)
-                {
+                let idata = if entry.kind.is_inline() {
                     entry.data.clone().map(Vec::into_boxed_slice)
                 } else {
                     None
@@ -2125,7 +2124,7 @@ impl Volume {
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
 
         for &(hash, kind, input_ulid) in &result.input_old_entries {
-            if !matches!(kind, segment::EntryKind::Data | segment::EntryKind::Inline) {
+            if !kind.has_body_bytes() {
                 continue;
             }
             let still_at_input = self
@@ -2176,14 +2175,20 @@ impl Volume {
             if e.kind == segment::EntryKind::DedupRef {
                 continue;
             }
-            let still_at_input = self
-                .extent_index
-                .lookup(&e.hash)
-                .is_some_and(|loc| result.inputs.contains(&loc.segment_id));
-            if !still_at_input {
+            // Update for entries whose hash is at an input (carry-forward) or
+            // absent entirely (fresh hash from partial-death sub-run slicing).
+            let current = self.extent_index.lookup(&e.hash);
+            let should_update = match current {
+                None => true,
+                Some(loc) => result.inputs.contains(&loc.segment_id),
+            };
+            if !should_update {
                 continue;
             }
-            let idata = if e.kind == segment::EntryKind::Inline {
+            let idata = if matches!(
+                e.kind,
+                segment::EntryKind::Inline | segment::EntryKind::CanonicalInline
+            ) {
                 let start = e.stored_offset as usize;
                 let end = start + e.stored_length as usize;
                 if end <= result.handoff_inline.len() {
@@ -2370,7 +2375,7 @@ impl Volume {
             for e in &old_entries {
                 // Body-owning kinds only. DedupRef/Zero/Delta carry no
                 // responsibility for this segment's body cleanup.
-                if !matches!(e.kind, EntryKind::Data | EntryKind::Inline) {
+                if !e.kind.has_body_bytes() {
                     continue;
                 }
                 // Only touch entries still pointed at by the extent index.
@@ -2426,7 +2431,7 @@ impl Volume {
             staged_path,
             bss,
             &mut entries,
-            [EntryKind::Data, EntryKind::DedupRef, EntryKind::Inline],
+            EntryKind::ALL_WITH_BODY,
             &handoff_inline,
         )?;
 
@@ -2437,7 +2442,7 @@ impl Volume {
         // Cancel the whole handoff on any mismatch — safer to re-GC later
         // than to commit corrupt bytes.
         for e in &entries {
-            if matches!(e.kind, EntryKind::Data | EntryKind::Inline)
+            if e.kind.has_body_bytes()
                 && let Some(body) = e.data.as_deref()
                 && let Err(err) = segment::verify_body_hash(e, body)
             {
@@ -2461,15 +2466,21 @@ impl Volume {
             if e.kind == EntryKind::DedupRef {
                 continue;
             }
-            // Only update if still pointed at one of the inputs.
-            let still_at_input = self
-                .extent_index
-                .lookup(&e.hash)
-                .is_some_and(|loc| inputs.contains(&loc.segment_id));
-            if !still_at_input {
+            // Update for entries whose hash is at an input (standard carry-
+            // forward — move the location from input → new output) or absent
+            // entirely (fresh hash produced by partial-death compaction's
+            // sub-run slicing — insert). Skip hashes already pointed at a
+            // non-input segment: something else owns them and the
+            // coordinator's output has no authority to overwrite.
+            let current = self.extent_index.lookup(&e.hash);
+            let should_update = match current {
+                None => true,
+                Some(loc) => inputs.contains(&loc.segment_id),
+            };
+            if !should_update {
                 continue;
             }
-            let idata = if e.kind == EntryKind::Inline {
+            let idata = if matches!(e.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
                 let start = e.stored_offset as usize;
                 let end = start + e.stored_length as usize;
                 if end <= handoff_inline.len() {
@@ -2651,7 +2662,7 @@ impl Volume {
             self.evict_cached_segment(ulid);
 
             for (i, entry) in entries.iter().enumerate() {
-                if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+                if !entry.kind.has_body_bytes() {
                     continue;
                 }
                 if self
@@ -2659,7 +2670,7 @@ impl Volume {
                     .lookup(&entry.hash)
                     .is_some_and(|loc| loc.segment_id == ulid)
                 {
-                    let idata = if entry.kind == EntryKind::Inline {
+                    let idata = if entry.kind.is_inline() {
                         let start = entry.stored_offset as usize;
                         let end = start + entry.stored_length as usize;
                         if end <= inline.len() {
@@ -2778,7 +2789,7 @@ impl Volume {
         // Cheap pre-scan: is there any DATA entry whose LBA no longer maps
         // to its hash? If not, there's nothing for redact to do.
         let has_lba_dead_data = entries.iter().any(|e| {
-            e.kind == EntryKind::Data
+            e.kind.is_data()
                 && e.stored_length > 0
                 && self.lbamap.hash_at(e.start_lba) != Some(e.hash)
         });
@@ -2795,7 +2806,7 @@ impl Volume {
         let mut punched_bytes: u64 = 0;
         let mut punched_hashes: Vec<blake3::Hash> = Vec::new();
         for entry in &entries {
-            if entry.kind != EntryKind::Data || entry.stored_length == 0 {
+            if !entry.kind.is_data() || entry.stored_length == 0 {
                 continue;
             }
             let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
@@ -2960,7 +2971,7 @@ impl Volume {
                 // flush — treat it like a failed CAS and leave it alone.
                 continue;
             };
-            let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
+            let idata = if entry.kind.is_inline() {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
@@ -3503,7 +3514,7 @@ impl Volume {
             let Some(old_wal_offset) = old_wal_offset else {
                 continue;
             };
-            let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
+            let idata = if entry.kind.is_inline() {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
@@ -6727,7 +6738,7 @@ mod tests {
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let dead_entry = entries
             .iter()
-            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .find(|e| e.kind.is_data() && e.start_lba == 0)
             .expect("should have a Data entry at LBA 0");
         assert!(dead_entry.stored_length > 0);
 
@@ -6789,8 +6800,8 @@ mod tests {
         assert!(present_path.exists(), ".present must exist after promote");
         for (i, entry) in idx_entries.iter().enumerate() {
             let present = segment::check_present_bit(&present_path, i as u32).unwrap_or(false);
-            if entry.kind == EntryKind::Data {
-                assert!(present, "Data entry {i} should be marked present");
+            if entry.kind.is_data() {
+                assert!(present, "Data-shaped entry {i} should be marked present");
             } else if entry.kind == EntryKind::DedupRef {
                 assert!(!present, "DedupRef entry {i} should NOT be marked present");
             }
@@ -6937,7 +6948,7 @@ mod tests {
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
-            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .find(|e| e.kind.is_data() && e.start_lba == 0)
             .expect("should have a Data entry at LBA 0");
         assert!(data_entry.stored_length > 0);
 
@@ -6983,7 +6994,7 @@ mod tests {
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
-            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .find(|e| e.kind.is_data() && e.start_lba == 0)
             .expect("should have a Data entry at LBA 0");
         assert!(data_entry.stored_length > 0);
 

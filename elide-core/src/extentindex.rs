@@ -383,8 +383,9 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                     Err(e) => return Err(e),
                 };
 
-            // Read inline section lazily: only when at least one Inline entry exists.
-            let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+            // Read inline section lazily: only when at least one inline-kind
+            // entry exists (Inline or CanonicalInline).
+            let has_inline = entries.iter().any(|e| e.kind.is_inline());
             let inline_bytes = if has_inline {
                 segment::read_inline_section(path)?
             } else {
@@ -450,8 +451,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         continue;
                     }
                 }
-                let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline)
-                {
+                let idata = if entry.kind.is_inline() {
                     let start = entry.stored_offset as usize;
                     let end = start + entry.stored_length as usize;
                     if end <= inline_bytes.len() {

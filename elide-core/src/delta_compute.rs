@@ -352,7 +352,7 @@ fn maybe_rewrite_segment(
     }
     // Re-read inline bodies if any are present (separate pass because
     // inline bodies live in the inline section, not the body section).
-    let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+    let has_inline = entries.iter().any(|e| e.kind.is_inline());
     if has_inline {
         let inline_bytes = read_inline_section(seg_path, &entries)?;
         read_extent_bodies(
@@ -386,12 +386,12 @@ fn maybe_rewrite_segment(
 /// length comes from the header. Returned bytes are passed to
 /// `read_extent_bodies` as `inline_bytes`.
 fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<Vec<u8>> {
-    // Inline section length = sum of stored_length of Inline entries.
-    // Position = body_section_start - inline_length.
+    // Inline section length = sum of stored_length of Inline / CanonicalInline
+    // entries. Position = body_section_start - inline_length.
     let layout = segment::read_segment_layout(seg_path)?;
     let inline_length: u64 = entries
         .iter()
-        .filter(|e| e.kind == EntryKind::Inline)
+        .filter(|e| e.kind.is_inline())
         .map(|e| e.stored_length as u64)
         .sum();
     if inline_length == 0 {
@@ -617,7 +617,7 @@ pub fn rewrite_post_snapshot_with_prior(
             )));
         }
     }
-    let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+    let has_inline = entries.iter().any(|e| e.kind.is_inline());
     if has_inline {
         let inline_bytes = read_inline_section(seg_path, &entries)?;
         read_extent_bodies(

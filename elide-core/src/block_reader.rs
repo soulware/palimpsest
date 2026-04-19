@@ -606,7 +606,7 @@ fn apply_snapshot_layer(
                 }
             }
 
-            let idata = if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
+            let idata = if entry.kind.is_inline() {
                 let start = entry.stored_offset as usize;
                 let end = start + entry.stored_length as usize;
                 if end <= inline_bytes.len() {

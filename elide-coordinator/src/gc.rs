@@ -728,7 +728,9 @@ fn collect_stats(
         let (_, entries, _) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
         // Read inline section from .idx for any inline entries.
-        let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+        let has_inline = entries
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::Inline | EntryKind::CanonicalInline));
         let inline_bytes = if has_inline {
             segment::read_inline_section(&idx_path)?
         } else {
@@ -747,7 +749,7 @@ fn collect_stats(
             let entry_idx = entry_idx as u32;
             // Pre-populate inline entry data from the .idx inline section.
             // compact_segments needs this data to write the output segment.
-            if entry.kind == EntryKind::Inline {
+            if entry.kind.is_inline() {
                 let start = entry.stored_offset as usize;
                 let end = start + entry.stored_length as usize;
                 if end <= inline_bytes.len() {
@@ -782,10 +784,10 @@ fn collect_stats(
                 }
                 continue;
             }
-            // Inline entries have stored bytes in the inline section (part of
-            // .idx, not S3 body). They do not contribute to physical_body_bytes
-            // but do participate in liveness like DATA entries.
-            if entry.kind != EntryKind::Inline {
+            // Inline/CanonicalInline entries have stored bytes in the inline
+            // section (part of .idx, not S3 body). They do not contribute to
+            // physical_body_bytes but do participate in liveness.
+            if !entry.kind.is_inline() {
                 physical_body_bytes += entry.stored_length as u64;
             }
             // DedupRef entries carry no body bytes (thin format: stored_length=0)
@@ -1018,7 +1020,7 @@ async fn fetch_live_bodies(
         .live_entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.kind == EntryKind::Data && e.stored_length > 0)
+        .filter(|(_, e)| e.kind.is_data() && e.stored_length > 0)
         .map(|(i, _)| i)
         .collect();
 
@@ -1199,7 +1201,7 @@ async fn compact_segments(
         // it would corrupt the compacted output and, once inputs are dropped,
         // any surviving LBA that resolves to this hash.
         for entry in &candidate.live_entries {
-            if matches!(entry.kind, EntryKind::Data | EntryKind::Inline)
+            if entry.kind.has_body_bytes()
                 && let Some(bytes) = entry.data.as_deref()
             {
                 segment::verify_body_hash(entry, bytes).with_context(|| {

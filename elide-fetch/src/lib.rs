@@ -40,7 +40,7 @@ use s3::region::Region;
 use serde::Deserialize;
 use ulid::Ulid;
 
-use elide_core::segment::{self, EntryKind, SegmentFetcher};
+use elide_core::segment::{self, SegmentFetcher};
 use elide_core::signing;
 
 // --- config ---
@@ -390,7 +390,10 @@ fn fetch_one_extent(
         entries[start].stored_offset + entries[start].stored_length as u64;
     for i in (start + 1)..entries.len() {
         let e = &entries[i];
-        if e.kind == EntryKind::DedupRef || e.kind == EntryKind::Inline {
+        // Only Data / CanonicalData entries carry body bytes addressable
+        // via stored_offset into the body section. DedupRef is thin;
+        // Inline / CanonicalInline live in the inline section.
+        if !e.kind.is_data() {
             break;
         }
         if e.stored_offset != next_expected_offset {

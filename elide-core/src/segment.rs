@@ -313,10 +313,44 @@ impl EntryKind {
         EntryKind::DedupRef,
         EntryKind::CanonicalData,
     ];
+    /// All four body-bearing kinds. Use with `read_extent_bodies` when you
+    /// need to populate `entry.data` for every entry that carries body
+    /// bytes — e.g. re-signing a staged GC output, reading inputs for
+    /// compaction.
+    pub const ALL_WITH_BODY: [EntryKind; 4] = [
+        EntryKind::Data,
+        EntryKind::Inline,
+        EntryKind::CanonicalData,
+        EntryKind::CanonicalInline,
+    ];
 
     /// True for entries that carry no LBA claim on rebuild.
     pub fn is_canonical_only(self) -> bool {
         matches!(self, EntryKind::CanonicalData | EntryKind::CanonicalInline)
+    }
+
+    /// True for entries whose body bytes live in the body section — `Data`
+    /// and its canonical-only demotion `CanonicalData`. Use this predicate
+    /// at any site that handles "a data-shaped entry," regardless of
+    /// whether it still claims an LBA.
+    pub fn is_data(self) -> bool {
+        matches!(self, EntryKind::Data | EntryKind::CanonicalData)
+    }
+
+    /// True for entries whose body bytes live in the inline section —
+    /// `Inline` and its canonical-only demotion `CanonicalInline`. Use
+    /// this predicate at any site that handles "an inline-shaped entry,"
+    /// regardless of LBA-claim status.
+    pub fn is_inline(self) -> bool {
+        matches!(self, EntryKind::Inline | EntryKind::CanonicalInline)
+    }
+
+    /// True for entries that carry body bytes (in either the body section
+    /// or the inline section): `Data`, `Inline`, `CanonicalData`,
+    /// `CanonicalInline`. Excludes `DedupRef`, `Zero`, and `Delta`, which
+    /// carry no body bytes of their own.
+    pub fn has_body_bytes(self) -> bool {
+        self.is_data() || self.is_inline()
     }
 }
 
@@ -607,7 +641,7 @@ pub fn write_segment_full(
 
     // Inline section.
     for entry in entries.iter() {
-        if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline)
+        if entry.kind.is_inline()
             && let Some(data) = &entry.data
         {
             w.write_all(data)?;
@@ -1240,7 +1274,7 @@ pub fn read_extent_bodies(
         if !kinds.contains(&entry.kind) {
             continue;
         }
-        if matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
+        if entry.kind.is_inline() {
             let start = entry.stored_offset as usize;
             let end = start + entry.stored_length as usize;
             if end <= inline_bytes.len() {
@@ -1509,9 +1543,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             .open(&body_tmp)?;
         dst.set_len(body_length)?;
         for entry in &entries {
-            if !matches!(entry.kind, EntryKind::Data | EntryKind::CanonicalData)
-                || entry.stored_length == 0
-            {
+            if !entry.kind.is_data() || entry.stored_length == 0 {
                 continue;
             }
             src.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
@@ -1559,7 +1591,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     let bitset_len = (entry_count as usize).div_ceil(8);
     let mut bitset = vec![0u8; bitset_len];
     for (i, entry) in entries.iter().enumerate() {
-        if entry.kind == EntryKind::Data {
+        if entry.kind.is_data() {
             bitset[i / 8] |= 1 << (i % 8);
         }
     }
