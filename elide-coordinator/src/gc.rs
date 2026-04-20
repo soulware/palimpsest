@@ -1077,7 +1077,7 @@ fn collect_stats(
                         render_runs(d),
                     );
                 }
-                tracing::info!(
+                tracing::debug!(
                     "[gc {ulid_str}] body-owning entries classified dead ({} of {}): {}",
                     healthy.len(),
                     dead_diag.len(),
