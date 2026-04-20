@@ -388,7 +388,7 @@ pub async fn run_volume_tasks(
                     );
                 }
                 Ok(gc::GcStats {
-                    strategy: gc::GcStrategy::None,
+                    strategy: gc::GcStrategy::None(reason),
                     total_segments,
                     dead_cleaned,
                     ..
@@ -397,7 +397,16 @@ pub async fn run_volume_tasks(
                         gc_was_active = true;
                         info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
                     }
-                    if gc_was_active && dead_cleaned == 0 {
+                    // Only the NoCandidates reason reflects a real idle-pass
+                    // result. NoIndex and PendingHandoffs are transient bail-outs
+                    // that do not advance the active→idle state — another tick
+                    // will re-evaluate once the bail condition clears. The
+                    // "volume applied" / "completed N handoff(s)" logs already
+                    // cover PendingHandoffs visibility.
+                    if matches!(reason, gc::NoneReason::NoCandidates)
+                        && gc_was_active
+                        && dead_cleaned == 0
+                    {
                         info!(
                             "[gc {volume_id}] idle — {total_segments} segment(s), \
                              all at or above density threshold ({:.2})",

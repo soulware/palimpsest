@@ -384,7 +384,7 @@ proptest! {
                     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
 
                     if let Ok(stats) = gc_stats
-                        && stats.strategy != GcStrategy::None
+                        && !matches!(stats.strategy, GcStrategy::None(_))
                     {
                         // After GC, index/ should have ≤1 .idx file from
                         // the compacted set, plus any segments that
