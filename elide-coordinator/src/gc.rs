@@ -95,14 +95,32 @@ const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_LIVE_CAP / 2;
 /// Which GC strategy was executed.
 #[derive(Debug, PartialEq)]
 pub enum GcStrategy {
-    /// No candidates found; nothing done.
-    None,
+    /// No work done this pass; see [`NoneReason`] for why.
+    None(NoneReason),
     /// Repacked the single least-dense segment.
     Repack,
     /// Swept multiple small segments into one.
     Sweep,
     /// Both repack and sweep ran in the same tick.
     Both,
+}
+
+/// Why a pass returned without compacting any segment.
+///
+/// Distinguishes the three early-exit paths so the coordinator can log
+/// them differently: `NoIndex` / `PendingHandoffs` are transient bail-outs
+/// where `total_segments` is not a real count, while `NoCandidates` is
+/// the genuine "all at or above density threshold" idle.
+#[derive(Debug, PartialEq)]
+pub enum NoneReason {
+    /// `index/` dir does not exist yet (volume has no segments).
+    NoIndex,
+    /// A prior pass's `.plan` or bare handoff has not cleared yet;
+    /// `gc_fork` bails before `collect_stats` runs.
+    PendingHandoffs,
+    /// Density and sweep passes ran; no segment met the selection
+    /// criteria. `total_segments` is the real count here.
+    NoCandidates,
 }
 
 /// Results from one GC pass.
@@ -123,9 +141,9 @@ pub struct GcStats {
 }
 
 impl GcStats {
-    fn none(total_segments: usize) -> Self {
+    fn none(reason: NoneReason, total_segments: usize) -> Self {
         Self {
-            strategy: GcStrategy::None,
+            strategy: GcStrategy::None(reason),
             candidates: 0,
             bytes_freed: 0,
             dead_cleaned: 0,
@@ -138,7 +156,9 @@ impl GcStats {
 /// Run one GC pass for a single fork.
 ///
 /// Both repack and sweep run in the same tick if both find candidates.
-/// Returns `GcStrategy::None` if neither finds candidates.
+/// Returns `GcStrategy::None(reason)` if neither finds candidates; the
+/// reason distinguishes genuine idle (`NoCandidates`) from transient
+/// bail-outs (`NoIndex`, `PendingHandoffs`).
 ///
 /// `repack_ulid` and `sweep_ulid` are the output segment names for each
 /// strategy.  Both must be pre-resolved via `gc_checkpoint` IPC before
@@ -159,12 +179,12 @@ pub fn gc_fork(
 ) -> Result<GcStats> {
     let index_dir = fork_dir.join("index");
     if !index_dir.exists() {
-        return Ok(GcStats::none(0));
+        return Ok(GcStats::none(NoneReason::NoIndex, 0));
     }
 
     let gc_dir = fork_dir.join("gc");
     if has_pending_results(&gc_dir)? {
-        return Ok(GcStats::none(0));
+        return Ok(GcStats::none(NoneReason::PendingHandoffs, 0));
     }
 
     // Clean up any stale .fetch files left by a coordinator crash mid-compaction.
@@ -377,10 +397,10 @@ pub fn gc_fork(
 
     match (ran_repack, ran_sweep) {
         (false, None) if dead_count == 0 && deferred_count == 0 => {
-            Ok(GcStats::none(total_segments))
+            Ok(GcStats::none(NoneReason::NoCandidates, total_segments))
         }
         (false, None) => Ok(GcStats {
-            strategy: GcStrategy::None,
+            strategy: GcStrategy::None(NoneReason::NoCandidates),
             candidates: 0,
             bytes_freed: 0,
             dead_cleaned: dead_count,
@@ -953,39 +973,117 @@ fn collect_stats(
 
         if !dead_diag.is_empty() {
             use std::fmt::Write as _;
-            let mut rendered = String::new();
-            for (i, d) in dead_diag.iter().enumerate() {
-                if i > 0 {
-                    rendered.push_str("; ");
+
+            // An entry is "anomalous" if its per-LBA lbamap view contains
+            // something that shouldn't happen for a cleanly-dead entry:
+            //   - `None`: gap in the lbamap for a range the entry claimed
+            //     (rebuild bug or missing replay)
+            //   - `Some(h) == entry.hash`: classification said dead but the
+            //     LBA still maps to this hash (classification bug)
+            // Healthy cases (ZERO_HASH replacement, single or multiple
+            // replacement hashes) render at debug with RLE-collapsed runs.
+            let is_anomalous = |d: &DeadEntry| {
+                d.per_lba.iter().any(|(_, h)| match h {
+                    None => true,
+                    Some(h) => *h == d.hash,
+                })
+            };
+
+            let render_runs = |d: &DeadEntry| -> String {
+                let mut out = String::new();
+                let mut iter = d.per_lba.iter().peekable();
+                while let Some((_, head)) = iter.next() {
+                    let mut count: u64 = 1;
+                    while let Some((_, next)) = iter.peek() {
+                        if *next == *head {
+                            iter.next();
+                            count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !out.is_empty() {
+                        out.push(',');
+                    }
+                    match head {
+                        Some(h) => {
+                            let _ = write!(out, "{count}×{}", h.to_hex());
+                        }
+                        None => {
+                            let _ = write!(out, "{count}×None");
+                        }
+                    }
                 }
-                let _ = write!(
-                    rendered,
-                    "hash={} lba={}+{} lbamap=[",
-                    d.hash.to_hex(),
-                    d.start_lba,
-                    d.lba_length
-                );
+                out
+            };
+
+            let render_per_lba = |d: &DeadEntry| -> String {
+                let mut out = String::new();
                 for (j, (lba, h)) in d.per_lba.iter().enumerate() {
                     if j > 0 {
-                        rendered.push(',');
+                        out.push(',');
                     }
                     match h {
                         Some(h) => {
-                            let _ = write!(rendered, "{lba}={}", h.to_hex());
+                            let _ = write!(out, "{lba}={}", h.to_hex());
                         }
                         None => {
-                            let _ = write!(rendered, "{lba}=None");
+                            let _ = write!(out, "{lba}=None");
                         }
                     }
                 }
-                rendered.push(']');
+                out
+            };
+
+            let (anomalous, healthy): (Vec<&DeadEntry>, Vec<&DeadEntry>) =
+                dead_diag.iter().partition(|d| is_anomalous(d));
+
+            if !anomalous.is_empty() {
+                let mut rendered = String::new();
+                for (i, d) in anomalous.iter().enumerate() {
+                    if i > 0 {
+                        rendered.push_str("; ");
+                    }
+                    let _ = write!(
+                        rendered,
+                        "hash={} lba={}+{} lbamap=[{}]",
+                        d.hash.to_hex(),
+                        d.start_lba,
+                        d.lba_length,
+                        render_per_lba(d),
+                    );
+                }
+                tracing::info!(
+                    "[gc {ulid_str}] body-owning entries classified dead with anomalous lbamap \
+                     ({} of {}): {}",
+                    anomalous.len(),
+                    dead_diag.len(),
+                    rendered,
+                );
             }
-            tracing::info!(
-                "[gc {ulid_str}] body-owning entries classified dead (first {}, \
-                 showing the coordinator's lbamap at each claimed LBA): {}",
-                dead_diag.len(),
-                rendered,
-            );
+
+            if !healthy.is_empty() {
+                let mut rendered = String::new();
+                for (i, d) in healthy.iter().enumerate() {
+                    if i > 0 {
+                        rendered.push_str("; ");
+                    }
+                    let _ = write!(
+                        rendered,
+                        "hash={} lba={}+{} → {}",
+                        d.hash.to_hex(),
+                        d.start_lba,
+                        d.lba_length,
+                        render_runs(d),
+                    );
+                }
+                tracing::debug!(
+                    "[gc {ulid_str}] body-owning entries classified dead ({} of {}): {}",
+                    healthy.len(),
+                    dead_diag.len(),
+                    rendered,
+                );
+            }
         }
 
         result.push(SegmentStats {
