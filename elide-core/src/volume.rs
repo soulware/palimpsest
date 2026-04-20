@@ -310,6 +310,14 @@ pub struct AncestorLayer {
     pub branch_ulid: Option<String>,
 }
 
+/// On-disk WAL state: file handle, ULID, and path. Present iff a WAL file
+/// exists under `wal/<ulid>`. Absent between promotes / on idle volumes.
+struct OpenWal {
+    wal: writelog::WriteLog,
+    ulid: Ulid,
+    path: PathBuf,
+}
+
 /// A writable block-device volume backed by a content-addressable store.
 ///
 /// Owns the in-memory LBA map, the active WAL, and the directory layout.
@@ -325,9 +333,10 @@ pub struct Volume {
     lock_file: nix::fcntl::Flock<fs::File>,
     lbamap: Arc<lbamap::LbaMap>,
     extent_index: Arc<extentindex::ExtentIndex>,
-    wal: writelog::WriteLog,
-    wal_ulid: Ulid,
-    wal_path: PathBuf,
+    /// Lazy WAL state. `None` means no WAL file exists on disk — the next
+    /// write opens a fresh one at `mint.next()`. Keeps idle volumes from
+    /// churning the WAL on every GC tick.
+    wal: Option<OpenWal>,
     /// DATA and REF extents written since the last promotion; used to write
     /// the clean segment file on the next promote().
     pending_entries: Vec<segment::SegmentEntry>,
@@ -405,20 +414,25 @@ pub struct PromoteResult {
     pub pre_promote_offsets: Vec<Option<u64>>,
 }
 
-/// The four ULIDs needed for a GC checkpoint, minted atomically in order.
+/// The three ULIDs needed for a GC checkpoint, minted atomically in order.
 ///
-/// Ordering invariant: `u_repack < u_sweep < u_flush < u_wal`.  All four
-/// come from the volume's own monotonic mint (never from an external
-/// clock), and `UlidMint` guarantees strict monotonicity even within the
-/// same millisecond.  Minting all four up front — before any I/O — is
-/// what makes the ordering self-documenting and crash-safe: the WAL
-/// segment flushed at `u_flush` is guaranteed > `u_sweep`, so rebuild
-/// applies the GC output before the flushed WAL segment.
+/// Ordering invariant: `u_repack < u_sweep < u_flush`.  All three come
+/// from the volume's own monotonic mint (never from an external clock),
+/// and `UlidMint` guarantees strict monotonicity even within the same
+/// millisecond.  Minting all three up front — before any I/O — is what
+/// makes the ordering self-documenting and crash-safe: the WAL segment
+/// flushed at `u_flush` is guaranteed > `u_sweep`, so rebuild applies
+/// the GC output before the flushed WAL segment.
+///
+/// No `u_wal` is pre-minted for the *next* WAL. Any future `mint.next()`
+/// that opens a WAL is monotonically > `u_flush > u_sweep > u_repack` by
+/// construction, so the "new WAL above GC output" invariant holds
+/// without reservation. Deferring WAL open to first-write is what avoids
+/// per-tick WAL churn on idle volumes.
 struct GcCheckpointUlids {
     u_repack: Ulid,
     u_sweep: Ulid,
     u_flush: Ulid,
-    u_wal: Ulid,
 }
 
 /// Result of the GC checkpoint prep phase.
@@ -1281,12 +1295,16 @@ impl Volume {
 
         // recover_wal does the single WAL scan: truncates any partial tail,
         // replays records into the LBA map, and rebuilds pending_entries.
-        let (wal, wal_ulid, wal_path, pending_entries) =
-            if let Some(path) = wal_files.into_iter().last() {
-                recover_wal(path, &mut lbamap, &mut extent_index)?
-            } else {
-                create_fresh_wal(&wal_dir, mint.next())?
-            };
+        // When no WAL file is present on disk, leave `wal` as None; the next
+        // write lazily opens a fresh WAL. This avoids creating an empty WAL
+        // for read-only volumes and idle sessions that never write.
+        let (wal, pending_entries) = if let Some(path) = wal_files.into_iter().last() {
+            let (wal, ulid, path, pending_entries) =
+                recover_wal(path, &mut lbamap, &mut extent_index)?;
+            (Some(OpenWal { wal, ulid, path }), pending_entries)
+        } else {
+            (None, Vec::new())
+        };
 
         let has_new_segments = !pending_entries.is_empty()
             || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
@@ -1298,8 +1316,6 @@ impl Volume {
             lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
             wal,
-            wal_ulid,
-            wal_path,
             pending_entries,
             has_new_segments,
             last_segment_ulid,
@@ -1407,7 +1423,9 @@ impl Volume {
         // instead of a DATA record. No body bytes in the WAL — reads resolve
         // through the extent index to the canonical segment's body.
         if self.extent_index.lookup(&hash).is_some() {
-            self.wal.append_ref(lba, lba_length, &hash)?;
+            self.ensure_wal_open()?
+                .wal
+                .append_ref(lba, lba_length, &hash)?;
             Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
             // Do NOT update extent_index — the canonical entry already points
             // to the segment with the body bytes. DedupRef entries carry no
@@ -1423,16 +1441,20 @@ impl Volume {
             segment::SegmentFlags::empty()
         };
 
-        let body_offset = self
-            .wal
-            .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
+        let (body_offset, wal_ulid) = {
+            let open = self.ensure_wal_open()?;
+            let offset = open
+                .wal
+                .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
+            (offset, open.ulid)
+        };
         Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
         Arc::make_mut(&mut self.extent_index).insert(
             hash,
             extentindex::ExtentLocation {
-                segment_id: self.wal_ulid,
+                segment_id: wal_ulid,
                 body_offset,
                 body_length: owned_data.len() as u32,
                 compressed,
@@ -1448,6 +1470,20 @@ impl Volume {
         Ok(())
     }
 
+    /// Open the WAL if it is currently absent. Mints a fresh ULID from
+    /// `self.mint` — always monotonically above any prior segment or
+    /// checkpoint ULID, preserving the "new WAL above GC output" invariant
+    /// without needing a reserved `u_wal` in `GcCheckpointUlids`.
+    fn ensure_wal_open(&mut self) -> io::Result<&mut OpenWal> {
+        if self.wal.is_none() {
+            let ulid = self.mint.next();
+            let (wal, ulid, path, _) = create_fresh_wal(&self.base_dir.join("wal"), ulid)?;
+            self.wal = Some(OpenWal { wal, ulid, path });
+        }
+        // ensure_wal_open just populated self.wal if it was None.
+        Ok(self.wal.as_mut().expect("wal open"))
+    }
+
     /// Zero `lba_count` blocks starting at `lba`.
     ///
     /// Appends a single ZERO WAL record covering the entire range — no hashing,
@@ -1459,7 +1495,9 @@ impl Volume {
     /// LBA map masks any data at those LBAs in ancestor segments, unlike an
     /// unwritten LBA range which falls through to the ancestor.
     pub fn write_zeroes(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
-        self.wal.append_zero(start_lba, lba_count)?;
+        self.ensure_wal_open()?
+            .wal
+            .append_zero(start_lba, lba_count)?;
         Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH);
         self.pending_entries
             .push(segment::SegmentEntry::new_zero(start_lba, lba_count));
@@ -1500,9 +1538,12 @@ impl Volume {
         )
     }
 
-    /// Flush buffered WAL writes and fsync to disk.
+    /// Flush buffered WAL writes and fsync to disk. No-op when no WAL is open.
     pub fn fsync(&mut self) -> io::Result<()> {
-        self.wal.fsync()
+        match self.wal.as_mut() {
+            Some(open) => open.wal.fsync(),
+            None => Ok(()),
+        }
     }
 
     /// No-op skip counters. See `docs/design-noop-write-skip.md`.
@@ -1992,47 +2033,38 @@ impl Volume {
 
     /// Inline, test-only variant of the GC checkpoint.
     ///
-    /// Mints the four ULIDs (`u_repack < u_sweep < u_flush < u_wal`), flushes
-    /// the current WAL to `pending/<u_flush>`, and opens a fresh WAL at
-    /// `u_wal` — all synchronously on the caller's thread.  Returns
-    /// `(u_repack, u_sweep)`.
+    /// Mints the three ULIDs (`u_repack < u_sweep < u_flush`) and flushes
+    /// the current WAL to `pending/<u_flush>` synchronously on the caller's
+    /// thread.  Returns `(u_repack, u_sweep)`.  The post-flush WAL is left
+    /// unopened — the next write lazily opens a fresh one (see `Volume::wal`).
     ///
     /// **Production uses [`Volume::prepare_gc_checkpoint`] instead**, which
     /// splits mint+rotate (actor thread) from the old-WAL fsync (worker
     /// thread) so writes aren't blocked.  This method keeps both on one
     /// thread for tests that want a synchronous checkpoint without spinning
-    /// up the actor machinery.  See [`GcCheckpointUlids`] for why the four
+    /// up the actor machinery.  See [`GcCheckpointUlids`] for why the three
     /// ULIDs are minted before any I/O.
     pub fn gc_checkpoint_for_test(&mut self) -> io::Result<(Ulid, Ulid)> {
         let GcCheckpointUlids {
             u_repack,
             u_sweep,
             u_flush,
-            u_wal,
         } = self.mint_gc_checkpoint_ulids();
-        // Flush the current WAL to pending/ under u_flush.  If the WAL is
-        // empty, the file is deleted and u_flush is unused (no segment produced).
+        // Flush the current WAL to pending/ under u_flush. If the WAL is
+        // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
-        // Open a new WAL with u_wal > u_flush.
-        let (wal, wal_ulid, wal_path, pending_entries) =
-            create_fresh_wal(&self.base_dir.join("wal"), u_wal)?;
-        self.wal = wal;
-        self.wal_ulid = wal_ulid;
-        self.wal_path = wal_path;
-        self.pending_entries = pending_entries;
         Ok((u_repack, u_sweep))
     }
 
-    /// Mint the four ULIDs for a GC checkpoint, in ordering-invariant order.
+    /// Mint the three ULIDs for a GC checkpoint, in ordering-invariant order.
     ///
-    /// See [`GcCheckpointUlids`] for the ordering invariant and why all four
+    /// See [`GcCheckpointUlids`] for the ordering invariant and why all three
     /// are minted before any I/O.
     fn mint_gc_checkpoint_ulids(&mut self) -> GcCheckpointUlids {
         GcCheckpointUlids {
             u_repack: self.mint.next(),
             u_sweep: self.mint.next(),
             u_flush: self.mint.next(),
-            u_wal: self.mint.next(),
         }
     }
 
@@ -2819,9 +2851,10 @@ impl Volume {
         self.file_cache.borrow_mut().evict(segment_id);
     }
 
-    /// Does NOT open a new WAL — the caller is responsible for that.
+    /// Flush the current WAL to a fresh `pending/<segment_ulid>` and leave
+    /// the volume in a no-WAL state. The next write lazily opens a new WAL.
     fn flush_wal_to_pending(&mut self) -> io::Result<()> {
-        // Mint a fresh segment ULID distinct from `self.wal_ulid` so
+        // Mint a fresh segment ULID distinct from the old WAL's ULID so
         // `wal/<old_wal_ulid>` and `pending/<segment_ulid>` never collide
         // on the same path. With a shared ULID, a stale cold-cache reader
         // that loaded the pre-promote snapshot could look up the old WAL
@@ -2829,9 +2862,9 @@ impl Volume {
         // offsets as if they were segment-relative — silent wrong bytes.
         // A distinct segment ULID turns that cold-cache race into NotFound.
         //
-        // Wastes one mint when the WAL is empty (the early return below
-        // skips the segment write). The mint is cheap and monotonic; the
-        // extra advance is harmless.
+        // Wastes one mint when the WAL is empty or absent (the early return
+        // below skips the segment write). The mint is cheap and monotonic;
+        // the extra advance is harmless.
         let segment_ulid = self.mint.next();
         self.flush_wal_to_pending_as(segment_ulid)
     }
@@ -2845,10 +2878,16 @@ impl Volume {
     ///
     /// The WAL file itself retains its original name (the WAL ULID) — only the
     /// output segment in `pending/` receives `segment_ulid`.
+    ///
+    /// Leaves `self.wal = None` on success — the next write lazily opens a
+    /// fresh WAL. No-op when no WAL is currently open.
     fn flush_wal_to_pending_as(&mut self, segment_ulid: Ulid) -> io::Result<()> {
-        self.wal.fsync()?;
+        let Some(mut open) = self.wal.take() else {
+            return Ok(());
+        };
+        open.wal.fsync()?;
         if self.pending_entries.is_empty() {
-            fs::remove_file(&self.wal_path)?;
+            fs::remove_file(&open.path)?;
             return Ok(());
         }
         self.has_new_segments = true;
@@ -2865,7 +2904,8 @@ impl Volume {
         // can interpose between snapshot and apply — the CAS always succeeds.
         // The machinery is wired in now so the upcoming off-actor apply phase
         // inherits the correct precondition check.
-        let old_wal_ulid = self.wal_ulid;
+        let old_wal_ulid = open.ulid;
+        let old_wal_path = open.path;
         let pre_promote_offsets: Vec<Option<u64>> = self
             .pending_entries
             .iter()
@@ -2963,7 +3003,7 @@ impl Volume {
         // holds the pre-promote snapshot either finds `wal/<old_wal_ulid>`
         // at its expected path (before this unlink) or gets NotFound (after)
         // — never a silent read of wrong bytes through `pending/<same_ulid>`.
-        fs::remove_file(&self.wal_path)?;
+        fs::remove_file(&old_wal_path)?;
         // Evict any cached fd for the deleted WAL so subsequent lookups of
         // `old_wal_ulid` re-open rather than reuse a handle to the deleted
         // inode. The cache is keyed by the path that was open, so we pass
@@ -2972,17 +3012,10 @@ impl Volume {
         Ok(())
     }
 
-    /// Promote the current WAL to a pending segment, then open a fresh WAL.
+    /// Promote the current WAL to a pending segment. The next write lazily
+    /// opens a fresh WAL via `ensure_wal_open`.
     fn promote(&mut self) -> io::Result<()> {
-        self.flush_wal_to_pending()?;
-        // Create the fresh WAL. If this fails the segment is safe in pending/
-        // and will be found on the next startup rebuild.
-        let (wal, wal_ulid, wal_path, _) =
-            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
-        self.wal = wal;
-        self.wal_ulid = wal_ulid;
-        self.wal_path = wal_path;
-        Ok(())
+        self.flush_wal_to_pending()
     }
 
     /// In-process checkpoint of the fork at the current point in the
@@ -3010,16 +3043,11 @@ impl Volume {
         self.flush_wal_to_pending()?;
 
         // If no new segments have been committed since the last snapshot, reuse
-        // the existing snapshot ULID rather than writing a new marker.
+        // the existing snapshot ULID rather than writing a new marker. The WAL
+        // stays closed — the next write lazily opens a fresh one.
         if !self.has_new_segments
             && let Some(latest_str) = latest_snapshot(&self.base_dir)?
         {
-            let (wal, wal_ulid, wal_path, pending_entries) =
-                create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
-            self.wal = wal;
-            self.wal_ulid = wal_ulid;
-            self.wal_path = wal_path;
-            self.pending_entries = pending_entries;
             return Ok(latest_str);
         }
 
@@ -3041,7 +3069,9 @@ impl Volume {
         {
             let mut own_segments: std::collections::HashSet<Ulid> =
                 std::collections::HashSet::new();
-            own_segments.insert(self.wal_ulid);
+            if let Some(open) = self.wal.as_ref() {
+                own_segments.insert(open.ulid);
+            }
             for entry in fs::read_dir(self.base_dir.join("pending"))?.flatten() {
                 if let Some(s) = entry.file_name().to_str()
                     && !s.contains('.')
@@ -3130,14 +3160,8 @@ impl Volume {
         fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
         self.has_new_segments = false;
 
-        // Open a fresh WAL to continue writing.
-        let (wal, wal_ulid, wal_path, pending_entries) =
-            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
-        self.wal = wal;
-        self.wal_ulid = wal_ulid;
-        self.wal_path = wal_path;
-        self.pending_entries = pending_entries;
-
+        // The WAL was closed by `flush_wal_to_pending` above. The next write
+        // lazily opens a fresh one.
         Ok(snap_ulid)
     }
 
@@ -3344,7 +3368,9 @@ impl Volume {
     /// The check is separated from `write()` so that writes are always fast
     /// (WAL append only) and the promotion cost is never borne by the write caller.
     pub fn needs_promote(&self) -> bool {
-        self.wal.size() >= FLUSH_THRESHOLD
+        self.wal
+            .as_ref()
+            .is_some_and(|o| o.wal.size() >= FLUSH_THRESHOLD)
     }
 
     pub fn promote_for_test(&mut self) -> io::Result<()> {
@@ -3355,22 +3381,26 @@ impl Volume {
     // Off-actor promote: prep + apply
     // ------------------------------------------------------------------
 
-    /// Fsync the WAL without promoting.
+    /// Fsync the WAL without promoting. No-op when no WAL is open.
     ///
     /// Used by the actor's `Flush` handler to satisfy the NBD durability
     /// contract without blocking on segment serialization.
     pub fn wal_fsync(&mut self) -> io::Result<()> {
-        self.wal.fsync()
+        match self.wal.as_mut() {
+            Some(open) => open.wal.fsync(),
+            None => Ok(()),
+        }
     }
 
     /// Prep phase of the off-actor promote.  Runs on the actor thread.
     ///
-    /// Fsyncs the WAL, snapshots CAS precondition tokens, takes ownership
-    /// of `pending_entries`, mints a fresh segment ULID, and opens a new
-    /// WAL.  Returns `None` if the WAL is empty (nothing to promote).
+    /// Takes the current WAL, snapshots CAS precondition tokens, takes
+    /// ownership of `pending_entries`, and mints a fresh segment ULID.
+    /// Returns `None` if the WAL is empty or absent (nothing to promote).
     ///
-    /// After this call the volume is ready to accept new writes on the
-    /// fresh WAL.  The returned [`PromoteJob`] is sent to the worker
+    /// After this call the volume's `wal` is `None`. The next write will
+    /// lazily open a fresh WAL via `ensure_wal_open`; writes resume
+    /// immediately. The returned [`PromoteJob`] is sent to the worker
     /// thread for the heavy segment-write work.
     pub fn prepare_promote(&mut self) -> io::Result<Option<PromoteJob>> {
         if self.pending_entries.is_empty() {
@@ -3385,8 +3415,13 @@ impl Volume {
         // durability contract while letting the actor keep processing
         // writes in the meantime.
 
-        let old_wal_ulid = self.wal_ulid;
-        let old_wal_path = self.wal_path.clone();
+        // pending_entries non-empty implies wal is Some (write path only
+        // ever appends entries after opening the WAL).
+        let open = self.wal.take().ok_or_else(|| {
+            io::Error::other("internal: pending_entries non-empty but wal absent")
+        })?;
+        let old_wal_ulid = open.ulid;
+        let old_wal_path = open.path;
 
         // Snapshot CAS tokens before write_and_commit rewrites stored_offset.
         let pre_promote_offsets: Vec<Option<u64>> = self
@@ -3406,13 +3441,6 @@ impl Volume {
         let entries = std::mem::take(&mut self.pending_entries);
         let segment_ulid = self.mint.next();
         let pending_dir = self.base_dir.join("pending");
-
-        // Open fresh WAL — new writes start flowing immediately.
-        let (wal, wal_ulid, wal_path, _) =
-            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
-        self.wal = wal;
-        self.wal_ulid = wal_ulid;
-        self.wal_path = wal_path;
 
         Ok(Some(PromoteJob {
             segment_ulid,
@@ -3514,11 +3542,12 @@ impl Volume {
 
     /// Prep phase of the off-actor GC checkpoint.
     ///
-    /// Mints four ULIDs (`u_repack < u_sweep < u_flush < u_wal`),
-    /// snapshots CAS tokens, takes entries, builds a [`PromoteJob`]
-    /// using `u_flush` as the segment ULID, and opens a fresh WAL at
-    /// `u_wal`.  Writes resume immediately on the fresh WAL — no
-    /// deferral needed.
+    /// Mints three ULIDs (`u_repack < u_sweep < u_flush`), snapshots CAS
+    /// tokens, takes entries, and builds a [`PromoteJob`] using `u_flush`
+    /// as the segment ULID. No fresh WAL is opened here — the next write
+    /// lazily opens one at `mint.next()`, which is guaranteed >
+    /// `u_flush > u_sweep > u_repack` by monotonicity. This avoids
+    /// churning a new empty WAL file on every idle GC tick.
     ///
     /// The old WAL's `fsync()` is deferred to the worker thread (see
     /// `execute_promote`), identical to the write-path promote offload.
@@ -3526,31 +3555,27 @@ impl Volume {
     /// the caller of `GcCheckpoint` still observes a durable old WAL
     /// before acting on `(u_repack, u_sweep)`.
     ///
-    /// Returns `job: None` when the WAL was empty (no segment to promote).
-    /// The checkpoint completes immediately in that case — an empty WAL is
-    /// just a MAGIC header with no records to fsync before the file is
-    /// deleted and replaced at `u_wal`.
+    /// Returns `job: None` when the WAL was empty or absent (no segment
+    /// to promote). The checkpoint completes immediately in that case.
     ///
-    /// Always mints ULIDs and rotates the WAL. An earlier Idle short-circuit
-    /// (cfcb132) was reverted because the coordinator's per-tick
-    /// `promote_wal` IPC empties `pending_entries` before this call, which
-    /// would make the Idle check fire on every tick under active writes and
-    /// silently disable GC.
+    /// Always mints ULIDs. An earlier Idle short-circuit (cfcb132) was
+    /// reverted because the coordinator's per-tick `promote_wal` IPC
+    /// empties `pending_entries` before this call, which would make the
+    /// Idle check fire on every tick under active writes and silently
+    /// disable GC. We still run GC on every tick; we only stop creating
+    /// a new WAL file when there is nothing to promote.
     pub fn prepare_gc_checkpoint(&mut self) -> io::Result<GcCheckpointPrep> {
         let GcCheckpointUlids {
             u_repack,
             u_sweep,
             u_flush,
-            u_wal,
         } = self.mint_gc_checkpoint_ulids();
 
         if self.pending_entries.is_empty() {
-            // Empty WAL — delete the WAL file, open fresh WAL at u_wal.
-            fs::remove_file(&self.wal_path)?;
-            let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"), u_wal)?;
-            self.wal = wal;
-            self.wal_ulid = wal_ulid;
-            self.wal_path = wal_path;
+            // Empty or absent WAL — delete any lingering file, leave wal None.
+            if let Some(open) = self.wal.take() {
+                fs::remove_file(&open.path)?;
+            }
             return Ok(GcCheckpointPrep {
                 u_repack,
                 u_sweep,
@@ -3559,8 +3584,13 @@ impl Volume {
             });
         }
 
-        let old_wal_ulid = self.wal_ulid;
-        let old_wal_path = self.wal_path.clone();
+        // pending_entries non-empty implies wal is Some (write path only
+        // ever appends entries after opening the WAL).
+        let open = self.wal.take().ok_or_else(|| {
+            io::Error::other("internal: pending_entries non-empty but wal absent")
+        })?;
+        let old_wal_ulid = open.ulid;
+        let old_wal_path = open.path;
 
         let pre_promote_offsets: Vec<Option<u64>> = self
             .pending_entries
@@ -3578,12 +3608,6 @@ impl Volume {
 
         let entries = std::mem::take(&mut self.pending_entries);
         let pending_dir = self.base_dir.join("pending");
-
-        // Open fresh WAL at u_wal — writes resume immediately.
-        let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"), u_wal)?;
-        self.wal = wal;
-        self.wal_ulid = wal_ulid;
-        self.wal_path = wal_path;
 
         Ok(GcCheckpointPrep {
             u_repack,
@@ -5397,14 +5421,25 @@ mod tests {
             "expected at least one promoted segment in pending/"
         );
 
-        // A fresh WAL should have been created.
+        // After promotion the WAL is left closed — the next write lazily
+        // opens a fresh one. wal/ should therefore be empty until we write
+        // again.
+        let wal_count = fs::read_dir(base.join("wal"))
+            .unwrap()
+            .filter(|e| e.is_ok())
+            .count();
+        assert_eq!(
+            wal_count, 0,
+            "expected no WAL file after promotion (lazy open)"
+        );
+        vol.write(0, &vec![0xAB; 4096]).unwrap();
         let wal_count = fs::read_dir(base.join("wal"))
             .unwrap()
             .filter(|e| e.is_ok())
             .count();
         assert_eq!(
             wal_count, 1,
-            "expected exactly one WAL file after promotion"
+            "expected exactly one WAL file after first post-promote write"
         );
 
         fs::remove_dir_all(base).unwrap();

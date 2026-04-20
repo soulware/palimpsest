@@ -42,7 +42,7 @@ Callers that need data in `pending/` before proceeding (the coordinator's snapsh
 
 The segment file reused the WAL's ULID (`segment_ulid == self.wal_ulid`). `find_segment_in_dirs` searches `wal/` before `pending/`, so during the promote window stale readers found the WAL file at its original path. After the delete, stale readers with cached fds continued reading via the deleted inode (Linux keeps it alive); stale readers without a cached fd fell through to `pending/<same_ulid>` and could read **wrong bytes** because their extent index entries still held WAL-relative offsets. **This was a latent race**, fixed by the fresh-ULID change in Landing 2.
 
-`gc_checkpoint` was the one existing caller that already broke the WAL-ULID-reuse convention: it pre-minted `u_repack < u_sweep < u_flush < u_wal` from the mint, called `flush_wal_to_pending_as(u_flush)` (so the segment landed at `pending/<u_flush>`, not at the WAL's original ULID), then opened a fresh WAL with `u_wal > u_flush`. The offload inherited this pattern and extended it to the common case.
+`gc_checkpoint` was the one existing caller that already broke the WAL-ULID-reuse convention: it pre-mints `u_repack < u_sweep < u_flush` from the mint and calls `flush_wal_to_pending_as(u_flush)` so the segment lands at `pending/<u_flush>`, not at the WAL's original ULID. The offload inherited this pattern and extended it to the common case. No `u_wal` is reserved — the post-checkpoint WAL is opened lazily on the next write (see "Lazy WAL" below).
 
 ## Current flow
 
@@ -169,23 +169,23 @@ This preserves NBD's FLUSH contract — every write ack'd before the flush is du
 
 ### Sequencing: gc_checkpoint through the flusher
 
-`gc_checkpoint` opens a fresh WAL immediately — writes never pause. The reply is parked until the GC promote lands on disk.
+`gc_checkpoint` leaves the WAL closed after flushing — the next write lazily opens a fresh WAL via `ensure_wal_open`. Writes never pause; the reply is parked until the GC promote lands on disk.
 
 When `GcCheckpoint` arrives:
 
 1. If `parked_gc` is already `Some`, return an error (concurrent GC checkpoint).
 2. Call `Volume::prepare_gc_checkpoint()`:
-   a. Mint `u_repack`, `u_sweep`, `u_flush`, `u_wal` in order.
-   b. If `pending_entries` is empty: delete the old WAL, open fresh WAL at `u_wal`, return `GcCheckpointPrep { job: None }`. No fsync — an empty WAL is just a MAGIC header being deleted.
-   c. Otherwise: snapshot entries and CAS tokens, open fresh WAL at `u_wal` (writes resume immediately), return `GcCheckpointPrep { job: Some(PromoteJob { segment_ulid: u_flush, .. }) }`. The old WAL's `fsync()` runs on the worker as the first step of `execute_promote`, identical to the write-path promote — the parked GC reply won't resolve until the worker finishes, so the coordinator still observes a durable old WAL before acting on `(u_repack, u_sweep)`.
+   a. Mint `u_repack`, `u_sweep`, `u_flush` in order.
+   b. If `pending_entries` is empty: delete any lingering WAL file, leave `self.wal = None`, return `GcCheckpointPrep { job: None }`. No fsync — an empty WAL is just a MAGIC header being deleted.
+   c. Otherwise: take ownership of the open WAL and `pending_entries`, snapshot CAS tokens, return `GcCheckpointPrep { job: Some(PromoteJob { segment_ulid: u_flush, .. }) }` with `self.wal = None`. The old WAL's `fsync()` runs on the worker as the first step of `execute_promote`, identical to the write-path promote — the parked GC reply won't resolve until the worker finishes, so the coordinator still observes a durable old WAL before acting on `(u_repack, u_sweep)`.
 3. If `job` is `Some`: dispatch to flusher, park the reply in `parked_gc`.
 4. If `job` is `None`: `publish_snapshot()`, send `Ok((u_repack, u_sweep))` immediately.
 
 On `PromoteComplete` for `u_flush`: the actor applies the promote, publishes the snapshot, takes the parked reply, and sends `Ok((u_repack, u_sweep))`.
 
-The key simplification relative to the original plan: there is **no drain-before-GC gate** and **no deferred-write queue**. The fresh WAL at `u_wal` is opened atomically during `prepare_gc_checkpoint`, so writes flow onto it immediately while the GC promote runs concurrently on the flusher. The ULID ordering invariant holds because all four GC ULIDs are minted before the fresh WAL's ULID, and the fresh WAL is `u_wal` itself: `(existing_segments) < u_repack < u_sweep < u_flush < u_wal ≤ (fresh_wal_segments)`.
+The key simplification relative to the original plan: there is **no drain-before-GC gate** and **no deferred-write queue**. Writes that arrive after the checkpoint call `ensure_wal_open`, which mints a fresh ULID from the monotonic mint and opens a new WAL file. Because the mint is strictly monotonic, that ULID is always > `u_flush` > `u_sweep` > `u_repack`, so the ordering invariant holds without pre-reserving a fourth `u_wal`: `(existing_segments) < u_repack < u_sweep < u_flush < (next_write_wal_ulid)`.
 
-This works because the coordinator's post-condition is simply "pending/<u_flush> is on disk and (u_repack, u_sweep) are returned." The parked reply ensures that. Writes that land on the fresh WAL at `u_wal` sort above all four GC ULIDs — they are invisible to the GC pass by construction.
+This works because the coordinator's post-condition is simply "pending/<u_flush> is on disk and (u_repack, u_sweep) are returned." The parked reply ensures that. Writes that land on the freshly-opened lazy WAL sort above all three GC ULIDs — they are invisible to the GC pass by construction. And an idle volume that sees many consecutive GC ticks with no intervening writes never opens a WAL at all, eliminating per-tick WAL churn.
 
 #### Concurrent GcCheckpoint is an error
 
@@ -208,12 +208,12 @@ Under the offload, each promote advances the mint by:
 
 | Context | Mint advances |
 |---|---|
-| Write-path / idle-tick promote | 2 (`segment_ulid`, `new_wal_ulid`) |
-| `gc_checkpoint` promote | 4 (`u_repack`, `u_sweep`, `u_flush`, `u_wal`) — unchanged from before |
+| Write-path / idle-tick promote | 1 (`segment_ulid`) — plus 1 more when the next write calls `ensure_wal_open` |
+| `gc_checkpoint` promote | 3 (`u_repack`, `u_sweep`, `u_flush`) — plus 1 more when the next write calls `ensure_wal_open` |
 
 All minting is single-threaded on the actor. Even with multiple promotes in flight, the segment ULIDs are minted in dispatch order and form a strict sequence. The flusher never mints.
 
-`GcCheckpoint` mints its four ULIDs during `prepare_gc_checkpoint`. Because the mint is monotonic and all minting is single-threaded, the four ULIDs sort above every previously minted segment ULID. The GC ULID-ordering invariant is preserved: `(existing_segments) < u_repack < u_sweep < u_flush < u_wal < (fresh_wal_segments)`.
+`GcCheckpoint` mints its three ULIDs during `prepare_gc_checkpoint`. Because the mint is monotonic and all minting is single-threaded, the three ULIDs sort above every previously minted segment ULID. Any subsequent `ensure_wal_open` mints a ULID strictly above `u_flush`. The GC ULID-ordering invariant is preserved: `(existing_segments) < u_repack < u_sweep < u_flush < (next_write_wal_ulid)`.
 
 ## Recovery semantics
 
@@ -288,7 +288,7 @@ Every crash window either loses no data or leaks a duplicate segment that sweep 
 - **Commit marker file linking `old_wal_ulid → segment_ulid`.** A sidecar file (e.g. `pending/<segment_ulid>.from-<old_wal_ulid>`) fsynced before the segment rename would let recovery detect the "flusher succeeded, apply crashed" case without duplicating the segment. **Rejected for the first landing** — the duplicate-segment leak is rare, sweep cleans it up, and adding a new on-disk format shape should not be conflated with the offload change. Can be added later if the leak shows up in benchmarks or production.
 - **Rename-based link** (e.g. staged name renamed to final by the apply phase). Same tradeoff as the sidecar marker. No clear win.
 - **Recover multiple WALs by in-memory merge without promoting them.** Keeps the old WAL files around after recovery, referenced by extent_index at WAL-relative offsets. Avoids the duplicate-segment issue but leaves the volume in a multi-WAL state that violates the "one active WAL" invariant and complicates the actor's mental model. Rejected.
-- **Drain-before-GC and deferred-write queue.** The original plan proposed that `gc_checkpoint` wait for all in-flight promotes to drain, then defer writes until its own promote completed (no active WAL during the GC window). **Rejected during implementation** — the simpler design of opening the fresh WAL at `u_wal` immediately achieves the same ULID-ordering guarantee without deferring writes or draining the flusher queue. The coordinator's post-condition ("pending/<u_flush> on disk") is satisfied by the parked reply; writes on the fresh WAL sort above all GC ULIDs by construction.
+- **Drain-before-GC and deferred-write queue.** The original plan proposed that `gc_checkpoint` wait for all in-flight promotes to drain, then defer writes until its own promote completed (no active WAL during the GC window). **Rejected during implementation** — the simpler design of leaving the WAL closed post-checkpoint (next write lazily opens a fresh one at `mint.next()`) achieves the same ULID-ordering guarantee without deferring writes or draining the flusher queue. The coordinator's post-condition ("pending/<u_flush> on disk") is satisfied by the parked reply; writes on the freshly-opened lazy WAL sort above all GC ULIDs by construction.
 
 ## Apply-phase correctness
 

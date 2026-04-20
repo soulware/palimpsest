@@ -583,7 +583,7 @@ proptest! {
                     simulate_upload(&mut vol, fork_dir);
 
                     // gc_checkpoint flushes the WAL under a pre-minted ULID
-                    // (u_wal > u_sweep) and returns (u_repack, u_sweep) from
+                    // (u_flush > u_sweep) and returns (u_repack, u_sweep) from
                     // the volume's own mint, so future WAL segments always sort
                     // above GC outputs on rebuild.
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();

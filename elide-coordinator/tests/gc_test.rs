@@ -620,7 +620,7 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
 ///
 /// Without the fix: rebuild applies old_wal_ulid first (lba=0→D2), then
 /// u_sweep (lba=0→D1), so u_sweep wins → D1 (stale).
-/// With the fix (pre-mint u_wal): the WAL is flushed under u_wal > u_sweep,
+/// With the fix (pre-mint u_flush): the WAL is flushed under u_flush > u_sweep,
 /// so it sorts after the GC output and wins → D2 (correct).
 #[test]
 fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
@@ -677,8 +677,8 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
     // old_wal_ulid < u_sweep.  Any subsequent drain puts both in segments/
     // with inverted ordering; on crash-recovery rebuild u_sweep wins → D1.
     //
-    // With the fix: gc_checkpoint pre-mints u_repack < u_sweep < u_wal, then
-    // flushes the WAL under u_wal.  After drain and crash, u_wal > u_sweep so
+    // With the fix: gc_checkpoint pre-mints u_repack < u_sweep < u_flush, then
+    // flushes the WAL under u_flush.  After drain and crash, u_flush > u_sweep so
     // the WAL segment wins → D2.
     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
 

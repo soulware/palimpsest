@@ -882,8 +882,9 @@ mod tests {
 
         let node = collect_node(&vol_dir, &by_id_dir).unwrap();
         assert!(node.is_live);
-        assert_eq!(node.wal_files.len(), 1);
-        assert_eq!(node.wal_files[0].record_count, 0);
+        // Lazy WAL: a fresh, never-written volume has no WAL file on disk.
+        // The next write will open one.
+        assert_eq!(node.wal_files.len(), 0);
 
         fs::remove_dir_all(tmp).unwrap();
     }

@@ -101,8 +101,8 @@ Each entry below has a named deterministic regression test; see the listed file 
 
 - Bug A: DEDUP_REF-only input segments were never deleted (no handoff line named them). Fix in the manifest era: emit a `Dead` line for every consumed input. Under the self-describing protocol every input ULID is in the new segment's header so this class of bug cannot recur.
 - Bug B: a write between `gc_checkpoint()` and `apply_gc_handoffs()` could revive a hash GC had marked dead, and `apply_gc_handoffs` would then remove the now-live hash. Fix: re-check `lba_referenced_hashes()` inside `apply_gc_handoffs` and cancel the pass if any not-carried hash is live.
-- Bug C: `gc_checkpoint` did not open a new WAL when the existing WAL was empty, so its ULID stayed below the freshly-minted GC output ULIDs. Fix: always open a new WAL after minting.
-- Bug D: `gc_checkpoint` flushed a non-empty WAL under its old (pre-mint) ULID. Fix: pre-mint `u_repack`, `u_sweep`, `u_wal` before any I/O and flush the WAL under `u_wal`.
+- Bug C: `gc_checkpoint` did not open a new WAL when the existing WAL was empty, so its ULID stayed below the freshly-minted GC output ULIDs. Superseded by the lazy-WAL design: on idle, `gc_checkpoint` deletes the empty WAL file and leaves the volume in a no-WAL state; the next write opens a fresh WAL at `mint.next()` (monotonically above the GC output ULIDs), so no reserved `u_wal` is needed.
+- Bug D: `gc_checkpoint` flushed a non-empty WAL under its old (pre-mint) ULID. Fix: pre-mint `u_repack`, `u_sweep`, `u_flush` before any I/O and flush the WAL under `u_flush`.
 - Bug E: on restart, the extent index was rebuilt from on-disk `.idx` files which still pointed at old segments, leaving the system stale once `apply_done_handoffs` removed them. Fix in the manifest era: re-apply `.applied` handoffs on restart. Under the self-describing protocol the bare `gc/<new>` body is picked up by `collect_gc_applied_segment_files` during rebuild and feeds the extent index at low priority — so the bug is resolved structurally and no explicit re-apply is needed.
 - GC compactor converted DEDUP_REF entries to DATA entries with `stored_length=0`, producing a zero-length body record that caused EIO on rebuild. Fix: check `is_dedup_ref` and emit `new_dedup_ref` in the coordinator GC path. This bug was invisible to `elide-core`'s proptest because the test helper was a *separate reimplementation* of GC that happened to handle DEDUP_REFs correctly — which is why `gc_proptest.rs` exists in the coordinator crate, calling the real code.
 
@@ -153,7 +153,7 @@ The test seeds two segments, then runs a reader thread (500 read-all iterations)
 Two TLA+ models checked with TLC:
 
 - `specs/HandoffProtocol.tla` — GC handoff protocol.
-- `specs/GCCheckpointOrdering.tla` — `u_repack < u_sweep < u_wal < new_wal_ulid` ordering invariant enforced by the three-ULID pre-mint in `gc_checkpoint`.
+- `specs/GCCheckpointOrdering.tla` — `u_repack < u_sweep < u_flush < next_write_wal_ulid` ordering invariant enforced by the three-ULID pre-mint in `gc_checkpoint`. The post-checkpoint WAL is opened lazily on the next write; its ULID comes from the monotonic mint so it automatically exceeds `u_flush`.
 - `specs/WorkerOffload.tla` — actor ↔ worker offload protocol. Models the prep/middle/apply three-phase shape every offloaded maintenance op shares (sweep, repack, delta_repack, promote, gc_handoff, sign_snapshot_manifest) using one canonical op. Checks the CAS-loser survival invariant that proptest cannot cover (a single-threaded test cannot interleave a write between prep and apply on the same actor), and the post-crash no-permanent-park invariant that is structurally invisible to proptest (the actor is dropped along with its parked slots).
 
 ### HandoffProtocol

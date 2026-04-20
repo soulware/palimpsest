@@ -15,8 +15,11 @@ Date: 2026-03-30
 > input ULID list carried in the segment header. The ULID ordering
 > invariants this document records are unchanged: GC outputs still get
 > `max(inputs).increment()` and `gc_checkpoint` still pre-mints
-> `(u_repack, u_sweep, u_wal)` in one shot for crash-recovery
-> correctness.
+> `(u_repack, u_sweep, u_flush)` in one shot for crash-recovery
+> correctness. The post-checkpoint WAL is opened lazily on the next
+> write rather than pre-minted as a fourth `u_wal`, because
+> `mint.next()` is strictly monotonic — any future mint is already
+> above `u_flush`, so no reservation is needed.
 
 ---
 
