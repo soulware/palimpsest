@@ -2370,6 +2370,7 @@ mod tests {
             source_hash: parent_hash,
             delta_offset: 0,
             delta_length: delta_blob.len() as u32,
+            delta_hash: blake3::hash(&delta_blob),
         };
         let mut delta_entries = vec![SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])];
         write_segment_with_delta_body(

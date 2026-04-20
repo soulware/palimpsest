@@ -927,6 +927,7 @@ mod tests {
             source_hash: blake3::hash(b"x"),
             delta_offset: 0,
             delta_length: 0,
+            delta_hash: blake3::hash(b""),
         }
     }
 }

@@ -280,11 +280,18 @@ All entry kinds (DATA, DEDUP_REF, ZERO, INLINE, and DELTA) use the same 64-byte 
 Per entry with deltas:
   entry_index     (4 bytes)  — index of the base entry (u32 le)
   delta_count     (1 byte)   — number of delta options (≥1)
-  per delta option (45 bytes):
+  per delta option (77 bytes):
     source_hash   (32 bytes) — BLAKE3 hash of the source extent
     option_flags  (1 byte)   — bit 0: FLAG_DELTA_INLINE (reserved)
     delta_offset  (8 bytes)  — byte offset within delta body section (u64 le)
     delta_length  (4 bytes)  — byte length in delta body (u32 le)
+    delta_hash    (32 bytes) — BLAKE3 hash of the compressed delta blob;
+                               authenticates the delta bytes at
+                               [delta_offset, delta_offset + delta_length)
+                               (the delta body section is outside the segment
+                               signature, so each option's delta_hash is the
+                               sole authentication of its blob, verified on
+                               demand-fetch before the blob is cached)
 ```
 
 The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64) - inputs_length`.

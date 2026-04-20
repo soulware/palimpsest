@@ -100,6 +100,7 @@ fn delta_entry_end_to_end_decompression() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
     };
     let mut delta_entries = vec![SegmentEntry::new_delta(
         child_hash,
@@ -179,6 +180,7 @@ fn delta_entry_roundtrip_from_drained_cache() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
     };
     let mut delta_entries = vec![SegmentEntry::new_delta(
         child_hash,
@@ -278,6 +280,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
     };
     let mut delta_entries = vec![SegmentEntry::new_delta(
         child_hash,
@@ -432,6 +435,7 @@ fn block_reader_read_block_dispatches_to_delta() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
     };
     let mut delta_entries = vec![SegmentEntry::new_delta(
         child_hash,

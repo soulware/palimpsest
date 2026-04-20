@@ -826,11 +826,13 @@ mod tests {
                 source_hash: source_a,
                 delta_offset: 0,
                 delta_length: 16,
+                delta_hash: blake3::hash(b"blob-a"),
             },
             DeltaOption {
                 source_hash: source_b,
                 delta_offset: 16,
                 delta_length: 16,
+                delta_hash: blake3::hash(b"blob-b"),
             },
         ];
 

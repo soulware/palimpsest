@@ -423,6 +423,32 @@ fn fetch_one_extent(
         let key = segment_key(volume_id, segment_id)?;
         match store.get_range(&key, range_start, range_end) {
             Ok(bytes) => {
+                // Hash-verify every entry in the batch before touching disk.
+                // The .idx is signed and authentic, so each entry's declared
+                // hash is trusted; the bytes we just pulled from the store
+                // are not. A mismatch here means either the remote object is
+                // tampered/corrupt or the range slice is wrong — in either
+                // case the batch is rejected and we try the next ancestor.
+                if bytes.len() as u64 != range_end - range_start {
+                    return Err(io::Error::other(format!(
+                        "short range-GET for {segment_id}: expected {} bytes, got {}",
+                        range_end - range_start,
+                        bytes.len(),
+                    )));
+                }
+                for (i, e) in entries.iter().enumerate().take(batch_last + 1).skip(start) {
+                    let rel = (e.stored_offset - batch_body_start) as usize;
+                    let len = e.stored_length as usize;
+                    let slice = bytes.get(rel..rel + len).ok_or_else(|| {
+                        io::Error::other(format!(
+                            "entry {i} out of batch bounds while verifying {segment_id}"
+                        ))
+                    })?;
+                    segment::verify_body_hash(e, slice).map_err(|err| {
+                        io::Error::new(err.kind(), format!("demand-fetch {segment_id}[{i}]: {err}"))
+                    })?;
+                }
+
                 std::fs::create_dir_all(body_dir)?;
 
                 // Durability ordering: write .body bytes and fsync them before
@@ -526,10 +552,47 @@ fn fetch_one_delta_body(
     let range_start = layout.body_section_start + layout.body_length;
     let range_end = range_start + layout.delta_length as u64;
 
+    // Read the signed .idx so each delta option's authentic `delta_hash`
+    // is available for verifying the bytes we pull from the remote store.
+    let (_, entries, _) = segment::read_segment_index(&idx_path)?;
+
     for (volume_id, _) in chain.iter().rev() {
         let key = segment_key(volume_id, segment_id)?;
         match store.get_range(&key, range_start, range_end) {
             Ok(bytes) => {
+                if bytes.len() as u64 != range_end - range_start {
+                    return Err(io::Error::other(format!(
+                        "short range-GET for delta body {segment_id}: expected {} bytes, got {}",
+                        range_end - range_start,
+                        bytes.len(),
+                    )));
+                }
+                // Verify every delta option's blob against its signed
+                // `delta_hash`. The delta body section is outside the
+                // segment signature, so the hash in each option is the
+                // only authentication. A mismatch means tamper or
+                // corruption in the remote object — refuse the batch.
+                for (i, e) in entries.iter().enumerate() {
+                    for (j, opt) in e.delta_options.iter().enumerate() {
+                        let start = opt.delta_offset as usize;
+                        let end = start + opt.delta_length as usize;
+                        let slice = bytes.get(start..end).ok_or_else(|| {
+                            io::Error::other(format!(
+                                "delta option {segment_id}[{i}][{j}] out of bounds \
+                                 (offset {start}, length {}) for delta body of {} bytes",
+                                opt.delta_length,
+                                bytes.len(),
+                            ))
+                        })?;
+                        segment::verify_delta_blob_hash(opt, slice).map_err(|err| {
+                            io::Error::new(
+                                err.kind(),
+                                format!("demand-fetch delta {segment_id}[{i}][{j}]: {err}"),
+                            )
+                        })?;
+                    }
+                }
+
                 std::fs::create_dir_all(body_dir)?;
                 let tmp_path = body_dir.join(format!("{segment_id}.delta.tmp"));
                 {
@@ -833,6 +896,195 @@ mod tests {
         assert!(
             check_present_bit(&present_path, 1).unwrap(),
             "bit 1 still set"
+        );
+    }
+
+    /// Tampered body bytes in the remote store fail per-entry hash verification
+    /// at fetch time: no `.body` is written and no present bits are set.
+    #[test]
+    fn fetch_extent_rejects_tampered_body() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+
+        let data0 = vec![0x55u8; 4096];
+        let h0 = blake3::hash(&data0);
+        let mut entries = vec![SegmentEntry::new_data(
+            h0,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data0.clone(),
+        )];
+        let seg_path = tmp.path().join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let mut full_bytes = std::fs::read(&seg_path).unwrap();
+
+        // Write the signed .idx — the signed section is authentic.
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        // Flip a byte inside the body section. Bodies are not covered by the
+        // segment signature, so the .idx is still valid — only per-entry hash
+        // verification catches this.
+        let body_byte = bss as usize + entries[0].stored_offset as usize + 17;
+        full_bytes[body_byte] ^= 0xFF;
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
+
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store_dir.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
+        };
+        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
+
+        let err = fetcher
+            .fetch_extent(
+                seg_ulid,
+                &index_dir,
+                &cache_dir,
+                &segment::ExtentFetch {
+                    body_section_start: bss,
+                    body_offset: entries[0].stored_offset,
+                    body_length: entries[0].stored_length,
+                    entry_idx: 0,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("demand-fetch"),
+            "error should identify the source: {err}"
+        );
+
+        // The .body file must NOT exist and no present bit may be set.
+        assert!(
+            !cache_dir.join(format!("{seg_id}.body")).exists(),
+            ".body must not be written on hash mismatch"
+        );
+        let present_path = cache_dir.join(format!("{seg_id}.present"));
+        if present_path.exists() {
+            assert!(
+                !check_present_bit(&present_path, 0).unwrap(),
+                "bit 0 must not be set when verification fails"
+            );
+        }
+    }
+
+    /// A tampered delta blob in the remote store fails per-option hash
+    /// verification at delta-body fetch time: no `.delta` is written.
+    #[test]
+    fn fetch_delta_body_rejects_tampered_blob() {
+        use elide_core::segment::{DeltaOption, SegmentEntry, write_segment_with_delta_body};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+
+        // One Delta entry with one option. The delta blob is 256 bytes; we
+        // record its hash in the option, build the segment, then tamper the
+        // blob in the stored object.
+        let delta_blob = vec![0x77u8; 256];
+        let delta_hash = blake3::hash(&delta_blob);
+        let option = DeltaOption {
+            source_hash: blake3::hash(b"source"),
+            delta_offset: 0,
+            delta_length: delta_blob.len() as u32,
+            delta_hash,
+        };
+        let reconstructed_hash = blake3::hash(b"reconstructed-content");
+        let mut entries = vec![SegmentEntry::new_delta(
+            reconstructed_hash,
+            0,
+            1,
+            vec![option],
+        )];
+        let seg_path = tmp.path().join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        write_segment_with_delta_body(&seg_path, &mut entries, &delta_blob, signer.as_ref())
+            .unwrap();
+        let mut full_bytes = std::fs::read(&seg_path).unwrap();
+
+        // Publish the signed .idx locally.
+        let layout = elide_core::segment::read_segment_layout(&seg_path).unwrap();
+        let bss = layout.body_section_start;
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        // Tamper a byte inside the delta body section of the stored object.
+        let delta_start = (bss + layout.body_length) as usize;
+        full_bytes[delta_start + 3] ^= 0xFF;
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
+
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store_dir.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
+        };
+        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
+
+        let err = fetcher
+            .fetch_delta_body(seg_ulid, &index_dir, &cache_dir)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("demand-fetch delta"),
+            "error should identify delta fetch: {err}"
+        );
+
+        // .delta must not exist.
+        assert!(
+            !cache_dir.join(format!("{seg_id}.delta")).exists(),
+            ".delta must not be written on hash mismatch"
         );
     }
 

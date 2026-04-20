@@ -40,6 +40,9 @@
 //       option_flags   (1 byte)   bit 0: FLAG_DELTA_INLINE (reserved)
 //       delta_offset   (8 bytes)  u64 le — offset within delta body section
 //       delta_length   (4 bytes)  u32 le — byte length in delta body
+//       delta_hash     (32 bytes) blake3 hash of the compressed delta blob
+//                                 (authenticates the bytes in the delta body
+//                                 section; verified on demand-fetch)
 //
 // Body section: raw concatenated extent bytes, no framing.
 // Data entries have real body bytes. DedupRef and Zero entries contribute nothing
@@ -186,8 +189,9 @@ pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 const IDX_ENTRY_LEN: u32 = 64;
 
 /// Size of one serialized delta option in the delta table:
-/// source_hash(32) + option_flags(1) + delta_offset(8) + delta_length(4) = 45 bytes.
-const DELTA_OPTION_LEN: u32 = 45;
+/// source_hash(32) + option_flags(1) + delta_offset(8) + delta_length(4) +
+/// delta_hash(32) = 77 bytes.
+const DELTA_OPTION_LEN: u32 = 77;
 
 /// Size of one delta table entry header: entry_index(4) + delta_count(1) = 5 bytes.
 const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
@@ -349,6 +353,12 @@ pub struct DeltaOption {
     pub delta_offset: u64,
     /// Byte length of the delta blob in the delta body section.
     pub delta_length: u32,
+    /// BLAKE3 hash of the compressed delta blob at
+    /// `[delta_offset, delta_offset + delta_length)` in the delta body
+    /// section. Authenticates the delta bytes (which are otherwise outside
+    /// the signed region) so demand-fetch can verify what it pulls from the
+    /// object store before writing to the local cache.
+    pub delta_hash: blake3::Hash,
 }
 
 /// One entry in the in-memory representation of a segment's index section.
@@ -745,6 +755,7 @@ fn write_delta_table<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Resul
             w.write_all(&[0u8])?; // option_flags: 1
             w.write_all(&opt.delta_offset.to_le_bytes())?; // 8
             w.write_all(&opt.delta_length.to_le_bytes())?; // 4
+            w.write_all(opt.delta_hash.as_bytes())?; // 32
         }
     }
     Ok(())
@@ -788,6 +799,7 @@ pub fn rewrite_with_deltas(
     let src_index_length = src_h.index_length.get();
     let src_inline_length = src_h.inline_length.get();
     let src_body_length = src_h.body_length.get();
+    let src_delta_length = src_h.delta_length.get();
     let src_inputs_length = src_h.inputs_length.get();
     let entry_count = src_h.entry_count.get();
 
@@ -795,7 +807,14 @@ pub fn rewrite_with_deltas(
     // — a GC output that gets delta-rewritten keeps its original inputs list.
     let mut index_buf = vec![0u8; src_index_length as usize];
     src.read_exact(&mut index_buf)?;
-    let (mut entries, inputs) = parse_index_section(&index_buf, entry_count, src_inputs_length)?;
+    let (mut entries, inputs) = parse_index_section(
+        &index_buf,
+        entry_count,
+        src_inputs_length,
+        src_body_length,
+        src_inline_length,
+        src_delta_length,
+    )?;
 
     // Attach delta options to the specified entries.
     for (idx, opts) in deltas {
@@ -953,7 +972,17 @@ pub fn read_segment_index(path: &Path) -> io::Result<(u64, Vec<SegmentEntry>, Ve
     let h = SegmentHeader::read_from_bytes(&raw)
         .map_err(|_| io::Error::other("segment header size mismatch"))?;
     let inputs_length = h.inputs_length.get();
-    let (entries, inputs) = parse_index_section(&index_buf, entry_count, inputs_length)?;
+    let body_length = h.body_length.get();
+    let inline_length = h.inline_length.get();
+    let delta_length = h.delta_length.get();
+    let (entries, inputs) = parse_index_section(
+        &index_buf,
+        entry_count,
+        inputs_length,
+        body_length,
+        inline_length,
+        delta_length,
+    )?;
     Ok((body_section_start, entries, inputs))
 }
 
@@ -973,6 +1002,9 @@ pub fn read_and_verify_segment_index(
     let h = SegmentHeader::read_from_bytes(&raw)
         .map_err(|_| io::Error::other("segment header size mismatch"))?;
     let inputs_length = h.inputs_length.get();
+    let body_length = h.body_length.get();
+    let inline_length = h.inline_length.get();
+    let delta_length = h.delta_length.get();
 
     let sig_bytes: [u8; 64] = raw[HEADER_SIGNED_PREFIX..HEADER_LEN as usize]
         .try_into()
@@ -1002,7 +1034,14 @@ pub fn read_and_verify_segment_index(
             )
         })?;
 
-    let (entries, inputs) = parse_index_section(&index_buf, entry_count, inputs_length)?;
+    let (entries, inputs) = parse_index_section(
+        &index_buf,
+        entry_count,
+        inputs_length,
+        body_length,
+        inline_length,
+        delta_length,
+    )?;
     Ok((body_section_start, entries, inputs))
 }
 
@@ -1098,6 +1137,9 @@ fn parse_index_section(
     data: &[u8],
     entry_count: u32,
     inputs_length: u32,
+    body_length: u64,
+    inline_length: u32,
+    delta_length: u32,
 ) -> io::Result<(Vec<SegmentEntry>, Vec<ulid::Ulid>)> {
     if !(inputs_length as usize).is_multiple_of(INPUT_ULID_LEN) {
         return Err(io::Error::other(format!(
@@ -1124,7 +1166,7 @@ fn parse_index_section(
     // Pass 1: parse fixed-size base entries (64 bytes each).
     let mut pos = 0usize;
     let mut has_deltas = false;
-    for _ in 0..entry_count {
+    for i in 0..entry_count {
         let hash = blake3::Hash::from_bytes(read_fixed(entries_data, &mut pos)?);
         let start_lba = u64::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let lba_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
@@ -1156,6 +1198,15 @@ fn parse_index_section(
         let stored_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let _reserved: [u8; 7] = read_fixed(entries_data, &mut pos)?;
 
+        validate_entry_bounds(
+            i,
+            kind,
+            stored_offset,
+            stored_length,
+            body_length,
+            inline_length,
+        )?;
+
         entries.push(SegmentEntry {
             hash,
             start_lba,
@@ -1171,7 +1222,7 @@ fn parse_index_section(
 
     // Pass 2: parse delta table (appended after base entries, before inputs).
     if has_deltas && pos < entries_data.len() {
-        parse_delta_table(entries_data, base_len, &mut entries)?;
+        parse_delta_table(entries_data, base_len, &mut entries, delta_length)?;
     }
 
     // Pass 3: parse inputs table (tail of index section).
@@ -1186,13 +1237,82 @@ fn parse_index_section(
     Ok((entries, inputs))
 }
 
+/// Validate an entry's `stored_offset` / `stored_length` against the declared
+/// section lengths from the segment header.
+///
+/// After the segment signature is verified, these fields are authentic to the
+/// signer — but a compromised coordinator (holding an ephemeral GC key) could
+/// still produce a signed-but-malformed segment. Bounds-checking at parse
+/// time ensures the volume apply path never reads out-of-range bytes.
+///
+/// Invariants:
+/// - Body entries (`Data`, `CanonicalData`): `stored_offset + stored_length <= body_length`
+/// - Inline entries (`Inline`, `CanonicalInline`): `stored_offset + stored_length <= inline_length`
+/// - Thin entries (`DedupRef`, `Zero`, `Delta`): `stored_offset == 0 && stored_length == 0`
+/// - `offset + length` never wraps
+fn validate_entry_bounds(
+    i: u32,
+    kind: EntryKind,
+    stored_offset: u64,
+    stored_length: u32,
+    body_length: u64,
+    inline_length: u32,
+) -> io::Result<()> {
+    let len = stored_length as u64;
+    match kind {
+        EntryKind::Data | EntryKind::CanonicalData => {
+            let end = stored_offset.checked_add(len).ok_or_else(|| {
+                io::Error::other(format!(
+                    "entry {i}: body offset {stored_offset} + length {stored_length} overflows"
+                ))
+            })?;
+            if end > body_length {
+                return Err(io::Error::other(format!(
+                    "entry {i}: body range [{stored_offset}, {end}) exceeds body_length {body_length}"
+                )));
+            }
+        }
+        EntryKind::Inline | EntryKind::CanonicalInline => {
+            let end = stored_offset.checked_add(len).ok_or_else(|| {
+                io::Error::other(format!(
+                    "entry {i}: inline offset {stored_offset} + length {stored_length} overflows"
+                ))
+            })?;
+            if end > inline_length as u64 {
+                return Err(io::Error::other(format!(
+                    "entry {i}: inline range [{stored_offset}, {end}) exceeds inline_length {inline_length}"
+                )));
+            }
+        }
+        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {
+            if stored_offset != 0 || stored_length != 0 {
+                return Err(io::Error::other(format!(
+                    "entry {i}: thin entry ({kind:?}) must have zero offset/length, got \
+                     offset={stored_offset} length={stored_length}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse the delta table from the index section, starting at `table_start`.
 ///
-/// Each delta table entry: entry_index(4) + delta_count(1) + N × 45 bytes.
+/// Each delta table entry: entry_index(4) + delta_count(1) + N × 77 bytes
+/// (see `DELTA_OPTION_LEN`).
+///
+/// `delta_section_length` is the segment header's `delta_length` field.
+/// When non-zero, each option's `delta_offset + delta_length` must fit
+/// within it. When zero, the segment has no local delta body (the
+/// coordinator appends one at S3 upload time): options are symbolic
+/// pointers into the eventual S3 object's delta body and the actual
+/// bounds check happens in `fetch_one_delta_body` against the fetched
+/// bytes. Integer-wrap is still rejected either way.
 fn parse_delta_table(
     data: &[u8],
     table_start: usize,
     entries: &mut [SegmentEntry],
+    delta_section_length: u32,
 ) -> io::Result<()> {
     let mut pos = table_start;
     while pos < data.len() {
@@ -1205,15 +1325,31 @@ fn parse_delta_table(
             )));
         }
         let mut opts = Vec::with_capacity(delta_count);
-        for _ in 0..delta_count {
+        for j in 0..delta_count {
             let source_hash = blake3::Hash::from_bytes(read_fixed(data, &mut pos)?);
             let _option_flags = read_u8(data, &mut pos)?;
             let delta_offset = u64::from_le_bytes(read_fixed(data, &mut pos)?);
             let delta_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
+            let delta_hash = blake3::Hash::from_bytes(read_fixed(data, &mut pos)?);
+            let end = delta_offset
+                .checked_add(delta_length as u64)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "delta option [{entry_index}][{j}]: offset {delta_offset} + length \
+                     {delta_length} overflows"
+                    ))
+                })?;
+            if delta_section_length > 0 && end > delta_section_length as u64 {
+                return Err(io::Error::other(format!(
+                    "delta option [{entry_index}][{j}]: range [{delta_offset}, {end}) exceeds \
+                     delta_section_length {delta_section_length}"
+                )));
+            }
             opts.push(DeltaOption {
                 source_hash,
                 delta_offset,
                 delta_length,
+                delta_hash,
             });
         }
         entries[entry_index].delta_options = opts;
@@ -1243,7 +1379,7 @@ pub fn read_extent_bodies(
     inline_bytes: &[u8],
 ) -> io::Result<()> {
     read_body_section_bodies(path, body_section_start, entries)?;
-    populate_inline_bodies(entries, inline_bytes);
+    populate_inline_bodies(entries, inline_bytes)?;
     Ok(())
 }
 
@@ -1278,20 +1414,45 @@ pub fn read_body_section_bodies(
 
 /// Populate `entry.data` for `Inline` / `CanonicalInline` entries by
 /// slicing `inline_bytes`. No file I/O — `inline_bytes` is the inline
-/// section already in memory (see `read_inline_section`). Entries whose
-/// slice would overflow `inline_bytes` are silently skipped, matching
-/// the tolerance of `read_extent_bodies` for truncated inline sections.
-pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8]) {
-    for entry in entries.iter_mut() {
+/// section already in memory (see `read_inline_section`).
+///
+/// Returns `InvalidData` if any inline entry's slice would overflow
+/// `inline_bytes`. After segment parsing has validated entry bounds
+/// against the declared `inline_length`, the caller is expected to pass
+/// an `inline_bytes` buffer of that exact length — overflow here means
+/// the buffer was truncated or the entries were built without going
+/// through `parse_index_section`. Either case is a corruption signal
+/// and must not be silently dropped.
+pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8]) -> io::Result<()> {
+    for (i, entry) in entries.iter_mut().enumerate() {
         if entry.stored_length == 0 || !entry.kind.is_inline() {
             continue;
         }
         let start = entry.stored_offset as usize;
-        let end = start + entry.stored_length as usize;
-        if end <= inline_bytes.len() {
-            entry.data = Some(inline_bytes[start..end].to_vec());
+        let end = start
+            .checked_add(entry.stored_length as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "entry {i}: inline offset {} + length {} overflows",
+                        entry.stored_offset, entry.stored_length
+                    ),
+                )
+            })?;
+        if end > inline_bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "entry {i}: inline range [{start}, {end}) exceeds inline buffer \
+                     length {}",
+                    inline_bytes.len()
+                ),
+            ));
         }
+        entry.data = Some(inline_bytes[start..end].to_vec());
     }
+    Ok(())
 }
 
 /// Verify that `body` hashes to `entry.hash`.
@@ -1306,6 +1467,32 @@ pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8])
 ///
 /// Returns `io::ErrorKind::InvalidData` on mismatch so callers can
 /// distinguish corruption from unrelated I/O failures.
+/// Verify a delta blob against the signed `delta_hash` from a `DeltaOption`.
+///
+/// The delta body section is outside the segment signature, so the
+/// `delta_hash` carried in each (signed) `DeltaOption` is the sole
+/// authentication of the compressed delta bytes. Call this on every delta
+/// blob retrieved from an untrusted source (e.g. on demand-fetch) before
+/// admitting the bytes to the local cache.
+///
+/// Returns `io::ErrorKind::InvalidData` on mismatch.
+pub fn verify_delta_blob_hash(option: &DeltaOption, blob: &[u8]) -> io::Result<()> {
+    let computed = blake3::hash(blob);
+    if computed == option.delta_hash {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "delta blob hash mismatch len={}B: declared={} computed={}",
+                blob.len(),
+                &option.delta_hash.to_hex()[..16],
+                &computed.to_hex()[..16],
+            ),
+        ))
+    }
+}
+
 pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
     if !matches!(
         entry.kind,
@@ -1520,13 +1707,20 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         header[20], header[21], header[22], header[23], header[24], header[25], header[26],
         header[27],
     ]);
-    let delta_length = u32::from_le_bytes([header[28], header[29], header[30], header[31]]) as u64;
+    let delta_length = u32::from_le_bytes([header[28], header[29], header[30], header[31]]);
     let inputs_length = u32::from_le_bytes([header[32], header[33], header[34], header[35]]);
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
     let mut index_data = vec![0u8; index_length as usize];
     src.read_exact(&mut index_data)?;
-    let (entries, _inputs) = parse_index_section(&index_data, entry_count, inputs_length)?;
+    let (entries, _inputs) = parse_index_section(
+        &index_data,
+        entry_count,
+        inputs_length,
+        body_length,
+        inline_length,
+        delta_length,
+    )?;
 
     // Build the sparse body in a temp file but do not rename yet —
     // the rename is the last step so `.body`'s existence implies
@@ -1581,8 +1775,8 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
                 .truncate(true)
                 .open(&delta_tmp)?;
             src.seek(SeekFrom::Start(body_section_start + body_length))?;
-            let n = io::copy(&mut (&mut src).take(delta_length), &mut dst)?;
-            if n != delta_length {
+            let n = io::copy(&mut (&mut src).take(delta_length as u64), &mut dst)?;
+            if n != delta_length as u64 {
                 return Err(io::Error::other("short read promoting delta body"));
             }
             dst.sync_data()?;
@@ -2838,6 +3032,7 @@ mod tests {
         let source_hash = blake3::hash(b"source-extent");
         let delta_blob = b"compressed-delta-data";
         let delta_body = delta_blob.to_vec();
+        let delta_hash = blake3::hash(delta_blob);
 
         let deltas = vec![(
             0,
@@ -2845,6 +3040,7 @@ mod tests {
                 source_hash,
                 delta_offset: 0,
                 delta_length: delta_blob.len() as u32,
+                delta_hash,
             }],
         )];
 
@@ -2919,6 +3115,7 @@ mod tests {
             source_hash,
             delta_offset: 0,
             delta_length: 128,
+            delta_hash: blake3::hash(b"delta-blob-bytes"),
         };
 
         let mut entries = vec![
@@ -2980,16 +3177,19 @@ mod tests {
                 source_hash: blake3::hash(b"source-a"),
                 delta_offset: 0,
                 delta_length: 100,
+                delta_hash: blake3::hash(b"blob-a"),
             },
             DeltaOption {
                 source_hash: blake3::hash(b"source-b"),
                 delta_offset: 100,
                 delta_length: 200,
+                delta_hash: blake3::hash(b"blob-b"),
             },
             DeltaOption {
                 source_hash: blake3::hash(b"source-c"),
                 delta_offset: 300,
                 delta_length: 50,
+                delta_hash: blake3::hash(b"blob-c"),
             },
         ];
 
@@ -3006,6 +3206,119 @@ mod tests {
             assert_eq!(orig.delta_offset, read.delta_offset);
             assert_eq!(orig.delta_length, read.delta_length);
         }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `parse_index_section` rejects a Data entry whose body range extends
+    /// past `body_length`. This catches a malicious-but-signed segment
+    /// (e.g. from a compromised coordinator ephemeral key) before the
+    /// apply path issues an OOB read.
+    #[test]
+    fn parse_rejects_body_entry_past_body_length() {
+        // Build a valid segment with a single Data entry, then tamper its
+        // `stored_length` in the index section to exceed body_length.
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01CCCCCCCCCCCCCCCCCCCCCCCC");
+        let (signer, _vk) = test_signer();
+
+        let data = vec![0xA5u8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // Tamper: bump stored_length on the sole entry from 4096 to 8192.
+        // Signature will no longer verify, but `read_segment_index` (the
+        // no-signature reader used in the extent-fetch path) still parses
+        // and is what this invariant is guarding.
+        let mut raw = fs::read(&seg_path).unwrap();
+        // Entry i=0: starts at HEADER_LEN, layout is
+        //   hash(32) + start_lba(8) + lba_length(4) + flags(1)
+        //   + stored_offset(8) + stored_length(4) + reserved(7)
+        // stored_length sits at offset 32+8+4+1+8 = 53 within the entry.
+        let stored_length_off = HEADER_LEN as usize + 32 + 8 + 4 + 1 + 8;
+        raw[stored_length_off..stored_length_off + 4].copy_from_slice(&8192u32.to_le_bytes());
+        fs::write(&seg_path, &raw).unwrap();
+
+        let err = read_segment_index(&seg_path).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds body_length"),
+            "expected bounds error, got: {err}"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `parse_index_section` rejects a thin entry (DedupRef / Zero / Delta)
+    /// that carries a nonzero stored_offset or stored_length. Thin entries
+    /// reserve no body space; nonzero fields are an integrity error.
+    #[test]
+    fn parse_rejects_thin_entry_with_nonzero_offset() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01DDDDDDDDDDDDDDDDDDDDDDDD");
+        let (signer, _vk) = test_signer();
+
+        // A DedupRef entry — thin by construction.
+        let hash = blake3::hash(b"canonical");
+        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 0, 1)];
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // Tamper: give the DedupRef a nonzero stored_length.
+        let mut raw = fs::read(&seg_path).unwrap();
+        let stored_length_off = HEADER_LEN as usize + 32 + 8 + 4 + 1 + 8;
+        raw[stored_length_off..stored_length_off + 4].copy_from_slice(&16u32.to_le_bytes());
+        fs::write(&seg_path, &raw).unwrap();
+
+        let err = read_segment_index(&seg_path).unwrap_err();
+        assert!(
+            err.to_string().contains("thin entry"),
+            "expected thin-entry error, got: {err}"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `parse_index_section` rejects entries whose `stored_offset +
+    /// stored_length` overflows u64, regardless of the declared section
+    /// length. Covers the integer-wrap attack.
+    #[test]
+    fn parse_rejects_integer_wrap() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01EEEEEEEEEEEEEEEEEEEEEEEE");
+        let (signer, _vk) = test_signer();
+
+        let data = vec![0xB5u8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // Tamper: set stored_offset = u64::MAX - 3 and stored_length = 10.
+        let mut raw = fs::read(&seg_path).unwrap();
+        let stored_offset_off = HEADER_LEN as usize + 32 + 8 + 4 + 1;
+        let stored_length_off = stored_offset_off + 8;
+        raw[stored_offset_off..stored_offset_off + 8]
+            .copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+        raw[stored_length_off..stored_length_off + 4].copy_from_slice(&10u32.to_le_bytes());
+        fs::write(&seg_path, &raw).unwrap();
+
+        let err = read_segment_index(&seg_path).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows"),
+            "expected overflow error, got: {err}"
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }
