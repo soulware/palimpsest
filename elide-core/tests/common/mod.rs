@@ -253,12 +253,27 @@ fn compact_candidates_inner(
                 EntryKind::DedupRef => lba_live,
                 _ => lba_live || (extent_live && live_hashes.contains(&entry.hash)),
             };
-            if keep {
-                outputs.push(PlanOutput::Keep {
+            if !keep {
+                continue;
+            }
+            // LBA-dead but hash-live Data/Inline must land as Canonical so
+            // the stale LBA binding does not shadow newer writes at the GC
+            // output's higher ULID. Mirrors coordinator `collect_stats`
+            // which calls `into_canonical()` in the same case.
+            let demote_to_canonical =
+                !lba_live && matches!(entry.kind, EntryKind::Data | EntryKind::Inline);
+            let output = if demote_to_canonical {
+                PlanOutput::Canonical {
                     input: *ulid,
                     entry_idx: entry_idx as u32,
-                });
-            }
+                }
+            } else {
+                PlanOutput::Keep {
+                    input: *ulid,
+                    entry_idx: entry_idx as u32,
+                }
+            };
+            outputs.push(output);
         }
     }
 
