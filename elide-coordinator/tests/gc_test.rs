@@ -1555,24 +1555,23 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     verify!(vol, "GcSweep");
 }
 
-/// Bug H — `collect_stats` preserves a DATA/INLINE entry at its original
-/// LBA even when the LBA has been overwritten, if the hash is still live
-/// somewhere else via a DedupRef (`extent_live && live_hashes.contains(h)`
-/// arm at the bottom of the DATA/Inline branch). The GC output then has a
-/// higher ULID than the segment that wrote the live content at that LBA,
-/// so on rebuild the spurious entry shadows the correct one — silently
-/// returning stale bytes forever (until the offending output is itself
-/// GC'd, which can take a long time or never happen if the hash remains
-/// ref'd from some long-lived file).
+/// Bug H — a GC round 2's repack preserved an LBA-dead body-bearing entry
+/// at its original LBA when the hash was still live elsewhere via a
+/// DedupRef. The output inherited a stale (LBA → hash) binding at a ULID
+/// higher than the segment writing the live content, silently returning
+/// stale bytes after restart.
 ///
-/// Note: end-to-end reproduction is awkward because the coordinator's
-/// sweep will typically pick up the overwriting segment alongside the
-/// canonical, and entry-order within a single sweep output corrects the
-/// spurious binding. See the `collect_stats_preserves_dead_lba_entry`
-/// unit test in `elide-coordinator/src/gc.rs` for a direct, deterministic
-/// demonstration of the buggy arm. This end-to-end test exists as a
-/// scaffolded integration check — it currently does NOT fail, and is
-/// preserved so the shape of the scenario is visible alongside the fix.
+/// Two cooperating fixes close this:
+/// 1. `collect_stats` demotes the stale-LBA body-bearing entry to
+///    `CanonicalData` / `CanonicalInline` (body preserved for extent-index
+///    resolution; no LBA claim on rebuild). See commit 73e43ff.
+/// 2. `discover_fork_segments` processes gc + index as a single
+///    ULID-ordered committed tier instead of gc-before-index. Without
+///    this, the in-apply rebuild of `lbamap` inside `apply_plan` saw
+///    `U_s1` at the artificially-lowered `gc` priority and let the older
+///    `S0` (not in the inputs list) overwrite its LBA binding — a bug
+///    that mis-set the in-memory `lbamap` for the duration of the pass
+///    and leaked into GC round 2's liveness view.
 ///
 /// The user-visible symptom on the real volume that found this: after a
 /// restart the volume read back zeros at an LBA the user believed held
@@ -1587,23 +1586,19 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
 ///      S0+Y' from producing a higher-ULID output that would mask the bug).
 ///   3. Write h2 (distinct) at LBA N → segment X (DATA/INLINE h2 at N).
 ///   4. Write h2 at LBA M → segment Y (DedupRef h2 at M, keeping h2 live).
-///   5. GC round 1: sweep X+Y → U1. U1 has `DATA/INLINE h2 at LBA N` and
+///   5. GC round 1: sweep X+Y → U1. U1 has `INLINE h2 at LBA N` and
 ///      `DedupRef h2 at LBA M`. At this point lbamap[N]=h2 and everything
 ///      is consistent.
 ///   6. Write h1 at LBA N (REF path — h1 still canonical in S0) → Y'.
 ///      Now lbamap[N]=h1. U1's entry at N is LBA-dead; U1's REF at M is
 ///      still live.
 ///   7. GC round 2: U1 density 50% → repack candidate. Y' density 100%
-///      is alone in the sweep bucket → sweep skipped. collect_stats for
-///      U1's entry at LBA N hits the buggy arm (!lba_live && extent_live
-///      && live_hashes.contains(h2) via M) and keeps the entry at LBA N.
-///      Output U_r has `DATA/INLINE h2 at LBA N`.
-///   8. Restart. Rebuild: S0 → h1 at N, Y' → h1 at N, U_r → h2 at N.
-///      U_r has highest ULID → lbamap[N] = h2. BUG.
-///
-/// Fix (forthcoming): promote-demote the stale-LBA body-bearing entry to
-/// a `CanonicalBody` kind that carries the body for extent_index lookups
-/// but makes no LBA claim on rebuild.
+///      is alone in the sweep bucket → sweep skipped. `collect_stats`
+///      demotes U1's LBA-dead h2 entry to `CanonicalInline` (body kept
+///      for dedup resolution, no LBA claim). Output U_r has
+///      `CanonicalInline h2` + `DedupRef h2 at M`.
+///   8. Restart. Rebuild: S0 → h1 at N; Y' → h1 at N (same); U_r's
+///      canonical is skipped on rebuild. Final lbamap[N]=h1. Fixed.
 #[test]
 fn gc_bug_h_canonical_body_shadows_live_lba() {
     let dir = tempfile::TempDir::new().unwrap();

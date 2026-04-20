@@ -324,16 +324,16 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 
     for (fork_dir, branch_ulid) in forks {
         // Discover all segments in race-safe listing order (pending → gc →
-        // index) and rebuild-processing order (gc → index → pending). Both
-        // `lbamap::rebuild_segments` and this function share the helper.
-        // `discover_fork_segments` filters out `index/<input>.idx` files
-        // superseded by a bare `gc/<new>` — see its doc comment.
+        // index) and rebuild-processing order ((gc ∪ index) by ULID, then
+        // pending by ULID). Both `lbamap::rebuild_segments` and this
+        // function share the helper. `discover_fork_segments` filters out
+        // `index/<input>.idx` files superseded by a bare `gc/<new>` — see
+        // its doc comment.
         //
-        // Insert semantics are per-tier: `insert_if_absent` is used
-        // throughout (first-write-wins = lowest ULID canonical). Because
-        // we iterate tiers in gc → index → pending order and each tier in
-        // ULID order, the first insert for any hash comes from the
-        // lowest-ULID segment holding it — matching the documented rule.
+        // `insert_if_absent` is used throughout (first-write-wins = lowest
+        // ULID canonical). Iterating the committed tier (gc ∪ index) in
+        // ULID ascending order means the first insert for any hash comes
+        // from the lowest-ULID segment holding it, matching the rule.
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
         if segments.is_empty() {

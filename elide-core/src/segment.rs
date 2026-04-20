@@ -1900,9 +1900,11 @@ pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
 
 // --- fork rebuild discovery ---
 
-/// Which source directory a discovered segment lives in. Dictates
-/// rebuild processing priority within a single fork:
-/// `GcApplied < Index < Pending` (last-write-wins on overlapping LBAs).
+/// Which source directory a discovered segment lives in. `GcApplied` and
+/// `Index` share the committed tier (processed together in ULID order by
+/// `discover_fork_segments` — a bare gc output is logically an index
+/// segment whose finalize hasn't run yet); `Pending` is always processed
+/// after the committed tier on rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentTier {
     /// `gc/<ulid>` — volume-applied GC output awaiting coordinator upload.
@@ -1936,9 +1938,16 @@ pub struct SegmentRef {
 /// segment is absent from both lists; see `extentindex::rebuild` for
 /// the same discipline.
 ///
-/// **Processing order: gc → index → pending**, each tier sorted by ULID.
-/// This is the priority ordering — later processing wins when the same
-/// LBA appears in multiple tiers.
+/// **Processing order: (gc ∪ index) sorted by ULID, then pending sorted
+/// by ULID.** A bare `gc/<ulid>` file is a committed GC output whose
+/// finalize (`promote_segment`) has not yet run. Logically it occupies the
+/// same priority tier as `index/<ulid>.idx` — the `inputs` list names the
+/// older segments it replaces, and its own ULID was minted higher than any
+/// input ULID. Processing gc and index together in ULID order lets the
+/// bare output supersede any lower-ULID (non-input) segment at the same
+/// LBA, matching the lbamap's last-write-wins rule. Pending remains the
+/// highest priority because post-checkpoint writes land at ULIDs above any
+/// gc output from the same checkpoint.
 ///
 /// `branch_ulid` applies an ULID-string cutoff used for ancestor layers
 /// in forked volumes: entries with ULID string greater than the cutoff
@@ -1948,36 +1957,40 @@ pub fn discover_fork_segments(
     branch_ulid: Option<&str>,
 ) -> io::Result<Vec<SegmentRef>> {
     // pending/ first (source of drain-path promote).
-    let mut pending_paths = collect_segment_files(&fork_dir.join("pending"))?;
-    pending_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let pending_paths = collect_segment_files(&fork_dir.join("pending"))?;
 
     // gc/ next (source of gc-carried promote).
-    let mut gc_paths = collect_gc_applied_segment_files(fork_dir)?;
-    gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let gc_paths = collect_gc_applied_segment_files(fork_dir)?;
 
     // index/ last (destination of both promote paths).
-    let mut idx_paths = collect_idx_files(&fork_dir.join("index"))?;
-    idx_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+    let idx_paths = collect_idx_files(&fork_dir.join("index"))?;
 
-    // Build output in processing order: gc → index → pending.
-    let mut out: Vec<SegmentRef> =
-        Vec::with_capacity(gc_paths.len() + idx_paths.len() + pending_paths.len());
-
+    // Merge gc + index into a single committed-tier list, sorted by ULID
+    // ascending. Pending is appended after, also sorted by ULID ascending.
+    let mut committed: Vec<SegmentRef> = Vec::with_capacity(gc_paths.len() + idx_paths.len());
     for p in gc_paths {
         if let Some(sref) = segment_ref_from_path(p, SegmentTier::GcApplied, branch_ulid) {
-            out.push(sref);
+            committed.push(sref);
         }
     }
     for p in idx_paths {
         if let Some(sref) = segment_ref_from_path(p, SegmentTier::Index, branch_ulid) {
-            out.push(sref);
+            committed.push(sref);
         }
     }
+    committed.sort_unstable_by_key(|s| s.ulid);
+
+    let mut pending: Vec<SegmentRef> = Vec::with_capacity(pending_paths.len());
     for p in pending_paths {
         if let Some(sref) = segment_ref_from_path(p, SegmentTier::Pending, branch_ulid) {
-            out.push(sref);
+            pending.push(sref);
         }
     }
+    pending.sort_unstable_by_key(|s| s.ulid);
+
+    let mut out: Vec<SegmentRef> = Vec::with_capacity(committed.len() + pending.len());
+    out.extend(committed);
+    out.extend(pending);
 
     // Enforce the supersede rule: a bare `gc/<new>` carries a declarative
     // `inputs` list naming the ULIDs it replaces. Any `index/<input>.idx`

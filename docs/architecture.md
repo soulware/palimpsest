@@ -784,8 +784,8 @@ The LBA map is optionally persisted to a local `lba.map` file on clean shutdown 
 
 **Rebuild procedure:**
 1. Follow the `origin` chain from the fork to the root, collecting ancestor layers (oldest first)
-2. For each ancestor fork: scan bare `gc/<ulid>` files (lowest priority), then `index/*.idx`, then `pending/` in ULID order, stopping at the branch-point ULID stored in the child's `origin`
-3. For the current fork: scan all of bare `gc/<ulid>` files, `index/*.idx`, and `pending/` (all of them)
+2. For each ancestor fork: apply bare `gc/<ulid>` files and `index/*.idx` interleaved in ULID order (single committed tier), then `pending/` in ULID order, stopping at the branch-point ULID stored in the child's `origin`
+3. For the current fork: same — committed tier (gc ∪ index) in ULID order, then `pending/` in ULID order (all of them)
 4. Replay the current WAL on top (WAL entries are the most recent writes)
 
 Since segment index sections are the ground truth for segment contents, rebuilding the LBA map requires only index sections and the WAL — never the segment data bodies. A full startup rebuild for a volume with 100 segments across its ancestry is a scan of ~6–200KB per segment index section, not 3GB of segment bodies.
@@ -978,9 +978,9 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 
 To rebuild the LBA map for a volume:
 1. Follow the `origin` chain to the root volume (no `origin` file). Each `origin` file contains `<parent-ulid>/snapshots/<snapshot-ulid>` — the parent is resolved as `by_id_dir/<parent-ulid>`. Using ULIDs in `origin` means the chain is stable across renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` performs this traversal.
-2. From the root outward, for each ancestor in the chain: apply bare `gc/<ulid>` files (lowest priority), then `index/*.idx`, then `pending/`, in ULID order within each group, stopping at (and including) the branch-point ULID recorded in the child's `origin`. Snapshot markers are not scanned during replay.
-3. Apply the current volume's own bare `gc/<ulid>` files, `index/*.idx`, and `pending/` in ULID order within each group (all of them, no cutoff).
-4. **Priority within each rebuild pass:** bare `gc/<ulid>` files are applied first (lowest priority — GC-compacted data, ULID < the WAL flush that followed), then `index/*.idx` (committed segments promoted from pending/), then `pending/` (highest priority — in-flight WAL flushes, always the most recent write for any LBA). Bodies with `.staged` siblings are coordinator-staged and not yet volume-re-signed; they are excluded by `collect_gc_applied_segment_files`.
+2. From the root outward, for each ancestor in the chain: apply the committed tier — bare `gc/<ulid>` files and `index/*.idx` interleaved in ULID order — then `pending/` in ULID order, stopping at (and including) the branch-point ULID recorded in the child's `origin`. Snapshot markers are not scanned during replay.
+3. Apply the current volume's own committed tier (bare `gc/<ulid>` + `index/*.idx` interleaved in ULID order) then `pending/` in ULID order (all of them, no cutoff).
+4. **Priority within each rebuild pass:** the committed tier (bare `gc/<ulid>` and `index/*.idx`) is processed together in ULID order, so a bare gc output supersedes any lower-ULID non-input segment at the same LBA (a bare gc output's ULID is always higher than all its inputs). `pending/` is processed after the committed tier — pending segments are post-checkpoint writes whose ULIDs are above any concurrent gc output from the same checkpoint, so they always win at overlapping LBAs. Bodies with `.staged` siblings are coordinator-staged and not yet volume-re-signed; they are excluded by `collect_gc_applied_segment_files`.
 5. Replay the WAL.
 
 The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor from leaking newer data into the derived volume's view.

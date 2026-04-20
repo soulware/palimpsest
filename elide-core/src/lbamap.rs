@@ -485,8 +485,13 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
     for (fork_dir, branch_ulid) in layers {
         // `discover_fork_segments` handles the race-safe listing order
         // (pending → gc → index) and returns segments in the correct
-        // rebuild *processing* order (gc → index → pending). See the
-        // helper's doc comment for why both orderings matter.
+        // rebuild *processing* order: the committed tier (gc ∪ index) by
+        // ULID ascending, then pending by ULID ascending. Last-write-wins
+        // on overlapping LBAs gives the intended semantics: a bare
+        // `gc/<U>` output (minted above all its inputs' ULIDs) shadows
+        // any older non-input index segment at the same LBA, and pending
+        // writes — always minted after any concurrent GC output — win over
+        // both. See the helper's doc comment.
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
         if segments.is_empty() {
