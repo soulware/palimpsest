@@ -41,6 +41,10 @@ WAL records exist to make writes crash-replayable before they reach a segment. R
 
 `Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)` spans (prepare → worker done → apply). Any concurrent mutation voids the plan and the worker's orphan segment is deleted. Repack has the same property and it hasn't been a problem; the fallback is a clean discard, not a retry-in-place, so the next scheduled pass picks up whatever state now exists.
 
+### Space reclamation is deferred to GC
+
+A successful reclaim pass updates the lbamap to point at fresh compact entries and leaves the original hash's body in its source segment as an LBA-dead entry. The body is not deleted at apply time. GC reclaims it later when the containing segment crosses an eligibility threshold (dead-input, ≤ 16 MiB live, or density < 0.70). A dead body in an otherwise-dense segment stays on disk until enough surrounding entries also die — so `runs_rewritten > 0` from `elide volume reclaim` means "scheduled", not "freed on disk".
+
 ## Coordinator wiring (open)
 
 Two options once the primitive is worker-offloaded:
