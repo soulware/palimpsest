@@ -334,9 +334,10 @@ pub async fn run_volume_tasks(
 
             let gc_result = {
                 let fork_dir = fork_dir.clone();
+                let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_path_buf();
                 let gc_config = gc_config.clone();
                 tokio::task::spawn_blocking(move || {
-                    gc::gc_fork(&fork_dir, &gc_config, repack_ulid, sweep_ulid)
+                    gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, repack_ulid, sweep_ulid)
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
