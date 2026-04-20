@@ -2329,6 +2329,17 @@ impl Volume {
             );
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
+            // Refresh `self.lbamap` from disk before returning. Without
+            // this, a legitimate cancel here pins the in-memory view to
+            // the pre-supersede state: if another GC output has already
+            // committed `disk[L] = H_new` while our snapshot still has
+            // `self.lbamap[L] = H_old`, the next pass re-reads `H_old`
+            // as live and fires the same cancel again — forever. Reads
+            // through `self.lbamap` would also keep returning `H_old`'s
+            // body even after disk moved on. Refreshing after the cancel
+            // lets the next pass see the current truth (one wasted pass,
+            // then convergence).
+            self.rebuild_lbamap_from_disk()?;
             return Ok(StagedApply::Cancelled);
         }
 
@@ -2396,11 +2407,19 @@ impl Volume {
         // entry's "still live" status is evaluated against a hash no longer
         // backed by any on-disk writer), cancelling apply and stalling GC.
         //
-        // Replay the WAL tail after the rebuild so in-flight writes aren't
-        // lost — mirrors how `Volume::open` constructs the initial lbamap.
-        //
         // Crash ordering: on a crash between rename and rebuild, restart
         // re-runs `Volume::open`'s rebuild which produces the same result.
+        self.rebuild_lbamap_from_disk()?;
+
+        Ok(StagedApply::Applied)
+    }
+
+    /// Rebuild `self.lbamap` from disk (segments across fork + ancestors)
+    /// and replay the current WAL tail on top, mirroring the initial
+    /// construction in `Volume::open`. Used by the GC apply path on both
+    /// the stale-cancel and commit branches to keep the in-memory view
+    /// from drifting relative to on-disk state.
+    fn rebuild_lbamap_from_disk(&mut self) -> io::Result<()> {
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -2408,9 +2427,6 @@ impl Volume {
             .collect();
         chain.push((self.base_dir.clone(), None));
         let mut fresh = lbamap::rebuild_segments(&chain)?;
-        // Replay the current WAL tail so in-flight writes survive the
-        // rebuild. `scan_readonly` never mutates the WAL file — we only
-        // rebuild the in-memory view.
         let wal_dir = self.base_dir.join("wal");
         if let Ok(entries) = fs::read_dir(&wal_dir) {
             for entry in entries.flatten() {
@@ -2447,8 +2463,7 @@ impl Volume {
             }
         }
         self.lbamap = Arc::new(fresh);
-
-        Ok(StagedApply::Applied)
+        Ok(())
     }
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,
