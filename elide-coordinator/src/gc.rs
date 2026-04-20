@@ -144,8 +144,15 @@ impl GcStats {
 /// strategy.  Both must be pre-resolved via `gc_checkpoint` IPC before
 /// calling this function — they originate from the volume process so that
 /// ULID ordering is consistent with the volume's write clock.
+///
+/// `by_id_dir` is the data-dir root that houses `<volume_ulid>/` fork
+/// directories (plus an optional `readonly/` sibling tree). Passed so that
+/// `walk_ancestors` can resolve the fork chain — the liveness rebuild must
+/// include ancestor layers, otherwise hashes live only via an ancestor LBA
+/// look dead to the coordinator and trip stale-liveness on apply.
 pub fn gc_fork(
     fork_dir: &Path,
+    by_id_dir: &Path,
     config: &GcConfig,
     repack_ulid: Ulid,
     sweep_ulid: Ulid,
@@ -182,7 +189,18 @@ pub fn gc_fork(
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
 
-    let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+    // Walk the ancestor chain so the liveness view matches what the volume
+    // uses at apply time. Without this, a hash that lives only via an
+    // ancestor-mapped LBA would look dead from the coordinator, get omitted
+    // from the plan, and trip the volume's stale-liveness check on apply.
+    // Mirrors `volume::open_read_state`.
+    let ancestor_layers = elide_core::volume::walk_ancestors(fork_dir, by_id_dir)
+        .context("walking fork ancestor chain")?;
+    let rebuild_chain: Vec<(std::path::PathBuf, Option<String>)> = ancestor_layers
+        .iter()
+        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+        .chain(std::iter::once((fork_dir.to_path_buf(), None)))
+        .collect();
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
 
@@ -732,6 +750,18 @@ fn collect_stats(
         let mut partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
         let mut has_partial_death = false;
+        // Capture body-owning entries that this pass classifies as fully dead
+        // so we can log the coordinator's LBA-map view at classification time.
+        // This pairs with the volume's `diagnose_stale_cancel_legacy` — if a
+        // later apply trips stale-liveness on one of these hashes, the two
+        // views can be diffed directly from the logs.
+        struct DeadEntry {
+            hash: blake3::Hash,
+            start_lba: u64,
+            lba_length: u32,
+            per_lba: Vec<(u64, Option<blake3::Hash>)>,
+        }
+        let mut dead_diag: Vec<DeadEntry> = Vec::new();
 
         for (entry_idx, mut entry) in entries.into_iter().enumerate() {
             let entry_idx = entry_idx as u32;
@@ -849,6 +879,18 @@ fn collect_stats(
                         // Fully dead and this segment owns the hash in the
                         // extent index — schedule removal.
                         removed_hashes.push(entry.hash);
+                        if entry.kind.has_body_bytes() && dead_diag.len() < 8 {
+                            let per_lba: Vec<(u64, Option<blake3::Hash>)> = (entry.start_lba
+                                ..entry.start_lba + entry.lba_length as u64)
+                                .map(|lba| (lba, lba_map.hash_at(lba)))
+                                .collect();
+                            dead_diag.push(DeadEntry {
+                                hash: entry.hash,
+                                start_lba: entry.start_lba,
+                                lba_length: entry.lba_length,
+                                per_lba,
+                            });
+                        }
                     }
                     _ => {
                         // Fully dead with no extent-index ownership here.
@@ -907,6 +949,43 @@ fn collect_stats(
                     }
                 }
             }
+        }
+
+        if !dead_diag.is_empty() {
+            use std::fmt::Write as _;
+            let mut rendered = String::new();
+            for (i, d) in dead_diag.iter().enumerate() {
+                if i > 0 {
+                    rendered.push_str("; ");
+                }
+                let _ = write!(
+                    rendered,
+                    "hash={} lba={}+{} lbamap=[",
+                    d.hash.to_hex(),
+                    d.start_lba,
+                    d.lba_length
+                );
+                for (j, (lba, h)) in d.per_lba.iter().enumerate() {
+                    if j > 0 {
+                        rendered.push(',');
+                    }
+                    match h {
+                        Some(h) => {
+                            let _ = write!(rendered, "{lba}={}", h.to_hex());
+                        }
+                        None => {
+                            let _ = write!(rendered, "{lba}=None");
+                        }
+                    }
+                }
+                rendered.push(']');
+            }
+            tracing::info!(
+                "[gc {ulid_str}] body-owning entries classified dead (first {}, \
+                 showing the coordinator's lbamap at each claimed LBA): {}",
+                dead_diag.len(),
+                rendered,
+            );
         }
 
         result.push(SegmentStats {
@@ -1498,7 +1577,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should have compacted at least 2 segments (S1 + S2), got {}",
@@ -1595,7 +1674,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
+        gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
 
         // Find the emitted GC plan in gc/. Under the plan handoff protocol
         // the coordinator writes `gc/<ulid>.plan` instead of a signed
@@ -2358,7 +2437,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
         assert_eq!(
             stats.deferred, 0,
             "Delta partial-death must be expanded in-band, not deferred"
@@ -2457,7 +2536,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should compact ≥2 segments, got {}",

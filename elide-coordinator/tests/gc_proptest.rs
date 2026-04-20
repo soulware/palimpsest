@@ -367,7 +367,7 @@ proptest! {
                     // from this GC pass and survive into the next tick.
                     let checkpoint_extra = idx_before.saturating_sub(idx_pre_checkpoint);
 
-                    let gc_stats = gc_fork(fork_dir, &gc_config, repack_ulid, sweep_ulid);
+                    let gc_stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, repack_ulid, sweep_ulid);
 
                     // Volume applies the handoff: re-signs gc body, updates extent
                     // index, writes index/<new>.idx, deletes index/<old>.idx.
@@ -589,7 +589,7 @@ proptest! {
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
 
                     // Step 1: real GC compaction (no-ops if nothing to compact).
-                    let _ = gc_fork(fork_dir, &gc_config, repack_ulid, sweep_ulid);
+                    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, repack_ulid, sweep_ulid);
 
                     // Step 2: volume re-signs GC output, updates extent index.
                     let _ = vol.apply_gc_handoffs();
@@ -705,7 +705,7 @@ fn gc_oracle_repro_bug_h() {
     // (S1, is_body=false, fd→pending/S1).
     simulate_upload(&mut vol, fork_dir);
     let (r, s) = vol.gc_checkpoint_for_test().unwrap();
-    let _ = gc_fork(fork_dir, &gc_config, r, s);
+    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, r, s);
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
@@ -723,7 +723,7 @@ fn gc_oracle_repro_bug_h() {
     // holds the stale fd to pending/S1.
     simulate_upload(&mut vol, fork_dir);
     let (r, s) = vol.gc_checkpoint_for_test().unwrap();
-    let _ = gc_fork(fork_dir, &gc_config, r, s);
+    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, r, s);
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
@@ -781,7 +781,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     // Op 2: GcSweep.
     simulate_upload(&mut vol, fork_dir);
     let (r, s) = vol.gc_checkpoint_for_test().unwrap();
-    let _ = gc_fork(fork_dir, &gc_config, r, s);
+    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, r, s);
     let applied_1 = vol.apply_gc_handoffs().unwrap();
     eprintln!("apply_1 applied={applied_1}");
     eprintln!("gc/ after apply_1: [{}]", list_dir(&gc_dir).join(", "));
@@ -805,7 +805,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         list_dir(&index_dir).join(", ")
     );
     let (r, s) = vol.gc_checkpoint_for_test().unwrap();
-    let stats_2 = gc_fork(fork_dir, &gc_config, r, s).unwrap();
+    let stats_2 = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, r, s).unwrap();
     eprintln!(
         "stats_2: strategy={:?} candidates={} deferred={}",
         stats_2.strategy, stats_2.candidates, stats_2.deferred
