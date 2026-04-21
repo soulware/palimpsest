@@ -43,6 +43,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let gc_config = config.gc.clone();
     let socket_path = config.resolved_socket_path();
     let data_dir = Arc::new(config.data_dir.clone());
+    let child_env: supervisor::ChildEnv = Arc::new(config.store.child_env());
 
     info!(
         "[coordinator] data_dir: {}; drain every {}s, scan every {}s; elide bin: {}",
@@ -161,6 +162,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                         vol_dir,
                         data_dir.as_ref().clone(),
                         elide_bin.clone(),
+                        child_env.clone(),
                     ));
                 }
             }

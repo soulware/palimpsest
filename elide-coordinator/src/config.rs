@@ -14,6 +14,13 @@
 //   # bucket   = "my-elide-bucket"
 //   # endpoint = "https://s3.amazonaws.com"  # optional; omit for AWS default
 //   # region   = "us-east-1"                 # optional; falls back to AWS_DEFAULT_REGION
+//   #
+//   # Access keys are NOT configured here — they are read from the usual
+//   # AWS env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) by both
+//   # the coordinator and the spawned volume subprocesses. The coordinator
+//   # exports `ELIDE_S3_BUCKET`, `AWS_ENDPOINT_URL`, and `AWS_DEFAULT_REGION`
+//   # into each volume subprocess so only coordinator.toml needs to be set
+//   # — no per-volume `fetch.toml` required for a uniform store.
 //
 //   [drain]
 //   interval_secs      = 5    # how often each fork is checked for pending segments
@@ -113,6 +120,30 @@ pub struct StoreSection {
 }
 
 impl StoreSection {
+    /// Env vars to export into spawned volume subprocesses so the volume's
+    /// fetcher picks up the same store config as the coordinator without
+    /// requiring the operator to also set env vars on the parent shell or
+    /// drop a `fetch.toml` into every volume directory.
+    ///
+    /// Only the non-secret settings are exported — access keys still come
+    /// from the coordinator's own env (`AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY`) and are inherited by the subprocess. Local
+    /// store mode returns an empty list; the volume's fallback to
+    /// `./elide_store` handles that case.
+    pub fn child_env(&self) -> Vec<(&'static str, String)> {
+        let mut env = Vec::new();
+        if let Some(bucket) = &self.bucket {
+            env.push(("ELIDE_S3_BUCKET", bucket.clone()));
+            if let Some(ep) = &self.endpoint {
+                env.push(("AWS_ENDPOINT_URL", ep.clone()));
+            }
+            if let Some(region) = &self.region {
+                env.push(("AWS_DEFAULT_REGION", region.clone()));
+            }
+        }
+        env
+    }
+
     pub fn build(&self) -> Result<Arc<dyn ObjectStore>> {
         if let Some(path) = &self.local_path {
             std::fs::create_dir_all(path)
@@ -223,5 +254,75 @@ impl Default for CoordinatorConfig {
             elide_import_bin: default_elide_import_bin(),
             gc: GcConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_env_empty_for_local_store() {
+        let store = StoreSection {
+            local_path: Some(PathBuf::from("/tmp/whatever")),
+            ..StoreSection::default()
+        };
+        assert!(store.child_env().is_empty());
+    }
+
+    #[test]
+    fn child_env_empty_when_unset() {
+        let store = StoreSection::default();
+        assert!(store.child_env().is_empty());
+    }
+
+    #[test]
+    fn child_env_exports_bucket_endpoint_region() {
+        let store = StoreSection {
+            bucket: Some("elide-test".into()),
+            endpoint: Some("https://t3.storage.dev".into()),
+            region: Some("auto".into()),
+            local_path: None,
+        };
+        let env = store.child_env();
+        assert_eq!(
+            env,
+            vec![
+                ("ELIDE_S3_BUCKET", "elide-test".to_owned()),
+                ("AWS_ENDPOINT_URL", "https://t3.storage.dev".to_owned()),
+                ("AWS_DEFAULT_REGION", "auto".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn child_env_bucket_only_omits_optional_fields() {
+        let store = StoreSection {
+            bucket: Some("elide-test".into()),
+            endpoint: None,
+            region: None,
+            local_path: None,
+        };
+        let env = store.child_env();
+        assert_eq!(env, vec![("ELIDE_S3_BUCKET", "elide-test".to_owned())]);
+    }
+
+    #[test]
+    fn parses_toml_with_store_section() {
+        let toml_str = r#"
+            data_dir = "elide_data"
+
+            [store]
+            bucket = "elide-test"
+            endpoint = "https://t3.storage.dev"
+            region = "auto"
+        "#;
+        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.store.bucket.as_deref(), Some("elide-test"));
+        assert_eq!(
+            cfg.store.endpoint.as_deref(),
+            Some("https://t3.storage.dev")
+        );
+        assert_eq!(cfg.store.region.as_deref(), Some("auto"));
     }
 }
