@@ -506,7 +506,7 @@ async fn reclaim_volume(vol_name: &str, data_dir: &Path) -> String {
         return format!("err volume '{vol_name}' is not running — start it first");
     }
     info!("[reclaim {vol_name}] starting pass");
-    match elide_coordinator::control::reclaim(&fork_dir).await {
+    match elide_coordinator::control::reclaim(&fork_dir, None).await {
         Some(stats) => {
             info!(
                 "[reclaim {vol_name}] done: scanned={} runs_rewritten={} bytes_rewritten={} discarded={}",

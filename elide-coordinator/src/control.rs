@@ -230,19 +230,29 @@ pub struct ReclaimIpcStats {
     pub discarded: usize,
 }
 
-/// Run a full alias-merge extent reclamation pass on the volume.
+/// Run an alias-merge extent reclamation pass on the volume.
 ///
-/// The volume-side handler does the complete scan-and-execute sequence
-/// against the current ArcSwap snapshot: no arguments, default thresholds,
-/// most-wasteful candidates first. Heavy work (fetch / hash / compress)
-/// runs outside the actor thread, so NBD writes are not blocked for
-/// the full duration of the pass.
+/// The volume-side handler scans for bloated-hash candidates using
+/// default thresholds (most-wasteful first) and rewrites them via the
+/// three-phase primitive. Heavy work (fetch / hash / compress) runs off
+/// the actor thread; NBD writes are not blocked for the pass duration.
+///
+/// `cap` bounds how many candidates the handler will process in this
+/// call:
+/// * `None` — unlimited (CLI / ad-hoc full-sweep).
+/// * `Some(n)` — process at most `n`; any remaining candidates are
+///   picked up on the next call. Tick-loop callers pass a small cap
+///   (typically `1`) to bound per-tick latency.
 ///
 /// Returns `Some(stats)` on success. Returns `None` if the socket is
 /// absent (volume not running) or the call fails — callers decide
 /// whether to surface that as an error or a "nothing to reclaim".
-pub async fn reclaim(fork_dir: &Path) -> Option<ReclaimIpcStats> {
-    let response = call(fork_dir, "reclaim").await?;
+pub async fn reclaim(fork_dir: &Path, cap: Option<u32>) -> Option<ReclaimIpcStats> {
+    let req = match cap {
+        Some(n) => format!("reclaim {n}"),
+        None => "reclaim".to_string(),
+    };
+    let response = call(fork_dir, &req).await?;
     let rest = match response.strip_prefix("ok ") {
         Some(r) => r.trim(),
         None => {

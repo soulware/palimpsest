@@ -251,6 +251,21 @@ pub async fn run_volume_tasks(
                 );
             }
 
+            // Alias-merge extent reclamation: rewrites LBA sub-ranges of
+            // bloated hashes (partial-overwrite survivors) into fresh
+            // compact entries. One candidate per tick caps per-tick
+            // latency; the scanner sorts most-wasteful-first, so
+            // sustained bloat converges across ticks. Default scanner
+            // thresholds gate tiny / weakly-bloated hashes out.
+            if let Some(s) = control::reclaim(&fork_dir, Some(1)).await
+                && s.runs_rewritten > 0
+            {
+                info!(
+                    "[drain {volume_id}] reclaim: scanned={} runs={} bytes={} discarded={}",
+                    s.candidates_scanned, s.runs_rewritten, s.bytes_rewritten, s.discarded,
+                );
+            }
+
             // Phase 5 Tier 1: rewrite post-snapshot pending segments with
             // zstd-dictionary deltas against same-LBA extents from the latest
             // sealed snapshot. Runs before drain so converted segments reach

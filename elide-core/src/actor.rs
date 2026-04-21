@@ -705,7 +705,13 @@ impl VolumeActor {
         lba_length: u32,
         reply: Sender<io::Result<ReclaimOutcome>>,
     ) {
-        let job = self.volume.prepare_reclaim(start_lba, lba_length);
+        let job = match self.volume.prepare_reclaim(start_lba, lba_length) {
+            Ok(j) => j,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::Reclaim(job)) {
                 warn!("worker channel closed during reclaim: {e}");
@@ -2622,27 +2628,90 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
 // Reclaim worker execution
 // ---------------------------------------------------------------------------
 
-/// Read a hash's full stored body via the extent index snapshot.
-///
-/// Returns `Ok(Some(bytes))` for Data/Inline entries, with the bytes
-/// fully decompressed if the stored body was compressed. Returns
-/// `Ok(None)` for Delta-backed hashes — reclaim skips those because
-/// rewriting would re-materialise the body as DATA and lose the delta
-/// saving (see `docs/design-extent-reclamation.md § Open questions`).
-/// Returns `Err` for I/O failures or corruption.
-fn read_reclaim_extent_body(
-    extent_index: &ExtentIndex,
+/// zstd level for re-delta'd reclaim outputs. Mirrors the import-time
+/// `delta_compute::ZSTD_LEVEL`; reclaim runs off-actor and the blob is
+/// fetched infrequently, so a middling level keeps compression time
+/// bounded without sacrificing ratio.
+const RECLAIM_ZSTD_LEVEL: i32 = 3;
+
+/// What the reclaim worker has to work with for a single hash sitting
+/// inside the target range.
+enum ReclaimBody {
+    /// Rematerialised bytes for a Data or Inline hash. Slice the live
+    /// sub-range, rehash, compress, emit `Data`/`Inline`/`DedupRef`.
+    Data(Vec<u8>),
+    /// A Delta hash the worker was able to decompress locally. The
+    /// live sub-range is re-compressed against `source_plain` (zstd
+    /// dictionary) to produce a smaller delta blob and emitted as a
+    /// fresh `Delta` entry carrying one option for `source_hash`.
+    Delta {
+        source_hash: blake3::Hash,
+        source_plain: Vec<u8>,
+        fragment: Vec<u8>,
+    },
+    /// No locally-resolvable body or source — skip this entry. For a
+    /// Delta hash this happens when no option's source resolves in the
+    /// local extent index, or the source body / delta blob is missing
+    /// from all search dirs. Reclaim is best-effort; we never
+    /// demand-fetch and never rehydrate a Delta as Data.
+    Skip,
+}
+
+/// Read the full stored bytes (fully decompressed) for a Data or Inline
+/// hash via the extent index snapshot.
+fn read_full_extent_body(
+    loc: &crate::extentindex::ExtentLocation,
     search_dirs: &[PathBuf],
-    hash: &blake3::Hash,
-) -> io::Result<Option<Vec<u8>>> {
-    if let Some(loc) = extent_index.lookup(hash) {
-        let raw = if let Some(ref idata) = loc.inline_data {
-            if loc.compressed {
-                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
-            } else {
-                idata.to_vec()
-            }
+) -> io::Result<Vec<u8>> {
+    if let Some(ref idata) = loc.inline_data {
+        return if loc.compressed {
+            lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
         } else {
+            Ok(idata.to_vec())
+        };
+    }
+    let mut found = None;
+    for dir in search_dirs {
+        if let Some(hit) = segment::locate_segment_body(dir, loc.segment_id) {
+            found = Some(hit);
+            break;
+        }
+    }
+    let (path, layout) = found.ok_or_else(|| {
+        io::Error::other(format!(
+            "reclaim: segment {} not found in search dirs",
+            loc.segment_id
+        ))
+    })?;
+    let seek = layout.body_seek(loc);
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&path)?;
+    f.seek(SeekFrom::Start(seek))?;
+    let mut buf = vec![0u8; loc.body_length as usize];
+    f.read_exact(&mut buf)?;
+    if loc.compressed {
+        lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
+    } else {
+        Ok(buf)
+    }
+}
+
+/// Read a delta blob from the segment identified by `loc`.
+///
+/// Returns `Ok(None)` if the delta body file cannot be located in any
+/// of `search_dirs` — the worker has no fetcher attached and must not
+/// reach out to S3 just to seed a dictionary rewrite.
+fn read_delta_blob(
+    loc: &crate::extentindex::DeltaLocation,
+    option: &segment::DeltaOption,
+    search_dirs: &[PathBuf],
+) -> io::Result<Option<Vec<u8>>> {
+    use std::io::{Read, Seek, SeekFrom};
+    match loc.body_source {
+        crate::extentindex::DeltaBodySource::Full {
+            body_section_start,
+            body_length,
+        } => {
             let mut found = None;
             for dir in search_dirs {
                 if let Some(hit) = segment::locate_segment_body(dir, loc.segment_id) {
@@ -2650,28 +2719,72 @@ fn read_reclaim_extent_body(
                     break;
                 }
             }
-            let (path, layout) = found.ok_or_else(|| {
-                io::Error::other(format!(
-                    "reclaim: segment {} not found in search dirs",
-                    loc.segment_id
-                ))
-            })?;
-            let seek = layout.body_seek(loc);
-            use std::io::{Read, Seek, SeekFrom};
+            let Some((path, _layout)) = found else {
+                return Ok(None);
+            };
             let mut f = std::fs::File::open(&path)?;
+            let seek = body_section_start + body_length + option.delta_offset;
             f.seek(SeekFrom::Start(seek))?;
-            let mut buf = vec![0u8; loc.body_length as usize];
+            let mut buf = vec![0u8; option.delta_length as usize];
             f.read_exact(&mut buf)?;
-            if loc.compressed {
-                lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?
-            } else {
-                buf
+            Ok(Some(buf))
+        }
+        crate::extentindex::DeltaBodySource::Cached => {
+            let sid = loc.segment_id.to_string();
+            for dir in search_dirs {
+                let delta_path = dir.join("cache").join(format!("{sid}.delta"));
+                if delta_path.exists() {
+                    let mut f = std::fs::File::open(&delta_path)?;
+                    f.seek(SeekFrom::Start(option.delta_offset))?;
+                    let mut buf = vec![0u8; option.delta_length as usize];
+                    f.read_exact(&mut buf)?;
+                    return Ok(Some(buf));
+                }
             }
-        };
-        return Ok(Some(raw));
+            Ok(None)
+        }
     }
-    if extent_index.lookup_delta(hash).is_some() {
-        return Ok(None);
+}
+
+/// Resolve what reclaim can do with `hash` locally.
+///
+/// - Data/Inline hash in the extent index → `ReclaimBody::Data(bytes)`.
+/// - Delta hash with at least one option whose `source_hash` resolves
+///   as Data/Inline locally and whose delta blob file is findable →
+///   `ReclaimBody::Delta { .. }`.
+/// - Delta hash with no resolvable source/blob → `ReclaimBody::Skip`.
+/// - Hash absent from the extent index entirely → `Err`.
+fn read_reclaim_extent_body(
+    extent_index: &ExtentIndex,
+    search_dirs: &[PathBuf],
+    hash: &blake3::Hash,
+) -> io::Result<ReclaimBody> {
+    if let Some(loc) = extent_index.lookup(hash) {
+        return Ok(ReclaimBody::Data(read_full_extent_body(loc, search_dirs)?));
+    }
+    if let Some(delta_loc) = extent_index.lookup_delta(hash) {
+        // Source selection: first option whose `source_hash` resolves
+        // as Data/Inline and whose source body + delta blob are both
+        // locally readable. Mirrors `try_read_delta_extent`'s "first
+        // resolved option wins" rule — keeps the output delta shape
+        // aligned with the shape a concurrent reader would pick.
+        for option in &delta_loc.options {
+            let Some(source_loc) = extent_index.lookup(&option.source_hash) else {
+                continue;
+            };
+            let source_plain = read_full_extent_body(source_loc, search_dirs)?;
+            let Some(delta_blob) = read_delta_blob(delta_loc, option, search_dirs)? else {
+                // Delta blob file missing locally — try the next option.
+                continue;
+            };
+            let fragment = crate::delta_compute::apply_delta(&source_plain, &delta_blob)?;
+            return Ok(ReclaimBody::Delta {
+                source_hash: option.source_hash,
+                source_plain,
+                fragment,
+            });
+        }
+        return Ok(ReclaimBody::Skip);
     }
     Err(io::Error::other(format!(
         "reclaim: hash {} not in extent index (data, inline, or delta)",
@@ -2697,13 +2810,18 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     // the same hash inside the target share one full-map walk.
     let mut decision: std::collections::HashMap<blake3::Hash, bool> =
         std::collections::HashMap::new();
-    // Cache decompressed bodies per hash so multiple in-range runs of
-    // the same hash share one file read + decompress.
-    let mut body_cache: std::collections::HashMap<blake3::Hash, Option<Vec<u8>>> =
+    // Cache per-hash resolved bodies so multiple in-range runs of the
+    // same hash share one file read + decompress. Skip entries are
+    // cached via the `Skip` variant to avoid retrying the resolve.
+    let mut body_cache: std::collections::HashMap<blake3::Hash, ReclaimBody> =
         std::collections::HashMap::new();
 
     let mut entries: Vec<segment::SegmentEntry> = Vec::new();
     let mut uncompressed_bytes: Vec<u64> = Vec::new();
+    // Delta blobs, concatenated in emission order. Offsets recorded on
+    // each emitted Delta entry are into this buffer; it becomes the
+    // segment's delta body section at write time.
+    let mut delta_body: Vec<u8> = Vec::new();
 
     for er in &job.entries {
         if er.hash == crate::volume::ZERO_HASH {
@@ -2717,66 +2835,227 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
             if !contained {
                 return false;
             }
-            runs.iter().any(|(_, _, offset)| *offset != 0)
+            // Bloat: at least one block inside the hash's logical body is
+            // no longer referenced by any live LBA. Mirror the scanner's
+            // criterion (`scan_reclaim_candidates`) so the two agree on
+            // "worth rewriting" — the previous `any run with
+            // payload_block_offset != 0` gate only caught middle
+            // overwrites and silently rejected tail overwrites that the
+            // scanner flagged.
+            let live_blocks: u64 = runs.iter().map(|(_, len, _)| *len as u64).sum();
+            let max_offset_end: u64 = runs
+                .iter()
+                .map(|(_, len, off)| *off as u64 + *len as u64)
+                .max()
+                .unwrap_or(0);
+            let logical_blocks = match job.extent_index_snapshot.lookup(&er.hash) {
+                Some(loc) if loc.inline_data.is_none() && !loc.compressed => {
+                    // Uncompressed Data: body_length is the exact logical
+                    // size in bytes. Divide to get blocks. Catches tail
+                    // overwrites where max_offset_end == live_blocks.
+                    loc.body_length as u64 / 4096
+                }
+                // Compressed Data, Inline, Delta-backed, or missing from
+                // the index: we don't have an exact logical-size signal,
+                // so max_offset_end is a conservative lower bound.
+                // Catches middle splits; misses pure tail overwrites of
+                // these shapes (rare in practice).
+                _ => max_offset_end,
+            };
+            live_blocks < logical_blocks
         });
         if !should_rewrite {
             continue;
         }
 
-        // Resolve the full decompressed body for this hash (cached).
-        let body_opt = match body_cache.get(&er.hash) {
-            Some(b) => b.as_ref(),
-            None => {
+        // Resolve the body / delta-source context for this hash (cached).
+        use std::collections::hash_map::Entry;
+        let resolved = match body_cache.entry(er.hash) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
                 let fetched = read_reclaim_extent_body(
                     &job.extent_index_snapshot,
                     &job.search_dirs,
                     &er.hash,
                 )?;
-                body_cache.insert(er.hash, fetched);
-                body_cache.get(&er.hash).unwrap().as_ref()
+                v.insert(fetched)
             }
-        };
-        let Some(body) = body_opt else {
-            // Delta-backed hash — skip (see open question #4).
-            continue;
         };
 
         let length_blocks = (er.range_end - er.range_start) as u32;
         let start = er.payload_block_offset as usize * 4096;
         let end = start + length_blocks as usize * 4096;
-        if body.len() < end {
-            return Err(io::Error::other(format!(
-                "reclaim: body for hash {} too short ({} < {end})",
-                er.hash.to_hex(),
-                body.len()
-            )));
-        }
-        let bytes = body[start..end].to_vec();
 
-        let new_hash = blake3::hash(&bytes);
-        // If the new hash is already canonical somewhere, emit a thin
-        // DedupRef; otherwise emit a fresh Data/Inline with compression.
-        if job.extent_index_snapshot.lookup(&new_hash).is_some() {
-            entries.push(segment::SegmentEntry::new_dedup_ref(
-                new_hash,
-                er.range_start,
-                length_blocks,
-            ));
-            uncompressed_bytes.push(bytes.len() as u64);
-            continue;
+        match resolved {
+            ReclaimBody::Skip => continue,
+            ReclaimBody::Data(body) => {
+                if body.len() < end {
+                    return Err(io::Error::other(format!(
+                        "reclaim: body for hash {} too short ({} < {end})",
+                        er.hash.to_hex(),
+                        body.len()
+                    )));
+                }
+                let bytes = body[start..end].to_vec();
+                let new_hash = blake3::hash(&bytes);
+
+                // If the new hash is already canonical somewhere, emit a thin
+                // DedupRef — cheapest possible output, strictly beats any Delta.
+                if job.extent_index_snapshot.lookup(&new_hash).is_some() {
+                    entries.push(segment::SegmentEntry::new_dedup_ref(
+                        new_hash,
+                        er.range_start,
+                        length_blocks,
+                    ));
+                    uncompressed_bytes.push(bytes.len() as u64);
+                    continue;
+                }
+
+                // When H's body is going to stick around regardless of
+                // this reclaim, emitting a thin Delta against H is a
+                // strict win over a fresh body: the sliced sub-range is
+                // a literal substring of H, so `zstd_compress(sub, dict=H)`
+                // is typically a few hundred bytes (a dict reference)
+                // versus a few KB for a fresh lz4'd body.
+                //
+                // Two independent signals that H will stick around:
+                // 1. H's segment is pinned by the current snapshot
+                //    (segment_id <= snapshot_floor_ulid). Snapshot-
+                //    referenced segments cannot be rewritten or dropped
+                //    for the lifetime of the snapshot — a much stickier
+                //    pin than delta-source refcount, which dynamically
+                //    tracks live Delta LBAs.
+                // 2. H is already serving as a delta source for some
+                //    other live entry (delta_source_refcount > 0).
+                //    `lba_referenced_hashes` keeps H alive as long as
+                //    any such Delta remains on the volume.
+                //
+                // If neither holds, H would be orphaned by this reclaim
+                // and GC would drop its body on the next pass; pinning
+                // H via our own Delta would trade "drop H's body" for
+                // "keep it forever" — net loss.
+                //
+                // Size guard: if zstd isn't smaller than the raw sub-range,
+                // fall through to Data. The guard also protects against
+                // pathological inputs where the sub-range and H's body
+                // happen to be the same bytes (zero bloat, no reclaim
+                // should have been attempted).
+                let pre_snapshot_h = match (
+                    job.snapshot_floor_ulid,
+                    job.extent_index_snapshot.lookup(&er.hash),
+                ) {
+                    (Some(floor), Some(loc)) => loc.segment_id <= floor,
+                    _ => false,
+                };
+                let source_pinned =
+                    pre_snapshot_h || job.lbamap_snapshot.delta_source_refcount(&er.hash) > 0;
+                if source_pinned {
+                    let delta_blob =
+                        zstd::bulk::Compressor::with_dictionary(RECLAIM_ZSTD_LEVEL, body)
+                            .map_err(|e| {
+                                io::Error::other(format!("reclaim zstd compressor init: {e}"))
+                            })?
+                            .compress(&bytes)
+                            .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
+                    if delta_blob.len() < bytes.len() {
+                        let delta_offset = delta_body.len() as u64;
+                        let delta_length = delta_blob.len() as u32;
+                        let delta_hash = blake3::hash(&delta_blob);
+                        delta_body.extend_from_slice(&delta_blob);
+
+                        entries.push(segment::SegmentEntry::new_delta(
+                            new_hash,
+                            er.range_start,
+                            length_blocks,
+                            vec![segment::DeltaOption {
+                                source_hash: er.hash,
+                                delta_offset,
+                                delta_length,
+                                delta_hash,
+                            }],
+                        ));
+                        uncompressed_bytes.push(bytes.len() as u64);
+                        continue;
+                    }
+                    // delta_blob wasn't smaller — fall through to Data.
+                }
+
+                let (stored_body, flags) = match crate::volume::maybe_compress(&bytes) {
+                    Some(c) => (c, segment::SegmentFlags::COMPRESSED),
+                    None => (bytes.clone(), segment::SegmentFlags::empty()),
+                };
+                entries.push(segment::SegmentEntry::new_data(
+                    new_hash,
+                    er.range_start,
+                    length_blocks,
+                    flags,
+                    stored_body,
+                ));
+                uncompressed_bytes.push(bytes.len() as u64);
+            }
+            ReclaimBody::Delta {
+                source_hash,
+                source_plain,
+                fragment,
+            } => {
+                if fragment.len() < end {
+                    return Err(io::Error::other(format!(
+                        "reclaim: delta fragment for hash {} too short ({} < {end})",
+                        er.hash.to_hex(),
+                        fragment.len()
+                    )));
+                }
+                let bytes = &fragment[start..end];
+                let new_hash = blake3::hash(bytes);
+
+                // If the new hash is already canonical somewhere, prefer a
+                // thin DedupRef — a DATA entry is cheaper to read than a
+                // Delta when the body exists.
+                if job.extent_index_snapshot.lookup(&new_hash).is_some() {
+                    entries.push(segment::SegmentEntry::new_dedup_ref(
+                        new_hash,
+                        er.range_start,
+                        length_blocks,
+                    ));
+                    uncompressed_bytes.push(bytes.len() as u64);
+                    continue;
+                }
+
+                // Re-delta the sliced sub-range against the same source
+                // we just used to decompress. If the resulting blob
+                // isn't smaller than the raw sub-range bytes, skip — a
+                // bigger-delta entry would be a net loss on every read
+                // path.
+                let delta_blob =
+                    zstd::bulk::Compressor::with_dictionary(RECLAIM_ZSTD_LEVEL, source_plain)
+                        .map_err(|e| {
+                            io::Error::other(format!("reclaim zstd compressor init: {e}"))
+                        })?
+                        .compress(bytes)
+                        .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
+                if delta_blob.len() >= bytes.len() {
+                    continue;
+                }
+
+                let delta_offset = delta_body.len() as u64;
+                let delta_length = delta_blob.len() as u32;
+                let delta_hash = blake3::hash(&delta_blob);
+                delta_body.extend_from_slice(&delta_blob);
+
+                entries.push(segment::SegmentEntry::new_delta(
+                    new_hash,
+                    er.range_start,
+                    length_blocks,
+                    vec![segment::DeltaOption {
+                        source_hash: *source_hash,
+                        delta_offset,
+                        delta_length,
+                        delta_hash,
+                    }],
+                ));
+                uncompressed_bytes.push(bytes.len() as u64);
+            }
         }
-        let (stored_body, flags) = match crate::volume::maybe_compress(&bytes) {
-            Some(c) => (c, segment::SegmentFlags::COMPRESSED),
-            None => (bytes.clone(), segment::SegmentFlags::empty()),
-        };
-        entries.push(segment::SegmentEntry::new_data(
-            new_hash,
-            er.range_start,
-            length_blocks,
-            flags,
-            stored_body,
-        ));
-        uncompressed_bytes.push(bytes.len() as u64);
     }
 
     if entries.is_empty() {
@@ -2784,18 +3063,39 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
             lbamap_snapshot: job.lbamap_snapshot,
             segment_ulid: job.segment_ulid,
             body_section_start: 0,
+            body_length: 0,
             entries: Vec::new(),
             segment_written: false,
             pending_dir: job.pending_dir,
         });
     }
 
-    let body_section_start = segment::write_and_commit(
-        &job.pending_dir,
-        job.segment_ulid,
-        &mut entries,
-        job.signer.as_ref(),
-    )?;
+    // Write the segment. Tmp + rename gives us the same commit point
+    // `segment::write_and_commit` provides for delta-free reclaim.
+    let ulid_str = job.segment_ulid.to_string();
+    let tmp_path = job.pending_dir.join(format!("{ulid_str}.tmp"));
+    let final_path = job.pending_dir.join(&ulid_str);
+    let body_section_start = if delta_body.is_empty() {
+        segment::write_segment(&tmp_path, &mut entries, job.signer.as_ref())?
+    } else {
+        segment::write_segment_with_delta_body(
+            &tmp_path,
+            &mut entries,
+            &delta_body,
+            job.signer.as_ref(),
+        )?
+    };
+    fs::rename(&tmp_path, &final_path)?;
+    segment::fsync_dir(&final_path)?;
+
+    // body_length = sum of stored_length over entries that contribute
+    // to the body section (Data + CanonicalData). Delta, DedupRef, and
+    // Inline entries do not.
+    let body_length: u64 = entries
+        .iter()
+        .filter(|e| e.kind.is_data())
+        .map(|e| e.stored_length as u64)
+        .sum();
 
     let reclaimed: Vec<ReclaimedEntry> = entries
         .into_iter()
@@ -2810,6 +3110,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
         lbamap_snapshot: job.lbamap_snapshot,
         segment_ulid: job.segment_ulid,
         body_section_start,
+        body_length,
         entries: reclaimed,
         segment_written: true,
         pending_dir: job.pending_dir,

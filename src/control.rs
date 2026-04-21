@@ -267,25 +267,45 @@ fn handle_connection(
                 let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
             }
         }
-    } else if line == "reclaim" {
+    } else if line == "reclaim" || line.starts_with("reclaim ") {
         // End-to-end alias-merge pass over the whole volume:
         //   1. Scan the current snapshot for bloated-hash candidates.
         //   2. Reclaim each candidate (most-wasteful-first) via the
         //      three-phase primitive.
-        // No args: the volume uses default thresholds. No locks taken
-        // by this handler thread — the primitive does its own
-        // short-critical-section work on the actor thread.
         //
-        // Returns "ok <candidates_scanned> <runs_rewritten> <bytes_rewritten> <discarded>".
+        // Accepts an optional cap:
+        //   "reclaim"      — unlimited (CLI / ad-hoc use).
+        //   "reclaim <N>"  — process at most N candidates (per-tick use).
+        //
+        // No locks taken by this handler thread — the primitive does its
+        // own short-critical-section work on the actor thread.
+        //
+        // Returns "ok <candidates_scanned> <runs_rewritten> <bytes_rewritten> <discarded>"
+        // where `candidates_scanned` counts how many the scanner found
+        // (not how many the cap let us process).
+        let cap: Option<usize> = match line.strip_prefix("reclaim ") {
+            None => None,
+            Some(rest) => match rest.trim().parse::<usize>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    let _ = writeln!(writer, "err invalid reclaim cap: {rest}");
+                    return;
+                }
+            },
+        };
         let candidates =
             handle.reclaim_candidates(elide_core::volume::ReclaimThresholds::default());
         let scanned = candidates.len();
-        info!("[reclaim] scan found {scanned} candidate(s)");
+        info!("[reclaim] scan found {scanned} candidate(s), cap={cap:?}");
+        let to_process: Vec<_> = match cap {
+            Some(n) => candidates.into_iter().take(n).collect(),
+            None => candidates,
+        };
         let mut total_runs: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut discarded: u64 = 0;
         let mut io_err: Option<std::io::Error> = None;
-        for c in candidates {
+        for c in to_process {
             debug!(
                 "[reclaim] candidate lba={} len={} dead_blocks={} live_blocks={} stored_bytes={}",
                 c.start_lba, c.lba_length, c.dead_blocks, c.live_blocks, c.stored_bytes,
