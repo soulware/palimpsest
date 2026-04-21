@@ -186,6 +186,13 @@ enum VolumeCommand {
         /// Source: `<name>`, `<vol_ulid>`, or `<vol_ulid>/<snap_ulid>`
         #[arg(long)]
         from: String,
+        /// Upload a new "now" snapshot marker to the remote store and branch
+        /// from it, instead of relying on an existing snapshot. Required when
+        /// the source has no snapshot (e.g. recovering from a dead host).
+        /// With a live source writer, the forker owns the race: the owner's
+        /// GC may delete segments before observing the marker.
+        #[arg(long)]
+        force_snapshot: bool,
     },
 
     /// Create a new volume
@@ -214,6 +221,13 @@ enum VolumeCommand {
         /// default (nbd.sock inside the volume directory).
         #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
+        /// When forking: upload a new "now" snapshot marker to the remote
+        /// store and branch from it, instead of relying on an existing
+        /// snapshot. Required when the source has no snapshot (e.g.
+        /// recovering from a dead host). Conflicts with an explicit snapshot
+        /// pin in `--from <vol>/<snap>`.
+        #[arg(long, requires = "from")]
+        force_snapshot: bool,
     },
 
     /// Update configuration for a running volume
@@ -447,7 +461,11 @@ fn main() {
                 }
             },
 
-            VolumeCommand::Fork { fork_name, from } => {
+            VolumeCommand::Fork {
+                fork_name,
+                from,
+                force_snapshot,
+            } => {
                 if let Err(e) = validate_volume_name(&fork_name) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -459,6 +477,7 @@ fn main() {
                     &socket_path,
                     &by_id_dir,
                     None,
+                    force_snapshot,
                 ) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -472,6 +491,7 @@ fn main() {
                 nbd_port,
                 nbd_bind,
                 nbd_socket,
+                force_snapshot,
             } => {
                 let nbd = if let Some(path) = nbd_socket {
                     Some(elide_core::config::NbdConfig {
@@ -491,9 +511,15 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    if let Err(e) =
-                        create_fork(&args.data_dir, &name, from, &socket_path, &by_id_dir, nbd)
-                    {
+                    if let Err(e) = create_fork(
+                        &args.data_dir,
+                        &name,
+                        from,
+                        &socket_path,
+                        &by_id_dir,
+                        nbd,
+                        force_snapshot,
+                    ) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -618,6 +644,7 @@ fn main() {
                                 &socket_path,
                                 &by_id_dir,
                                 None,
+                                false,
                             )
                         {
                             eprintln!("error creating fork '{fork_name}': {e}");
@@ -1006,6 +1033,10 @@ fn create_volume(
 /// For writable volumes, an implicit snapshot is taken first. For readonly
 /// volumes (pulled or already local), the latest snapshot is discovered from
 /// the remote store. For explicit pins the caller already chose a snapshot.
+///
+/// `force_snapshot` (readonly sources only): upload a new "now" snapshot
+/// marker to the remote store and branch from it. Needed when the source
+/// has no existing snapshot. Conflicts with an explicit pin.
 fn create_fork(
     data_dir: &Path,
     fork_name: &str,
@@ -1013,6 +1044,7 @@ fn create_fork(
     socket_path: &Path,
     by_id_dir: &Path,
     nbd: Option<elide_core::config::NbdConfig>,
+    force_snapshot: bool,
 ) -> std::io::Result<()> {
     validate_volume_name(fork_name)?;
 
@@ -1042,6 +1074,12 @@ fn create_fork(
     } else {
         FromSpec::Name
     };
+
+    if force_snapshot && matches!(spec, FromSpec::ExplicitPin(..)) {
+        return Err(std::io::Error::other(
+            "--force-snapshot conflicts with an explicit snapshot pin in --from <vol>/<snap>",
+        ));
+    }
 
     // Resolve the source directory. Try local first; for ULID-based forms
     // fall back to auto-pulling from the remote store. For names, try local
@@ -1104,29 +1142,50 @@ fn create_fork(
         )));
     }
 
-    // Determine the snapshot ULID to branch from.
+    // Determine the snapshot ULID to branch from. For forker-attested "now"
+    // pins, also capture the ephemeral pubkey that signed the synthetic
+    // manifest so we can record it in the fork's provenance.
+    let mut parent_key_override: Option<elide_core::signing::VerifyingKey> = None;
     let snap_ulid: Option<ulid::Ulid> = match &spec {
         FromSpec::ExplicitPin(_, snap) => Some(*snap),
         _ if source_fork_dir.join("volume.readonly").exists() => {
-            // Readonly volume (pulled or already local). Prefer the local
-            // snapshots/ directory — it is always authoritative when present
-            // (e.g. after a local import). Fall back to the remote store
-            // only when snapshots/ is missing or empty (volume pulled from
-            // the store but coordinator hasn't prefetched yet).
-            if let Some(snap) = volume::latest_snapshot(&source_fork_dir)? {
+            // Readonly volume (pulled or already local). Canonicalize through
+            // any by_name/ symlink so file_name() returns the ULID, not the
+            // human volume name.
+            let real_dir = std::fs::canonicalize(&source_fork_dir)?;
+            let vol_id = pulled_vol_ulid.as_deref().unwrap_or_else(|| {
+                real_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("readonly dir must have a ULID name")
+            });
+            if force_snapshot {
+                // Forker-attested "now" snapshot: synthesize a signed manifest
+                // under an ephemeral key, mirror it locally in the readonly
+                // dir, and upload only the marker to S3 (for GC protection).
+                // The ephemeral pubkey is embedded in the fork's provenance
+                // below so the open-time ancestor walk can verify the manifest.
+                let config = load_fetch_config(socket_path, data_dir, vol_id)?;
+                let (snap, vk) = create_readonly_snapshot_now(&config, vol_id, &source_fork_dir)?;
+                parent_key_override = Some(vk);
+                Some(snap)
+            } else if let Some(snap) = volume::latest_snapshot(&source_fork_dir)? {
+                // Prefer the local snapshots/ directory — it is always
+                // authoritative when present (e.g. after a local import).
                 Some(snap)
             } else {
-                // Canonicalize through any by_name/ symlink so file_name()
-                // returns the ULID, not the human volume name.
-                let real_dir = std::fs::canonicalize(&source_fork_dir)?;
-                let vol_id = pulled_vol_ulid.as_deref().unwrap_or_else(|| {
-                    real_dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .expect("readonly dir must have a ULID name")
-                });
+                // Fall back to the remote store. Fail fast with a useful hint
+                // if no snapshot exists anywhere.
                 let config = load_fetch_config(socket_path, data_dir, vol_id)?;
-                Some(resolve_latest_remote_snapshot(&config, vol_id)?)
+                match resolve_latest_remote_snapshot(&config, vol_id) {
+                    Ok(snap) => Some(snap),
+                    Err(_) => {
+                        return Err(std::io::Error::other(format!(
+                            "source volume {vol_id} has no snapshots; pass \
+                             --force-snapshot to upload a new 'now' marker"
+                        )));
+                    }
+                }
             }
         }
         FromSpec::BareUlid(_) => {
@@ -1154,11 +1213,14 @@ fn create_fork(
         let _ = std::fs::remove_dir_all(new_fork_dir);
     };
 
-    match snap_ulid {
-        Some(snap) => {
+    match (snap_ulid, parent_key_override) {
+        (Some(snap), Some(vk)) => {
+            volume::fork_volume_at_with_manifest_key(&new_fork_dir, &source_fork_dir, snap, vk)?;
+        }
+        (Some(snap), None) => {
             volume::fork_volume_at(&new_fork_dir, &source_fork_dir, snap)?;
         }
-        None => {
+        (None, _) => {
             volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
         }
     }
@@ -1386,6 +1448,105 @@ fn resolve_latest_remote_snapshot(
             "volume {volume_id} has no snapshots in the remote store"
         ))
     })
+}
+
+/// Forker-attested "now" snapshot for a readonly source.
+///
+/// Creates a pin the forker stands behind without possessing the source
+/// owner's private key. Steps:
+///
+/// 1. Run a synchronous `prefetch_indexes` tick against `readonly_dir` so
+///    every S3 segment owned by the source has its `.idx` mirrored locally.
+///    The `.idx` signatures are verified against the source's `volume.pub`
+///    during prefetch — their integrity is not affected by this flow.
+/// 2. Pick the pin ULID: `max(Ulid::now(), max_seg_ulid.increment())`, so
+///    every prefetched segment falls at or below the pin.
+/// 3. Generate an ephemeral Ed25519 keypair.
+/// 4. Write a signed `.manifest` for the pin, listing every segment in
+///    `readonly_dir/index/`, into `readonly_dir/snapshots/<pin>.manifest`.
+///    The manifest is **not** uploaded — other hosts would try to verify it
+///    against the source's `volume.pub` and fail. The caller embeds the
+///    ephemeral pubkey in the fork's provenance so the fork's own open path
+///    has a matching trust anchor.
+/// 5. Write the empty marker locally and upload it to S3 (the marker is
+///    plain-file + anonymous, used only as a GC root).
+///
+/// Returns `(pin_ulid, ephemeral_pubkey)`.
+fn create_readonly_snapshot_now(
+    config: &elide_fetch::FetchConfig,
+    volume_id: &str,
+    readonly_dir: &Path,
+) -> std::io::Result<(ulid::Ulid, elide_core::signing::VerifyingKey)> {
+    use object_store::PutPayload;
+
+    let store = elide::build_object_store(config)
+        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Step 1: synchronous prefetch. Downloads any .idx not already present
+    // and verifies each under the source's volume.pub.
+    rt.block_on(async {
+        elide_coordinator::prefetch::prefetch_indexes(readonly_dir, &store).await
+    })
+    .map_err(|e| std::io::Error::other(format!("prefetching ancestor indexes: {e:#}")))?;
+
+    // Step 2: enumerate the freshly prefetched .idx files — these are the
+    // segments the pin covers. Compute max ULID for pin placement.
+    let index_dir = readonly_dir.join("index");
+    let mut segments: Vec<ulid::Ulid> = Vec::new();
+    let mut max_seg: Option<ulid::Ulid> = None;
+    for entry in std::fs::read_dir(&index_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".idx") else {
+            continue;
+        };
+        if let Ok(u) = ulid::Ulid::from_string(stem) {
+            segments.push(u);
+            if max_seg.is_none_or(|m| u > m) {
+                max_seg = Some(u);
+            }
+        }
+    }
+
+    let now = ulid::Ulid::new();
+    let snap = match max_seg {
+        None => now,
+        Some(m) => {
+            let above = m.increment().unwrap_or(m);
+            if now > above { now } else { above }
+        }
+    };
+    let snap_str = snap.to_string();
+
+    // Step 3: ephemeral key. Private half is dropped at end of scope; only
+    // the verifying key survives, returned to the caller for provenance.
+    let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+
+    // Step 4: signed manifest, local only.
+    elide_core::signing::write_snapshot_manifest(readonly_dir, &*signer, &snap, &segments)?;
+
+    // Step 5: empty marker, local + S3.
+    let snap_dir = readonly_dir.join("snapshots");
+    std::fs::create_dir_all(&snap_dir)?;
+    std::fs::write(snap_dir.join(&snap_str), b"")?;
+
+    rt.block_on(async {
+        let key = elide_coordinator::upload::snapshot_key(volume_id, &snap_str)
+            .map_err(|e| std::io::Error::other(format!("snapshot_key: {e}")))?;
+        store
+            .put(&key, PutPayload::from_static(b""))
+            .await
+            .map_err(|e| std::io::Error::other(format!("uploading snapshot marker: {e}")))?;
+        Ok::<_, std::io::Error>(())
+    })?;
+
+    eprintln!(
+        "attested now-snapshot {snap_str} for {volume_id} ({} segments)",
+        segments.len()
+    );
+    Ok((snap, vk))
 }
 
 /// Update configuration for a volume and restart it if running.

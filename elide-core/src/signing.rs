@@ -152,6 +152,15 @@ pub fn generate_ephemeral_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {
 /// parent's directory. Keys never rotate — if a volume's key needs to
 /// change, the operation is "fork the volume" — so the embedded value is
 /// authoritative for the lifetime of the child and all its descendants.
+///
+/// `manifest_pubkey`, when set, overrides `pubkey` for verifying the pinned
+/// `snapshots/<snap_ulid>.manifest` only. Used for forker-attested "now"
+/// pins (`volume fork --force-snapshot`), where the forker doesn't hold
+/// the parent's private key and instead signs the manifest with an
+/// ephemeral key. The parent's own `volume.provenance` and `.idx`
+/// signatures are still verified under `pubkey` (the real owner's key).
+/// When `None`, the same `pubkey` is used for both, matching the
+/// original single-key design.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentRef {
     /// ULID of the parent volume.
@@ -160,6 +169,9 @@ pub struct ParentRef {
     pub snapshot_ulid: String,
     /// Parent volume's Ed25519 verifying key at fork time (32 raw bytes).
     pub pubkey: [u8; 32],
+    /// Optional override key for verifying the pinned snapshot's
+    /// `.manifest`. See struct docs for use.
+    pub manifest_pubkey: Option<[u8; 32]>,
 }
 
 impl ParentRef {
@@ -280,9 +292,13 @@ fn sign_provenance(key: &SigningKey, lineage: &ProvenanceLineage) -> [u8; 64] {
 /// Signing input (NUL-separated, fixed field order):
 ///   parent_or_empty || NUL || parent_pubkey_hex_or_empty || NUL ||
 ///   entry_1 || NUL || entry_2 || NUL || … || entry_N
+///   [ || NUL || manifest_pubkey_hex ]  (only when Some)
 ///
-/// Empty `extent_index` contributes zero trailing entries (the input ends
-/// after the parent_pubkey field's terminating NUL).
+/// Empty `extent_index` contributes zero trailing entries. The optional
+/// `manifest_pubkey` suffix is only included when a parent is present and
+/// its `manifest_pubkey` field is `Some` — when absent, the signing input
+/// is byte-identical to the original single-key format, so existing
+/// provenance signatures continue to verify under the same input.
 fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
@@ -291,9 +307,17 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
         .as_ref()
         .map(|p| encode_hex(&p.pubkey))
         .unwrap_or_default();
+    let manifest_pubkey_hex = lineage
+        .parent
+        .as_ref()
+        .and_then(|p| p.manifest_pubkey.as_ref())
+        .map(|k| encode_hex(k));
     let mut total = parent_str.len() + 1 + parent_pubkey_hex.len() + lineage.extent_index.len();
     for entry in &lineage.extent_index {
         total += entry.len();
+    }
+    if let Some(ref hex) = manifest_pubkey_hex {
+        total += 1 + hex.len();
     }
     let mut msg = Vec::with_capacity(total);
     msg.extend_from_slice(parent_str.as_bytes());
@@ -302,6 +326,10 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     for entry in &lineage.extent_index {
         msg.push(0u8);
         msg.extend_from_slice(entry.as_bytes());
+    }
+    if let Some(hex) = manifest_pubkey_hex {
+        msg.push(0u8);
+        msg.extend_from_slice(hex.as_bytes());
     }
     msg
 }
@@ -314,6 +342,11 @@ fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
         .as_ref()
         .map(|p| encode_hex(&p.pubkey))
         .unwrap_or_default();
+    let manifest_pubkey_hex = lineage
+        .parent
+        .as_ref()
+        .and_then(|p| p.manifest_pubkey.as_ref())
+        .map(|k| encode_hex(k));
     let mut content = String::new();
     content.push_str("parent: ");
     content.push_str(parent_str);
@@ -321,6 +354,13 @@ fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
     content.push_str("parent_pubkey: ");
     content.push_str(&parent_pubkey_hex);
     content.push('\n');
+    // Only emit when set: absence on disk means "same key as pubkey", which
+    // keeps existing provenance files byte-identical under the new format.
+    if let Some(hex) = manifest_pubkey_hex {
+        content.push_str("parent_manifest_pubkey: ");
+        content.push_str(&hex);
+        content.push('\n');
+    }
     content.push_str("extent_index:\n");
     for entry in &lineage.extent_index {
         content.push_str("  ");
@@ -344,12 +384,17 @@ fn parse_provenance(
 ) -> io::Result<(ProvenanceLineage, Vec<u8>)> {
     let mut parent_str: Option<Option<String>> = None;
     let mut parent_pubkey_str: Option<Option<String>> = None;
+    let mut manifest_pubkey_str: Option<String> = None;
     let mut extent_index: Option<Vec<String>> = None;
     let mut sig: Option<Vec<u8>> = None;
 
     let mut lines = content.lines().peekable();
     while let Some(line) = lines.next() {
-        if let Some(v) = line.strip_prefix("parent_pubkey: ") {
+        if let Some(v) = line.strip_prefix("parent_manifest_pubkey: ") {
+            if !v.is_empty() {
+                manifest_pubkey_str = Some(v.to_owned());
+            }
+        } else if let Some(v) = line.strip_prefix("parent_pubkey: ") {
             parent_pubkey_str = Some(if v.is_empty() {
                 None
             } else {
@@ -397,7 +442,14 @@ fn parse_provenance(
     let sig = sig.ok_or_else(|| io::Error::other(format!("{provenance_file} missing sig line")))?;
 
     let parent = match (parent_str, parent_pubkey_str) {
-        (None, None) => None,
+        (None, None) => {
+            if manifest_pubkey_str.is_some() {
+                return Err(io::Error::other(format!(
+                    "{provenance_file} has parent_manifest_pubkey but no parent"
+                )));
+            }
+            None
+        }
         (Some(s), Some(hex)) => {
             let (volume_ulid, snapshot_ulid) = s.split_once('/').ok_or_else(|| {
                 io::Error::other(format!(
@@ -422,10 +474,23 @@ fn parse_provenance(
                     "{provenance_file} parent_pubkey wrong length (expected 64 hex chars)"
                 ))
             })?;
+            let manifest_pubkey = match manifest_pubkey_str {
+                None => None,
+                Some(hex) => {
+                    let bytes = decode_hex(&hex)?;
+                    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                        io::Error::other(format!(
+                            "{provenance_file} parent_manifest_pubkey wrong length (expected 64 hex chars)"
+                        ))
+                    })?;
+                    Some(arr)
+                }
+            };
             Some(ParentRef {
                 volume_ulid,
                 snapshot_ulid,
                 pubkey,
+                manifest_pubkey,
             })
         }
         (Some(_), None) => {

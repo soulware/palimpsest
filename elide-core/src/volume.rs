@@ -4562,12 +4562,24 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
                     current_parent.volume_ulid
                 ))
             })?;
+        // For forker-attested "now" pins the `.manifest` is signed by a
+        // different (ephemeral) key than the parent's identity. When set,
+        // use it for the manifest; fall back to the identity key otherwise.
+        let manifest_verifying = match current_parent.manifest_pubkey {
+            Some(bytes) => crate::signing::VerifyingKey::from_bytes(&bytes).map_err(|e| {
+                io::Error::other(format!(
+                    "invalid parent manifest pubkey in provenance for {}: {e}",
+                    current_parent.volume_ulid
+                ))
+            })?,
+            None => parent_verifying,
+        };
 
         let snap_ulid = Ulid::from_string(&current_parent.snapshot_ulid).map_err(|e| {
             io::Error::other(format!("invalid snapshot ULID in provenance parent: {e}"))
         })?;
         let segments =
-            crate::signing::read_snapshot_manifest(&parent_dir, &parent_verifying, &snap_ulid)?;
+            crate::signing::read_snapshot_manifest(&parent_dir, &manifest_verifying, &snap_ulid)?;
 
         let index_dir = parent_dir.join("index");
         for seg in &segments {
@@ -4581,8 +4593,8 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
         }
 
         // Advance to this ancestor's own parent (if any), verifying its
-        // provenance under the pubkey we already trust (from the previous
-        // child's embedded parent_pubkey).
+        // provenance under the identity key we already trust (from the
+        // previous child's embedded parent_pubkey).
         let parent_lineage = crate::signing::read_lineage_with_key(
             &parent_dir,
             &parent_verifying,
@@ -4724,6 +4736,39 @@ pub fn fork_volume_at(
     source_fork_dir: &Path,
     branch_ulid: Ulid,
 ) -> io::Result<()> {
+    fork_volume_at_inner(new_fork_dir, source_fork_dir, branch_ulid, None)
+}
+
+/// Like `fork_volume_at` but also records a `manifest_pubkey` override in
+/// the child's provenance. The parent's identity key (for verifying the
+/// ancestor's own `volume.provenance` and `.idx` signatures) is still
+/// loaded from the source's on-disk `volume.pub`; `manifest_pubkey` is
+/// used **only** for the pinned snapshot's `.manifest`.
+///
+/// Used by `volume fork --force-snapshot` when the forker doesn't hold the
+/// source owner's private key and instead signs the synthetic manifest
+/// with an ephemeral key. That ephemeral pubkey goes here; the ancestor's
+/// own artefacts continue to verify under the owner's key.
+pub fn fork_volume_at_with_manifest_key(
+    new_fork_dir: &Path,
+    source_fork_dir: &Path,
+    branch_ulid: Ulid,
+    manifest_pubkey: crate::signing::VerifyingKey,
+) -> io::Result<()> {
+    fork_volume_at_inner(
+        new_fork_dir,
+        source_fork_dir,
+        branch_ulid,
+        Some(manifest_pubkey),
+    )
+}
+
+fn fork_volume_at_inner(
+    new_fork_dir: &Path,
+    source_fork_dir: &Path,
+    branch_ulid: Ulid,
+    manifest_pubkey: Option<crate::signing::VerifyingKey>,
+) -> io::Result<()> {
     if new_fork_dir.exists() {
         return Err(io::Error::other(format!(
             "fork directory '{}' already exists",
@@ -4764,9 +4809,12 @@ pub fn fork_volume_at(
     // index is empty for forks — fork ancestry is a read-path relationship
     // tracked in `parent`, not a hash-pool relationship.
     //
-    // Embed the parent's current public key under the child's signature so
-    // the fork's open-time ancestor walk has a trust anchor for the parent's
-    // own signed artefacts — see `ParentRef` in signing.rs.
+    // Embed the parent's identity pubkey (loaded from the source's on-disk
+    // `volume.pub`) under the child's signature so the fork's open-time
+    // ancestor walk has a trust anchor for the parent's own signed
+    // artefacts — see `ParentRef` in signing.rs. If a manifest_pubkey was
+    // supplied (force-snapshot path), also embed it as a narrow override
+    // for the pinned `.manifest` only.
     let parent_pubkey =
         crate::signing::load_verifying_key(&source_real, crate::signing::VOLUME_PUB_FILE)?;
     let lineage = crate::signing::ProvenanceLineage {
@@ -4774,6 +4822,7 @@ pub fn fork_volume_at(
             volume_ulid: source_ulid.to_owned(),
             snapshot_ulid: branch_ulid.to_string(),
             pubkey: parent_pubkey.to_bytes(),
+            manifest_pubkey: manifest_pubkey.map(|k| k.to_bytes()),
         }),
         extent_index: Vec::new(),
     };
