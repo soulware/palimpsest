@@ -1459,25 +1459,38 @@ fn resolve_latest_remote_snapshot(
 ///    every S3 segment owned by the source has its `.idx` mirrored locally.
 ///    The `.idx` signatures are verified against the source's `volume.pub`
 ///    during prefetch — their integrity is not affected by this flow.
-/// 2. Pick the pin ULID: `max(Ulid::now(), max_seg_ulid.increment())`, so
-///    every prefetched segment falls at or below the pin.
-/// 3. Generate an ephemeral Ed25519 keypair.
-/// 4. Write a signed `.manifest` for the pin, listing every segment in
-///    `readonly_dir/index/`, into `readonly_dir/snapshots/<pin>.manifest`.
-///    The manifest is **not** uploaded — other hosts would try to verify it
-///    against the source's `volume.pub` and fail. The caller embeds the
-///    ephemeral pubkey in the fork's provenance so the fork's own open path
-///    has a matching trust anchor.
-/// 5. Write the empty marker locally and upload it to S3 (the marker is
-///    plain-file + anonymous, used only as a GC root).
+/// 2. Pick the pin ULID as `max_seg` — the highest segment ULID seen in the
+///    source. Pinning exactly what's observed in S3, not a wall-clock "now".
+///    Empty volumes fall back to `Ulid::new()` for a fresh marker ULID.
+/// 3. Upload the empty S3 marker to `by_id/<vol>/snapshots/<snap>`. The
+///    marker goes up *before* local state is written so any subsequent
+///    owner GC that observes it treats `snap` as a retention floor.
+/// 4. Re-list `by_id/<vol>/segments/` and confirm every pinned ULID is
+///    still present in S3. If any is missing, the owner's GC beat us to
+///    it — fail the pin (best-effort delete the stale marker) and surface
+///    the concrete missing ULIDs so the caller knows this isn't a retry
+///    candidate without a fresh `--force-snapshot`.
+/// 5. Load or create the per-source attestation key at
+///    `<readonly_dir>/force-snapshot.key`. Stable across invocations on
+///    this host: two fork invocations against the same source reuse the
+///    same key, so they sign byte-identical manifests and cannot clobber
+///    each other's provenance bindings.
+/// 6. Write the signed `.manifest` for the pin (listing every segment in
+///    `readonly_dir/index/`) and the empty local marker. The manifest is
+///    **not** uploaded — other hosts would try to verify it against the
+///    source's `volume.pub` and fail. The caller embeds the attestation
+///    pubkey in the fork's provenance so the fork's own open path has a
+///    matching trust anchor.
 ///
-/// Returns `(pin_ulid, ephemeral_pubkey)`.
+/// Returns `(pin_ulid, attestation_pubkey)`.
 fn create_readonly_snapshot_now(
     config: &elide_fetch::FetchConfig,
     volume_id: &str,
     readonly_dir: &Path,
 ) -> std::io::Result<(ulid::Ulid, elide_core::signing::VerifyingKey)> {
+    use futures::TryStreamExt;
     use object_store::PutPayload;
+    use object_store::path::Path as StorePath;
 
     let store = elide::build_object_store(config)
         .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
@@ -1491,7 +1504,8 @@ fn create_readonly_snapshot_now(
     .map_err(|e| std::io::Error::other(format!("prefetching ancestor indexes: {e:#}")))?;
 
     // Step 2: enumerate the freshly prefetched .idx files — these are the
-    // segments the pin covers. Compute max ULID for pin placement.
+    // segments the pin covers. Pin ULID = max(segments): we pin exactly
+    // what the source currently has in S3.
     let index_dir = readonly_dir.join("index");
     let mut segments: Vec<ulid::Ulid> = Vec::new();
     let mut max_seg: Option<ulid::Ulid> = None;
@@ -1510,37 +1524,82 @@ fn create_readonly_snapshot_now(
         }
     }
 
-    let now = ulid::Ulid::new();
+    // Ulid::new() here is deliberate — Ulid::default() is the nil ULID, not
+    // a fresh one, so unwrap_or_default would pin an all-zeros marker.
     let snap = match max_seg {
-        None => now,
-        Some(m) => {
-            let above = m.increment().unwrap_or(m);
-            if now > above { now } else { above }
-        }
+        Some(m) => m,
+        None => ulid::Ulid::new(),
     };
     let snap_str = snap.to_string();
 
-    // Step 3: ephemeral key. Private half is dropped at end of scope; only
-    // the verifying key survives, returned to the caller for provenance.
-    let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+    // Step 3 + 4: upload marker, then re-list segments and verify every
+    // pinned ULID is still in S3. Any missing ULIDs mean owner-side GC
+    // already deleted them — the pin is unreachable and we fail rather
+    // than produce a manifest whose reads will silently return zeros.
+    let marker_key = elide_coordinator::upload::snapshot_key(volume_id, &snap_str)
+        .map_err(|e| std::io::Error::other(format!("snapshot_key: {e}")))?;
+    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
+    let pinned: std::collections::HashSet<ulid::Ulid> = segments.iter().copied().collect();
 
-    // Step 4: signed manifest, local only.
+    rt.block_on(async {
+        store
+            .put(&marker_key, PutPayload::from_static(b""))
+            .await
+            .map_err(|e| std::io::Error::other(format!("uploading snapshot marker: {e}")))?;
+
+        let objects = store
+            .list(Some(&seg_prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| {
+                std::io::Error::other(format!("listing segments for verification: {e}"))
+            })?;
+        let present: std::collections::HashSet<ulid::Ulid> = objects
+            .iter()
+            .filter_map(|o| o.location.filename())
+            .filter_map(|name| ulid::Ulid::from_string(name).ok())
+            .collect();
+
+        let mut missing: Vec<ulid::Ulid> = pinned.difference(&present).copied().collect();
+        if !missing.is_empty() {
+            missing.sort();
+            // Best-effort cleanup: the marker pins a snapshot that isn't
+            // fully backed. Leaving it behind extends owner GC retention
+            // for no reason.
+            if let Err(e) = store.delete(&marker_key).await {
+                eprintln!("warning: failed to delete stale snapshot marker {snap_str}: {e}");
+            }
+            let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();
+            let extra = missing.len().saturating_sub(preview.len());
+            let suffix = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            return Err(std::io::Error::other(format!(
+                "force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
+                 (owner GC raced us); missing: [{}]{}",
+                missing.len(),
+                pinned.len(),
+                preview.join(", "),
+                suffix,
+            )));
+        }
+        Ok::<_, std::io::Error>(())
+    })?;
+
+    // Step 5: load-or-create the per-source attestation key.
+    let (signer, vk) = elide_core::signing::load_or_create_keypair(
+        readonly_dir,
+        elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
+        elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
+    )?;
+
+    // Step 6: signed manifest + local marker.
     elide_core::signing::write_snapshot_manifest(readonly_dir, &*signer, &snap, &segments)?;
-
-    // Step 5: empty marker, local + S3.
     let snap_dir = readonly_dir.join("snapshots");
     std::fs::create_dir_all(&snap_dir)?;
     std::fs::write(snap_dir.join(&snap_str), b"")?;
-
-    rt.block_on(async {
-        let key = elide_coordinator::upload::snapshot_key(volume_id, &snap_str)
-            .map_err(|e| std::io::Error::other(format!("snapshot_key: {e}")))?;
-        store
-            .put(&key, PutPayload::from_static(b""))
-            .await
-            .map_err(|e| std::io::Error::other(format!("uploading snapshot marker: {e}")))?;
-        Ok::<_, std::io::Error>(())
-    })?;
 
     eprintln!(
         "attested now-snapshot {snap_str} for {volume_id} ({} segments)",

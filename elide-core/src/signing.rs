@@ -62,6 +62,15 @@ pub const VOLUME_KEY_FILE: &str = "volume.key";
 pub const VOLUME_PUB_FILE: &str = "volume.pub";
 pub const VOLUME_PROVENANCE_FILE: &str = "volume.provenance";
 
+// Force-snapshot attestation key (local only, never uploaded). Lives in
+// `readonly/<src>/` and signs locally-generated `.manifest` files for
+// forker-attested "now" pins of a readonly source (`fork --force-snapshot`).
+// Persistent across invocations on the same host so multiple forks against
+// the same source share one attestation key and produce a single coherent
+// `<snap>.manifest`.
+pub const FORCE_SNAPSHOT_KEY_FILE: &str = "force-snapshot.key";
+pub const FORCE_SNAPSHOT_PUB_FILE: &str = "force-snapshot.pub";
+
 /// Suffix appended to a snapshot ULID to form the signed segments manifest
 /// filename, e.g. `snapshots/01ABC....manifest`.
 pub const SNAPSHOT_MANIFEST_SUFFIX: &str = ".manifest";
@@ -142,6 +151,25 @@ pub fn generate_ephemeral_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {
     (Arc::new(Ed25519Signer { key }), verifying_key)
 }
 
+/// Load the keypair at `dir/<key_file>`, or generate it (plus `<pub_file>`)
+/// if the key file does not yet exist. Returns `(signer, verifying_key)`.
+///
+/// Used for the `force-snapshot.key` / `.pub` pair on a readonly source:
+/// the first forker mints the keypair, subsequent forkers on the same host
+/// reuse it.
+pub fn load_or_create_keypair(
+    dir: &Path,
+    key_file: &str,
+    pub_file: &str,
+) -> io::Result<(Arc<dyn SegmentSigner>, VerifyingKey)> {
+    if dir.join(key_file).exists() {
+        return load_keypair(dir, key_file);
+    }
+    let key = generate_keypair(dir, key_file, pub_file)?;
+    let verifying_key = key.verifying_key();
+    Ok((Arc::new(Ed25519Signer { key }), verifying_key))
+}
+
 /// A reference to a specific snapshot of a parent volume, plus the
 /// parent's verifying key captured at fork time.
 ///
@@ -156,11 +184,13 @@ pub fn generate_ephemeral_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {
 /// `manifest_pubkey`, when set, overrides `pubkey` for verifying the pinned
 /// `snapshots/<snap_ulid>.manifest` only. Used for forker-attested "now"
 /// pins (`volume fork --force-snapshot`), where the forker doesn't hold
-/// the parent's private key and instead signs the manifest with an
-/// ephemeral key. The parent's own `volume.provenance` and `.idx`
-/// signatures are still verified under `pubkey` (the real owner's key).
-/// When `None`, the same `pubkey` is used for both, matching the
-/// original single-key design.
+/// the parent's private key and instead signs the manifest with a
+/// stable per-source key (`readonly/<src>/force-snapshot.key`) — shared
+/// across multiple forks on the same host so concurrent or sequential
+/// fork invocations produce one coherent manifest. The parent's own
+/// `volume.provenance` and `.idx` signatures are still verified under
+/// `pubkey` (the real owner's key). When `None`, the same `pubkey` is
+/// used for both, matching the original single-key design.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentRef {
     /// ULID of the parent volume.
