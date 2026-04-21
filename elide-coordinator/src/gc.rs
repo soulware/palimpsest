@@ -89,6 +89,14 @@ const SWEEP_LIVE_CAP: u64 = 32 * 1024 * 1024;
 /// no infinite re-pack loop.
 const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_LIVE_CAP / 2;
 
+/// Entry-count cap on the merged GC output. Mirrors the WAL's
+/// `FLUSH_ENTRY_THRESHOLD` (volume.rs) so GC outputs sit at the same scale
+/// as freshly-flushed segments — packing stops when either this cap or
+/// [`SWEEP_LIVE_CAP`] would be exceeded. Bounds the index region for
+/// dedup-heavy workloads where many thin entries would otherwise pack
+/// without advancing the byte budget.
+const SWEEP_ENTRY_CAP: usize = 8192;
+
 /// Which GC strategy was executed.
 #[derive(Debug, PartialEq)]
 pub enum GcStrategy {
@@ -302,14 +310,19 @@ pub fn gc_fork(
 
     let mut bucket: Vec<SegmentStats> = Vec::new();
     let mut budget = SWEEP_LIVE_CAP;
+    let mut entry_budget = SWEEP_ENTRY_CAP;
 
-    // Tier 0 — tombstone inputs. Free in body bytes; no budget effect.
+    // Tier 0 — tombstone inputs. Free in both body bytes and output entries
+    // (they emit `Drop` records, not fresh entries). No budget effect.
     bucket.append(&mut dead_inputs);
 
-    // Tier 1 — smalls, ascending. Greedy until the next won't fit.
+    // Tier 1 — smalls, ascending. Greedy until the next would exceed either
+    // the live-bytes budget or the output-entry budget.
     for s in small_inputs {
-        if s.live_lba_bytes <= budget {
+        let s_entries = s.estimated_output_entries();
+        if s.live_lba_bytes <= budget && s_entries <= entry_budget {
             budget -= s.live_lba_bytes;
+            entry_budget -= s_entries;
             bucket.push(s);
         }
     }
@@ -317,11 +330,15 @@ pub fn gc_fork(
     // Tier 2 — at most one sparse-large filler. Prefer lowest density
     // (maximum dead-byte reclamation per rewritten byte); tie-break by
     // largest live_lba_bytes (best fit for the remaining headroom).
+    // Filler must also fit the remaining entry budget.
     if budget > 0
+        && entry_budget > 0
         && let Some((pos, _)) = sparse_large
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.live_lba_bytes <= budget)
+            .filter(|(_, s)| {
+                s.live_lba_bytes <= budget && s.estimated_output_entries() <= entry_budget
+            })
             .min_by(|(_, a), (_, b)| {
                 a.density()
                     .partial_cmp(&b.density())
@@ -664,6 +681,25 @@ impl SegmentStats {
     /// and should be skipped.
     fn has_data_content(&self) -> bool {
         self.has_body_entries
+    }
+
+    /// Upper bound on the number of entries this input contributes to the
+    /// merged GC output. Each non-partial live entry produces one output
+    /// (Keep / Canonical / ZeroSplit). A partial-LBA-death entry expands
+    /// into one Run per surviving sub-run, plus an optional Canonical for
+    /// owned-body kinds (Data / Inline / Delta) — we treat that Canonical
+    /// as always present, which overestimates by at most one per partial
+    /// DedupRef. Tombstone-only inputs (no live entries) contribute zero —
+    /// they emit a Drop record on the plan, not a fresh output entry.
+    fn estimated_output_entries(&self) -> usize {
+        let mut n = 0usize;
+        for runs in &self.partial_death_runs {
+            match runs {
+                Some(r) => n += r.len() + 1,
+                None => n += 1,
+            }
+        }
+        n
     }
 }
 

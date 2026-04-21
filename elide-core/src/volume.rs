@@ -101,6 +101,12 @@ pub(crate) fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
 /// (NBD/ublk) enforces its own per-request maximum before reaching here.
 const FLUSH_THRESHOLD: u64 = 32 * 1024 * 1024;
 
+/// Entry-count cap at which the WAL is promoted, regardless of byte size.
+/// Bounds the per-segment index region for workloads that produce many
+/// thin entries (DedupRef, Zero, Inline) without advancing the byte cap.
+/// Matches a 4 KiB-block 32 MiB segment exactly (32 MiB / 4 KiB = 8192).
+const FLUSH_ENTRY_THRESHOLD: usize = 8192;
+
 /// Maximum byte length of a single write. The segment format stores
 /// `body_length` as a `u32`, so payloads must fit in 4 GiB. We cap at
 /// `u32::MAX` rounded down to a 4 KiB boundary.
@@ -3381,15 +3387,20 @@ impl Volume {
         self.promote()
     }
 
-    /// True if the WAL has reached the 32 MiB soft cap and should be promoted.
+    /// True if the WAL should be promoted to a pending segment.
+    ///
+    /// Trips on either the byte cap ([`FLUSH_THRESHOLD`]) or the entry-count
+    /// cap ([`FLUSH_ENTRY_THRESHOLD`]) — the latter bounds the index region
+    /// for workloads (heavy dedup, lots of inline / zero writes) that produce
+    /// many thin entries without advancing the byte cap.
     ///
     /// The actor calls this after every write reply and promotes if true.
     /// The check is separated from `write()` so that writes are always fast
     /// (WAL append only) and the promotion cost is never borne by the write caller.
     pub fn needs_promote(&self) -> bool {
-        self.wal
-            .as_ref()
-            .is_some_and(|o| o.wal.size() >= FLUSH_THRESHOLD)
+        self.wal.as_ref().is_some_and(|o| {
+            o.wal.size() >= FLUSH_THRESHOLD || self.pending_entries.len() >= FLUSH_ENTRY_THRESHOLD
+        })
     }
 
     pub fn promote_for_test(&mut self) -> io::Result<()> {
@@ -5433,6 +5444,41 @@ mod tests {
     }
 
     #[test]
+    fn entry_count_threshold_triggers_needs_promote() {
+        // FLUSH_ENTRY_THRESHOLD must trip even when the WAL byte size is far
+        // below FLUSH_THRESHOLD. Use Zero writes — each appends a single
+        // entry of zero body bytes — so we cap on entry count, not byte size.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Write FLUSH_ENTRY_THRESHOLD - 1 zero entries, each one block
+        // wide at a unique LBA. After this the WAL is one entry below
+        // the cap; needs_promote() must still return false.
+        for i in 0..(FLUSH_ENTRY_THRESHOLD as u64 - 1) {
+            vol.write_zeroes(i, 1).unwrap();
+        }
+        assert!(
+            !vol.needs_promote(),
+            "needs_promote() should be false at {} entries (cap is {})",
+            FLUSH_ENTRY_THRESHOLD - 1,
+            FLUSH_ENTRY_THRESHOLD,
+        );
+
+        // One more entry pushes the WAL to exactly FLUSH_ENTRY_THRESHOLD;
+        // needs_promote() must now return true even though WAL bytes are
+        // a tiny fraction of FLUSH_THRESHOLD.
+        vol.write_zeroes(FLUSH_ENTRY_THRESHOLD as u64 - 1, 1)
+            .unwrap();
+        assert!(
+            vol.needs_promote(),
+            "needs_promote() should be true at {} entries",
+            FLUSH_ENTRY_THRESHOLD,
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn recovery_rebuilds_lbamap() {
         let base = keyed_temp_dir();
 
@@ -6386,6 +6432,54 @@ mod tests {
             vol.read(4352, 1).unwrap(),
             unique_block(0x10001u32.wrapping_mul(2).wrapping_add(4351))
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_respects_entry_cap() {
+        // Three pending segments, each carrying 4096 DedupRef entries
+        // (live_bytes = 0 — DedupRef has no body cost) plus one tiny
+        // DATA segment, total 12_289 entries. Without an entry cap,
+        // tier-1 packing would admit all three (byte budget never bites
+        // on 0-live_bytes inputs) and produce a 12_289-entry output —
+        // far past the WAL's flush cap. With SWEEP_ENTRY_CAP = 8192,
+        // tier 1 admits exactly two of the dedup segments (8192 entries)
+        // and stops; the third dedup segment and the lone DATA are left
+        // for a later pass.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Anchor segment: a single DATA entry establishing the dedup hash.
+        let payload = unique_block(0xCAFE);
+        vol.write(0, &payload).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Two dedup-only pending segments, 4096 DedupRef entries each.
+        for i in 1..=4096u64 {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+        for i in 100_000..(100_000u64 + 4096) {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+
+        // Plus another dedup-only segment so the cap actually has to
+        // refuse one of them.
+        for i in 200_000..(200_000u64 + 4096) {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 2,
+            "sweep must stop at SWEEP_ENTRY_CAP — exactly two of the \
+             three dedup segments fit (8192 entries), the third is left \
+             for a later pass"
+        );
+        assert_eq!(stats.new_segments, 1);
 
         fs::remove_dir_all(base).unwrap();
     }

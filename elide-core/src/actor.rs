@@ -1990,6 +1990,12 @@ const SWEEP_TARGET_LIVE: u64 = 32 * 1024 * 1024;
 /// permanently — no infinite re-pack loop.
 const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_TARGET_LIVE / 2;
 
+/// Entry-count cap on the merged sweep output. Mirrors the WAL's
+/// `FLUSH_ENTRY_THRESHOLD` so swept outputs sit at the same scale as
+/// freshly-flushed segments — and so a sweep cannot reintroduce an
+/// over-large index region by packing many thin-entry inputs.
+const SWEEP_ENTRY_CAP: usize = 8192;
+
 /// Per-segment scratch state for sweep candidate selection.
 ///
 /// `live_part` and `dead_part` are computed in the cheap scan phase
@@ -2102,18 +2108,22 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
 
     let mut bucket: Vec<SweepCandidate> = Vec::new();
     let mut budget = SWEEP_TARGET_LIVE;
+    let mut entry_budget = SWEEP_ENTRY_CAP;
     for c in smalls {
-        if c.live_bytes <= budget {
+        let c_entries = c.live_part.len();
+        if c.live_bytes <= budget && c_entries <= entry_budget {
             budget -= c.live_bytes;
+            entry_budget -= c_entries;
             bucket.push(c);
         }
     }
     if !bucket.is_empty()
         && budget > 0
+        && entry_budget > 0
         && let Some(pos) = fillers
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.live_bytes <= budget)
+            .filter(|(_, c)| c.live_bytes <= budget && c.live_part.len() <= entry_budget)
             .max_by_key(|(_, c)| c.live_bytes)
             .map(|(i, _)| i)
     {
