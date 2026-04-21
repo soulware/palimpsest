@@ -85,40 +85,33 @@ async fn put_with_content_type(
     }
 }
 
-/// Directory under each volume that holds upload-completion sentinels —
-/// one empty file per S3 object we've confirmed uploaded. The sentinel's
-/// mtime is the completion time, which lets us skip re-uploads when the
-/// source hasn't changed since.
+/// Directory under each volume that holds upload-completion records — one
+/// file per S3 object we've confirmed uploaded. For small metadata the file
+/// holds a verbatim copy of the uploaded bytes, so `diff uploaded/<f>
+/// <source>` works with standard tools and re-upload decisions are taken by
+/// exact content comparison rather than mtime. The snapshot triple uses a
+/// plain empty sentinel since the S3 marker is empty and filemap/.manifest
+/// are already inspectable under `snapshots/`.
 const UPLOADED_DIR: &str = "uploaded";
 
 fn upload_sentinel(vol_dir: &Path, relative: &str) -> PathBuf {
     vol_dir.join(UPLOADED_DIR).join(relative)
 }
 
-/// Return true if `sentinel` exists and (when `source` is given) is at least
-/// as new as it. A missing sentinel — or one older than its source — means
-/// the upload needs to run.
-fn is_already_uploaded(sentinel: &Path, source: Option<&Path>) -> bool {
-    let Ok(sentinel_meta) = std::fs::metadata(sentinel) else {
-        return false;
-    };
-    let Some(source) = source else {
-        return true;
-    };
-    let Ok(source_meta) = std::fs::metadata(source) else {
-        return false;
-    };
-    match (sentinel_meta.modified(), source_meta.modified()) {
-        (Ok(s), Ok(src)) => s >= src,
-        _ => false,
-    }
+/// Return true iff `sentinel` exists and its bytes equal `expected`. A
+/// partial-write after a crash fails the equality check and triggers a
+/// self-healing re-upload on the next tick.
+fn is_already_uploaded(sentinel: &Path, expected: &[u8]) -> bool {
+    std::fs::read(sentinel)
+        .map(|b| b == expected)
+        .unwrap_or(false)
 }
 
-fn mark_uploaded(sentinel: &Path) -> std::io::Result<()> {
+fn mark_uploaded(sentinel: &Path, content: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = sentinel.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::File::create(sentinel)?;
+    std::fs::write(sentinel, content)?;
     Ok(())
 }
 
@@ -303,49 +296,58 @@ pub async fn drain_pending(
 /// names/<name> entry, snapshot markers, and filemaps.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
-/// Each artifact is gated on an `uploaded/<name>` sentinel file whose mtime
-/// must be at least as new as the local source's mtime. Immutable files
-/// (volume.pub, provenance, names entry, snapshot triples) upload exactly
-/// once per volume/snapshot lifetime; `manifest.toml` re-uploads only when
-/// `volume.toml` changes.
+/// Each artifact is gated on an `uploaded/<name>` file whose bytes must
+/// equal the value we are about to upload; a mismatch (or missing file)
+/// triggers upload. For small metadata (volume.pub, provenance, manifest.toml,
+/// names_<name>) the `uploaded/` entry holds a verbatim copy of the uploaded
+/// bytes, so the directory is inspectable with standard tools. The snapshot
+/// triple (marker + filemap + .manifest) is covered by a single empty
+/// sentinel at `uploaded/snapshots/<ulid>`.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
-    if pub_key_path.exists() {
-        let sentinel = upload_sentinel(vol_dir, "volume.pub");
-        if !is_already_uploaded(&sentinel, Some(&pub_key_path)) {
-            match upload_small_file(&pub_key_path, volume_id, "volume.pub", MIME_TEXT, store).await
-            {
-                Ok(()) => {
-                    if let Err(e) = mark_uploaded(&sentinel) {
-                        warn!("failed to mark volume.pub sentinel: {e}");
+    match std::fs::read(&pub_key_path) {
+        Ok(bytes) => {
+            let sentinel = upload_sentinel(vol_dir, "volume.pub");
+            if !is_already_uploaded(&sentinel, &bytes) {
+                match upload_small_bytes(&bytes, volume_id, "volume.pub", MIME_TEXT, store).await {
+                    Ok(()) => {
+                        if let Err(e) = mark_uploaded(&sentinel, &bytes) {
+                            warn!("failed to mark volume.pub sentinel: {e}");
+                        }
                     }
+                    Err(e) => warn!("pub key upload failed: {e:#}"),
                 }
-                Err(e) => warn!("pub key upload failed: {e:#}"),
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("failed to read volume.pub: {e:#}"),
     }
 
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
-    if provenance_path.exists() {
-        let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
-        if !is_already_uploaded(&sentinel, Some(&provenance_path)) {
-            match upload_small_file(
-                &provenance_path,
-                volume_id,
-                elide_core::signing::VOLUME_PROVENANCE_FILE,
-                MIME_TEXT,
-                store,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if let Err(e) = mark_uploaded(&sentinel) {
-                        warn!("failed to mark provenance sentinel: {e}");
+    match std::fs::read(&provenance_path) {
+        Ok(bytes) => {
+            let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
+            if !is_already_uploaded(&sentinel, &bytes) {
+                match upload_small_bytes(
+                    &bytes,
+                    volume_id,
+                    elide_core::signing::VOLUME_PROVENANCE_FILE,
+                    MIME_TEXT,
+                    store,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Err(e) = mark_uploaded(&sentinel, &bytes) {
+                            warn!("failed to mark provenance sentinel: {e}");
+                        }
                     }
+                    Err(e) => warn!("provenance upload failed: {e:#}"),
                 }
-                Err(e) => warn!("provenance upload failed: {e:#}"),
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("failed to read provenance: {e:#}"),
     }
 
     if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
@@ -357,19 +359,17 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
     }
 }
 
-async fn upload_small_file(
-    local_path: &Path,
+async fn upload_small_bytes(
+    data: &[u8],
     volume_id: &str,
     remote_name: &str,
     content_type: &'static str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let data =
-        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     let len = data.len();
     let key = StorePath::from(format!("by_id/{volume_id}/{remote_name}"));
     let started = Instant::now();
-    put_with_content_type(store, &key, Bytes::from(data), content_type)
+    put_with_content_type(store, &key, Bytes::copy_from_slice(data), content_type)
         .await
         .with_context(|| format!("uploading {remote_name} to {key}"))?;
     info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
@@ -421,45 +421,57 @@ async fn upload_manifest(
         source,
     };
 
-    // Both manifest.toml and the names/<name> entry derive from volume.toml,
-    // so we gate both on a sentinel tracked against volume.toml's mtime.
-    let volume_toml = vol_dir.join("volume.toml");
+    // Render manifest.toml up front so we can compare against the cached
+    // copy at `uploaded/manifest.toml`. Content-equal gating means re-saving
+    // volume.toml without changing a manifest-visible field does not trigger
+    // a re-upload.
+    let content_bytes = toml::to_string(&manifest)
+        .context("serializing manifest.toml")?
+        .into_bytes();
     let manifest_sentinel = upload_sentinel(vol_dir, "manifest.toml");
-    if !is_already_uploaded(&manifest_sentinel, Some(&volume_toml)) {
-        let content = toml::to_string(&manifest).context("serializing manifest.toml")?;
-        let content_bytes = content.into_bytes();
+    if !is_already_uploaded(&manifest_sentinel, &content_bytes) {
         let manifest_len = content_bytes.len();
         let key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
         let started = Instant::now();
-        put_with_content_type(store, &key, Bytes::from(content_bytes), MIME_TOML)
-            .await
-            .with_context(|| format!("uploading manifest.toml to {key}"))?;
+        put_with_content_type(
+            store,
+            &key,
+            Bytes::copy_from_slice(&content_bytes),
+            MIME_TOML,
+        )
+        .await
+        .with_context(|| format!("uploading manifest.toml to {key}"))?;
         info!(
             "[upload] {key} ({manifest_len} bytes in {:.2?})",
             started.elapsed()
         );
-        if let Err(e) = mark_uploaded(&manifest_sentinel) {
+        if let Err(e) = mark_uploaded(&manifest_sentinel, &content_bytes) {
             warn!("failed to mark manifest.toml sentinel: {e}");
         }
     }
 
-    // The names/<name> → ULID entry is immutable once written: for a given
-    // (name, ULID) pair the value never changes. A rename produces a brand
-    // new key, so we gate strictly on sentinel existence here.
+    // The names/<name> → ULID entry is immutable for a given (name, ULID)
+    // pair; a rename produces a brand new key. We still gate on content so
+    // the uploaded/ copy is verifiable against what would be uploaded now.
+    let name_bytes = volume_id.as_bytes();
     let names_sentinel = upload_sentinel(vol_dir, &format!("names_{name}"));
-    if !is_already_uploaded(&names_sentinel, None) {
+    if !is_already_uploaded(&names_sentinel, name_bytes) {
         let name_key = StorePath::from(format!("names/{name}"));
-        let name_bytes = volume_id.to_owned().into_bytes();
         let name_len = name_bytes.len();
         let started = Instant::now();
-        put_with_content_type(store, &name_key, Bytes::from(name_bytes), MIME_TEXT)
-            .await
-            .with_context(|| format!("uploading name entry to {name_key}"))?;
+        put_with_content_type(
+            store,
+            &name_key,
+            Bytes::copy_from_slice(name_bytes),
+            MIME_TEXT,
+        )
+        .await
+        .with_context(|| format!("uploading name entry to {name_key}"))?;
         info!(
             "[upload] {name_key} ({name_len} bytes in {:.2?})",
             started.elapsed()
         );
-        if let Err(e) = mark_uploaded(&names_sentinel) {
+        if let Err(e) = mark_uploaded(&names_sentinel, name_bytes) {
             warn!("failed to mark names_{name} sentinel: {e}");
         }
     }
@@ -522,10 +534,11 @@ pub async fn upload_snapshots_and_filemaps(
         }
 
         // Per-snapshot triple (marker + filemap + .manifest) is immutable
-        // for a given ULID, so one sentinel covers all three. If the sentinel
-        // already exists, the whole snapshot is done — skip it.
+        // for a given ULID, so one empty sentinel covers all three. Bytes
+        // aren't useful here — the S3 marker is empty, and the filemap /
+        // .manifest pair is already inspectable under `snapshots/<ulid>.*`.
         let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{name}"));
-        if is_already_uploaded(&sentinel, None) {
+        if is_already_uploaded(&sentinel, &[]) {
             continue;
         }
 
@@ -576,7 +589,7 @@ pub async fn upload_snapshots_and_filemaps(
             }
         }
 
-        if all_ok && let Err(e) = mark_uploaded(&sentinel) {
+        if all_ok && let Err(e) = mark_uploaded(&sentinel, &[]) {
             warn!("failed to mark snapshot {name} sentinel: {e}");
         }
     }
@@ -849,6 +862,10 @@ mod tests {
         let got = store.get(&pub_key).await.expect("volume.pub not in store");
         let bytes = got.bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), fake_pub);
+
+        // uploaded/volume.pub holds a verbatim copy of the uploaded bytes.
+        let sentinel = vol_dir.join("uploaded").join("volume.pub");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), fake_pub);
     }
 
     #[tokio::test]
@@ -891,6 +908,72 @@ mod tests {
         let got = store.get(&name_key).await.expect("name entry not in store");
         let ulid_bytes = got.bytes().await.unwrap();
         assert_eq!(std::str::from_utf8(&ulid_bytes).unwrap(), VOL_ULID);
+
+        // uploaded/ holds verbatim copies of the uploaded bytes — diff-able
+        // with standard tools against the store objects.
+        let uploaded = vol_dir.join("uploaded");
+        assert_eq!(
+            std::fs::read_to_string(uploaded.join("manifest.toml")).unwrap(),
+            content
+        );
+        assert_eq!(
+            std::fs::read_to_string(uploaded.join("names_my-vol")).unwrap(),
+            VOL_ULID
+        );
+    }
+
+    /// Volume-metadata upload is skipped on re-drain when the rendered bytes
+    /// match the existing `uploaded/<f>` entry. Regression guard for the
+    /// mtime→content-equal gating switch: touching `volume.toml` (or any
+    /// source) without changing the rendered manifest must not re-upload.
+    #[tokio::test]
+    async fn drain_skips_reupload_when_metadata_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        std::fs::create_dir_all(vol_dir.join("pending")).unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("stable".into()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
+        std::fs::write(vol_dir.join("volume.pub"), b"k").unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
+
+        // Delete the store objects behind the coordinator's back. If gating
+        // works, re-drain sees matching `uploaded/` and skips — the objects
+        // remain absent. If gating is broken (e.g. reverted to mtime), the
+        // objects reappear.
+        let manifest_key = StorePath::from(format!("by_id/{VOL_ULID}/manifest.toml"));
+        let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
+        let name_key = StorePath::from("names/stable");
+        store.delete(&manifest_key).await.unwrap();
+        store.delete(&pub_key).await.unwrap();
+        store.delete(&name_key).await.unwrap();
+
+        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
+
+        assert!(store.head(&manifest_key).await.is_err());
+        assert!(store.head(&pub_key).await.is_err());
+        assert!(store.head(&name_key).await.is_err());
+
+        // Now change volume.pub content — re-drain must upload.
+        std::fs::write(vol_dir.join("volume.pub"), b"rotated").unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
+        let got = store.get(&pub_key).await.expect("volume.pub re-uploaded");
+        assert_eq!(got.bytes().await.unwrap().as_ref(), b"rotated");
     }
 
     #[tokio::test]
