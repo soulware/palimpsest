@@ -83,7 +83,7 @@ const MIN_COMPRESSION_RATIO_DEN: usize = 2;
 ///
 /// Returns `Some(compressed_bytes)` if the entropy is low enough and the
 /// compression ratio meets the minimum threshold; `None` to store raw.
-fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
     if shannon_entropy(data) > ENTROPY_THRESHOLD {
         return None;
     }
@@ -741,6 +741,7 @@ pub enum WorkerJob {
     Repack(RepackJob),
     DeltaRepack(DeltaRepackJob),
     SignSnapshotManifest(SignSnapshotManifestJob),
+    Reclaim(ReclaimJob),
 }
 
 /// Result returned by the worker thread to the actor.
@@ -760,137 +761,70 @@ pub enum WorkerResult {
     Repack(io::Result<RepackResult>),
     DeltaRepack(io::Result<DeltaRepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
+    Reclaim(io::Result<ReclaimResult>),
 }
 
-/// Snapshot captured at reclaim phase 1. Carries the target range, a
-/// clone of the current `Arc<LbaMap>` (used as the precondition token in
-/// phase 3 and as the read source for bloat detection in phase 2), and
-/// the clipped entries covering the target range at capture time.
+/// Data needed by the worker to execute extent reclamation off-actor.
 ///
-/// `lbamap_snapshot` is kept private: the pointer identity is the entire
-/// precondition check, and exposing it would invite accidental aliasing
-/// that weakens the guarantee.
-pub struct ReclaimPlan {
-    target_start_lba: u64,
-    target_lba_length: u32,
-    entries: Vec<lbamap::ExtentRead>,
-    lbamap_snapshot: Arc<lbamap::LbaMap>,
+/// Produced by [`Volume::prepare_reclaim`] on the actor thread. The heavy
+/// middle phase — reading live bytes for each bloated run, re-hashing,
+/// compressing, and assembling one segment file — runs on the worker
+/// thread via [`crate::actor::execute_reclaim`]. The actor reclaims no
+/// lock during that window; writes continue to flow through the channel.
+///
+/// `lbamap_snapshot` is kept private on the carried `ReclaimResult`: the
+/// pointer identity is the entire precondition check, and exposing it
+/// would invite accidental aliasing that weakens the guarantee.
+pub struct ReclaimJob {
+    pub target_start_lba: u64,
+    pub target_lba_length: u32,
+    pub entries: Vec<lbamap::ExtentRead>,
+    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
+    pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
+    pub search_dirs: Vec<PathBuf>,
+    pub pending_dir: PathBuf,
+    /// Pre-minted on the actor so the worker can write
+    /// `pending/<segment_ulid>` without needing access to the mint.
+    pub segment_ulid: Ulid,
+    pub signer: Arc<dyn segment::SegmentSigner>,
 }
 
-impl std::fmt::Debug for ReclaimPlan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReclaimPlan")
-            .field("target_start_lba", &self.target_start_lba)
-            .field("target_lba_length", &self.target_lba_length)
-            .field("entries", &self.entries.len())
-            .finish()
-    }
+/// A rewritten entry placed in the reclaim output segment, paired with
+/// the uncompressed byte count it represents (so outcome accounting
+/// reflects logical size rather than stored length after compression).
+pub struct ReclaimedEntry {
+    pub entry: segment::SegmentEntry,
+    pub uncompressed_bytes: u64,
 }
 
-/// A single rewrite proposal: a fresh compact entry to commit at phase 3.
-#[derive(Debug, Clone)]
-pub struct ReclaimProposed {
-    pub start_lba: u64,
-    pub data: Vec<u8>,
-    pub hash: blake3::Hash,
+/// Result of a [`ReclaimJob`]. Consumed by [`Volume::apply_reclaim_result`]
+/// on the actor thread.
+///
+/// `segment_written` distinguishes the "nothing to do" case (empty
+/// proposal set, no file on disk) from the "worker committed a segment"
+/// case. Apply must either splice the entries into the live lbamap +
+/// extent index (pointer-equality precondition holds) or delete
+/// `pending/<segment_ulid>` as an orphan (precondition failed).
+pub struct ReclaimResult {
+    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
+    pub segment_ulid: Ulid,
+    pub body_section_start: u64,
+    pub entries: Vec<ReclaimedEntry>,
+    pub segment_written: bool,
+    pub pending_dir: PathBuf,
 }
 
 /// Outcome of a complete alias-merge reclaim pass.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReclaimOutcome {
-    /// True if the phase-3 precondition failed (the LBA map was mutated
-    /// between snapshot and commit) and nothing was committed.
+    /// True if the apply precondition failed (the LBA map was mutated
+    /// between prepare and apply) and nothing was committed.
     pub discarded: bool,
-    /// Number of rewrite proposals committed (excluding ones the noop-skip
+    /// Number of rewrite entries committed (excluding ones the noop-skip
     /// hash check absorbed because the LBA map already records the rewrite).
     pub runs_rewritten: u32,
-    /// Total bytes committed to fresh compact entries.
+    /// Total uncompressed bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
-}
-
-impl ReclaimPlan {
-    /// The target range captured at phase 1, as `(start_lba, lba_length)`.
-    pub fn target(&self) -> (u64, u32) {
-        (self.target_start_lba, self.target_lba_length)
-    }
-
-    /// Clipped view of the LBA map over the target range at phase 1.
-    pub fn entries(&self) -> &[lbamap::ExtentRead] {
-        &self.entries
-    }
-
-    /// Phase 2 of extent reclamation: compute rewrite proposals for this
-    /// plan. The `read` callback produces bytes for a given LBA range —
-    /// supply `VolumeHandle::read` or `Volume::read` depending on whether
-    /// phase 2 is running off-actor (the intended shape, see
-    /// `docs/design-extent-reclamation.md § Optimistic commit structure`)
-    /// or on the actor thread (acceptable in tests).
-    ///
-    /// Every rewrite decision is made entirely against the plan's captured
-    /// map snapshot; the current volume state is not inspected. That is
-    /// what makes this safe to run off-actor without holding any lock —
-    /// any interleaved mutation is caught by phase 3's precondition check.
-    ///
-    /// Two predicates gate each candidate extent:
-    /// 1. **Containment** — every LBA map run for this hash (not just the
-    ///    in-range ones) must fall inside the target range. Rewriting a
-    ///    hash whose body is partially referenced from outside the target
-    ///    would leave those outside references on the now-bloated body
-    ///    and *introduce* waste rather than eliminate it.
-    /// 2. **Bloat** — at least one run for the hash has
-    ///    `payload_block_offset != 0`, which is a strong signal that a
-    ///    prior write split the original payload and dead bytes exist
-    ///    inside the stored body.
-    ///
-    /// `ZERO_HASH` is always skipped: zero extents carry no body, so
-    /// "rewriting" them would invent a body for bytes that never had one.
-    pub fn compute_rewrites<F>(&self, mut read: F) -> io::Result<Vec<ReclaimProposed>>
-    where
-        F: FnMut(u64, u32) -> io::Result<Vec<u8>>,
-    {
-        let target_start = self.target_start_lba;
-        let target_end = target_start + self.target_lba_length as u64;
-
-        // Cache containment/bloat decisions per hash so repeated runs of
-        // the same hash inside the target share one full-map walk.
-        let mut decision: HashMap<blake3::Hash, bool> = HashMap::new();
-
-        let mut proposed = Vec::new();
-        for er in &self.entries {
-            if er.hash == ZERO_HASH {
-                continue;
-            }
-            let should_rewrite = *decision.entry(er.hash).or_insert_with(|| {
-                let runs = self.lbamap_snapshot.runs_for_hash(&er.hash);
-                let contained = runs.iter().all(|(lba, length, _offset)| {
-                    *lba >= target_start && *lba + *length as u64 <= target_end
-                });
-                if !contained {
-                    return false;
-                }
-                runs.iter().any(|(_, _, offset)| *offset != 0)
-            });
-            if !should_rewrite {
-                continue;
-            }
-            let length_blocks = (er.range_end - er.range_start) as u32;
-            let bytes = read(er.range_start, length_blocks)?;
-            let expected_len = length_blocks as usize * 4096;
-            if bytes.len() != expected_len {
-                return Err(io::Error::other(format!(
-                    "reclaim read returned {} bytes, expected {expected_len}",
-                    bytes.len()
-                )));
-            }
-            let hash = blake3::hash(&bytes);
-            proposed.push(ReclaimProposed {
-                start_lba: er.range_start,
-                data: bytes,
-                hash,
-            });
-        }
-        Ok(proposed)
-    }
 }
 
 /// Per-hash thresholds controlling which hashes the reclamation scanner
@@ -3279,58 +3213,151 @@ impl Volume {
         (Arc::clone(&self.lbamap), Arc::clone(&self.extent_index))
     }
 
-    /// Phase 1 of extent reclamation: capture an immutable snapshot of the
-    /// LBA map state over the target range. Cheap: one `Arc::clone` and
-    /// one O(log n) range query.
+    /// Synchronous alias-merge wrapper: prepare → execute → apply.
     ///
-    /// The returned plan carries a clone of the current `Arc<LbaMap>` which
-    /// serves as the precondition token at phase 3 (`Arc::ptr_eq` detects
-    /// any mutation between capture and commit) and as the read source for
-    /// phase 2's bloat detection (no need to re-walk the live map).
+    /// Used by tests and inline callers that hold a `&mut Volume`
+    /// directly. Production callers go through the actor channel via
+    /// [`crate::actor::VolumeHandle::reclaim_alias_merge`], where the
+    /// heavy middle phase runs on the worker thread.
+    pub fn reclaim_alias_merge(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+    ) -> io::Result<ReclaimOutcome> {
+        let job = self.prepare_reclaim(start_lba, lba_length);
+        let result = crate::actor::execute_reclaim(job)?;
+        self.apply_reclaim_result(result)
+    }
+
+    /// Prep phase of reclaim — runs on the actor thread.
     ///
-    /// See `docs/design-extent-reclamation.md § Optimistic commit structure`.
-    pub fn reclaim_snapshot(&self, start_lba: u64, lba_length: u32) -> ReclaimPlan {
+    /// Snapshots `lbamap` (precondition token + read source for the
+    /// worker's bloat-gate walk), snapshots `extent_index` (so the
+    /// worker can resolve hashes to segment bodies without an actor
+    /// round-trip), captures the clipped range entries, and mints the
+    /// output segment ULID so the worker can write
+    /// `pending/<segment_ulid>` directly.
+    ///
+    /// Search dirs are the fork directory followed by ancestor layers
+    /// in the same order `BlockReader` uses — the worker's read helper
+    /// walks them to find segment body files.
+    pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> ReclaimJob {
         let end_lba = start_lba + lba_length as u64;
         let entries = self.lbamap.extents_in_range(start_lba, end_lba);
-        ReclaimPlan {
+
+        let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
+        for layer in &self.ancestor_layers {
+            if !search_dirs.contains(&layer.dir) {
+                search_dirs.push(layer.dir.clone());
+            }
+        }
+
+        let segment_ulid = self.mint.next();
+
+        ReclaimJob {
             target_start_lba: start_lba,
             target_lba_length: lba_length,
             entries,
             lbamap_snapshot: Arc::clone(&self.lbamap),
+            extent_index_snapshot: Arc::clone(&self.extent_index),
+            search_dirs,
+            pending_dir: self.base_dir.join("pending"),
+            segment_ulid,
+            signer: Arc::clone(&self.signer),
         }
     }
 
-    /// Phase 3 of extent reclamation: verify the LBA map has not changed
-    /// since the plan was captured, then apply each proposed rewrite through
-    /// the internal-origin write path.
+    /// Apply phase of reclaim — runs on the actor thread after the
+    /// worker returns.
     ///
-    /// The precondition check is `Arc::ptr_eq(plan.lbamap_snapshot, self.lbamap)`.
-    /// Any mutation between phase 1 and this call would have called
-    /// `Arc::make_mut` on the volume's `lbamap` Arc (externally-visible via
-    /// at least the published snapshot), which reallocates — so the pointers
-    /// differ and this returns cleanly with `discarded: true`.
+    /// Precondition: `Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)`.
+    /// Any mutation between prepare and apply would have called
+    /// `Arc::make_mut` on the volume's `lbamap` Arc (externally visible
+    /// via at least the published snapshot), which reallocates — so the
+    /// pointers differ and this returns cleanly with `discarded: true`,
+    /// deleting the worker's pending segment as an orphan. GC would
+    /// eventually classify it as all-dead, but cleaning up eagerly
+    /// avoids the extra GC round-trip.
     ///
-    /// A discard leaves all Volume state completely unchanged; the caller
-    /// can retry on the next quiet window. The wasted work is whatever
-    /// phase 2 did (reads, hashing) — never any WAL or map state.
-    pub fn reclaim_commit(
-        &mut self,
-        plan: ReclaimPlan,
-        proposed: Vec<ReclaimProposed>,
-    ) -> io::Result<ReclaimOutcome> {
-        if !Arc::ptr_eq(&plan.lbamap_snapshot, &self.lbamap) {
+    /// On success, splices the worker's entries into the live lbamap +
+    /// extent index. Runs under the actor lock; no CAS needed because
+    /// the pointer-equality guard above already proved no concurrent
+    /// mutation happened.
+    pub fn apply_reclaim_result(&mut self, result: ReclaimResult) -> io::Result<ReclaimOutcome> {
+        if !Arc::ptr_eq(&result.lbamap_snapshot, &self.lbamap) {
+            // Orphan cleanup: delete the worker's pending/<segment_ulid>.
+            if result.segment_written {
+                let path = result.pending_dir.join(result.segment_ulid.to_string());
+                let _ = std::fs::remove_file(&path);
+            }
             return Ok(ReclaimOutcome {
                 discarded: true,
                 ..Default::default()
             });
         }
-        let mut outcome = ReclaimOutcome::default();
-        for p in proposed {
-            let bytes = p.data.len() as u64;
-            if self.write_with_hash(p.start_lba, &p.data, p.hash)? {
-                outcome.runs_rewritten += 1;
-                outcome.bytes_rewritten += bytes;
+
+        if !result.segment_written {
+            return Ok(ReclaimOutcome::default());
+        }
+
+        self.has_new_segments = true;
+        self.last_segment_ulid = Some(result.segment_ulid);
+
+        let lbamap = Arc::make_mut(&mut self.lbamap);
+        for re in &result.entries {
+            lbamap.insert(re.entry.start_lba, re.entry.lba_length, re.entry.hash);
+        }
+        let extent_index = Arc::make_mut(&mut self.extent_index);
+        for re in &result.entries {
+            let entry = &re.entry;
+            match entry.kind {
+                EntryKind::Data => {
+                    extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: result.segment_ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start: result.body_section_start,
+                            inline_data: None,
+                        },
+                    );
+                }
+                EntryKind::Inline => {
+                    extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: result.segment_ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start: result.body_section_start,
+                            inline_data: entry.data.clone().map(Vec::into_boxed_slice),
+                        },
+                    );
+                }
+                EntryKind::DedupRef => {
+                    // canonical body already indexed — nothing to insert.
+                }
+                EntryKind::CanonicalData
+                | EntryKind::CanonicalInline
+                | EntryKind::Zero
+                | EntryKind::Delta => {
+                    unreachable!(
+                        "reclaim output produces only Data/Inline/DedupRef, got {:?}",
+                        entry.kind
+                    );
+                }
             }
+        }
+
+        let mut outcome = ReclaimOutcome::default();
+        for re in &result.entries {
+            outcome.runs_rewritten += 1;
+            outcome.bytes_rewritten += re.uncompressed_bytes;
         }
         Ok(outcome)
     }
@@ -5041,21 +5068,11 @@ mod tests {
         // Before: 3 entries.
         assert_eq!(vol.lbamap_len(), 3);
 
-        // Phase 1.
-        let plan = vol.reclaim_snapshot(100, 8);
-        // Phase 2 — use the on-actor read path directly; MVP proptest path too.
-        let proposed = plan
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
+        // Sync prep+execute+apply via the in-process wrapper.
+        let outcome = vol.reclaim_alias_merge(100, 8).unwrap();
         // Two rewrites: prefix run [100,103) and tail run [104,108). The
         // middle [103,104) is a clean single-block entry with offset=0 —
         // its hash has no `offset != 0` run anywhere, so it's left alone.
-        assert_eq!(proposed.len(), 2);
-        let starts: Vec<u64> = proposed.iter().map(|p| p.start_lba).collect();
-        assert_eq!(starts, vec![100, 104]);
-
-        // Phase 3.
-        let outcome = vol.reclaim_commit(plan, proposed).unwrap();
         assert!(!outcome.discarded);
         assert_eq!(outcome.runs_rewritten, 2);
         assert_eq!(outcome.bytes_rewritten, (3 + 4) * 4096);
@@ -5063,15 +5080,11 @@ mod tests {
         // Readback still matches.
         assert_eq!(vol.read(100, 8).unwrap(), expected);
 
-        // Second pass is an idempotent no-op: hashes are now stable, the
-        // LBA-map skip catches every rewrite the planner would propose.
-        let plan2 = vol.reclaim_snapshot(100, 8);
-        let proposed2 = plan2
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
-        // All three entries now have payload_block_offset == 0 and cover their
-        // whole (contained) body — no bloat signal, no proposals.
-        assert!(proposed2.is_empty());
+        // Second pass is an idempotent no-op: hashes are now stable, every
+        // rewrite the worker would propose hits the lbamap noop-skip.
+        let outcome2 = vol.reclaim_alias_merge(100, 8).unwrap();
+        assert!(!outcome2.discarded);
+        assert_eq!(outcome2.runs_rewritten, 0);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -5090,19 +5103,18 @@ mod tests {
         vol.write(100, &big).unwrap();
 
         // Query only the tail half — H's first 25 blocks live outside.
-        let plan = vol.reclaim_snapshot(125, 25);
-        let proposed = plan
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
-        // Containment fails: H has a run [100, 150) which starts at 100, outside
-        // the query [125, 150). No rewrite.
-        assert!(proposed.is_empty());
+        // Containment fails: H has a run [100, 150) which starts at 100,
+        // outside the query [125, 150). Nothing to rewrite.
+        let outcome = vol.reclaim_alias_merge(125, 25).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 0);
 
         fs::remove_dir_all(base).unwrap();
     }
 
-    /// When the LBA map is mutated between phase 1 and phase 3, reclaim_commit
-    /// must discard cleanly with no state change.
+    /// When the LBA map is mutated between prepare and apply, the apply
+    /// phase must discard cleanly — orphan-cleaning the worker's output
+    /// segment — with no state change to the live lbamap.
     #[test]
     fn reclaim_alias_merge_discards_on_concurrent_mutation() {
         let base = keyed_temp_dir();
@@ -5113,23 +5125,26 @@ mod tests {
         let hole = [0x11u8; 4096];
         vol.write(203, &hole).unwrap();
 
-        let plan = vol.reclaim_snapshot(200, 8);
-        let proposed = plan
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
-        assert!(!proposed.is_empty());
+        let job = vol.prepare_reclaim(200, 8);
+        let result = crate::actor::execute_reclaim(job).unwrap();
+        // The worker must have produced at least one rewrite.
+        assert!(result.segment_written);
+        let segment_path = result.pending_dir.join(result.segment_ulid.to_string());
+        assert!(segment_path.exists(), "worker segment should be on disk");
 
-        // Simulate concurrent mutation: force the Volume's lbamap Arc to
-        // reallocate by doing any mutation (here: a write to an unrelated LBA
-        // that still clones the Arc via Arc::make_mut because phase 1 is
-        // holding a reference).
+        // Simulate concurrent mutation: any write bumps the lbamap Arc and
+        // breaks the pointer-equality precondition.
         vol.write(500, &reclaim_payload(0x77, 1)).unwrap();
 
-        // Phase 3 must detect the mutation and discard.
-        let outcome = vol.reclaim_commit(plan, proposed).unwrap();
+        // Apply must detect the mutation, discard, and delete the orphan.
+        let outcome = vol.apply_reclaim_result(result).unwrap();
         assert!(outcome.discarded);
         assert_eq!(outcome.runs_rewritten, 0);
         assert_eq!(outcome.bytes_rewritten, 0);
+        assert!(
+            !segment_path.exists(),
+            "apply must remove the orphan segment on discard"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -5147,11 +5162,9 @@ mod tests {
         // always skipped.
         vol.write(304, &[0xABu8; 4096]).unwrap();
 
-        let plan = vol.reclaim_snapshot(300, 10);
-        let proposed = plan
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
-        assert!(proposed.is_empty());
+        let outcome = vol.reclaim_alias_merge(300, 10).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 0);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -5304,12 +5317,7 @@ mod tests {
         drop(lbamap);
         drop(extent_index);
 
-        let plan = vol.reclaim_snapshot(c.start_lba, c.lba_length);
-        let proposed = plan
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
-        assert!(!proposed.is_empty());
-        let outcome = vol.reclaim_commit(plan, proposed).unwrap();
+        let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
         assert!(!outcome.discarded);
         assert!(outcome.runs_rewritten > 0);
 
@@ -5333,21 +5341,14 @@ mod tests {
     }
 
     /// Idempotent-convergence property: a reclaim pass over an
-    /// already-optimal range produces no proposals at all, and any that
-    /// did slip through would be absorbed by the noop-skip hash check
-    /// when committed via `write_with_hash`.
+    /// already-optimal range produces no rewrites at all.
     #[test]
     fn reclaim_alias_merge_optimal_range_is_noop() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(400, &reclaim_payload(0x7A, 4)).unwrap();
 
-        let plan = vol.reclaim_snapshot(400, 4);
-        let proposed = plan
-            .compute_rewrites(|lba, len| vol.read(lba, len))
-            .unwrap();
-        assert!(proposed.is_empty());
-        let outcome = vol.reclaim_commit(plan, proposed).unwrap();
+        let outcome = vol.reclaim_alias_merge(400, 4).unwrap();
         assert_eq!(outcome.runs_rewritten, 0);
         assert!(!outcome.discarded);
 

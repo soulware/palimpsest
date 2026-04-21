@@ -37,11 +37,11 @@ use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats,
     DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep,
-    PromoteSegmentResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
-    ReclaimThresholds, RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry,
-    RepackedSegment, SignSnapshotManifestJob, SignSnapshotManifestResult, SweepJob, SweepResult,
-    SweptDeadEntry, SweptLiveEntry, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult,
+    ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, RepackedDeadEntry,
+    RepackedLiveEntry, RepackedSegment, SignSnapshotManifestJob, SignSnapshotManifestResult,
+    SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry, Volume, WorkerJob, WorkerResult,
+    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -147,21 +147,15 @@ pub(crate) enum VolumeRequest {
     NoopStats {
         reply: Sender<NoopSkipStats>,
     },
-    /// Phase 1 of extent reclamation: capture an LBA map snapshot over a
-    /// target range. Returns a `ReclaimPlan` the caller carries through
-    /// the off-actor heavy work. See `docs/design-extent-reclamation.md`.
-    ReclaimSnapshot {
+    /// Alias-merge extent reclamation. Actor preps a `ReclaimJob`,
+    /// dispatches to the worker, and parks the reply until
+    /// `WorkerResult::Reclaim` returns. Apply runs on the actor:
+    /// `Arc::ptr_eq` guard on the captured `Arc<LbaMap>`, splice on
+    /// success, orphan cleanup on discard. See
+    /// `docs/design-extent-reclamation.md`.
+    Reclaim {
         start_lba: u64,
         lba_length: u32,
-        reply: Sender<io::Result<ReclaimPlan>>,
-    },
-    /// Phase 3 of extent reclamation: verify the plan's snapshot is still
-    /// valid and commit each proposed rewrite via internal-origin writes.
-    /// The precondition check is pointer-equality on the captured
-    /// `Arc<LbaMap>`, so a single short critical section suffices.
-    ReclaimCommit {
-        plan: ReclaimPlan,
-        proposed: Vec<ReclaimProposed>,
         reply: Sender<io::Result<ReclaimOutcome>>,
     },
     Shutdown,
@@ -257,6 +251,11 @@ pub struct VolumeActor {
     /// concurrent requests are rejected (the coordinator's per-volume
     /// snapshot lock already prevents them in production).
     parked_sign_snapshot_manifest: Option<Sender<io::Result<()>>>,
+    /// Reply channel for an in-flight `Reclaim` request, parked while
+    /// the worker thread reads live bytes, rehashes, and assembles the
+    /// output segment. `None` when no reclaim is in progress;
+    /// concurrent `Reclaim` requests are rejected with an error.
+    parked_reclaim: Option<Sender<io::Result<ReclaimOutcome>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -696,6 +695,31 @@ impl VolumeActor {
         }
     }
 
+    /// Run the reclaim prep on the actor and dispatch the heavy middle
+    /// (body reads + re-hash + re-compress + segment assembly) to the
+    /// worker. Reply is parked until [`crate::volume::ReclaimResult`]
+    /// arrives and is applied.
+    fn start_reclaim(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        reply: Sender<io::Result<ReclaimOutcome>>,
+    ) {
+        let job = self.volume.prepare_reclaim(start_lba, lba_length);
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::Reclaim(job)) {
+                warn!("worker channel closed during reclaim: {e}");
+                let _ = reply.send(Err(io::Error::other(
+                    "worker channel closed during reclaim",
+                )));
+                return;
+            }
+            self.parked_reclaim = Some(reply);
+        } else {
+            let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
     /// Run the snapshot-manifest prep on the actor and dispatch the
     /// heavy middle (`index/` enumeration + signing + manifest/marker
     /// writes) to the worker.  Reply is parked until
@@ -735,6 +759,7 @@ impl VolumeActor {
             || self.parked_repack.is_some()
             || self.parked_delta_repack.is_some()
             || self.parked_sign_snapshot_manifest.is_some()
+            || self.parked_reclaim.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -842,6 +867,26 @@ impl VolumeActor {
                         }
                         Err(e) => {
                             warn!("worker sign_snapshot_manifest failed during shutdown: {e}");
+                            Err(e)
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                Ok(WorkerResult::Reclaim(result)) => {
+                    let reply = self.parked_reclaim.take();
+                    let outcome = match result {
+                        Ok(r) => {
+                            let apply_result = self.volume.apply_reclaim_result(r);
+                            if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0)
+                            {
+                                self.publish_snapshot();
+                            }
+                            apply_result
+                        }
+                        Err(e) => {
+                            warn!("worker reclaim failed during shutdown: {e}");
                             Err(e)
                         }
                     };
@@ -1044,24 +1089,18 @@ impl VolumeActor {
                         VolumeRequest::NoopStats { reply } => {
                             let _ = reply.send(self.volume.noop_stats());
                         }
-                        VolumeRequest::ReclaimSnapshot {
+                        VolumeRequest::Reclaim {
                             start_lba,
                             lba_length,
                             reply,
                         } => {
-                            let plan = self.volume.reclaim_snapshot(start_lba, lba_length);
-                            let _ = reply.send(Ok(plan));
-                        }
-                        VolumeRequest::ReclaimCommit {
-                            plan,
-                            proposed,
-                            reply,
-                        } => {
-                            let result = self.volume.reclaim_commit(plan, proposed);
-                            if matches!(&result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
-                                self.publish_snapshot();
+                            if self.parked_reclaim.is_some() {
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent reclaim not allowed",
+                                )));
+                            } else {
+                                self.start_reclaim(start_lba, lba_length, reply);
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::Shutdown => {
                             self.shutdown_worker();
@@ -1238,6 +1277,25 @@ impl VolumeActor {
                                 }
                                 Err(e) => {
                                     warn!("worker sign_snapshot_manifest failed: {e}");
+                                    Err(e)
+                                }
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                        Ok(WorkerResult::Reclaim(result)) => {
+                            let reply = self.parked_reclaim.take();
+                            let outcome = match result {
+                                Ok(r) => {
+                                    let apply_result = self.volume.apply_reclaim_result(r);
+                                    if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
+                                        self.publish_snapshot();
+                                    }
+                                    apply_result
+                                }
+                                Err(e) => {
+                                    warn!("worker reclaim failed: {e}");
                                     Err(e)
                                 }
                             };
@@ -1580,63 +1638,27 @@ impl VolumeHandle {
 
     /// Alias-merge extent reclamation over `[lba, lba + lba_length)`.
     ///
-    /// This is the volume-side primitive that rewrites aliased runs of a
-    /// single hash inside the target range as fresh compact entries,
-    /// leaving the old bloated body orphaned for coordinator GC to
-    /// eventually drop. Preserves content boundaries — never merges
-    /// across different hashes. Safe on any volume.
+    /// Volume-side primitive that rewrites aliased runs of a single
+    /// hash inside the target range as fresh compact entries, leaving
+    /// the old bloated body orphaned for coordinator GC to eventually
+    /// drop. Preserves content boundaries — never merges across
+    /// different hashes. Safe on any volume.
     ///
-    /// Three phases bracket the heavy work with two short actor messages:
-    /// 1. `ReclaimSnapshot` — actor thread, microseconds. Captures an
-    ///    `Arc<LbaMap>` clone + the clipped in-range entries.
-    /// 2. Phase 2 — **this thread**, millisecond-scale. Walks the plan
-    ///    off-actor, reads live bytes via `VolumeHandle::read`, hashes
-    ///    each contiguous same-hash run, emits rewrite proposals.
-    /// 3. `ReclaimCommit` — actor thread, microseconds. Pointer-equality
-    ///    precondition check; on success commits each proposal through
-    ///    `Volume::write_with_hash` (the noop-skip hash check makes
-    ///    re-running reclamation over an already-merged range idempotent).
-    ///    On mismatch returns a clean discard.
-    ///
-    /// Heavy work between phases never holds any lock and does not block
-    /// writes queued behind it on the actor channel. A concurrent mutation
-    /// causes a discard — not a retry here — and the caller is free to
-    /// try again later.
+    /// One actor round-trip: the actor preps the job, dispatches the
+    /// heavy middle (read + re-hash + re-compress + segment assembly)
+    /// to the worker thread, then applies the result under the actor
+    /// lock with a pointer-equality precondition on the captured
+    /// `Arc<LbaMap>`. A concurrent mutation between prepare and apply
+    /// causes a clean discard (the worker's output segment is deleted)
+    /// and the caller is free to try again later.
     ///
     /// See `docs/design-extent-reclamation.md`.
     pub fn reclaim_alias_merge(&self, lba: u64, lba_length: u32) -> io::Result<ReclaimOutcome> {
-        let plan = self.reclaim_snapshot(lba, lba_length)?;
-        let proposed = plan.compute_rewrites(|start, len| self.read(start, len))?;
-        if proposed.is_empty() {
-            return Ok(ReclaimOutcome::default());
-        }
-        self.reclaim_commit(plan, proposed)
-    }
-
-    fn reclaim_snapshot(&self, lba: u64, lba_length: u32) -> io::Result<ReclaimPlan> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::ReclaimSnapshot {
+            .send(VolumeRequest::Reclaim {
                 start_lba: lba,
                 lba_length,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
-    }
-
-    fn reclaim_commit(
-        &self,
-        plan: ReclaimPlan,
-        proposed: Vec<ReclaimProposed>,
-    ) -> io::Result<ReclaimOutcome> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::ReclaimCommit {
-                plan,
-                proposed,
                 reply: reply_tx,
             })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
@@ -1672,6 +1694,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
             WorkerJob::SignSnapshotManifest(job) => {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
             }
+            WorkerJob::Reclaim(job) => WorkerResult::Reclaim(execute_reclaim(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -2571,6 +2594,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         parked_repack: None,
         parked_delta_repack: None,
         parked_sign_snapshot_manifest: None,
+        parked_reclaim: None,
     };
 
     let handle = VolumeHandle {
@@ -2582,4 +2606,202 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     };
 
     (actor, handle)
+}
+
+// ---------------------------------------------------------------------------
+// Reclaim worker execution
+// ---------------------------------------------------------------------------
+
+/// Read a hash's full stored body via the extent index snapshot.
+///
+/// Returns `Ok(Some(bytes))` for Data/Inline entries, with the bytes
+/// fully decompressed if the stored body was compressed. Returns
+/// `Ok(None)` for Delta-backed hashes — reclaim skips those because
+/// rewriting would re-materialise the body as DATA and lose the delta
+/// saving (see `docs/design-extent-reclamation.md § Open questions`).
+/// Returns `Err` for I/O failures or corruption.
+fn read_reclaim_extent_body(
+    extent_index: &ExtentIndex,
+    search_dirs: &[PathBuf],
+    hash: &blake3::Hash,
+) -> io::Result<Option<Vec<u8>>> {
+    if let Some(loc) = extent_index.lookup(hash) {
+        let raw = if let Some(ref idata) = loc.inline_data {
+            if loc.compressed {
+                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
+            } else {
+                idata.to_vec()
+            }
+        } else {
+            let mut found = None;
+            for dir in search_dirs {
+                if let Some(hit) = segment::locate_segment_body(dir, loc.segment_id) {
+                    found = Some(hit);
+                    break;
+                }
+            }
+            let (path, layout) = found.ok_or_else(|| {
+                io::Error::other(format!(
+                    "reclaim: segment {} not found in search dirs",
+                    loc.segment_id
+                ))
+            })?;
+            let seek = layout.body_seek(loc);
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&path)?;
+            f.seek(SeekFrom::Start(seek))?;
+            let mut buf = vec![0u8; loc.body_length as usize];
+            f.read_exact(&mut buf)?;
+            if loc.compressed {
+                lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?
+            } else {
+                buf
+            }
+        };
+        return Ok(Some(raw));
+    }
+    if extent_index.lookup_delta(hash).is_some() {
+        return Ok(None);
+    }
+    Err(io::Error::other(format!(
+        "reclaim: hash {} not in extent index (data, inline, or delta)",
+        hash.to_hex()
+    )))
+}
+
+/// Execute an extent reclamation job on the worker thread.
+///
+/// Walks the range entries captured at prepare time, applies the
+/// containment + bloat gates against the lbamap snapshot, reads each
+/// bloated hash's full body via the extent index snapshot, slices out
+/// the live sub-range, re-hashes, compresses, and assembles one
+/// pending segment. The segment rename is the durability commit point.
+///
+/// Apply on the actor checks `Arc::ptr_eq` against the live lbamap; on
+/// mismatch the segment is deleted as an orphan.
+pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
+    let target_start = job.target_start_lba;
+    let target_end = target_start + job.target_lba_length as u64;
+
+    // Cache containment/bloat decisions per hash so repeated runs of
+    // the same hash inside the target share one full-map walk.
+    let mut decision: std::collections::HashMap<blake3::Hash, bool> =
+        std::collections::HashMap::new();
+    // Cache decompressed bodies per hash so multiple in-range runs of
+    // the same hash share one file read + decompress.
+    let mut body_cache: std::collections::HashMap<blake3::Hash, Option<Vec<u8>>> =
+        std::collections::HashMap::new();
+
+    let mut entries: Vec<segment::SegmentEntry> = Vec::new();
+    let mut uncompressed_bytes: Vec<u64> = Vec::new();
+
+    for er in &job.entries {
+        if er.hash == crate::volume::ZERO_HASH {
+            continue;
+        }
+        let should_rewrite = *decision.entry(er.hash).or_insert_with(|| {
+            let runs = job.lbamap_snapshot.runs_for_hash(&er.hash);
+            let contained = runs.iter().all(|(lba, length, _)| {
+                *lba >= target_start && *lba + *length as u64 <= target_end
+            });
+            if !contained {
+                return false;
+            }
+            runs.iter().any(|(_, _, offset)| *offset != 0)
+        });
+        if !should_rewrite {
+            continue;
+        }
+
+        // Resolve the full decompressed body for this hash (cached).
+        let body_opt = match body_cache.get(&er.hash) {
+            Some(b) => b.as_ref(),
+            None => {
+                let fetched = read_reclaim_extent_body(
+                    &job.extent_index_snapshot,
+                    &job.search_dirs,
+                    &er.hash,
+                )?;
+                body_cache.insert(er.hash, fetched);
+                body_cache.get(&er.hash).unwrap().as_ref()
+            }
+        };
+        let Some(body) = body_opt else {
+            // Delta-backed hash — skip (see open question #4).
+            continue;
+        };
+
+        let length_blocks = (er.range_end - er.range_start) as u32;
+        let start = er.payload_block_offset as usize * 4096;
+        let end = start + length_blocks as usize * 4096;
+        if body.len() < end {
+            return Err(io::Error::other(format!(
+                "reclaim: body for hash {} too short ({} < {end})",
+                er.hash.to_hex(),
+                body.len()
+            )));
+        }
+        let bytes = body[start..end].to_vec();
+
+        let new_hash = blake3::hash(&bytes);
+        // If the new hash is already canonical somewhere, emit a thin
+        // DedupRef; otherwise emit a fresh Data/Inline with compression.
+        if job.extent_index_snapshot.lookup(&new_hash).is_some() {
+            entries.push(segment::SegmentEntry::new_dedup_ref(
+                new_hash,
+                er.range_start,
+                length_blocks,
+            ));
+            uncompressed_bytes.push(bytes.len() as u64);
+            continue;
+        }
+        let (stored_body, flags) = match crate::volume::maybe_compress(&bytes) {
+            Some(c) => (c, segment::SegmentFlags::COMPRESSED),
+            None => (bytes.clone(), segment::SegmentFlags::empty()),
+        };
+        entries.push(segment::SegmentEntry::new_data(
+            new_hash,
+            er.range_start,
+            length_blocks,
+            flags,
+            stored_body,
+        ));
+        uncompressed_bytes.push(bytes.len() as u64);
+    }
+
+    if entries.is_empty() {
+        return Ok(ReclaimResult {
+            lbamap_snapshot: job.lbamap_snapshot,
+            segment_ulid: job.segment_ulid,
+            body_section_start: 0,
+            entries: Vec::new(),
+            segment_written: false,
+            pending_dir: job.pending_dir,
+        });
+    }
+
+    let body_section_start = segment::write_and_commit(
+        &job.pending_dir,
+        job.segment_ulid,
+        &mut entries,
+        job.signer.as_ref(),
+    )?;
+
+    let reclaimed: Vec<ReclaimedEntry> = entries
+        .into_iter()
+        .zip(uncompressed_bytes)
+        .map(|(entry, uncompressed_bytes)| ReclaimedEntry {
+            entry,
+            uncompressed_bytes,
+        })
+        .collect();
+
+    Ok(ReclaimResult {
+        lbamap_snapshot: job.lbamap_snapshot,
+        segment_ulid: job.segment_ulid,
+        body_section_start,
+        entries: reclaimed,
+        segment_written: true,
+        pending_dir: job.pending_dir,
+    })
 }
