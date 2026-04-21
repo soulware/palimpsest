@@ -413,8 +413,13 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
 
     // Step 7: apply_done_handoffs — no .applied file exists (cancelled), so
     // nothing is deleted.
-    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
-        .unwrap();
+    rt.block_on(apply_done_handoffs(
+        fork_dir,
+        "test-vol",
+        &store,
+        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+    ))
+    .unwrap();
 
     // Assert: lba=5 reads back D0 correctly.
     // Without the fix: apply_gc_handoffs removed H0 from the extent index (or
@@ -444,8 +449,13 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
 
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc2).unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
-        .unwrap();
+    rt.block_on(apply_done_handoffs(
+        fork_dir,
+        "test-vol",
+        &store,
+        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+    ))
+    .unwrap();
 
     // After the corrected sweep, both LBAs must still read correctly.
     let got5 = vol.read(5, 1).expect("read lba=5 after second GC sweep");
@@ -548,8 +558,13 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
 
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
-        .unwrap();
+    rt.block_on(apply_done_handoffs(
+        fork_dir,
+        "test-vol",
+        &store,
+        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+    ))
+    .unwrap();
 
     // Step 5: write D2 to lba=0 and flush.  This goes to the current WAL whose
     // ULID is below u_sweep.  After draining, segments/ contains both the GC
@@ -663,8 +678,13 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
 
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
-        .unwrap();
+    rt.block_on(apply_done_handoffs(
+        fork_dir,
+        "test-vol",
+        &store,
+        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+    ))
+    .unwrap();
 
     // Step 6: drain pending/ — the WAL segment flushed by gc_checkpoint lands
     // in segments/ alongside the GC output.
@@ -756,7 +776,12 @@ fn drain_failure_skips_gc_and_data_survives() {
     // and skips GC for this tick.
     let fail_store: Arc<dyn ObjectStore> = Arc::new(FailStore);
     let drain_result = rt
-        .block_on(upload::drain_pending(fork_dir, "test-vol", &fail_store))
+        .block_on(upload::drain_pending(
+            fork_dir,
+            "test-vol",
+            &fail_store,
+            upload::DEFAULT_PART_SIZE_BYTES,
+        ))
         .expect("drain_pending itself should not error");
     assert!(
         drain_result.failed > 0,
@@ -786,7 +811,12 @@ fn drain_failure_skips_gc_and_data_survives() {
     // socket handles the promote IPC that drain_pending sends after upload.
     let _mock = rt.block_on(spawn_mock_socket(fork_dir.to_owned()));
     let drain_result2 = rt
-        .block_on(upload::drain_pending(fork_dir, "test-vol", &good_store))
+        .block_on(upload::drain_pending(
+            fork_dir,
+            "test-vol",
+            &good_store,
+            upload::DEFAULT_PART_SIZE_BYTES,
+        ))
         .expect("drain should succeed with good store");
     assert_eq!(
         drain_result2.failed, 0,
@@ -798,8 +828,13 @@ fn drain_failure_skips_gc_and_data_survives() {
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &good_store))
-        .unwrap();
+    rt.block_on(apply_done_handoffs(
+        fork_dir,
+        "test-vol",
+        &good_store,
+        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+    ))
+    .unwrap();
 
     // All data must be readable after recovery.
     let got0 = vol.read(0, 1).expect("read lba=0 after recovery");
@@ -921,8 +956,13 @@ fn gc_restart_safety_applied_handoff() {
     // Step 7: apply_done_handoffs — deletes old segment bodies and .idx files,
     // moves gc/<new> → segments/<new>.  Safe because the extent index now
     // points to the new segment.
-    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
-        .unwrap();
+    rt.block_on(apply_done_handoffs(
+        fork_dir,
+        "test-vol",
+        &store,
+        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+    ))
+    .unwrap();
 
     // All LBAs must read their last-written values.
     let got0 = vol
@@ -1103,7 +1143,12 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
         let _ = vol.apply_gc_handoffs();
         promote_gc(vol);
-        let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+        let _ = rt.block_on(apply_done_handoffs(
+            fork_dir,
+            "test-vol",
+            &store,
+            elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        ));
     };
 
     // Oracle: track expected value for each LBA.
@@ -1258,7 +1303,12 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
         let _ = vol.apply_gc_handoffs();
         promote_gc(vol);
-        let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+        let _ = rt.block_on(apply_done_handoffs(
+            fork_dir,
+            "test-vol",
+            &store,
+            elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        ));
     };
 
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
@@ -1425,7 +1475,12 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
         let _ = vol.apply_gc_handoffs();
         promote_gc(vol);
-        let _ = rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store));
+        let _ = rt.block_on(apply_done_handoffs(
+            fork_dir,
+            "test-vol",
+            &store,
+            elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        ));
     };
 
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();

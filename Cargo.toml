@@ -24,6 +24,11 @@ libc           = "0.2"
 lz4_flex       = "0.11"
 futures        = "0.3"
 object_store   = { version = "0.11", features = ["aws"] }
+# Pulled in transitively via rust-s3 (elide-fetch) and object_store (coordinator).
+# Declared directly here so we can call `CryptoProvider::install_default` at
+# startup — rustls 0.23 requires this when feature-flag auto-detection fails,
+# which it does for our dependency shape.
+rustls         = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 serde          = { version = "1", features = ["derive"] }
 tokio          = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 toml           = { version = "0.8", default-features = false, features = ["parse", "display"] }

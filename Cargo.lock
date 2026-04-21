@@ -828,6 +828,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "object_store",
+ "rustls",
  "serde",
  "tempfile",
  "tokio",

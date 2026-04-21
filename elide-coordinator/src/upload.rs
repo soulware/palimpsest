@@ -27,18 +27,100 @@
 // which the coordinator calls only after a confirmed S3 PUT. This means every
 // .idx file the coordinator sees is safe to fetch from the object store.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
+use object_store::{
+    Attribute, AttributeValue, Attributes, ObjectStore, PutOptions, WriteMultipart,
+};
 use serde::Serialize;
 use ulid::Ulid;
+
+/// `Content-Type` for plain UTF-8 text files (volume.pub, provenance, filemap, etc.).
+const MIME_TEXT: &str = "text/plain; charset=utf-8";
+/// `Content-Type` for TOML manifests.
+const MIME_TOML: &str = "application/toml; charset=utf-8";
+
+/// Default multipart part size for tests and non-configurable callers.
+/// Operational code paths read the value from `StoreSection::multipart_part_size_bytes()`.
+pub const DEFAULT_PART_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Build `PutOptions` that set `Content-Type` on the uploaded object.
+fn put_opts_with_type(content_type: &'static str) -> PutOptions {
+    let mut attrs = Attributes::new();
+    attrs.insert(Attribute::ContentType, AttributeValue::from(content_type));
+    attrs.into()
+}
+
+/// PUT a payload with `Content-Type` set. If the backing store returns
+/// `NotImplemented` for attribute options (as `LocalFileSystem` does —
+/// tests hit this path), retry without attributes. Production S3 always
+/// uses the typed path.
+async fn put_with_content_type(
+    store: &Arc<dyn ObjectStore>,
+    key: &StorePath,
+    payload: Bytes,
+    content_type: &'static str,
+) -> std::result::Result<(), object_store::Error> {
+    match store
+        .put_opts(
+            key,
+            payload.clone().into(),
+            put_opts_with_type(content_type),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::NotImplemented) => {
+            store.put(key, payload.into()).await.map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Directory under each volume that holds upload-completion sentinels —
+/// one empty file per S3 object we've confirmed uploaded. The sentinel's
+/// mtime is the completion time, which lets us skip re-uploads when the
+/// source hasn't changed since.
+const UPLOADED_DIR: &str = "uploaded";
+
+fn upload_sentinel(vol_dir: &Path, relative: &str) -> PathBuf {
+    vol_dir.join(UPLOADED_DIR).join(relative)
+}
+
+/// Return true if `sentinel` exists and (when `source` is given) is at least
+/// as new as it. A missing sentinel — or one older than its source — means
+/// the upload needs to run.
+fn is_already_uploaded(sentinel: &Path, source: Option<&Path>) -> bool {
+    let Ok(sentinel_meta) = std::fs::metadata(sentinel) else {
+        return false;
+    };
+    let Some(source) = source else {
+        return true;
+    };
+    let Ok(source_meta) = std::fs::metadata(source) else {
+        return false;
+    };
+    match (sentinel_meta.modified(), source_meta.modified()) {
+        (Ok(s), Ok(src)) => s >= src,
+        _ => false,
+    }
+}
+
+fn mark_uploaded(sentinel: &Path) -> std::io::Result<()> {
+    if let Some(parent) = sentinel.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(sentinel)?;
+    Ok(())
+}
 
 pub struct DrainResult {
     pub uploaded: usize,
@@ -158,6 +240,7 @@ pub async fn drain_pending(
     vol_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
 
@@ -192,7 +275,7 @@ pub async fn drain_pending(
         // DedupRef bodies are never in the file to begin with.
         crate::control::redact_segment(vol_dir, ulid).await;
 
-        match upload_segment(&segment_path, name, volume_id, store).await {
+        match upload_segment_file(&segment_path, name, volume_id, store, part_size_bytes).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
@@ -220,25 +303,49 @@ pub async fn drain_pending(
 /// names/<name> entry, snapshot markers, and filemaps.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
+/// Each artifact is gated on an `uploaded/<name>` sentinel file whose mtime
+/// must be at least as new as the local source's mtime. Immutable files
+/// (volume.pub, provenance, names entry, snapshot triples) upload exactly
+/// once per volume/snapshot lifetime; `manifest.toml` re-uploads only when
+/// `volume.toml` changes.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
-    if pub_key_path.exists()
-        && let Err(e) = upload_small_file(&pub_key_path, volume_id, "volume.pub", store).await
-    {
-        warn!("pub key upload failed: {e:#}");
+    if pub_key_path.exists() {
+        let sentinel = upload_sentinel(vol_dir, "volume.pub");
+        if !is_already_uploaded(&sentinel, Some(&pub_key_path)) {
+            match upload_small_file(&pub_key_path, volume_id, "volume.pub", MIME_TEXT, store).await
+            {
+                Ok(()) => {
+                    if let Err(e) = mark_uploaded(&sentinel) {
+                        warn!("failed to mark volume.pub sentinel: {e}");
+                    }
+                }
+                Err(e) => warn!("pub key upload failed: {e:#}"),
+            }
+        }
     }
 
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
-    if provenance_path.exists()
-        && let Err(e) = upload_small_file(
-            &provenance_path,
-            volume_id,
-            elide_core::signing::VOLUME_PROVENANCE_FILE,
-            store,
-        )
-        .await
-    {
-        warn!("provenance upload failed: {e:#}");
+    if provenance_path.exists() {
+        let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
+        if !is_already_uploaded(&sentinel, Some(&provenance_path)) {
+            match upload_small_file(
+                &provenance_path,
+                volume_id,
+                elide_core::signing::VOLUME_PROVENANCE_FILE,
+                MIME_TEXT,
+                store,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if let Err(e) = mark_uploaded(&sentinel) {
+                        warn!("failed to mark provenance sentinel: {e}");
+                    }
+                }
+                Err(e) => warn!("provenance upload failed: {e:#}"),
+            }
+        }
     }
 
     if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
@@ -254,15 +361,18 @@ async fn upload_small_file(
     local_path: &Path,
     volume_id: &str,
     remote_name: &str,
+    content_type: &'static str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let data =
         std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
+    let len = data.len();
     let key = StorePath::from(format!("by_id/{volume_id}/{remote_name}"));
-    store
-        .put(&key, Bytes::from(data).into())
+    let started = Instant::now();
+    put_with_content_type(store, &key, Bytes::from(data), content_type)
         .await
         .with_context(|| format!("uploading {remote_name} to {key}"))?;
+    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
     Ok(())
 }
 
@@ -311,22 +421,48 @@ async fn upload_manifest(
         source,
     };
 
-    let content = toml::to_string(&manifest).context("serializing manifest.toml")?;
-    let key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
-    store
-        .put(&key, Bytes::from(content.into_bytes()).into())
-        .await
-        .with_context(|| format!("uploading manifest.toml to {key}"))?;
+    // Both manifest.toml and the names/<name> entry derive from volume.toml,
+    // so we gate both on a sentinel tracked against volume.toml's mtime.
+    let volume_toml = vol_dir.join("volume.toml");
+    let manifest_sentinel = upload_sentinel(vol_dir, "manifest.toml");
+    if !is_already_uploaded(&manifest_sentinel, Some(&volume_toml)) {
+        let content = toml::to_string(&manifest).context("serializing manifest.toml")?;
+        let content_bytes = content.into_bytes();
+        let manifest_len = content_bytes.len();
+        let key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
+        let started = Instant::now();
+        put_with_content_type(store, &key, Bytes::from(content_bytes), MIME_TOML)
+            .await
+            .with_context(|| format!("uploading manifest.toml to {key}"))?;
+        info!(
+            "[upload] {key} ({manifest_len} bytes in {:.2?})",
+            started.elapsed()
+        );
+        if let Err(e) = mark_uploaded(&manifest_sentinel) {
+            warn!("failed to mark manifest.toml sentinel: {e}");
+        }
+    }
 
-    // Upload the name index entry: names/<name> → ULID.
-    let name_key = StorePath::from(format!("names/{name}"));
-    store
-        .put(
-            &name_key,
-            Bytes::from(volume_id.to_owned().into_bytes()).into(),
-        )
-        .await
-        .with_context(|| format!("uploading name entry to {name_key}"))?;
+    // The names/<name> → ULID entry is immutable once written: for a given
+    // (name, ULID) pair the value never changes. A rename produces a brand
+    // new key, so we gate strictly on sentinel existence here.
+    let names_sentinel = upload_sentinel(vol_dir, &format!("names_{name}"));
+    if !is_already_uploaded(&names_sentinel, None) {
+        let name_key = StorePath::from(format!("names/{name}"));
+        let name_bytes = volume_id.to_owned().into_bytes();
+        let name_len = name_bytes.len();
+        let started = Instant::now();
+        put_with_content_type(store, &name_key, Bytes::from(name_bytes), MIME_TEXT)
+            .await
+            .with_context(|| format!("uploading name entry to {name_key}"))?;
+        info!(
+            "[upload] {name_key} ({name_len} bytes in {:.2?})",
+            started.elapsed()
+        );
+        if let Err(e) = mark_uploaded(&names_sentinel) {
+            warn!("failed to mark names_{name} sentinel: {e}");
+        }
+    }
 
     Ok(())
 }
@@ -339,10 +475,15 @@ pub async fn upload_snapshot(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let key = snapshot_key(volume_id, snapshot_ulid)?;
+    let started = Instant::now();
     store
         .put(&key, Bytes::new().into())
         .await
         .with_context(|| format!("uploading snapshot marker to {key}"))?;
+    info!(
+        "[upload] {key} (0 bytes, snapshot marker in {:.2?})",
+        started.elapsed()
+    );
     Ok(())
 }
 
@@ -380,9 +521,20 @@ pub async fn upload_snapshots_and_filemaps(
             continue;
         }
 
+        // Per-snapshot triple (marker + filemap + .manifest) is immutable
+        // for a given ULID, so one sentinel covers all three. If the sentinel
+        // already exists, the whole snapshot is done — skip it.
+        let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{name}"));
+        if is_already_uploaded(&sentinel, None) {
+            continue;
+        }
+
+        let mut all_ok = true;
+
         // Upload snapshot marker.
         if let Err(e) = upload_snapshot(volume_id, name, store).await {
             warn!("snapshot marker upload failed for {name}: {e:#}");
+            all_ok = false;
         }
 
         // Upload filemap if present.
@@ -391,10 +543,17 @@ pub async fn upload_snapshots_and_filemaps(
             let key = filemap_key(volume_id, name)?;
             let data = std::fs::read(&filemap_path)
                 .with_context(|| format!("reading filemap: {}", filemap_path.display()))?;
-            store
-                .put(&key, Bytes::from(data).into())
-                .await
-                .with_context(|| format!("uploading filemap to {key}"))?;
+            let len = data.len();
+            let started = Instant::now();
+            match put_with_content_type(store, &key, Bytes::from(data), MIME_TEXT).await {
+                Ok(()) => {
+                    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
+                }
+                Err(e) => {
+                    warn!("filemap upload failed for {key}: {e:#}");
+                    all_ok = false;
+                }
+            }
         }
 
         // Upload signed segments manifest if present.
@@ -404,31 +563,73 @@ pub async fn upload_snapshots_and_filemaps(
             let data = std::fs::read(&manifest_path).with_context(|| {
                 format!("reading snapshot manifest: {}", manifest_path.display())
             })?;
-            store
-                .put(&key, Bytes::from(data).into())
-                .await
-                .with_context(|| format!("uploading snapshot manifest to {key}"))?;
+            let len = data.len();
+            let started = Instant::now();
+            match put_with_content_type(store, &key, Bytes::from(data), MIME_TEXT).await {
+                Ok(()) => {
+                    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
+                }
+                Err(e) => {
+                    warn!("snapshot manifest upload failed for {key}: {e:#}");
+                    all_ok = false;
+                }
+            }
+        }
+
+        if all_ok && let Err(e) = mark_uploaded(&sentinel) {
+            warn!("failed to mark snapshot {name} sentinel: {e}");
         }
     }
 
     Ok(())
 }
 
-async fn upload_segment(
+/// Upload a segment body file to S3 at its canonical segment key.
+///
+/// Used by both the drain path (pending/<ulid>) and GC compaction (gc body).
+/// The upload goes via multipart: each part is a separate request with its
+/// own timeout and retry, so a stalled part no longer forces a restart of
+/// the whole segment upload. Small segments complete in a single part at
+/// roughly the same cost as a simple PUT.
+///
+/// Concurrency is capped at `MAX_CONCURRENT_PARTS` via `wait_for_capacity`
+/// so parallel parts don't saturate the upload link and trip reqwest's
+/// 30s per-request timeout. Two parts in flight is enough to hide one
+/// request's handshake latency without fanning out.
+pub(crate) async fn upload_segment_file(
     path: &Path,
     ulid_str: &str,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
 ) -> Result<()> {
+    const MAX_CONCURRENT_PARTS: usize = 2;
+
     let key = segment_key(volume_id, ulid_str)?;
-
     let data = std::fs::read(path).with_context(|| format!("reading segment {ulid_str}"))?;
+    let len = data.len();
+    let mut bytes = Bytes::from(data);
 
-    store
-        .put(&key, Bytes::from(data).into())
+    let started = Instant::now();
+    let upload = store
+        .put_multipart(&key)
+        .await
+        .with_context(|| format!("initiating multipart upload for {key}"))?;
+    let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size_bytes);
+    while !bytes.is_empty() {
+        let take = bytes.len().min(part_size_bytes);
+        let part = bytes.split_to(take);
+        writer
+            .wait_for_capacity(MAX_CONCURRENT_PARTS)
+            .await
+            .with_context(|| format!("multipart part upload for {key}"))?;
+        writer.put(part);
+    }
+    writer
+        .finish()
         .await
         .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
-
+    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
     Ok(())
 }
 
@@ -587,7 +788,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
 
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.failed, 0);
@@ -636,7 +839,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(result.uploaded, 0);
         assert_eq!(result.failed, 0);
 
@@ -665,7 +870,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
 
         // manifest.toml should be present and parseable
         let manifest_key = StorePath::from(format!("by_id/{VOL_ULID}/manifest.toml"));
@@ -745,7 +952,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
+            .await
+            .unwrap();
 
         // Snapshot marker should be in store.
         let snap_key = snapshot_key(VOL_ULID, &snap_ulid).unwrap();

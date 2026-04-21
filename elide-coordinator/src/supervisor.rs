@@ -20,11 +20,17 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{error, info, warn};
 
 use tokio::process::Command;
+
+/// Env vars the coordinator exports into each volume subprocess so the
+/// volume's fetcher inherits store config without operator-level env or a
+/// per-volume `fetch.toml`. Built by [`crate::config::StoreSection::child_env`].
+pub type ChildEnv = Arc<Vec<(&'static str, String)>>;
 
 const PID_FILE: &str = "volume.pid";
 const RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -36,7 +42,12 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Supervise a single fork: spawn `elide serve-volume`, restart on exit.
 /// Runs indefinitely; cancel the task to stop supervision.
-pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, elide_bin: PathBuf) {
+pub async fn supervise(
+    fork_dir: PathBuf,
+    data_dir: PathBuf,
+    elide_bin: PathBuf,
+    child_env: ChildEnv,
+) {
     let label = fork_dir.display().to_string();
     let mut fast_failures: u32 = 0;
 
@@ -101,7 +112,7 @@ pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, elide_bin: PathBuf)
             remove_pid(&fork_dir);
         }
 
-        match spawn_volume(&fork_dir, &elide_bin) {
+        match spawn_volume(&fork_dir, &elide_bin, &child_env) {
             Ok(mut child) => {
                 let pid = child.id().unwrap_or(0);
                 info!("[supervisor {label}] started pid {pid}");
@@ -130,9 +141,17 @@ pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, elide_bin: PathBuf)
     }
 }
 
-fn spawn_volume(fork_dir: &Path, elide_bin: &Path) -> std::io::Result<tokio::process::Child> {
+fn spawn_volume(
+    fork_dir: &Path,
+    elide_bin: &Path,
+    child_env: &[(&'static str, String)],
+) -> std::io::Result<tokio::process::Child> {
     let mut cmd = Command::new(elide_bin);
     cmd.arg("serve-volume").arg(fork_dir);
+
+    for (k, v) in child_env {
+        cmd.env(k, v);
+    }
 
     if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir)
         && let Some(nbd) = cfg.nbd

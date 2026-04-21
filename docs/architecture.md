@@ -615,10 +615,23 @@ When the volume needs S3 credentials (at startup or before expiry):
 1. Volume sends `credentials <macaroon>` to `control.sock`
 2. Coordinator verifies the HMAC chain (proves it minted this token)
 3. Coordinator checks all caveats: volume/fork match, scope is `credentials`, `pid` matches `SO_PEERCRED` of the current connection
-4. Coordinator issues short-lived read-only STS credentials (or equivalent) scoped to the volume's S3 prefix
+4. Coordinator issues short-lived read-only credentials scoped to the volume's S3 prefix — `by_id/<volume-ulid>/*` (see *Directory layout on disk and in S3* above). The issuance mechanism depends on the backend; see *Credential backends* below.
 5. Returns `ok <access-key> <secret-key> <session-token> <expiry-unix>`
 
 The PID check on every request (step 3) means the macaroon is useless even if exfiltrated — it can only be presented from the original process. The HMAC chain means no volume can forge a token for a different volume.
+
+### Credential backends
+
+Step 4 delegates to a `CredentialIssuer` selected at coordinator startup from `coordinator.toml`. The macaroon handshake runs identically for every backend — only the credential material returned in step 5 changes.
+
+| Backend | Issuer | Notes |
+|---|---|---|
+| AWS S3 | STS `AssumeRole` with a session policy narrowing `s3:GetObject` to `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` | Session duration 15 min – 12 h; the coordinator's own role needs `sts:AssumeRole` on a dedicated read-only role |
+| S3-compatible with STS (e.g. MinIO, Ceph RGW/STS) | `AssumeRole` against the backend's STS endpoint with the same session policy | Compatibility varies by backend; the session policy shape is the portable part |
+| S3-compatible without STS | Coordinator returns its own configured read-only key pair with no per-volume scoping | Defense-in-depth only — the coordinator must be configured with a distinct read-only key, not the upload key. Logged as a downgrade at coordinator startup. |
+| Local filesystem (`elide_store/`) | No-op issuer — returns a sentinel the volume's fetcher treats as "no auth needed" | Used for tests and single-host deployments |
+
+The volume never negotiates the backend type. It treats the returned triple as opaque and passes it to `object_store`; the no-op sentinel is detected by the fetcher and skips signing entirely.
 
 ### Token lifetime
 
@@ -636,6 +649,14 @@ attenuated: volume=myvm, scope=credentials, pid=1234, not-after=<+5m>
 ```
 
 The attenuated token is derived by the volume in-process — no coordinator round-trip. The coordinator verifies all caveats including the narrowed `not-after`.
+
+### Refresh and clock skew
+
+Short-lived credentials require the volume to refresh before expiry. The fetcher holds a `CredentialProvider` that re-issues a `credentials <macaroon>` request when the remaining lifetime drops below 10%, or 60 s, whichever is greater. Refresh is lazy — driven by the next fetch request, not a background timer — so an idle volume holds stale credentials until it next needs to fetch.
+
+A fetch that receives HTTP 403 retries once after forcing a credential refresh. This absorbs clock skew between coordinator, volume, and the backend's signing check. A second 403 propagates as a fetch error.
+
+In-flight fetches started under the old credentials are not cancelled on refresh — they either succeed under the old signature or fail and retry with the new one. No lock is held across refresh.
 
 ### Standalone mode (no coordinator)
 

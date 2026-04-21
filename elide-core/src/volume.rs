@@ -4303,8 +4303,29 @@ impl ReadonlyVolume {
 /// Walk the ancestry chain and rebuild the LBA map and extent index.
 ///
 /// This is the common open-time setup shared by `Volume::open` and
-/// `ReadonlyVolume::open`.  Returns the ancestor layers (oldest-first), the
-/// rebuilt LBA map, and the rebuilt extent index.
+/// `ReadonlyVolume::open`. Returns the ancestor layers (oldest-first, fork
+/// parents first then extent-index sources deduped by dir), the rebuilt
+/// LBA map, and the rebuilt extent index.
+///
+/// **Ancestor layer semantics have two jobs** and used to conflate them:
+///
+/// 1. *LBA-map contribution* — which volumes' segments claim LBAs that
+///    should be visible in this volume's read view. This is strictly the
+///    fork parent chain (`volume.parent`); extent-index sources never
+///    contribute LBA claims.
+/// 2. *Body lookup search path* — when an extent resolves via the extent
+///    index to a canonical segment, where to find that segment's body on
+///    disk (and where to route demand-fetches). **This must include
+///    extent-index sources**, because a fork's parent may hold DedupRef
+///    entries whose canonical bodies live in an extent-index source.
+///    Earlier versions of this function only returned fork parents, which
+///    caused silent zero-fill on fork reads through DedupRef — see
+///    `docs/architecture.md`.
+///
+/// The rebuilt `LbaMap` is computed from `lba_chain` (fork-only, correct).
+/// The returned `ancestor_layers` is the broader set (fork + extent), used
+/// downstream by `find_segment_in_dirs`, `open_delta_body_in_dirs`,
+/// `prepare_reclaim`, and `RemoteFetcher`'s search list.
 fn open_read_state(
     fork_dir: &Path,
     by_id_dir: &Path,
@@ -4314,26 +4335,39 @@ fn open_read_state(
     // locally. The trust chain is rooted in this volume's own pubkey and
     // walked via the `parent_pubkey` embedded in each child's provenance.
     verify_ancestor_manifests(fork_dir, by_id_dir)?;
-    let ancestor_layers = walk_ancestors(fork_dir, by_id_dir)?;
-    let lba_chain: Vec<(PathBuf, Option<String>)> = ancestor_layers
+    let fork_layers = walk_ancestors(fork_dir, by_id_dir)?;
+    let lba_chain: Vec<(PathBuf, Option<String>)> = fork_layers
         .iter()
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_owned(), None)))
         .collect();
     let lbamap = lbamap::rebuild_segments(&lba_chain)?;
 
-    // The extent index is seeded from both the fork ancestry (volume.parent)
-    // and the extent-index ancestry (volume.extent_index). The extent-only
-    // ancestors contribute hashes for dedup/delta without affecting the LBA
-    // map, so reads never fall through to them.
-    let extent_only = walk_extent_ancestors(fork_dir, by_id_dir)?;
-    let mut hash_chain = lba_chain.clone();
-    for layer in extent_only {
+    // Extent-index sources: recursed across the fork chain by
+    // `walk_extent_ancestors`. They contribute canonical hashes to the
+    // extent index and must also be searchable for body lookups.
+    let extent_sources = walk_extent_ancestors(fork_dir, by_id_dir)?;
+
+    // Build the hash chain for extent-index rebuild: fork chain + extent
+    // sources (deduped by dir). `extent_index.lookup` returns canonical
+    // locations populated from both.
+    let mut hash_chain = lba_chain;
+    for layer in &extent_sources {
         if !hash_chain.iter().any(|(dir, _)| dir == &layer.dir) {
-            hash_chain.push((layer.dir, layer.branch_ulid));
+            hash_chain.push((layer.dir.clone(), layer.branch_ulid.clone()));
         }
     }
     let extent_index = extentindex::rebuild(&hash_chain)?;
+
+    // The returned `ancestor_layers` unifies fork parents and extent
+    // sources. Callers use this as the body-lookup search path; the
+    // LBA-map-only subset was already consumed above.
+    let mut ancestor_layers = fork_layers;
+    for layer in extent_sources {
+        if !ancestor_layers.iter().any(|l| l.dir == layer.dir) {
+            ancestor_layers.push(layer);
+        }
+    }
     Ok((ancestor_layers, lbamap, extent_index))
 }
 
@@ -4513,38 +4547,63 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
     Ok(ancestors)
 }
 
-/// Read the flat extent-index source list from `volume.provenance`.
+/// Collect all extent-index source volumes reachable from `fork_dir`,
+/// recursing through the fork-parent chain.
 ///
-/// The `extent_index` field is a flat list of
-/// `<source-ulid>/<snapshot-ulid>` entries, each naming a snapshot
-/// whose extents populate this volume's `ExtentIndex` (for dedup and delta
-/// compression source lookups) but are **never** merged into the LBA map.
-/// The child is born with an empty LBA map; hashes from these sources are
-/// only consulted when the child writes an extent whose content hash matches
-/// a source extent, in which case the child emits a `DedupRef` pointing at
-/// the source segment. See `docs/architecture.md` for the "not in read path"
-/// invariant.
+/// The `extent_index` field of a `volume.provenance` is a flat list of
+/// `<source-ulid>/<snapshot-ulid>` entries, each naming a snapshot whose
+/// extents populate the volume's `ExtentIndex` for dedup / delta source
+/// lookups. At write time these hashes are consulted to decide whether
+/// to emit a thin `DedupRef` / `Delta` entry instead of a fresh body.
 ///
-/// The list is flat, not a chain: when a new volume is imported with
-/// `--extents-from X`, the coordinator reads `X`'s own extent_index list,
-/// appends `X`, dedupes, and writes the result into the new provenance.
-/// There is no recursion at attach time — the list is already fully
-/// expanded. Multiple sources passed at import time each contribute their
-/// (already-flat) lists, concatenated and deduped by directory path.
+/// **At read time**, every volume in the fork chain may contain thin
+/// entries whose canonical bodies live in an extent-index source listed
+/// by *that* ancestor. A fork child must therefore see the union of every
+/// ancestor's extent-index sources, not just its own (`fork_volume` writes
+/// an empty `extent_index` for forks — see `volume.rs::fork_volume_at`).
+/// Without this recursion, a fork reading through DedupRef entries in its
+/// parent silently zero-fills, because the extent_index rebuild would
+/// never scan the source that owns the canonical body.
+///
+/// The `extent_index` field itself is flat at attach time (the coordinator
+/// concatenates + dedupes the sources' own lists during import), so each
+/// layer we visit contributes a fully-expanded set. This function's job
+/// is the orthogonal recursion across *fork parents*: we walk `lineage.parent`
+/// from `fork_dir` upward, unioning each volume's `extent_index`.
+///
+/// Dedup is by `source_dir`; when multiple ancestors reference the same
+/// source at different snapshots, we keep the lexicographically greatest
+/// `snapshot_ulid` — that's the cutoff that includes the most data.
 pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
-    let lineage = load_lineage_or_empty(fork_dir)?;
     let mut layers: Vec<AncestorLayer> = Vec::new();
-    for entry in &lineage.extent_index {
-        let (source_ulid_str, snapshot_ulid) =
-            parse_lineage_entry(entry, "extent_index", fork_dir)?;
-        let source_dir = resolve_ancestor_dir(by_id_dir, source_ulid_str);
-        if layers.iter().any(|l| l.dir == source_dir) {
-            continue;
+    let mut cursor: Option<PathBuf> = Some(fork_dir.to_owned());
+    while let Some(dir) = cursor {
+        let lineage = load_lineage_or_empty(&dir)?;
+        for entry in &lineage.extent_index {
+            let (source_ulid_str, snapshot_ulid) =
+                parse_lineage_entry(entry, "extent_index", &dir)?;
+            let source_dir = resolve_ancestor_dir(by_id_dir, source_ulid_str);
+            match layers.iter_mut().find(|l| l.dir == source_dir) {
+                Some(existing) => {
+                    if existing
+                        .branch_ulid
+                        .as_deref()
+                        .is_none_or(|prev| snapshot_ulid.as_str() > prev)
+                    {
+                        existing.branch_ulid = Some(snapshot_ulid);
+                    }
+                }
+                None => {
+                    layers.push(AncestorLayer {
+                        dir: source_dir,
+                        branch_ulid: Some(snapshot_ulid),
+                    });
+                }
+            }
         }
-        layers.push(AncestorLayer {
-            dir: source_dir,
-            branch_ulid: Some(snapshot_ulid),
-        });
+        cursor = lineage
+            .parent
+            .map(|p| resolve_ancestor_dir(by_id_dir, &p.volume_ulid));
     }
     Ok(layers)
 }

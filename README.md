@@ -8,6 +8,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 |---|---|
 | [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, fork it, and serve it over NBD |
 | [docs/quickstart-data-volume.md](docs/quickstart-data-volume.md) | Create an empty data volume, mount from a Multipass VM, write data, upload segments |
+| [docs/quickstart-tigris.md](docs/quickstart-tigris.md) | Run against a real S3-compatible backend (Tigris); covers AWS S3, MinIO, R2, etc. |
 | [docs/overview.md](docs/overview.md) | Problem statement, key concepts, operation modes, empirical findings |
 | [docs/findings.md](docs/findings.md) | Empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification |
 | [docs/architecture.md](docs/architecture.md) | System architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots |

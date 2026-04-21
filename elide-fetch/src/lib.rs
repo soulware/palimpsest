@@ -78,6 +78,15 @@ impl FetchConfig {
     /// 3. `./elide_store` — the coordinator's default local store location
     ///
     /// Returns `Ok(None)` only if none of the above is present.
+    ///
+    /// Note: CLI commands (`remote list`, `remote pull`, `create --from`)
+    /// should prefer asking a running coordinator for config+creds via its
+    /// IPC socket before falling through to this function. `FetchConfig`
+    /// intentionally does not read `coordinator.toml` itself — the config
+    /// there names a bucket but the matching `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY` live in the coordinator's process env, not
+    /// on disk, so consuming just the `[store]` section would give the
+    /// illusion of being configured without having usable credentials.
     pub fn load(data_dir: &Path) -> io::Result<Option<Self>> {
         let config_path = data_dir.join("fetch.toml");
         if config_path.exists() {

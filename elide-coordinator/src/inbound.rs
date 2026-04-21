@@ -29,6 +29,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::import::{self, ImportRegistry, ImportState};
+use elide_coordinator::config::StoreSection;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry};
 
 #[allow(clippy::too_many_arguments)]
@@ -41,6 +42,8 @@ pub async fn serve(
     evict_registry: EvictRegistry,
     snapshot_locks: SnapshotLockRegistry,
     store: Arc<dyn ObjectStore>,
+    store_config: Arc<StoreSection>,
+    part_size_bytes: usize,
 ) {
     let _ = std::fs::remove_file(socket_path);
 
@@ -64,8 +67,18 @@ pub async fn serve(
                 let evict_reg = evict_registry.clone();
                 let snap_locks = snapshot_locks.clone();
                 let store = store.clone();
+                let store_cfg = store_config.clone();
                 tokio::spawn(handle(
-                    stream, data_dir, rescan, registry, bin, evict_reg, snap_locks, store,
+                    stream,
+                    data_dir,
+                    rescan,
+                    registry,
+                    bin,
+                    evict_reg,
+                    snap_locks,
+                    store,
+                    store_cfg,
+                    part_size_bytes,
                 ));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
@@ -83,6 +96,8 @@ async fn handle(
     evict_registry: EvictRegistry,
     snapshot_locks: SnapshotLockRegistry,
     store: Arc<dyn ObjectStore>,
+    store_config: Arc<StoreSection>,
+    part_size_bytes: usize,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -113,6 +128,8 @@ async fn handle(
         &evict_registry,
         &snapshot_locks,
         &store,
+        &store_config,
+        part_size_bytes,
     )
     .await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
@@ -128,6 +145,8 @@ async fn dispatch(
     evict_registry: &EvictRegistry,
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
+    store_config: &StoreSection,
+    part_size_bytes: usize,
 ) -> String {
     if line.is_empty() {
         return "err empty request".to_string();
@@ -221,7 +240,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: snapshot <volume>".to_string();
             }
-            snapshot_volume(args, data_dir, snapshot_locks, store).await
+            snapshot_volume(args, data_dir, snapshot_locks, store, part_size_bytes).await
         }
 
         "reclaim" => {
@@ -231,11 +250,100 @@ async fn dispatch(
             reclaim_volume(args, data_dir).await
         }
 
+        // Vend the non-secret `[store]` config so CLI read operations
+        // (remote list, remote pull, volume create --from) can build an
+        // S3 client that matches the coordinator's. Returned as TOML so
+        // the caller can round-trip through toml::from_str.
+        "get-store-config" => render_store_config(store_config),
+
+        // Vend S3 credentials from the coordinator's env. Today this is
+        // the long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; the
+        // same wire format will carry macaroon-issued short-lived
+        // credentials when that lands.
+        "get-store-creds" => render_store_creds(),
+
         _ => {
             warn!("[inbound] unexpected op: {op:?}");
             format!("err unknown op: {op}")
         }
     }
+}
+
+// ── Store config / creds vending ──────────────────────────────────────────────
+
+/// Response for `get-store-config`: a multi-line TOML body naming either a
+/// local store path or an S3 bucket/endpoint/region. Intentionally contains
+/// no secrets.
+fn render_store_config(store: &StoreSection) -> String {
+    let mut body = String::from("ok\n");
+    if let Some(path) = &store.local_path {
+        body.push_str(&format!(
+            "local_path = {}\n",
+            toml_quote(&path.display().to_string())
+        ));
+        return body;
+    }
+    if let Some(bucket) = &store.bucket {
+        body.push_str(&format!("bucket = {}\n", toml_quote(bucket)));
+        if let Some(ep) = &store.endpoint {
+            body.push_str(&format!("endpoint = {}\n", toml_quote(ep)));
+        }
+        if let Some(region) = &store.region {
+            body.push_str(&format!("region = {}\n", toml_quote(region)));
+        }
+        return body;
+    }
+    // No explicit store configured — coordinator's own fallback is
+    // `./elide_store`, so surface that so the CLI sees the same default.
+    body.push_str("local_path = \"elide_store\"\n");
+    body
+}
+
+/// Response for `get-store-creds`: TOML-bodied access key + secret + optional
+/// session token read from the coordinator's env. Returns `err` when the
+/// coordinator's env has no credentials — callers should treat that as
+/// fatal rather than silently swap in their own env.
+fn render_store_creds() -> String {
+    let ak = match std::env::var("AWS_ACCESS_KEY_ID") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return "err no credentials configured in coordinator env".to_string(),
+    };
+    let sk = match std::env::var("AWS_SECRET_ACCESS_KEY") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return "err AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing".to_string();
+        }
+    };
+    let mut body = String::from("ok\n");
+    body.push_str(&format!("access_key_id = {}\n", toml_quote(&ak)));
+    body.push_str(&format!("secret_access_key = {}\n", toml_quote(&sk)));
+    if let Ok(tok) = std::env::var("AWS_SESSION_TOKEN")
+        && !tok.is_empty()
+    {
+        body.push_str(&format!("session_token = {}\n", toml_quote(&tok)));
+    }
+    body
+}
+
+/// Quote a string as a TOML basic string. The values we serialise (bucket
+/// names, URLs, AWS keys) never contain characters that would require
+/// `r"..."` literals or multi-line strings.
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ── Import operations ─────────────────────────────────────────────────────────
@@ -492,6 +600,7 @@ async fn snapshot_volume(
     data_dir: &Path,
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
 ) -> String {
     let link = data_dir.join("by_name").join(vol_name);
     let fork_dir = match std::fs::canonicalize(&link) {
@@ -522,7 +631,9 @@ async fn snapshot_volume(
     //    upload any snapshot files already sitting under snapshots/.
     //    We run this before sign_snapshot_manifest so that index/ is populated
     //    with every segment up to the flush point.
-    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store).await {
+    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store, part_size_bytes)
+        .await
+    {
         Ok(r) if r.failed > 0 => {
             return format!("err drain reported {} failed segment(s)", r.failed);
         }
@@ -543,7 +654,10 @@ async fn snapshot_volume(
     //    `try_lock`s the same lock and skips the tick while we hold it,
     //    so there is no race with a concurrent apply_done_handoffs.
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
-    if let Err(e) = elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store).await {
+    if let Err(e) =
+        elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store, part_size_bytes)
+            .await
+    {
         return format!("err draining gc handoffs: {e:#}");
     }
 

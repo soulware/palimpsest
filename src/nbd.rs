@@ -6,10 +6,61 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tracing::{error, warn};
 
 use elide_core::volume::{ReadonlyVolume, Volume};
+
+/// How long volume open retries wait in total before giving up when an
+/// ancestor artifact is missing. The common case is the coordinator's
+/// prefetch task racing with the supervisor's spawn — a second or two is
+/// plenty. After the budget expires we propagate the error.
+const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const OPEN_RETRY_STEP: Duration = Duration::from_millis(500);
+
+/// Return `true` if `e` looks like a transient "ancestor artifact not yet
+/// on disk" error (NotFound at the OS layer, wrapped in `io::Error::other`
+/// with a message that includes the underlying ENOENT text). The retry
+/// loop treats these as retryable; everything else propagates immediately.
+fn is_missing_file_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    // Upstream signing / volume-open helpers wrap ENOENT in
+    // `io::Error::other(format!("… not readable: {e}"))`, discarding the
+    // original `ErrorKind`. Detect the embedded ENOENT via its text.
+    let msg = e.to_string();
+    msg.contains("No such file or directory")
+}
+
+fn open_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<Volume> {
+    let started = Instant::now();
+    loop {
+        match Volume::open(dir, by_id_dir) {
+            Ok(v) => return Ok(v),
+            Err(e) if is_missing_file_error(&e) && started.elapsed() < OPEN_RETRY_BUDGET => {
+                warn!("volume open: ancestor artifact missing, retrying ({e})");
+                std::thread::sleep(OPEN_RETRY_STEP);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn open_readonly_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<ReadonlyVolume> {
+    let started = Instant::now();
+    loop {
+        match ReadonlyVolume::open(dir, by_id_dir) {
+            Ok(v) => return Ok(v),
+            Err(e) if is_missing_file_error(&e) && started.elapsed() < OPEN_RETRY_BUDGET => {
+                warn!("volume open (readonly): ancestor artifact missing, retrying ({e})");
+                std::thread::sleep(OPEN_RETRY_STEP);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 use crate::extents::{LocatedExtent, locate_extents};
 
@@ -764,7 +815,7 @@ fn serve_readonly_volume_listener(
 ) -> io::Result<()> {
     install_sigusr1_handler();
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = ReadonlyVolume::open(dir, by_id_dir)?;
+    let mut volume = open_readonly_volume_with_retry(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
@@ -798,7 +849,7 @@ fn run_volume_ipc_only(
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = Volume::open(dir, by_id_dir)?;
+    let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
@@ -833,7 +884,7 @@ fn serve_volume_listener(
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
-    let mut volume = Volume::open(dir, by_id_dir)?;
+    let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
     if let Some(config) = fetch_config {
         let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;

@@ -72,6 +72,9 @@ async fn run() -> Result<()> {
                 config.data_dir = dir;
             }
             let store = config.store.build()?;
+            tracing::info!("[coordinator] store: {}", config.store.describe());
+            config.store.probe(store.as_ref()).await?;
+            tracing::info!("[coordinator] store: reachable");
             daemon::run(config, store).await
         }
     }

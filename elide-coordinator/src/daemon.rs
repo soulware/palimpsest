@@ -41,8 +41,22 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let elide_bin = config.elide_bin.clone();
     let elide_import_bin = Arc::new(config.elide_import_bin.clone());
     let gc_config = config.gc.clone();
+    let part_size_bytes = config.store.multipart_part_size_bytes();
     let socket_path = config.resolved_socket_path();
     let data_dir = Arc::new(config.data_dir.clone());
+    let child_env: supervisor::ChildEnv = {
+        let mut env = config.store.child_env();
+        // Let spawned volume subprocesses call back into us over the IPC
+        // socket to request store config + credentials, rather than
+        // inheriting AWS_* via the parent's env. This is the path that
+        // macaroon-scoped credentials will flow over later.
+        env.push((
+            "ELIDE_COORDINATOR_SOCKET",
+            config.resolved_socket_path().to_string_lossy().into_owned(),
+        ));
+        Arc::new(env)
+    };
+    let store_config = Arc::new(config.store.clone());
 
     info!(
         "[coordinator] data_dir: {}; drain every {}s, scan every {}s; elide bin: {}",
@@ -98,6 +112,8 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 evict_reg,
                 snap_locks,
                 store,
+                store_config,
+                part_size_bytes,
             )
             .await;
         });
@@ -150,6 +166,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     store.clone(),
                     drain_interval,
                     gc_config.clone(),
+                    part_size_bytes,
                     evict_rx,
                     snapshot_locks.clone(),
                 ));
@@ -161,6 +178,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                         vol_dir,
                         data_dir.as_ref().clone(),
                         elide_bin.clone(),
+                        child_env.clone(),
                     ));
                 }
             }

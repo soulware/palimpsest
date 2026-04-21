@@ -381,6 +381,14 @@ fn main() {
         .try_init()
         .ok();
 
+    // rustls 0.23 requires a process-level default `CryptoProvider` to be
+    // installed before any TLS connection is made. Feature-flag auto-detect
+    // fails in our dependency graph (rustls pulled in transitively, not as
+    // a direct dep of any crate that enables the `aws_lc_rs` feature on it),
+    // so install it explicitly. `install_default` returns `Err` if another
+    // provider was already installed — ignore that, it's fine.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let args = Args::parse();
 
     let socket_path = args.data_dir.join("control.sock");
@@ -691,11 +699,11 @@ fn main() {
             }
 
             VolumeCommand::Remote { command } => {
-                let config = match elide_fetch::FetchConfig::load(&args.data_dir) {
+                let config = match resolve_fetch_config(&socket_path, &args.data_dir) {
                     Ok(Some(c)) => c,
                     Ok(None) => {
                         eprintln!(
-                            "error: no store configured — create fetch.toml or set ELIDE_S3_BUCKET"
+                            "error: no store configured — start the coordinator, create fetch.toml, or set ELIDE_S3_BUCKET"
                         );
                         std::process::exit(1);
                     }
@@ -733,7 +741,7 @@ fn main() {
             let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
                 .expect("failed to determine volume size");
             let fetch_config =
-                elide_fetch::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
+                resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
             let nbd_bind = if let Some(path) = socket {
                 Some(nbd::NbdBind::Unix(path))
             } else {
@@ -1050,7 +1058,7 @@ fn create_fork(
             if dir.exists() {
                 dir
             } else {
-                let config = load_fetch_config(data_dir, &ulid_str)?;
+                let config = load_fetch_config(socket_path, data_dir, &ulid_str)?;
                 eprintln!("pulling {ulid_str} from remote store...");
                 remote_pull(&config, from, data_dir, socket_path)?;
                 let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
@@ -1069,7 +1077,7 @@ fn create_fork(
                 local
             } else {
                 // Name not found locally — try the remote store.
-                let config = load_fetch_config_for_name(data_dir, from)?;
+                let config = load_fetch_config_for_name(socket_path, data_dir, from)?;
                 eprintln!("pulling '{from}' from remote store...");
                 remote_pull(&config, from, data_dir, socket_path)?;
                 // remote_pull resolved the name to a ULID and pulled into
@@ -1117,7 +1125,7 @@ fn create_fork(
                         .and_then(|n| n.to_str())
                         .expect("readonly dir must have a ULID name")
                 });
-                let config = load_fetch_config(data_dir, vol_id)?;
+                let config = load_fetch_config(socket_path, data_dir, vol_id)?;
                 Some(resolve_latest_remote_snapshot(&config, vol_id)?)
             }
         }
@@ -1199,9 +1207,113 @@ fn create_fork(
     Ok(())
 }
 
+/// Ask a running coordinator for its store config and (for S3) credentials.
+///
+/// Returns `Ok(Some(_))` when the coordinator is reachable and provided a
+/// usable config. Returns `Ok(None)` when no coordinator is running at
+/// `socket_path` — callers should fall back to `FetchConfig::load` in that
+/// case. Returns an error when the coordinator IS running but reported an
+/// error (e.g. `get-store-creds` failed because the coordinator's env has
+/// no AWS credentials) — that's an operator-visible misconfiguration and
+/// falling back would silently paper over it.
+///
+/// On success for an S3 store, exports `AWS_ACCESS_KEY_ID`,
+/// `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` into this
+/// process's env so `rust-s3`'s default credential chain picks them up when
+/// building the fetcher.
+fn fetch_config_via_coordinator(
+    socket_path: &Path,
+) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+    let config = match coordinator_client::get_store_config(socket_path) {
+        Ok(c) => c,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(path) = config.local_path {
+        return Ok(Some(elide_fetch::FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(path),
+            fetch_batch_bytes: None,
+        }));
+    }
+    let Some(bucket) = config.bucket else {
+        return Err(std::io::Error::other(
+            "coordinator returned empty store config",
+        ));
+    };
+    let creds = coordinator_client::get_store_creds(socket_path)?;
+    // SAFETY: CLI startup is single-threaded at this point — no background
+    // tasks have been spawned, so there are no concurrent env readers.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+        if let Some(tok) = &creds.session_token {
+            std::env::set_var("AWS_SESSION_TOKEN", tok);
+        } else {
+            std::env::remove_var("AWS_SESSION_TOKEN");
+        }
+    }
+    Ok(Some(elide_fetch::FetchConfig {
+        bucket: Some(bucket),
+        endpoint: config.endpoint,
+        region: config.region,
+        local_path: None,
+        fetch_batch_bytes: None,
+    }))
+}
+
+/// Resolve the fetch config: try the running coordinator first, then fall
+/// back to `FetchConfig::load` (which reads `fetch.toml`, `ELIDE_S3_BUCKET`,
+/// or `./elide_store`). Returns `Ok(None)` if no source is available.
+fn resolve_fetch_config(
+    socket_path: &Path,
+    data_dir: &Path,
+) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
+    if let Some(cfg) = fetch_config_via_coordinator(socket_path)? {
+        return Ok(Some(cfg));
+    }
+    elide_fetch::FetchConfig::load(data_dir)
+}
+
+/// Resolve the fetch config for a volume subprocess (`serve-volume`).
+///
+/// The coordinator exports `ELIDE_COORDINATOR_SOCKET` into each spawned
+/// volume's environment. When set, we pull store config + credentials from
+/// the coordinator over IPC — that's the path forward for macaroon-scoped
+/// credentials. When unset (standalone `elide serve-volume` invocation with
+/// no coordinator), fall back to `FetchConfig::load` from the volume
+/// directory.
+fn resolve_volume_fetch_config(
+    fork_dir: &Path,
+) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
+    if let Ok(sock) = std::env::var("ELIDE_COORDINATOR_SOCKET") {
+        let socket_path = Path::new(&sock);
+        if let Some(cfg) = fetch_config_via_coordinator(socket_path)? {
+            return Ok(Some(cfg));
+        }
+    }
+    elide_fetch::FetchConfig::load(fork_dir)
+}
+
 /// Load the fetch config, or return a clear error mentioning the volume ULID.
-fn load_fetch_config(data_dir: &Path, ulid_str: &str) -> std::io::Result<elide_fetch::FetchConfig> {
-    match elide_fetch::FetchConfig::load(data_dir) {
+fn load_fetch_config(
+    socket_path: &Path,
+    data_dir: &Path,
+    ulid_str: &str,
+) -> std::io::Result<elide_fetch::FetchConfig> {
+    match resolve_fetch_config(socket_path, data_dir) {
         Ok(Some(c)) => Ok(c),
         Ok(None) => Err(std::io::Error::other(format!(
             "source volume {ulid_str} not found locally and no store configured for remote pull"
@@ -1214,10 +1326,11 @@ fn load_fetch_config(data_dir: &Path, ulid_str: &str) -> std::io::Result<elide_f
 
 /// Load the fetch config, or return a clear error mentioning a volume name.
 fn load_fetch_config_for_name(
+    socket_path: &Path,
     data_dir: &Path,
     name: &str,
 ) -> std::io::Result<elide_fetch::FetchConfig> {
-    match elide_fetch::FetchConfig::load(data_dir) {
+    match resolve_fetch_config(socket_path, data_dir) {
         Ok(Some(c)) => Ok(c),
         Ok(None) => Err(std::io::Error::other(format!(
             "volume '{name}' not found locally and no store configured for remote pull"

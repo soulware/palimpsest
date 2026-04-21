@@ -63,7 +63,6 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use object_store::ObjectStore;
 use ulid::Ulid;
 
@@ -429,6 +428,7 @@ pub async fn apply_done_handoffs(
     fork_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
 ) -> Result<usize> {
     let gc_dir = fork_dir.join("gc");
     if !gc_dir.try_exists().context("checking gc dir")? {
@@ -503,14 +503,15 @@ pub async fn apply_done_handoffs(
         // Upload + promote are idempotent: if a previous pass already
         // uploaded and promoted, the store PUT is a re-PUT of the same
         // bytes and `promote_segment` short-circuits on cache body presence.
-        let key = segment_key(volume_id, &new_ulid_str)
-            .with_context(|| format!("building key for {new_ulid_str}"))?;
-        let data = std::fs::read(&gc_body)
-            .with_context(|| format!("reading compacted segment {new_ulid_str}"))?;
-        store
-            .put(&key, Bytes::from(data).into())
-            .await
-            .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
+        crate::upload::upload_segment_file(
+            &gc_body,
+            &new_ulid_str,
+            volume_id,
+            store,
+            part_size_bytes,
+        )
+        .await
+        .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
         // Promote IPC: volume writes index/<new>.idx, copies body to cache,
         // deletes stale index/<old>.idx for each input. The gc body stays
@@ -1479,9 +1480,14 @@ mod tests {
     async fn done_no_gc_dir() {
         let tmp = TempDir::new().unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", &store)
-            .await
-            .unwrap();
+        let n = apply_done_handoffs(
+            tmp.path(),
+            "vol",
+            &store,
+            crate::upload::DEFAULT_PART_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1490,9 +1496,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("gc")).unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", &store)
-            .await
-            .unwrap();
+        let n = apply_done_handoffs(
+            tmp.path(),
+            "vol",
+            &store,
+            crate::upload::DEFAULT_PART_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1505,9 +1516,14 @@ mod tests {
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending"), "").unwrap();
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", &store)
-            .await
-            .unwrap();
+        let n = apply_done_handoffs(
+            tmp.path(),
+            "vol",
+            &store,
+            crate::upload::DEFAULT_PART_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 0);
         // Files should be untouched.
         assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending").exists());
@@ -1595,7 +1611,14 @@ mod tests {
         // Step 5: coordinator completes the handoff — uploads to S3, sends
         // promote IPC to volume (mock), deletes gc/<new>, renames .applied → .done.
         let _mock = spawn_mock_socket(dir.to_owned()).await;
-        let done = apply_done_handoffs(dir, "test-vol", &store).await.unwrap();
+        let done = apply_done_handoffs(
+            dir,
+            "test-vol",
+            &store,
+            crate::upload::DEFAULT_PART_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(
             done > 0,
             "apply_done_handoffs should have processed the handoff"
@@ -2550,7 +2573,14 @@ mod tests {
 
         // Coordinator completes: upload + promote.
         let _mock = spawn_mock_socket(dir.to_owned()).await;
-        let done = apply_done_handoffs(dir, "test-vol", &store).await.unwrap();
+        let done = apply_done_handoffs(
+            dir,
+            "test-vol",
+            &store,
+            crate::upload::DEFAULT_PART_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(done > 0, "handoff should complete");
 
         // Crash + reopen — rebuild from index/*.idx.

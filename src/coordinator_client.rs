@@ -5,9 +5,11 @@
 //
 // Exception: `import_attach_by_name` reads multiple lines until a terminal line.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+
+use serde::Deserialize;
 
 fn call(socket_path: &Path, cmd: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
@@ -25,6 +27,77 @@ fn call(socket_path: &Path, cmd: &str) -> io::Result<String> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     Ok(line.trim().to_owned())
+}
+
+/// Like `call`, but reads the entire response body until EOF — for commands
+/// that return a multi-line TOML body (`get-store-config`, `get-store-creds`).
+fn call_all(socket_path: &Path, cmd: &str) -> io::Result<String> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        io::Error::other(format!(
+            "coordinator not running ({}): {e}",
+            socket_path.display()
+        ))
+    })?;
+    writeln!(stream, "{cmd}")?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+/// Non-secret store config as served by the coordinator's `get-store-config`
+/// command. Either `local_path` is set, or `bucket` is set (with optional
+/// `endpoint` / `region`).
+#[derive(Debug, Deserialize)]
+pub struct StoreConfig {
+    pub local_path: Option<String>,
+    pub bucket: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+}
+
+/// Short-lived store credentials as served by `get-store-creds`. Today these
+/// are the coordinator's long-lived AWS env creds; the same shape will carry
+/// macaroon-scoped tokens in the future.
+#[derive(Debug, Deserialize)]
+pub struct StoreCreds {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+/// Parse a `get-store-*` response: `ok\n<TOML>\n…` or `err <message>\n`.
+fn parse_toml_response<T: for<'de> Deserialize<'de>>(raw: &str) -> io::Result<T> {
+    let trimmed = raw.trim_start();
+    if let Some(body) = trimmed
+        .strip_prefix("ok\n")
+        .or_else(|| trimmed.strip_prefix("ok\r\n"))
+    {
+        toml::from_str(body).map_err(|e| io::Error::other(format!("parse response: {e}")))
+    } else if let Some(msg) = trimmed.strip_prefix("err ") {
+        Err(io::Error::other(msg.trim().to_owned()))
+    } else {
+        Err(io::Error::other(format!(
+            "unexpected response shape: {}",
+            trimmed.lines().next().unwrap_or("")
+        )))
+    }
+}
+
+/// Ask the coordinator for its non-secret store config (bucket, endpoint,
+/// region, or local_path). This is the static counterpart to
+/// `get_store_creds`.
+pub fn get_store_config(socket_path: &Path) -> io::Result<StoreConfig> {
+    let raw = call_all(socket_path, "get-store-config")?;
+    parse_toml_response(&raw)
+}
+
+/// Ask the coordinator for S3 credentials (long-lived today, macaroon-scoped
+/// later). Errors if the coordinator's env has no credentials configured.
+pub fn get_store_creds(socket_path: &Path) -> io::Result<StoreCreds> {
+    let raw = call_all(socket_path, "get-store-creds")?;
+    parse_toml_response(&raw)
 }
 
 /// Trigger an immediate fork discovery pass.

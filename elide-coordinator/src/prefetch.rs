@@ -19,7 +19,7 @@
 // extentindex::rebuild will both scan index/*.idx, and the volume opens
 // correctly. Individual reads then demand-fetch the body bytes on first access.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -30,8 +30,9 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use elide_core::signing::{self, VerifyingKey};
-use elide_core::volume::{walk_ancestors, walk_extent_ancestors};
+use elide_core::volume::{resolve_ancestor_dir, walk_extent_ancestors};
 
+use crate::pull::pull_volume_skeleton;
 use crate::upload::derive_names;
 
 pub struct PrefetchResult {
@@ -58,21 +59,13 @@ pub async fn prefetch_indexes(
 ) -> Result<PrefetchResult> {
     // `fork_dir` is either `<data_dir>/by_id/<ulid>/` or
     // `<data_dir>/readonly/<ulid>/`. Ancestors are always resolved against
-    // `by_id/` first (with a fallback to `readonly/` inside `walk_ancestors`),
-    // so recover the canonical `by_id/` path from the data dir root.
+    // `by_id/` first (with a fallback to `readonly/` inside
+    // `resolve_ancestor_dir`), so recover the canonical data dir root.
     let data_dir = fork_dir
         .parent()
         .and_then(|p| p.parent())
         .unwrap_or(fork_dir);
     let by_id_dir = data_dir.join("by_id");
-    // Walk both kinds of ancestry: fork ancestors (volume.parent) and
-    // extent-index ancestors (volume.extent_index). Both contribute segments
-    // that need .idx files locally. Extent-only ancestors are deduplicated
-    // against the fork chain by directory path.
-    let fork_ancestors =
-        walk_ancestors(fork_dir, by_id_dir.as_path()).context("walking fork ancestor chain")?;
-    let extent_ancestors = walk_extent_ancestors(fork_dir, by_id_dir.as_path())
-        .context("walking extent-index ancestor chain")?;
 
     let mut result = PrefetchResult {
         fetched: 0,
@@ -81,30 +74,110 @@ pub async fn prefetch_indexes(
     };
 
     // Current fork: all its segments are valid (no branch-point cutoff).
+    // We always have the current fork's own volume.pub locally — it was
+    // written when the fork was created (or pulled as a skeleton).
     let current_volume_id = derive_names(fork_dir)
         .with_context(|| format!("resolving volume id for {}", fork_dir.display()))?;
-    let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)
+    let own_vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)
         .with_context(|| format!("loading volume.pub from {}", fork_dir.display()))?;
-    prefetch_fork(store, fork_dir, &current_volume_id, None, &vk, &mut result).await?;
+    prefetch_fork(
+        store,
+        fork_dir,
+        &current_volume_id,
+        None,
+        &own_vk,
+        &mut result,
+    )
+    .await?;
 
-    // Merge the two ancestor chains into a single list, deduped by dir path.
-    // Fork ancestors come first so their cutoffs take precedence if an
-    // ancestor appears in both chains.
-    let mut all_ancestors = fork_ancestors;
-    for layer in extent_ancestors {
-        if !all_ancestors.iter().any(|a| a.dir == layer.dir) {
-            all_ancestors.push(layer);
-        }
-    }
-
-    for ancestor in &all_ancestors {
-        let volume_id = derive_names(&ancestor.dir)
-            .with_context(|| format!("resolving volume id for {}", ancestor.dir.display()))?;
-        let ancestor_vk = signing::load_verifying_key(&ancestor.dir, signing::VOLUME_PUB_FILE)
-            .with_context(|| format!("loading volume.pub from {}", ancestor.dir.display()))?;
+    // Walk the fork parent chain using embedded pubkeys committed in each
+    // child's signed provenance — *not* the parent's on-disk `volume.pub`.
+    // This matches the read-path trust model (see `block_reader.rs`): the
+    // child's provenance fixes its parent's key at fork time, so the parent
+    // directory doesn't need a locally-trusted `volume.pub`.
+    //
+    // If an ancestor isn't present locally, pull its skeleton first so
+    // subsequent steps can proceed.
+    let mut trusted_dirs: Vec<PathBuf> = Vec::new();
+    let own_lineage =
+        signing::read_lineage_with_key(fork_dir, &own_vk, signing::VOLUME_PROVENANCE_FILE)
+            .with_context(|| format!("reading provenance for {}", fork_dir.display()))?;
+    let mut cursor = own_lineage.parent;
+    while let Some(parent) = cursor {
+        let parent_dir = resolve_ancestor_dir(by_id_dir.as_path(), &parent.volume_ulid);
+        let parent_dir = if parent_dir.exists() {
+            parent_dir
+        } else {
+            info!(
+                "[prefetch] pulling ancestor skeleton: {}",
+                parent.volume_ulid
+            );
+            pull_volume_skeleton(store, data_dir, &parent.volume_ulid)
+                .await
+                .with_context(|| format!("pulling ancestor {}", parent.volume_ulid))?
+        };
+        let parent_vk = VerifyingKey::from_bytes(&parent.pubkey).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid parent pubkey in provenance for {}: {e}",
+                parent.volume_ulid
+            )
+        })?;
         prefetch_fork(
             store,
-            &ancestor.dir,
+            &parent_dir,
+            &parent.volume_ulid,
+            Some(&parent.snapshot_ulid),
+            &parent_vk,
+            &mut result,
+        )
+        .await?;
+        trusted_dirs.push(parent_dir.clone());
+        // Continue walking under the pubkey the child committed to.
+        let parent_lineage = signing::read_lineage_with_key(
+            &parent_dir,
+            &parent_vk,
+            signing::VOLUME_PROVENANCE_FILE,
+        )
+        .with_context(|| format!("reading provenance for ancestor {}", parent.volume_ulid))?;
+        cursor = parent_lineage.parent;
+    }
+
+    // Extent-index ancestors have no embedded pubkey — the child just names
+    // them by `<volume_ulid>/<snapshot_ulid>` with no trust anchor. For
+    // these we pull the skeleton if missing and fall back to loading
+    // `volume.pub` from disk (the just-pulled one, which is what the store
+    // itself published). Dedup against the fork chain we already walked.
+    let extent_ancestors = walk_extent_ancestors(fork_dir, by_id_dir.as_path())
+        .context("walking extent-index ancestor chain")?;
+    for ancestor in extent_ancestors {
+        if trusted_dirs.contains(&ancestor.dir) {
+            continue;
+        }
+        let ancestor_dir = if ancestor.dir.exists() {
+            ancestor.dir.clone()
+        } else {
+            let ulid_str = ancestor
+                .dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "extent ancestor dir has no ULID component: {}",
+                        ancestor.dir.display()
+                    )
+                })?;
+            info!("[prefetch] pulling extent-source skeleton: {ulid_str}");
+            pull_volume_skeleton(store, data_dir, ulid_str)
+                .await
+                .with_context(|| format!("pulling extent-source {ulid_str}"))?
+        };
+        let volume_id = derive_names(&ancestor_dir)
+            .with_context(|| format!("resolving volume id for {}", ancestor_dir.display()))?;
+        let ancestor_vk = signing::load_verifying_key(&ancestor_dir, signing::VOLUME_PUB_FILE)
+            .with_context(|| format!("loading volume.pub from {}", ancestor_dir.display()))?;
+        prefetch_fork(
+            store,
+            &ancestor_dir,
             &volume_id,
             ancestor.branch_ulid.as_deref(),
             &ancestor_vk,

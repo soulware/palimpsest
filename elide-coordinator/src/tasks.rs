@@ -91,11 +91,13 @@ fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
 ///
 /// Exits when the volume directory is removed. Intended to be spawned as a
 /// tokio task.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
     store: Arc<dyn ObjectStore>,
     drain_interval: Duration,
     gc_config: GcConfig,
+    part_size_bytes: usize,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
     snapshot_locks: SnapshotLockRegistry,
 ) {
@@ -278,7 +280,7 @@ pub async fn run_volume_tasks(
         // operates on a fully-promoted, consistent segment set.
         let mut drain_ok = true;
         if fork_dir.join("pending").exists() {
-            match upload::drain_pending(&fork_dir, &volume_id, &store).await {
+            match upload::drain_pending(&fork_dir, &volume_id, &store, part_size_bytes).await {
                 Ok(r) if r.failed > 0 => {
                     error!(
                         "[drain {volume_id}] {} segment(s) failed to upload; \
@@ -312,7 +314,7 @@ pub async fn run_volume_tasks(
             // gating cleanup behind the checkpoint would strand the bare file
             // indefinitely — `has_pending_results` would then also block
             // every future `gc_fork` pass. Always run this.
-            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {
+            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store, part_size_bytes).await {
                 Ok(0) => {}
                 Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
                 Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
