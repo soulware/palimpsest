@@ -44,14 +44,14 @@ containerd
 
 1. **Image identification.** Custom OCI media type in the manifest (`application/vnd.elide.volume.v1`). Containerd's resolver config routes anything with that media type to elide-snapshotter instead of the overlayfs snapshotter — exactly how nydus-snapshotter is wired.
 2. **Pull.** The snapshotter recognizes the media type and pulls Elide segments (OCI registries accept arbitrary blob types), not tar layers. First boot already has demand-fetch — no "import" step, no pre-materialization.
-3. **Prepare.** For each container, the snapshotter creates a volume fork from the base volume and exposes it as a block device. Returns mount options: `ext4 /dev/ublkbN /rootfs`.
+3. **Prepare.** For each container, the snapshotter creates a writable replica (branched from the base volume's latest snapshot via `volume create --from`) and exposes it as a block device. Returns mount options: `ext4 /dev/ublkbN /rootfs`. "Fork" below refers to this per-container replica as a lineage concept, not a CLI command.
 4. **Run.** Container runs with that rootfs. Reads trigger Elide demand-fetch; writes go to the fork. Block-level dedup is automatic across every image on the host — two containers sharing glibc share actual disk blocks even if they come from unrelated base images.
 5. **Remove.** Snapshotter drops the fork. Base volume is untouched.
 
 ### Why this is cleaner than nydus/SOCI
 
 - **No FUSE.** Present a real ext4 on a real block device; the kernel's own ext4 driver does file lookups. Nydus has to emulate a filesystem layer on top of tar chunks.
-- **CoW per container is a volume fork.** No overlayfs stack to assemble, no whiteout semantics to re-derive.
+- **CoW per container is a volume-level replica.** No overlayfs stack to assemble, no whiteout semantics to re-derive.
 - **Block dedup works across all images on the host**, not just those sharing an OCI base layer. Nydus dedup is chunk-level but scoped to the OCI layer chain.
 - **Delta updates.** "New image version" = a few MB of changed segments pulled on first read, not a whole new layer blob. Findings put this at ~94% savings for point releases, ~86% cross-major.
 

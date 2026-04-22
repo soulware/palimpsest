@@ -112,12 +112,13 @@ elide volume ls <name>                    # readable once prefetch completes
 An imported volume is readonly. Two ways to handle writes (not mutually exclusive):
 
 - **External write layer** — serve `--readonly`, let the hypervisor or guest overlay writes. Writes are opaque to Elide. Good for ephemeral.
-- **Elide-managed writable fork** — `volume fork <base> <child>`; writes go through the content-addressed store. Good for long-lived VMs.
+- **Elide-managed writable replica** — `volume create <child> --from <base>`; writes go through the content-addressed store. Good for long-lived VMs.
 
 ## Disaster recovery
 
-- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover with `volume remote pull <name>`. The recovered volume is permanently readonly (`volume.key` was never uploaded); fork from a snapshot to continue writing.
-- **Lost private key.** S3 data remains readable (signatures verified with `volume.pub` in S3), but new writes are impossible. If snapshots exist, fork from the latest. Snapshot markers are intentionally unsigned empty files, so an emergency branch point can be created by uploading an empty file to `by_id/<vol>/snapshots/<ulid>` with a ULID ≥ the latest segment.
+- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover with `volume remote pull <name>`. The recovered volume is permanently readonly (`volume.key` was never uploaded); create a writable replica from a snapshot (`volume create <name> --from <src>`) to continue writing.
+- **Lost private key.** S3 data remains readable (signatures verified with `volume.pub` in S3), but new writes are impossible. If snapshots exist, branch from the latest via `volume create --from <src>`. Snapshot markers are intentionally unsigned empty files, so an emergency branch point can be created by uploading an empty file to `by_id/<vol>/snapshots/<ulid>` with a ULID ≥ the latest segment.
+- **Unresponsive or dead upstream, need current state past the latest snapshot.** Today: `volume create --from <src> --force-snapshot` uploads a forker-attested "now" marker and branches from it. Proposed replacement: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design-replica-model.md](design-replica-model.md).
 - **Local `cache/` deletion.** Automatic recovery — `Volume::open` rebuilds from `index/*.idx` and reads demand-fetch bodies.
 - **Local `cache/` + `index/` deletion.** Prefetch re-runs on startup (empty `index/` + empty `pending/`) and the volume reopens writable.
 - **Partial `index/` deletion is silent data loss.** The prefetch trigger requires `index/` to be *completely* empty; a partial delete leaves the coordinator seeing locally-present data. Missing segments' LBAs read as zeros. The only safe way to remove individual body files is `elide volume evict`, which preserves `.idx`.

@@ -2,9 +2,19 @@
 
 Branch: `fork-from-remote`
 
+> **Status (2026-04-22):** The core design landed — pull-from-remote, readonly
+> ancestor trees, explicit `<vol_ulid>/<snap_ulid>` pins, `.idx` prefetch on
+> cold start — and remains the mechanism behind cheap-reference replicas. The
+> CLI surface has since changed: `volume fork` is retired, and the equivalent
+> command is `volume create <name> --from <vol_ulid>/<snap_ulid>`. The
+> `--force-snapshot` work referenced in later phases is also retired in
+> favour of the (still-unimplemented) `volume materialize` command. See
+> [design-replica-model.md](design-replica-model.md) for the current model.
+> This document is preserved as a historical record of the original plan.
+
 ## Goal
 
-`elide volume fork --from <vol_ulid>/<snap_ulid> <new_name>` should work whether the ancestor is local or remote. Having the ancestor local is an optimization; by construction it is a readonly fork source.
+`elide volume create <new_name> --from <vol_ulid>/<snap_ulid>` should work whether the ancestor is local or remote. Having the ancestor local is an optimization; by construction it is a readonly fork source.
 
 ## Model
 

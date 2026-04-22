@@ -168,38 +168,22 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Create a new volume branched from a source volume.
+    /// Create a new volume.
     ///
-    /// `--from` accepts three forms:
+    /// With `--from`, creates a writable replica branched from an existing
+    /// volume.  `--from` accepts three forms:
     ///   - `<name>` — branches from the volume's latest snapshot
     ///   - `<vol_ulid>` — bare ULID, branches from latest snapshot
     ///   - `<vol_ulid>/<snap_ulid>` — pins to a specific snapshot
     ///
     /// If the source is not found locally, the volume and its ancestor
-    /// chain are auto-pulled from the remote store before forking.
+    /// chain are auto-pulled from the remote store.
     ///
     /// ULID-wins: if the `--from` value parses as a valid ULID it is always
     /// treated as a volume ID, never as a volume name.
-    Fork {
-        /// Name for the new volume
-        fork_name: String,
-        /// Source: `<name>`, `<vol_ulid>`, or `<vol_ulid>/<snap_ulid>`
-        #[arg(long)]
-        from: String,
-        /// Upload a new "now" snapshot marker to the remote store and branch
-        /// from it, instead of relying on an existing snapshot. Required when
-        /// the source has no snapshot (e.g. recovering from a dead host).
-        /// With a live source writer, the forker owns the race: the owner's
-        /// GC may delete segments before observing the marker.
-        #[arg(long)]
-        force_snapshot: bool,
-    },
-
-    /// Create a new volume
     ///
-    /// With `--from`, creates a fork of an existing volume (equivalent to
-    /// `volume fork --from`).  Without `--from`, creates a fresh empty volume
-    /// and `--size` is required.
+    /// Without `--from`, creates a fresh empty volume and `--size` is
+    /// required.
     Create {
         /// Volume name
         name: String,
@@ -460,29 +444,6 @@ fn main() {
                     std::process::exit(1);
                 }
             },
-
-            VolumeCommand::Fork {
-                fork_name,
-                from,
-                force_snapshot,
-            } => {
-                if let Err(e) = validate_volume_name(&fork_name) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-                if let Err(e) = create_fork(
-                    &args.data_dir,
-                    &fork_name,
-                    &from,
-                    &socket_path,
-                    &by_id_dir,
-                    None,
-                    force_snapshot,
-                ) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            }
 
             VolumeCommand::Create {
                 name,
@@ -1841,7 +1802,7 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
 ///   - `<vol_ulid>` (address directly by ULID)
 ///   - `<vol_ulid>/<snap_ulid>` (address a specific snapshot; the ULID part
 ///     is what gets pulled — the snapshot ULID is retained for the caller
-///     that wants to pin provenance, e.g. `volume fork --from`)
+///     that wants to pin provenance, e.g. `volume create --from`)
 ///
 /// Each pulled volume lands under `data_dir/readonly/<vol_ulid>/` with
 /// `volume.readonly`, `volume.pub`, `volume.provenance`, and an empty
@@ -1903,7 +1864,7 @@ fn remote_pull(
 /// Accepts `<name>`, `<vol_ulid>`, or `<vol_ulid>/<snap_ulid>`. For ULID
 /// forms the snapshot portion is validated but discarded — this function
 /// only decides *which volume* to pull; the snapshot ULID is a pinning
-/// concern for the caller (`volume fork --from`), not for pull itself.
+/// concern for the caller (`volume create --from`), not for pull itself.
 fn resolve_pull_spec(
     rt: &tokio::runtime::Runtime,
     store: &dyn object_store::ObjectStore,

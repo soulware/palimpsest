@@ -57,14 +57,14 @@ region   = "auto"
 
 The startup log should show the configured bucket and endpoint. If it instead shows `local_store elide_store/`, the `[store]` section didn't parse — double-check the `coordinator.toml` path and syntax.
 
-## Import, fork, write, verify
+## Import, branch a replica, write, verify
 
 In a second terminal (same repo root):
 
 ```sh
 ./target/debug/elide volume import start ubuntu-22.04 ubuntu:22.04
 ./target/debug/elide volume import attach <import-ulid>
-./target/debug/elide volume fork vm1 --from ubuntu-22.04
+./target/debug/elide volume create vm1 --from ubuntu-22.04
 ```
 
 Within a few seconds of each import segment landing in `pending/`, the coordinator's drain loop should upload it to Tigris. Verify:

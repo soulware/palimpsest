@@ -183,7 +183,7 @@ pub fn load_or_create_keypair(
 ///
 /// `manifest_pubkey`, when set, overrides `pubkey` for verifying the pinned
 /// `snapshots/<snap_ulid>.manifest` only. Used for forker-attested "now"
-/// pins (`volume fork --force-snapshot`), where the forker doesn't hold
+/// pins (`volume create --from --force-snapshot`), where the forker doesn't hold
 /// the parent's private key and instead signs the manifest with a
 /// stable per-source key (`readonly/<src>/force-snapshot.key`) — shared
 /// across multiple forks on the same host so concurrent or sequential
