@@ -187,6 +187,49 @@ should keep snapshot-based and pin-based strategies behind the same
 interface so the choice is per-backend and doesn't leak into the
 materialize driver.
 
+## Proposed: historical materialize via Tigris versioning
+
+Tigris's always-on per-object versioning plus explicit bucket snapshots
+give two tiers of time-travel read:
+
+- **Bucket snapshots** — explicit, named, O(1), coarse granularity
+  (whatever cadence we run them at). Manifest and segments are captured
+  coherently, so a snapshot is a single-read-view of a volume's past
+  state.
+- **Per-object versions** — implicit and always-on (append-only data
+  model); every write creates a new version, enumerable via
+  `ListObjectVersions` + `versionId`. Fine granularity.
+
+Together these make a stronger form of `materialize` possible:
+`volume materialize <new> --from <vol>@T` where T is any retained
+historical point, not just the source's current state. Host B can
+resurrect host A's volume as it existed at T even if host A has since
+mutated, GC'd, or deleted the underlying segments.
+
+Implications:
+
+- **Implicit backup.** Tigris retention policy becomes RPO. Snapshot
+  cadence becomes recovery granularity. No separate backup system
+  required for Tigris-backed deployments.
+- **Forensic use.** Cherry-pick a single historical manifest or segment
+  into the live bucket without restoring an entire volume.
+- **Cross-host DR.** "Host A's bucket is in a bad state" becomes
+  "materialize host A's last good snapshot onto host B" — one-shot
+  read-through-snapshot.
+
+Open questions:
+
+- Retention cost. Non-current versions and snapshots consume storage;
+  "keep a year of history" has a real bill. Lifecycle policy has to be
+  explicit and operator-visible.
+- Addressing. `<vol>@<snapshot-name>` is easy; arbitrary wall-clock T
+  between snapshots requires navigating `versionId` by timestamp — need
+  to decide what forms the CLI accepts.
+- Whose retention pins whose segments when volumes share history.
+- Plain-S3 deployments get none of this unless we build it, which we
+  aren't. Worth deciding whether historical materialize is a
+  Tigris-deployment feature or an aspired capability of the trait.
+
 ## Relationship to existing CLI
 
 **Landed:**
