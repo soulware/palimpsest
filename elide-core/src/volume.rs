@@ -4721,7 +4721,7 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
 
 /// Like `fork_volume` but pins the fork to an explicit snapshot ULID.
 ///
-/// Used by `volume fork --from <vol_ulid>/<snap_ulid>` when the caller
+/// Used by `volume create --from <vol_ulid>/<snap_ulid>` when the caller
 /// wants the branch point to be something other than the source volume's
 /// latest snapshot — typically because the source is a pulled readonly
 /// ancestor and the caller has a specific snapshot ULID in mind.
@@ -4745,7 +4745,7 @@ pub fn fork_volume_at(
 /// loaded from the source's on-disk `volume.pub`; `manifest_pubkey` is
 /// used **only** for the pinned snapshot's `.manifest`.
 ///
-/// Used by `volume fork --force-snapshot` when the forker doesn't hold the
+/// Used by `volume create --from --force-snapshot` when the forker doesn't hold the
 /// source owner's private key and instead signs the synthetic manifest
 /// with an ephemeral key. That ephemeral pubkey goes here; the ancestor's
 /// own artefacts continue to verify under the owner's key.

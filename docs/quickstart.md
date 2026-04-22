@@ -65,13 +65,18 @@ On Apple Silicon, `elide-import` auto-selects `arm64`.
 ./target/debug/elide volume ls ubuntu-22.04 /etc
 ```
 
-## Fork for a VM
+## Branch a writable replica for a VM
 
-Create a writable fork branched from the imported base:
+Create a writable replica branched from the imported base:
 
 ```sh
-./target/debug/elide volume fork vm1 --from ubuntu-22.04
+./target/debug/elide volume create vm1 --from ubuntu-22.04
 ```
+
+`--from` accepts a volume name (resolved locally or against the remote
+store), a bare volume ULID, or an explicit `<vol_ulid>/<snap_ulid>` pin.
+The explicit-pin form is forward-compatible — see
+[design-replica-model.md](design-replica-model.md).
 
 ## Serve over NBD
 
@@ -106,7 +111,7 @@ Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 # prints the snapshot ULID
 ```
 
-`vm1/snapshots/<ulid>` is now a branch point for further forks — `elide volume fork vm2 --from vm1` will branch from here.
+`vm1/snapshots/<ulid>` is now a branch point — `elide volume create vm2 --from vm1` will branch a new writable replica from the latest snapshot.
 
 ## Clean up
 

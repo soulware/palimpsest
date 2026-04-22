@@ -6,7 +6,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 
 | Document | Contents |
 |---|---|
-| [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, fork it, and serve it over NBD |
+| [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, branch a writable replica, and serve it over NBD |
 | [docs/quickstart-data-volume.md](docs/quickstart-data-volume.md) | Create an empty data volume, mount from a Multipass VM, write data, upload segments |
 | [docs/quickstart-tigris.md](docs/quickstart-tigris.md) | Run against a real S3-compatible backend (Tigris); covers AWS S3, MinIO, R2, etc. |
 | [docs/overview.md](docs/overview.md) | Problem statement, key concepts, operation modes, empirical findings |
@@ -24,6 +24,8 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/design-gc-partial-death-compaction.md](docs/design-gc-partial-death-compaction.md) | Design: decouple composite body from surviving sub-runs of partial-LBA-death entries so normal GC can subsequently reclaim each piece independently |
 | [docs/design-gc-plan-handoff.md](docs/design-gc-plan-handoff.md) | Design: coordinator emits a plaintext plan; volume materialises bodies via BlockReader and signs the output — single source of truth for body resolution |
 | [docs/design-delta-compression.md](docs/design-delta-compression.md) | Design: delta compression via file-path matching, file-aware import, snapshot filemaps |
+| [docs/design-replica-model.md](docs/design-replica-model.md) | Proposed: replica-based model for forks and recovery; retires `volume fork`, adds `volume materialize`, frames snapshot cadence as a retention SLA |
+| [docs/design-tigris-native.md](docs/design-tigris-native.md) | Exploration: what Elide looks like if designed Tigris-native (bucket snapshots, forks, versioning as first-class primitives) rather than as a portable S3 consumer |
 | [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes — architecture, sequencing, open work |
 | [docs/design-oci-export.md](docs/design-oci-export.md) | Exploration: squashed OCI export, dual publish via referrers, elide-snapshotter for containerd |
 | [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |

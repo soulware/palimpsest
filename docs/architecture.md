@@ -65,7 +65,7 @@ The split keeps the volume process binary lean and focused. The async HTTP stack
 needed for OCI registry pulls belongs in tooling (`elide-import`), not in the
 process that serves block I/O.
 
-**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, and streams its output to attached clients. The import process runs in two phases: a **write phase** (segments written to `pending/`) followed by a **serve phase** (the import binds `control.sock` and handles `promote` IPC from the coordinator until `pending/` is empty). The coordinator removes `import.lock` when the process exits. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume fork <name> <new-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
+**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, and streams its output to attached clients. The import process runs in two phases: a **write phase** (segments written to `pending/`) followed by a **serve phase** (the import binds `control.sock` and handles `promote` IPC from the coordinator until `pending/` is empty). The coordinator removes `import.lock` when the process exits. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume create <new-name> --from <import-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming and doubles as the initial snapshot ULID recorded at `snapshots/<import-ulid>` inside the imported volume. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
 
 ### Proposed: Async runtime scope
 
@@ -120,7 +120,7 @@ elide_data/                           — single root (default --data-dir)
       snapshots/
         01JQXXXXX                     — branch point marker for derived volumes
       import.lock                     — present while import is running or interrupted
-    01JQBBBBBBB/                      — writable volume forked from ubuntu-22.04
+    01JQBBBBBBB/                      — writable replica of ubuntu-22.04
       volume.name                     — "server-1"
       volume.size
       volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
@@ -438,12 +438,13 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
 | `elide volume ls <name\|ulid> [path]` | Browse ext4 filesystem contents |
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
-| `elide volume fork <src> <new-name>` | Create a new volume branched from latest snapshot of `<src>`; refuses if `<new-name>` already exists |
-| `elide volume create <name> [--size N]` | Create a new empty volume (generates ULID dir, writes `volume.name`); rescan |
+| `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` (explicit pin — recommended, forward-compatible), `<vol_ulid>` (bare; resolves to the latest snapshot), or `<name>` (local or remote lookup). Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design-replica-model.md](design-replica-model.md) for the direction of travel |
+| `elide volume create <name> --from <source> --force-snapshot` | Same as above, but uploads a new forker-attested "now" marker when the source has no usable snapshot. Interim mechanism; will be replaced by `volume materialize` (pending) |
+| `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.name`); rescan |
 | `elide volume remote list` | `LIST names/` against the store; print all named volumes with ULID and size |
 | `elide volume remote pull <name>` | Resolve name → ULID via `names/<name>`, download manifest, reconstruct local skeleton, trigger coordinator rescan; prefetch of segment indexes happens automatically on next coordinator tick |
 
-`create` and `fork` generate a fresh ULID for the new volume directory. Both send a lightweight `rescan` to the coordinator after writing to disk. If the coordinator is not running, the rescan fails with a warning and the volume is discovered on the next startup or scan.
+`create` generates a fresh ULID for the new volume directory and sends a lightweight `rescan` to the coordinator after writing to disk. If the coordinator is not running, the rescan fails with a warning and the volume is discovered on the next startup or scan.
 
 **Coordinator-required (process and device management):**
 
@@ -680,7 +681,7 @@ OCI import is a potentially long-running operation. The coordinator supervises i
 - `snapshots/<import-ulid>` marks the branch point for derived volumes
 - `manifest.toml` records source metadata (OCI digest, arch)
 
-To get a writable copy, the user runs `elide volume fork <name> <new-name>` after import completes. This is an explicit step, not automatic.
+To get a writable copy, the user runs `elide volume create <new-name> --from <import-name>` after import completes. This is an explicit step, not automatic.
 
 ### `import.lock` and the two-phase lifecycle
 
@@ -990,10 +991,11 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 | Term | Definition |
 |------|------------|
 | **Volume** | A ULID-named directory directly under `data_dir`. Every volume is a peer. Its stable global identity is its ULID (the directory name and S3 prefix); its human-readable name is stored in `volume.name`. |
-| **Fork** | A volume created from another volume's snapshot via `volume fork`. Structurally identical to any other volume; the parent relationship is recorded in an `origin` file using ULID paths. "Fork" describes lineage, not location. |
+| **Replica** | A volume that references an upstream (a cheap-reference replica created via `volume create --from`) or was copied from one (a self-contained replica created via `volume materialize`). Every non-root volume is a replica of some upstream. |
+| **Fork** | Historical synonym for "replica" describing lineage. No longer a CLI command — see `volume create --from` and `volume materialize`. The parent relationship is recorded in an `origin` file using ULID paths. |
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a volume's committed segment sequence. The ULID gives the position: all segments with ULID ≤ the snapshot ULID are part of that snapshot. The latest snapshot ULID also serves as the **compaction floor** — segments at or below it are frozen and will never be compacted. The file content is empty or an optional human-readable label. |
-| **Imported volume** | A readonly volume populated by `volume import`. Marked with `volume.readonly`. No `wal/` — frozen after import completes. The user runs `volume fork <name> <new-name>` to get a writable copy. |
-| **Export** | A squash-and-detach operation that produces a new self-contained volume with no ancestry dependencies. |
+| **Imported volume** | A readonly volume populated by `volume import`. Marked with `volume.readonly`. No `wal/` — frozen after import completes. The user runs `volume create <new-name> --from <vol_ulid>/<snap_ulid>` to get a writable copy. |
+| **Export** | A squash-and-detach operation that produces a new self-contained volume with no ancestry dependencies. Conceptually the offline / batch analogue of `volume materialize`. |
 
 ### Ancestry walk
 
