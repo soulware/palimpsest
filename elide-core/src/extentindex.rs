@@ -234,6 +234,36 @@ impl ExtentIndex {
         self.deltas.get(hash)
     }
 
+    /// Flip `DeltaBodySource::Full → Cached` for `hash`, but only if
+    /// the current delta entry still references `expected_segment_id`.
+    /// Returns `true` if the flip happened, `false` if the delta was
+    /// missing or has since been re-pointed at a different segment.
+    ///
+    /// Used by `apply_promote_segment_result`'s drain branch: once
+    /// `pending/<ulid>` has been split into the three-file cache
+    /// layout (`cache/<ulid>.body`, `cache/<ulid>.delta`,
+    /// `cache/<ulid>.present`, `index/<ulid>.idx`), the delta blob
+    /// now lives in the standalone `.delta` file rather than inline
+    /// in a full segment file, so the delta location must flip
+    /// source shape to match. Without this flip, delta reads route
+    /// through `find_segment_file` looking for a full segment layout
+    /// and either silently read garbage from the body-only file
+    /// (before evict) or fail with `segment not found` once the
+    /// `.body` has been evicted.
+    pub fn flip_delta_body_source_to_cached_if_matches(
+        &mut self,
+        hash: &blake3::Hash,
+        expected_segment_id: Ulid,
+    ) -> bool {
+        match self.deltas.get_mut(hash) {
+            Some(loc) if loc.segment_id == expected_segment_id => {
+                loc.body_source = DeltaBodySource::Cached;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Remove the entry for `hash`, if present.
     pub fn remove(&mut self, hash: &blake3::Hash) {
         self.inner.remove(hash);
