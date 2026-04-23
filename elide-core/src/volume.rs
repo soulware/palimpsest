@@ -2644,6 +2644,21 @@ impl Volume {
                 }
             }
 
+            // Delta entries: the delta blob has moved from inline in
+            // the now-deleted pending file to the standalone
+            // `cache/<ulid>.delta` sidecar, so flip
+            // `DeltaBodySource::Full → Cached`. CAS against
+            // `segment_id == ulid` so a concurrent delta-repack or
+            // reclaim that re-pointed the hash at a newer segment
+            // wins.
+            for entry in entries.iter() {
+                if entry.kind != EntryKind::Delta {
+                    continue;
+                }
+                Arc::make_mut(&mut self.extent_index)
+                    .flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
+            }
+
             let ulid_str = ulid.to_string();
             let delta_path = self
                 .base_dir
