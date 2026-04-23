@@ -228,8 +228,16 @@ impl S3RangeFetcher {
 
 impl RangeFetcher for S3RangeFetcher {
     fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+        // rust-s3 panics inside `get_object_range` when `start > end_inclusive`;
+        // reject the empty-range case up front so the caller gets an error
+        // rather than a dead thread.
+        if end_exclusive <= start {
+            return Err(io::Error::other(format!(
+                "s3 get_range {key}: empty range [{start}, {end_exclusive})"
+            )));
+        }
         // HTTP Range is inclusive on both ends; our trait uses exclusive end.
-        let end_inclusive = end_exclusive.saturating_sub(1);
+        let end_inclusive = end_exclusive - 1;
         let resp = self
             .bucket
             .get_object_range(key, start, Some(end_inclusive))
@@ -375,6 +383,19 @@ fn fetch_one_extent(
             "entry_idx {} out of range ({} entries)",
             extent.entry_idx,
             entries.len()
+        )));
+    }
+    // Body-section demand-fetch only applies to Data / CanonicalData entries
+    // with a non-empty stored body. Anything else means an `ExtentLocation`
+    // upstream was built with `BodySource::Cached(idx)` pointing at the
+    // wrong kind of entry — that's a bug and an empty range-GET would
+    // otherwise panic the S3 client.
+    let start_entry = &entries[start];
+    if !start_entry.kind.is_data() || start_entry.stored_length == 0 {
+        return Err(io::Error::other(format!(
+            "demand-fetch {segment_id}[{}]: expected data-kind entry with non-empty body, \
+             got kind={:?} stored_length={}",
+            start, start_entry.kind, start_entry.stored_length
         )));
     }
 
