@@ -8,7 +8,7 @@ use elide_core::volume;
 
 use elide::{
     coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size, resolve_volume_dir,
-    resolve_volume_size, validate_volume_name, verify,
+    resolve_volume_size, ublk, validate_volume_name, verify,
 };
 
 /// Elide volume management and analysis tools.
@@ -50,15 +50,24 @@ enum Command {
         bind: String,
         /// Port for the NBD server. If omitted, no NBD server is started
         /// (volume runs for coordinator IPC only).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["ublk", "ublk_id"])]
         port: Option<u16>,
         /// Unix socket path for the NBD server. Mutually exclusive with --port.
-        #[arg(long, conflicts_with = "port")]
+        #[arg(long, conflicts_with_all = ["port", "ublk", "ublk_id"])]
         socket: Option<PathBuf>,
         /// Serve as a read-only block device (auto-detected for imported bases;
         /// use this flag to explicitly serve a writable volume read-only)
         #[arg(long)]
         readonly: bool,
+        /// Serve over ublk (Linux userspace block device) instead of NBD.
+        /// Requires Linux with CONFIG_BLK_DEV_UBLK and the 'ublk' cargo
+        /// feature enabled.
+        #[arg(long, conflicts_with_all = ["port", "socket"])]
+        ublk: bool,
+        /// Explicit ublk device id (maps to /dev/ublkb<id>). If omitted and
+        /// --ublk is passed, the kernel auto-allocates.
+        #[arg(long, conflicts_with_all = ["port", "socket"], requires = "ublk")]
+        ublk_id: Option<i32>,
     },
 
     /// Scan an image for file extents and analyse dedup + delta compression potential
@@ -724,12 +733,22 @@ fn main() {
             port,
             socket,
             readonly,
+            ublk,
+            ublk_id,
         } => {
             // In the flat layout, fork_dir IS the volume directory.
             let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
                 .expect("failed to determine volume size");
             let fetch_config =
                 resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
+            if ublk {
+                if readonly {
+                    panic!("ublk transport does not yet support --readonly");
+                }
+                ublk::run_volume_ublk(&fork_dir, size_bytes, fetch_config, ublk_id)
+                    .expect("ublk server error");
+                return;
+            }
             let nbd_bind = if let Some(path) = socket {
                 Some(nbd::NbdBind::Unix(path))
             } else {

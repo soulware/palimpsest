@@ -55,6 +55,17 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 **Runtime coexistence.** libublk-rs uses `smol`; we already use `tokio` in the coordinator. No conflict — smol here is a thread-local executor, not a global runtime.
 
+**Handle Send/Sync accommodation (follow-up).** `VolumeHandle` is `Send` but not `Sync` — it owns a `RefCell<FileCache>` (per-thread segment-fd LRU) by design; the comment at `elide-core/src/actor.rs:1343` captures this. `libublk`'s `run_target` requires the queue handler closure to be `Send + Sync + Clone + 'static`, so the spike wraps the handle in `Arc<Mutex<VolumeHandle>>` purely as a type-system accommodation — the lock is taken once per queue-thread startup to extract a fresh clone, never on the hot I/O path.
+
+The right long-term shape is to split `VolumeHandle` into two types:
+
+- `VolumeClient` (Send+Sync+Clone): mailbox channel, atomic snapshot pointer, immutable config. No per-thread state.
+- `VolumeReader` (Send, !Sync): owns the per-thread file-fd cache; forwards writes via `Deref<Target = VolumeClient>`.
+
+`actor::spawn` returns a `VolumeClient`; each thread calls `client.reader()` to get its reader. This removes the `Arc<Mutex<>>` at the transport boundary and matches the locality design intent already documented in `actor.rs`.
+
+Trigger for landing the split: **either** raising ublk `queue_depth` / `nr_queues` past 1 in step 2, **or** adding a second transport (vhost-user-blk, iSCSI, …). Before either, the split is mechanical churn across ~30–50 call sites (NBD handler, coordinator, tests) serving a single use case; after, it pays off in every caller. Deferred to the step-2 PR at the earliest.
+
 ## Control plane
 
 - Lifecycle: `ADD_DEV` → `SET_PARAMS` → `START_DEV` → run → `STOP_DEV` → `DEL_DEV`.
