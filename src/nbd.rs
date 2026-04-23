@@ -134,6 +134,10 @@ impl NbdListener {
         match self {
             NbdListener::Tcp(l) => {
                 let (stream, addr) = l.accept()?;
+                // NBD is a strict request/reply protocol with small (16-byte)
+                // reply headers. Leaving Nagle on interacts with the guest's
+                // delayed-ACK timer and adds tens of ms per request.
+                stream.set_nodelay(true)?;
                 Ok((Box::new(stream), addr.to_string()))
             }
             NbdListener::Unix(l) => {
@@ -1130,10 +1134,11 @@ fn opt_reply(s: &mut impl Write, option: u32, reply_type: u32, data: &[u8]) -> i
 }
 
 fn tx_reply(s: &mut impl Write, error: u32, handle: u64) -> io::Result<()> {
-    s.write_all(&NBD_REPLY_MAGIC.to_be_bytes())?;
-    s.write_all(&error.to_be_bytes())?;
-    s.write_all(&handle.to_be_bytes())?;
-    Ok(())
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&NBD_REPLY_MAGIC.to_be_bytes());
+    buf[4..8].copy_from_slice(&error.to_be_bytes());
+    buf[8..16].copy_from_slice(&handle.to_be_bytes());
+    s.write_all(&buf)
 }
 
 fn read_u16(s: &mut impl Read) -> io::Result<u16> {
