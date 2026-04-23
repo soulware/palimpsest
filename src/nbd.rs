@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,9 +119,46 @@ pub enum NbdBind {
     Unix(PathBuf),
 }
 
-/// Combined Read + Write bound for use as a trait object.
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+/// Accepted NBD connection stream.  Preserves the concrete type so the
+/// transmission loop can split it into independent read/write halves via
+/// `try_clone` — required by the multi-threaded request pipeline.
+enum NbdStream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl NbdStream {
+    fn try_clone(&self) -> io::Result<NbdStream> {
+        match self {
+            NbdStream::Tcp(s) => s.try_clone().map(NbdStream::Tcp),
+            NbdStream::Unix(s) => s.try_clone().map(NbdStream::Unix),
+        }
+    }
+}
+
+impl Read for NbdStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            NbdStream::Tcp(s) => s.read(buf),
+            NbdStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for NbdStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            NbdStream::Tcp(s) => s.write(buf),
+            NbdStream::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            NbdStream::Tcp(s) => s.flush(),
+            NbdStream::Unix(s) => s.flush(),
+        }
+    }
+}
 
 /// Listener abstraction over TCP and Unix domain sockets.
 enum NbdListener {
@@ -130,7 +167,7 @@ enum NbdListener {
 }
 
 impl NbdListener {
-    fn accept(&self) -> io::Result<(Box<dyn ReadWrite>, String)> {
+    fn accept(&self) -> io::Result<(NbdStream, String)> {
         match self {
             NbdListener::Tcp(l) => {
                 let (stream, addr) = l.accept()?;
@@ -138,11 +175,11 @@ impl NbdListener {
                 // reply headers. Leaving Nagle on interacts with the guest's
                 // delayed-ACK timer and adds tens of ms per request.
                 stream.set_nodelay(true)?;
-                Ok((Box::new(stream), addr.to_string()))
+                Ok((NbdStream::Tcp(stream), addr.to_string()))
             }
             NbdListener::Unix(l) => {
                 let (stream, _) = l.accept()?;
-                Ok((Box::new(stream), "unix".to_string()))
+                Ok((NbdStream::Unix(stream), "unix".to_string()))
             }
         }
     }
@@ -921,12 +958,250 @@ fn serve_volume_listener(
     }
 }
 
+/// Per-connection read worker pool size.  Reads are lock-free in the volume
+/// and don't contend; the pool exists to prevent one slow demand-fetch from
+/// head-of-line blocking subsequent requests.  Writes always serialise
+/// through a single dedicated thread to preserve flush ordering.
+const READ_WORKERS_PER_CONN: usize = 4;
+
+/// Shared mutex over the write half of the NBD socket.  Held briefly around
+/// each reply frame so the 16-byte header and any payload are written
+/// atomically and don't interleave with other workers' replies.
+type WriterMutex = Arc<Mutex<NbdStream>>;
+
+/// Write-path command dispatched from the reader thread to the per-connection
+/// write-queue thread.  The single-thread queue preserves submission order
+/// so NBD flush semantics are respected for free.
+enum WriteJob {
+    Write {
+        handle: u64,
+        offset: u64,
+        length: usize,
+        payload: Vec<u8>,
+    },
+    Flush {
+        handle: u64,
+    },
+    ZeroRange {
+        cmd: u16,
+        handle: u64,
+        offset: u64,
+        length: usize,
+    },
+}
+
+struct ReadJob {
+    handle: u64,
+    offset: u64,
+    length: usize,
+}
+
+fn reply_header(writer: &WriterMutex, error: u32, handle: u64) -> io::Result<()> {
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&NBD_REPLY_MAGIC.to_be_bytes());
+    buf[4..8].copy_from_slice(&error.to_be_bytes());
+    buf[8..16].copy_from_slice(&handle.to_be_bytes());
+    let mut w = writer
+        .lock()
+        .map_err(|_| io::Error::other("nbd writer mutex poisoned"))?;
+    w.write_all(&buf)
+}
+
+fn reply_with_data(writer: &WriterMutex, error: u32, handle: u64, data: &[u8]) -> io::Result<()> {
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&NBD_REPLY_MAGIC.to_be_bytes());
+    buf[4..8].copy_from_slice(&error.to_be_bytes());
+    buf[8..16].copy_from_slice(&handle.to_be_bytes());
+    let mut w = writer
+        .lock()
+        .map_err(|_| io::Error::other("nbd writer mutex poisoned"))?;
+    w.write_all(&buf)?;
+    w.write_all(data)
+}
+
+fn run_write_queue(
+    rx: crossbeam_channel::Receiver<WriteJob>,
+    volume: elide_core::actor::VolumeHandle,
+    writer: WriterMutex,
+) -> io::Result<()> {
+    while let Ok(job) = rx.recv() {
+        match job {
+            WriteJob::Write {
+                handle,
+                offset,
+                length,
+                payload,
+            } => {
+                let start_lba = offset / 4096;
+                let end_lba = (offset + length as u64).div_ceil(4096);
+                let lba_count = (end_lba - start_lba) as u32;
+                let skip = (offset % 4096) as usize;
+                let result = if skip == 0 && length.is_multiple_of(4096) {
+                    // Already block-aligned — write directly.
+                    volume.write(start_lba, payload)
+                } else {
+                    // Sub-block write: read covering blocks, patch, write back.
+                    volume.read(start_lba, lba_count).and_then(|mut blocks| {
+                        debug_assert!(skip + length <= blocks.len());
+                        blocks[skip..skip + length].copy_from_slice(&payload);
+                        volume.write(start_lba, blocks)
+                    })
+                };
+                match result {
+                    Ok(()) => reply_header(&writer, 0, handle)?,
+                    Err(e) => {
+                        error!("[write error offset={} len={}: {}]", offset, length, e);
+                        reply_header(&writer, 5, handle)?; // EIO
+                    }
+                }
+            }
+            WriteJob::Flush { handle } => match volume.flush() {
+                Ok(()) => reply_header(&writer, 0, handle)?,
+                Err(e) => {
+                    error!("[fsync error: {}]", e);
+                    reply_header(&writer, 5, handle)?; // EIO
+                }
+            },
+            WriteJob::ZeroRange {
+                cmd,
+                handle,
+                offset,
+                length,
+            } => {
+                // Round inward to fully-covered 4096-byte blocks.
+                // Sub-block-aligned ranges are no-ops (the filesystem will
+                // rewrite those LBAs before reading them anyway).
+                let start_lba = offset.div_ceil(4096);
+                let end_lba = (offset + length as u64) / 4096;
+                if end_lba > start_lba {
+                    let lba_count = (end_lba - start_lba) as u32;
+                    match volume.write_zeroes(start_lba, lba_count) {
+                        Ok(()) => reply_header(&writer, 0, handle)?,
+                        Err(e) => {
+                            error!(
+                                "[write-zeroes error cmd={} offset={} len={}: {}]",
+                                cmd, offset, length, e
+                            );
+                            reply_header(&writer, 5, handle)?; // EIO
+                        }
+                    }
+                } else {
+                    reply_header(&writer, 0, handle)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_read_worker(
+    rx: crossbeam_channel::Receiver<ReadJob>,
+    volume: elide_core::actor::VolumeHandle,
+    writer: WriterMutex,
+) -> io::Result<()> {
+    while let Ok(ReadJob {
+        handle,
+        offset,
+        length,
+    }) = rx.recv()
+    {
+        let start_lba = offset / 4096;
+        let end_lba = (offset + length as u64).div_ceil(4096);
+        let lba_count = (end_lba - start_lba) as u32;
+        let skip = (offset % 4096) as usize;
+        match volume.read(start_lba, lba_count) {
+            Ok(blocks) => {
+                // skip + length <= lba_count * 4096 = blocks.len() by construction.
+                debug_assert!(skip + length <= blocks.len());
+                reply_with_data(&writer, 0, handle, &blocks[skip..skip + length])?;
+            }
+            Err(e) => {
+                error!("[read error offset={} len={}: {}]", offset, length, e);
+                reply_header(&writer, 5, handle)?; // EIO — no payload follows
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reader-side loop.  Parses request headers, drains payloads for writes,
+/// and dispatches to the write-queue thread or the read-worker pool.
+/// Returns on NBD_CMD_DISC (clean shutdown) or any socket/protocol error.
+fn run_reader_loop(
+    reader: &mut NbdStream,
+    writer: &WriterMutex,
+    write_tx: &crossbeam_channel::Sender<WriteJob>,
+    read_tx: &crossbeam_channel::Sender<ReadJob>,
+    reads: &mut u64,
+    writes: &mut u64,
+) -> io::Result<()> {
+    loop {
+        let magic = read_u32(reader)?;
+        if magic != NBD_REQUEST_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad request magic",
+            ));
+        }
+        let _flags = read_u16(reader)?;
+        let cmd = read_u16(reader)?;
+        let handle = read_u64(reader)?;
+        let offset = read_u64(reader)?;
+        let length = read_u32(reader)? as usize;
+
+        match cmd {
+            NBD_CMD_READ => {
+                *reads += 1;
+                read_tx
+                    .send(ReadJob {
+                        handle,
+                        offset,
+                        length,
+                    })
+                    .map_err(|_| io::Error::other("nbd read worker pool closed"))?;
+            }
+            NBD_CMD_WRITE => {
+                *writes += 1;
+                // Payload must be drained on the reader thread — the socket
+                // read half is not shared with workers.
+                let mut payload = vec![0u8; length];
+                reader.read_exact(&mut payload)?;
+                write_tx
+                    .send(WriteJob::Write {
+                        handle,
+                        offset,
+                        length,
+                        payload,
+                    })
+                    .map_err(|_| io::Error::other("nbd write queue closed"))?;
+            }
+            NBD_CMD_FLUSH => {
+                write_tx
+                    .send(WriteJob::Flush { handle })
+                    .map_err(|_| io::Error::other("nbd write queue closed"))?;
+            }
+            NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
+                write_tx
+                    .send(WriteJob::ZeroRange {
+                        cmd,
+                        handle,
+                        offset,
+                        length,
+                    })
+                    .map_err(|_| io::Error::other("nbd write queue closed"))?;
+            }
+            NBD_CMD_DISC => return Ok(()),
+            _ => reply_header(writer, 22, handle)?, // EINVAL
+        }
+    }
+}
+
 fn handle_volume_connection(
-    mut s: impl Read + Write,
+    mut s: NbdStream,
     volume: &elide_core::actor::VolumeHandle,
     volume_size: u64,
 ) -> io::Result<()> {
-    // Newstyle handshake
+    // --- Newstyle handshake (sequential) ---
     s.write_all(&NBD_MAGIC.to_be_bytes())?;
     s.write_all(&NBD_OPTS_MAGIC.to_be_bytes())?;
     s.write_all(&NBD_FLAG_FIXED_NEWSTYLE.to_be_bytes())?;
@@ -936,7 +1211,6 @@ fn handle_volume_connection(
     let tx_flags: u16 =
         NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES;
 
-    // Options loop
     loop {
         let magic = read_u64(&mut s)?;
         if magic != NBD_OPTS_MAGIC {
@@ -958,7 +1232,6 @@ fn handle_volume_connection(
                 break;
             }
             NBD_OPT_GO | NBD_OPT_INFO => {
-                // Export info
                 let mut info = Vec::new();
                 info.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
                 info.extend_from_slice(&volume_size.to_be_bytes());
@@ -999,127 +1272,88 @@ fn handle_volume_connection(
         }
     }
 
-    // Transmission loop
+    // --- Transmission phase (concurrent) ---
+    // Split the socket: `reader` is used exclusively by this thread; every
+    // thread that writes replies does so through the shared `writer`.
+    let writer: WriterMutex = Arc::new(Mutex::new(s.try_clone()?));
+    let mut reader = s;
+
+    let (write_tx, write_rx) = crossbeam_channel::bounded::<WriteJob>(16);
+    let (read_tx, read_rx) = crossbeam_channel::bounded::<ReadJob>(32);
+
+    let write_thread = {
+        let writer = Arc::clone(&writer);
+        let vol = volume.clone();
+        std::thread::Builder::new()
+            .name("nbd-write".into())
+            .spawn(move || run_write_queue(write_rx, vol, writer))
+            .map_err(io::Error::other)?
+    };
+
+    let mut read_threads = Vec::with_capacity(READ_WORKERS_PER_CONN);
+    for i in 0..READ_WORKERS_PER_CONN {
+        let writer = Arc::clone(&writer);
+        let vol = volume.clone();
+        let rx = read_rx.clone();
+        let t = std::thread::Builder::new()
+            .name(format!("nbd-read-{i}"))
+            .spawn(move || run_read_worker(rx, vol, writer))
+            .map_err(io::Error::other)?;
+        read_threads.push(t);
+    }
+    drop(read_rx);
+
     let mut reads: u64 = 0;
     let mut writes: u64 = 0;
+    let reader_result = run_reader_loop(
+        &mut reader,
+        &writer,
+        &write_tx,
+        &read_tx,
+        &mut reads,
+        &mut writes,
+    );
 
-    loop {
-        let magic = read_u32(&mut s)?;
-        if magic != NBD_REQUEST_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad request magic",
-            ));
+    // Drop senders so workers drain any queued jobs and then exit.
+    drop(write_tx);
+    drop(read_tx);
+
+    let mut first_err = reader_result.err();
+    let push_err = |slot: &mut Option<io::Error>, e: io::Error| {
+        if slot.is_none() {
+            *slot = Some(e);
         }
-        let _flags = read_u16(&mut s)?;
-        let cmd = read_u16(&mut s)?;
-        let handle = read_u64(&mut s)?;
-        let offset = read_u64(&mut s)?;
-        let length = read_u32(&mut s)? as usize;
-
-        match cmd {
-            NBD_CMD_READ => {
-                reads += 1;
-                let start_lba = offset / 4096;
-                let end_lba = (offset + length as u64).div_ceil(4096);
-                let lba_count = (end_lba - start_lba) as u32;
-                match volume.read(start_lba, lba_count) {
-                    Ok(blocks) => {
-                        let skip = (offset % 4096) as usize;
-                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
-                        debug_assert!(skip + length <= blocks.len());
-                        tx_reply(&mut s, 0, handle)?;
-                        s.write_all(&blocks[skip..skip + length])?;
-                    }
-                    Err(e) => {
-                        error!("[read error offset={} len={}: {}]", offset, length, e);
-                        tx_reply(&mut s, 5, handle)?; // EIO — no data follows on error
-                    }
-                }
-            }
-
-            NBD_CMD_WRITE => {
-                writes += 1;
-                let mut buf = vec![0u8; length];
-                s.read_exact(&mut buf)?;
-                let start_lba = offset / 4096;
-                let end_lba = (offset + length as u64).div_ceil(4096);
-                let lba_count = (end_lba - start_lba) as u32;
-                let skip = (offset % 4096) as usize;
-                let result = if skip == 0 && length.is_multiple_of(4096) {
-                    // Already block-aligned — write directly.
-                    volume.write(start_lba, buf)
-                } else {
-                    // Sub-block write: read covering blocks, patch, write back.
-                    volume.read(start_lba, lba_count).and_then(|mut blocks| {
-                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
-                        debug_assert!(skip + length <= blocks.len());
-                        blocks[skip..skip + length].copy_from_slice(&buf);
-                        volume.write(start_lba, blocks)
-                    })
-                };
-                match result {
-                    Ok(()) => {
-                        tx_reply(&mut s, 0, handle)?;
-                    }
-                    Err(e) => {
-                        error!("[write error offset={} len={}: {}]", offset, length, e);
-                        tx_reply(&mut s, 5, handle)?; // EIO
-                    }
-                }
-            }
-
-            NBD_CMD_DISC => {
-                println!("[reads: {}, writes: {}]", reads, writes);
-                if let Ok(s) = volume.noop_stats()
-                    && s.skipped_writes > 0
-                {
-                    println!(
-                        "[noop-skip: {} writes, {} bytes saved]",
-                        s.skipped_writes, s.skipped_bytes,
-                    );
-                }
-                break;
-            }
-
-            NBD_CMD_FLUSH => match volume.flush() {
-                Ok(()) => tx_reply(&mut s, 0, handle)?,
-                Err(e) => {
-                    error!("[fsync error: {}]", e);
-                    tx_reply(&mut s, 5, handle)?; // EIO
-                }
-            },
-
-            NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
-                // Round inward to fully-covered 4096-byte blocks.
-                // Sub-block-aligned ranges are no-ops (the filesystem will
-                // rewrite those LBAs before reading them anyway).
-                let start_lba = offset.div_ceil(4096);
-                let end_lba = (offset + length as u64) / 4096;
-                if end_lba > start_lba {
-                    let lba_count = (end_lba - start_lba) as u32;
-                    match volume.write_zeroes(start_lba, lba_count) {
-                        Ok(()) => tx_reply(&mut s, 0, handle)?,
-                        Err(e) => {
-                            error!(
-                                "[write-zeroes error cmd={} offset={} len={}: {}]",
-                                cmd, offset, length, e
-                            );
-                            tx_reply(&mut s, 5, handle)?; // EIO
-                        }
-                    }
-                } else {
-                    tx_reply(&mut s, 0, handle)?;
-                }
-            }
-
-            _ => {
-                tx_reply(&mut s, 22, handle)?; // EINVAL
-            }
+    };
+    match write_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => push_err(&mut first_err, e),
+        Err(_) => push_err(
+            &mut first_err,
+            io::Error::other("nbd write thread panicked"),
+        ),
+    }
+    for t in read_threads {
+        match t.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => push_err(&mut first_err, e),
+            Err(_) => push_err(&mut first_err, io::Error::other("nbd read worker panicked")),
         }
     }
 
-    Ok(())
+    println!("[reads: {}, writes: {}]", reads, writes);
+    if let Ok(st) = volume.noop_stats()
+        && st.skipped_writes > 0
+    {
+        println!(
+            "[noop-skip: {} writes, {} bytes saved]",
+            st.skipped_writes, st.skipped_bytes,
+        );
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 // --- Wire helpers ---
@@ -1278,6 +1512,38 @@ mod tests {
             let mut data = vec![0u8; length as usize];
             self.s.read_exact(&mut data)?;
             Ok(data)
+        }
+
+        /// Send a read request without waiting for the reply.  Used to
+        /// pipeline multiple in-flight requests.
+        fn send_read(&mut self, handle: u64, offset: u64, length: u32) -> io::Result<()> {
+            self.s.write_all(&NBD_REQUEST_MAGIC.to_be_bytes())?;
+            self.s.write_all(&0u16.to_be_bytes())?;
+            self.s.write_all(&NBD_CMD_READ.to_be_bytes())?;
+            self.s.write_all(&handle.to_be_bytes())?;
+            self.s.write_all(&offset.to_be_bytes())?;
+            self.s.write_all(&length.to_be_bytes())?;
+            Ok(())
+        }
+
+        /// Receive the next read reply on the wire; returns (handle, data).
+        /// With multiple in-flight reads the server may reply in any order,
+        /// so the caller matches using the handle echoed in the reply.
+        fn recv_read_reply(&mut self, length: u32) -> io::Result<(u64, Vec<u8>)> {
+            let mut b4 = [0u8; 4];
+            self.s.read_exact(&mut b4)?;
+            assert_eq!(u32::from_be_bytes(b4), NBD_REPLY_MAGIC, "bad reply magic");
+            self.s.read_exact(&mut b4)?;
+            let error = u32::from_be_bytes(b4);
+            let mut b8 = [0u8; 8];
+            self.s.read_exact(&mut b8)?;
+            let handle = u64::from_be_bytes(b8);
+            if error != 0 {
+                return Err(io::Error::other(format!("NBD read error {error}")));
+            }
+            let mut data = vec![0u8; length as usize];
+            self.s.read_exact(&mut data)?;
+            Ok((handle, data))
         }
 
         fn write(&mut self, handle: u64, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -1564,6 +1830,57 @@ mod tests {
         let mut c = NbdClient::connect(&sock).unwrap();
         let buf = c.read(1, 0, 4096).unwrap();
         assert_eq!(buf, vec![0u8; 4096]);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Pipelined reads: fire many reads without waiting for replies, then
+    /// collect replies matched by handle.  Validates that the server handles
+    /// multiple in-flight requests and that reply framing (header+payload
+    /// held atomically under the writer mutex) does not interleave between
+    /// concurrent workers.
+    #[test]
+    fn pipelined_reads_match_handles() {
+        use std::collections::HashMap;
+
+        let dir = temp_dir();
+        let sock = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(&sock).unwrap();
+
+        // Seed 16 blocks with distinct byte patterns so we can tell replies
+        // apart from their contents.
+        const N: u64 = 16;
+        for i in 0..N {
+            let byte = 0x20u8 + i as u8;
+            let data = vec![byte; 4096];
+            c.write(100 + i, i * 4096, &data).unwrap();
+        }
+
+        // Fire all reads before reading any reply.  The server should process
+        // these concurrently across its read-worker pool.
+        for i in 0..N {
+            c.send_read(200 + i, i * 4096, 4096).unwrap();
+        }
+
+        let mut received: HashMap<u64, Vec<u8>> = HashMap::new();
+        for _ in 0..N {
+            let (handle, data) = c.recv_read_reply(4096).unwrap();
+            assert!(
+                received.insert(handle, data).is_none(),
+                "duplicate reply for handle {handle}"
+            );
+        }
+
+        for i in 0..N {
+            let h = 200 + i;
+            let data = received.get(&h).expect("missing reply");
+            assert!(
+                data.iter().all(|&b| b == 0x20 + i as u8),
+                "handle {h} has wrong data: first byte 0x{:02x}",
+                data[0]
+            );
+        }
 
         c.disconnect().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
