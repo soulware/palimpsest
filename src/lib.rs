@@ -8,6 +8,7 @@ pub mod inspect;
 pub mod inspect_files;
 pub mod ls;
 pub mod nbd;
+pub mod ublk;
 pub mod verify;
 
 use std::io;

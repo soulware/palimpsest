@@ -38,3 +38,17 @@ zstd           = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+
+# ublk transport support (Linux only).
+#
+# The `ublk` cargo feature toggles inclusion of the libublk crate. On non-Linux
+# targets the crate is not in the dependency graph (target-gated below), and
+# src/ublk.rs compiles to a stub that errors if the transport is requested.
+# Default is off while the spike lands; we will flip to default-on for Linux
+# once the integration is exercised.
+[features]
+default = []
+ublk = ["dep:libublk"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libublk = { version = "0.4", optional = true }
