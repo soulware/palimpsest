@@ -153,7 +153,7 @@ proptest! {
                         let expected = [*seed; 4096];
                         // Read-your-writes: snapshot must reflect this write
                         // immediately, before any flush to pending/.
-                        let actual = handle.read(*lba as u64, 1).unwrap();
+                        let actual = handle.reader().read(*lba as u64, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             &expected[..],
@@ -192,7 +192,7 @@ proptest! {
                     }
                     // All oracle LBAs must still be readable with correct data.
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -206,7 +206,7 @@ proptest! {
                     // Old pending/ files are deleted; if publish_snapshot() did
                     // not bump flush_gen, handles reuse stale fds and get ENOENT.
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -222,7 +222,7 @@ proptest! {
                     // Same invariant: repack deletes old files; snapshot must be
                     // republished so handles evict their cached fds.
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -239,7 +239,7 @@ proptest! {
                     // Reclaim preserves observable content — every oracle
                     // LBA must still read back its last-written value.
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -276,7 +276,7 @@ proptest! {
                     // unaffected (snapshot does not touch the data path).
                     let _ = handle.sign_snapshot_manifest(snap_ulid);
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -293,7 +293,7 @@ proptest! {
                     // phase returns None and the call is a nil op.
                     let _ = handle.delta_repack_post_snapshot();
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -321,7 +321,7 @@ proptest! {
                     handle = new_handle;
 
                     for (&lba, expected) in &oracle {
-                        let actual = handle.read(lba, 1).unwrap();
+                        let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
@@ -440,7 +440,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
         .unwrap();
 
     for (&lba, expected) in &oracle {
-        let actual = new_handle.read(lba, 1).unwrap();
+        let actual = new_handle.reader().read(lba, 1).unwrap();
         assert_eq!(
             actual.as_slice(),
             expected.as_slice(),

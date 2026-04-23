@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use elide_core::actor::VolumeHandle;
+use elide_core::actor::VolumeClient;
 use elide_core::volume::ZERO_HASH;
 use elide_core::{
     extentindex, lbamap,
@@ -61,7 +61,7 @@ pub fn drain_with_redact(vol: &mut elide_core::volume::Volume) {
 /// Equivalent to `drain_with_redact` but works when the `Volume` is behind
 /// an actor — sends `RedactSegment` and `Promote` messages through the
 /// handle's channel, so the actor's in-memory snapshot is updated correctly.
-pub fn drain_via_handle(handle: &VolumeHandle, base_dir: &Path) {
+pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
     for ulid in pending_ulids(base_dir) {
         handle.redact_segment(ulid).unwrap();
         handle.promote_segment(ulid).unwrap();

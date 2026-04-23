@@ -7,7 +7,7 @@ Status: exploration / pre-implementation reference. Captures the plan before any
 - ublk is a Linux userspace block device subsystem: kernel presents `/dev/ublkbN`, userspace daemon handles I/O over an `io_uring` passthrough channel on `/dev/ublkcN`.
 - It is **host-side only**. From inside a VM we still need NBD (or vhost-user-blk).
 - Goal: **ublk as preferred host-local transport; NBD stays for remote/VM**. Both first-class, not a replacement.
-- **Transport is mutually exclusive per volume** — a writable volume is served on ublk *or* NBD, never both. Two transports would mean two independent page-cache views of the same backing data; serialising writes through `VolumeHandle` doesn't prevent stale reads on the other side.
+- **Transport is mutually exclusive per volume** — a writable volume is served on ublk *or* NBD, never both. Two transports would mean two independent page-cache views of the same backing data; serialising writes through `VolumeClient` doesn't prevent stale reads on the other side.
 - **Explicit transport choice for now.** Working toward ublk-by-default on Linux hosts, but the coordinator will not auto-pick until the ublk path is proven.
 
 ## Why it's worth doing
@@ -21,11 +21,11 @@ Status: exploration / pre-implementation reference. Captures the plan before any
 
 All in `src/nbd.rs:handle_volume_connection` (src/nbd.rs:924). Every command maps 1:1 to a ublk op:
 
-- `NBD_CMD_READ` → `UBLK_IO_OP_READ` → `VolumeHandle::read`
-- `NBD_CMD_WRITE` → `UBLK_IO_OP_WRITE` → `VolumeHandle::write`
-- `NBD_CMD_FLUSH` → `UBLK_IO_OP_FLUSH` → `VolumeHandle::flush`
-- `NBD_CMD_TRIM` → `UBLK_IO_OP_DISCARD` → `VolumeHandle::trim`
-- `NBD_CMD_WRITE_ZEROES` → `UBLK_IO_OP_WRITE_ZEROES` → `VolumeHandle::write_zeroes`
+- `NBD_CMD_READ` → `UBLK_IO_OP_READ` → `VolumeReader::read`
+- `NBD_CMD_WRITE` → `UBLK_IO_OP_WRITE` → `VolumeClient::write`
+- `NBD_CMD_FLUSH` → `UBLK_IO_OP_FLUSH` → `VolumeClient::flush`
+- `NBD_CMD_TRIM` → `UBLK_IO_OP_DISCARD` → `VolumeClient::trim`
+- `NBD_CMD_WRITE_ZEROES` → `UBLK_IO_OP_WRITE_ZEROES` → `VolumeClient::write_zeroes`
 
 The sub-4K RMW path (src/nbd.rs:1049) is NBD-only noise — ublk's `SET_PARAMS` pins logical block size to 4096 and the kernel won't issue sub-4K I/O.
 
@@ -34,16 +34,16 @@ The sub-4K RMW path (src/nbd.rs:1049) is NBD-only noise — ublk's `SET_PARAMS` 
 - New module `src/ublk.rs` mirroring `src/nbd.rs` shape: `pub fn run_volume_ublk(dir, size_bytes, dev_id: Option<i32>) -> io::Result<()>`.
 - Use `libublk` crate (Ming Lei — kernel maintainer; MIT/Apache; v0.4.x; active).
 - One `io_uring` per queue, pinned to queue's affine CPU. Starting point: `nr_hw_queues = min(num_cpus, 4)`, `queue_depth = 64`, `max_io_buf_bytes = 1 MiB`. Tune later.
-- I/O handler = thin adapter onto `VolumeHandle` — same shape as NBD transmission loop, different transport.
-- **No shared transport trait up front.** Sockets vs io_uring + queue affinity are different enough that a trait is premature. Op dispatch is trivially the same; both call `VolumeHandle` directly.
+- I/O handler = thin adapter onto `VolumeClient`/`VolumeReader` — same shape as NBD transmission loop, different transport.
+- **No shared transport trait up front.** Sockets vs io_uring + queue affinity are different enough that a trait is premature. Op dispatch is trivially the same; both call the client/reader directly.
 
 ## Async model
 
-ublk's I/O transport is io_uring — async is inherent. But the async surface is **scoped to `src/ublk.rs`**; `VolumeHandle` and the rest of the core stay synchronous.
+ublk's I/O transport is io_uring — async is inherent. But the async surface is **scoped to `src/ublk.rs`**; `VolumeClient`/`VolumeReader` and the rest of the core stay synchronous.
 
 **Plan: A → B.**
 
-- **A (spike, step 1).** libublk-rs as designed — one `io_uring` per queue, `smol::LocalExecutor` per queue thread, per-tag handler is `async fn` that `await`s FETCH_REQ, calls `VolumeHandle` synchronously, `await`s COMMIT_AND_FETCH_REQ. At `queue_depth = 1` a blocking backend call stalls only that queue's one in-flight op — acceptable for proving plumbing.
+- **A (spike, step 1).** libublk-rs as designed — one `io_uring` per queue, `smol::LocalExecutor` per queue thread, per-tag handler is `async fn` that `await`s FETCH_REQ, calls the volume client/reader synchronously, `await`s COMMIT_AND_FETCH_REQ. At `queue_depth = 1` a blocking backend call stalls only that queue's one in-flight op — acceptable for proving plumbing.
 - **B (step 2).** Raise `queue_depth` and wrap backend calls in `spawn_blocking` (via the `blocking` crate) so the queue's executor can progress other tags in parallel. The actor already serialises at its mailbox, so concurrent blocking calls from N threads just queue up — same shape as today's NBD-per-connection threading.
 
 **Why not C (hand-rolled sync io_uring loop).** Considered and rejected:
@@ -55,16 +55,12 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 **Runtime coexistence.** libublk-rs uses `smol`; we already use `tokio` in the coordinator. No conflict — smol here is a thread-local executor, not a global runtime.
 
-**Handle Send/Sync accommodation (follow-up).** `VolumeHandle` is `Send` but not `Sync` — it owns a `RefCell<FileCache>` (per-thread segment-fd LRU) by design; the comment at `elide-core/src/actor.rs:1343` captures this. `libublk`'s `run_target` requires the queue handler closure to be `Send + Sync + Clone + 'static`, so the spike wraps the handle in `Arc<Mutex<VolumeHandle>>` purely as a type-system accommodation — the lock is taken once per queue-thread startup to extract a fresh clone, never on the hot I/O path.
-
-The right long-term shape is to split `VolumeHandle` into two types:
+**Handle Send/Sync shape.** `VolumeHandle` was split into two types ahead of step 2:
 
 - `VolumeClient` (Send+Sync+Clone): mailbox channel, atomic snapshot pointer, immutable config. No per-thread state.
-- `VolumeReader` (Send, !Sync): owns the per-thread file-fd cache; forwards writes via `Deref<Target = VolumeClient>`.
+- `VolumeReader` (Send, !Sync): owns the per-thread file-fd cache; derefs to `VolumeClient` so it can also issue writes/flushes.
 
-`actor::spawn` returns a `VolumeClient`; each thread calls `client.reader()` to get its reader. This removes the `Arc<Mutex<>>` at the transport boundary and matches the locality design intent already documented in `actor.rs`.
-
-Trigger for landing the split: **either** raising ublk `queue_depth` / `nr_queues` past 1 in step 2, **or** adding a second transport (vhost-user-blk, iSCSI, …). Before either, the split is mechanical churn across ~30–50 call sites (NBD handler, coordinator, tests) serving a single use case; after, it pays off in every caller. Deferred to the step-2 PR at the earliest.
+`actor::spawn` returns a `VolumeClient`; each thread calls `client.reader()` to get its reader. The queue-handler closure captures a `VolumeClient` directly (satisfies libublk's `Send + Sync + Clone + 'static` bound) and constructs a per-queue `VolumeReader` on entry. No `Arc<Mutex<>>` is needed at the transport boundary.
 
 ## Control plane
 
@@ -92,7 +88,7 @@ Trigger for landing the split: **either** raising ublk `queue_depth` / `nr_queue
 
 - Not runnable in `cargo test` sandbox — needs `/dev/ublk-control`, kernel module, udev perms. Treat like `nbd::tests`: sandbox-incompatible, run on a real Linux host.
 - Minimal smoke: start ublk-backed volume, write pattern via `/dev/ublkbN` with `O_DIRECT`, read back, compare.
-- Proptest coverage unchanged — it drives `VolumeHandle` directly, under the transport.
+- Proptest coverage unchanged — it drives `VolumeClient`/`VolumeReader` directly, under the transport.
 
 ## Phased rollout
 

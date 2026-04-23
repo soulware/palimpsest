@@ -74,7 +74,7 @@ The volume process carries tokio today to satisfy `object_store`'s async trait o
 Three independent changes compose to get there:
 
 1. **Sync demand-fetch.** Replace `object_store` inside `elide-fetch` with `rust-s3` (`sync` feature — uses `attohttpc`, no tokio). `elide-fetch` exposes a small sync `RangeFetcher` trait with two built-in impls (S3 via `rust-s3`, local filesystem via `std::fs`). The coordinator continues to use `object_store` for its own list/put/delete and adapts its store to `RangeFetcher` when constructing a fetcher (cheap wrapper, runs on a `spawn_blocking` thread).
-2. **Sync ublk queue threads.** ublk integration follows the existing actor model: one synchronous thread per ublk queue, each holding a `VolumeHandle`, blocking on `crossbeam-channel` into the actor. io_uring is used as the kernel↔userspace transport only, not as an async programming model. Demand-fetch misses can block the queue thread initially; a blocking fetch-thread pool can be introduced later if the miss pattern justifies it without changing the queue model.
+2. **Sync ublk queue threads.** ublk integration follows the existing actor model: one synchronous thread per ublk queue, each holding a `VolumeClient` and a per-thread `VolumeReader`, blocking on `crossbeam-channel` into the actor. io_uring is used as the kernel↔userspace transport only, not as an async programming model. Demand-fetch misses can block the queue thread initially; a blocking fetch-thread pool can be introduced later if the miss pattern justifies it without changing the queue model.
 3. **Drop `tokio` from `elide/Cargo.toml`.** Requires (1), (2), *and* relocating the embedded coordinator-tasks loop and the CLI's S3 subcommands (`pull`, `ls`, fork-from-S3) out of the volume binary — either into `elide-coordinator` (the daemon) or behind a thin sync RPC to it.
 
 **Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping it synchronous matches its I/O model (NBD today, ublk later — both sync at the interface) and removes the only external dependency forcing an async runtime into it. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
@@ -1040,15 +1040,20 @@ The intended integration pattern is **actor + snapshot**:
 
 **`VolumeActor`** owns a `Volume` exclusively and processes requests from a `crossbeam-channel` bounded channel sequentially. It is the sole thread that mutates the fork. After every `write()` call, it publishes a new `ReadSnapshot` via an `ArcSwap`.
 
-**`VolumeHandle`** is the shareable client handle — `Clone + Send`. It holds:
+**`VolumeClient`** is the shareable client handle — `Send + Sync + Clone`. It holds only shared state:
 - A `crossbeam_channel::Sender<VolumeRequest>` to the actor
 - An `Arc<ArcSwap<ReadSnapshot>>` for the lock-free read path
-- A per-handle file-descriptor cache (`RefCell<Option<(String, File)>>`) so sequential reads hitting the same segment avoid repeated `open` syscalls. Each clone gets a fresh empty cache — handles are not `Sync` and are intended for exclusive use by one thread.
-- `last_flush_gen: Cell<u64>` — tracks the last snapshot generation whose offsets populated the fd cache. Compared against `ReadSnapshot::flush_gen` on every read.
+- An `Arc<VolumeConfig>` with the fork directory layout and optional fetcher
+
+No per-thread state — the client is safe to pass into transport closures that require `Send + Sync + Clone` (e.g. libublk queue handlers) without a lock.
+
+**`VolumeReader`** is a per-thread read handle — `Send`, `!Sync`. Constructed by `VolumeClient::reader()`; each transport thread serving reads owns one. It holds the client (via `Deref<Target = VolumeClient>`, so it can also issue writes and control operations) plus:
+- A per-reader file-descriptor cache so sequential reads hitting the same segment avoid repeated `open` syscalls
+- `last_flush_gen: Cell<u64>` — the snapshot generation whose offsets populated the fd cache. Compared against `ReadSnapshot::flush_gen` on every read; cache is cleared when they diverge.
 
 **`ReadSnapshot`** is an immutable view sufficient to serve any read. It holds:
 - `Arc<LbaMap>` and `Arc<ExtentIndex>` — the actor stores its live maps as `Arc`s; publishing a snapshot is an `Arc::clone()` — O(1) unless a reader is still holding the previous version, in which case the next write triggers a copy-on-write clone via `Arc::make_mut`. In practice reads complete in microseconds, so the refcount is almost always 1.
-- `flush_gen: u64` — a promotion counter incremented by the actor after every WAL promotion. Handles compare this against a cached value before each read; if it changed they evict their file-descriptor cache before proceeding. Embedding the counter inside the snapshot means a handle always sees a consistent pair: the post-promote extent index offsets and the corresponding generation arrive together in a single `ArcSwap::load()`. There is no window in which a handle could observe new offsets without knowing to evict its cache, or vice versa.
+- `flush_gen: u64` — a promotion counter incremented by the actor after every WAL promotion. Readers compare this against a cached value before each read; if it changed they evict their file-descriptor cache before proceeding. Embedding the counter inside the snapshot means a reader always sees a consistent pair: the post-promote extent index offsets and the corresponding generation arrive together in a single `ArcSwap::load()`. There is no window in which a reader could observe new offsets without knowing to evict its cache, or vice versa.
 
 **Request flow:**
 - `Write`, `Flush`, `SweepPending` — sent through the channel with an attached `crossbeam_channel::Sender` for the response. The actor processes them in arrival order and replies when done.
@@ -1068,9 +1073,9 @@ Background promotes that fail (I/O error, disk full) are logged and do not crash
 
 **Why `crossbeam-channel`:** the actor loop and NBD/ublk handlers are synchronous threads; `crossbeam-channel` is a natural fit. When ublk integration uses io_uring, ublk queue threads remain synchronous callers — they block on the `Sender` and the actor thread owns the `Receiver`. If a fully async actor is ever needed, `crossbeam-channel` bridges cleanly into async runtimes via `block_on`.
 
-**Why this enables ublk:** ublk supports multiple queues, each driven by a separate thread. Each queue thread holds a cloned `VolumeHandle`. Reads fan out across queue threads with no contention; writes and flushes serialise through the actor. No `Mutex<Volume>` is needed anywhere.
+**Why this enables ublk:** ublk supports multiple queues, each driven by a separate thread. Each queue thread holds a cloned `VolumeClient` and constructs its own `VolumeReader`. Reads fan out across queue threads with no contention; writes and flushes serialise through the actor. No `Mutex<Volume>` is needed anywhere.
 
-**Current state (NBD):** the NBD server is single-threaded (one TCP connection). It uses a `VolumeHandle` through a single thread — the concurrency benefit is not yet exercised, but the structure is correct for ublk when that integration is added.
+**Current state (NBD):** the NBD server already splits its per-connection threads along the new boundary: one write thread holds a `VolumeReader` (for the sub-block RMW path) and each of the read worker threads holds its own `VolumeReader`. The ublk integration uses the same pattern — one reader per queue thread.
 
 **NBD protocol coverage:** the server implements the fixed newstyle handshake and the following transmission-phase commands:
 

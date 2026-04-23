@@ -57,7 +57,7 @@ The last row is a behaviour change from the two-tier design: `blake3::hash([0; N
 
 **Snapshots.** A skipped write produces no local segment entry. The snapshot's view of that LBA is inherited from whatever existing entry already covered it — exactly right, since the content is unchanged.
 
-**Durability.** `NBD_CMD_FLUSH` routes through `VolumeHandle::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
+**Durability.** `NBD_CMD_FLUSH` routes through `VolumeClient::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
 
 **Hash collisions.** Same BLAKE3 collision-resistance assumption already baked into the existing extent-index dedup path. No new trust.
 
@@ -65,7 +65,7 @@ The last row is a behaviour change from the two-tier design: `blake3::hash([0; N
 
 ## Counters
 
-Two counters on `Volume`, exposed via `VolumeHandle::noop_stats()` and printed on NBD client disconnect:
+Two counters on `Volume`, exposed via `VolumeClient::noop_stats()` and printed on NBD client disconnect:
 
 - `skipped_writes` — `write()` calls short-circuited by the hash check.
 - `skipped_bytes` — bytes the skip avoided writing to the WAL.

@@ -2,7 +2,7 @@
 //!
 //! Step-1 spike: single queue, depth 1, no zero-copy, no user-recovery. The
 //! handler is synchronous — one in-flight op per queue, so a blocking
-//! `VolumeHandle` call only stalls its own queue. Multi-queue, higher depth,
+//! `VolumeClient` call only stalls its own queue. Multi-queue, higher depth,
 //! `spawn_blocking` offload, and `UBLK_F_USER_RECOVERY_REISSUE` are follow-up
 //! steps. See docs/design-ublk-transport.md.
 //!
@@ -25,7 +25,7 @@ mod imp {
     use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
     use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 
-    use elide_core::actor::VolumeHandle;
+    use elide_core::actor::{VolumeClient, VolumeReader};
     use elide_core::volume::Volume;
 
     const BLOCK: u64 = 4096;
@@ -55,14 +55,14 @@ mod imp {
             println!("[demand-fetch enabled]");
         }
 
-        let (actor, handle) = elide_core::actor::spawn(volume);
+        let (actor, client) = elide_core::actor::spawn(volume);
         let _actor_thread = std::thread::Builder::new()
             .name("volume-actor".into())
             .spawn(move || actor.run())
             .map_err(io::Error::other)?;
 
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        crate::control::start(dir, handle.clone(), Arc::clone(&connected))?;
+        crate::control::start(dir, client.clone(), Arc::clone(&connected))?;
 
         let ctrl = UblkCtrlBuilder::default()
             .name("elide")
@@ -79,16 +79,12 @@ mod imp {
             Ok(())
         };
 
-        // VolumeHandle is Send but not Sync (its per-handle file_cache is a
-        // RefCell meant for one thread). run_target requires the queue
-        // handler's captures to be Send + Sync + Clone, so we park the
-        // handle behind a Mutex and clone it out inside each queue thread.
-        // Contention is zero on the hot path — the lock is only taken once
-        // per queue-thread startup.
-        let handle_mu = Arc::new(std::sync::Mutex::new(handle.clone()));
+        // VolumeClient is Send + Sync + Clone, so it satisfies run_target's
+        // queue-handler bound directly. Each queue thread constructs its own
+        // VolumeReader (Send, !Sync) to hold a per-thread file-descriptor
+        // cache for reads.
         let q_handler = move |qid, dev: &UblkDev| {
-            let handle = handle_mu.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            q_fn(qid, dev, handle);
+            q_fn(qid, dev, client.reader());
         };
 
         let wait_hook = move |d_ctrl: &UblkCtrl| {
@@ -133,7 +129,7 @@ mod imp {
         };
     }
 
-    fn q_fn(qid: u16, dev: &UblkDev, handle: VolumeHandle) {
+    fn q_fn(qid: u16, dev: &UblkDev, reader: VolumeReader) {
         let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
         let bufs = bufs_rc.clone();
 
@@ -155,7 +151,7 @@ mod imp {
             };
 
             let res = if (bytes as usize) <= slice.len() {
-                dispatch(&handle, op, off, bytes, &mut slice[..bytes as usize])
+                dispatch(&reader, op, off, bytes, &mut slice[..bytes as usize])
             } else {
                 -libc::EINVAL
             };
@@ -182,9 +178,10 @@ mod imp {
         queue.wait_and_handle_io(io_handler);
     }
 
-    /// Translate one ublk I/O into a `VolumeHandle` call. Returns the kernel
-    /// completion status: bytes on success, negative errno on failure.
-    fn dispatch(handle: &VolumeHandle, op: u32, offset: u64, length: u32, buf: &mut [u8]) -> i32 {
+    /// Translate one ublk I/O into a `VolumeReader` / `VolumeClient` call.
+    /// Returns the kernel completion status: bytes on success, negative errno
+    /// on failure.
+    fn dispatch(reader: &VolumeReader, op: u32, offset: u64, length: u32, buf: &mut [u8]) -> i32 {
         // ublk SET_PARAMS pinned logical_bs_shift=12, so offset and length
         // are always 4K-aligned — no RMW path needed.
         debug_assert!(offset.is_multiple_of(BLOCK));
@@ -194,7 +191,7 @@ mod imp {
         let lba_count = (length as u64 / BLOCK) as u32;
 
         match op {
-            UBLK_IO_OP_READ => match handle.read(start_lba, lba_count) {
+            UBLK_IO_OP_READ => match reader.read(start_lba, lba_count) {
                 Ok(data) => {
                     let len = data.len().min(length as usize);
                     buf[..len].copy_from_slice(&data[..len]);
@@ -207,7 +204,7 @@ mod imp {
             },
             UBLK_IO_OP_WRITE => {
                 let data = buf[..length as usize].to_vec();
-                match handle.write(start_lba, data) {
+                match reader.write(start_lba, data) {
                     Ok(()) => length as i32,
                     Err(e) => {
                         tracing::error!("[ublk write error offset={offset} len={length}: {e}]");
@@ -215,21 +212,21 @@ mod imp {
                     }
                 }
             }
-            UBLK_IO_OP_FLUSH => match handle.flush() {
+            UBLK_IO_OP_FLUSH => match reader.flush() {
                 Ok(()) => 0,
                 Err(e) => {
                     tracing::error!("[ublk flush error: {e}]");
                     -libc::EIO
                 }
             },
-            UBLK_IO_OP_DISCARD => match handle.trim(start_lba, lba_count) {
+            UBLK_IO_OP_DISCARD => match reader.trim(start_lba, lba_count) {
                 Ok(()) => length as i32,
                 Err(e) => {
                     tracing::error!("[ublk discard error offset={offset} len={length}: {e}]");
                     -libc::EIO
                 }
             },
-            UBLK_IO_OP_WRITE_ZEROES => match handle.write_zeroes(start_lba, lba_count) {
+            UBLK_IO_OP_WRITE_ZEROES => match reader.write_zeroes(start_lba, lba_count) {
                 Ok(()) => length as i32,
                 Err(e) => {
                     tracing::error!("[ublk write-zeroes error offset={offset} len={length}: {e}]");

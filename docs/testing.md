@@ -118,11 +118,11 @@ Open gaps in simulation coverage, documented so they are not forgotten:
 
 ## Actor-layer proptest
 
-`elide-core/tests/actor_proptest.rs` tests `VolumeActor`, `VolumeHandle`, and `ReadSnapshot` instead of `Volume` directly. The actor layer introduces a per-handle file-handle cache and an `ArcSwap`-published snapshot that `Volume`-level tests cannot see.
+`elide-core/tests/actor_proptest.rs` tests `VolumeActor`, `VolumeClient`/`VolumeReader`, and `ReadSnapshot` instead of `Volume` directly. The actor layer introduces a per-reader file-handle cache and an `ArcSwap`-published snapshot that `Volume`-level tests cannot see.
 
 Key additions over the volume-level proptest:
 
-- Spawns a real actor thread; all reads/writes go through `VolumeHandle`.
+- Spawns a real actor thread; all reads/writes go through `VolumeClient`/`VolumeReader`.
 - Asserts **read-your-writes** after every write — no flush needed. This exercises the `ArcSwap` snapshot publication path and is where the stale file-handle bug was caught.
 - `SweepPending` and `Repack` assert the full oracle after return, covering the invariant that `publish_snapshot()` is called after any compaction that deletes old segment files (without it, handles with cached fds to deleted segments read from stale offsets).
 
