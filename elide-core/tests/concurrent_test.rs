@@ -63,7 +63,7 @@ fn coordinator_gc_does_not_create_read_failures() {
     // Reader thread: continuously reads all seeded LBAs.  These are cold —
     // they are in cache/, not in the WAL.  A read failure here means the
     // extent index still points at a file the coordinator has already deleted.
-    let read_handle = handle.clone();
+    let read_reader = handle.reader();
     let oracle_snap = oracle.clone();
     let read_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let read_errors_clone = Arc::clone(&read_errors);
@@ -71,7 +71,7 @@ fn coordinator_gc_does_not_create_read_failures() {
     let reader = thread::spawn(move || {
         for _ in 0..500 {
             for lba in 0u64..8 {
-                match read_handle.read(lba, 1) {
+                match read_reader.read(lba, 1) {
                     Ok(actual) => {
                         if let Some(expected) = oracle_snap.get(&lba)
                             && actual != *expected
@@ -130,8 +130,9 @@ fn coordinator_gc_does_not_create_read_failures() {
     );
 
     // Full oracle check after everything settles.
+    let final_reader = handle.reader();
     for (lba, expected) in &oracle {
-        let actual = handle.read(*lba, 1).unwrap();
+        let actual = final_reader.read(*lba, 1).unwrap();
         assert_eq!(actual, *expected, "lba {lba} wrong in final check");
     }
 

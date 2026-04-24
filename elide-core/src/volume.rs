@@ -877,7 +877,7 @@ impl Default for ReclaimThresholds {
 
 /// A single reclamation candidate identified by the scanner. The caller
 /// passes `(start_lba, lba_length)` to
-/// [`crate::actor::VolumeHandle::reclaim_alias_merge`].
+/// [`crate::actor::VolumeClient::reclaim_alias_merge`].
 ///
 /// The range is chosen to tightly cover every LBA map run for this
 /// hash. The primitive's containment check therefore always succeeds
@@ -904,7 +904,7 @@ pub struct ReclaimCandidate {
 /// candidates that clear all three thresholds in `ReclaimThresholds`.
 ///
 /// The scanner is read-only and takes `&LbaMap` / `&ExtentIndex` so it
-/// can run on a [`crate::actor::VolumeHandle`] snapshot without any
+/// can run on a [`crate::actor::VolumeClient`] snapshot without any
 /// actor round-trip. Returned candidates are sorted by `dead_blocks`
 /// descending (the most wasteful rewrites first).
 ///
@@ -3275,7 +3275,7 @@ impl Volume {
     ///
     /// Used by tests and inline callers that hold a `&mut Volume`
     /// directly. Production callers go through the actor channel via
-    /// [`crate::actor::VolumeHandle::reclaim_alias_merge`], where the
+    /// [`crate::actor::VolumeClient::reclaim_alias_merge`], where the
     /// heavy middle phase runs on the worker thread.
     pub fn reclaim_alias_merge(
         &mut self,
@@ -4127,7 +4127,7 @@ fn cache_hit_allowed(
 /// `.idx` files live in `index/` (coordinator-written, permanent).
 /// `.body` and `.present` files live in `cache/` (volume-managed read cache).
 ///
-/// Extracted from `Volume::find_segment_file` so that `VolumeHandle` can serve
+/// Extracted from `Volume::find_segment_file` so that `VolumeReader` can serve
 /// reads directly from a `ReadSnapshot` without going through the actor channel.
 pub(crate) fn find_segment_in_dirs(
     segment_id: Ulid,

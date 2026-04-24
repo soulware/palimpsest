@@ -25,7 +25,7 @@ Three phases, of which only the middle is heavy. See `docs/design-noop-write-ski
 
 ### Entry points
 
-`VolumeHandle::reclaim_alias_merge(start_lba, lba_length)` is the production API: one actor round-trip, the heavy middle runs on the worker, the apply parks the reply until the worker returns.
+`VolumeClient::reclaim_alias_merge(start_lba, lba_length)` is the production API: one actor round-trip, the heavy middle runs on the worker, the apply parks the reply until the worker returns.
 
 `Volume::reclaim_alias_merge(start_lba, lba_length)` is the synchronous in-process wrapper (`prepare → execute → apply` on the calling thread), used by tests and offline tooling.
 

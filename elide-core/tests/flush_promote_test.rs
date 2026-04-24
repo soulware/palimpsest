@@ -19,7 +19,7 @@ use elide_core::volume::Volume;
 
 mod common;
 
-fn open_actor(dir: &Path) -> (elide_core::actor::VolumeHandle, thread::JoinHandle<()>) {
+fn open_actor(dir: &Path) -> (elide_core::actor::VolumeClient, thread::JoinHandle<()>) {
     common::write_test_keypair(dir);
     let vol = Volume::open(dir, dir).unwrap();
     let (actor, handle) = spawn(vol);

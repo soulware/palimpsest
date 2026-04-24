@@ -64,7 +64,7 @@ use std::thread;
 
 use tracing::{debug, info};
 
-use elide_core::actor::VolumeHandle;
+use elide_core::actor::VolumeClient;
 
 /// Start the control socket server for `fork_dir`.
 ///
@@ -81,7 +81,7 @@ use elide_core::actor::VolumeHandle;
 /// clone.
 pub fn start(
     fork_dir: &Path,
-    handle: VolumeHandle,
+    handle: VolumeClient,
     nbd_connected: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let socket_path = fork_dir.join("control.sock");
@@ -98,7 +98,7 @@ pub fn start(
 fn run(
     listener: UnixListener,
     socket_path: PathBuf,
-    handle: VolumeHandle,
+    handle: VolumeClient,
     nbd_connected: Arc<AtomicBool>,
 ) {
     for stream in listener.incoming() {
@@ -112,7 +112,7 @@ fn run(
 
 fn handle_connection(
     stream: std::os::unix::net::UnixStream,
-    handle: &VolumeHandle,
+    handle: &VolumeClient,
     nbd_connected: &AtomicBool,
 ) {
     let mut reader = BufReader::new(&stream);
