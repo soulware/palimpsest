@@ -1,11 +1,13 @@
 name: ci
 
-# Host-runner CI: fmt, clippy, and the workspace test suite.
+# Host-runner CI. Two parallel jobs:
+#   - host-tests: fmt, clippy, and the workspace test suite (skipping the
+#     kernel-feature modules that run in ci-kernel.yml).
+#   - host-proptests: the feature-gated proptest suites, which take
+#     noticeably longer. Split so the faster job signals green quickly.
 #
-# Kernel-feature tests (nbd::, ublk::) are skipped here and run in
-# ci-kernel.yml inside a nested KVM guest. Everything else is run as a
-# single `cargo test --workspace` invocation so we can't silently drop
-# coverage when a new test file lands.
+# Both jobs share a Swatinem rust-cache via `shared-key: rust-build`, so
+# cold PR runs restore from the main-branch build cache.
 
 on:
   push:
@@ -37,6 +39,18 @@ jobs:
 
       - name: cargo test
         run: "cargo test --workspace --no-fail-fast -- --skip nbd:: --skip ublk::"
+
+  host-proptests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-build
 
       - name: cargo test (proptest)
         run: "cargo test --workspace --features proptest --tests --no-fail-fast"
