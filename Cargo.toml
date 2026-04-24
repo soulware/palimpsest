@@ -16,7 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono         = { version = "0.4", default-features = false, features = ["clock"] }
 clap           = { version = "4", features = ["derive", "env"] }
 crossbeam-channel = "0.5"
-ctrlc          = "3"
+ctrlc          = { version = "3", features = ["termination"] }
 elide-core        = { path = "elide-core" }
 elide-coordinator = { path = "elide-coordinator" }
 elide-fetch       = { path = "elide-fetch" }
@@ -48,7 +48,16 @@ tempfile = "3"
 # once the integration is exercised.
 [features]
 default = []
-ublk = ["dep:libublk"]
+ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libublk = { version = "0.4", optional = true }
+libublk  = { version = "0.4", optional = true }
+# Transitive via libublk; declared directly so the SIGINT/SIGTERM handler
+# thread can initialize its own thread-local ublk control ring (required by
+# `ublk_init_ctrl_task_ring`) before calling `kill_dev`, and so the ublk
+# transport can build POLL_ADD SQEs that bridge worker-thread completions
+# onto the queue's own uring (step 2b).
+io-uring = { version = "0.7", optional = true }
+# libublk depends on smol = "2.0.2" directly — we match that runtime to
+# drive per-queue `LocalExecutor`s for async per-tag I/O dispatch.
+smol     = { version = "2", optional = true }

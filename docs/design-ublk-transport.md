@@ -41,10 +41,11 @@ The sub-4K RMW path (src/nbd.rs:1049) is NBD-only noise — ublk's `SET_PARAMS` 
 
 ublk's I/O transport is io_uring — async is inherent. But the async surface is **scoped to `src/ublk.rs`**; `VolumeClient`/`VolumeReader` and the rest of the core stay synchronous.
 
-**Plan: A → B.**
+**Plan: A → B → (2b).**
 
-- **A (spike, step 1).** libublk-rs as designed — one `io_uring` per queue, `smol::LocalExecutor` per queue thread, per-tag handler is `async fn` that `await`s FETCH_REQ, calls the volume client/reader synchronously, `await`s COMMIT_AND_FETCH_REQ. At `queue_depth = 1` a blocking backend call stalls only that queue's one in-flight op — acceptable for proving plumbing.
-- **B (step 2).** Raise `queue_depth` and wrap backend calls in `spawn_blocking` (via the `blocking` crate) so the queue's executor can progress other tags in parallel. The actor already serialises at its mailbox, so concurrent blocking calls from N threads just queue up — same shape as today's NBD-per-connection threading.
+- **A (spike, step 1, landed).** libublk-rs synchronous handler — one `io_uring` per queue, single queue, `queue_depth = 1`, synchronous `VolumeClient` call inline. Acceptable for proving plumbing; no head-of-line concern at depth 1.
+- **B (step 2, landed).** `nr_hw_queues = min(num_cpus, 4)` at `queue_depth = 1`, synchronous handler per queue. Concurrency comes from multiple queue threads running independently with their own `VolumeReader`. A slow backend call on one queue (e.g. demand-fetch from S3) stalls only that queue, not its siblings.
+- **2b (follow-up, not landed).** Raise `queue_depth` > 1 with async per-tag handling. **A naive `smol::LocalExecutor` + `blocking::unblock` offload does not work** — it was tried and reverted. The problem: `blocking` wakes futures on its own thread pool, and that wake cannot interrupt `io_uring::submit_and_wait` on the queue thread, so every I/O waits for a kernel event or the ring's idle timeout. Observable symptom: `mount /dev/ublkb0` hangs for 20–30 s per metadata read. A correct implementation requires either (a) a uring-registered eventfd wired into the async waker path so blocking-pool completions interrupt the queue's uring wait, or (b) a worker-pool model where backend threads submit completion SQEs back into the queue's ring. Either route is a real piece of engineering — do it as its own PR with an fio-backed before/after.
 
 **Why not C (hand-rolled sync io_uring loop).** Considered and rejected:
 
@@ -60,11 +61,11 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 - `VolumeClient` (Send+Sync+Clone): mailbox channel, atomic snapshot pointer, immutable config. No per-thread state.
 - `VolumeReader` (Send, !Sync): owns the per-thread file-fd cache; derefs to `VolumeClient` so it can also issue writes/flushes.
 
-`actor::spawn` returns a `VolumeClient`; each thread calls `client.reader()` to get its reader. The queue-handler closure captures a `VolumeClient` directly (satisfies libublk's `Send + Sync + Clone + 'static` bound) and constructs a per-queue `VolumeReader` on entry. No `Arc<Mutex<>>` is needed at the transport boundary.
+`actor::spawn` returns a `VolumeClient`; the queue-handler closure captures a `VolumeClient` directly (satisfies libublk's `Send + Sync + Clone + 'static` bound). Each queue thread constructs one `VolumeReader` on entry. Step 2b will revisit reader ownership once the depth > 1 model is chosen.
 
 ## Control plane
 
-- Lifecycle: `ADD_DEV` → `SET_PARAMS` → `START_DEV` → run → `STOP_DEV` → `DEL_DEV`.
+- Lifecycle: `ADD_DEV` → `SET_PARAMS` → `START_DEV` → run → `STOP_DEV` → `DEL_DEV`. `libublk::run_target` handles the first four; elide installs a SIGINT/SIGTERM/SIGHUP handler that calls `kill_dev` (safe from outside the target callbacks) to break the queue-thread join, then explicitly calls `del_dev` after `run_target` returns so the device does not linger in `/sys/class/ublk-char` and the id can be reused on the next serve.
 - Add `UblkConfig { dev_id: Option<i32> }` in `elide-core/src/config.rs` alongside `NbdConfig`. `ublk` and `nbd` sections are mutually exclusive in `volume.toml`; config parse rejects both being set.
 - CLI: `--ublk` / `--ublk-id N`, conflicts with `--nbd-port` / `--nbd-socket` in clap.
 - Conflict detection: `find_nbd_conflict` grows a `find_ublk_conflict` checking `dev_id`.
@@ -94,8 +95,9 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 First PR is the spike only. Later steps are sequenced separately, each on its own PR.
 
-1. **Spike (first PR).** Port NBD handler logic to a `libublk` handler. Single queue, depth 1, no zero-copy, no recovery. Against a ramdisk volume. Prove plumbing. (~1 day.)
-2. **Multi-queue + depth.** Raise `nr_hw_queues` and `queue_depth`, verify under `fio`. Latency win should show here.
+1. **Spike (landed).** Port NBD handler logic to a `libublk` handler. Single queue, depth 1, no zero-copy, no recovery. Prove plumbing.
+2. **Multi-queue, depth 1 (landed).** `nr_hw_queues = min(num_cpus, 4)`, sync handler per queue. Lifecycle cleanup: signal-thread `kill_dev` + post-`run_target` `del_dev` so devices do not leak across serve restarts. `elide ublk list` / `elide ublk delete` diagnostic CLI.
+2b. **Depth > 1 (not started).** Correct async integration — uring-registered eventfd waker, or worker-pool returning via completion SQEs. fio before/after. See Async model above for the dead-end we avoided.
 3. **USER_RECOVERY_REISSUE.** Coordinator calls `START_USER_RECOVERY` on respawn. Crash-injection test. Enabled by default once validated.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Requires root — likely a separate "privileged" tier.
 5. **Config + CLI.** First-class `ublk` section in `volume.toml` (mutually exclusive with `nbd`), coordinator lifecycle integration, docs.

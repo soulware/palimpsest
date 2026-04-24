@@ -131,6 +131,27 @@ enum Command {
     /// Print all records in a WAL file (diagnostic)
     #[command(hide = true)]
     InspectWal { path: PathBuf },
+
+    /// Manage ublk devices (diagnostic, Linux-only)
+    #[command(hide = true)]
+    Ublk {
+        #[command(subcommand)]
+        command: UblkCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UblkCommand {
+    /// List ublk devices currently known to the kernel
+    List,
+    /// Delete a ublk device by id, or all devices with --all
+    Delete {
+        /// Specific device id (maps to /dev/ublkb<id>)
+        id: Option<i32>,
+        /// Delete every device found in /sys/class/ublk-char
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -859,6 +880,29 @@ fn main() {
         Command::InspectWal { path } => {
             inspect_files::inspect_wal(&path).expect("inspect-wal failed");
         }
+
+        Command::Ublk { command } => match command {
+            UblkCommand::List => {
+                if let Err(e) = ublk::list_devices() {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            UblkCommand::Delete { id, all } => {
+                let result = match (id, all) {
+                    (Some(id), false) => ublk::delete_device(id),
+                    (None, true) => ublk::delete_all_devices(),
+                    _ => {
+                        eprintln!("error: specify a device id, or use --all (but not both)");
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = result {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 
