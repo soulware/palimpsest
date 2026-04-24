@@ -42,12 +42,15 @@ tempfile = "3"
 # ublk transport support (Linux only).
 #
 # The `ublk` cargo feature toggles inclusion of the libublk crate. On non-Linux
-# targets the crate is not in the dependency graph (target-gated below), and
-# src/ublk.rs compiles to a stub that errors if the transport is requested.
-# Default is off while the spike lands; we will flip to default-on for Linux
-# once the integration is exercised.
+# targets the underlying deps are target-gated out of the graph (see below),
+# so activating the feature is a no-op — src/ublk.rs compiles to a stub that
+# errors if the transport is requested.
+#
+# `ublk` is in the default feature set so Linux builds pick it up automatically;
+# to opt out, build with `--no-default-features` (and re-add any other defaults
+# you need).
 [features]
-default = []
+default = ["ublk"]
 ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
 # Workspace aggregate for property-based test suites. Enables `proptest`
 # on every member crate that has one, so CI can run them all via a single
