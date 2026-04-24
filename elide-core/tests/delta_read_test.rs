@@ -95,7 +95,9 @@ fn delta_entry_end_to_end_decompression() {
     // ordering to be safe).
     // Derive by incrementing so ordering against `parent_seg_ulid` is
     // guaranteed — `Ulid::new()` twice in the same millisecond is random.
-    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
+    let delta_seg_ulid = parent_seg_ulid
+        .increment()
+        .expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -176,7 +178,9 @@ fn delta_entry_roundtrip_from_drained_cache() {
     // ── Delta segment: one Delta entry pointing at the parent hash.
     // Derive by incrementing so ordering against `parent_seg_ulid` is
     // guaranteed — `Ulid::new()` twice in the same millisecond is random.
-    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
+    let delta_seg_ulid = parent_seg_ulid
+        .increment()
+        .expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -277,7 +281,9 @@ fn delta_entry_demand_fetch_from_pull_host() {
 
     // Derive by incrementing so ordering against `parent_seg_ulid` is
     // guaranteed — `Ulid::new()` twice in the same millisecond is random.
-    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
+    let delta_seg_ulid = parent_seg_ulid
+        .increment()
+        .expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -433,7 +439,9 @@ fn block_reader_read_block_dispatches_to_delta() {
     // Delta segment with a Delta entry at LBA 10, source = parent_hash.
     // Derive by incrementing so ordering against `parent_seg_ulid` is
     // guaranteed — `Ulid::new()` twice in the same millisecond is random.
-    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
+    let delta_seg_ulid = parent_seg_ulid
+        .increment()
+        .expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
