@@ -1070,6 +1070,7 @@ dependencies = [
  "object_store",
  "rustls",
  "serde",
+ "smol",
  "tempfile",
  "tokio",
  "toml",
