@@ -93,8 +93,9 @@ fn delta_entry_end_to_end_decompression() {
     // rebuild applies it after the parent (the parent contributes nothing
     // to LBA 10 anyway, but monotonic ULIDs are required for rebuild
     // ordering to be safe).
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    // Derive by incrementing so ordering against `parent_seg_ulid` is
+    // guaranteed — `Ulid::new()` twice in the same millisecond is random.
+    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -173,8 +174,9 @@ fn delta_entry_roundtrip_from_drained_cache() {
     write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
 
     // ── Delta segment: one Delta entry pointing at the parent hash.
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    // Derive by incrementing so ordering against `parent_seg_ulid` is
+    // guaranteed — `Ulid::new()` twice in the same millisecond is random.
+    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -273,8 +275,9 @@ fn delta_entry_demand_fetch_from_pull_host() {
     )];
     write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    // Derive by incrementing so ordering against `parent_seg_ulid` is
+    // guaranteed — `Ulid::new()` twice in the same millisecond is random.
+    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -428,8 +431,9 @@ fn block_reader_read_block_dispatches_to_delta() {
     write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
 
     // Delta segment with a Delta entry at LBA 10, source = parent_hash.
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    // Derive by incrementing so ordering against `parent_seg_ulid` is
+    // guaranteed — `Ulid::new()` twice in the same millisecond is random.
+    let delta_seg_ulid = parent_seg_ulid.increment().expect("ulid increment overflow");
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
