@@ -1,0 +1,173 @@
+name: ci-kernel (prototype)
+
+# Prototype of "Lane C" — kernel-feature integration tests run inside a nested
+# KVM VM on a stock ubuntu-24.04 GitHub runner. The host kernel image on
+# GitHub's hosted runners cannot load arbitrary modules (modprobe denied), but
+# /dev/kvm is available, so we boot an Ubuntu 24.04 cloud image as a guest and
+# run the tests that need ublk_drv / nbd there.
+#
+# Status: prototype. Triggered manually or by applying the `ci:kernel` label.
+# Goal: measure end-to-end wall time and prove modprobe ublk_drv / nbd works
+# inside the guest. Discard if the approach is too slow.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  kernel-tests:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label.name == 'ci:kernel')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host — verify KVM + record kernel
+        run: |
+          echo "host kernel: $(uname -r)"
+          ls -la /dev/kvm
+          grep -cE 'vmx|svm' /proc/cpuinfo || true
+
+      - name: Host — install qemu + cloud tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils openssh-client
+
+      - name: Host — fetch Ubuntu 24.04 cloud image
+        run: |
+          echo "::group::download"
+          time wget -q \
+            https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
+            -O base.img
+          ls -lh base.img
+          qemu-img create -f qcow2 -F qcow2 -b "$PWD/base.img" vm.qcow2 40G
+          echo "::endgroup::"
+
+      - name: Host — prepare SSH key + cloud-init seed
+        run: |
+          ssh-keygen -t ed25519 -N '' -f id_vm -q
+          cat > user-data <<EOF
+          #cloud-config
+          users:
+            - name: ci
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - $(cat id_vm.pub)
+          package_update: true
+          packages:
+            - build-essential
+            - pkg-config
+            - libssl-dev
+            - curl
+            - git
+            - nbd-client
+            - linux-modules-extra-$(uname -r)
+          runcmd:
+            - [ sh, -c, 'modprobe ublk_drv || true' ]
+            - [ sh, -c, 'modprobe nbd || true' ]
+          EOF
+          cat > meta-data <<EOF
+          instance-id: ci-vm
+          local-hostname: ci-vm
+          EOF
+          cloud-localds seed.img user-data meta-data
+
+      - name: Host — boot guest VM (KVM, virtio, 9p repo share)
+        run: |
+          echo "::group::qemu boot"
+          sudo qemu-system-x86_64 \
+            -enable-kvm \
+            -cpu host \
+            -smp 4 \
+            -m 8192 \
+            -nographic \
+            -serial file:qemu-serial.log \
+            -drive file=vm.qcow2,if=virtio,format=qcow2 \
+            -drive file=seed.img,if=virtio,format=raw \
+            -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=n0 \
+            -fsdev local,path=${{ github.workspace }},security_model=mapped-xattr,id=repo \
+            -device virtio-9p-pci,fsdev=repo,mount_tag=repo \
+            -daemonize \
+            -pidfile qemu.pid
+          echo "qemu pid: $(cat qemu.pid)"
+          echo "::endgroup::"
+
+      - name: Host — wait for SSH + cloud-init
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i id_vm -p 2222"
+          echo "::group::ssh wait"
+          for i in $(seq 1 120); do
+            if ssh $SSH_OPTS ci@localhost 'true' 2>/dev/null; then
+              echo "ssh up after ~${i}*5s"
+              break
+            fi
+            sleep 5
+          done
+          ssh $SSH_OPTS ci@localhost 'true' || { echo "ssh never came up"; tail -200 qemu-serial.log; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::cloud-init wait"
+          ssh $SSH_OPTS ci@localhost 'sudo cloud-init status --wait || true'
+          echo "::endgroup::"
+
+      - name: Guest — kernel surface smoke test
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          SSH="ssh $SSH_OPTS ci@localhost"
+          $SSH 'uname -r'
+          $SSH 'zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_BLK_DEV_UBLK|CONFIG_BLK_DEV_NBD" || true'
+          $SSH 'find /lib/modules/$(uname -r) -name "ublk_drv*" -o -name "nbd*" 2>/dev/null'
+          $SSH 'sudo modprobe ublk_drv && ls -la /dev/ublk-control'
+          $SSH 'sudo modprobe nbd && ls -la /dev/nbd0'
+          $SSH 'lsmod | grep -E "ublk|^nbd"'
+
+      - name: Guest — mount repo (9p) + install Rust
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          SSH="ssh $SSH_OPTS ci@localhost"
+          $SSH 'sudo mkdir -p /repo && sudo mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 repo /repo'
+          $SSH 'ls /repo | head'
+          echo "::group::rustup"
+          $SSH 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
+          echo "::endgroup::"
+
+      - name: Guest — build workspace
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          SSH="ssh $SSH_OPTS ci@localhost"
+          echo "::group::cargo build (workspace + ublk feature)"
+          time $SSH 'source ~/.cargo/env && cd /repo && cargo build --workspace --features ublk 2>&1 | tail -40'
+          echo "::endgroup::"
+
+      - name: Guest — kernel-lane tests
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          SSH="ssh $SSH_OPTS ci@localhost"
+          echo "::group::cargo test nbd"
+          time $SSH 'source ~/.cargo/env && cd /repo && cargo test -p elide --lib nbd:: -- --nocapture 2>&1 | tail -100'
+          echo "::endgroup::"
+          echo "::group::cargo test ublk"
+          time $SSH 'source ~/.cargo/env && cd /repo && cargo test -p elide --lib --features ublk ublk:: -- --nocapture 2>&1 | tail -100' || true
+          echo "::endgroup::"
+
+      - name: Artifacts — qemu serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-serial-log
+          path: qemu-serial.log
+          if-no-files-found: ignore
+
+      - name: Host — shutdown VM
+        if: always()
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=5 -i id_vm -p 2222 ci@localhost \
+              'sudo poweroff' || true
+          sleep 5
+          sudo kill "$(cat qemu.pid)" 2>/dev/null || true
