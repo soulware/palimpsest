@@ -13,16 +13,19 @@ name: ci-kernel (prototype)
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize]
 
 jobs:
   kernel-tests:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label.name == 'ci:kernel')
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'ci:kernel')
+      || (github.event_name == 'pull_request' && github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'ci:kernel'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Host — verify KVM + record kernel
         run: |
@@ -36,15 +39,34 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils openssh-client
 
+      - name: Host — cache Ubuntu cloud image
+        id: img-cache
+        uses: actions/cache@v5
+        with:
+          path: base.img
+          key: ubuntu-cloudimg-noble-current-v1
+
       - name: Host — fetch Ubuntu 24.04 cloud image
+        if: steps.img-cache.outputs.cache-hit != 'true'
         run: |
           echo "::group::download"
           time wget -q \
             https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
             -O base.img
           ls -lh base.img
-          qemu-img create -f qcow2 -F qcow2 -b "$PWD/base.img" vm.qcow2 40G
           echo "::endgroup::"
+
+      - name: Host — build qcow2 overlay
+        run: qemu-img create -f qcow2 -F qcow2 -b "$PWD/base.img" vm.qcow2 40G
+
+      - name: Host — restore cargo registry cache
+        id: cargo-reg
+        uses: actions/cache/restore@v5
+        with:
+          path: cargo-registry.tar
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v1-
 
       - name: Host — prepare SSH key + cloud-init seed
         run: |
@@ -65,10 +87,6 @@ jobs:
             - curl
             - git
             - nbd-client
-            - linux-modules-extra-$(uname -r)
-          runcmd:
-            - [ sh, -c, 'modprobe ublk_drv || true' ]
-            - [ sh, -c, 'modprobe nbd || true' ]
           EOF
           cat > meta-data <<EOF
           instance-id: ci-vm
@@ -84,7 +102,7 @@ jobs:
             -cpu host \
             -smp 4 \
             -m 8192 \
-            -nographic \
+            -display none \
             -serial file:qemu-serial.log \
             -drive file=vm.qcow2,if=virtio,format=qcow2 \
             -drive file=seed.img,if=virtio,format=raw \
@@ -115,6 +133,15 @@ jobs:
           ssh $SSH_OPTS ci@localhost 'sudo cloud-init status --wait || true'
           echo "::endgroup::"
 
+      - name: Guest — install kernel modules-extra
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          SSH="ssh $SSH_OPTS ci@localhost"
+          echo "::group::apt install linux-modules-extra"
+          $SSH 'sudo apt-get update -qq'
+          $SSH 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-modules-extra-$(uname -r)'
+          echo "::endgroup::"
+
       - name: Guest — kernel surface smoke test
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
@@ -136,12 +163,21 @@ jobs:
           $SSH 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
           echo "::endgroup::"
 
+      - name: Guest — seed cargo registry from cache
+        if: steps.cargo-reg.outputs.cache-matched-key != ''
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          echo "::group::seed ~/.cargo/registry from cache"
+          scp $SSH_OPTS cargo-registry.tar ci@localhost:/tmp/cargo-registry.tar
+          ssh $SSH_OPTS ci@localhost 'mkdir -p ~/.cargo && tar xf /tmp/cargo-registry.tar -C ~/.cargo && rm /tmp/cargo-registry.tar && du -sh ~/.cargo/registry'
+          echo "::endgroup::"
+
       - name: Guest — build workspace
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
           echo "::group::cargo build (workspace + ublk feature)"
-          time $SSH 'source ~/.cargo/env && cd /repo && cargo build --workspace --features ublk 2>&1 | tail -40'
+          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo build --workspace --features ublk 2>&1 | tail -40'
           echo "::endgroup::"
 
       - name: Guest — kernel-lane tests
@@ -149,15 +185,36 @@ jobs:
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
           echo "::group::cargo test nbd"
-          time $SSH 'source ~/.cargo/env && cd /repo && cargo test -p elide --lib nbd:: -- --nocapture 2>&1 | tail -100'
+          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo test -p elide --lib nbd:: -- --nocapture 2>&1 | tail -100'
           echo "::endgroup::"
           echo "::group::cargo test ublk"
-          time $SSH 'source ~/.cargo/env && cd /repo && cargo test -p elide --lib --features ublk ublk:: -- --nocapture 2>&1 | tail -100' || true
+          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo test -p elide --lib --features ublk ublk:: -- --nocapture 2>&1 | tail -100' || true
           echo "::endgroup::"
+
+      - name: Host — pack cargo registry for cache
+        if: always() && steps.cargo-reg.outputs.cache-hit != 'true'
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          echo "::group::pack ~/.cargo/registry"
+          ssh $SSH_OPTS ci@localhost 'cd ~/.cargo && tar cf /tmp/cargo-registry.tar registry' || true
+          scp $SSH_OPTS ci@localhost:/tmp/cargo-registry.tar cargo-registry.tar || true
+          ls -lh cargo-registry.tar 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Host — save cargo registry cache
+        if: always() && steps.cargo-reg.outputs.cache-hit != 'true' && hashFiles('cargo-registry.tar') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: cargo-registry.tar
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Artifacts — prepare qemu serial log
+        if: always()
+        run: sudo chown "$USER:" qemu-serial.log || true
 
       - name: Artifacts — qemu serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-serial-log
           path: qemu-serial.log

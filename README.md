@@ -45,3 +45,11 @@ remaining work relative to the previous status.  Latest first.
 | 2026-03-30 | [docs/status-2026-03-30.md](docs/status-2026-03-30.md) |
 
 Start with [docs/overview.md](docs/overview.md).
+
+## Continuous integration
+
+The default CI lane runs on every push and covers build, clippy, and userspace
+tests. A second, opt-in lane (`ci-kernel`) exercises kernel-dependent features
+(ublk, nbd) inside a nested KVM VM on the GitHub runner. It is currently a
+prototype: apply the `ci:kernel` label to a pull request to trigger a run, or
+dispatch it manually from the Actions tab.
