@@ -26,7 +26,11 @@ ulid         = "1"
 zstd         = "0.13"
 
 [features]
-proptest-gc = []
+# Gate the slow property-based test suites behind an explicit feature so that
+# `cargo test -p elide-coordinator` runs only the fast unit/integration tests.
+#
+#   cargo test -p elide-coordinator --features proptest
+proptest = []
 
 [dev-dependencies]
 async-trait = "0.1"
@@ -36,4 +40,4 @@ tempfile    = "3"
 
 [[test]]
 name = "gc_proptest"
-required-features = ["proptest-gc"]
+required-features = ["proptest"]

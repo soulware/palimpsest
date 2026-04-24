@@ -1,0 +1,40 @@
+name: ci
+
+# Host-runner CI: fmt, clippy, and the workspace test suite.
+#
+# Kernel-feature tests (nbd::, ublk::) are skipped here and run in
+# ci-kernel.yml inside a nested KVM guest. Everything else is run as a
+# single `cargo test --workspace` invocation so we can't silently drop
+# coverage when a new test file lands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast -- --skip nbd:: --skip ublk::
+
+      - name: cargo test (proptest)
+        run: cargo test --workspace --features proptest --tests --no-fail-fast

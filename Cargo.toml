@@ -49,6 +49,10 @@ tempfile = "3"
 [features]
 default = []
 ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
+# Workspace aggregate for property-based test suites. Enables `proptest`
+# on every member crate that has one, so CI can run them all via a single
+# `cargo test --workspace --features proptest --tests` invocation.
+proptest = ["elide-core/proptest", "elide-coordinator/proptest"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk  = { version = "0.4", optional = true }

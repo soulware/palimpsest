@@ -23,19 +23,14 @@ zerocopy       = { version = "0.8", features = ["derive"] }
 zstd           = "0.13"
 
 [features]
-# Gate the slow property-based test suites behind explicit features so that
+# Gate the slow property-based test suites behind an explicit feature so that
 # `cargo test -p elide-core` runs only the fast unit/integration tests.
 #
 # Run all proptest suites:
-#   cargo test -p elide-core --features proptest-tests
-# Run a single suite:
-#   cargo test -p elide-core --features proptest-volume
-#   cargo test -p elide-core --features proptest-actor
-#   cargo test -p elide-core --features proptest-fork
-proptest-volume = []
-proptest-actor  = []
-proptest-fork   = []
-proptest-tests  = ["proptest-volume", "proptest-actor", "proptest-fork"]
+#   cargo test -p elide-core --features proptest
+# Run a single suite (via test-binary filter):
+#   cargo test -p elide-core --features proptest --test volume_proptest
+proptest = []
 
 [dev-dependencies]
 criterion  = { version = "0.5", features = ["html_reports"] }
@@ -45,15 +40,15 @@ zstd       = "0.13"
 
 [[test]]
 name = "actor_proptest"
-required-features = ["proptest-actor"]
+required-features = ["proptest"]
 
 [[test]]
 name = "fork_proptest"
-required-features = ["proptest-fork"]
+required-features = ["proptest"]
 
 [[test]]
 name = "volume_proptest"
-required-features = ["proptest-volume"]
+required-features = ["proptest"]
 
 [[bench]]
 name = "compression"
