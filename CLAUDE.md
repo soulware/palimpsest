@@ -22,7 +22,7 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - Error messages should be lowercase and not end with punctuation (Rust convention).
 
 **Code quality.**
-- Run `cargo fmt` and `cargo clippy -- -D warnings` before committing (enforced by pre-commit hook).
+- Run `cargo fmt` before committing (enforced by pre-commit hook). Clippy with `-D warnings` is enforced in CI, not locally.
 - Fix all clippy warnings — don't accumulate `#[allow(...)]` suppressions unless there is a deliberate, documented reason.
 - Prefer `div_ceil()` over manual ceiling-division idioms.
 - Use const-generic `read_fixed::<N>` helpers rather than `.try_into().expect(...)` for fixed-size slice conversions.
@@ -35,6 +35,11 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - When reading a string from an external source (filename, file content, CLI arg) that represents a typed value, always parse it through the type's own parser rather than using the raw string directly.
 - This validates the value at the boundary and produces a canonical string if re-serialised (e.g. `Ulid::from_string(s)?.to_string()`, not `s.to_owned()`).
 - The same applies to any structured string: paths, hashes, addresses, IDs.
+
+**Monotonic ULIDs in tests.**
+- When a test mints two or more ULIDs that must be ordered (e.g. a parent segment and a later delta segment), use `elide_core::ulid_mint::UlidMint` — seed with `Ulid::nil()` and call `.next()` per ULID.
+- Two back-to-back `Ulid::new()` calls in the same millisecond produce ULIDs in random order — a flake source that has bitten CI more than once.
+- Independent test IDs (distinct volume dirs, unrelated segment IDs in uniqueness tests) can still use `Ulid::new()` directly.
 
 ## Design principles
 

@@ -43,6 +43,8 @@ jobs:
 
       - name: Host — rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-build
 
       - name: Host — build elide test binary
         id: build-tests

@@ -28,6 +28,7 @@ use elide_core::segment::{
     extract_idx, promote_to_cache, write_segment, write_segment_with_delta_body,
 };
 use elide_core::signing;
+use elide_core::ulid_mint::UlidMint;
 use elide_core::volume::ReadonlyVolume;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -77,7 +78,8 @@ fn delta_entry_end_to_end_decompression() {
     assert!(!delta_blob.is_empty());
 
     // --- Segment 1: holds the parent DATA entry at LBA 0. ---
-    let parent_seg_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
     let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -93,8 +95,7 @@ fn delta_entry_end_to_end_decompression() {
     // rebuild applies it after the parent (the parent contributes nothing
     // to LBA 10 anyway, but monotonic ULIDs are required for rebuild
     // ordering to be safe).
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_ulid = mint.next();
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -161,7 +162,8 @@ fn delta_entry_roundtrip_from_drained_cache() {
     let delta_blob = compressor.compress(&child_bytes).unwrap();
 
     // ── Parent segment: one DATA entry with the parent bytes.
-    let parent_seg_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
     let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -173,8 +175,7 @@ fn delta_entry_roundtrip_from_drained_cache() {
     write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
 
     // ── Delta segment: one Delta entry pointing at the parent hash.
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_ulid = mint.next();
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -262,7 +263,8 @@ fn delta_entry_demand_fetch_from_pull_host() {
     let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
     let delta_blob = compressor.compress(&child_bytes).unwrap();
 
-    let parent_seg_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
     let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -273,8 +275,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
     )];
     write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_ulid = mint.next();
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -416,7 +417,8 @@ fn block_reader_read_block_dispatches_to_delta() {
     let delta_blob = compressor.compress(&child_bytes).unwrap();
 
     // Parent DATA segment at LBA 0.
-    let parent_seg_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
     let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -428,8 +430,7 @@ fn block_reader_read_block_dispatches_to_delta() {
     write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
 
     // Delta segment with a Delta entry at LBA 10, source = parent_hash.
-    let delta_seg_ulid = Ulid::new();
-    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_ulid = mint.next();
     let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,

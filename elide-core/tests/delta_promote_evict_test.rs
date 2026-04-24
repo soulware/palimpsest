@@ -25,6 +25,7 @@ use elide_core::segment::{
     write_segment_with_delta_body,
 };
 use elide_core::signing;
+use elide_core::ulid_mint::UlidMint;
 use elide_core::volume::Volume;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -80,7 +81,8 @@ fn setup_delta_volume() -> (
         "test fixture: delta must be smaller than raw child bytes"
     );
 
-    let parent_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -91,8 +93,7 @@ fn setup_delta_volume() -> (
     )];
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_ulid = Ulid::new();
-    assert!(delta_ulid > parent_ulid);
+    let delta_ulid = mint.next();
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -240,7 +241,8 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
         .compress(&child_bytes)
         .unwrap();
 
-    let parent_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -251,8 +253,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     )];
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_ulid = Ulid::new();
-    assert!(delta_ulid > parent_ulid);
+    let delta_ulid = mint.next();
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,

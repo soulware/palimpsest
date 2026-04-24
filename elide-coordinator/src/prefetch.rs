@@ -361,7 +361,7 @@ mod tests {
     use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
     use elide_core::signing::{
         ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
-        generate_ephemeral_signer, generate_keypair, load_signer, write_provenance,
+        generate_keypair, load_signer, write_provenance,
     };
 
     /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
@@ -561,6 +561,18 @@ mod tests {
         let by_id = tmp.path().join("by_id");
         let root_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let root_dir = by_id.join(root_ulid);
+        std::fs::create_dir_all(&root_dir).unwrap();
+
+        // Generate the root's keypair + provenance on disk so prefetch can
+        // verify signatures and walk (empty) lineage.
+        let key = generate_keypair(&root_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &root_dir,
+            &key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
 
         // Write one segment to a staging file, upload it, then discard locally.
         let data = vec![0xCDu8; 4096];
@@ -573,19 +585,9 @@ mod tests {
             SegmentFlags::empty(),
             data,
         )];
-        let (signer, vk) = generate_ephemeral_signer();
+        let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
         write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
-
-        // Write volume.pub (hex-encoded) so prefetch can verify signatures.
-        std::fs::create_dir_all(&root_dir).unwrap();
-        let vk_hex: String = vk
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-            + "\n";
-        std::fs::write(root_dir.join("volume.pub"), &vk_hex).unwrap();
 
         // Upload the segment to the store.
         let store_tmp = TempDir::new().unwrap();
@@ -616,15 +618,16 @@ mod tests {
         let vol_dir = by_id.join(vol_ulid);
         std::fs::create_dir_all(&vol_dir).unwrap();
 
-        // Write volume.pub so prefetch_indexes doesn't fail.
-        let (_, vk) = generate_ephemeral_signer();
-        let vk_hex: String = vk
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-            + "\n";
-        std::fs::write(vol_dir.join("volume.pub"), &vk_hex).unwrap();
+        // Generate the volume's keypair + provenance on disk so prefetch can
+        // verify signatures and walk (empty) lineage.
+        let key = generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &vol_dir,
+            &key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
 
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =

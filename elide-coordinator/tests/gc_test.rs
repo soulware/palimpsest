@@ -126,7 +126,10 @@ impl ObjectStore for FailStore {
         _location: &object_store::path::Path,
         _opts: PutMultipartOpts,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        unimplemented!("FailStore::put_multipart_opts")
+        Err(object_store::Error::Generic {
+            store: "FailStore",
+            source: "simulated upload failure".into(),
+        })
     }
 
     async fn get_opts(
