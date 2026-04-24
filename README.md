@@ -48,8 +48,9 @@ Start with [docs/overview.md](docs/overview.md).
 
 ## Continuous integration
 
-The default CI lane runs on every push and covers build, clippy, and userspace
-tests. A second, opt-in lane (`ci-kernel`) exercises kernel-dependent features
-(ublk, nbd) inside a nested KVM VM on the GitHub runner. It is currently a
-prototype: apply the `ci:kernel` label to a pull request to trigger a run, or
-dispatch it manually from the Actions tab.
+Two lanes run unconditionally on every pull request and every push to `main`:
+
+- `ci` — build, clippy, and userspace tests.
+- `ci-kernel` — kernel-dependent features (`ublk::`, `nbd::`) exercised inside
+  a nested KVM VM on the GitHub runner. Host builds the test binary; the guest
+  runs it via a 9p share. Blocking, not advisory.
