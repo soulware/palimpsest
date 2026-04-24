@@ -1,14 +1,16 @@
 name: ci-kernel (prototype)
 
-# Prototype of "Lane C" — kernel-feature integration tests run inside a nested
-# KVM VM on a stock ubuntu-24.04 GitHub runner. The host kernel image on
-# GitHub's hosted runners cannot load arbitrary modules (modprobe denied), but
-# /dev/kvm is available, so we boot an Ubuntu 24.04 cloud image as a guest and
-# run the tests that need ublk_drv / nbd there.
+# Prototype of "Lane C" — kernel-feature integration tests that need ublk_drv
+# / nbd. GitHub's hosted runners deny modprobe for arbitrary modules on the
+# host kernel, so we boot a nested KVM VM with an Ubuntu 24.04 cloud image
+# and run the kernel-dependent tests inside the guest.
+#
+# Compilation happens on the *host* runner (fast CPUs, simple caching via
+# Swatinem/rust-cache). The guest only ever runs the pre-built test binaries,
+# reading them from the workspace via a 9p share. Host and guest are both
+# Ubuntu 24.04, so binaries are ABI-compatible.
 #
 # Status: prototype. Triggered manually or by applying the `ci:kernel` label.
-# Goal: measure end-to-end wall time and prove modprobe ublk_drv / nbd works
-# inside the guest. Discard if the approach is too slow.
 
 on:
   workflow_dispatch:
@@ -39,6 +41,27 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils openssh-client
 
+      - name: Host — rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Host — build elide test binary
+        id: build-tests
+        run: |
+          echo "::group::cargo test --no-run"
+          cargo test --no-run -p elide --lib --features ublk --message-format=json \
+            | tee build-output.json \
+            | jq -r 'select(.reason == "compiler-message") | .message.rendered // empty'
+          echo "::endgroup::"
+          TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "elide" and (.target.kind | index("lib"))) | .executable' build-output.json | head -1)
+          if [ -z "$TEST_BIN" ] || [ ! -x "$TEST_BIN" ]; then
+            echo "could not locate elide test binary"
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | {kind: .target.kind, name: .target.name, exe: .executable}' build-output.json
+            exit 1
+          fi
+          echo "host path: $TEST_BIN"
+          ls -lh "$TEST_BIN"
+          echo "test_bin=$TEST_BIN" >> "$GITHUB_OUTPUT"
+
       - name: Host — cache Ubuntu cloud image
         id: img-cache
         uses: actions/cache@v5
@@ -59,15 +82,6 @@ jobs:
       - name: Host — build qcow2 overlay
         run: qemu-img create -f qcow2 -F qcow2 -b "$PWD/base.img" vm.qcow2 40G
 
-      - name: Host — restore cargo registry cache
-        id: cargo-reg
-        uses: actions/cache/restore@v5
-        with:
-          path: cargo-registry.tar
-          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-v1-
-
       - name: Host — prepare SSH key + cloud-init seed
         run: |
           ssh-keygen -t ed25519 -N '' -f id_vm -q
@@ -81,11 +95,6 @@ jobs:
                 - $(cat id_vm.pub)
           package_update: true
           packages:
-            - build-essential
-            - pkg-config
-            - libssl-dev
-            - curl
-            - git
             - nbd-client
           EOF
           cat > meta-data <<EOF
@@ -101,7 +110,7 @@ jobs:
             -enable-kvm \
             -cpu host \
             -smp 4 \
-            -m 8192 \
+            -m 4096 \
             -display none \
             -serial file:qemu-serial.log \
             -drive file=vm.qcow2,if=virtio,format=qcow2 \
@@ -147,66 +156,32 @@ jobs:
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
           $SSH 'uname -r'
-          $SSH 'zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_BLK_DEV_UBLK|CONFIG_BLK_DEV_NBD" || true'
-          $SSH 'find /lib/modules/$(uname -r) -name "ublk_drv*" -o -name "nbd*" 2>/dev/null'
           $SSH 'sudo modprobe ublk_drv && ls -la /dev/ublk-control'
           $SSH 'sudo modprobe nbd && ls -la /dev/nbd0'
           $SSH 'lsmod | grep -E "ublk|^nbd"'
 
-      - name: Guest — mount repo (9p) + install Rust
+      - name: Guest — mount repo (9p)
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
           $SSH 'sudo mkdir -p /repo && sudo mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 repo /repo'
           $SSH 'ls /repo | head'
-          echo "::group::rustup"
-          $SSH 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
-          echo "::endgroup::"
 
-      - name: Guest — seed cargo registry from cache
-        if: steps.cargo-reg.outputs.cache-matched-key != ''
-        run: |
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
-          echo "::group::seed ~/.cargo/registry from cache"
-          scp $SSH_OPTS cargo-registry.tar ci@localhost:/tmp/cargo-registry.tar
-          ssh $SSH_OPTS ci@localhost 'mkdir -p ~/.cargo && tar xf /tmp/cargo-registry.tar -C ~/.cargo && rm /tmp/cargo-registry.tar && du -sh ~/.cargo/registry'
-          echo "::endgroup::"
-
-      - name: Guest — build workspace
+      - name: Guest — run kernel-lane tests
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
-          echo "::group::cargo build (workspace + ublk feature)"
-          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo build --workspace --features ublk 2>&1 | tail -40'
+          HOST_BIN="${{ steps.build-tests.outputs.test_bin }}"
+          GUEST_BIN="/repo${HOST_BIN#${{ github.workspace }}}"
+          echo "host path:  $HOST_BIN"
+          echo "guest path: $GUEST_BIN"
+          $SSH "test -x $GUEST_BIN" || { echo "test binary not accessible in guest"; exit 1; }
+          echo "::group::nbd tests"
+          time $SSH "$GUEST_BIN nbd:: --nocapture"
           echo "::endgroup::"
-
-      - name: Guest — kernel-lane tests
-        run: |
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
-          SSH="ssh $SSH_OPTS ci@localhost"
-          echo "::group::cargo test nbd"
-          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo test -p elide --lib nbd:: -- --nocapture 2>&1 | tail -100'
+          echo "::group::ublk tests"
+          time $SSH "$GUEST_BIN ublk:: --nocapture" || true
           echo "::endgroup::"
-          echo "::group::cargo test ublk"
-          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo test -p elide --lib --features ublk ublk:: -- --nocapture 2>&1 | tail -100' || true
-          echo "::endgroup::"
-
-      - name: Host — pack cargo registry for cache
-        if: always() && steps.cargo-reg.outputs.cache-hit != 'true'
-        run: |
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
-          echo "::group::pack ~/.cargo/registry"
-          ssh $SSH_OPTS ci@localhost 'cd ~/.cargo && tar cf /tmp/cargo-registry.tar registry' || true
-          scp $SSH_OPTS ci@localhost:/tmp/cargo-registry.tar cargo-registry.tar || true
-          ls -lh cargo-registry.tar 2>/dev/null || true
-          echo "::endgroup::"
-
-      - name: Host — save cargo registry cache
-        if: always() && steps.cargo-reg.outputs.cache-hit != 'true' && hashFiles('cargo-registry.tar') != ''
-        uses: actions/cache/save@v5
-        with:
-          path: cargo-registry.tar
-          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Artifacts — prepare qemu serial log
         if: always()
