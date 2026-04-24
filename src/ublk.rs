@@ -64,8 +64,8 @@ mod imp {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::Path;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crossbeam_channel::{Receiver, Sender, unbounded};
     use libublk::BufDesc;
@@ -162,6 +162,63 @@ mod imp {
         }
     }
 
+    /// Query a ublk device's current state via GET_DEV_INFO. Returns the
+    /// raw `UBLK_S_DEV_*` value. Opens a fresh `UblkCtrl::new_simple`, so
+    /// it is safe to call even when no daemon owns the device.
+    fn probe_dev_state(id: i32) -> io::Result<u16> {
+        let ctrl = UblkCtrl::new_simple(id)
+            .map_err(|e| io::Error::other(format!("ublk open ctrl for dev {id}: {e}")))?;
+        Ok(ctrl.dev_info().state)
+    }
+
+    /// Install the SIGINT/SIGTERM/SIGHUP handler once at the top of
+    /// `run_volume_ublk`. The handler looks at `slot`:
+    ///
+    /// - If `Some(ctrl)`: call `kill_dev` to unblock `run_target`'s
+    ///   queue-thread join. The main thread then runs `del_dev` +
+    ///   `clear_ublk_id` on the way out.
+    /// - If `None`: there is no live device yet (startup, or recovery
+    ///   probe), so the only useful thing the handler can do is exit the
+    ///   process so the user is not stuck waiting on a blocking ioctl.
+    ///
+    /// `kill_dev` uses a thread-local libublk control ring, which the
+    /// ctrlc signal thread has not initialized — set it up on first
+    /// delivery before issuing the ioctl, otherwise `kill_dev` panics.
+    fn install_signal_handler(slot: Arc<Mutex<Option<Arc<UblkCtrl>>>>) {
+        // `let _`: another handler already installed (e.g. in tests) is
+        // not fatal — the process already has a SIGINT disposition.
+        let _ = ctrlc::set_handler(move || {
+            if let Err(e) = ublk_init_ctrl_task_ring(|opt| {
+                if opt.is_none() {
+                    *opt = Some(
+                        io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
+                            .build(32)
+                            .map_err(libublk::UblkError::IOError)?,
+                    );
+                }
+                Ok(())
+            }) {
+                tracing::error!("ublk signal-thread ctrl ring init failed: {e}");
+                std::process::exit(130);
+            }
+            let guard = slot.lock().expect("sig_ctrl poisoned");
+            match guard.as_ref() {
+                Some(c) => {
+                    if let Err(e) = c.kill_dev() {
+                        tracing::error!("ublk kill_dev on signal failed: {e}");
+                    }
+                }
+                None => {
+                    // No live device: a blocking ioctl (e.g.
+                    // start_user_recover) is in flight and cannot be
+                    // interrupted cooperatively. Exit immediately so the
+                    // user is never trapped.
+                    std::process::exit(130);
+                }
+            }
+        });
+    }
+
     pub fn run_volume_ublk(
         dir: &Path,
         size_bytes: u64,
@@ -188,10 +245,46 @@ mod imp {
 
         let nr_queues = pick_nr_queues();
 
+        // Install the signal handler as early as possible, before any
+        // potentially-blocking ioctl (in particular `start_user_recover`,
+        // which retries on EBUSY for up to 30s). The handler consults a
+        // shared slot: if a live ctrl is registered, it kill_dev's it so
+        // `run_target` can unwind cleanly; if the slot is still empty
+        // (startup, recovery probe, etc.) it exits the process directly
+        // so the user is never trapped in an uninterruptible phase.
+        let sig_ctrl: Arc<Mutex<Option<Arc<UblkCtrl>>>> = Arc::new(Mutex::new(None));
+        install_signal_handler(Arc::clone(&sig_ctrl));
+
         let persisted_id = read_ublk_id(dir)?;
         let (target_id, recovering) = match plan_route(persisted_id, dev_id, ublk_device_exists) {
             Route::Add { target_id } => (target_id, false),
-            Route::Recover { id } => (Some(id), true),
+            Route::Recover { id } => {
+                // Recovery is only valid from QUIESCED (or FAIL_IO). A DEAD
+                // device cannot be recovered — the kernel never transitions
+                // DEAD → QUIESCED, so `start_user_recover` would EBUSY-spin
+                // for 30s and then fail. Probe state: if DEAD, delete the
+                // stale entry and fall through to Add at the same id.
+                match probe_dev_state(id) {
+                    Ok(state) if state == libublk::sys::UBLK_S_DEV_DEAD as u16 => {
+                        tracing::warn!(
+                            "ublk dev {id} is DEAD (not recoverable); deleting stale entry and re-adding"
+                        );
+                        if let Ok(c) = UblkCtrl::new_simple(id)
+                            && let Err(e) = c.del_dev()
+                        {
+                            tracing::warn!("ublk del_dev for stale DEAD dev {id}: {e}");
+                        }
+                        (Some(id), false)
+                    }
+                    Ok(_) => (Some(id), true),
+                    Err(e) => {
+                        tracing::warn!(
+                            "ublk dev {id}: could not probe state ({e}); attempting recovery anyway"
+                        );
+                        (Some(id), true)
+                    }
+                }
+            }
             Route::BoundMismatch { persisted, cli } => {
                 return Err(io::Error::other(format!(
                     "volume bound to ublk dev {persisted}; refusing to serve with --ublk-id {cli}. \
@@ -238,40 +331,10 @@ mod imp {
                 .map_err(|e| io::Error::other(format!("ublk ctrl build: {e}")))?,
         );
 
-        // Break run_target out of its queue-thread join on SIGINT/SIGTERM/SIGHUP.
-        // kill_dev() is the libublk-recommended safe path from outside the
-        // target callbacks; it triggers STOP_DEV, which causes the queue
-        // threads to exit and run_target to return, after which we issue a
-        // DEL_DEV so the device does not accumulate across serve restarts.
-        //
-        // kill_dev uses the *calling thread's* thread-local control ring,
-        // which ctrlc's signal thread has not initialized. Set it up on
-        // first signal delivery before issuing the ioctl, otherwise
-        // kill_dev() panics with "Control ring not initialized".
-        //
-        // Ignore an error from set_handler: another signal handler being
-        // installed already (e.g. in test) should not fail the serve.
-        {
-            let ctrl_sig = Arc::clone(&ctrl);
-            let _ = ctrlc::set_handler(move || {
-                if let Err(e) = ublk_init_ctrl_task_ring(|opt| {
-                    if opt.is_none() {
-                        *opt = Some(
-                            io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
-                                .build(32)
-                                .map_err(libublk::UblkError::IOError)?,
-                        );
-                    }
-                    Ok(())
-                }) {
-                    tracing::error!("ublk signal-thread ctrl ring init failed: {e}");
-                    return;
-                }
-                if let Err(e) = ctrl_sig.kill_dev() {
-                    tracing::error!("ublk kill_dev on signal failed: {e}");
-                }
-            });
-        }
+        // Publish the live ctrl so the already-installed signal handler
+        // can kill_dev it on SIGINT/SIGTERM/SIGHUP. kill_dev triggers
+        // STOP_DEV, which unblocks run_target's queue-thread join.
+        *sig_ctrl.lock().expect("sig_ctrl poisoned") = Some(Arc::clone(&ctrl));
 
         let tgt_init = move |dev: &mut UblkDev| {
             set_params(dev, size_bytes);
@@ -307,6 +370,11 @@ mod imp {
         let run_result = ctrl
             .run_target(tgt_init, q_handler, wait_hook)
             .map_err(|e| io::Error::other(format!("ublk run_target: {e}")));
+
+        // Clear the slot now that run_target has returned: any subsequent
+        // signal should exit the process directly rather than kill_dev a
+        // ctrl we are about to del_dev below.
+        *sig_ctrl.lock().expect("sig_ctrl poisoned") = None;
 
         // Always attempt DEL_DEV so the kernel-side device does not linger
         // after the daemon exits. run_target's internal stop_dev only stops
