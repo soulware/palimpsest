@@ -45,23 +45,41 @@ jobs:
         with:
           shared-key: rust-build
 
-      - name: Host — build elide test binary
+      - name: Host — build elide test binaries
         id: build-tests
         run: |
           echo "::group::cargo test --no-run"
-          cargo test --no-run -p elide --lib --features ublk --message-format=json \
+          # --tests compiles the lib-test binary (hosts `nbd::` and `ublk::`
+          # unit tests) AND the integration tests under `tests/` (e.g.
+          # `ublk_crash`). As a side-effect cargo also builds the `elide`
+          # bin, because the integration test references it via
+          # CARGO_BIN_EXE_elide.
+          cargo test --no-run -p elide --tests --features ublk --message-format=json \
             | tee build-output.json \
             | jq -r 'select(.reason == "compiler-message") | .message.rendered // empty'
           echo "::endgroup::"
-          TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "elide" and (.target.kind | index("lib"))) | .executable' build-output.json | head -1)
-          if [ -z "$TEST_BIN" ] || [ ! -x "$TEST_BIN" ]; then
-            echo "could not locate elide test binary"
-            jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | {kind: .target.kind, name: .target.name, exe: .executable}' build-output.json
-            exit 1
-          fi
-          echo "host path: $TEST_BIN"
-          ls -lh "$TEST_BIN"
-          echo "test_bin=$TEST_BIN" >> "$GITHUB_OUTPUT"
+
+          LIB_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "elide" and (.target.kind | index("lib"))) | .executable' build-output.json | head -1)
+          CRASH_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "ublk_crash") | .executable' build-output.json | head -1)
+          ELIDE_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == false and .target.name == "elide" and (.target.kind | index("bin"))) | .executable' build-output.json | head -1)
+
+          for pair in "LIB_BIN=$LIB_BIN" "CRASH_BIN=$CRASH_BIN" "ELIDE_BIN=$ELIDE_BIN"; do
+            path="${pair#*=}"
+            if [ -z "$path" ] || [ ! -x "$path" ]; then
+              echo "missing artifact: $pair"
+              jq -r 'select(.reason == "compiler-artifact") | {kind: .target.kind, name: .target.name, test: .profile.test, exe: .executable}' build-output.json
+              exit 1
+            fi
+          done
+
+          echo "host lib:   $LIB_BIN"
+          echo "host crash: $CRASH_BIN"
+          echo "host elide: $ELIDE_BIN"
+          ls -lh "$LIB_BIN" "$CRASH_BIN" "$ELIDE_BIN"
+
+          echo "lib_bin=$LIB_BIN" >> "$GITHUB_OUTPUT"
+          echo "crash_bin=$CRASH_BIN" >> "$GITHUB_OUTPUT"
+          echo "elide_bin=$ELIDE_BIN" >> "$GITHUB_OUTPUT"
 
       - name: Host — cache Ubuntu cloud image
         id: img-cache
@@ -172,16 +190,33 @@ jobs:
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
-          HOST_BIN="${{ steps.build-tests.outputs.test_bin }}"
-          GUEST_BIN="/repo${HOST_BIN#${{ github.workspace }}}"
-          echo "host path:  $HOST_BIN"
-          echo "guest path: $GUEST_BIN"
-          $SSH "test -x $GUEST_BIN" || { echo "test binary not accessible in guest"; exit 1; }
+          WS="${{ github.workspace }}"
+
+          LIB_HOST="${{ steps.build-tests.outputs.lib_bin }}"
+          CRASH_HOST="${{ steps.build-tests.outputs.crash_bin }}"
+          ELIDE_HOST="${{ steps.build-tests.outputs.elide_bin }}"
+          LIB_GUEST="/repo${LIB_HOST#$WS}"
+          CRASH_GUEST="/repo${CRASH_HOST#$WS}"
+          ELIDE_GUEST="/repo${ELIDE_HOST#$WS}"
+
+          echo "host lib:    $LIB_HOST   -> $LIB_GUEST"
+          echo "host crash:  $CRASH_HOST -> $CRASH_GUEST"
+          echo "host elide:  $ELIDE_HOST -> $ELIDE_GUEST"
+          for p in "$LIB_GUEST" "$CRASH_GUEST" "$ELIDE_GUEST"; do
+            $SSH "test -x $p" || { echo "binary not accessible in guest: $p"; exit 1; }
+          done
+
           echo "::group::nbd tests"
-          time $SSH "$GUEST_BIN nbd:: --nocapture"
+          time $SSH "$LIB_GUEST nbd:: --nocapture"
           echo "::endgroup::"
-          echo "::group::ublk tests"
-          time $SSH "$GUEST_BIN ublk:: --nocapture"
+          echo "::group::ublk unit tests"
+          time $SSH "$LIB_GUEST ublk:: --nocapture"
+          echo "::endgroup::"
+          # Crash-injection tests spawn the `elide` binary, open /dev/ublk-control
+          # and /dev/ublkbN, so they need root. `sudo env VAR=... cmd` reliably
+          # passes the env var through regardless of sudoers env_keep policy.
+          echo "::group::ublk crash-injection tests"
+          time $SSH "sudo env ELIDE_BIN=$ELIDE_GUEST $CRASH_GUEST --nocapture"
           echo "::endgroup::"
 
       - name: Artifacts — prepare qemu serial log
