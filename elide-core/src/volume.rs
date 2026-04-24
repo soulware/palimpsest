@@ -3299,7 +3299,25 @@ impl Volume {
     /// Search dirs are the fork directory followed by ancestor layers
     /// in the same order `BlockReader` uses — the worker's read helper
     /// walks them to find segment body files.
+    ///
+    /// ## Ordering invariant: `u_flush < u_reclaim`
+    ///
+    /// Flushes any open WAL to `pending/<u_flush>` before minting the
+    /// reclaim output ULID `u_reclaim`. Mirrors the `u_gc < u_flush`
+    /// invariant documented on [`GcCheckpointUlids`], but with reversed
+    /// polarity: reclaim outputs must sort *above* the flushed-WAL
+    /// segment, because reclaim's new LBA mappings supersede the
+    /// pre-reclaim WAL entries they consumed.
+    ///
+    /// Without this flush, a WAL entry for an LBA that reclaim rewrites
+    /// survives to `pending/<u_flush>` where `u_flush > u_reclaim`. On
+    /// crash rebuild the flushed segment applies after the reclaim
+    /// output and shadows it — re-pointing the LBA at a hash whose body
+    /// `redact_segment` may have already hole-punched (hash-dead under
+    /// the post-reclaim lbamap), producing zero reads.
     pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> io::Result<ReclaimJob> {
+        self.flush_wal()?;
+
         let end_lba = start_lba + lba_length as u64;
         let entries = self.lbamap.extents_in_range(start_lba, end_lba);
 

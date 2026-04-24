@@ -32,6 +32,7 @@ use elide_core::segment::{
     write_segment_with_delta_body,
 };
 use elide_core::signing;
+use elide_core::ulid_mint::UlidMint;
 use elide_core::volume::{ReclaimThresholds, Volume, scan_reclaim_candidates};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -85,7 +86,8 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     );
 
     // --- Parent DATA segment. ---
-    let parent_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -97,8 +99,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
     // --- Delta segment, ULID strictly greater so rebuild applies it after. ---
-    let delta_ulid = Ulid::new();
-    assert!(delta_ulid > parent_ulid);
+    let delta_ulid = mint.next();
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -234,26 +235,26 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     // Finally: the reclaim output segment's sole entries in the index
     // section are Data (none), DedupRef (none) + Delta (both) — no
     // body_section bytes. Read the segment back and verify.
+    // `prepare_reclaim` flushes the WAL before minting the reclaim output
+    // ULID, so pending/ may also contain a flushed-WAL segment in addition
+    // to the fixture parent/delta and the reclaim output. The reclaim
+    // output is always the highest-ULID segment.
     let outcome_seg_ulid = {
-        let entries: Vec<_> = fs::read_dir(vol_dir.join("pending"))
+        let mut hits: Vec<Ulid> = fs::read_dir(vol_dir.join("pending"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                let n = e.file_name();
-                let s = n.to_string_lossy();
-                !s.ends_with(".tmp")
-                    && Ulid::from_string(&s).is_ok()
-                    && Ulid::from_string(&s).unwrap() != parent_ulid
-                    && Ulid::from_string(&s).unwrap() != delta_ulid
+            .filter_map(|e| {
+                let n = e.file_name().into_string().ok()?;
+                if n.contains('.') {
+                    return None;
+                }
+                Ulid::from_string(&n).ok()
             })
+            .filter(|u| *u != parent_ulid && *u != delta_ulid)
             .collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "exactly one reclaim-output pending segment, got {}: {entries:?}",
-            entries.len()
-        );
-        Ulid::from_string(&entries[0].file_name().to_string_lossy()).unwrap()
+        hits.sort();
+        hits.pop()
+            .expect("reclaim must have produced a pending segment")
     };
     let out_path = vol_dir.join(format!("pending/{outcome_seg_ulid}"));
     let vk = signing::load_verifying_key(&vol_dir, signing::VOLUME_PUB_FILE).unwrap();
@@ -313,7 +314,8 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         .unwrap();
 
     // --- Parent segment (carries H). ---
-    let parent_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -325,8 +327,7 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
     // --- Unrelated Delta segment at LBA 50 (source = parent_hash). ---
-    let delta50_ulid = Ulid::new();
-    assert!(delta50_ulid > parent_ulid);
+    let delta50_ulid = mint.next();
     let delta50_path = vol_dir.join(format!("pending/{delta50_ulid}"));
     let mut delta50_entries = vec![SegmentEntry::new_delta(
         child50_hash,
@@ -561,7 +562,8 @@ fn scanner_surfaces_bloated_delta_hash() {
         .compress(&child_bytes)
         .unwrap();
 
-    let parent_ulid = Ulid::new();
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
     let mut parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
@@ -572,8 +574,7 @@ fn scanner_surfaces_bloated_delta_hash() {
     )];
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_ulid = Ulid::new();
-    assert!(delta_ulid > parent_ulid);
+    let delta_ulid = mint.next();
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
     let mut delta_entries = vec![SegmentEntry::new_delta(
         child_hash,

@@ -293,6 +293,10 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     // Identify the new pending segment (neither parent nor original
     // delta). Promote it and verify the output's Delta entries flip
     // to Cached.
+    // `prepare_reclaim` flushes the WAL before minting the reclaim output
+    // ULID, so pending/ may also contain a flushed-WAL segment in addition
+    // to the fixture parent/delta and the reclaim output. The reclaim
+    // output is always the highest-ULID segment.
     let reclaim_ulid = {
         let mut hits = fs::read_dir(vol_dir.join("pending"))
             .unwrap()
@@ -306,8 +310,9 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
             })
             .filter(|u| *u != parent_ulid && *u != delta_ulid)
             .collect::<Vec<_>>();
-        assert_eq!(hits.len(), 1, "exactly one reclaim output segment");
-        hits.pop().unwrap()
+        hits.sort();
+        hits.pop()
+            .expect("reclaim must have produced a pending segment")
     };
 
     // Collect live hashes whose delta entry points at the reclaim

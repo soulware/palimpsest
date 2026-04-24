@@ -54,3 +54,11 @@ jobs:
 
       - name: cargo test (proptest)
         run: "cargo test --workspace --features proptest --tests --no-fail-fast"
+
+      - name: Upload proptest regressions
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: "**/proptest-regressions/**"
+          if-no-files-found: ignore

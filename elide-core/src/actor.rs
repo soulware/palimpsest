@@ -718,6 +718,13 @@ impl VolumeActor {
                 return;
             }
         };
+        // `prepare_reclaim` flushes the WAL before minting the reclaim
+        // output ULID (see the `u_flush < u_reclaim` invariant on
+        // `Volume::prepare_reclaim`). That mutates the extent index
+        // (WAL-relative offsets → segment-relative) and deletes the old
+        // WAL file. Republish so readers don't resolve hashes through
+        // the pre-flush snapshot into a deleted WAL.
+        self.publish_snapshot();
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::Reclaim(job)) {
                 warn!("worker channel closed during reclaim: {e}");
