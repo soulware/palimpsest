@@ -91,8 +91,9 @@ fn setup_delta_volume() -> (
     )];
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_ulid = Ulid::new();
-    assert!(delta_ulid > parent_ulid);
+    // Derive by incrementing so ordering against `parent_ulid` is
+    // guaranteed — `Ulid::new()` twice in the same millisecond is random.
+    let delta_ulid = parent_ulid.increment().expect("ulid increment overflow");
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
@@ -251,8 +252,9 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     )];
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    let delta_ulid = Ulid::new();
-    assert!(delta_ulid > parent_ulid);
+    // Derive by incrementing so ordering against `parent_ulid` is
+    // guaranteed — `Ulid::new()` twice in the same millisecond is random.
+    let delta_ulid = parent_ulid.increment().expect("ulid increment overflow");
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
