@@ -34,7 +34,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --no-fail-fast -- --skip nbd:: --skip ublk::
+        run: "cargo test --workspace --no-fail-fast -- --skip nbd:: --skip ublk::"
 
       - name: cargo test (proptest)
-        run: cargo test --workspace --features proptest --tests --no-fail-fast
+        run: "cargo test --workspace --features proptest --tests --no-fail-fast"
