@@ -1,18 +1,20 @@
-//! Extent-reclamation data types and the candidate scanner.
-//!
-//! `impl Volume` for reclaim (`prepare_reclaim`, `apply_reclaim_result`,
-//! `reclaim_alias_merge`) lives in `volume/mod.rs` because it touches
-//! private fields on `Volume`.
+//! Extent-reclamation data types, the candidate scanner, and the
+//! `impl Volume` block that drives the prepare → execute → apply trio.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ulid::Ulid;
 
-use crate::{extentindex, lbamap, segment};
+use crate::{
+    extentindex::{self, BodySource},
+    lbamap,
+    segment::{self, EntryKind},
+};
 
-use super::ZERO_HASH;
+use super::{Volume, ZERO_HASH, latest_snapshot};
 
 /// Data needed by the worker to execute extent reclamation off-actor.
 ///
@@ -282,4 +284,200 @@ pub fn scan_reclaim_candidates(
 
     candidates.sort_unstable_by(|a, b| b.dead_blocks.cmp(&a.dead_blocks));
     candidates
+}
+
+impl Volume {
+    /// Synchronous alias-merge wrapper: prepare → execute → apply.
+    ///
+    /// Used by tests and inline callers that hold a `&mut Volume`
+    /// directly. Production callers go through the actor channel via
+    /// [`crate::actor::VolumeClient::reclaim_alias_merge`], where the
+    /// heavy middle phase runs on the worker thread.
+    pub fn reclaim_alias_merge(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+    ) -> io::Result<ReclaimOutcome> {
+        let job = self.prepare_reclaim(start_lba, lba_length)?;
+        let result = crate::actor::execute_reclaim(job)?;
+        self.apply_reclaim_result(result)
+    }
+
+    /// Prep phase of reclaim — runs on the actor thread.
+    ///
+    /// Snapshots `lbamap` (precondition token + read source for the
+    /// worker's bloat-gate walk), snapshots `extent_index` (so the
+    /// worker can resolve hashes to segment bodies without an actor
+    /// round-trip), captures the clipped range entries, and mints the
+    /// output segment ULID so the worker can write
+    /// `pending/<segment_ulid>` directly.
+    ///
+    /// Search dirs are the fork directory followed by ancestor layers
+    /// in the same order `BlockReader` uses — the worker's read helper
+    /// walks them to find segment body files.
+    ///
+    /// ## Ordering invariant: `u_flush < u_reclaim`
+    ///
+    /// Flushes any open WAL to `pending/<u_flush>` before minting the
+    /// reclaim output ULID `u_reclaim`. Mirrors the `u_gc < u_flush`
+    /// invariant documented on `GcCheckpointUlids`, but with reversed
+    /// polarity: reclaim outputs must sort *above* the flushed-WAL
+    /// segment, because reclaim's new LBA mappings supersede the
+    /// pre-reclaim WAL entries they consumed.
+    ///
+    /// Without this flush, a WAL entry for an LBA that reclaim rewrites
+    /// survives to `pending/<u_flush>` where `u_flush > u_reclaim`. On
+    /// crash rebuild the flushed segment applies after the reclaim
+    /// output and shadows it — re-pointing the LBA at a hash whose body
+    /// `redact_segment` may have already hole-punched (hash-dead under
+    /// the post-reclaim lbamap), producing zero reads.
+    pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> io::Result<ReclaimJob> {
+        self.flush_wal()?;
+
+        let end_lba = start_lba + lba_length as u64;
+        let entries = self.lbamap.extents_in_range(start_lba, end_lba);
+
+        let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
+        for layer in &self.ancestor_layers {
+            if !search_dirs.contains(&layer.dir) {
+                search_dirs.push(layer.dir.clone());
+            }
+        }
+
+        let segment_ulid = self.mint.next();
+        let snapshot_floor_ulid = latest_snapshot(&self.base_dir)?;
+
+        Ok(ReclaimJob {
+            target_start_lba: start_lba,
+            target_lba_length: lba_length,
+            entries,
+            lbamap_snapshot: Arc::clone(&self.lbamap),
+            extent_index_snapshot: Arc::clone(&self.extent_index),
+            search_dirs,
+            pending_dir: self.base_dir.join("pending"),
+            segment_ulid,
+            signer: Arc::clone(&self.signer),
+            snapshot_floor_ulid,
+        })
+    }
+
+    /// Apply phase of reclaim — runs on the actor thread after the
+    /// worker returns.
+    ///
+    /// Precondition: `Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)`.
+    /// Any mutation between prepare and apply would have called
+    /// `Arc::make_mut` on the volume's `lbamap` Arc (externally visible
+    /// via at least the published snapshot), which reallocates — so the
+    /// pointers differ and this returns cleanly with `discarded: true`,
+    /// deleting the worker's pending segment as an orphan. GC would
+    /// eventually classify it as all-dead, but cleaning up eagerly
+    /// avoids the extra GC round-trip.
+    ///
+    /// On success, splices the worker's entries into the live lbamap +
+    /// extent index. Runs under the actor lock; no CAS needed because
+    /// the pointer-equality guard above already proved no concurrent
+    /// mutation happened.
+    pub fn apply_reclaim_result(&mut self, result: ReclaimResult) -> io::Result<ReclaimOutcome> {
+        if !Arc::ptr_eq(&result.lbamap_snapshot, &self.lbamap) {
+            // Orphan cleanup: delete the worker's pending/<segment_ulid>.
+            if result.segment_written {
+                let path = result.pending_dir.join(result.segment_ulid.to_string());
+                let _ = std::fs::remove_file(&path);
+            }
+            return Ok(ReclaimOutcome {
+                discarded: true,
+                ..Default::default()
+            });
+        }
+
+        if !result.segment_written {
+            return Ok(ReclaimOutcome::default());
+        }
+
+        self.has_new_segments = true;
+        self.last_segment_ulid = Some(result.segment_ulid);
+
+        let lbamap = Arc::make_mut(&mut self.lbamap);
+        let extent_index = Arc::make_mut(&mut self.extent_index);
+        for re in &result.entries {
+            let entry = &re.entry;
+            match entry.kind {
+                EntryKind::Data => {
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: result.segment_ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start: result.body_section_start,
+                            inline_data: None,
+                        },
+                    );
+                }
+                EntryKind::Inline => {
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: result.segment_ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start: result.body_section_start,
+                            inline_data: entry.data.clone().map(Vec::into_boxed_slice),
+                        },
+                    );
+                }
+                EntryKind::DedupRef => {
+                    // Canonical body already indexed — nothing to insert
+                    // in extent_index; lbamap just claims the LBA run.
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                }
+                EntryKind::Delta => {
+                    // Thin Delta: claim the LBA run with its source
+                    // list attached (so GC's `lba_referenced_hashes`
+                    // fold keeps the source alive), and register the
+                    // delta in the extent_index. `body_length` is the
+                    // tail of the body section; the delta region
+                    // begins at `body_section_start + body_length`.
+                    let source_hashes: Arc<[blake3::Hash]> =
+                        entry.delta_options.iter().map(|o| o.source_hash).collect();
+                    lbamap.insert_delta(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        source_hashes,
+                    );
+                    extent_index.insert_delta_if_absent(
+                        entry.hash,
+                        extentindex::DeltaLocation {
+                            segment_id: result.segment_ulid,
+                            body_source: extentindex::DeltaBodySource::Full {
+                                body_section_start: result.body_section_start,
+                                body_length: result.body_length,
+                            },
+                            options: entry.delta_options.clone(),
+                        },
+                    );
+                }
+                EntryKind::CanonicalData | EntryKind::CanonicalInline | EntryKind::Zero => {
+                    unreachable!(
+                        "reclaim output produces only Data/Inline/DedupRef/Delta, got {:?}",
+                        entry.kind
+                    );
+                }
+            }
+        }
+
+        let mut outcome = ReclaimOutcome::default();
+        for re in &result.entries {
+            outcome.runs_rewritten += 1;
+            outcome.bytes_rewritten += re.uncompressed_bytes;
+        }
+        Ok(outcome)
+    }
 }
