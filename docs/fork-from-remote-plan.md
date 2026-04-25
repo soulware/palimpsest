@@ -2,6 +2,12 @@
 
 Branch: `fork-from-remote`
 
+> **2026-04-25 update:** the `readonly/<vol_ulid>/` tree split described
+> in this plan was reverted; pulled ancestors live in `by_id/<vol_ulid>/`
+> like every other volume, distinguished by absent `volume.name` and
+> absent `by_name/` symlink. See `docs/architecture.md` for the current
+> directory layout.
+
 > **Status (2026-04-22):** The core design landed — pull-from-remote, readonly
 > ancestor trees, explicit `<vol_ulid>/<snap_ulid>` pins, `.idx` prefetch on
 > cold start — and remains the mechanism behind cheap-reference replicas. The

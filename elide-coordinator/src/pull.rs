@@ -1,10 +1,13 @@
-// Pull a readonly "skeleton" for a volume from S3 into the local data dir.
+// Pull a readonly ancestor for a volume from S3 into the local data dir.
 //
-// The skeleton is the minimal on-disk presence needed for the coordinator's
-// prefetch task (and downstream code like `Volume::open`) to proceed:
+// A pulled ancestor is the minimal on-disk presence needed for the
+// coordinator's prefetch task (and downstream code like `Volume::open`) to
+// resolve a child's lineage:
 //
-//   readonly/<ulid>/
-//     volume.toml              — size + optional name, derived from manifest.toml
+//   by_id/<ulid>/
+//     volume.toml              — size only; no name (visual indicator that
+//                                this entry is a pulled ancestor, not a
+//                                user-managed volume)
 //     volume.readonly          — marker
 //     volume.pub               — Ed25519 verifying key
 //     volume.provenance        — signed lineage (parent + extent_index)
@@ -22,8 +25,8 @@ use anyhow::{Context, Result};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 
-/// Pull the readonly skeleton for `volume_id` from the object store into
-/// `<data_dir>/readonly/<volume_id>/`. If the directory already exists,
+/// Pull a readonly ancestor for `volume_id` from the object store into
+/// `<data_dir>/by_id/<volume_id>/`. If the directory already exists,
 /// returns its path without re-pulling (idempotent — safe to call on every
 /// prefetch tick).
 ///
@@ -32,9 +35,11 @@ use object_store::path::Path as StorePath;
 ///   - `by_id/<volume_id>/volume.pub`
 ///   - `by_id/<volume_id>/volume.provenance`
 ///
-/// Writes them into `<data_dir>/readonly/<volume_id>/` along with a
-/// `volume.readonly` marker, a generated `volume.toml`, and an empty
-/// `index/` directory.
+/// Writes them into `<data_dir>/by_id/<volume_id>/` along with a
+/// `volume.readonly` marker, a `volume.toml` carrying only the size (no
+/// name), and an empty `index/` directory. The absent name and absent
+/// `by_name/` symlink mark this entry as a pulled ancestor rather than a
+/// user-managed volume.
 ///
 /// Signature verification of the downloaded `volume.provenance` is *not*
 /// performed here — the caller is responsible for verifying under the
@@ -46,7 +51,7 @@ pub async fn pull_volume_skeleton(
     data_dir: &Path,
     volume_id: &str,
 ) -> Result<PathBuf> {
-    let vol_dir = data_dir.join("readonly").join(volume_id);
+    let vol_dir = data_dir.join("by_id").join(volume_id);
     if vol_dir.exists() {
         return Ok(vol_dir);
     }
@@ -67,10 +72,6 @@ pub async fn pull_volume_skeleton(
         .get("size")
         .and_then(|v| v.as_integer())
         .ok_or_else(|| anyhow::anyhow!("manifest.toml for {volume_id} missing 'size'"))?;
-    let name = manifest
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
 
     let pub_bytes = fetch_bytes(
         store,
@@ -92,7 +93,7 @@ pub async fn pull_volume_skeleton(
 
     std::fs::create_dir_all(&vol_dir).with_context(|| format!("creating {}", vol_dir.display()))?;
     elide_core::config::VolumeConfig {
-        name,
+        name: None,
         size: Some(size as u64),
         ..Default::default()
     }

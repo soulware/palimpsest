@@ -63,8 +63,9 @@ pub const VOLUME_PUB_FILE: &str = "volume.pub";
 pub const VOLUME_PROVENANCE_FILE: &str = "volume.provenance";
 
 // Force-snapshot attestation key (local only, never uploaded). Lives in
-// `readonly/<src>/` and signs locally-generated `.manifest` files for
-// forker-attested "now" pins of a readonly source (`fork --force-snapshot`).
+// the source ancestor's `by_id/<src>/` directory and signs locally-
+// generated `.manifest` files for forker-attested "now" pins of a readonly
+// source (`fork --force-snapshot`).
 // Persistent across invocations on the same host so multiple forks against
 // the same source share one attestation key and produce a single coherent
 // `<snap>.manifest`.
@@ -185,7 +186,7 @@ pub fn load_or_create_keypair(
 /// `snapshots/<snap_ulid>.manifest` only. Used for forker-attested "now"
 /// pins (`volume create --from --force-snapshot`), where the forker doesn't hold
 /// the parent's private key and instead signs the manifest with a
-/// stable per-source key (`readonly/<src>/force-snapshot.key`) — shared
+/// stable per-source key (`by_id/<src>/force-snapshot.key`) — shared
 /// across multiple forks on the same host so concurrent or sequential
 /// fork invocations produce one coherent manifest. The parent's own
 /// `volume.provenance` and `.idx` signatures are still verified under

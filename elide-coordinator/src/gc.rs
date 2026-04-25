@@ -166,7 +166,7 @@ impl GcStats {
 /// is consistent with the volume's write clock.
 ///
 /// `by_id_dir` is the data-dir root that houses `<volume_ulid>/` fork
-/// directories (plus an optional `readonly/` sibling tree). Passed so that
+/// directories. Passed so that
 /// `walk_ancestors` can resolve the fork chain — the liveness rebuild must
 /// include ancestor layers, otherwise hashes live only via an ancestor LBA
 /// look dead to the coordinator and trip stale-liveness on apply.

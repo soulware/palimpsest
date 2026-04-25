@@ -4549,24 +4549,12 @@ fn load_lineage_or_empty(fork_dir: &Path) -> io::Result<crate::signing::Provenan
 /// at parse time.
 /// Resolve an ancestor volume directory by ULID.
 ///
-/// An ancestor may live in the writable `by_id/<ulid>/` tree or in the
-/// readonly pulled tree `readonly/<ulid>/`. Prefer `by_id/` when both exist:
-/// a locally writable copy supersedes a pulled readonly skeleton.
-///
-/// Falls back to `by_id_dir.join(ulid)` when neither candidate is present so
-/// that callers (and tests) get a deterministic path they can report in errors.
+/// All ancestors — writable, imported readonly bases, and ancestors pulled
+/// from S3 to satisfy a child's lineage — live in `by_id/<ulid>/`. The
+/// returned path is deterministic so callers (and tests) can report it in
+/// errors even if it does not yet exist.
 pub fn resolve_ancestor_dir(by_id_dir: &Path, ulid: &str) -> PathBuf {
-    let by_id_candidate = by_id_dir.join(ulid);
-    if by_id_candidate.exists() {
-        return by_id_candidate;
-    }
-    if let Some(parent) = by_id_dir.parent() {
-        let readonly_candidate = parent.join("readonly").join(ulid);
-        if readonly_candidate.exists() {
-            return readonly_candidate;
-        }
-    }
-    by_id_candidate
+    by_id_dir.join(ulid)
 }
 
 /// Verify every ancestor of `fork_dir` by walking the fork chain from the
@@ -7780,52 +7768,6 @@ mod tests {
     }
 
     #[test]
-    fn walk_ancestors_crosses_into_readonly_tree() {
-        // Simulate the fork-from-remote layout: a writable child in
-        // `by_id/<child>/` whose parent only exists as a pulled readonly
-        // skeleton in `readonly/<parent>/`. `walk_ancestors` must resolve
-        // across both trees.
-        let data_dir = temp_dir();
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let by_id = data_dir.join("by_id");
-        let readonly = data_dir.join("readonly");
-
-        let parent_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
-        let parent_dir = readonly.join(parent_ulid);
-        let child_dir = by_id.join(child_ulid);
-
-        write_test_provenance(
-            &child_dir,
-            Some(&format!("{parent_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV")),
-            &[],
-        );
-        // Create the readonly parent dir so `resolve_ancestor_dir` picks it.
-        std::fs::create_dir_all(&parent_dir).unwrap();
-
-        let ancestors = walk_ancestors(&child_dir, &by_id).unwrap();
-        assert_eq!(ancestors.len(), 1);
-        assert_eq!(
-            ancestors[0].dir, parent_dir,
-            "ancestor should resolve into the readonly/ tree"
-        );
-        assert_eq!(
-            ancestors[0].branch_ulid.as_deref(),
-            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
-        );
-    }
-
-    #[test]
-    fn resolve_ancestor_dir_prefers_by_id_over_readonly() {
-        let data_dir = temp_dir();
-        let by_id = data_dir.join("by_id");
-        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        std::fs::create_dir_all(by_id.join(ulid)).unwrap();
-        std::fs::create_dir_all(data_dir.join("readonly").join(ulid)).unwrap();
-        assert_eq!(resolve_ancestor_dir(&by_id, ulid), by_id.join(ulid));
-    }
-
-    #[test]
     fn walk_ancestors_two_levels() {
         let by_id = temp_dir();
         let root_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -8628,9 +8570,8 @@ mod tests {
     /// forked child needs to demand-fetch a segment that belongs to an
     /// ancestor, `find_segment_in_dirs` must route the fetcher at the
     /// ancestor's `index/` and `cache/` directories — not the child's.
-    /// The child's `index/` does not hold ancestor `.idx` files in the
-    /// `readonly/` layout, so using the child's dirs fails with ENOENT on
-    /// the very first read. See docs/fork-from-remote-plan.md phase 1c.
+    /// The child's `index/` does not hold ancestor `.idx` files; using the
+    /// child's dirs fails with ENOENT on the very first read.
     #[test]
     fn find_segment_in_dirs_routes_fetcher_at_ancestor_index_dir() {
         use crate::extentindex::BodySource;

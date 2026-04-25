@@ -155,6 +155,12 @@ elide_data/                           — single root (default --data-dir)
     server-2-experiment  ->  ../by_id/01JQDDDDDDD
 ```
 
+`by_id/<ulid>/` holds three roles, distinguishable by file shape:
+
+1. **Writable volume** — has `volume.key`, `volume.name`, `wal/`, `by_name/` symlink.
+2. **Imported readonly base** — has `volume.readonly`, `volume.name`, `manifest.toml`, `by_name/` symlink.
+3. **Ancestor pulled from S3** — has `volume.readonly`, *no* `volume.name`, *no* `by_name/` symlink. `index/` is populated incrementally by prefetch; `cache/` is populated incrementally by demand-fetches issued by children that read through this ancestor.
+
 Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` / `volume.extent_index` files. Provenance is a single signed document recording both lineage relationships under one Ed25519 signature. Tampering with lineage is detectable with the volume's own public key, and the file format is extensible — adding new lineage fields in the future means extending the signed payload rather than dropping more unsigned files into the directory. `volume.provenance` is uploaded to S3 alongside `volume.pub` so that `remote pull` can materialise a signed, verifiable skeleton on another host.
 
 Provenance file format:
@@ -185,7 +191,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 **Invariants:**
 - `by_id/` entries are valid ULIDs — the coordinator skips anything else
 - `by_name/` entries are symlinks only — no real directories
-- `volume.name` is present in every volume; single non-empty line
+- `volume.name` is present in every user-managed volume; *absent* on ancestors pulled from S3 to satisfy a child's lineage. The missing name (and the matching absence of a `by_name/` symlink) is the on-disk indicator that a `by_id/` entry exists only as a fork source, not as a user-managed volume.
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
 - `volume.pub` present in every volume — readonly volumes have only `volume.pub` (no `volume.key`); `serve-volume` verifies provenance against it on every open, writable or not
 - `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
@@ -199,7 +205,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 - **`index/<ulid>.idx` present** means the volume has flushed segment `<ulid>` to `pending/` (or applied a GC handoff producing it). The volume writes `index/<ulid>.idx` at two points: (1) when flushing the WAL to `pending/<ulid>`; (2) when applying a GC handoff — writing `index/<new>.idx` from `gc/<new>` and deleting `index/<old>.idx` for each consumed input. `index/` is never written by the coordinator. `index/<ulid>.idx` files are never evicted — they are the permanent LBA index for all segments the volume has ever created or compacted.
 - **`pending/<ulid>` absent ↔ segment `<ulid>` is confirmed in S3.** The volume deletes `pending/<ulid>` as part of responding to the coordinator's `promote` IPC, which the coordinator issues only after a confirmed S3 upload. If `pending/<ulid>` exists, the segment has not yet been confirmed in S3. `cache/<ulid>.body` and `cache/<ulid>.present` are volume-owned: written by the volume on `promote` response and on demand-fetch; may be evicted by the volume at any time; their absence means body bytes must be fetched from S3.
 
-**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have a `pending/` subdirectory (segments awaiting upload) or an `index/` subdirectory (already-uploaded segments). Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `index/` is absent or empty (just pulled from the store, no segments indexed yet). Readonly volumes with a non-empty `index/` are already indexed and are skipped.
+**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have a `pending/` subdirectory (segments awaiting upload) or an `index/` subdirectory (already-uploaded segments). Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `index/` is absent or empty (just pulled from the store, no segments indexed yet). Readonly volumes with a non-empty `index/` are already indexed and are skipped. Pulled ancestors (no `volume.name`, no `by_name/` symlink) are picked up by the same scan: they have `volume.readonly` and an empty/missing `index/` until prefetch fills it.
 
 **Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 

@@ -57,10 +57,8 @@ pub async fn prefetch_indexes(
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<PrefetchResult> {
-    // `fork_dir` is either `<data_dir>/by_id/<ulid>/` or
-    // `<data_dir>/readonly/<ulid>/`. Ancestors are always resolved against
-    // `by_id/` first (with a fallback to `readonly/` inside
-    // `resolve_ancestor_dir`), so recover the canonical data dir root.
+    // `fork_dir` is `<data_dir>/by_id/<ulid>/`. All volumes — writable,
+    // imported readonly bases, and pulled ancestors — live in `by_id/`.
     let data_dir = fork_dir
         .parent()
         .and_then(|p| p.parent())
@@ -463,22 +461,19 @@ mod tests {
         assert_eq!(result2.skipped, 1);
     }
 
-    /// Cross-tree ancestor: the child is writable in `by_id/<child>/` but its
-    /// parent lives in `readonly/<parent>/` (pulled as a readonly ancestor).
-    /// `walk_ancestors` must resolve across both trees and prefetch must write
-    /// the parent's `.idx` into the readonly parent's own `index/` dir,
-    /// verifying it against the parent's own `volume.pub`.
+    /// Pulled ancestor: the child is writable and its parent is a pulled
+    /// ancestor (no `volume.name`, no `by_name/` symlink). Both live in
+    /// `by_id/`. Prefetch must write the parent's `.idx` into the parent's
+    /// own `index/` dir, verifying it against the parent's own `volume.pub`.
     #[tokio::test]
-    async fn prefetch_indexes_writes_readonly_ancestor_idx() {
+    async fn prefetch_indexes_writes_pulled_ancestor_idx() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let by_id = data_dir.join("by_id");
-        let readonly = data_dir.join("readonly");
 
         let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
-        // Parent is in readonly/ (pulled); child is a writable volume in by_id/.
-        let parent_dir = readonly.join(parent_ulid);
+        let parent_dir = by_id.join(parent_ulid);
         let child_dir = by_id.join(child_ulid);
 
         std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
@@ -540,10 +535,7 @@ mod tests {
         assert_eq!(result.failed, 0);
 
         let idx_path = parent_dir.join("index").join(format!("{seg_ulid}.idx"));
-        assert!(
-            idx_path.exists(),
-            ".idx must land in readonly/<parent>/index/"
-        );
+        assert!(idx_path.exists(), ".idx must land in by_id/<parent>/index/");
         // And definitely not in the child's index dir.
         assert!(
             !child_dir

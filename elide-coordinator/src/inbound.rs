@@ -1171,11 +1171,11 @@ fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Pull one readonly volume skeleton from the store.
+/// Pull one readonly ancestor from the store.
 ///
 /// Mirrors the CLI's `pull_one_readonly`: downloads `manifest.toml`,
-/// `volume.pub`, and `volume.provenance`, writes the skeleton under
-/// `data_dir/readonly/<vol_ulid>/`, and returns the parent ULID parsed from
+/// `volume.pub`, and `volume.provenance`, writes the ancestor under
+/// `data_dir/by_id/<vol_ulid>/`, and returns the parent ULID parsed from
 /// the (signature-verified) provenance, or empty if this is a root volume.
 async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectStore>) -> String {
     use object_store::path::Path as StorePath;
@@ -1185,9 +1185,9 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
         return format!("err invalid ULID: {volume_id}");
     }
 
-    let vol_dir = data_dir.join("readonly").join(volume_id);
+    let vol_dir = data_dir.join("by_id").join(volume_id);
     if vol_dir.exists() {
-        return format!("err readonly volume already present locally: {volume_id}");
+        return format!("err volume already present locally: {volume_id}");
     }
 
     // Step 1: fetch manifest.toml.
@@ -1243,14 +1243,14 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
         Err(e) => return format!("err downloading volume.provenance: {e}"),
     };
 
-    // Step 4: write the skeleton.
+    // Step 4: write the ancestor entry. No name carried over from manifest:
+    // a missing volume.name (and missing by_name/ symlink) is the on-disk
+    // marker that distinguishes a pulled ancestor from a user-managed volume.
+    let _ = manifest;
     let result: std::io::Result<()> = (|| {
         std::fs::create_dir_all(&vol_dir)?;
         elide_core::config::VolumeConfig {
-            name: manifest
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned()),
+            name: None,
             size: Some(size as u64),
             ..Default::default()
         }
@@ -1266,7 +1266,7 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
     })();
     if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&vol_dir);
-        return format!("err writing readonly skeleton: {e}");
+        return format!("err writing pulled ancestor: {e}");
     }
 
     // Step 5: parse and verify provenance to find the parent.
@@ -1282,7 +1282,7 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
         }
     };
 
-    info!("[inbound] pulled readonly volume {volume_id}");
+    info!("[inbound] pulled ancestor {volume_id}");
     match parent_ulid {
         Some(p) => format!("ok {p}"),
         None => "ok".to_string(),
@@ -1293,8 +1293,8 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
 ///
 /// Mirrors the CLI's `create_readonly_snapshot_now`: prefetches indexes,
 /// uploads the snapshot marker, verifies pinned segments are still in S3,
-/// and writes a signed manifest under an ephemeral key in the readonly
-/// volume's directory. Returns `<snap_ulid> <ephemeral_pubkey_hex>`.
+/// and writes a signed manifest under an ephemeral key in the ancestor's
+/// directory. Returns `<snap_ulid> <ephemeral_pubkey_hex>`.
 async fn force_snapshot_now_op(
     args: &str,
     data_dir: &Path,
@@ -1309,18 +1309,18 @@ async fn force_snapshot_now_op(
         return format!("err invalid ULID: {volume_id}");
     }
 
-    let readonly_dir = data_dir.join("readonly").join(volume_id);
-    if !readonly_dir.exists() {
-        return format!("err readonly volume not found locally: {volume_id}");
+    let ancestor_dir = data_dir.join("by_id").join(volume_id);
+    if !ancestor_dir.exists() {
+        return format!("err volume not found locally: {volume_id}");
     }
 
     // Step 1: prefetch indexes from S3.
-    if let Err(e) = elide_coordinator::prefetch::prefetch_indexes(&readonly_dir, store).await {
+    if let Err(e) = elide_coordinator::prefetch::prefetch_indexes(&ancestor_dir, store).await {
         return format!("err prefetching ancestor indexes: {e:#}");
     }
 
     // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
-    let index_dir = readonly_dir.join("index");
+    let index_dir = ancestor_dir.join("index");
     let mut segments: Vec<ulid::Ulid> = Vec::new();
     let mut max_seg: Option<ulid::Ulid> = None;
     let entries = match std::fs::read_dir(&index_dir) {
@@ -1396,7 +1396,7 @@ async fn force_snapshot_now_op(
 
     // Step 5: load-or-create the per-source attestation key.
     let (signer, vk) = match elide_core::signing::load_or_create_keypair(
-        &readonly_dir,
+        &ancestor_dir,
         elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
         elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
     ) {
@@ -1406,11 +1406,11 @@ async fn force_snapshot_now_op(
 
     // Step 6: signed manifest + local marker.
     if let Err(e) =
-        elide_core::signing::write_snapshot_manifest(&readonly_dir, &*signer, &snap, &segments)
+        elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments)
     {
         return format!("err writing snapshot manifest: {e}");
     }
-    let snap_dir = readonly_dir.join("snapshots");
+    let snap_dir = ancestor_dir.join("snapshots");
     if let Err(e) = std::fs::create_dir_all(&snap_dir) {
         return format!("err creating snapshots dir: {e}");
     }
@@ -1429,11 +1429,11 @@ async fn force_snapshot_now_op(
 /// Fork an existing source volume into a new writable volume.
 ///
 /// Mirrors the CLI's `fork_volume_at*` + by_name symlink + volume.toml write.
-/// `source_ulid` resolves to either a writable (`by_id/<ulid>/`) or readonly
-/// (`readonly/<ulid>/`) source. `snap` is optional: if omitted, falls back to
-/// `volume::fork_volume` (latest local snapshot). `parent-key` is the hex
-/// ephemeral pubkey from `force-snapshot-now`, recorded in the new fork's
-/// provenance for force-snapshot pins.
+/// `source_ulid` resolves to any volume in `by_id/<ulid>/` — writable,
+/// imported readonly base, or pulled ancestor. `snap` is optional: if
+/// omitted, falls back to `volume::fork_volume` (latest local snapshot).
+/// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
+/// recorded in the new fork's provenance for force-snapshot pins.
 fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let new_name = match iter.next() {
@@ -1512,7 +1512,6 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         return format!("err volume already exists: {new_name}");
     }
 
-    // Resolve the source: writable (by_id/) or readonly (readonly/).
     let by_id_dir = data_dir.join("by_id");
     let source_dir = elide_core::volume::resolve_ancestor_dir(&by_id_dir, source_ulid_str);
     if !source_dir.exists() {

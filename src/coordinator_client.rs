@@ -377,7 +377,7 @@ pub fn update_volume(socket_path: &Path, name: &str, flags: &[String]) -> io::Re
     }
 }
 
-/// Pull one volume's readonly skeleton from the store via the coordinator.
+/// Pull one readonly ancestor from the store via the coordinator.
 /// Returns the parent ULID (for the ancestor walk), or `None` for a root.
 pub fn pull_readonly(socket_path: &Path, vol_ulid: &str) -> io::Result<Option<String>> {
     let resp = call(socket_path, &format!("pull-readonly {vol_ulid}"))?;
