@@ -1,16 +1,14 @@
-// Proptest coverage for the pending-delete target parser.
+// Proptest coverage for the retention-marker parsers.
 //
-// The reaper deletes anything `parse_target` returns Ok for. The
-// invariant exercised here is the safety contract: no input string
-// can produce an Ok target that escapes the supplied volume scope, no
-// input can panic the parser, and every Ok result round-trips through
-// `to_key`.
+// The reaper acts on whatever these parsers accept. The invariant
+// exercised here is totality: no byte string can panic the parser,
+// every Ok parse round-trips through the canonical renderer.
 
-use elide_coordinator::pending_delete::{parse_marker_key, parse_target};
+use elide_coordinator::pending_delete::{parse_marker_body, parse_marker_key, render_marker};
 use proptest::prelude::*;
 use ulid::Ulid;
 
-fn arb_volume() -> impl Strategy<Value = Ulid> {
+fn arb_ulid() -> impl Strategy<Value = Ulid> {
     any::<u128>().prop_map(Ulid::from)
 }
 
@@ -20,46 +18,35 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Arbitrary byte strings must never panic the parser. Either the
-    /// input is rejected, or it's a valid target whose `to_key()`
-    /// round-trips bit-for-bit.
+    /// Arbitrary byte strings must never panic `parse_marker_body`.
+    /// On Ok, every parsed ULID round-trips back to the rendered body.
     #[test]
-    fn parse_target_total_function(s in ".{0,256}", v in arb_volume()) {
-        match parse_target(&s, v) {
-            Ok(target) => {
-                prop_assert_eq!(
-                    target.to_key().as_ref().to_owned(),
-                    s,
-                    "round-trip mismatch"
-                );
+    fn parse_marker_body_total(s in ".{0,4096}") {
+        match parse_marker_body(&s) {
+            Ok(ulids) => {
+                let rendered = render_marker(&ulids);
+                let reparsed = parse_marker_body(&rendered).unwrap();
+                prop_assert_eq!(reparsed, ulids);
             }
             Err(_) => {}
         }
     }
 
-    /// Volume scope: any Ok result has its volume component equal to the
-    /// supplied `expected_vol`. A successful parse cannot reach into a
-    /// foreign volume's prefix, even with adversarial inputs.
+    /// `render_marker` always produces a body that `parse_marker_body`
+    /// accepts, recovering the original list.
     #[test]
-    fn parse_target_volume_scope(s in ".{0,256}", v in arb_volume()) {
-        if let Ok(target) = parse_target(&s, v) {
-            // The rendered key must start with `by_id/<v>/`.
-            let prefix = format!("by_id/{v}/");
-            prop_assert!(
-                target.to_key().as_ref().starts_with(&prefix),
-                "target {:?} not under expected volume {}",
-                target,
-                v
-            );
-        }
+    fn render_then_parse_is_identity(ulids in prop::collection::vec(arb_ulid(), 0..32)) {
+        let rendered = render_marker(&ulids);
+        let parsed = parse_marker_body(&rendered).unwrap();
+        prop_assert_eq!(parsed, ulids);
     }
 
-    /// Marker-key parser is total too. An Ok result must round-trip when
-    /// the components are reconstructed.
+    /// `parse_marker_key` is total. An Ok result reconstructs the
+    /// original key bit-for-bit.
     #[test]
-    fn parse_marker_key_total_function(s in ".{0,256}") {
-        if let Ok((vol, marker)) = parse_marker_key(&s) {
-            let reconstructed = format!("by_id/{vol}/pending-delete/{marker}.toml");
+    fn parse_marker_key_total(s in ".{0,256}") {
+        if let Ok((vol, gc_output)) = parse_marker_key(&s) {
+            let reconstructed = format!("by_id/{vol}/retention/{gc_output}");
             prop_assert_eq!(reconstructed, s);
         }
     }

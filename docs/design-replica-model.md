@@ -125,7 +125,7 @@ The required model is:
 - Within T, `GET key` on the canonical object still returns bytes.
 - After T, a reaper physically deletes the canonical object (and the
   marker); subsequent `GET`s 404.
-- Readers never consult the pending-delete prefix — they read canonical
+- Readers never consult the `retention/` prefix — they read canonical
   keys only, and treat 404 as "past T, gone."
 
 Rather than depending on any backend's native lifecycle, versioning, or
@@ -142,7 +142,7 @@ lands; they're then retired.
 
 ## Proposed: application-managed pending-delete markers
 
-Elide adds a `pending-delete/` prefix under each volume's S3 root. When
+Elide adds a `retention/` prefix under each volume's S3 root. When
 the coordinator's handoff protocol would physically delete an S3 object
 (GC input deletion, per the coordinator-driven handoff described in
 `operations.md` and `architecture.md`), it instead writes a
@@ -152,39 +152,47 @@ periodic reaper on the owning coordinator physically deletes targets
 
 ### Marker record
 
-Path: `by_id/<vol_ulid>/pending-delete/<marker_ulid>.toml`
+Path: `by_id/<vol_ulid>/retention/<gc_output_ulid>`
 
-```toml
-retention = "24h"
-reason = "gc-input"
+The marker filename **is** the GC output ULID — the segment whose
+handoff produced this marker. Cross-reference: `segments/<date>/<gc_output_ulid>`
+(the GC output itself, in S3) and `retention/<gc_output_ulid>`
+(its retention record) name each other. Re-running the upload of the
+same GC handoff re-PUTs the marker key with the same content — fully
+idempotent.
 
-targets = [
-  "by_id/01J.../segments/2026/04/25/01J....seg",
-  "by_id/01J.../index/01J....idx",
-]
+Content: plain text, one input segment ULID per line, no trailing
+metadata.
+
+```
+01K7QXAB1JNZSCK4KKY5888AJ
+01K7QXAB1JNZSCK4KKY5888BR
+01K7QXAB1JNZSCK4KKY5888CW
 ```
 
-- **`retention`** — humantime duration, stamped at creation from the
-  coordinator's config. The reaper derives the deadline as
-  `ulid_timestamp(marker_ulid) + retention`; live config changes never
-  affect existing markers.
-- **`reason`** — string enum. v1 has a single value, `gc-input`,
-  emitted by the coordinator's GC handoff. Audit/diagnostic only; the
-  reaper ignores it. Additional reasons can be added later as new
-  call sites need them; the enum is open by design.
-- **`targets`** — flat array of S3 keys retired together. Listed
-  explicitly, no wildcards. The reaper deletes every target before
-  deleting the marker (see *Reaper* below).
+That's the whole record. No retention field, no reason field, no
+schema version, no volume ULID:
 
-The marker filename is the creation ULID — the sole source of truth
-for when the marker was minted, consistent with how handoff ordering
-is already reasoned about. No creation-timestamp field, no deadline
-field (derivable), no schema-version field, no volume ULID (implicit
-in path).
+- **Retention is derived, not stamped.** Deadline =
+  `ulid_timestamp(<gc_output_ulid>) + current_config.T`. This relies
+  on the load-bearing property documented in *operations.md* under
+  *gc_checkpoint — the pre-mint pattern*: GC output ULIDs come from
+  `UlidMint::next` (clock-if-ahead-else-`last.increment()`), so their
+  timestamps track wall-clock at handoff. Operator changes to T apply
+  to all markers immediately — the intuitive behavior for an
+  operational knob.
+- **Reason is implicit.** v1 has one writer (the GC handoff), and the
+  GC output's segment header already identifies it as a GC output
+  (non-empty `inputs_length`). A diagnostic field would duplicate
+  that.
+- **Volume scope is structural.** The volume ULID is in the path; the
+  marker content is a list of input ULIDs that the reaper reconstructs
+  into S3 keys *under the invocation volume*. There's no shape an
+  input ULID can take that escapes the volume's prefix.
 
 ### Reader semantics
 
-Readers never list or open `pending-delete/`. They read canonical paths
+Readers never list or open `retention/`. They read canonical paths
 and treat 404 as the authoritative "reaped past T" signal. Replicas
 that want to guarantee success discipline their own reads: capture the
 upstream's latest `.manifest` as the reference set, then complete all
@@ -192,10 +200,10 @@ referenced segment fetches within T of that capture.
 
 ### Rebuild semantics
 
-Unaffected. Local rebuild reads `index/*.idx` — pending-delete markers
-live in a different prefix and are invisible. If a from-S3 rebuild
+Unaffected. Local rebuild reads `index/*.idx` — retention markers
+live in a different S3 prefix and are invisible. If a from-S3 rebuild
 codepath is ever added, it can scan canonical `segments/` / `index/`
-keys and ignore `pending-delete/` entirely: any GC input still
+keys and ignore `retention/` entirely: any GC input still
 physically present during its retention window is correctly superseded
 by the higher-ULID GC output's `inputs` list, so its presence is
 harmless to the extent-index view.
@@ -203,7 +211,7 @@ harmless to the extent-index view.
 ### Reaper
 
 Runs as a periodic task on the coordinator that owns the volume. Lists
-`pending-delete/`, decides which markers are past T using their
+`retention/`, decides which markers are past T using their
 creation ULID, then for each expired marker:
 
 1. Parse and validate every target key (see *Target validation* below).
@@ -253,58 +261,53 @@ the same `vol_ulid` before any deletion happens:
 
 1. **Invocation.** The reaper is invoked per-volume. The caller passes
    the volume's ULID explicitly; the reaper lists
-   `by_id/<vol_ulid>/pending-delete/` under that ULID. This ULID is the
+   `by_id/<vol_ulid>/retention/` under that ULID. This ULID is the
    ground truth for the run.
 2. **Marker path.** For each listed marker, the reaper parses the
    volume component out of the marker's own key and asserts it equals
    the invocation ULID. A mismatch means the listing returned a key
    from a different prefix — log loudly and skip.
-3. **Target.** The target parser receives the invocation ULID as
-   `expected_vol` and emits a `ReapTarget` only when the target's
-   volume component matches.
+3. **Input ULID.** Each line of the marker body is parsed as a ULID
+   via `Ulid::from_string`. The reaper reconstructs the segment key as
+   `by_id/<invocation_vol>/segments/<YYYYMMDD>/<input_ulid>`. There is
+   no shape an input ULID can take that escapes the invocation
+   volume's prefix — the prefix is constructed from the trusted
+   invocation ULID, not from anything in the marker.
 
-Each target string is parsed into a typed `ReapTarget` enum with one
-variant per allowed shape. v1 ships a single variant matching the
-only reason currently emitted (`gc-input`):
+A line that doesn't parse as a ULID is rejected. In particular:
 
-- `by_id/<vol_ulid>/segments/YYYYMMDD/<seg_ulid>` — segment body
-
-Future variants (snapshot presence marker
-`by_id/<vol_ulid>/snapshots/YYYYMMDD/<snap_ulid>`, snapshot filemap
-`...<snap_ulid>.filemap`, snapshot manifest `...<snap_ulid>.manifest`)
-land alongside their writer call sites if/when those reasons are
-introduced.
-
-Anything that doesn't match an enum variant is rejected. In
-particular:
-
-- **No path weirdness.** No `..`, no `.`, no double slashes, no leading
-  or trailing slash, no embedded NUL. ULIDs and date components are
-  parsed through their typed parsers (`Ulid::from_string`, fixed-width
-  date), not pattern-matched as raw strings.
-- **Default-deny on file class.** `manifest.toml`, `volume.pub`, and
-  anything under `pending-delete/` are not in the enum and therefore
-  unreapable. Adding a new reapable file class is a deliberate code
-  change, not a marker-content change.
-- **Bounded target count per marker.** A hard cap (e.g. 1024) on
-  `targets.len()` rejects malformed or runaway markers before any
-  delete fires. Realistic GC handoffs sit well below the cap; anything
-  near it is a bug or tampering signal.
+- **Bounded line count.** A hard cap (e.g. 1024) on input lines
+  rejects malformed or runaway markers before any delete fires.
+  Realistic GC handoffs sit well below the cap; anything near it is a
+  bug or tampering signal.
+- **No empty lines, no whitespace, no trailing data on the line.** A
+  malformed line aborts the whole marker — log loudly, skip, do not
+  partially reap.
 
 A rejected marker becomes an operator signal, not silent data loss.
 
 This three-checkpoint flow is deliberate. A parser bug in any single
 layer cannot cause cross-volume reaping on its own — the bug would
 have to corrupt the invocation ULID, the marker-path parse, and the
-target parse identically. The dominant risk we're defending against
-isn't a sophisticated attacker; it's an internal bug that misroutes a
-delete to the wrong volume's data. Three independent agreements on
-the same ULID make that class of bug structurally hard to trigger.
+input-line parse identically. The dominant risk we're defending
+against isn't a sophisticated attacker; it's an internal bug that
+misroutes a delete to the wrong volume's data. Three independent
+agreements on the same ULID make that class of bug structurally hard
+to trigger.
+
+Volume scope was previously enforced via a typed `ReapTarget` enum
+that pattern-matched the full S3 key. Under the simplified
+ULID-per-line shape, the enum collapses to "is this a valid ULID?";
+volume scope and key shape both come from the invocation. This is
+strictly safer — a malformed marker can produce at worst an extra 404
+DELETE under the invocation volume's prefix, never a delete in
+another volume's prefix.
 
 The validation step also defends against the narrow split-IAM threat
 model from *Authenticity* above: an attacker with PutObject but not
-DeleteObject who plants a marker pointing at `manifest.toml` produces
-a noisy reject, not a deletion.
+DeleteObject who plants a marker pointing at non-segment ULIDs
+produces 404s on DELETE (those keys aren't real segments), not silent
+deletion of unrelated data.
 
 ### The invariant
 

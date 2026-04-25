@@ -228,7 +228,34 @@ Per-tick work is bounded by the 32 MiB live cap, the 8192-entry cap, and O(1)-pe
 
 Before each GC pass the coordinator calls `gc_checkpoint` on the volume. The volume mints two ULIDs in one shot from its monotonic clock — `u_gc` and `u_flush` — flushes the current WAL under `u_flush`, and leaves the volume in a no-WAL state (the next write lazily opens a fresh WAL via `ensure_wal_open`). The coordinator receives `u_gc` as the output ULID for the GC pass. Pre-minting both together encodes the required ordering (`u_gc < u_flush < next_write_wal_ulid`) in advance and is essential for crash-recovery correctness — without it, a WAL flushed at checkpoint time would keep its older ULID and get shadowed by the GC output on rebuild. The post-checkpoint WAL is not pre-minted: because the mint is strictly monotonic, any future `mint.next()` is already above `u_flush`, so no reservation is needed. This also eliminates per-tick WAL churn on idle volumes. ULIDs are always minted by the volume, so coordinator clock skew cannot corrupt segment ordering. See `docs/testing.md` bugs C and D for regressions.
 
-The GC output ULID is `max(inputs).increment()`. Because input segments have already drained (timestamps seconds to minutes behind wall-clock), any concurrent write gets a ULID far ahead of the output and wins at rebuild — no locking needed, and a missed concurrent write is at worst a space leak.
+The GC output ULID comes from `UlidMint::next()` (see
+`elide-core/src/ulid_mint.rs`): wall-clock if the clock is ahead of
+the mint's last-seen ULID, otherwise `last.increment()`. For an
+active volume this means the GC output ULID timestamp tracks
+**handoff time**, not max-input timestamp. Monotonicity vs inputs is
+preserved because either we used a clock value that was already past
+all inputs, or we incremented from `last` which was itself already
+past.
+
+**Load-bearing properties.** Two things rely on this minting:
+
+1. *Concurrent-writes-always-win at rebuild.* Any write happening
+   during compaction gets a ULID at least as fresh as the GC
+   output's, so it cannot be shadowed at rebuild. Worst case from a
+   missed concurrent write is a space leak, never corruption.
+2. *GC output ULID timestamp ≈ handoff wall-clock.* Anything that
+   needs "when did this GC output appear in the volume's timeline"
+   can read `ulid_timestamp(gc_output)` directly. In particular,
+   pending-delete retention deadlines for input segments are
+   derived as `ulid_timestamp(gc_output) + retention` — accurate to
+   ~1 ms in the absence of clock skew, and bounded by `UlidMint`'s
+   monotonic increment when skew occurs.
+
+A change to GC ULID minting (e.g. reverting to a pure
+`max(inputs).increment()` form) would break property 2 silently for
+idle-then-burst volumes — the output ULID would carry the max input
+timestamp, which can be hours or days old, and any retention scheme
+using it as the grace anchor would mis-fire.
 
 ### Self-describing handoff
 

@@ -37,7 +37,7 @@ The volume's crash-recovery model is verified with [proptest](https://proptest-r
 ### Correctness invariants
 
 - **ULID total order is correctness.** `rebuild_segments` applies segments oldest-first by ULID; a violation lets an older segment silently shadow a newer write.
-- **WAL ULID is pre-assigned at WAL creation.** Any segment produced by `sweep_pending` or coordinator GC must have a ULID `< wal_ulid`. `sweep_pending` uses `max(candidate_ULIDs)`; coordinator GC uses `max(inputs).increment()`. Both are guaranteed below the current WAL ULID because all `pending/` and S3-confirmed segments were created before the current WAL was opened.
+- **WAL ULID is pre-assigned at WAL creation.** Any segment produced by `sweep_pending` or coordinator GC must have a ULID `< wal_ulid`. `sweep_pending` uses `max(candidate_ULIDs)`; coordinator GC uses `UlidMint::next` (clock-if-ahead-else-`last.increment()`). Both are guaranteed below the current WAL ULID because all `pending/` and S3-confirmed segments — and the mint's last-seen ULID — were created before the current WAL was opened. See `docs/operations.md` *gc_checkpoint — the pre-mint pattern* for why GC ULID timestamps tracking wall-clock-at-handoff is also load-bearing for retention.
 - **`index/` ↔ S3 invariant.** The coordinator reads `index/` to find GC candidates but never writes into `cache/`. The volume's promote IPC handler is the sole path that moves bodies into `cache/`, and only after S3 upload.
 - **Snapshot floor.** Segments at or below the latest snapshot ULID are frozen — `sweep_pending` and `repack` must never modify or delete them.
 

@@ -388,8 +388,7 @@ proptest! {
                         "test-vol",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-                        Duration::from_secs(60),
-                    ));
+                                            ));
 
                     if let Ok(stats) = gc_stats
                         && !matches!(stats.strategy, GcStrategy::None(_))
@@ -612,8 +611,7 @@ proptest! {
                         "test-vol",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-                        Duration::from_secs(60),
-                    ));
+                                            ));
 
                     // Assert: every oracle LBA still reads its expected value.
                     for (&lba, expected) in &oracle {
@@ -729,7 +727,6 @@ fn gc_oracle_repro_bug_h() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-        Duration::from_secs(60),
     ));
     // Read both LBAs to populate file cache with the pending/ segment.
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
@@ -753,7 +750,6 @@ fn gc_oracle_repro_bug_h() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-        Duration::from_secs(60),
     ));
 
     // These reads triggered "failed to fill whole buffer" before the fix.
@@ -820,7 +816,6 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-        Duration::from_secs(60),
     ));
     eprintln!(
         "index/ after sweep 1: [{}]",
@@ -855,7 +850,6 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-        Duration::from_secs(60),
     ));
     let final_idx = list_dir(&index_dir);
     eprintln!("index/ final: [{}]", final_idx.join(", "));

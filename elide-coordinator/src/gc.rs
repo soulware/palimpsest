@@ -60,7 +60,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{error, warn};
 
 use anyhow::{Context, Result};
@@ -76,8 +75,7 @@ use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
-use crate::pending_delete::{PendingDeleteMarker, Reason, marker_key};
-use crate::upload::segment_key;
+use crate::pending_delete::{marker_key, render_marker};
 
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
@@ -427,10 +425,11 @@ pub fn gc_fork(
 /// treated as success; `finalize_gc_handoff` is a no-op if the bare file is
 /// already gone).
 ///
-/// `pending_delete_retention` is stamped into each pending-delete marker
-/// minted by this function (one marker per handoff, listing the consumed
-/// input segment keys). The reaper later acts on those markers — see
-/// `pending_delete::reaper` and `docs/design-replica-model.md`.
+/// Each successful handoff writes a retention marker at
+/// `retention/<gc_output_ulid>` listing the consumed input ULIDs. The
+/// coordinator's reaper deletes those inputs from S3 after the
+/// configured retention window — see `crate::reaper` and
+/// `docs/design-replica-model.md`.
 ///
 /// Returns the number of handoffs completed.
 pub async fn apply_done_handoffs(
@@ -438,7 +437,6 @@ pub async fn apply_done_handoffs(
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
-    pending_delete_retention: Duration,
 ) -> Result<usize> {
     let gc_dir = fork_dir.join("gc");
     if !gc_dir.try_exists().context("checking gc dir")? {
@@ -531,39 +529,22 @@ pub async fn apply_done_handoffs(
             continue;
         }
 
-        // Write a pending-delete marker that lists the consumed input
-        // segment keys. The reaper deletes those keys (and the marker)
-        // after the configured retention window — replicas that were
-        // already reading these inputs get a guaranteed grace period.
-        // See `docs/design-replica-model.md` for the full design.
+        // Write a retention marker at `retention/<gc_output_ulid>` listing
+        // the consumed input ULIDs. The reaper deletes those inputs from
+        // S3 (and the marker) once `ulid_timestamp(<gc_output_ulid>) +
+        // pending_delete_retention` has passed — giving replicas a
+        // guaranteed grace period. See `docs/design-replica-model.md`.
         //
-        // Idempotency: marker_ulid is derived deterministically from
-        // new_ulid (`new_ulid.increment()`), so re-running this loop
-        // after a crash re-PUTs the same marker key with the same body.
-        let mut targets = Vec::with_capacity(inputs.len());
-        for old_ulid in &inputs {
-            let key = segment_key(volume_id, &old_ulid.to_string())
-                .with_context(|| format!("building key for {old_ulid}"))?;
-            targets.push(key.to_string());
-        }
-        let marker_ulid = new_ulid.increment().ok_or_else(|| {
-            anyhow::anyhow!("ulid overflow incrementing {new_ulid_str} for marker")
-        })?;
+        // Idempotency: the marker key is the GC output ULID, so re-running
+        // this loop after a crash re-PUTs the same key with the same body.
         let volume_ulid = Ulid::from_string(volume_id)
             .map_err(|e| anyhow::anyhow!("invalid volume_id '{volume_id}': {e}"))?;
-        let marker = PendingDeleteMarker {
-            retention: pending_delete_retention,
-            reason: Reason::GcInput,
-            targets,
-        };
-        let body = marker
-            .to_toml()
-            .with_context(|| format!("serialising pending-delete marker for {new_ulid_str}"))?;
-        let key: StorePath = marker_key(volume_ulid, marker_ulid);
+        let body = render_marker(&inputs);
+        let key: StorePath = marker_key(volume_ulid, new_ulid);
         store
             .put(&key, Bytes::from(body).into())
             .await
-            .with_context(|| format!("writing pending-delete marker {marker_ulid}"))?;
+            .with_context(|| format!("writing retention marker {new_ulid_str}"))?;
 
         // Drop each consumed input's local cache. Safe here: promote_segment
         // already published cache/<new>.body and index/<new>.idx, and deleted
@@ -1353,6 +1334,7 @@ fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upload::segment_key;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
@@ -1512,7 +1494,6 @@ mod tests {
             "vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
-            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1529,7 +1510,6 @@ mod tests {
             "vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
-            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1550,7 +1530,6 @@ mod tests {
             "vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
-            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1647,7 +1626,6 @@ mod tests {
             "test-vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
-            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -2613,7 +2591,6 @@ mod tests {
             "test-vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
-            Duration::from_secs(60),
         )
         .await
         .unwrap();

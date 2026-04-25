@@ -329,15 +329,7 @@ pub async fn run_volume_tasks(
             // gating cleanup behind the checkpoint would strand the bare file
             // indefinitely — `has_pending_results` would then also block
             // every future `gc_fork` pass. Always run this.
-            match gc::apply_done_handoffs(
-                &fork_dir,
-                &volume_id,
-                &store,
-                part_size_bytes,
-                gc_config.pending_delete_retention,
-            )
-            .await
-            {
+            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store, part_size_bytes).await {
                 Ok(0) => {}
                 Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
                 Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
