@@ -986,9 +986,16 @@ enum ListFilter {
     All,
 }
 
+struct VolumeRow {
+    name: String,
+    state: &'static str,
+    transport: String,
+    pid: String,
+}
+
 fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     let by_name_dir = data_dir.join("by_name");
-    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<VolumeRow> = Vec::new();
     match std::fs::read_dir(&by_name_dir) {
         Ok(dir_entries) => {
             for entry in dir_entries {
@@ -1011,38 +1018,100 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
                     ListFilter::Readonly => is_readonly,
                     ListFilter::Writable => !is_readonly,
                 };
-                if include {
-                    let suffix = if vol_dir.join(STOPPED_FILE).exists() {
-                        "  (stopped)".to_owned()
-                    } else if vol_dir.join("import.lock").exists() {
-                        "  (importing)".to_owned()
-                    } else {
-                        // Show the NBD endpoint when the volume is running.
-                        let ep = elide_core::config::VolumeConfig::read(&vol_dir)
-                            .ok()
-                            .and_then(|cfg| cfg.nbd)
-                            .and_then(|nbd| nbd.endpoint(&vol_dir));
-                        match ep {
-                            Some(ep) => format!("  ({ep})"),
-                            None => String::new(),
-                        }
-                    };
-                    entries.push((name, suffix));
+                if !include {
+                    continue;
                 }
+                rows.push(volume_row(name, &vol_dir));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    if entries.is_empty() {
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    if rows.is_empty() {
         println!("no volumes found in {}", data_dir.display());
-    } else {
-        for (name, suffix) in &entries {
-            println!("{name}{suffix}");
-        }
+        return Ok(());
+    }
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+    let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
+    let transport_w = rows
+        .iter()
+        .map(|r| r.transport.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
+    println!(
+        "{:<name_w$}  {:<state_w$}  {:<transport_w$}  {}",
+        "NAME", "STATE", "TRANSPORT", "PID"
+    );
+    for r in &rows {
+        println!(
+            "{:<name_w$}  {:<state_w$}  {:<transport_w$}  {}",
+            r.name, r.state, r.transport, r.pid
+        );
     }
     Ok(())
+}
+
+/// Gather per-volume display state: lifecycle, transport summary, and pid.
+fn volume_row(name: String, vol_dir: &Path) -> VolumeRow {
+    let state = if vol_dir.join(STOPPED_FILE).exists() {
+        "stopped"
+    } else if vol_dir.join("import.lock").exists() {
+        "importing"
+    } else {
+        "running"
+    };
+    let transport = transport_summary(vol_dir);
+    let pid = if state == "running" {
+        read_volume_pid(vol_dir)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    } else {
+        "-".to_owned()
+    };
+    VolumeRow {
+        name,
+        state,
+        transport,
+        pid,
+    }
+}
+
+/// Summarise the configured block-device transport for display: `nbd <endpoint>`,
+/// `ublk <device>`, or `-` if neither is configured. For ublk, prefers the
+/// kernel-assigned id recorded in `ublk.id` (set on a successful ADD); falls
+/// back to the configured `dev_id` or `auto` for not-yet-bound volumes.
+fn transport_summary(vol_dir: &Path) -> String {
+    let cfg = match elide_core::config::VolumeConfig::read(vol_dir) {
+        Ok(c) => c,
+        Err(_) => return "-".to_owned(),
+    };
+    if let Some(nbd) = cfg.nbd.as_ref() {
+        return match nbd.endpoint(vol_dir) {
+            Some(ep) => format!("nbd {ep}"),
+            None => "nbd".to_owned(),
+        };
+    }
+    if cfg.ublk.is_some() {
+        let runtime_id = std::fs::read_to_string(vol_dir.join("ublk.id"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+        let id = runtime_id.or(cfg.ublk.as_ref().and_then(|u| u.dev_id));
+        return match id {
+            Some(id) => format!("ublk /dev/ublkb{id}"),
+            None => "ublk auto".to_owned(),
+        };
+    }
+    "-".to_owned()
+}
+
+/// Read the supervised volume's pid from `volume.pid`. Returns `None` if the
+/// file is missing, unreadable, or contains garbage.
+fn read_volume_pid(vol_dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(vol_dir.join("volume.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 /// Encode the CLI's typed transport flags as the space-separated tokens
