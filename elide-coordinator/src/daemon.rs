@@ -522,7 +522,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec![format!("by_id/{rid_new}"), format!("by_id/{wid}")]
+            vec![format!("by_id/{wid}"), format!("by_id/{rid_new}")]
         );
     }
 }
