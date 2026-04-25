@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Drop-in replacement for `limactl shell elide-dev` that also injects
+# AWS/Tigris credentials, resolved on the host from 1Password.
+#
+# Usage:
+#   scripts/elide-vm                           # interactive login shell in $HOME
+#   scripts/elide-vm <command> [args...]       # run command on the guest
+#
+# Examples:
+#   scripts/elide-vm                                       # bash -l, AWS_* set
+#   scripts/elide-vm /home/elide/repo/target/debug/elide-coordinator serve
+#   scripts/elide-vm bash -lc 'cd ~/repo && ./target/debug/elide-coordinator serve'
+#
+# Paths and cwd are guest-relative — host/guest filesystems are not
+# mirrored. Use absolute guest paths, or cd inside an interactive shell
+# / `bash -lc`.
+#
+# Config via env vars (all optional):
+#   OP_AWS_ACCESS_KEY_REF  1Password reference for AWS_ACCESS_KEY_ID
+#                          (default: op://Personal/Tigris-Elide-Dev/access_key_id)
+#   OP_AWS_SECRET_KEY_REF  1Password reference for AWS_SECRET_ACCESS_KEY
+#                          (default: op://Personal/Tigris-Elide-Dev/secret_access_key)
+#   LIMA_INSTANCE          Lima VM name (default: elide-dev)
+#
+# Note on secret exposure: the resolved keys are passed to the in-VM
+# command via argv, so they appear briefly in `ps` output inside the VM.
+# Acceptable for a single-user dev VM; not for shared hosts.
+set -euo pipefail
+
+: "${OP_AWS_ACCESS_KEY_REF:=op://Personal/Tigris-Elide-Dev/access_key_id}"
+: "${OP_AWS_SECRET_KEY_REF:=op://Personal/Tigris-Elide-Dev/secret_access_key}"
+: "${LIMA_INSTANCE:=elide-dev}"
+
+for tool in op limactl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "error: '$tool' not found on host" >&2
+    exit 1
+  fi
+done
+
+if [[ $# -eq 0 ]]; then
+  set -- bash -l
+fi
+
+AWS_ACCESS_KEY_ID="$(op read "$OP_AWS_ACCESS_KEY_REF")"
+AWS_SECRET_ACCESS_KEY="$(op read "$OP_AWS_SECRET_KEY_REF")"
+
+exec limactl shell "$LIMA_INSTANCE" \
+  env AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+      AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+      "$@"
