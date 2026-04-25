@@ -39,7 +39,7 @@ for tool in op limactl; do
 done
 
 if [[ $# -eq 0 ]]; then
-  set -- bash -l
+  set -- bash -lc 'cd ~/elide && exec bash -l'
 fi
 
 AWS_ACCESS_KEY_ID="$(op read "$OP_AWS_ACCESS_KEY_REF")"
