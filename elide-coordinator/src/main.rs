@@ -7,9 +7,11 @@
 //     runs segment GC. Configuration comes from coordinator.toml.
 
 // Binary-only modules (process supervision, IPC, import jobs).
+mod credential;
 mod daemon;
 mod import;
 mod inbound;
+mod macaroon;
 mod supervisor;
 
 // Re-use the library's shared modules so types are identical across the

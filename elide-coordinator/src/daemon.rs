@@ -30,6 +30,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::config::CoordinatorConfig;
+use crate::credential::{self, CredentialIssuer, SharedKeyPassthrough};
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
@@ -57,6 +58,12 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         Arc::new(env)
     };
     let store_config = Arc::new(config.store.clone());
+
+    // Load (or generate on first start) the macaroon root key and select
+    // the credential issuer. Both are needed by the inbound socket to
+    // serve `register` and `credentials`.
+    let root_key = credential::load_or_generate_root_key(&config.data_dir)?;
+    let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
 
     info!(
         "[coordinator] data_dir: {}; drain every {}s, scan every {}s; elide bin: {}",
@@ -102,6 +109,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         let evict_reg = evict_registry.clone();
         let snap_locks = snapshot_locks.clone();
         let store = store.clone();
+        let issuer = issuer.clone();
         tokio::spawn(async move {
             inbound::serve(
                 &socket_path,
@@ -114,6 +122,8 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 store,
                 store_config,
                 part_size_bytes,
+                root_key,
+                issuer,
             )
             .await;
         });

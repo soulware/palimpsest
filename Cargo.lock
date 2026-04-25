@@ -1098,6 +1098,7 @@ dependencies = [
  "nix",
  "object_store",
  "proptest",
+ "rand_core 0.6.4",
  "serde",
  "tempfile",
  "tokio",

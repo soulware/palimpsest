@@ -1548,21 +1548,82 @@ fn resolve_fetch_config(
 /// Resolve the fetch config for a volume subprocess (`serve-volume`).
 ///
 /// The coordinator exports `ELIDE_COORDINATOR_SOCKET` into each spawned
-/// volume's environment. When set, we pull store config + credentials from
-/// the coordinator over IPC — that's the path forward for macaroon-scoped
-/// credentials. When unset (standalone `elide serve-volume` invocation with
-/// no coordinator), fall back to `FetchConfig::load` from the volume
-/// directory.
+/// volume's environment. When set, we pull store config from the
+/// coordinator over IPC and authenticate to its credential vending via
+/// the macaroon handshake (`register` then `credentials`). The volume
+/// ULID is the fork directory's basename. When the env var is unset
+/// (standalone `elide serve-volume` invocation with no coordinator),
+/// fall back to `FetchConfig::load` from the volume directory.
 fn resolve_volume_fetch_config(
     fork_dir: &Path,
 ) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
     if let Ok(sock) = std::env::var("ELIDE_COORDINATOR_SOCKET") {
         let socket_path = Path::new(&sock);
-        if let Some(cfg) = fetch_config_via_coordinator(socket_path)? {
+        let volume_ulid = elide_fetch::derive_volume_id(fork_dir)?;
+        if let Some(cfg) = fetch_config_via_coordinator_macaroon(socket_path, &volume_ulid)? {
             return Ok(Some(cfg));
         }
     }
     elide_fetch::FetchConfig::load(fork_dir)
+}
+
+/// Volume-side counterpart to `fetch_config_via_coordinator` that uses the
+/// PID-bound macaroon handshake instead of the unauthenticated
+/// `get-store-creds`. The CLI keeps using `get-store-creds` because it
+/// is not a spawned volume process and has no entry in `volume.pid`.
+fn fetch_config_via_coordinator_macaroon(
+    socket_path: &Path,
+    volume_ulid: &str,
+) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+    let config = match coordinator_client::get_store_config(socket_path) {
+        Ok(c) => c,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(path) = config.local_path {
+        return Ok(Some(elide_fetch::FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(path),
+            fetch_batch_bytes: None,
+        }));
+    }
+    let Some(bucket) = config.bucket else {
+        return Err(std::io::Error::other(
+            "coordinator returned empty store config",
+        ));
+    };
+    let creds = coordinator_client::register_and_get_creds(socket_path, volume_ulid)?;
+    // SAFETY: serve-volume startup is single-threaded at this point — no
+    // background tasks have been spawned, so there are no concurrent env
+    // readers.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+        if let Some(tok) = &creds.session_token {
+            std::env::set_var("AWS_SESSION_TOKEN", tok);
+        } else {
+            std::env::remove_var("AWS_SESSION_TOKEN");
+        }
+    }
+    Ok(Some(elide_fetch::FetchConfig {
+        bucket: Some(bucket),
+        endpoint: config.endpoint,
+        region: config.region,
+        local_path: None,
+        fetch_batch_bytes: None,
+    }))
 }
 
 /// Load the fetch config, or return a clear error mentioning the volume ULID.

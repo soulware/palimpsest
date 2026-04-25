@@ -596,7 +596,7 @@ The coordinator holds the only copy of read-write S3 credentials. Volume process
 
 ### Macaroon model
 
-The coordinator holds a **root key** (random bytes, generated at first start, stored alongside `coordinator.toml`). It uses this to mint per-fork macaroons — HMAC-SHA256 bearer tokens with a chain of typed caveats. Verification is stateless: the coordinator re-derives the expected HMAC from the root key and the caveat chain; no token storage is needed.
+The coordinator holds a **root key** (32 random bytes, generated at first start, stored at `<data_dir>/coordinator.root_key` with mode 0600). It uses this to mint per-volume macaroons — keyed-BLAKE3 bearer tokens with a chain of typed caveats. Verification is stateless: the coordinator re-derives the expected MAC from the root key and the caveat chain; no token storage is needed.
 
 **Caveats on a volume macaroon:**
 
@@ -611,11 +611,13 @@ The coordinator holds a **root key** (random bytes, generated at first start, st
 The PID is only known after the volume process is spawned, so the macaroon cannot be minted before spawn. Instead, the volume registers with the coordinator on startup:
 
 1. Coordinator spawns volume process, records PID in `volume.pid`
-2. Volume connects to `control.sock` and sends `register <volume> <fork>`
-3. Coordinator reads `SO_PEERCRED` from the Unix socket connection → obtains peer PID
-4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>/<fork>`? If not, reject
+2. Volume connects to `control.sock` and sends `register <volume-ulid>`
+3. Coordinator reads peer credentials from the Unix socket connection → obtains peer PID
+4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>`? If not, reject
 5. Coordinator mints a macaroon with the caveats above (including `pid = <peer-pid>`) and responds with it
 6. Volume stores the macaroon in memory for all subsequent `credentials` requests
+
+The supervisor writes `volume.pid` immediately after `Command::spawn()` returns, but a fast-starting volume can reach step 2 before that write completes. The volume retries `register` a handful of times on `err volume not registered` to absorb that window.
 
 ### Credential exchange flow
 
@@ -709,7 +711,7 @@ In-flight fetches started under the old credentials are not cancelled on refresh
 
 ### Implementation note
 
-The caveat set is small and typed (`volume`, `fork`, `scope`, `pid`, optionally `not-after`). This is implementable in ~150–200 lines of HMAC-SHA256 chain code. Existing `macaroon` crates on crates.io should be evaluated before hand-rolling; if they use untyped opaque blobs (as noted in the fly.io design), a thin typed wrapper or a minimal hand-rolled implementation may be preferable for clarity.
+The caveat set is small and typed (`volume`, `scope`, `pid`, optionally `not-after`). It is implemented in `elide-coordinator/src/macaroon.rs` (~270 lines) using `blake3::keyed_hash` for the MAC; the existing `macaroon` crate on crates.io was considered but its untyped string-caveat surface is a worse fit than a typed enum here. Wire format is a single hex line over the existing IPC line protocol: `v1.<32-byte mac, hex>.<caveat blob, hex>`.
 
 ## Import process lifecycle
 

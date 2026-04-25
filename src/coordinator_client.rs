@@ -110,6 +110,61 @@ pub fn get_store_creds(socket_path: &Path) -> io::Result<StoreCreds> {
     parse_toml_response(&raw)
 }
 
+/// Mint a per-volume macaroon for the spawned volume process.
+///
+/// The coordinator authenticates the request via SO_PEERCRED on the
+/// connecting socket and refuses if the peer pid does not match the
+/// volume's recorded `volume.pid`. There is a brief window after spawn
+/// where the parent has not yet written `volume.pid`; the caller in
+/// `register_and_get_creds` retries on that condition.
+pub fn register_volume(socket_path: &Path, volume_ulid: &str) -> io::Result<String> {
+    let resp = call(socket_path, &format!("register {volume_ulid}"))?;
+    if let Some(macaroon) = resp.strip_prefix("ok ") {
+        Ok(macaroon.to_owned())
+    } else if let Some(msg) = resp.strip_prefix("err ") {
+        Err(io::Error::other(msg.to_owned()))
+    } else {
+        Err(io::Error::other(format!("unexpected response: {resp}")))
+    }
+}
+
+/// Exchange a registered macaroon for short-lived S3 credentials.
+///
+/// Coordinator re-checks SO_PEERCRED against the macaroon's `pid` caveat
+/// and the volume's recorded `volume.pid` before delegating to the
+/// configured `CredentialIssuer`.
+pub fn macaroon_credentials(socket_path: &Path, macaroon: &str) -> io::Result<StoreCreds> {
+    let raw = call_all(socket_path, &format!("credentials {macaroon}"))?;
+    parse_toml_response(&raw)
+}
+
+/// Combined registration + credential fetch with retry.
+///
+/// The supervisor writes `volume.pid` after `Command::spawn()` returns,
+/// which can race against a fast-starting volume reaching this code path
+/// before the parent has flushed the pid file. We retry a handful of
+/// times with short backoff to absorb that window.
+pub fn register_and_get_creds(socket_path: &Path, volume_ulid: &str) -> io::Result<StoreCreds> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const BACKOFF_MS: u64 = 50;
+    let mut last_err: Option<io::Error> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        match register_volume(socket_path, volume_ulid) {
+            Ok(m) => return macaroon_credentials(socket_path, &m),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not registered") || msg.contains("does not match") {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("register: exhausted retries")))
+}
+
 /// Trigger an immediate fork discovery pass.
 pub fn rescan(socket_path: &Path) -> io::Result<()> {
     let resp = call(socket_path, "rescan")?;
