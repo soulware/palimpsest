@@ -505,54 +505,64 @@ fn main() {
                 ublk_id,
                 force_snapshot,
             } => {
-                let nbd = if let Some(path) = nbd_socket {
-                    Some(elide_core::config::NbdConfig {
-                        socket: Some(path),
-                        ..Default::default()
-                    })
-                } else {
-                    nbd_port.map(|port| elide_core::config::NbdConfig {
-                        port: Some(port),
-                        bind: nbd_bind,
-                        ..Default::default()
-                    })
-                };
-                let ublk_cfg = if ublk || ublk_id.is_some() {
-                    Some(elide_core::config::UblkConfig { dev_id: ublk_id })
-                } else {
-                    None
-                };
-
                 if let Some(from) = &from {
                     if let Err(e) = validate_volume_name(&name) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
+                    let flags = encode_transport_flags(
+                        nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
+                    );
                     if let Err(e) = create_fork(
                         &args.data_dir,
                         &name,
                         from,
                         &socket_path,
                         &by_id_dir,
-                        nbd,
-                        ublk_cfg,
+                        &flags,
                         force_snapshot,
                     ) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
                 } else {
-                    if let Err(e) =
-                        create_volume(&args.data_dir, &name, size.as_deref(), nbd, ublk_cfg)
-                    {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
-                    if coordinator_client::rescan(&socket_path).is_err() {
-                        eprintln!(
-                            "warning: coordinator unreachable; volume will be picked up on next scan"
-                        );
-                    }
+                    let size_str = match size.as_deref() {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("error: --size is required (e.g. --size 4G)");
+                            std::process::exit(1);
+                        }
+                    };
+                    let bytes = match parse_size(size_str) {
+                        Ok(b) if b > 0 => b,
+                        Ok(_) => {
+                            eprintln!("error: volume size must be non-zero");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("error: bad --size: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let flags = encode_transport_flags(
+                        nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
+                    );
+                    let ulid = match coordinator_client::create_volume_remote(
+                        &socket_path,
+                        &name,
+                        bytes,
+                        &flags,
+                    ) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let by_name = args.data_dir.join("by_name").join(&name);
+                    let by_id = args.data_dir.join("by_id").join(&ulid);
+                    println!("{}", by_name.display());
+                    println!("{}", by_id.display());
                 }
             }
 
@@ -566,12 +576,21 @@ fn main() {
                 ublk_id,
                 no_ublk,
             } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                if let Err(e) = update_volume(
-                    &vol_dir, nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, ublk_id, no_ublk,
-                ) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+                let flags = encode_transport_flags(
+                    nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, ublk_id, no_ublk,
+                );
+                match coordinator_client::update_volume(&socket_path, &name, &flags) {
+                    Ok(note) if note == "restarting" => {
+                        println!("volume restarting with new config")
+                    }
+                    Ok(note) if note == "not-running" => {
+                        println!("volume not running; config will take effect on next start")
+                    }
+                    Ok(other) => println!("ok {other}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
 
@@ -668,8 +687,7 @@ fn main() {
                                 &name,
                                 &socket_path,
                                 &by_id_dir,
-                                None,
-                                None,
+                                &[],
                                 false,
                             )
                         {
@@ -736,19 +754,19 @@ fn main() {
             }
 
             VolumeCommand::Stop { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                if let Err(e) = stop_volume(&vol_dir, &name) {
+                if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
+                println!("{name}: stopped");
             }
 
             VolumeCommand::Start { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                if let Err(e) = start_volume(&vol_dir, &name, &args.data_dir, &socket_path) {
+                if let Err(e) = coordinator_client::start_volume(&socket_path, &name) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
+                println!("{name}: started");
             }
 
             VolumeCommand::Remote { command } => {
@@ -801,9 +819,17 @@ fn main() {
                 if readonly {
                     panic!("ublk transport does not yet support --readonly");
                 }
-                ublk::run_volume_ublk(&fork_dir, size_bytes, fetch_config, ublk_id)
-                    .expect("ublk server error");
-                return;
+                match ublk::run_volume_ublk(&fork_dir, size_bytes, fetch_config, ublk_id) {
+                    Ok(()) => return,
+                    Err(ublk::UblkRunError::Config(msg)) => {
+                        eprintln!("ublk: {msg}");
+                        std::process::exit(ublk::EXIT_CONFIG);
+                    }
+                    Err(ublk::UblkRunError::Other(e)) => {
+                        eprintln!("ublk server error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             let nbd_bind = if let Some(path) = socket {
                 Some(nbd::NbdBind::Unix(path))
@@ -1019,62 +1045,41 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     Ok(())
 }
 
-fn create_volume(
-    data_dir: &Path,
-    name: &str,
-    size: Option<&str>,
-    nbd: Option<elide_core::config::NbdConfig>,
-    ublk: Option<elide_core::config::UblkConfig>,
-) -> std::io::Result<()> {
-    validate_volume_name(name)?;
-    let size_str =
-        size.ok_or_else(|| std::io::Error::other("--size is required (e.g. --size 4G)"))?;
-    let bytes =
-        parse_size(size_str).map_err(|e| std::io::Error::other(format!("bad --size: {e}")))?;
-    if bytes == 0 {
-        return Err(std::io::Error::other("volume size must be non-zero"));
+/// Encode the CLI's typed transport flags as the space-separated tokens
+/// understood by the coordinator's `create` / `update` IPC verbs. Order
+/// follows the IPC parser; absent options emit nothing.
+fn encode_transport_flags(
+    nbd_port: Option<u16>,
+    nbd_bind: Option<String>,
+    nbd_socket: Option<PathBuf>,
+    no_nbd: bool,
+    ublk: bool,
+    ublk_id: Option<i32>,
+    no_ublk: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = nbd_port {
+        out.push(format!("nbd-port={p}"));
     }
-
-    let by_name_dir = data_dir.join("by_name");
-
-    // Enforce local name uniqueness.
-    if by_name_dir.join(name).exists() {
-        return Err(std::io::Error::other(format!(
-            "volume already exists: {name}"
-        )));
+    if let Some(b) = nbd_bind {
+        out.push(format!("nbd-bind={b}"));
     }
-
-    let vol_ulid = ulid::Ulid::new().to_string();
-    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
-
-    std::fs::create_dir_all(&vol_dir)?;
-    std::fs::create_dir_all(vol_dir.join("pending"))?;
-    std::fs::create_dir_all(vol_dir.join("index"))?;
-    std::fs::create_dir_all(vol_dir.join("cache"))?;
-
-    let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
-    elide_core::signing::write_provenance(
-        &vol_dir,
-        &key,
-        VOLUME_PROVENANCE_FILE,
-        &elide_core::signing::ProvenanceLineage::default(),
-    )?;
-
-    elide_core::config::VolumeConfig {
-        name: Some(name.to_owned()),
-        size: Some(bytes),
-        nbd,
-        ublk,
+    if let Some(s) = nbd_socket {
+        out.push(format!("nbd-socket={}", s.display()));
     }
-    .write(&vol_dir)?;
-
-    std::fs::create_dir_all(&by_name_dir)?;
-    let by_name_path = by_name_dir.join(name);
-    std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &by_name_path)?;
-
-    println!("{}", by_name_path.display());
-    println!("{}", vol_dir.display());
-    Ok(())
+    if no_nbd {
+        out.push("no-nbd".to_owned());
+    }
+    if ublk {
+        out.push("ublk".to_owned());
+    }
+    if let Some(id) = ublk_id {
+        out.push(format!("ublk-id={id}"));
+    }
+    if no_ublk {
+        out.push("no-ublk".to_owned());
+    }
+    out
 }
 
 /// Create a new volume forked from a source.
@@ -1105,8 +1110,7 @@ fn create_fork(
     from: &str,
     socket_path: &Path,
     by_id_dir: &Path,
-    nbd: Option<elide_core::config::NbdConfig>,
-    ublk: Option<elide_core::config::UblkConfig>,
+    flags: &[String],
     force_snapshot: bool,
 ) -> std::io::Result<()> {
     validate_volume_name(fork_name)?;
@@ -1205,46 +1209,50 @@ fn create_fork(
         )));
     }
 
-    // Determine the snapshot ULID to branch from. For forker-attested "now"
-    // pins, also capture the ephemeral pubkey that signed the synthetic
-    // manifest so we can record it in the fork's provenance.
-    let mut parent_key_override: Option<elide_core::signing::VerifyingKey> = None;
+    // Resolve source ULID for the fork-create IPC. For ULID forms it's
+    // already in `spec`; for Name it comes from the canonicalized symlink
+    // target (or the auto-pull's ULID if we just pulled it).
+    let source_ulid_str: String = match &spec {
+        FromSpec::ExplicitPin(vol, _) | FromSpec::BareUlid(vol) => vol.to_string(),
+        FromSpec::Name => {
+            if let Some(p) = &pulled_vol_ulid {
+                p.clone()
+            } else {
+                std::fs::canonicalize(&source_fork_dir)?
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| std::io::Error::other("source dir has no ULID file name"))?
+                    .to_owned()
+            }
+        }
+    };
+
+    // Determine the snapshot ULID + (for force-snapshot) the ephemeral
+    // pubkey we'll record in the fork's provenance.
+    let mut parent_key_hex: Option<String> = None;
     let snap_ulid: Option<ulid::Ulid> = match &spec {
         FromSpec::ExplicitPin(_, snap) => Some(*snap),
         _ if source_fork_dir.join("volume.readonly").exists() => {
-            // Readonly volume (pulled or already local). Canonicalize through
-            // any by_name/ symlink so file_name() returns the ULID, not the
-            // human volume name.
-            let real_dir = std::fs::canonicalize(&source_fork_dir)?;
-            let vol_id = pulled_vol_ulid.as_deref().unwrap_or_else(|| {
-                real_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .expect("readonly dir must have a ULID name")
-            });
             if force_snapshot {
-                // Forker-attested "now" snapshot: synthesize a signed manifest
-                // under an ephemeral key, mirror it locally in the readonly
-                // dir, and upload only the marker to S3 (for GC protection).
-                // The ephemeral pubkey is embedded in the fork's provenance
-                // below so the open-time ancestor walk can verify the manifest.
-                let config = load_fetch_config(socket_path, data_dir, vol_id)?;
-                let (snap, vk) = create_readonly_snapshot_now(&config, vol_id, &source_fork_dir)?;
-                parent_key_override = Some(vk);
-                Some(snap)
+                // Coordinator synthesizes the "now" snapshot (uploads marker,
+                // verifies pinned segments, writes signed manifest under an
+                // ephemeral key). Returns the snap ULID + ephemeral pubkey hex.
+                let (snap_str, pubkey_hex) =
+                    coordinator_client::force_snapshot_now(socket_path, &source_ulid_str)?;
+                eprintln!("attested now-snapshot {snap_str} for {source_ulid_str}");
+                parent_key_hex = Some(pubkey_hex);
+                Some(ulid::Ulid::from_string(&snap_str).map_err(|e| {
+                    std::io::Error::other(format!("coordinator returned invalid snap ULID: {e}"))
+                })?)
             } else if let Some(snap) = volume::latest_snapshot(&source_fork_dir)? {
-                // Prefer the local snapshots/ directory — it is always
-                // authoritative when present (e.g. after a local import).
                 Some(snap)
             } else {
-                // Fall back to the remote store. Fail fast with a useful hint
-                // if no snapshot exists anywhere.
-                let config = load_fetch_config(socket_path, data_dir, vol_id)?;
-                match resolve_latest_remote_snapshot(&config, vol_id) {
+                let config = load_fetch_config(socket_path, data_dir, &source_ulid_str)?;
+                match resolve_latest_remote_snapshot(&config, &source_ulid_str) {
                     Ok(snap) => Some(snap),
                     Err(_) => {
                         return Err(std::io::Error::other(format!(
-                            "source volume {vol_id} has no snapshots; pass \
+                            "source volume {source_ulid_str} has no snapshots; pass \
                              --force-snapshot to upload a new 'now' marker"
                         )));
                     }
@@ -1253,83 +1261,29 @@ fn create_fork(
         }
         FromSpec::BareUlid(_) => {
             // Writable volume addressed by ULID: take an implicit snapshot.
-            // The coordinator identifies volumes by name, so read it from
-            // the volume config.
             let name = elide_core::config::VolumeConfig::read(&source_fork_dir)?
                 .name
                 .ok_or_else(|| std::io::Error::other("source volume has no name in volume.toml"))?;
             snapshot_volume(data_dir, &name)?;
-            None // fork_volume will use latest_snapshot()
+            None
         }
         FromSpec::Name => {
-            // Writable local volume addressed by name.
             snapshot_volume(data_dir, from)?;
             None
         }
     };
 
-    let new_vol_ulid = ulid::Ulid::new().to_string();
-    let new_fork_dir = data_dir.join("by_id").join(&new_vol_ulid);
-
-    let cleanup = |new_fork_dir: &Path, symlink_path: &Path| {
-        let _ = std::fs::remove_file(symlink_path);
-        let _ = std::fs::remove_dir_all(new_fork_dir);
-    };
-
-    match (snap_ulid, parent_key_override) {
-        (Some(snap), Some(vk)) => {
-            volume::fork_volume_at_with_manifest_key(&new_fork_dir, &source_fork_dir, snap, vk)?;
-        }
-        (Some(snap), None) => {
-            volume::fork_volume_at(&new_fork_dir, &source_fork_dir, snap)?;
-        }
-        (None, _) => {
-            volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
-        }
-    }
-
-    let src_cfg = elide_core::config::VolumeConfig::read(&source_fork_dir).map_err(|e| {
-        cleanup(&new_fork_dir, &symlink_path);
-        std::io::Error::other(format!("failed to read source volume config: {e}"))
-    })?;
-    let size = src_cfg.size.ok_or_else(|| {
-        cleanup(&new_fork_dir, &symlink_path);
-        std::io::Error::other("source volume has no size (import may not have completed)")
-    })?;
-    if let Err(e) = (elide_core::config::VolumeConfig {
-        name: Some(fork_name.to_owned()),
-        size: Some(size),
-        nbd,
-        ublk,
-    }
-    .write(&new_fork_dir))
-    {
-        cleanup(&new_fork_dir, &symlink_path);
-        return Err(std::io::Error::other(format!(
-            "failed to write volume config: {e}"
-        )));
-    }
-
-    if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
-        cleanup(&new_fork_dir, &symlink_path);
-        return Err(std::io::Error::other(format!(
-            "failed to create by_name dir: {e}"
-        )));
-    }
-
-    if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
-        cleanup(&new_fork_dir, &symlink_path);
-        return Err(std::io::Error::other(format!(
-            "failed to create by_name symlink: {e}"
-        )));
-    }
-
-    // fork_volume wrote keypair + signed provenance already; nothing to add.
-
+    let snap_str = snap_ulid.map(|s| s.to_string());
+    let new_vol_ulid = coordinator_client::fork_create(
+        socket_path,
+        fork_name,
+        &source_ulid_str,
+        snap_str.as_deref(),
+        parent_key_hex.as_deref(),
+        flags,
+    )?;
+    let new_fork_dir = by_id_dir.join(&new_vol_ulid);
     println!("{}", new_fork_dir.display());
-    if coordinator_client::rescan(socket_path).is_err() {
-        eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
-    }
     Ok(())
 }
 
@@ -1514,341 +1468,7 @@ fn resolve_latest_remote_snapshot(
     })
 }
 
-/// Forker-attested "now" snapshot for a readonly source.
-///
-/// Creates a pin the forker stands behind without possessing the source
-/// owner's private key. Steps:
-///
-/// 1. Run a synchronous `prefetch_indexes` tick against `readonly_dir` so
-///    every S3 segment owned by the source has its `.idx` mirrored locally.
-///    The `.idx` signatures are verified against the source's `volume.pub`
-///    during prefetch — their integrity is not affected by this flow.
-/// 2. Pick the pin ULID as `max_seg` — the highest segment ULID seen in the
-///    source. Pinning exactly what's observed in S3, not a wall-clock "now".
-///    Empty volumes fall back to `Ulid::new()` for a fresh marker ULID.
-/// 3. Upload the empty S3 marker to `by_id/<vol>/snapshots/<snap>`. The
-///    marker goes up *before* local state is written so any subsequent
-///    owner GC that observes it treats `snap` as a retention floor.
-/// 4. Re-list `by_id/<vol>/segments/` and confirm every pinned ULID is
-///    still present in S3. If any is missing, the owner's GC beat us to
-///    it — fail the pin (best-effort delete the stale marker) and surface
-///    the concrete missing ULIDs so the caller knows this isn't a retry
-///    candidate without a fresh `--force-snapshot`.
-/// 5. Load or create the per-source attestation key at
-///    `<readonly_dir>/force-snapshot.key`. Stable across invocations on
-///    this host: two fork invocations against the same source reuse the
-///    same key, so they sign byte-identical manifests and cannot clobber
-///    each other's provenance bindings.
-/// 6. Write the signed `.manifest` for the pin (listing every segment in
-///    `readonly_dir/index/`) and the empty local marker. The manifest is
-///    **not** uploaded — other hosts would try to verify it against the
-///    source's `volume.pub` and fail. The caller embeds the attestation
-///    pubkey in the fork's provenance so the fork's own open path has a
-///    matching trust anchor.
-///
-/// Returns `(pin_ulid, attestation_pubkey)`.
-fn create_readonly_snapshot_now(
-    config: &elide_fetch::FetchConfig,
-    volume_id: &str,
-    readonly_dir: &Path,
-) -> std::io::Result<(ulid::Ulid, elide_core::signing::VerifyingKey)> {
-    use futures::TryStreamExt;
-    use object_store::PutPayload;
-    use object_store::path::Path as StorePath;
-
-    let store = elide::build_object_store(config)
-        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
-    let rt = tokio::runtime::Runtime::new()?;
-
-    // Step 1: synchronous prefetch. Downloads any .idx not already present
-    // and verifies each under the source's volume.pub.
-    rt.block_on(async {
-        elide_coordinator::prefetch::prefetch_indexes(readonly_dir, &store).await
-    })
-    .map_err(|e| std::io::Error::other(format!("prefetching ancestor indexes: {e:#}")))?;
-
-    // Step 2: enumerate the freshly prefetched .idx files — these are the
-    // segments the pin covers. Pin ULID = max(segments): we pin exactly
-    // what the source currently has in S3.
-    let index_dir = readonly_dir.join("index");
-    let mut segments: Vec<ulid::Ulid> = Vec::new();
-    let mut max_seg: Option<ulid::Ulid> = None;
-    for entry in std::fs::read_dir(&index_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(stem) = name.strip_suffix(".idx") else {
-            continue;
-        };
-        if let Ok(u) = ulid::Ulid::from_string(stem) {
-            segments.push(u);
-            if max_seg.is_none_or(|m| u > m) {
-                max_seg = Some(u);
-            }
-        }
-    }
-
-    // Ulid::new() here is deliberate — Ulid::default() is the nil ULID, not
-    // a fresh one, so unwrap_or_default would pin an all-zeros marker.
-    let snap = match max_seg {
-        Some(m) => m,
-        None => ulid::Ulid::new(),
-    };
-    let snap_str = snap.to_string();
-
-    // Step 3 + 4: upload marker, then re-list segments and verify every
-    // pinned ULID is still in S3. Any missing ULIDs mean owner-side GC
-    // already deleted them — the pin is unreachable and we fail rather
-    // than produce a manifest whose reads will silently return zeros.
-    let marker_key = elide_coordinator::upload::snapshot_key(volume_id, &snap_str)
-        .map_err(|e| std::io::Error::other(format!("snapshot_key: {e}")))?;
-    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
-    let pinned: std::collections::HashSet<ulid::Ulid> = segments.iter().copied().collect();
-
-    rt.block_on(async {
-        store
-            .put(&marker_key, PutPayload::from_static(b""))
-            .await
-            .map_err(|e| std::io::Error::other(format!("uploading snapshot marker: {e}")))?;
-
-        let objects = store
-            .list(Some(&seg_prefix))
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!("listing segments for verification: {e}"))
-            })?;
-        let present: std::collections::HashSet<ulid::Ulid> = objects
-            .iter()
-            .filter_map(|o| o.location.filename())
-            .filter_map(|name| ulid::Ulid::from_string(name).ok())
-            .collect();
-
-        let mut missing: Vec<ulid::Ulid> = pinned.difference(&present).copied().collect();
-        if !missing.is_empty() {
-            missing.sort();
-            // Best-effort cleanup: the marker pins a snapshot that isn't
-            // fully backed. Leaving it behind extends owner GC retention
-            // for no reason.
-            if let Err(e) = store.delete(&marker_key).await {
-                eprintln!("warning: failed to delete stale snapshot marker {snap_str}: {e}");
-            }
-            let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();
-            let extra = missing.len().saturating_sub(preview.len());
-            let suffix = if extra > 0 {
-                format!(" (+{extra} more)")
-            } else {
-                String::new()
-            };
-            return Err(std::io::Error::other(format!(
-                "force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
-                 (owner GC raced us); missing: [{}]{}",
-                missing.len(),
-                pinned.len(),
-                preview.join(", "),
-                suffix,
-            )));
-        }
-        Ok::<_, std::io::Error>(())
-    })?;
-
-    // Step 5: load-or-create the per-source attestation key.
-    let (signer, vk) = elide_core::signing::load_or_create_keypair(
-        readonly_dir,
-        elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
-        elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
-    )?;
-
-    // Step 6: signed manifest + local marker.
-    elide_core::signing::write_snapshot_manifest(readonly_dir, &*signer, &snap, &segments)?;
-    let snap_dir = readonly_dir.join("snapshots");
-    std::fs::create_dir_all(&snap_dir)?;
-    std::fs::write(snap_dir.join(&snap_str), b"")?;
-
-    eprintln!(
-        "attested now-snapshot {snap_str} for {volume_id} ({} segments)",
-        segments.len()
-    );
-    Ok((snap, vk))
-}
-
-/// Update configuration for a volume and restart it if running.
-///
-/// Writes or removes the [nbd]/[ublk] sections, then sends `shutdown` to the
-/// volume's control socket. The supervisor restarts the process, picking up
-/// the new config. NBD and ublk are mutually exclusive: switching transports
-/// also clears the section for the other transport.
-#[allow(clippy::too_many_arguments)]
-fn update_volume(
-    vol_dir: &Path,
-    nbd_port: Option<u16>,
-    nbd_bind: Option<String>,
-    nbd_socket: Option<PathBuf>,
-    no_nbd: bool,
-    ublk: bool,
-    ublk_id: Option<i32>,
-    no_ublk: bool,
-) -> std::io::Result<()> {
-    use std::io::{BufRead, Write};
-    use std::os::unix::net::UnixStream;
-
-    let mut cfg = elide_core::config::VolumeConfig::read(vol_dir)?;
-    if no_nbd {
-        cfg.nbd = None;
-    } else if let Some(path) = nbd_socket {
-        cfg.nbd = Some(elide_core::config::NbdConfig {
-            socket: Some(path),
-            ..Default::default()
-        });
-        cfg.ublk = None;
-    } else if nbd_port.is_some() || nbd_bind.is_some() {
-        let existing = cfg.nbd.get_or_insert_with(Default::default);
-        if let Some(port) = nbd_port {
-            existing.port = Some(port);
-            existing.socket = None; // switching to TCP clears socket
-        }
-        if let Some(bind) = nbd_bind {
-            existing.bind = Some(bind);
-        }
-        cfg.ublk = None;
-    }
-
-    if no_ublk {
-        cfg.ublk = None;
-    } else if ublk || ublk_id.is_some() {
-        cfg.ublk = Some(elide_core::config::UblkConfig { dev_id: ublk_id });
-        cfg.nbd = None;
-    }
-
-    cfg.write(vol_dir)?;
-
-    // Restart the volume process so it picks up the new config.
-    let sock = vol_dir.join("control.sock");
-    match UnixStream::connect(&sock) {
-        Ok(mut stream) => {
-            writeln!(stream, "shutdown")?;
-            stream.flush()?;
-            stream.shutdown(std::net::Shutdown::Write)?;
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            let line = line.trim();
-            if line == "ok" {
-                println!("volume restarting with new config");
-            } else {
-                return Err(std::io::Error::other(format!("shutdown failed: {line}")));
-            }
-        }
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            println!("volume not running; config will take effect on next start");
-        }
-        Err(e) => return Err(e),
-    }
-
-    Ok(())
-}
-
 const STOPPED_FILE: &str = "volume.stopped";
-
-/// Send a one-shot command to the volume's control socket and return the
-/// response line. Returns `None` if the volume is not running.
-fn control_call(vol_dir: &Path, cmd: &str) -> std::io::Result<Option<String>> {
-    use std::io::{BufRead, Write};
-    use std::os::unix::net::UnixStream;
-
-    let sock = vol_dir.join("control.sock");
-    match UnixStream::connect(&sock) {
-        Ok(mut stream) => {
-            writeln!(stream, "{cmd}")?;
-            stream.flush()?;
-            stream.shutdown(std::net::Shutdown::Write)?;
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            Ok(Some(line.trim().to_owned()))
-        }
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn stop_volume(vol_dir: &Path, name: &str) -> std::io::Result<()> {
-    if vol_dir.join("volume.readonly").exists() {
-        return Err(std::io::Error::other("volume is readonly; nothing to stop"));
-    }
-    if vol_dir.join(STOPPED_FILE).exists() {
-        println!("{name}: stopped");
-        return Ok(());
-    }
-
-    // Refuse to stop while an NBD client is connected.
-    if let Some(resp) = control_call(vol_dir, "connected")?
-        && resp == "ok true"
-    {
-        return Err(std::io::Error::other(
-            "nbd client is connected; disconnect it first",
-        ));
-    }
-
-    // Write the marker before sending shutdown so the supervisor won't restart.
-    std::fs::write(vol_dir.join(STOPPED_FILE), "")?;
-
-    match control_call(vol_dir, "shutdown")? {
-        Some(resp) if resp == "ok" => {}
-        Some(resp) => {
-            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            return Err(std::io::Error::other(format!("shutdown failed: {resp}")));
-        }
-        None => {
-            // Already not running — marker is still written, which is correct.
-        }
-    }
-
-    println!("{name}: stopped");
-    Ok(())
-}
-
-fn start_volume(
-    vol_dir: &Path,
-    name: &str,
-    data_dir: &Path,
-    coordinator_socket: &Path,
-) -> std::io::Result<()> {
-    if !vol_dir.join(STOPPED_FILE).exists() {
-        return Err(std::io::Error::other("volume is not stopped"));
-    }
-
-    // Refuse to start if another active volume uses the same NBD endpoint.
-    if let Some(conflict) = elide_core::config::find_nbd_conflict(vol_dir, data_dir)? {
-        return Err(std::io::Error::other(format!(
-            "nbd endpoint {} conflicts with volume '{}'",
-            conflict.endpoint, conflict.name,
-        )));
-    }
-
-    std::fs::remove_file(vol_dir.join(STOPPED_FILE))?;
-
-    // Trigger an immediate rescan so the supervisor picks up the change.
-    if let Err(e) = coordinator_client::rescan(coordinator_socket) {
-        // Non-fatal: the supervisor will notice on its next poll anyway.
-        eprintln!("warning: could not notify coordinator: {e}");
-    }
-
-    println!("{name}: started");
-    Ok(())
-}
 
 /// List all named volumes in the remote store.
 ///
@@ -1947,7 +1567,10 @@ fn remote_pull(
 
     // Step 2: walk the ancestor chain, pulling each skeleton that isn't
     // already local. Start from the requested volume; after each pull, parse
-    // its downloaded provenance to find the next parent.
+    // its downloaded provenance to find the next parent. The actual write
+    // is delegated to the coordinator's `pull-readonly` IPC so the
+    // root-owned readonly tree is created by the coordinator process, not
+    // the (possibly non-root) CLI.
     let mut pulled: Vec<String> = Vec::new();
     let mut next: Option<String> = Some(root_ulid);
     while let Some(ulid_str) = next.take() {
@@ -1955,7 +1578,7 @@ fn remote_pull(
             // Local copy is authoritative; stop walking up from here.
             break;
         }
-        let parent_ulid = pull_one_readonly(&rt, &*store, data_dir, &ulid_str)?;
+        let parent_ulid = coordinator_client::pull_readonly(socket_path, &ulid_str)?;
         pulled.push(ulid_str);
         next = parent_ulid;
     }
@@ -2027,122 +1650,6 @@ fn resolve_pull_spec(
 fn ancestor_exists_locally(data_dir: &Path, ulid_str: &str) -> bool {
     data_dir.join("by_id").join(ulid_str).exists()
         || data_dir.join("readonly").join(ulid_str).exists()
-}
-
-/// Download the readonly skeleton for one volume into `readonly/<ulid>/`.
-///
-/// Fetches `manifest.toml`, `volume.pub`, and `volume.provenance` from the
-/// store and writes them, along with a `volume.readonly` marker and an empty
-/// `index/` directory so `discover_volumes` queues the volume for prefetch.
-///
-/// Returns the parent volume ULID to pull next, or `None` if this volume is
-/// the root of its fork chain. The parent is extracted from the downloaded
-/// provenance's `parent` field (`<ulid>/snapshots/<ulid>`), signature-verified
-/// against the volume's own `volume.pub`.
-fn pull_one_readonly(
-    rt: &tokio::runtime::Runtime,
-    store: &dyn object_store::ObjectStore,
-    data_dir: &Path,
-    volume_id: &str,
-) -> std::io::Result<Option<String>> {
-    use object_store::path::Path as StorePath;
-
-    let vol_dir = data_dir.join("readonly").join(volume_id);
-    if vol_dir.exists() {
-        return Err(std::io::Error::other(format!(
-            "readonly volume already present locally: {volume_id}"
-        )));
-    }
-
-    // Fetch manifest.toml.
-    let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
-    let manifest_bytes = rt.block_on(async {
-        let data = store.get(&manifest_key).await.map_err(|e| match e {
-            object_store::Error::NotFound { .. } => std::io::Error::other(format!(
-                "manifest not found in store for volume {volume_id}"
-            )),
-            e => std::io::Error::other(format!("downloading manifest: {e}")),
-        })?;
-        data.bytes()
-            .await
-            .map_err(|e| std::io::Error::other(format!("reading manifest: {e}")))
-    })?;
-    let manifest: toml::Table = toml::from_str(
-        std::str::from_utf8(&manifest_bytes)
-            .map_err(|e| std::io::Error::other(format!("manifest is not valid utf-8: {e}")))?,
-    )
-    .map_err(|e| std::io::Error::other(format!("parsing manifest.toml: {e}")))?;
-    let size = manifest
-        .get("size")
-        .and_then(|v| v.as_integer())
-        .ok_or_else(|| std::io::Error::other("manifest.toml missing 'size'"))?;
-
-    // Fetch volume.pub.
-    let pub_key_bytes = rt.block_on(async {
-        let key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
-        let data = store
-            .get(&key)
-            .await
-            .map_err(|e| std::io::Error::other(format!("downloading volume.pub: {e}")))?;
-        data.bytes()
-            .await
-            .map_err(|e| std::io::Error::other(format!("reading volume.pub: {e}")))
-    })?;
-
-    // Fetch volume.provenance. Every volume — including roots — has a
-    // signed provenance recording its lineage (possibly empty). NotFound is
-    // a hard error: it means the upstream store is missing load-bearing
-    // metadata and we cannot safely materialise a readonly skeleton.
-    let provenance_bytes = rt.block_on(async {
-        let key = StorePath::from(format!("by_id/{volume_id}/volume.provenance"));
-        let data = store.get(&key).await.map_err(|e| match e {
-            object_store::Error::NotFound { .. } => std::io::Error::other(format!(
-                "volume.provenance not found in store for volume {volume_id}"
-            )),
-            e => std::io::Error::other(format!("downloading volume.provenance: {e}")),
-        })?;
-        data.bytes()
-            .await
-            .map_err(|e| std::io::Error::other(format!("reading volume.provenance: {e}")))
-    })?;
-
-    // Write the skeleton.
-    std::fs::create_dir_all(&vol_dir)?;
-    elide_core::config::VolumeConfig {
-        name: manifest
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned()),
-        size: Some(size as u64),
-        ..Default::default()
-    }
-    .write(&vol_dir)?;
-    std::fs::write(vol_dir.join("volume.readonly"), "")?;
-    std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
-    std::fs::write(
-        vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
-        &provenance_bytes,
-    )?;
-    // Empty index/ so discover_volumes queues the volume for prefetch.
-    std::fs::create_dir_all(vol_dir.join("index"))?;
-
-    // Parse the downloaded provenance to find the parent ULID (if any).
-    // Signature is verified against the just-written `volume.pub`.
-    let parent_ulid = match elide_core::signing::read_lineage_verifying_signature(
-        &vol_dir,
-        elide_core::signing::VOLUME_PUB_FILE,
-        elide_core::signing::VOLUME_PROVENANCE_FILE,
-    ) {
-        Ok(lineage) => lineage.parent.map(|p| p.volume_ulid),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&vol_dir);
-            return Err(std::io::Error::other(format!(
-                "verifying provenance for {volume_id}: {e}"
-            )));
-        }
-    };
-
-    Ok(parent_ulid)
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {

@@ -57,6 +57,36 @@
 use std::io;
 use std::path::Path;
 
+/// Outcome of [`run_volume_ublk`]. `Config` failures are permanent under the
+/// current host configuration (missing kernel module, missing privilege,
+/// wrong kernel version, persistent dev-id mismatch). The supervisor signals
+/// these to the coordinator via process exit code [`EXIT_CONFIG`] so it does
+/// not respawn in a tight loop.
+#[derive(Debug)]
+pub enum UblkRunError {
+    Config(String),
+    Other(io::Error),
+}
+
+impl std::fmt::Display for UblkRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(msg) => write!(f, "{msg}"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<io::Error> for UblkRunError {
+    fn from(e: io::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// Exit code used by the volume process to signal "permanent misconfiguration —
+/// don't respawn me". Matches BSD `EX_CONFIG` from `sysexits.h`.
+pub const EXIT_CONFIG: i32 = 78;
+
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 mod imp {
     use std::io;
@@ -224,7 +254,7 @@ mod imp {
         size_bytes: u64,
         fetch_config: Option<elide_fetch::FetchConfig>,
         dev_id: Option<i32>,
-    ) -> io::Result<()> {
+    ) -> Result<(), super::UblkRunError> {
         let by_id_dir = dir.parent().unwrap_or(dir);
         let mut volume = Volume::open(dir, by_id_dir)?;
 
@@ -286,13 +316,13 @@ mod imp {
                 }
             }
             Route::BoundMismatch { persisted, cli } => {
-                return Err(io::Error::other(format!(
+                return Err(super::UblkRunError::Config(format!(
                     "volume bound to ublk dev {persisted}; refusing to serve with --ublk-id {cli}. \
                      pass --ublk-id {persisted}, or clear the binding after a clean shutdown"
                 )));
             }
             Route::ForeignDevice { id } => {
-                return Err(io::Error::other(format!(
+                return Err(super::UblkRunError::Config(format!(
                     "ublk dev {id} exists but this volume is not bound to it. \
                      run `elide ublk delete {id}` to remove the stale device, or use a different --ublk-id"
                 )));
@@ -318,6 +348,9 @@ mod imp {
         let ctrl_flags = (libublk::sys::UBLK_F_USER_RECOVERY
             | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
 
+        // UblkCtrlBuilder::build() opens /dev/ublk-control. Failures here
+        // (missing module, no privilege, kernel too old) won't fix themselves
+        // by retrying — surface as Config so the supervisor stops respawning.
         let ctrl = Arc::new(
             UblkCtrlBuilder::default()
                 .name("elide")
@@ -328,7 +361,13 @@ mod imp {
                 .ctrl_flags(ctrl_flags)
                 .dev_flags(dev_lifecycle)
                 .build()
-                .map_err(|e| io::Error::other(format!("ublk ctrl build: {e}")))?,
+                .map_err(|e| {
+                    super::UblkRunError::Config(format!(
+                        "ublk control device unavailable ({e}); \
+                         check that the ublk_drv kernel module is loaded \
+                         and that the daemon has CAP_SYS_ADMIN (rerun under sudo)"
+                    ))
+                })?,
         );
 
         // Publish the live ctrl so the already-installed signal handler
@@ -1128,24 +1167,24 @@ mod imp {
         _size_bytes: u64,
         _fetch_config: Option<elide_fetch::FetchConfig>,
         _dev_id: Option<i32>,
-    ) -> io::Result<()> {
-        Err(stub_err())
+    ) -> Result<(), super::UblkRunError> {
+        Err(super::UblkRunError::Config(stub_msg().to_owned()))
     }
 
     pub fn list_devices() -> io::Result<()> {
-        Err(stub_err())
+        Err(io::Error::other(stub_msg()))
     }
 
     pub fn delete_device(_id: i32) -> io::Result<()> {
-        Err(stub_err())
+        Err(io::Error::other(stub_msg()))
     }
 
     pub fn delete_all_devices() -> io::Result<()> {
-        Err(stub_err())
+        Err(io::Error::other(stub_msg()))
     }
 
-    fn stub_err() -> io::Error {
-        io::Error::other("ublk transport requires Linux and the 'ublk' cargo feature")
+    fn stub_msg() -> &'static str {
+        "ublk transport requires Linux and the 'ublk' cargo feature"
     }
 }
 
@@ -1159,7 +1198,7 @@ pub fn run_volume_ublk(
     size_bytes: u64,
     fetch_config: Option<elide_fetch::FetchConfig>,
     dev_id: Option<i32>,
-) -> io::Result<()> {
+) -> Result<(), UblkRunError> {
     imp::run_volume_ublk(dir, size_bytes, fetch_config, dev_id)
 }
 

@@ -55,6 +55,25 @@ pub async fn serve(
         }
     };
 
+    // The socket inherits the binding process's umask (typically 0022 → 0755),
+    // which on Linux blocks non-root from `connect()` (write perm is required).
+    // A coordinator running under sudo would otherwise leave a CLI in the user's
+    // session unable to talk to it. Relax to 0666 so any local user can issue
+    // unprivileged ops; permission-sensitive ops still go through coordinator
+    // logic, not raw filesystem access.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
+        {
+            warn!(
+                "[inbound] chmod 0666 on {} failed: {e} (non-root CLI may be unable to connect)",
+                socket_path.display()
+            );
+        }
+    }
+
     info!("[inbound] listening on {}", socket_path.display());
 
     loop {
@@ -223,6 +242,60 @@ async fn dispatch(
                 return "err usage: delete <volume>".to_string();
             }
             delete_volume(args, data_dir)
+        }
+
+        "stop" => {
+            if args.is_empty() {
+                return "err usage: stop <volume>".to_string();
+            }
+            stop_volume_op(args, data_dir).await
+        }
+
+        "start" => {
+            if args.is_empty() {
+                return "err usage: start <volume>".to_string();
+            }
+            start_volume_op(args, data_dir, &rescan)
+        }
+
+        "create" => {
+            // create <name> <size_bytes> [<flag>...]
+            if args.is_empty() {
+                return "err usage: create <name> <size_bytes> [flags...]".to_string();
+            }
+            create_volume_op(args, data_dir, &rescan)
+        }
+
+        "update" => {
+            // update <name> [<flag>...]
+            if args.is_empty() {
+                return "err usage: update <volume> [flags...]".to_string();
+            }
+            update_volume_op(args, data_dir).await
+        }
+
+        "pull-readonly" => {
+            // pull-readonly <vol_ulid>
+            if args.is_empty() {
+                return "err usage: pull-readonly <vol_ulid>".to_string();
+            }
+            pull_readonly_op(args, data_dir, store).await
+        }
+
+        "force-snapshot-now" => {
+            // force-snapshot-now <vol_ulid>
+            if args.is_empty() {
+                return "err usage: force-snapshot-now <vol_ulid>".to_string();
+            }
+            force_snapshot_now_op(args, data_dir, store).await
+        }
+
+        "fork-create" => {
+            // fork-create <new_name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [<flags>...]
+            if args.is_empty() {
+                return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
+            }
+            fork_create_op(args, data_dir, &rescan)
         }
 
         "evict" => {
@@ -833,6 +906,768 @@ fn delete_volume(volume_name: &str, data_dir: &Path) -> String {
     }
 }
 
+// ── Volume create / update ────────────────────────────────────────────────────
+
+/// Parsed transport flags from the `create`/`update` IPC argument string.
+/// Each `Some` field is an explicit set request; the corresponding `no_*`
+/// boolean is an explicit clear. Mutually-exclusive flags are validated by
+/// the consumer (different rules for create vs update).
+#[derive(Default)]
+struct TransportPatch {
+    nbd_port: Option<u16>,
+    nbd_bind: Option<String>,
+    nbd_socket: Option<std::path::PathBuf>,
+    no_nbd: bool,
+    ublk: bool,
+    ublk_id: Option<i32>,
+    no_ublk: bool,
+}
+
+/// Parse a flat space-separated flag list. Recognised tokens:
+///   nbd-port=<u16>, nbd-bind=<addr>, nbd-socket=<path>, no-nbd,
+///   ublk, ublk-id=<i32>, no-ublk
+/// Unknown tokens produce an error so silent typos don't get accepted.
+fn parse_transport_flags(args: &str) -> Result<TransportPatch, String> {
+    let mut patch = TransportPatch::default();
+    for tok in args.split_whitespace() {
+        let (key, val) = match tok.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (tok, None),
+        };
+        match (key, val) {
+            ("nbd-port", Some(v)) => {
+                patch.nbd_port = Some(v.parse().map_err(|e| format!("bad nbd-port {v:?}: {e}"))?);
+            }
+            ("nbd-bind", Some(v)) => patch.nbd_bind = Some(v.to_owned()),
+            ("nbd-socket", Some(v)) => patch.nbd_socket = Some(v.into()),
+            ("no-nbd", None) => patch.no_nbd = true,
+            ("ublk", None) => patch.ublk = true,
+            ("ublk-id", Some(v)) => {
+                patch.ublk_id = Some(v.parse().map_err(|e| format!("bad ublk-id {v:?}: {e}"))?);
+            }
+            ("no-ublk", None) => patch.no_ublk = true,
+            _ => return Err(format!("unknown flag: {tok}")),
+        }
+    }
+    Ok(patch)
+}
+
+fn validate_volume_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("volume name must not be empty".to_owned());
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_' && *c != '.')
+    {
+        return Err(format!(
+            "invalid character {c:?} in volume name {name:?}: only [a-zA-Z0-9._-] allowed"
+        ));
+    }
+    if matches!(name, "status" | "attach") {
+        return Err(format!("'{name}' is a reserved name"));
+    }
+    Ok(())
+}
+
+fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
+    // First two whitespace-separated tokens: name, size_bytes. Remainder is flags.
+    let mut iter = args.splitn(3, ' ').map(str::trim);
+    let name = match iter.next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return "err usage: create <name> <size_bytes> [flags...]".to_string(),
+    };
+    let size_str = match iter.next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return "err usage: create <name> <size_bytes> [flags...]".to_string(),
+    };
+    let flag_str = iter.next().unwrap_or("");
+
+    if let Err(e) = validate_volume_name(name) {
+        return format!("err {e}");
+    }
+    let bytes: u64 = match size_str.parse() {
+        Ok(b) if b > 0 => b,
+        Ok(_) => return "err size must be non-zero".to_string(),
+        Err(e) => return format!("err bad size {size_str:?}: {e}"),
+    };
+
+    let patch = match parse_transport_flags(flag_str) {
+        Ok(p) => p,
+        Err(e) => return format!("err {e}"),
+    };
+    if patch.no_nbd || patch.no_ublk {
+        return "err no-nbd / no-ublk are not valid on create (volume starts without transport)"
+            .to_string();
+    }
+    if (patch.nbd_port.is_some() || patch.nbd_bind.is_some() || patch.nbd_socket.is_some())
+        && (patch.ublk || patch.ublk_id.is_some())
+    {
+        return "err nbd-* flags are mutually exclusive with ublk".to_string();
+    }
+
+    let nbd_cfg = if let Some(socket) = patch.nbd_socket {
+        Some(elide_core::config::NbdConfig {
+            socket: Some(socket),
+            ..Default::default()
+        })
+    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
+        Some(elide_core::config::NbdConfig {
+            port: patch.nbd_port,
+            bind: patch.nbd_bind,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    let ublk_cfg = if patch.ublk || patch.ublk_id.is_some() {
+        Some(elide_core::config::UblkConfig {
+            dev_id: patch.ublk_id,
+        })
+    } else {
+        None
+    };
+
+    let by_name_dir = data_dir.join("by_name");
+    if by_name_dir.join(name).exists() {
+        return format!("err volume already exists: {name}");
+    }
+
+    let vol_ulid = ulid::Ulid::new().to_string();
+    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
+
+    let result: std::io::Result<()> = (|| {
+        std::fs::create_dir_all(&vol_dir)?;
+        std::fs::create_dir_all(vol_dir.join("pending"))?;
+        std::fs::create_dir_all(vol_dir.join("index"))?;
+        std::fs::create_dir_all(vol_dir.join("cache"))?;
+        let key = elide_core::signing::generate_keypair(
+            &vol_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )?;
+        elide_core::signing::write_provenance(
+            &vol_dir,
+            &key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &elide_core::signing::ProvenanceLineage::default(),
+        )?;
+        elide_core::config::VolumeConfig {
+            name: Some(name.to_owned()),
+            size: Some(bytes),
+            nbd: nbd_cfg,
+            ublk: ublk_cfg,
+        }
+        .write(&vol_dir)?;
+        std::fs::create_dir_all(&by_name_dir)?;
+        std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        // Best-effort cleanup so a partial volume doesn't strand the name.
+        let _ = std::fs::remove_file(by_name_dir.join(name));
+        let _ = std::fs::remove_dir_all(&vol_dir);
+        return format!("err create failed: {e}");
+    }
+
+    rescan.notify_one();
+    info!("[inbound] created volume {name} ({vol_ulid})");
+    format!("ok {vol_ulid}")
+}
+
+async fn update_volume_op(args: &str, data_dir: &Path) -> String {
+    let (name, flag_str) = match args.split_once(' ') {
+        Some((n, rest)) => (n.trim(), rest.trim()),
+        None => (args.trim(), ""),
+    };
+    if name.is_empty() {
+        return "err usage: update <volume> [flags...]".to_string();
+    }
+    let link = data_dir.join("by_name").join(name);
+    if !link.exists() {
+        return format!("err volume not found: {name}");
+    }
+    let vol_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) => return format!("err resolving volume dir: {e}"),
+    };
+
+    let patch = match parse_transport_flags(flag_str) {
+        Ok(p) => p,
+        Err(e) => return format!("err {e}"),
+    };
+
+    let mut cfg = match elide_core::config::VolumeConfig::read(&vol_dir) {
+        Ok(c) => c,
+        Err(e) => return format!("err reading volume.toml: {e}"),
+    };
+
+    // Mirror the CLI's apply order: nbd flags first, then ublk. The setters
+    // clear the opposite transport so the two sections remain mutually
+    // exclusive.
+    if patch.no_nbd {
+        cfg.nbd = None;
+    } else if let Some(socket) = patch.nbd_socket {
+        cfg.nbd = Some(elide_core::config::NbdConfig {
+            socket: Some(socket),
+            ..Default::default()
+        });
+        cfg.ublk = None;
+    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
+        let existing = cfg.nbd.get_or_insert_with(Default::default);
+        if let Some(port) = patch.nbd_port {
+            existing.port = Some(port);
+            existing.socket = None;
+        }
+        if let Some(bind) = patch.nbd_bind {
+            existing.bind = Some(bind);
+        }
+        cfg.ublk = None;
+    }
+
+    if patch.no_ublk {
+        cfg.ublk = None;
+    } else if patch.ublk || patch.ublk_id.is_some() {
+        cfg.ublk = Some(elide_core::config::UblkConfig {
+            dev_id: patch.ublk_id,
+        });
+        cfg.nbd = None;
+    }
+
+    if let Err(e) = cfg.write(&vol_dir) {
+        return format!("err writing volume.toml: {e}");
+    }
+
+    // Restart the volume process so it picks up the new config. ECONNREFUSED /
+    // ENOENT mean the volume isn't running — fine, the new config takes effect
+    // on next start.
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
+        Some(resp) if resp == "ok" => {
+            info!("[inbound] updated volume {name}; restart triggered");
+            "ok restarting".to_string()
+        }
+        Some(resp) => format!("err shutdown failed: {resp}"),
+        None => {
+            info!("[inbound] updated volume {name}; not running");
+            "ok not-running".to_string()
+        }
+    }
+}
+
+// ── Volume fork (create --from) plumbing ──────────────────────────────────────
+
+/// Decode a 64-character hex string into a 32-byte array (Ed25519 pubkey).
+fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", s.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("invalid hex at byte {i}"))?;
+    }
+    Ok(out)
+}
+
+/// Pull one readonly volume skeleton from the store.
+///
+/// Mirrors the CLI's `pull_one_readonly`: downloads `manifest.toml`,
+/// `volume.pub`, and `volume.provenance`, writes the skeleton under
+/// `data_dir/readonly/<vol_ulid>/`, and returns the parent ULID parsed from
+/// the (signature-verified) provenance, or empty if this is a root volume.
+async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectStore>) -> String {
+    use object_store::path::Path as StorePath;
+
+    let volume_id = args.trim();
+    if ulid::Ulid::from_string(volume_id).is_err() {
+        return format!("err invalid ULID: {volume_id}");
+    }
+
+    let vol_dir = data_dir.join("readonly").join(volume_id);
+    if vol_dir.exists() {
+        return format!("err readonly volume already present locally: {volume_id}");
+    }
+
+    // Step 1: fetch manifest.toml.
+    let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
+    let manifest_bytes = match store.get(&manifest_key).await {
+        Ok(d) => match d.bytes().await {
+            Ok(b) => b,
+            Err(e) => return format!("err reading manifest: {e}"),
+        },
+        Err(object_store::Error::NotFound { .. }) => {
+            return format!("err manifest not found in store for volume {volume_id}");
+        }
+        Err(e) => return format!("err downloading manifest: {e}"),
+    };
+    let manifest: toml::Table = match std::str::from_utf8(&manifest_bytes)
+        .map_err(|e| format!("manifest is not valid utf-8: {e}"))
+        .and_then(|s| toml::from_str(s).map_err(|e| format!("parsing manifest.toml: {e}")))
+    {
+        Ok(t) => t,
+        Err(e) => return format!("err {e}"),
+    };
+    let size = match manifest.get("size").and_then(|v| v.as_integer()) {
+        Some(s) => s,
+        None => return "err manifest.toml missing 'size'".to_string(),
+    };
+
+    // Step 2: fetch volume.pub.
+    let pub_key_bytes = match store
+        .get(&StorePath::from(format!("by_id/{volume_id}/volume.pub")))
+        .await
+    {
+        Ok(d) => match d.bytes().await {
+            Ok(b) => b,
+            Err(e) => return format!("err reading volume.pub: {e}"),
+        },
+        Err(e) => return format!("err downloading volume.pub: {e}"),
+    };
+
+    // Step 3: fetch volume.provenance. NotFound is hard error.
+    let provenance_bytes = match store
+        .get(&StorePath::from(format!(
+            "by_id/{volume_id}/volume.provenance"
+        )))
+        .await
+    {
+        Ok(d) => match d.bytes().await {
+            Ok(b) => b,
+            Err(e) => return format!("err reading volume.provenance: {e}"),
+        },
+        Err(object_store::Error::NotFound { .. }) => {
+            return format!("err volume.provenance not found in store for volume {volume_id}");
+        }
+        Err(e) => return format!("err downloading volume.provenance: {e}"),
+    };
+
+    // Step 4: write the skeleton.
+    let result: std::io::Result<()> = (|| {
+        std::fs::create_dir_all(&vol_dir)?;
+        elide_core::config::VolumeConfig {
+            name: manifest
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            size: Some(size as u64),
+            ..Default::default()
+        }
+        .write(&vol_dir)?;
+        std::fs::write(vol_dir.join("volume.readonly"), "")?;
+        std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
+            &provenance_bytes,
+        )?;
+        std::fs::create_dir_all(vol_dir.join("index"))?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&vol_dir);
+        return format!("err writing readonly skeleton: {e}");
+    }
+
+    // Step 5: parse and verify provenance to find the parent.
+    let parent_ulid = match elide_core::signing::read_lineage_verifying_signature(
+        &vol_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    ) {
+        Ok(lineage) => lineage.parent.map(|p| p.volume_ulid.to_string()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&vol_dir);
+            return format!("err verifying provenance for {volume_id}: {e}");
+        }
+    };
+
+    info!("[inbound] pulled readonly volume {volume_id}");
+    match parent_ulid {
+        Some(p) => format!("ok {p}"),
+        None => "ok".to_string(),
+    }
+}
+
+/// Synthesize a "now" snapshot for a readonly source volume.
+///
+/// Mirrors the CLI's `create_readonly_snapshot_now`: prefetches indexes,
+/// uploads the snapshot marker, verifies pinned segments are still in S3,
+/// and writes a signed manifest under an ephemeral key in the readonly
+/// volume's directory. Returns `<snap_ulid> <ephemeral_pubkey_hex>`.
+async fn force_snapshot_now_op(
+    args: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> String {
+    use futures::TryStreamExt;
+    use object_store::PutPayload;
+    use object_store::path::Path as StorePath;
+
+    let volume_id = args.trim();
+    if ulid::Ulid::from_string(volume_id).is_err() {
+        return format!("err invalid ULID: {volume_id}");
+    }
+
+    let readonly_dir = data_dir.join("readonly").join(volume_id);
+    if !readonly_dir.exists() {
+        return format!("err readonly volume not found locally: {volume_id}");
+    }
+
+    // Step 1: prefetch indexes from S3.
+    if let Err(e) = elide_coordinator::prefetch::prefetch_indexes(&readonly_dir, store).await {
+        return format!("err prefetching ancestor indexes: {e:#}");
+    }
+
+    // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
+    let index_dir = readonly_dir.join("index");
+    let mut segments: Vec<ulid::Ulid> = Vec::new();
+    let mut max_seg: Option<ulid::Ulid> = None;
+    let entries = match std::fs::read_dir(&index_dir) {
+        Ok(e) => e,
+        Err(e) => return format!("err reading index dir: {e}"),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return format!("err reading index entry: {e}"),
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".idx") else {
+            continue;
+        };
+        if let Ok(u) = ulid::Ulid::from_string(stem) {
+            segments.push(u);
+            if max_seg.is_none_or(|m| u > m) {
+                max_seg = Some(u);
+            }
+        }
+    }
+    let snap = match max_seg {
+        Some(m) => m,
+        None => ulid::Ulid::new(),
+    };
+    let snap_str = snap.to_string();
+
+    // Step 3 + 4: upload marker, verify pinned segments still present.
+    let marker_key = match elide_coordinator::upload::snapshot_key(volume_id, &snap_str) {
+        Ok(k) => k,
+        Err(e) => return format!("err snapshot_key: {e}"),
+    };
+    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
+    let pinned: std::collections::HashSet<ulid::Ulid> = segments.iter().copied().collect();
+
+    if let Err(e) = store.put(&marker_key, PutPayload::from_static(b"")).await {
+        return format!("err uploading snapshot marker: {e}");
+    }
+
+    let objects = match store.list(Some(&seg_prefix)).try_collect::<Vec<_>>().await {
+        Ok(v) => v,
+        Err(e) => return format!("err listing segments for verification: {e}"),
+    };
+    let present: std::collections::HashSet<ulid::Ulid> = objects
+        .iter()
+        .filter_map(|o| o.location.filename())
+        .filter_map(|name| ulid::Ulid::from_string(name).ok())
+        .collect();
+    let mut missing: Vec<ulid::Ulid> = pinned.difference(&present).copied().collect();
+    if !missing.is_empty() {
+        missing.sort();
+        if let Err(e) = store.delete(&marker_key).await {
+            warn!("[inbound] failed to delete stale snapshot marker {snap_str}: {e}");
+        }
+        let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();
+        let extra = missing.len().saturating_sub(preview.len());
+        let suffix = if extra > 0 {
+            format!(" (+{extra} more)")
+        } else {
+            String::new()
+        };
+        return format!(
+            "err force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
+             (owner GC raced us); missing: [{}]{}",
+            missing.len(),
+            pinned.len(),
+            preview.join(", "),
+            suffix,
+        );
+    }
+
+    // Step 5: load-or-create the per-source attestation key.
+    let (signer, vk) = match elide_core::signing::load_or_create_keypair(
+        &readonly_dir,
+        elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
+        elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
+    ) {
+        Ok(s) => s,
+        Err(e) => return format!("err attestation keypair: {e}"),
+    };
+
+    // Step 6: signed manifest + local marker.
+    if let Err(e) =
+        elide_core::signing::write_snapshot_manifest(&readonly_dir, &*signer, &snap, &segments)
+    {
+        return format!("err writing snapshot manifest: {e}");
+    }
+    let snap_dir = readonly_dir.join("snapshots");
+    if let Err(e) = std::fs::create_dir_all(&snap_dir) {
+        return format!("err creating snapshots dir: {e}");
+    }
+    if let Err(e) = std::fs::write(snap_dir.join(&snap_str), b"") {
+        return format!("err writing local marker: {e}");
+    }
+
+    info!(
+        "[inbound] attested now-snapshot {snap_str} for {volume_id} ({} segments)",
+        segments.len()
+    );
+    let pubkey_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    format!("ok {snap_str} {pubkey_hex}")
+}
+
+/// Fork an existing source volume into a new writable volume.
+///
+/// Mirrors the CLI's `fork_volume_at*` + by_name symlink + volume.toml write.
+/// `source_ulid` resolves to either a writable (`by_id/<ulid>/`) or readonly
+/// (`readonly/<ulid>/`) source. `snap` is optional: if omitted, falls back to
+/// `volume::fork_volume` (latest local snapshot). `parent-key` is the hex
+/// ephemeral pubkey from `force-snapshot-now`, recorded in the new fork's
+/// provenance for force-snapshot pins.
+fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
+    let mut iter = args.splitn(3, ' ').map(str::trim);
+    let new_name = match iter.next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string(),
+    };
+    let source_ulid_str = match iter.next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string(),
+    };
+    let rest = iter.next().unwrap_or("");
+
+    if let Err(e) = validate_volume_name(new_name) {
+        return format!("err {e}");
+    }
+    if ulid::Ulid::from_string(source_ulid_str).is_err() {
+        return format!("err invalid source ULID: {source_ulid_str}");
+    }
+
+    // Pull off `snap=<ulid>` and `parent-key=<hex>` first; remaining tokens
+    // go to the transport-flag parser.
+    let mut snap: Option<ulid::Ulid> = None;
+    let mut parent_key: Option<elide_core::signing::VerifyingKey> = None;
+    let mut flag_tokens: Vec<&str> = Vec::new();
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("snap=") {
+            match ulid::Ulid::from_string(v) {
+                Ok(u) => snap = Some(u),
+                Err(e) => return format!("err bad snap ULID {v:?}: {e}"),
+            }
+        } else if let Some(v) = tok.strip_prefix("parent-key=") {
+            let arr = match decode_hex32(v) {
+                Ok(a) => a,
+                Err(e) => return format!("err bad parent-key: {e}"),
+            };
+            match elide_core::signing::VerifyingKey::from_bytes(&arr) {
+                Ok(k) => parent_key = Some(k),
+                Err(e) => return format!("err parent-key not a valid Ed25519 pubkey: {e}"),
+            }
+        } else {
+            flag_tokens.push(tok);
+        }
+    }
+    let patch = match parse_transport_flags(&flag_tokens.join(" ")) {
+        Ok(p) => p,
+        Err(e) => return format!("err {e}"),
+    };
+    if patch.no_nbd || patch.no_ublk {
+        return "err no-nbd / no-ublk are not valid on fork-create".to_string();
+    }
+    let nbd_cfg = if let Some(socket) = patch.nbd_socket {
+        Some(elide_core::config::NbdConfig {
+            socket: Some(socket),
+            ..Default::default()
+        })
+    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
+        Some(elide_core::config::NbdConfig {
+            port: patch.nbd_port,
+            bind: patch.nbd_bind,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    let ublk_cfg = if patch.ublk || patch.ublk_id.is_some() {
+        Some(elide_core::config::UblkConfig {
+            dev_id: patch.ublk_id,
+        })
+    } else {
+        None
+    };
+
+    let by_name_dir = data_dir.join("by_name");
+    let symlink_path = by_name_dir.join(new_name);
+    if symlink_path.exists() {
+        return format!("err volume already exists: {new_name}");
+    }
+
+    // Resolve the source: writable (by_id/) or readonly (readonly/).
+    let by_id_dir = data_dir.join("by_id");
+    let source_dir = elide_core::volume::resolve_ancestor_dir(&by_id_dir, source_ulid_str);
+    if !source_dir.exists() {
+        return format!("err source volume {source_ulid_str} not found locally");
+    }
+
+    let new_vol_ulid = ulid::Ulid::new().to_string();
+    let new_fork_dir = by_id_dir.join(&new_vol_ulid);
+
+    let cleanup = |fork_dir: &Path, link: &Path| {
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(fork_dir);
+    };
+
+    let fork_result: std::io::Result<()> = match (snap, parent_key) {
+        (Some(snap), Some(vk)) => elide_core::volume::fork_volume_at_with_manifest_key(
+            &new_fork_dir,
+            &source_dir,
+            snap,
+            vk,
+        ),
+        (Some(snap), None) => elide_core::volume::fork_volume_at(&new_fork_dir, &source_dir, snap),
+        (None, _) => elide_core::volume::fork_volume(&new_fork_dir, &source_dir),
+    };
+    if let Err(e) = fork_result {
+        cleanup(&new_fork_dir, &symlink_path);
+        return format!("err fork failed: {e}");
+    }
+
+    // Inherit size from source; require it to be set.
+    let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup(&new_fork_dir, &symlink_path);
+            return format!("err reading source volume config: {e}");
+        }
+    };
+    let size = match src_cfg.size {
+        Some(s) => s,
+        None => {
+            cleanup(&new_fork_dir, &symlink_path);
+            return "err source volume has no size (import may not have completed)".to_string();
+        }
+    };
+    if let Err(e) = (elide_core::config::VolumeConfig {
+        name: Some(new_name.to_owned()),
+        size: Some(size),
+        nbd: nbd_cfg,
+        ublk: ublk_cfg,
+    }
+    .write(&new_fork_dir))
+    {
+        cleanup(&new_fork_dir, &symlink_path);
+        return format!("err writing volume config: {e}");
+    }
+    if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
+        cleanup(&new_fork_dir, &symlink_path);
+        return format!("err creating by_name dir: {e}");
+    }
+    if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
+        cleanup(&new_fork_dir, &symlink_path);
+        return format!("err creating by_name symlink: {e}");
+    }
+
+    rescan.notify_one();
+    info!("[inbound] forked volume {new_name} ({new_vol_ulid}) from {source_ulid_str}");
+    format!("ok {new_vol_ulid}")
+}
+
+// ── Volume stop / start ───────────────────────────────────────────────────────
+
+async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
+    let link = data_dir.join("by_name").join(volume_name);
+    if !link.exists() {
+        return format!("err volume not found: {volume_name}");
+    }
+    let vol_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) => return format!("err resolving volume dir: {e}"),
+    };
+
+    if vol_dir.join("volume.readonly").exists() {
+        return "err volume is readonly; nothing to stop".to_string();
+    }
+    if vol_dir.join("volume.stopped").exists() {
+        // Already stopped — idempotent success.
+        return "ok".to_string();
+    }
+
+    // Refuse to stop while an NBD client is connected. ublk volumes have
+    // no NBD client and `connected` will simply return false.
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
+        Some(resp) if resp == "ok true" => {
+            return "err nbd client is connected; disconnect it first".to_string();
+        }
+        _ => {}
+    }
+
+    // Write the marker before sending shutdown so the supervisor won't restart.
+    if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
+        return format!("err writing volume.stopped: {e}");
+    }
+
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
+        Some(resp) if resp == "ok" => {
+            info!("[inbound] stopped volume {volume_name}");
+            "ok".to_string()
+        }
+        Some(resp) => {
+            // Roll back the marker so the supervisor doesn't strand a still-
+            // running volume.
+            let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
+            format!("err shutdown failed: {resp}")
+        }
+        None => {
+            // Volume process wasn't running — marker is correct as-is.
+            info!("[inbound] stopped volume {volume_name} (process was not running)");
+            "ok".to_string()
+        }
+    }
+}
+
+fn start_volume_op(volume_name: &str, data_dir: &Path, rescan: &Notify) -> String {
+    let link = data_dir.join("by_name").join(volume_name);
+    if !link.exists() {
+        return format!("err volume not found: {volume_name}");
+    }
+    let vol_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) => return format!("err resolving volume dir: {e}"),
+    };
+
+    if !vol_dir.join("volume.stopped").exists() {
+        return "err volume is not stopped".to_string();
+    }
+
+    // NBD endpoint conflict check before clearing the marker.
+    match elide_core::config::find_nbd_conflict(&vol_dir, data_dir) {
+        Ok(Some(conflict)) => {
+            return format!(
+                "err nbd endpoint {} conflicts with volume '{}'",
+                conflict.endpoint, conflict.name,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return format!("err nbd conflict check: {e}"),
+    }
+
+    if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+        return format!("err clearing volume.stopped: {e}");
+    }
+    rescan.notify_one();
+    info!("[inbound] started volume {volume_name}");
+    "ok".to_string()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn pid_is_alive(pid: u32) -> bool {
@@ -840,4 +1675,89 @@ fn pid_is_alive(pid: u32) -> bool {
         return false;
     };
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_flags_empty() {
+        let p = parse_transport_flags("").unwrap();
+        assert!(p.nbd_port.is_none());
+        assert!(p.nbd_bind.is_none());
+        assert!(p.nbd_socket.is_none());
+        assert!(!p.no_nbd && !p.ublk && !p.no_ublk);
+        assert!(p.ublk_id.is_none());
+    }
+
+    #[test]
+    fn parse_flags_nbd() {
+        let p = parse_transport_flags("nbd-port=10809 nbd-bind=0.0.0.0").unwrap();
+        assert_eq!(p.nbd_port, Some(10809));
+        assert_eq!(p.nbd_bind.as_deref(), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn parse_flags_ublk() {
+        let p = parse_transport_flags("ublk ublk-id=7").unwrap();
+        assert!(p.ublk);
+        assert_eq!(p.ublk_id, Some(7));
+    }
+
+    #[test]
+    fn parse_flags_clearing() {
+        let p = parse_transport_flags("no-nbd no-ublk").unwrap();
+        assert!(p.no_nbd);
+        assert!(p.no_ublk);
+    }
+
+    #[test]
+    fn parse_flags_unknown_rejected() {
+        assert!(parse_transport_flags("nbd-port=80 unknown=1").is_err());
+        assert!(parse_transport_flags("not-a-flag").is_err());
+    }
+
+    #[test]
+    fn parse_flags_bad_value() {
+        assert!(parse_transport_flags("nbd-port=not-a-number").is_err());
+        assert!(parse_transport_flags("ublk-id=").is_err());
+    }
+
+    #[test]
+    fn validate_name_accepts() {
+        for n in &["foo", "vol-1", "my_vol", "ubuntu.22.04"] {
+            assert!(validate_volume_name(n).is_ok(), "expected ok for {n}");
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects() {
+        assert!(validate_volume_name("").is_err());
+        assert!(validate_volume_name("foo:bar").is_err());
+        assert!(validate_volume_name("foo/bar").is_err());
+        assert!(validate_volume_name("status").is_err());
+        assert!(validate_volume_name("attach").is_err());
+    }
+
+    #[test]
+    fn decode_hex32_roundtrip() {
+        let bytes = [0xAB; 32];
+        let s: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(decode_hex32(&s).unwrap(), bytes);
+    }
+
+    #[test]
+    fn decode_hex32_wrong_length() {
+        assert!(decode_hex32("abcd").is_err());
+        assert!(decode_hex32(&"a".repeat(63)).is_err());
+        assert!(decode_hex32(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn decode_hex32_invalid_chars() {
+        let mut s = "ab".repeat(32);
+        s.replace_range(2..4, "zz");
+        assert!(decode_hex32(&s).is_err());
+    }
 }

@@ -41,6 +41,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const FAST_EXIT_THRESHOLD_SECS: u64 = 5;
 /// Maximum backoff delay after repeated fast failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Volume process exit code signalling "permanent misconfiguration — do not
+/// respawn me". Mirrors `EXIT_CONFIG` in `src/ublk.rs` (BSD `EX_CONFIG`).
+const EXIT_CONFIG: i32 = 78;
 
 /// Supervise a single fork: spawn `elide serve-volume`, restart on exit.
 /// Runs indefinitely; cancel the task to stop supervision.
@@ -126,6 +129,20 @@ pub async fn supervise(
             }
         }
 
+        // ublk requires CAP_SYS_ADMIN; without it the volume process fails to
+        // open /dev/ublk-control and exits in a tight respawn loop. Catch this
+        // before spawning so the user sees a single, actionable log line and
+        // the volume is parked under volume.stopped.
+        if requires_ublk(&fork_dir) && !is_root() {
+            error!(
+                "[supervisor {label}] volume requires --ublk but coordinator is not running as root. \
+                 Rerun the coordinator under sudo (or grant it CAP_SYS_ADMIN), \
+                 or remove the [ublk] section from volume.toml. Marking volume.stopped."
+            );
+            let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+            continue;
+        }
+
         // Check for a running process left by a previous coordinator session.
         if let Some(pid) = read_pid(&fork_dir) {
             if is_alive(pid) {
@@ -147,11 +164,25 @@ pub async fn supervise(
                 info!("[supervisor {label}] started pid {pid}");
                 write_pid(&fork_dir, pid);
                 let started = std::time::Instant::now();
+                let mut config_exit = false;
                 match child.wait().await {
-                    Ok(status) => info!("[supervisor {label}] pid {pid} exited: {status}"),
+                    Ok(status) => {
+                        info!("[supervisor {label}] pid {pid} exited: {status}");
+                        if status.code() == Some(EXIT_CONFIG) {
+                            config_exit = true;
+                        }
+                    }
                     Err(e) => warn!("[supervisor {label}] wait error: {e}"),
                 }
                 remove_pid(&fork_dir);
+                if config_exit {
+                    error!(
+                        "[supervisor {label}] volume reported permanent misconfiguration; \
+                         marking volume.stopped (see preceding line for cause)"
+                    );
+                    let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+                    continue;
+                }
                 if started.elapsed().as_secs() < FAST_EXIT_THRESHOLD_SECS {
                     fast_failures = fast_failures.saturating_add(1);
                     let delay = MAX_BACKOFF.min(Duration::from_secs(1u64 << fast_failures.min(6)));
@@ -255,6 +286,25 @@ fn remove_pid(fork_dir: &Path) {
     let _ = std::fs::remove_file(fork_dir.join(PID_FILE));
 }
 
+/// Returns true if the volume's `volume.toml` declares a `[ublk]` transport.
+/// Missing or unreadable config returns false (no transport configured).
+fn requires_ublk(fork_dir: &Path) -> bool {
+    elide_core::config::VolumeConfig::read(fork_dir)
+        .ok()
+        .and_then(|cfg| cfg.ublk)
+        .is_some()
+}
+
+#[cfg(unix)]
+fn is_root() -> bool {
+    nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +340,32 @@ mod tests {
         write_pid(tmp.path(), u32::MAX);
         let pid = read_pid(tmp.path()).unwrap();
         assert!(!is_alive(pid));
+    }
+
+    #[test]
+    fn requires_ublk_missing_config() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!requires_ublk(tmp.path()));
+    }
+
+    #[test]
+    fn requires_ublk_nbd_only() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("volume.toml"), "[nbd]\nport = 10809\n").unwrap();
+        assert!(!requires_ublk(tmp.path()));
+    }
+
+    #[test]
+    fn requires_ublk_with_section() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("volume.toml"), "[ublk]\n").unwrap();
+        assert!(requires_ublk(tmp.path()));
+    }
+
+    #[test]
+    fn requires_ublk_with_dev_id() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("volume.toml"), "[ublk]\ndev_id = 7\n").unwrap();
+        assert!(requires_ublk(tmp.path()));
     }
 }

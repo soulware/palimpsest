@@ -301,3 +301,122 @@ pub fn delete_volume(socket_path: &Path, name: &str) -> io::Result<()> {
         _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
     }
 }
+
+/// Stop a volume's supervised process. Coordinator writes the stopped marker
+/// and forwards `shutdown` to the volume's control socket. Both the marker
+/// file and that socket are root-owned when the coordinator runs under sudo,
+/// so this path is what makes `volume stop` work for non-root CLI callers.
+pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
+    let resp = call(socket_path, &format!("stop {name}"))?;
+    match resp.split_once(' ') {
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ if resp == "ok" => Ok(()),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Start a previously-stopped volume. Coordinator clears `volume.stopped`
+/// and triggers a rescan so the supervisor relaunches the process.
+pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<()> {
+    let resp = call(socket_path, &format!("start {name}"))?;
+    match resp.split_once(' ') {
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ if resp == "ok" => Ok(()),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Create a fresh writable volume. Returns the new volume's ULID. Routes
+/// through the coordinator so a sudo'd coordinator can create root-owned
+/// state on behalf of a non-root CLI invocation.
+pub fn create_volume_remote(
+    socket_path: &Path,
+    name: &str,
+    size_bytes: u64,
+    flags: &[String],
+) -> io::Result<String> {
+    let mut line = format!("create {name} {size_bytes}");
+    for f in flags {
+        line.push(' ');
+        line.push_str(f);
+    }
+    let resp = call(socket_path, &line)?;
+    match resp.split_once(' ') {
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        Some(("ok", ulid)) => Ok(ulid.to_owned()),
+        _ if resp == "ok" => Ok(String::new()),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Update transport configuration on an existing volume. Returns "restarting"
+/// if the running volume process was signalled to pick up the new config, or
+/// "not-running" if it wasn't running.
+pub fn update_volume(socket_path: &Path, name: &str, flags: &[String]) -> io::Result<String> {
+    let mut line = format!("update {name}");
+    for f in flags {
+        line.push(' ');
+        line.push_str(f);
+    }
+    let resp = call(socket_path, &line)?;
+    match resp.split_once(' ') {
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        Some(("ok", note)) => Ok(note.to_owned()),
+        _ if resp == "ok" => Ok(String::new()),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Pull one volume's readonly skeleton from the store via the coordinator.
+/// Returns the parent ULID (for the ancestor walk), or `None` for a root.
+pub fn pull_readonly(socket_path: &Path, vol_ulid: &str) -> io::Result<Option<String>> {
+    let resp = call(socket_path, &format!("pull-readonly {vol_ulid}"))?;
+    match resp.split_once(' ') {
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        Some(("ok", parent)) if !parent.is_empty() => Ok(Some(parent.to_owned())),
+        _ if resp == "ok" => Ok(None),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Synthesize a "now" snapshot for a readonly source. Returns
+/// `(snap_ulid, ephemeral_pubkey_hex)`.
+pub fn force_snapshot_now(socket_path: &Path, vol_ulid: &str) -> io::Result<(String, String)> {
+    let resp = call(socket_path, &format!("force-snapshot-now {vol_ulid}"))?;
+    if let Some(("err", msg)) = resp.split_once(' ') {
+        return Err(io::Error::other(msg.to_owned()));
+    }
+    let mut parts = resp.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("ok"), Some(snap), Some(pubkey)) => Ok((snap.to_owned(), pubkey.to_owned())),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Fork a new writable volume from a local source. Returns the new volume ULID.
+pub fn fork_create(
+    socket_path: &Path,
+    new_name: &str,
+    source_ulid: &str,
+    snap: Option<&str>,
+    parent_key_hex: Option<&str>,
+    flags: &[String],
+) -> io::Result<String> {
+    let mut line = format!("fork-create {new_name} {source_ulid}");
+    if let Some(s) = snap {
+        line.push_str(&format!(" snap={s}"));
+    }
+    if let Some(k) = parent_key_hex {
+        line.push_str(&format!(" parent-key={k}"));
+    }
+    for f in flags {
+        line.push(' ');
+        line.push_str(f);
+    }
+    let resp = call(socket_path, &line)?;
+    match resp.split_once(' ') {
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        Some(("ok", ulid)) => Ok(ulid.to_owned()),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}

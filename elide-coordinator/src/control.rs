@@ -333,6 +333,14 @@ fn parse_compaction_stats(fork_dir: &Path, response: Option<String>) -> Option<C
     })
 }
 
+/// Send `op` to the volume's control socket from the coordinator binary's
+/// inbound IPC handlers. Thin wrapper around the private [`call`] so its
+/// internal helpers remain private. Public because the coordinator bin and
+/// lib are distinct crates within the same package.
+pub async fn call_for_inbound(fork_dir: &Path, op: &str) -> Option<String> {
+    call(fork_dir, op).await
+}
+
 /// Send `op` to the control socket.  Returns the full response line (including
 /// the "ok"/"err" prefix) on success, or `None` if the socket is absent or
 /// any I/O error occurs.
