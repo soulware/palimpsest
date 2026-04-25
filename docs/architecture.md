@@ -631,10 +631,46 @@ Step 4 delegates to a `CredentialIssuer` selected at coordinator startup from `c
 |---|---|---|
 | AWS S3 | STS `AssumeRole` with a session policy narrowing `s3:GetObject` to `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` | Session duration 15 min – 12 h; the coordinator's own role needs `sts:AssumeRole` on a dedicated read-only role |
 | S3-compatible with STS (e.g. MinIO, Ceph RGW/STS) | `AssumeRole` against the backend's STS endpoint with the same session policy | Compatibility varies by backend; the session policy shape is the portable part |
-| S3-compatible without STS | Coordinator returns its own configured read-only key pair with no per-volume scoping | Defense-in-depth only — the coordinator must be configured with a distinct read-only key, not the upload key. Logged as a downgrade at coordinator startup. |
+| S3-compatible with IAM-keyed policies (e.g. Tigris) | Mint a per-volume access key via `CreateAccessKey`, attach a policy granting `s3:GetObject` on `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` with a `DateLessThan` condition for time-bounding | See *Issuer: Tigris-native* below. Coordinator's admin key needs `iam:CreateAccessKey` / `iam:DeleteAccessKey` / `iam:PutAccessKeyPolicy`; per-volume keys themselves remain narrowly scoped. |
+| S3-compatible without STS or per-key IAM | Coordinator returns its own configured read-only key pair with no per-volume scoping | Defense-in-depth only — the coordinator must be configured with a distinct read-only key, not the upload key. Logged as a downgrade at coordinator startup. |
 | Local filesystem (`elide_store/`) | No-op issuer — returns a sentinel the volume's fetcher treats as "no auth needed" | Used for tests and single-host deployments |
 
 The volume never negotiates the backend type. It treats the returned triple as opaque and passes it to `object_store`; the no-op sentinel is detected by the fetcher and skips signing entirely.
+
+### Issuer: Tigris-native (no STS, IAM-policied keys)
+
+Tigris does not implement STS, but its IAM API supports per-access-key policies, programmatic key management, and time-bounded `Date*` conditions. This is enough to provide per-volume credential scoping without falling back to a shared key.
+
+On a `credentials` request, the issuer:
+
+1. Calls `CreateAccessKey` against Tigris's IAM endpoint, authenticated with an admin key configured in `coordinator.toml`.
+2. Attaches a policy to the new key:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Action": ["s3:GetObject"],
+       "Resource": ["arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*"],
+       "Condition": {
+         "DateLessThan": {"aws:CurrentTime": "<now + lifetime>"}
+       }
+     }]
+   }
+   ```
+
+3. Returns `ok <access-key> <secret-key> "" <expiry-unix>` — the session-token slot is empty; the expiry comes from the policy condition, not from the credential material itself.
+
+The key remains usable until the `DateLessThan` deadline passes, after which Tigris rejects all signatures regardless of policy attachment or clock state. Refresh follows the path described in *Refresh and clock skew*: the volume re-issues `credentials` ahead of expiry, the coordinator mints a fresh key with an extended deadline, and the previous key is scheduled for `DeleteAccessKey` after a short grace period (e.g. 60 s) to cover signed requests already in flight.
+
+**Coordinator privilege.** Unlike the AWS-STS path (which only needs `sts:AssumeRole` on a single read-only role), the Tigris-native issuer requires the coordinator's admin key to hold `iam:CreateAccessKey`, `iam:DeleteAccessKey`, and `iam:PutAccessKeyPolicy`. This is a strictly stronger privilege set than today's S3 RW key, and the admin key must be guarded accordingly. Per-volume keys minted by it remain narrowly scoped — only the admin key itself is privileged.
+
+**Eventual consistency.** Newly created access keys may take a brief window (typically sub-second) before signed requests using them succeed. The fetcher's existing 403-retry-with-refresh path absorbs this; no separate logic is needed.
+
+**Quota.** Tigris does not document a per-organization access-key cap. For deployments managing thousands of concurrent volumes per coordinator this should be verified before relying on per-volume keys at scale; for tens of volumes it is not a concern.
+
+**Standalone-mode shortcut.** When the operator does not need per-volume scoping (single-tenant dev, no untrusted volumes), the same Tigris account can be used with the *S3-compatible without STS or per-key IAM* row above — i.e. a single static read-only key shared across volumes. The Tigris-native issuer is the per-volume upgrade path, not a requirement.
 
 ### Token lifetime
 
