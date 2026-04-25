@@ -344,6 +344,54 @@ Default TBD. An operator knob exposed through the volume (or
 coordinator) config is the right shape; the coordinator applies it
 when minting markers and when reaping.
 
+### Retention economics
+
+A counterintuitive consequence: GC during the retention window
+*defers* space reclamation rather than driving it. An input segment
+compacted at time t becomes reapable at t + T, not t. Throughout
+[t, t+T] the input exists alongside its compacted output, so total
+storage briefly carries both.
+
+**Steady state.** If GC consumes input bytes at rate C (bytes/sec),
+there is `C × T` bytes of in-flight retained inputs at any moment.
+This term is invariant to GC frequency: doubling the frequency at
+the same per-batch size doubles C and the retention term; halving
+per-batch size at the same frequency keeps C constant. Total storage
+is approximately:
+
+```
+live_data + post_compaction_outputs + (C × T)
+```
+
+**How the knobs interact:**
+
+| Knob | Effect on retention overhead |
+|---|---|
+| `pending_delete_retention` (T) | Linear. Halving T halves the in-flight term. Lower bound is whatever replicas need to catch up; below that the guarantee is meaningless. |
+| `gc.density_threshold` | Indirect, via what's worth compacting. A lower threshold (compact only mostly-dead) means input bytes >> output bytes — savings dominate retention overhead. A higher threshold (compact mostly-live) means input ≈ output — retention overhead is ~2× the throughput for marginal savings. |
+| `gc.interval_secs` | Batch granularity only. Steady-state retention overhead is unchanged. |
+
+**Tombstone handoffs are the optimal case.** A 100%-dead input
+compacted to a zero-entry GC output has input bytes ≈ retention
+overhead and post-T reclamation = 100% of the input. The bytes that
+would have been retained anyway are retained *explicitly*, with no
+new compaction-output cost added.
+
+**The small-segment branch** of the current GC strategy
+(`docs/operations.md` *Per-tick selection*) admits small segments at
+any density to consolidate into 32 MiB outputs. Under retention
+semantics, that pays retention overhead for marginal compaction
+savings when the small segments are dense. The tradeoff is workload-
+dependent — not a correctness issue, just economics.
+
+**The intuitive "GC frees space" model is wrong** during the retention
+window. Under retention, GC's role is more like a smoothing filter
+between dead-byte accumulation and physical deletion: dead bytes
+accumulate at rate D, GC moves them through the retention pipeline at
+rate C ≥ D, the pipeline holds `C × T` bytes, and reclamation happens
+at rate C lagged by T. Tuning is about balancing the pipeline depth
+against the volume's tolerance for dead-byte accumulation in `live_data`.
+
 ### Naming clarification
 
 "Tombstone" already means something specific in Elide: a zero-entry GC
