@@ -156,14 +156,14 @@ enum UblkCommand {
 
 #[derive(Subcommand)]
 enum VolumeCommand {
-    /// List volumes in the data directory (writable by default)
+    /// List volumes in the data directory (all by default)
     List {
         /// List only readonly volumes (imported bases)
-        #[arg(long, conflicts_with = "all")]
-        readonly: bool,
-        /// List all volumes (writable and readonly)
+        #[arg(long, conflicts_with = "rw")]
+        ro: bool,
+        /// List only writable volumes
         #[arg(long)]
-        all: bool,
+        rw: bool,
     },
 
     /// Show a human-readable summary of a volume
@@ -443,13 +443,13 @@ fn main() {
 
     match args.command {
         Command::Volume { command } => match command {
-            VolumeCommand::List { readonly, all } => {
-                let filter = if all {
-                    ListFilter::All
-                } else if readonly {
+            VolumeCommand::List { ro, rw } => {
+                let filter = if ro {
                     ListFilter::Readonly
-                } else {
+                } else if rw {
                     ListFilter::Writable
+                } else {
+                    ListFilter::All
                 };
                 if let Err(e) = list_volumes(&args.data_dir, &socket_path, filter) {
                     eprintln!("error: {e}");
@@ -988,6 +988,8 @@ enum ListFilter {
 
 struct VolumeRow {
     name: String,
+    ulid: String,
+    mode: &'static str,
     state: &'static str,
     transport: String,
     pid: String,
@@ -1022,7 +1024,7 @@ fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std:
                 if !include {
                     continue;
                 }
-                rows.push(volume_row(name, &vol_dir, coordinator_up));
+                rows.push(volume_row(name, &vol_dir, is_readonly, coordinator_up));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1037,6 +1039,8 @@ fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std:
         return Ok(());
     }
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+    let ulid_w = rows.iter().map(|r| r.ulid.len()).max().unwrap_or(4).max(4);
+    let mode_w = 4;
     let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
     let transport_w = rows
         .iter()
@@ -1045,13 +1049,13 @@ fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std:
         .unwrap_or(9)
         .max(9);
     println!(
-        "{:<name_w$}  {:<state_w$}  {:<transport_w$}  PID",
-        "NAME", "STATE", "TRANSPORT"
+        "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<transport_w$}  PID",
+        "NAME", "ULID", "MODE", "STATE", "TRANSPORT"
     );
     for r in &rows {
         println!(
-            "{:<name_w$}  {:<state_w$}  {:<transport_w$}  {}",
-            r.name, r.state, r.transport, r.pid
+            "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<transport_w$}  {}",
+            r.name, r.ulid, r.mode, r.state, r.transport, r.pid
         );
     }
     if !coordinator_up {
@@ -1078,11 +1082,20 @@ fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std:
 /// which marker happens to be on disk, so collapsing to `-` plus a footer line
 /// (printed by the caller) keeps the table honest. Transport stays populated
 /// — it reflects static config, not lifecycle.
-fn volume_row(name: String, vol_dir: &Path, coordinator_up: bool) -> VolumeRow {
+fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: bool) -> VolumeRow {
     let transport = transport_summary(vol_dir);
+    let ulid = vol_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let mode = if is_readonly { "ro" } else { "rw" };
     if !coordinator_up {
         return VolumeRow {
             name,
+            ulid,
+            mode,
             state: "-",
             transport,
             pid: "-".to_owned(),
@@ -1103,6 +1116,8 @@ fn volume_row(name: String, vol_dir: &Path, coordinator_up: bool) -> VolumeRow {
         .unwrap_or_else(|| "-".to_owned());
     VolumeRow {
         name,
+        ulid,
+        mode,
         state,
         transport,
         pid,
