@@ -59,6 +59,13 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     };
     let store_config = Arc::new(config.store.clone());
 
+    std::fs::create_dir_all(data_dir.as_ref())
+        .with_context(|| format!("creating data_dir: {}", data_dir.display()))?;
+    std::fs::create_dir_all(data_dir.join("by_id"))
+        .with_context(|| format!("creating by_id dir under {}", data_dir.display()))?;
+    std::fs::create_dir_all(data_dir.join("by_name"))
+        .with_context(|| format!("creating by_name dir under {}", data_dir.display()))?;
+
     // Load (or generate on first start) the macaroon root key and select
     // the credential issuer. Both are needed by the inbound socket to
     // serve `register` and `credentials`.
@@ -72,13 +79,6 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         config.drain.scan_interval_secs,
         elide_bin.display(),
     );
-
-    std::fs::create_dir_all(data_dir.as_ref())
-        .with_context(|| format!("creating data_dir: {}", data_dir.display()))?;
-    std::fs::create_dir_all(data_dir.join("by_id"))
-        .with_context(|| format!("creating by_id dir under {}", data_dir.display()))?;
-    std::fs::create_dir_all(data_dir.join("by_name"))
-        .with_context(|| format!("creating by_name dir under {}", data_dir.display()))?;
 
     // Reconcile by_name/ against by_id/: remove symlinks whose target no longer
     // exists, add missing symlinks for volumes that have a volume.name file.
