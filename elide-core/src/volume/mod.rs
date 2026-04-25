@@ -45,22 +45,25 @@ use crate::{
     writelog,
 };
 
+mod fork;
 mod jobs;
 mod readonly;
 mod reclaim;
 mod repack;
+mod wal;
 
+pub use fork::{fork_volume, fork_volume_at, fork_volume_at_with_manifest_key};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
     GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteJob, PromoteResult,
     PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob,
     SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
+use readonly::open_read_state;
 pub use readonly::{
-    ReadonlyVolume, fork_volume, fork_volume_at, fork_volume_at_with_manifest_key, latest_snapshot,
-    resolve_ancestor_dir, verify_ancestor_manifests, walk_ancestors, walk_extent_ancestors,
+    ReadonlyVolume, latest_snapshot, resolve_ancestor_dir, verify_ancestor_manifests,
+    walk_ancestors, walk_extent_ancestors,
 };
-use readonly::{create_fresh_wal, open_read_state, recover_wal, replay_wal_records};
 pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
     scan_reclaim_candidates,
@@ -70,6 +73,7 @@ pub use repack::{
     RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry, RepackedSegment, SweepJob,
     SweepResult, SweptDeadEntry, SweptLiveEntry,
 };
+use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
 /// Compute the Shannon entropy of `data` in bits per byte.
 ///
