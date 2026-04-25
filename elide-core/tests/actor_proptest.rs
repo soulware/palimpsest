@@ -452,3 +452,124 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     new_handle.shutdown();
     new_actor_thread.join().unwrap();
 }
+
+/// Regression for proptest seed
+/// `cc 6e32d1e5e82fa03579895678c898dcf2b583e3dbd8a97c34a6f14dac42b6375a`.
+///
+/// Sequence (minimal shrunk form from the proptest):
+///
+/// ```text
+/// Write { lba: 0, seed: 0 }
+/// CoordGcLocal { n: 2 }
+/// Write { lba: 1, seed: 1 }
+/// Write { lba: 4, seed: 2 }
+/// Reclaim { start_lba: 0, lba_count: 1 }
+/// Write { lba: 4, seed: 0 }
+/// SweepPending
+/// DrainLocal
+/// CoordGcLocal { n: 2 }
+/// ```
+///
+/// After the second `CoordGcLocal`, LBA 1 reads back all-zeros instead
+/// of [1; 4096].
+#[test]
+fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
+    use std::collections::HashMap;
+    use std::thread;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+    let (actor, handle) = elide_core::actor::spawn(vol);
+    let actor_thread = thread::Builder::new()
+        .name("volume-actor".into())
+        .spawn(move || actor.run())
+        .unwrap();
+
+    let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
+
+    // Step 1: Write{lba:0, seed:0} → WAL DATA(lba:0, hash0)
+    handle.write(0, vec![0u8; 4096]).unwrap();
+    oracle.insert(0, [0u8; 4096]);
+
+    // Step 2: CoordGcLocal{2} — gc_checkpoint flushes WAL → pending/u_flush_a;
+    //   index/ empty, simulate returns None; apply_gc_handoffs no-op.
+    let gc_ulid = handle.gc_checkpoint().unwrap();
+    let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
+        .map(|(_, _, paths)| paths)
+        .unwrap_or_default();
+    handle.apply_gc_handoffs().unwrap();
+    for path in &to_delete {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Step 3: Write{lba:1, seed:1} → WAL DATA(lba:1, hash1)
+    handle.write(1, vec![1u8; 4096]).unwrap();
+    oracle.insert(1, [1u8; 4096]);
+
+    // Step 4: Write{lba:4, seed:2} → WAL DATA(lba:4, hash2)
+    handle.write(4, vec![2u8; 4096]).unwrap();
+    oracle.insert(4, [2u8; 4096]);
+
+    // Step 5: Reclaim{start_lba:0, lba_count:1} — reclaim_alias_merge over
+    //   only LBA 0. flush_wal first → pending/u_flush_b carrying
+    //   (lba:1,hash1) + (lba:4,hash2). Reclaim is a no-op for a single-entry
+    //   range, so no new pending segment is written.
+    handle.reclaim_alias_merge(0, 1).unwrap();
+
+    // Step 6: Write{lba:4, seed:0} — hash0 already indexed → WAL
+    //   DEDUP_REF(lba:4, hash0).
+    handle.write(4, vec![0u8; 4096]).unwrap();
+    oracle.insert(4, [0u8; 4096]);
+
+    // Step 7: SweepPending — merges the two small pending segments into
+    //   a single output named with the max input ULID (u_flush_b),
+    //   atomically replacing pending/u_flush_b. Crucially, the new file
+    //   has the same entry count and similar inline-body sizes as the
+    //   old pending/u_flush_b, so the file length is unchanged — which
+    //   matters for the SegmentIndexCache key below.
+    handle.sweep_pending().unwrap();
+
+    // Step 8: DrainLocal — promotes remaining pending → index/. This is
+    //   where the old bug surfaced: execute_promote_segment consults the
+    //   SegmentIndexCache (keyed by (path, file_len)) and, because the
+    //   file length matches, gets back a stale ParsedIndex describing
+    //   the pre-sweep entries. apply_promote_segment_result then
+    //   overwrote the extent index for hash1 with stale offsets,
+    //   pointing reads of LBA 1 at the wrong inline bytes.
+    common::drain_via_handle(&handle, fork_dir);
+
+    // Step 9: CoordGcLocal{2} — second GC pass. Only one segment in
+    //   index/, so simulate_coord_gc_local returns None and this is a
+    //   no-op for the bug — the corruption already happened in step 8,
+    //   the proptest assertion just happens to fire here.
+    let gc_ulid2 = handle.gc_checkpoint().unwrap();
+    let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
+        .map(|(_, _, paths)| paths)
+        .unwrap_or_default();
+    handle.apply_gc_handoffs().unwrap();
+    for path in &to_delete2 {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Assertion: every oracle LBA still reads back its written value.
+    for (&lba, expected) in &oracle {
+        let actual = handle.reader().read(lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {lba} wrong after second gc handoff",
+        );
+    }
+
+    handle.shutdown();
+    actor_thread.join().unwrap();
+}
