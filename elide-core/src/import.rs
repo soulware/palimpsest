@@ -43,37 +43,6 @@ const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
 /// the last fragment in a batch may push slightly past it.
 const IMPORT_SEGMENT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB raw
 
-fn shannon_entropy(data: &[u8]) -> f64 {
-    let mut counts = [0u32; 256];
-    for &b in data {
-        counts[b as usize] += 1;
-    }
-    let len = data.len() as f64;
-    counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = c as f64 / len;
-            -p * p.log2()
-        })
-        .sum()
-}
-
-/// Attempt lz4 compression on a byte buffer.
-///
-/// Returns `Some(compressed)` only if entropy is below 7.0 bits/byte and the
-/// result achieves at least a 1.5× ratio; otherwise returns `None` (store raw).
-fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
-    if shannon_entropy(data) > 7.0 {
-        return None;
-    }
-    let compressed = lz4_flex::compress_prepend_size(data);
-    if compressed.len() * 3 / 2 >= data.len() {
-        return None;
-    }
-    Some(compressed)
-}
-
 /// Write `entries` to `pending/<ulid>` using the standard tmp-rename commit.
 /// Clears `entries` on success. Returns the ULID used, or `None` if there
 /// was nothing to write.
@@ -115,7 +84,7 @@ fn make_entry(
             raw_bytes: 0,
         };
     }
-    let (flags, data) = match maybe_compress(body) {
+    let (flags, data) = match crate::volume::maybe_compress(body) {
         Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
         None => (SegmentFlags::empty(), body.to_vec()),
     };
