@@ -105,11 +105,11 @@ fn init_config(path: &std::path::Path, force: bool) -> Result<()> {
             path.display()
         );
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent directory: {}", parent.display()))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory: {}", parent.display()))?;
     }
     std::fs::write(path, config::DEFAULT_CONFIG_TEMPLATE)
         .with_context(|| format!("writing config: {}", path.display()))?;
