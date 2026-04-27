@@ -31,15 +31,23 @@
 //! **Shutdown-park.** The device is always added with
 //! `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`. SIGTERM/SIGINT/
 //! SIGHUP and crashes (SIGKILL, OOM, panic) are treated identically: the
-//! daemon stops, run_target's STOP_DEV transitions the kernel device to
-//! QUIESCED, and we deliberately do NOT del_dev. The kernel buffers
-//! in-flight I/O; mounts on `/dev/ublkb<N>` stay valid; the sysfs entry
-//! and `ublk.id` persist. Re-running `elide serve-volume --ublk` sees
-//! `ublk.id` + the existing `/sys/class/ublk-char/ublkcN` entry, issues
-//! `START_USER_RECOVERY`, reattaches fresh queue rings, and completes
-//! with `END_USER_RECOVERY` — the kernel then reissues buffered I/O to
-//! the new daemon. WAL idempotence + lowest-ULID-wins already handles
-//! duplicate writes, so reissue is safe.
+//! daemon process exits without calling `STOP_DEV` or `DEL_DEV`. The
+//! kernel's monitor work observes the io_uring fds close and, with
+//! `UBLK_F_USER_RECOVERY` set, transitions the device LIVE → QUIESCED
+//! (it does **not** transition there via STOP_DEV — that always goes to
+//! DEAD). The kernel buffers in-flight I/O; mounts on `/dev/ublkb<N>`
+//! stay valid; the sysfs entry and `ublk.id` persist. Re-running
+//! `elide serve-volume --ublk` sees `ublk.id` + the existing
+//! `/sys/class/ublk-char/ublkcN` entry, issues `START_USER_RECOVERY`,
+//! reattaches fresh queue rings, and completes with `END_USER_RECOVERY`
+//! — the kernel then reissues buffered I/O to the new daemon. WAL
+//! idempotence + lowest-ULID-wins already handles duplicate writes, so
+//! reissue is safe.
+//!
+//! Before exiting on a graceful signal the watcher fsyncs the WAL via
+//! `VolumeClient::flush` (bounded by a watchdog timer) so any write the
+//! actor accepted is durable. Anything still in flight is reissued by
+//! the kernel on the next `START_USER_RECOVERY`.
 //!
 //! Deletion is an explicit verb: `elide ublk delete <id>`, or the
 //! coordinator's startup reconciliation sweep (which deletes orphan
@@ -103,15 +111,16 @@ mod imp {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use crossbeam_channel::{Receiver, Sender, unbounded};
     use libublk::BufDesc;
     use libublk::UblkError;
     use libublk::UblkFlags;
     use libublk::UblkUringData;
-    use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder, ublk_init_ctrl_task_ring};
+    use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
     use libublk::helpers::IoBuf;
     use libublk::io::{UblkDev, UblkQueue};
     use libublk::uring_async::ublk_submit_sqe_async;
@@ -316,6 +325,11 @@ mod imp {
         s
     }
 
+    /// How long to give the volume actor to fsync the WAL on graceful
+    /// shutdown before forcing the process to exit anyway. Bounded so a
+    /// wedged actor cannot trap the operator.
+    const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
     /// Spawn the ublk-signal watcher thread.
     ///
     /// The caller MUST have already blocked the shutdown signals on the
@@ -323,46 +337,37 @@ mod imp {
     /// thread inherits the block and only this watcher reads the signals
     /// (via `signalfd`).
     ///
-    /// The watcher loops:
-    ///   1. Block on `signalfd::read_signal`. Any of the masked signals
-    ///      wakes it.
-    ///   2. Consult `slot`:
-    ///      - `Some(ctrl)` → `kill_dev` to unblock `run_target`'s
-    ///        queue-thread join. STOP_DEV moves the device to QUIESCED;
-    ///        per the shutdown-park policy the main thread does NOT
-    ///        del_dev or clear `ublk.id` on the way out — the device is
-    ///        left parked for the next serve to recover.
-    ///      - `None` → no live device (uninterruptible startup phase like
-    ///        `start_user_recover`, or shutdown is already past
-    ///        `run_target`). Exit the process directly so the user is
-    ///        never trapped.
-    ///   3. Once the watcher has asked the device to stop, any further
-    ///      signal means "give up, just die" → `process::exit`.
+    /// On signal the watcher does NOT call `kill_dev`. The kernel ublk
+    /// state machine treats `STOP_DEV` as the explicit "tear it down"
+    /// verb and transitions the device to `DEAD` regardless of
+    /// `UBLK_F_USER_RECOVERY` — there is no "STOP_DEV but go to QUIESCED"
+    /// path. To leave the device parked in `QUIESCED` (so the next serve
+    /// can `START_USER_RECOVERY` it without re-adding) the daemon must
+    /// simply exit: the kernel's monitor work observes the io_uring fds
+    /// close and, with `UBLK_F_USER_RECOVERY` set on the device,
+    /// transitions `LIVE` → `QUIESCED`.
     ///
-    /// `kill_dev` uses a thread-local libublk control ring, which is
-    /// initialised on this thread before entering the read loop.
-    fn spawn_ublk_signal_watcher(
-        slot: Arc<Mutex<Option<Arc<UblkCtrl>>>>,
-    ) -> io::Result<std::thread::JoinHandle<()>> {
+    /// Sequence on first signal:
+    ///   1. Spawn a watchdog thread that force-exits after
+    ///      `SHUTDOWN_FLUSH_TIMEOUT` so a wedged actor cannot block exit.
+    ///   2. Best-effort `client.flush()` (a durability barrier that fsyncs
+    ///      the WAL and waits for any in-flight promote's old-WAL fsync).
+    ///      Anything the actor accepted before this call is durable;
+    ///      anything still in flight after it is reissued by the kernel
+    ///      from its `UBLK_F_USER_RECOVERY_REISSUE` buffer on next serve.
+    ///   3. `process::exit(0)`. Queue threads, control socket, actor
+    ///      thread are all killed; their fds are reaped by the kernel,
+    ///      the io_uring fds close, and the kernel parks the device.
+    ///
+    /// A second signal short-circuits to `process::exit(130)` so an
+    /// impatient operator is never trapped.
+    fn spawn_ublk_signal_watcher(client: VolumeClient) -> io::Result<std::thread::JoinHandle<()>> {
         let sfd = nix::sys::signalfd::SignalFd::new(&shutdown_sigset())
             .map_err(|e| io::Error::other(format!("signalfd: {e}")))?;
         std::thread::Builder::new()
             .name("ublk-signal".into())
             .spawn(move || {
-                if let Err(e) = ublk_init_ctrl_task_ring(|opt| {
-                    if opt.is_none() {
-                        *opt = Some(
-                            io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
-                                .build(32)
-                                .map_err(libublk::UblkError::IOError)?,
-                        );
-                    }
-                    Ok(())
-                }) {
-                    tracing::error!("ublk-signal ctrl ring init failed: {e}");
-                    std::process::exit(130);
-                }
-                let mut killed = false;
+                let mut shutting_down = false;
                 loop {
                     match sfd.read_signal() {
                         Ok(Some(_)) => {}
@@ -377,21 +382,37 @@ mod imp {
                             std::process::exit(130);
                         }
                     }
-                    if killed {
-                        // Operator pressed Ctrl-C twice (or sent a second
-                        // SIGTERM). Honour "really mean it, just die".
+                    if shutting_down {
+                        // Second signal (Ctrl-C twice / repeated SIGTERM).
+                        // The flush is already in progress in the main
+                        // path of this thread; it has not returned, so
+                        // we are stuck somewhere. Honour "just die."
                         std::process::exit(130);
                     }
-                    let guard = slot.lock().expect("sig_ctrl poisoned");
-                    match guard.as_ref() {
-                        Some(c) => {
-                            if let Err(e) = c.kill_dev() {
-                                tracing::error!("ublk kill_dev on signal failed: {e}");
-                            }
-                            killed = true;
-                        }
-                        None => std::process::exit(130),
+                    shutting_down = true;
+
+                    // Watchdog: if the flush stalls (actor wedged, disk
+                    // unresponsive), force-exit after a bounded wait so
+                    // the kernel can park the device on its own. The
+                    // watchdog races the flush below; whichever calls
+                    // process::exit first wins.
+                    let _watchdog = std::thread::Builder::new()
+                        .name("ublk-shutdown-watchdog".into())
+                        .spawn(|| {
+                            std::thread::sleep(SHUTDOWN_FLUSH_TIMEOUT);
+                            tracing::warn!(
+                                "ublk shutdown flush did not complete within {:?}; \
+                                 exiting anyway — kernel will park the device on \
+                                 daemon-exit detection",
+                                SHUTDOWN_FLUSH_TIMEOUT
+                            );
+                            std::process::exit(0);
+                        });
+
+                    if let Err(e) = client.flush() {
+                        tracing::warn!("ublk shutdown flush: {e}");
                     }
+                    std::process::exit(0);
                 }
             })
             .map_err(io::Error::other)
@@ -436,12 +457,12 @@ mod imp {
 
         // Spawn the signal watcher before any potentially-blocking ioctl
         // (in particular `start_user_recover`, which retries on EBUSY for
-        // up to 30s). The watcher consults a shared slot: if a live ctrl
-        // is registered, kill_dev unwinds `run_target`; if the slot is
-        // still empty (startup, recovery probe, etc.) the watcher exits
-        // the process directly so the user is never trapped.
-        let sig_ctrl: Arc<Mutex<Option<Arc<UblkCtrl>>>> = Arc::new(Mutex::new(None));
-        let _sig_watcher = spawn_ublk_signal_watcher(Arc::clone(&sig_ctrl))?;
+        // up to 30s). On signal the watcher fsyncs the WAL and exits the
+        // process directly — STOP_DEV/del_dev are deliberately not used,
+        // so the kernel's daemon-exit detection parks the device in
+        // QUIESCED for the next serve to recover. See
+        // `docs/design-ublk-shutdown-park.md`.
+        let _sig_watcher = spawn_ublk_signal_watcher(client.clone())?;
 
         let persisted_id = read_ublk_id(dir)?;
         let (target_id, recovering) = match plan_route(persisted_id, dev_id, ublk_device_exists) {
@@ -530,11 +551,6 @@ mod imp {
                 .map_err(|e| classify_build_error(e, target_id, recovering))?,
         );
 
-        // Publish the live ctrl so the ublk-signal watcher can kill_dev
-        // it on SIGINT/SIGTERM/SIGHUP. kill_dev triggers STOP_DEV, which
-        // unblocks run_target's queue-thread join.
-        *sig_ctrl.lock().expect("sig_ctrl poisoned") = Some(Arc::clone(&ctrl));
-
         let tgt_init = move |dev: &mut UblkDev| {
             set_params(dev, size_bytes);
             Ok(())
@@ -569,49 +585,15 @@ mod imp {
             println!("[ublk device ready: /dev/ublkb{id}]");
         };
 
-        let run_result = ctrl
-            .run_target(tgt_init, q_handler, wait_hook)
-            .map_err(|e| io::Error::other(format!("ublk run_target: {e}")));
-
-        // Clear the slot now that run_target has returned: any subsequent
-        // signal should exit the process directly rather than kill_dev a
-        // ctrl that has already been parked.
-        *sig_ctrl.lock().expect("sig_ctrl poisoned") = None;
-
-        // Shutdown-park policy (see docs/design-ublk-shutdown-park.md):
-        //
-        // run_target's STOP_DEV has already transitioned the kernel device
-        // to QUIESCED. We deliberately do NOT del_dev here. With
-        // UBLK_F_USER_RECOVERY_REISSUE the kernel buffers in-flight I/O
-        // and waits for a new daemon to attach via START_USER_RECOVERY.
-        // Mounts on /dev/ublkb<N> stay valid; from the guest's
-        // perspective I/O is paused, not lost. The next `serve-volume`
-        // sees `ublk.id` + sysfs entry, takes Route::Recover, and
-        // reissues buffered writes. Tearing the device down on shutdown
-        // is what made `restart-while-mounted` fail today; not tearing it
-        // down is what makes USER_RECOVERY do the job it was designed for.
-        //
-        // libublk's `Drop for UblkCtrlInner` issues a synchronous del()
-        // when `for_add_dev()` is true — i.e. the ADD path. To suppress
-        // that without forking libublk we `mem::forget` the Arc on the
-        // ADD path, leaking the strong count so Drop never fires. The
-        // open `/dev/ublk-control` fd plus a ~kilobyte heap allocation
-        // are reaped by the kernel when this process exits below. The
-        // RECOVER path's Drop is a no-op (libublk only auto-deletes
-        // for-add ctrls), so a plain `drop` suffices.
-        //
-        // `ublk.id` is intentionally NOT cleared: it's the binding the
-        // next serve uses to recognise the parked device as ours. It is
-        // cleared only by the explicit operator action `elide ublk delete`
-        // and by the coordinator reconciliation sweep (which clears
-        // bindings whose sysfs entry has gone, e.g. after a host reboot).
-        if !recovering {
-            std::mem::forget(ctrl);
-        } else {
-            drop(ctrl);
-        }
-
-        run_result?;
+        // Run the queue threads to completion. Under shutdown-park this
+        // call only returns by an unusual route: the only way out is
+        // the signal watcher's `process::exit` (which kills this thread
+        // along with everything else), or libublk's own `stop_dev`
+        // detecting that the kernel device went away from another
+        // context. The `run_target` Result is propagated for the latter
+        // case; the signal path never reaches here.
+        ctrl.run_target(tgt_init, q_handler, wait_hook)
+            .map_err(|e| io::Error::other(format!("ublk run_target: {e}")))?;
         Ok(())
     }
 
