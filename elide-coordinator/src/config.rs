@@ -15,6 +15,12 @@
 //   # endpoint = "https://s3.amazonaws.com"  # optional; omit for AWS default
 //   # region   = "us-east-1"                 # optional; falls back to AWS_DEFAULT_REGION
 //   #
+//   # To use Tigris (single global endpoint, region "auto"):
+//   # [store]
+//   # bucket   = "my-elide-bucket"
+//   # endpoint = "https://t3.storage.dev"
+//   # region   = "auto"
+//   #
 //   # Multipart upload tuning for segment bodies (all optional):
 //   # multipart_part_size_mb = 5      # part size in MiB (min 5, S3 rule)
 //   # request_timeout       = "5m"    # per-HTTP-request timeout (humantime)
@@ -400,6 +406,11 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # bucket   = "my-elide-bucket"
 # endpoint = "https://s3.amazonaws.com"   # optional; omit for AWS default
 # region   = "us-east-1"                  # falls back to AWS_DEFAULT_REGION
+#
+# Tigris (https://www.tigrisdata.com) — single global endpoint, region "auto":
+# bucket   = "my-elide-bucket"
+# endpoint = "https://t3.storage.dev"
+# region   = "auto"
 #
 # Access keys come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
 # coordinator's environment and are inherited by spawned volume subprocesses.
