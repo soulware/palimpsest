@@ -1336,6 +1336,7 @@ mod tests {
     use super::*;
     use crate::upload::segment_key;
     use object_store::memory::InMemory;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct MockSocket(tokio::task::JoinHandle<()>);
@@ -1600,7 +1601,7 @@ mod tests {
         // tier 1 directly.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            interval_secs: 0,
+            interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
@@ -1704,7 +1705,7 @@ mod tests {
         // Sweep both under a permissive density threshold.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            interval_secs: 0,
+            interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
@@ -2468,7 +2469,7 @@ mod tests {
         // ── Run coordinator GC. Must NOT defer the Delta segment.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            interval_secs: 0,
+            interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
@@ -2567,7 +2568,7 @@ mod tests {
         // GC: compact both segments.
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
-            interval_secs: 0,
+            interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();

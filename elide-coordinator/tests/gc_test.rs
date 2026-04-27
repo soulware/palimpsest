@@ -79,6 +79,7 @@
 
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use elide_coordinator::config::GcConfig;
 use elide_coordinator::gc::{apply_done_handoffs, gc_fork};
@@ -275,7 +276,7 @@ fn make_gc_config() -> GcConfig {
     // are well below SWEEP_SMALL_THRESHOLD so they pack via tier 1.
     GcConfig {
         density_threshold: 0.0,
-        interval_secs: 0,
+        interval: Duration::ZERO,
         ..GcConfig::default()
     }
 }
@@ -1644,7 +1645,7 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     // exact numbers matter.
     let gc_config = GcConfig {
         density_threshold: 0.9,
-        interval_secs: 0,
+        interval: Duration::ZERO,
         ..GcConfig::default()
     };
 

@@ -369,7 +369,7 @@ live_data + post_compaction_outputs + (C × T)
 |---|---|
 | `retention_window` (T) | Linear. Halving T halves the in-flight term. Lower bound is whatever replicas need to catch up; below that the guarantee is meaningless. |
 | `gc.density_threshold` | Indirect, via what's worth compacting. A lower threshold (compact only mostly-dead) means input bytes >> output bytes — savings dominate retention overhead. A higher threshold (compact mostly-live) means input ≈ output — retention overhead is ~2× the throughput for marginal savings. |
-| `gc.interval_secs` | Batch granularity only. Steady-state retention overhead is unchanged. |
+| `gc.interval` | Batch granularity only. Steady-state retention overhead is unchanged. |
 
 **Tombstone handoffs are the optimal case.** A 100%-dead input
 compacted to a zero-entry GC output has input bytes ≈ retention

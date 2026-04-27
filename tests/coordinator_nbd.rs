@@ -320,12 +320,12 @@ fn coordinator_nbd_lifecycle() {
          [store]\n\
          local_path = {store:?}\n\
          \n\
-         [drain]\n\
-         interval_secs = 1\n\
-         scan_interval_secs = 2\n\
+         [supervisor]\n\
+         drain_interval = \"1s\"\n\
+         scan_interval = \"2s\"\n\
          \n\
          [gc]\n\
-         interval_secs = 5\n",
+         interval = \"5s\"\n",
         data = data_dir,
         elide = elide_bin(),
         store = store_dir,

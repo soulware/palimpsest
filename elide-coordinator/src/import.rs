@@ -359,7 +359,7 @@ pub async fn spawn_import(
 
     // Watch for the import to enter the serve phase (control.sock appears) and
     // trigger an immediate rescan so the coordinator starts draining without
-    // waiting up to scan_interval_secs.
+    // waiting up to supervisor.scan_interval.
     {
         let watch_dir = vol_dir.clone();
         let watch_lock = vol_dir.join(LOCK_FILE);

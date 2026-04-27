@@ -272,7 +272,7 @@ proptest! {
 
         let gc_config = GcConfig {
             density_threshold: 0.0,
-            interval_secs: 0,
+            interval: Duration::ZERO,
             ..GcConfig::default()
         };
 
@@ -486,7 +486,7 @@ proptest! {
 
         let gc_config = GcConfig {
             density_threshold: 0.0,
-            interval_secs: 0,
+            interval: Duration::ZERO,
             ..GcConfig::default()
         };
 
@@ -704,7 +704,7 @@ fn gc_oracle_repro_bug_h() {
 
     let gc_config = GcConfig {
         density_threshold: 0.0,
-        interval_secs: 0,
+        interval: Duration::ZERO,
         ..GcConfig::default()
     };
 
@@ -789,7 +789,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         .unwrap();
     let gc_config = GcConfig {
         density_threshold: 0.0,
-        interval_secs: 0,
+        interval: Duration::ZERO,
         ..GcConfig::default()
     };
     let index_dir = fork_dir.join("index");

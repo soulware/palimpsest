@@ -2,7 +2,7 @@
 // drains pending segments to S3, runs GC, and supervises volume processes.
 //
 // Architecture:
-//   - A root scanner runs every `scan_interval_secs`, walking configured root
+//   - A root scanner runs every `supervisor.scan_interval`, walking configured root
 //     directories to find volume directories. Each newly-discovered volume gets:
 //       - a run_volume_tasks task: drain + GC, sequential within each tick
 //       - a supervisor task (if `serve.toml` exists): spawns and restarts
@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use humantime_serde::re::humantime;
 use object_store::ObjectStore;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -37,8 +38,8 @@ use crate::supervisor;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry, new_snapshot_lock_registry};
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
-    let drain_interval = Duration::from_secs(config.drain.interval_secs);
-    let scan_interval = Duration::from_secs(config.drain.scan_interval_secs);
+    let drain_interval = config.supervisor.drain_interval;
+    let scan_interval = config.supervisor.scan_interval;
     let elide_bin = config.elide_bin.clone();
     let elide_import_bin = Arc::new(config.elide_import_bin.clone());
     let gc_config = config.gc.clone();
@@ -73,10 +74,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
 
     info!(
-        "[coordinator] data_dir: {}; drain every {}s, scan every {}s; elide bin: {}",
+        "[coordinator] data_dir: {}; drain every {}, scan every {}; elide bin: {}",
         data_dir.display(),
-        config.drain.interval_secs,
-        config.drain.scan_interval_secs,
+        humantime::format_duration(drain_interval),
+        humantime::format_duration(scan_interval),
         elide_bin.display(),
     );
 

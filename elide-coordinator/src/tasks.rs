@@ -115,7 +115,7 @@ pub async fn run_volume_tasks(
         .map(|n| format!(" ({n})"))
         .unwrap_or_default();
 
-    let gc_interval = Duration::from_secs(gc_config.interval_secs);
+    let gc_interval = gc_config.interval;
 
     // Run GC on the first tick to clear any backlog from a previous run.
     let mut last_gc = Instant::now()

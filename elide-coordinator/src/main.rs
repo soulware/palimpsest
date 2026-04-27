@@ -5,6 +5,8 @@
 //     Start the coordinator daemon. Watches configured volume roots, discovers
 //     forks, supervises volume processes, drains pending segments to S3, and
 //     runs segment GC. Configuration comes from coordinator.toml.
+//   init [--config <path>] [--force]
+//     Write a default coordinator.toml (commented template) to the given path.
 
 // Binary-only modules (process supervision, IPC, import jobs).
 mod credential;
@@ -21,7 +23,7 @@ use elide_coordinator::config;
 use std::path::PathBuf;
 use std::process;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -44,6 +46,19 @@ enum Command {
         /// Override the data_dir from the config file.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+
+    /// Write a default coordinator.toml (commented template) to the given path.
+    ///
+    /// Every field in the template is commented out — the values shown are
+    /// the defaults the daemon would use if the file were absent. Edit the
+    /// fields you want to override.
+    Init {
+        #[arg(long, default_value = "coordinator.toml")]
+        config: PathBuf,
+        /// Overwrite the file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -79,5 +94,25 @@ async fn run() -> Result<()> {
             tracing::info!("[coordinator] store: reachable");
             daemon::run(config, store).await
         }
+        Command::Init { config, force } => init_config(&config, force),
     }
+}
+
+fn init_config(path: &std::path::Path, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory: {}", parent.display()))?;
+    }
+    std::fs::write(path, config::DEFAULT_CONFIG_TEMPLATE)
+        .with_context(|| format!("writing config: {}", path.display()))?;
+    println!("wrote default config to {}", path.display());
+    Ok(())
 }

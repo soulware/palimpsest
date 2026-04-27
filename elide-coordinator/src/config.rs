@@ -16,9 +16,9 @@
 //   # region   = "us-east-1"                 # optional; falls back to AWS_DEFAULT_REGION
 //   #
 //   # Multipart upload tuning for segment bodies (all optional):
-//   # multipart_part_size_mb = 5    # part size in MiB (min 5, S3 rule)
-//   # request_timeout_secs   = 300  # per-HTTP-request timeout
-//   # connect_timeout_secs   = 5    # TCP+TLS connect timeout
+//   # multipart_part_size_mb = 5      # part size in MiB (min 5, S3 rule)
+//   # request_timeout       = "5m"    # per-HTTP-request timeout (humantime)
+//   # connect_timeout       = "5s"    # TCP+TLS connect timeout (humantime)
 //   #
 //   # Access keys are NOT configured here — they are read from the usual
 //   # AWS env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) by both
@@ -27,13 +27,16 @@
 //   # into each volume subprocess so only coordinator.toml needs to be set
 //   # — no per-volume `fetch.toml` required for a uniform store.
 //
-//   [drain]
-//   interval_secs      = 5    # how often each fork is checked for pending segments
-//   scan_interval_secs = 30   # how often root directories are re-scanned for new forks
+//   [supervisor]
+//   drain_interval  = "5s"   # how often each fork is checked for pending segments
+//   scan_interval   = "30s"  # how often root directories are re-scanned for new forks
 //
 //   [gc]
-//   density_threshold  = 0.70          # compact when live_bytes/file_bytes < threshold
-//   interval_secs      = 30            # how often GC runs per fork (seconds)
+//   density_threshold = 0.70   # compact when live_bytes/file_bytes < threshold
+//   interval          = "10s"  # how often GC runs per fork
+//   retention_window  = "24h"  # how long GC inputs are retained in S3
+//
+// All duration fields use humantime ("5s", "30m", "24h").
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +44,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
+use humantime_serde::re::humantime;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as StorePath;
@@ -61,9 +65,9 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub store: StoreSection,
 
-    /// Drain and scan timing.
+    /// Supervisor loop timings (drain cadence, root scan cadence).
     #[serde(default)]
-    pub drain: DrainConfig,
+    pub supervisor: SupervisorConfig,
 
     /// Path to the `elide` volume binary.
     /// Defaults to `"elide"` (resolved via PATH).
@@ -137,26 +141,26 @@ pub struct StoreSection {
     #[serde(default = "default_multipart_part_size_mb")]
     pub multipart_part_size_mb: u64,
 
-    /// Per-request timeout, in seconds. Covers the full HTTP request
-    /// lifetime (DNS + connect + TLS + body transfer + response). Must be
-    /// long enough for a single multipart part to upload on the slowest
-    /// link the coordinator is expected to run on. Default: 300.
-    #[serde(default = "default_request_timeout_secs")]
-    pub request_timeout_secs: u64,
+    /// Per-request timeout. Covers the full HTTP request lifetime (DNS +
+    /// connect + TLS + body transfer + response). Must be long enough for
+    /// a single multipart part to upload on the slowest link the
+    /// coordinator is expected to run on. Default: 5m.
+    #[serde(default = "default_request_timeout", with = "humantime_serde")]
+    pub request_timeout: Duration,
 
-    /// TCP+TLS connection-establishment timeout, in seconds. Default: 5.
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
+    /// TCP+TLS connection-establishment timeout. Default: 5s.
+    #[serde(default = "default_connect_timeout", with = "humantime_serde")]
+    pub connect_timeout: Duration,
 }
 
 fn default_multipart_part_size_mb() -> u64 {
     5
 }
-fn default_request_timeout_secs() -> u64 {
-    300
+fn default_request_timeout() -> Duration {
+    Duration::from_secs(300)
 }
-fn default_connect_timeout_secs() -> u64 {
-    5
+fn default_connect_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 impl Default for StoreSection {
@@ -167,8 +171,8 @@ impl Default for StoreSection {
             endpoint: None,
             region: None,
             multipart_part_size_mb: default_multipart_part_size_mb(),
-            request_timeout_secs: default_request_timeout_secs(),
-            connect_timeout_secs: default_connect_timeout_secs(),
+            request_timeout: default_request_timeout(),
+            connect_timeout: default_connect_timeout(),
         }
     }
 }
@@ -206,8 +210,8 @@ impl StoreSection {
     /// `reqwest` client options (timeouts) derived from config.
     fn client_options(&self) -> ClientOptions {
         ClientOptions::default()
-            .with_timeout(Duration::from_secs(self.request_timeout_secs))
-            .with_connect_timeout(Duration::from_secs(self.connect_timeout_secs))
+            .with_timeout(self.request_timeout)
+            .with_connect_timeout(self.connect_timeout)
     }
 
     /// One-line human-readable summary of the configured object store, for
@@ -224,10 +228,10 @@ impl StoreSection {
                 s.push_str(&format!(" region={region}"));
             }
             s.push_str(&format!(
-                " part={}MiB req_timeout={}s connect_timeout={}s",
+                " part={}MiB req_timeout={} connect_timeout={}",
                 self.multipart_part_size_mb.max(5),
-                self.request_timeout_secs,
-                self.connect_timeout_secs,
+                humantime::format_duration(self.request_timeout),
+                humantime::format_duration(self.connect_timeout),
             ));
             s
         } else {
@@ -299,28 +303,28 @@ impl StoreSection {
 }
 
 #[derive(Deserialize)]
-pub struct DrainConfig {
-    /// How often (seconds) each fork is checked for pending segments to upload.
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
+pub struct SupervisorConfig {
+    /// How often each fork is checked for pending segments to upload.
+    #[serde(default = "default_drain_interval", with = "humantime_serde")]
+    pub drain_interval: Duration,
 
-    /// How often (seconds) root directories are re-scanned for newly-created forks.
-    #[serde(default = "default_scan_interval")]
-    pub scan_interval_secs: u64,
+    /// How often root directories are re-scanned for newly-created forks.
+    #[serde(default = "default_scan_interval", with = "humantime_serde")]
+    pub scan_interval: Duration,
 }
 
-fn default_interval() -> u64 {
-    5
+fn default_drain_interval() -> Duration {
+    Duration::from_secs(5)
 }
-fn default_scan_interval() -> u64 {
-    30
+fn default_scan_interval() -> Duration {
+    Duration::from_secs(30)
 }
 
-impl Default for DrainConfig {
+impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            interval_secs: default_interval(),
-            scan_interval_secs: default_scan_interval(),
+            drain_interval: default_drain_interval(),
+            scan_interval: default_scan_interval(),
         }
     }
 }
@@ -333,9 +337,9 @@ pub struct GcConfig {
     #[serde(default = "default_gc_density")]
     pub density_threshold: f64,
 
-    /// How often (seconds) to run a GC pass per fork. Default: 10.
-    #[serde(default = "default_gc_interval")]
-    pub interval_secs: u64,
+    /// How often to run a GC pass per fork. Default: 10s.
+    #[serde(default = "default_gc_interval", with = "humantime_serde")]
+    pub interval: Duration,
 
     /// Retention window for GC input segments. After a successful GC
     /// handoff, inputs are not deleted from S3 immediately; the
@@ -350,8 +354,8 @@ pub struct GcConfig {
 fn default_gc_density() -> f64 {
     0.70
 }
-fn default_gc_interval() -> u64 {
-    10
+fn default_gc_interval() -> Duration {
+    Duration::from_secs(10)
 }
 fn default_retention_window() -> Duration {
     Duration::from_secs(24 * 60 * 60)
@@ -371,11 +375,48 @@ impl Default for GcConfig {
     fn default() -> Self {
         Self {
             density_threshold: default_gc_density(),
-            interval_secs: default_gc_interval(),
+            interval: default_gc_interval(),
             retention_window: default_retention_window(),
         }
     }
 }
+
+/// Default `coordinator.toml` template emitted by `elide-coordinator init`.
+/// All fields are commented out so the file documents itself: every value
+/// shown is the default the daemon would use if the file were absent.
+pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
+# Every field below is optional; the values shown are the defaults.
+
+# data_dir = "elide_data"
+# socket_path = "elide_data/control.sock"  # defaults to <data_dir>/control.sock
+# elide_bin = "elide"                      # resolved via PATH
+# elide_import_bin = "elide-import"        # resolved via PATH
+
+[store]
+# Local directory store (default if neither local_path nor bucket is set):
+# local_path = "elide_store"
+#
+# S3-compatible store:
+# bucket   = "my-elide-bucket"
+# endpoint = "https://s3.amazonaws.com"   # optional; omit for AWS default
+# region   = "us-east-1"                  # falls back to AWS_DEFAULT_REGION
+#
+# Access keys come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+# coordinator's environment and are inherited by spawned volume subprocesses.
+#
+# multipart_part_size_mb = 5      # min 5 (S3 rule)
+# request_timeout        = "5m"   # per-HTTP-request timeout (humantime)
+# connect_timeout        = "5s"   # TCP+TLS connect timeout (humantime)
+
+[supervisor]
+# drain_interval = "5s"   # how often each fork is checked for pending segments
+# scan_interval  = "30s"  # how often roots are re-scanned for new forks
+
+[gc]
+# density_threshold = 0.70    # compact when live_bytes / file_bytes < threshold
+# interval          = "10s"   # how often GC runs per fork
+# retention_window  = "24h"   # how long GC inputs stay in S3 before reaping
+"#;
 
 /// Load and parse a `coordinator.toml` file.
 ///
@@ -396,7 +437,7 @@ impl Default for CoordinatorConfig {
             data_dir: default_data_dir(),
             socket_path: None,
             store: StoreSection::default(),
-            drain: DrainConfig::default(),
+            supervisor: SupervisorConfig::default(),
             elide_bin: default_elide_bin(),
             elide_import_bin: default_elide_import_bin(),
             gc: GcConfig::default(),
@@ -473,5 +514,49 @@ mod tests {
             Some("https://t3.storage.dev")
         );
         assert_eq!(cfg.store.region.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn default_config_template_parses_to_defaults() {
+        let cfg: CoordinatorConfig = toml::from_str(DEFAULT_CONFIG_TEMPLATE)
+            .expect("DEFAULT_CONFIG_TEMPLATE must parse as a CoordinatorConfig");
+        let defaults = CoordinatorConfig::default();
+        assert_eq!(cfg.data_dir, defaults.data_dir);
+        assert_eq!(
+            cfg.supervisor.drain_interval,
+            defaults.supervisor.drain_interval
+        );
+        assert_eq!(
+            cfg.supervisor.scan_interval,
+            defaults.supervisor.scan_interval
+        );
+        assert_eq!(cfg.gc.interval, defaults.gc.interval);
+        assert_eq!(cfg.gc.retention_window, defaults.gc.retention_window);
+        assert_eq!(cfg.store.request_timeout, defaults.store.request_timeout);
+        assert_eq!(cfg.store.connect_timeout, defaults.store.connect_timeout);
+    }
+
+    #[test]
+    fn parses_humantime_durations() {
+        let toml_str = r#"
+            [supervisor]
+            drain_interval = "2s"
+            scan_interval  = "1m"
+
+            [store]
+            request_timeout = "10m"
+            connect_timeout = "500ms"
+
+            [gc]
+            interval         = "15s"
+            retention_window = "1h"
+        "#;
+        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.supervisor.drain_interval, Duration::from_secs(2));
+        assert_eq!(cfg.supervisor.scan_interval, Duration::from_secs(60));
+        assert_eq!(cfg.store.request_timeout, Duration::from_secs(600));
+        assert_eq!(cfg.store.connect_timeout, Duration::from_millis(500));
+        assert_eq!(cfg.gc.interval, Duration::from_secs(15));
+        assert_eq!(cfg.gc.retention_window, Duration::from_secs(3600));
     }
 }

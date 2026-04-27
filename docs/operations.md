@@ -15,7 +15,7 @@ Both paths produce identical segments. `NBD_CMD_FLUSH` sends an explicit `Flush`
 
 The coordinator is a long-running per-host daemon that owns all S3 mutations (upload, delete, GC rewrites). The volume holds read-only S3 credentials for demand-fetch and never writes to S3.
 
-**Configuration (`coordinator.toml`):** loaded from the current directory; overridable with `--config`. All fields optional.
+**Configuration (`coordinator.toml`):** loaded from the current directory; overridable with `--config`. All fields optional. Run `elide-coordinator init` to write a commented template with every field set to its default; pass `--force` to overwrite an existing file.
 
 ```toml
 data_dir = "elide_data"              # by_id/ and by_name/
@@ -26,13 +26,14 @@ data_dir = "elide_data"              # by_id/ and by_name/
 # endpoint = "https://..."           # MinIO, Tigris, etc.
 # region = "us-east-1"
 
-[drain]
-interval_secs      = 5
-scan_interval_secs = 30
+[supervisor]
+drain_interval = "5s"
+scan_interval  = "30s"
 
 [gc]
-density_threshold   = 0.70           # repack rewrites segments below this density
-interval_secs       = 30
+density_threshold = 0.70             # repack rewrites segments below this density
+interval          = "10s"
+retention_window  = "24h"            # how long GC inputs stay in S3 before reaping
 ```
 
 The coordinator scans `<data_dir>/by_id/` for ULID subdirectories and spawns a `fork_loop` task per fork; supervision runs for writable volumes only (readonly volumes are discovered for drain and prefetch).
