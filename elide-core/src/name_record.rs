@@ -63,6 +63,17 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+/// Best-effort hostname lookup for `NameRecord.hostname`.
+///
+/// Returns `None` if the system call fails or the result is not valid
+/// UTF-8. Hostname is advisory metadata only; never compared for
+/// ownership decisions.
+pub fn current_hostname() -> Option<String> {
+    nix::unistd::gethostname()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+}
+
 /// Lifecycle state of a named volume.
 ///
 /// See the design doc § "Three states, two intents" for the operator

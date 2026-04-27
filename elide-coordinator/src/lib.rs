@@ -1,6 +1,7 @@
 pub mod config;
 pub mod control;
 pub mod gc;
+pub mod lifecycle;
 pub mod name_store;
 pub mod portable;
 pub mod prefetch;

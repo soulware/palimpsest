@@ -270,7 +270,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: stop <volume>".to_string();
             }
-            stop_volume_op(args, data_dir).await
+            stop_volume_op(args, data_dir, store, root_key).await
         }
 
         "start" => {
@@ -1624,7 +1624,12 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
 
 // ── Volume stop / start ───────────────────────────────────────────────────────
 
-async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
+async fn stop_volume_op(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return format!("err volume not found: {volume_name}");
@@ -1651,6 +1656,31 @@ async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
         _ => {}
     }
 
+    // Verify ownership in S3 before taking any local action: refuse early
+    // if names/<name> is held by another coordinator. A missing record is
+    // fine — the volume may not yet have been drained to S3, in which
+    // case the local stop proceeds and the S3 update is a no-op.
+    use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
+    match mark_stopped(store, volume_name, root_key).await {
+        Ok(_) => {}
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            return format!(
+                "err name '{volume_name}' is owned by coordinator {held_by}; \
+                 use --force-takeover to override"
+            );
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in state {from:?}; cannot stop");
+        }
+        Err(LifecycleError::Store(e)) => {
+            // Transient store error or parse failure. The S3 record is
+            // unchanged; we can still proceed with the local stop, but
+            // surface the warning so operators know the bucket state may
+            // be stale.
+            warn!("[inbound] stop {volume_name}: failed to update names/<name>: {e}");
+        }
+    }
+
     // Write the marker before sending shutdown so the supervisor won't restart.
     if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
         return format!("err writing volume.stopped: {e}");
@@ -1663,7 +1693,9 @@ async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
         }
         Some(resp) => {
             // Roll back the marker so the supervisor doesn't strand a still-
-            // running volume.
+            // running volume. (Note: the S3 state has already flipped to
+            // Stopped; that's a soft inconsistency the operator can resolve
+            // by issuing `volume start` once the underlying issue is fixed.)
             let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
             format!("err shutdown failed: {resp}")
         }
