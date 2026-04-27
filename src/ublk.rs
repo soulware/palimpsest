@@ -201,52 +201,96 @@ mod imp {
         Ok(ctrl.dev_info().state)
     }
 
-    /// Install the SIGINT/SIGTERM/SIGHUP handler once at the top of
-    /// `run_volume_ublk`. The handler looks at `slot`:
+    /// The set of signals the ublk transport reacts to (process termination
+    /// signals — SIGINT for Ctrl-C, SIGTERM for orderly stop, SIGHUP for
+    /// terminal-loss). Centralised so the block-then-watch sequence cannot
+    /// drift between the mask installed at startup and the one signalfd
+    /// reads from.
+    fn shutdown_sigset() -> nix::sys::signal::SigSet {
+        let mut s = nix::sys::signal::SigSet::empty();
+        s.add(nix::sys::signal::Signal::SIGINT);
+        s.add(nix::sys::signal::Signal::SIGTERM);
+        s.add(nix::sys::signal::Signal::SIGHUP);
+        s
+    }
+
+    /// Spawn the ublk-signal watcher thread.
     ///
-    /// - If `Some(ctrl)`: call `kill_dev` to unblock `run_target`'s
-    ///   queue-thread join. The main thread then runs `del_dev` +
-    ///   `clear_ublk_id` on the way out.
-    /// - If `None`: there is no live device yet (startup, or recovery
-    ///   probe), so the only useful thing the handler can do is exit the
-    ///   process so the user is not stuck waiting on a blocking ioctl.
+    /// The caller MUST have already blocked the shutdown signals on the
+    /// current thread before calling this, so that every subsequently-spawned
+    /// thread inherits the block and only this watcher reads the signals
+    /// (via `signalfd`).
     ///
-    /// `kill_dev` uses a thread-local libublk control ring, which the
-    /// ctrlc signal thread has not initialized — set it up on first
-    /// delivery before issuing the ioctl, otherwise `kill_dev` panics.
-    fn install_signal_handler(slot: Arc<Mutex<Option<Arc<UblkCtrl>>>>) {
-        // `let _`: another handler already installed (e.g. in tests) is
-        // not fatal — the process already has a SIGINT disposition.
-        let _ = ctrlc::set_handler(move || {
-            if let Err(e) = ublk_init_ctrl_task_ring(|opt| {
-                if opt.is_none() {
-                    *opt = Some(
-                        io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
-                            .build(32)
-                            .map_err(libublk::UblkError::IOError)?,
-                    );
-                }
-                Ok(())
-            }) {
-                tracing::error!("ublk signal-thread ctrl ring init failed: {e}");
-                std::process::exit(130);
-            }
-            let guard = slot.lock().expect("sig_ctrl poisoned");
-            match guard.as_ref() {
-                Some(c) => {
-                    if let Err(e) = c.kill_dev() {
-                        tracing::error!("ublk kill_dev on signal failed: {e}");
+    /// The watcher loops:
+    ///   1. Block on `signalfd::read_signal`. Any of the masked signals
+    ///      wakes it.
+    ///   2. Consult `slot`:
+    ///      - `Some(ctrl)` → `kill_dev` to unblock `run_target`'s
+    ///        queue-thread join; the main thread runs `del_dev` +
+    ///        `clear_ublk_id` on the way out.
+    ///      - `None` → no live device (uninterruptible startup phase like
+    ///        `start_user_recover`, or shutdown is already past
+    ///        `run_target`). Exit the process directly so the user is
+    ///        never trapped.
+    ///   3. Once the watcher has asked the device to stop, any further
+    ///      signal means "give up, just die" → `process::exit`.
+    ///
+    /// `kill_dev` uses a thread-local libublk control ring, which is
+    /// initialised on this thread before entering the read loop.
+    fn spawn_ublk_signal_watcher(
+        slot: Arc<Mutex<Option<Arc<UblkCtrl>>>>,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
+        let sfd = nix::sys::signalfd::SignalFd::new(&shutdown_sigset())
+            .map_err(|e| io::Error::other(format!("signalfd: {e}")))?;
+        std::thread::Builder::new()
+            .name("ublk-signal".into())
+            .spawn(move || {
+                if let Err(e) = ublk_init_ctrl_task_ring(|opt| {
+                    if opt.is_none() {
+                        *opt = Some(
+                            io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
+                                .build(32)
+                                .map_err(libublk::UblkError::IOError)?,
+                        );
                     }
-                }
-                None => {
-                    // No live device: a blocking ioctl (e.g.
-                    // start_user_recover) is in flight and cannot be
-                    // interrupted cooperatively. Exit immediately so the
-                    // user is never trapped.
+                    Ok(())
+                }) {
+                    tracing::error!("ublk-signal ctrl ring init failed: {e}");
                     std::process::exit(130);
                 }
-            }
-        });
+                let mut killed = false;
+                loop {
+                    match sfd.read_signal() {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            tracing::error!(
+                                "ublk-signal: signalfd read returned None on a blocking fd"
+                            );
+                            std::process::exit(130);
+                        }
+                        Err(e) => {
+                            tracing::error!("ublk-signal: signalfd read failed: {e}");
+                            std::process::exit(130);
+                        }
+                    }
+                    if killed {
+                        // Operator pressed Ctrl-C twice (or sent a second
+                        // SIGTERM). Honour "really mean it, just die".
+                        std::process::exit(130);
+                    }
+                    let guard = slot.lock().expect("sig_ctrl poisoned");
+                    match guard.as_ref() {
+                        Some(c) => {
+                            if let Err(e) = c.kill_dev() {
+                                tracing::error!("ublk kill_dev on signal failed: {e}");
+                            }
+                            killed = true;
+                        }
+                        None => std::process::exit(130),
+                    }
+                }
+            })
+            .map_err(io::Error::other)
     }
 
     pub fn run_volume_ublk(
@@ -255,6 +299,17 @@ mod imp {
         fetch_config: Option<elide_fetch::FetchConfig>,
         dev_id: Option<i32>,
     ) -> Result<(), super::UblkRunError> {
+        // Block the shutdown signals on the calling thread BEFORE any
+        // other thread is spawned. The block is inherited by every
+        // subsequent thread (volume-actor, control-server, ublk queue
+        // threads, libublk's internal helpers). Only the dedicated
+        // ublk-signal watcher reads them, via signalfd. This eliminates
+        // the prior "ctrlc spawns its own dispatcher we don't control"
+        // and "any thread might service a signal" hazards.
+        shutdown_sigset()
+            .thread_block()
+            .map_err(|e| io::Error::other(format!("block shutdown signals: {e}")))?;
+
         let by_id_dir = dir.parent().unwrap_or(dir);
         let mut volume = Volume::open(dir, by_id_dir)?;
 
@@ -275,15 +330,14 @@ mod imp {
 
         let nr_queues = pick_nr_queues();
 
-        // Install the signal handler as early as possible, before any
-        // potentially-blocking ioctl (in particular `start_user_recover`,
-        // which retries on EBUSY for up to 30s). The handler consults a
-        // shared slot: if a live ctrl is registered, it kill_dev's it so
-        // `run_target` can unwind cleanly; if the slot is still empty
-        // (startup, recovery probe, etc.) it exits the process directly
-        // so the user is never trapped in an uninterruptible phase.
+        // Spawn the signal watcher before any potentially-blocking ioctl
+        // (in particular `start_user_recover`, which retries on EBUSY for
+        // up to 30s). The watcher consults a shared slot: if a live ctrl
+        // is registered, kill_dev unwinds `run_target`; if the slot is
+        // still empty (startup, recovery probe, etc.) the watcher exits
+        // the process directly so the user is never trapped.
         let sig_ctrl: Arc<Mutex<Option<Arc<UblkCtrl>>>> = Arc::new(Mutex::new(None));
-        install_signal_handler(Arc::clone(&sig_ctrl));
+        let _sig_watcher = spawn_ublk_signal_watcher(Arc::clone(&sig_ctrl))?;
 
         let persisted_id = read_ublk_id(dir)?;
         let (target_id, recovering) = match plan_route(persisted_id, dev_id, ublk_device_exists) {
@@ -370,9 +424,9 @@ mod imp {
                 })?,
         );
 
-        // Publish the live ctrl so the already-installed signal handler
-        // can kill_dev it on SIGINT/SIGTERM/SIGHUP. kill_dev triggers
-        // STOP_DEV, which unblocks run_target's queue-thread join.
+        // Publish the live ctrl so the ublk-signal watcher can kill_dev
+        // it on SIGINT/SIGTERM/SIGHUP. kill_dev triggers STOP_DEV, which
+        // unblocks run_target's queue-thread join.
         *sig_ctrl.lock().expect("sig_ctrl poisoned") = Some(Arc::clone(&ctrl));
 
         let tgt_init = move |dev: &mut UblkDev| {

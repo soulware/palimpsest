@@ -1067,6 +1067,7 @@ dependencies = [
  "libc",
  "libublk",
  "lz4_flex",
+ "nix",
  "object_store",
  "rustls",
  "serde",

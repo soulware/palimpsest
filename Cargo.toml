@@ -51,7 +51,7 @@ tempfile = "3"
 # you need).
 [features]
 default = ["ublk"]
-ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
+ublk = ["dep:libublk", "dep:io-uring", "dep:smol", "dep:nix"]
 # Workspace aggregate for property-based test suites. Enables `proptest`
 # on every member crate that has one, so CI can run them all via a single
 # `cargo test --workspace --features proptest --tests` invocation.
@@ -59,12 +59,15 @@ proptest = ["elide-core/proptest", "elide-coordinator/proptest"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk  = { version = "0.4", optional = true }
-# Transitive via libublk; declared directly so the SIGINT/SIGTERM handler
-# thread can initialize its own thread-local ublk control ring (required by
-# `ublk_init_ctrl_task_ring`) before calling `kill_dev`, and so the ublk
-# transport can build POLL_ADD SQEs that bridge worker-thread completions
-# onto the queue's own uring (step 2b).
+# Transitive via libublk; declared directly so the dedicated ublk-signal
+# watcher thread can initialize its own thread-local ublk control ring
+# (required by `ublk_init_ctrl_task_ring`) before calling `kill_dev`, and
+# so the ublk transport can build POLL_ADD SQEs that bridge worker-thread
+# completions onto the queue's own uring (step 2b).
 io-uring = { version = "0.7", optional = true }
 # libublk depends on smol = "2.0.2" directly — we match that runtime to
 # drive per-queue `LocalExecutor`s for async per-tag I/O dispatch.
 smol     = { version = "2", optional = true }
+# signalfd + pthread_sigmask for the ublk transport's dedicated signal
+# watcher thread. Linux-only: signalfd does not exist on macOS.
+nix      = { version = "0.31", features = ["signal"], optional = true }
