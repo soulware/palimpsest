@@ -15,6 +15,7 @@ mod import;
 mod inbound;
 mod macaroon;
 mod supervisor;
+mod ublk_sweep;
 
 // Re-use the library's shared modules so types are identical across the
 // lib and bin compilation units.

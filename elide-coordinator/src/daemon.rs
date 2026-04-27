@@ -88,6 +88,13 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // Clean up any stale import locks left by a previous coordinator run.
     import::cleanup_stale_locks(&config.data_dir);
 
+    // Reconcile ublk kernel devices against on-disk bindings. Under
+    // shutdown-park, daemons leave devices QUIESCED for recovery; this
+    // sweep handles the residual cases where the volume directory has
+    // been removed out-of-band, the host has rebooted (sysfs cleared but
+    // ublk.id remains), or an operator manually deleted a device.
+    crate::ublk_sweep::reconcile(&data_dir, &elide_bin).await;
+
     // Shared notify: inbound socket triggers this to request an immediate rescan.
     let rescan_notify = Arc::new(Notify::new());
 
@@ -254,11 +261,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
 /// Poll until all pids have exited or the timeout elapses. After the
 /// SIGTERM grace window, escalate to SIGKILL on any stragglers and wait
-/// briefly for them to die. A wedged volume process (e.g. a ublk daemon
-/// blocked in a kernel `wait_event` for udev to release `/dev/ublkb<N>`)
-/// would otherwise survive coordinator shutdown and hold its ublk device
-/// indefinitely; SIGKILL releases the process's fds and lets the kernel
-/// finalize cleanup.
+/// briefly for them to die. Under shutdown-park, volume daemons no longer
+/// del_dev on shutdown, so this escalation is a safety net for a daemon
+/// that fails to STOP_DEV the kernel device promptly (e.g. a queue thread
+/// blocked unwinding).
 async fn wait_for_pids(pids: &[u32], grace: Duration) {
     let still_alive = poll_until_exit_or_deadline(pids, grace).await;
     if still_alive.is_empty() {

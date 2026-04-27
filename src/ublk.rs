@@ -28,25 +28,34 @@
 //! thread's* ring, so the smol executor never sleeps past a ready waker.
 //! That was the defect in the earlier `blocking::unblock` attempt.
 //!
-//! **Crash recovery.** The device is always added with
-//! `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`. If the daemon
-//! exits without a clean `STOP_DEV`/`DEL_DEV` (SIGKILL, OOM, panic), the
-//! kernel transitions the device to QUIESCED and holds in-flight I/O.
-//! Re-running `elide serve --ublk --ublk-id N` with the same id sees the
-//! existing `/sys/class/ublk-char/ublkcN` entry, issues
-//! `START_USER_RECOVERY`, reattaches fresh queue rings, and completes with
-//! `END_USER_RECOVERY` — the kernel then reissues buffered I/O to the new
-//! daemon. WAL idempotence + lowest-ULID-wins already handles duplicate
-//! writes, so reissue is safe.
+//! **Shutdown-park.** The device is always added with
+//! `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`. SIGTERM/SIGINT/
+//! SIGHUP and crashes (SIGKILL, OOM, panic) are treated identically: the
+//! daemon stops, run_target's STOP_DEV transitions the kernel device to
+//! QUIESCED, and we deliberately do NOT del_dev. The kernel buffers
+//! in-flight I/O; mounts on `/dev/ublkb<N>` stay valid; the sysfs entry
+//! and `ublk.id` persist. Re-running `elide serve-volume --ublk` sees
+//! `ublk.id` + the existing `/sys/class/ublk-char/ublkcN` entry, issues
+//! `START_USER_RECOVERY`, reattaches fresh queue rings, and completes
+//! with `END_USER_RECOVERY` — the kernel then reissues buffered I/O to
+//! the new daemon. WAL idempotence + lowest-ULID-wins already handles
+//! duplicate writes, so reissue is safe.
+//!
+//! Deletion is an explicit verb: `elide ublk delete <id>`, or the
+//! coordinator's startup reconciliation sweep (which deletes orphan
+//! kernel devices and clears bindings whose sysfs entry has gone, e.g.
+//! after a host reboot). See `docs/design-ublk-shutdown-park.md`.
 //!
 //! **Volume ↔ device binding.** A sysfs `ublkcN` entry on its own does not
 //! identify which volume the device was serving. To keep recovery from
 //! reissuing one volume's buffered writes into a *different* volume's WAL,
 //! each successful ADD records the kernel-assigned id in `<volume>/ublk.id`
-//! (per-host runtime state, cleared on clean shutdown). On subsequent
-//! serve: if `ublk.id` and `--ublk-id` disagree, refuse; if the sysfs
-//! entry exists for an id the volume never bound to, refuse; otherwise
-//! route to RECOVER (bound + sysfs present) or ADD (bound or absent).
+//! (per-host runtime state). The file persists across daemon shutdown — it
+//! is the binding the next serve uses to take Route::Recover. On
+//! subsequent serve: if `ublk.id` and `--ublk-id` disagree, refuse; if the
+//! sysfs entry exists for an id the volume never bound to, refuse;
+//! otherwise route to RECOVER (bound + sysfs present) or ADD (bound or
+//! absent).
 //!
 //! Zero-copy (`UBLK_F_AUTO_BUF_REG`) is a follow-up step. See
 //! docs/design-ublk-transport.md.
@@ -96,7 +105,6 @@ mod imp {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use crossbeam_channel::{Receiver, Sender, unbounded};
     use libublk::BufDesc;
@@ -320,8 +328,10 @@ mod imp {
     ///      wakes it.
     ///   2. Consult `slot`:
     ///      - `Some(ctrl)` → `kill_dev` to unblock `run_target`'s
-    ///        queue-thread join; the main thread runs `del_dev` +
-    ///        `clear_ublk_id` on the way out.
+    ///        queue-thread join. STOP_DEV moves the device to QUIESCED;
+    ///        per the shutdown-park policy the main thread does NOT
+    ///        del_dev or clear `ublk.id` on the way out — the device is
+    ///        left parked for the next serve to recover.
     ///      - `None` → no live device (uninterruptible startup phase like
     ///        `start_user_recover`, or shutdown is already past
     ///        `run_target`). Exit the process directly so the user is
@@ -466,7 +476,8 @@ mod imp {
             Route::BoundMismatch { persisted, cli } => {
                 return Err(super::UblkRunError::Config(format!(
                     "volume bound to ublk dev {persisted}; refusing to serve with --ublk-id {cli}. \
-                     pass --ublk-id {persisted}, or clear the binding after a clean shutdown"
+                     pass --ublk-id {persisted}, or remove ublk.id from the volume directory \
+                     (after `elide ublk delete {persisted}` if the kernel device is still present)"
                 )));
             }
             Route::ForeignDevice { id } => {
@@ -541,10 +552,13 @@ mod imp {
 
         // `wait_hook` runs once the kernel has transitioned the device to
         // LIVE. That is the earliest safe moment to record the binding:
-        // the kernel has committed to this id, and the file will only ever
-        // be deleted on a clean shutdown below (or by the operator). An
-        // unclean daemon exit leaves `ublk.id` in place, which is how the
-        // next serve recognises the device is ours to recover.
+        // the kernel has committed to this id. Under shutdown-park, the
+        // file persists across both clean and unclean daemon exits — it
+        // is the binding the next serve uses to recognise the parked
+        // device as ours and take Route::Recover. The only paths that
+        // clear it are the explicit `elide ublk delete` CLI and the
+        // coordinator reconciliation sweep on host boot when sysfs is
+        // empty.
         let binding_dir: std::path::PathBuf = dir.to_path_buf();
         let wait_hook = move |d_ctrl: &UblkCtrl| {
             d_ctrl.dump();
@@ -561,86 +575,45 @@ mod imp {
 
         // Clear the slot now that run_target has returned: any subsequent
         // signal should exit the process directly rather than kill_dev a
-        // ctrl we are about to del_dev below.
+        // ctrl that has already been parked.
         *sig_ctrl.lock().expect("sig_ctrl poisoned") = None;
 
-        // Ensure the kernel-side device does not linger after the daemon
-        // exits. run_target's internal stop_dev only stops the device;
-        // without DEL_DEV the entry stays in /sys/class/ublk-char and the
-        // dev_id cannot be reused.
+        // Shutdown-park policy (see docs/design-ublk-shutdown-park.md):
         //
-        // libublk's Drop impl on a for-add UblkCtrl already issues a
-        // synchronous DEL_DEV (force_sync = true; self.del()), so for the
-        // ADD path the only thing required is to drop the Arc and let Drop
-        // run. For the RECOVER path Drop does NOT auto-delete, so we open
-        // a fresh new_simple ctrl and call del_dev on that — matching the
-        // safe pattern used in the DEAD-cleanup probe and `ublk delete` CLI.
-        // (Calling del_dev on the for-add ctrl directly would deadlock —
-        // documented in libublk-0.4.5/src/ctrl.rs.)
+        // run_target's STOP_DEV has already transitioned the kernel device
+        // to QUIESCED. We deliberately do NOT del_dev here. With
+        // UBLK_F_USER_RECOVERY_REISSUE the kernel buffers in-flight I/O
+        // and waits for a new daemon to attach via START_USER_RECOVERY.
+        // Mounts on /dev/ublkb<N> stay valid; from the guest's
+        // perspective I/O is paused, not lost. The next `serve-volume`
+        // sees `ublk.id` + sysfs entry, takes Route::Recover, and
+        // reissues buffered writes. Tearing the device down on shutdown
+        // is what made `restart-while-mounted` fail today; not tearing it
+        // down is what makes USER_RECOVERY do the job it was designed for.
         //
-        // Either path can stall in the kernel: `del_dev` blocks in
-        // `wait_event` until every reference on the ublk_device struct is
-        // released, and udev/systemd transiently opens `/dev/ublkb<N>`
-        // when the device appears. The cleanup runs on the main thread
-        // because libublk's control ring is thread-local and was
-        // initialized here at startup; a watchdog thread bounds the
-        // total time before forcing the process to exit. On timeout
-        // `ublk.id` is left in place — the next serve sees sysfs cleared
-        // (or will, once the kernel finishes the deferred deletion) and
-        // re-adds at the same id via `Route::Add { target_id: Some(id) }`.
-        let dev_id_for_cleanup = ctrl.dev_info().dev_id as i32;
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let _watchdog = std::thread::Builder::new()
-            .name("ublk-del-watchdog".into())
-            .spawn(move || {
-                if done_rx.recv_timeout(DEL_DEV_TIMEOUT).is_err() {
-                    tracing::warn!(
-                        "ublk del_dev for dev {dev_id_for_cleanup} did not return within {:?}; \
-                         exiting — kernel will finalize deletion when other holders release \
-                         the device, and the next serve will reclaim the id",
-                        DEL_DEV_TIMEOUT
-                    );
-                    std::process::exit(0);
-                }
-            })
-            .map_err(io::Error::other)?;
-
-        drop(ctrl);
-        if recovering {
-            match UblkCtrl::new_simple(dev_id_for_cleanup) {
-                Ok(simple) => {
-                    if let Err(e) = simple.del_dev() {
-                        tracing::debug!("ublk del_dev on shutdown returned: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "ublk new_simple({dev_id_for_cleanup}) for shutdown del_dev failed: {e}"
-                    );
-                }
-            }
-        }
-
-        // Stand the watchdog down before any post-cleanup work that we
-        // do want to complete (clear the binding file, propagate the
-        // `run_target` result). A racing watchdog firing after this point
-        // would only trigger on the binding-file write itself, which is
-        // fast and bounded.
-        let _ = done_tx.send(());
-
-        if let Err(e) = clear_ublk_id(dir) {
-            tracing::error!("ublk clear binding failed: {e}");
+        // libublk's `Drop for UblkCtrlInner` issues a synchronous del()
+        // when `for_add_dev()` is true — i.e. the ADD path. To suppress
+        // that without forking libublk we `mem::forget` the Arc on the
+        // ADD path, leaking the strong count so Drop never fires. The
+        // open `/dev/ublk-control` fd plus a ~kilobyte heap allocation
+        // are reaped by the kernel when this process exits below. The
+        // RECOVER path's Drop is a no-op (libublk only auto-deletes
+        // for-add ctrls), so a plain `drop` suffices.
+        //
+        // `ublk.id` is intentionally NOT cleared: it's the binding the
+        // next serve uses to recognise the parked device as ours. It is
+        // cleared only by the explicit operator action `elide ublk delete`
+        // and by the coordinator reconciliation sweep (which clears
+        // bindings whose sysfs entry has gone, e.g. after a host reboot).
+        if !recovering {
+            std::mem::forget(ctrl);
+        } else {
+            drop(ctrl);
         }
 
         run_result?;
         Ok(())
     }
-
-    /// Bound the time we wait for `del_dev` to come back. `del_dev` blocks
-    /// in the kernel until every ublk_device reference is released, which
-    /// can stall arbitrarily long if udev/systemd is slow to close the
-    /// `/dev/ublkb<N>` fd it opened during device-add probing.
-    const DEL_DEV_TIMEOUT: Duration = Duration::from_secs(3);
 
     fn pick_nr_queues() -> u16 {
         let cpus = std::thread::available_parallelism()
@@ -1005,10 +978,10 @@ mod imp {
     }
 
     /// True when `/sys/class/ublk-char/ublkc<id>` is present — i.e. the
-    /// kernel still has a device registered under that id. The entry
-    /// outlives an unclean daemon exit because the kernel transitions to
-    /// QUIESCED instead of tearing the device down, which is the signal
-    /// for USER_RECOVERY_REISSUE to kick in on respawn.
+    /// kernel still has a device registered under that id. Under
+    /// shutdown-park the entry outlives every daemon exit (the kernel
+    /// transitions to QUIESCED rather than tearing down), and is the
+    /// signal for USER_RECOVERY_REISSUE to kick in on the next serve.
     fn ublk_device_exists(id: i32) -> bool {
         std::path::Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists()
     }

@@ -1,6 +1,24 @@
 # Design: ublk shutdown leaves QUIESCED; deletion is explicit
 
-**Status:** Proposed.
+**Status:** Implemented.
+
+Implementation notes:
+
+- `src/ublk.rs` `run_volume_ublk` — post-`run_target` cleanup no longer calls
+  `del_dev`. The for-add ctrl is `mem::forget`-ed (option 1 in §Mechanism) to
+  suppress libublk's auto-delete on Drop; the recover ctrl is dropped
+  normally (its Drop is already a no-op). The `DEL_DEV_TIMEOUT` watchdog and
+  the `clear_ublk_id` call on shutdown are removed.
+- `elide-coordinator/src/ublk_sweep.rs` — startup reconciliation sweep that
+  enumerates `/sys/class/ublk-char/`, walks `<data_dir>/by_id/*/ublk.id`,
+  shells out to `elide ublk delete <id>` for orphan kernel devices (with a
+  per-device 10s subprocess timeout), and removes binding files whose
+  kernel device has gone (e.g. after a host reboot). Wired into `daemon::run`
+  before the first scan tick.
+- `elide ublk delete` (existing CLI) remains the explicit deletion verb.
+- Open question §"Boot-time devices" is resolved: sweep step 4 clears
+  `ublk.id` files whose sysfs entry no longer exists; the next serve takes
+  `Route::Add { target_id: None }` and the kernel auto-allocates a fresh id.
 
 ## Problem
 
