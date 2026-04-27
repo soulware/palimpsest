@@ -418,10 +418,27 @@ mod imp {
         // Always attempt DEL_DEV so the kernel-side device does not linger
         // after the daemon exits. run_target's internal stop_dev only stops
         // the device; without del_dev the entry stays in /sys/class/ublk-char
-        // and the dev_id cannot be reused. ENOENT is expected if the device
-        // was already removed out-of-band.
-        if let Err(e) = ctrl.del_dev() {
-            tracing::debug!("ublk del_dev on shutdown returned: {e}");
+        // and the dev_id cannot be reused.
+        //
+        // libublk explicitly warns that del_dev() deadlocks on a "for-add"
+        // control device (the very ctrl we built above). The safe pattern —
+        // also used in the DEAD-cleanup path during recovery probing — is to
+        // drop the for-add ctrl first so its /dev/ublk-control fd closes,
+        // then open a plain UblkCtrl::new_simple just for the delete. ENOENT
+        // is expected if the device was already removed out-of-band.
+        let dev_id_for_cleanup = ctrl.dev_info().dev_id as i32;
+        drop(ctrl);
+        match UblkCtrl::new_simple(dev_id_for_cleanup) {
+            Ok(simple) => {
+                if let Err(e) = simple.del_dev() {
+                    tracing::debug!("ublk del_dev on shutdown returned: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "ublk new_simple({dev_id_for_cleanup}) for shutdown del_dev failed: {e}"
+                );
+            }
         }
 
         // Clean shutdown: the device is gone, so the binding is no longer

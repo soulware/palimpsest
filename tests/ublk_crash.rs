@@ -138,12 +138,44 @@ fn wait_for_sysfs_gone(dev_id: i32) {
     panic!("/sys/class/ublk-char/ublkc{dev_id} still present 10s after signal");
 }
 
-/// Reap the child after signalling it; panics if wait() fails.
-fn reap(child: &mut Child, expected: &str) {
-    match child.wait() {
-        Ok(status) => eprintln!("[test] daemon ({expected}) exited: {status:?}"),
-        Err(e) => panic!("wait on daemon after {expected}: {e}"),
+/// Reap the child after signalling it, bounded by a deadline. If the
+/// child does not exit within the deadline, panic — a hung daemon is a
+/// regression, not a slow exit. SIGKILL the leaked process so the next
+/// test run is not blocked on its lingering ublk device.
+fn reap_within(child: &mut Child, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!("[test] daemon ({expected}) exited: {status:?}");
+                return;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let pid = child.id();
+                    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    let _ = child.wait();
+                    panic!(
+                        "daemon (pid={pid}) did not exit within {timeout:?} after {expected}; \
+                         SIGKILL'd to free kernel state — likely a shutdown deadlock"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("try_wait on daemon after {expected}: {e}"),
+        }
     }
+}
+
+/// Crash path: SIGKILL guarantees prompt exit. A short bound is fine.
+fn reap_killed(child: &mut Child, expected: &str) {
+    reap_within(child, expected, Duration::from_secs(2));
+}
+
+/// Clean shutdown path: more generous, but still bounded — anything
+/// over a few seconds is the deadlock we are trying to detect.
+fn reap_clean(child: &mut Child, expected: &str) {
+    reap_within(child, expected, Duration::from_secs(5));
 }
 
 /// Send `sig` to `child` via raw `kill(2)`.
@@ -324,7 +356,7 @@ fn sigkill_recovery() {
     // moves the device to QUIESCED, and keeps /dev/ublkbN alive pending
     // a recovery attach. `ublk.id` on disk must survive.
     send_signal(&daemon, libc::SIGKILL);
-    reap(&mut daemon, "SIGKILL");
+    reap_killed(&mut daemon, "SIGKILL");
 
     assert!(
         sysfs_entry_exists(DEV_ID_SIGKILL),
@@ -349,7 +381,7 @@ fn sigkill_recovery() {
 
     // Clean shutdown of the recovered daemon.
     send_signal(&daemon, libc::SIGTERM);
-    reap(&mut daemon, "SIGTERM (cleanup)");
+    reap_clean(&mut daemon, "SIGTERM (cleanup)");
     wait_for_sysfs_gone(DEV_ID_SIGKILL);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -374,7 +406,7 @@ fn sigterm_clean_restart() {
     write_pattern(DEV_ID_SIGTERM, 0, &data);
 
     send_signal(&daemon, libc::SIGTERM);
-    reap(&mut daemon, "SIGTERM");
+    reap_clean(&mut daemon, "SIGTERM");
 
     // Clean exit must tear down the kernel device and the on-disk
     // binding. If either survives, the daemon didn't reach the
@@ -400,7 +432,7 @@ fn sigterm_clean_restart() {
     );
 
     send_signal(&daemon, libc::SIGTERM);
-    reap(&mut daemon, "SIGTERM (cleanup)");
+    reap_clean(&mut daemon, "SIGTERM (cleanup)");
     wait_for_sysfs_gone(DEV_ID_SIGTERM);
 
     let _ = std::fs::remove_dir_all(&dir);
