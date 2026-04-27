@@ -184,6 +184,22 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] discovered volume: {label}");
 
+                // Reconcile the local volume.stopped marker against the
+                // bucket-side names/<name> state so the supervisor sees
+                // a consistent picture before launching. S3 wins; this is
+                // a best-effort recovery from prior drift (e.g. a `volume
+                // stop` whose S3 update succeeded but local marker write
+                // failed, or vice versa). Skipped for readonly volumes
+                // (imported bases have no name in the portable sense).
+                if !vol_dir.join("volume.readonly").exists()
+                    && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
+                {
+                    elide_coordinator::lifecycle::reconcile_marker(
+                        &store, &vol_dir, &name, &root_key,
+                    )
+                    .await;
+                }
+
                 let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(4);
                 evict_registry
                     .lock()

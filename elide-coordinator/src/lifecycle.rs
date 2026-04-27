@@ -9,9 +9,11 @@
 //! (release verb) and `claim_started_from_released` (the start verb's
 //! claim path).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use object_store::ObjectStore;
+use tracing::warn;
 use ulid::Ulid;
 
 use elide_core::name_record::{NameState, current_hostname};
@@ -261,6 +263,76 @@ pub async fn mark_live(
     Ok(MarkLiveOutcome::Resumed)
 }
 
+/// Reconcile the local `volume.stopped` marker against
+/// `names/<name>.state`. S3 is authoritative — the local marker is a
+/// host-side cache.
+///
+/// Behaviour, scoped to records this coordinator owns:
+/// - `state == Stopped` and marker absent → write the marker so the
+///   supervisor does not relaunch the daemon.
+/// - `state == Live` and marker present → remove the marker so the
+///   supervisor can launch the daemon.
+/// - All other cases (foreign owner, `Released`, no record at all)
+///   are left to the lifecycle verbs to handle. Reconciliation never
+///   acts on records owned by another coordinator.
+///
+/// Best-effort: errors are logged and the function returns `Ok(())`.
+/// Reconciliation drift is a soft inconsistency — the next operator
+/// `volume start` / `volume stop` resolves it cleanly.
+pub async fn reconcile_marker(
+    store: &Arc<dyn ObjectStore>,
+    vol_dir: &Path,
+    volume_name: &str,
+    root_key: &[u8; 32],
+) {
+    let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
+
+    let record = match name_store::read_name_record(store, volume_name).await {
+        Ok(Some((r, _))) => r,
+        Ok(None) => return,
+        Err(e) => {
+            warn!("[reconcile {volume_name}] reading names/<name>: {e}");
+            return;
+        }
+    };
+
+    // Reconciliation only acts on records this coordinator owns.
+    let owned_by_us = record
+        .coordinator_id
+        .as_deref()
+        .is_some_and(|id| id == coord_id);
+    if !owned_by_us {
+        return;
+    }
+
+    let marker = vol_dir.join("volume.stopped");
+    let marker_present = marker.exists();
+
+    match (record.state, marker_present) {
+        (NameState::Stopped, false) => {
+            if let Err(e) = std::fs::write(&marker, "") {
+                warn!("[reconcile {volume_name}] writing volume.stopped: {e}");
+            } else {
+                tracing::info!(
+                    "[reconcile {volume_name}] S3 says Stopped; wrote volume.stopped marker"
+                );
+            }
+        }
+        (NameState::Live, true) => {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                warn!("[reconcile {volume_name}] removing volume.stopped: {e}");
+            } else {
+                tracing::info!(
+                    "[reconcile {volume_name}] S3 says Live; removed volume.stopped marker"
+                );
+            }
+        }
+        // (Stopped, true) and (Live, false) are aligned — no action.
+        // (Released, _) is left to `volume start --claim` semantics.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +566,68 @@ mod tests {
             .await
             .expect_err("B must be refused on A-owned record");
         assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_writes_marker_when_s3_says_stopped() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+
+        reconcile_marker(&s, &vol_dir, "vol", &key_a()).await;
+        assert!(vol_dir.join("volume.stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_removes_marker_when_s3_says_live() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        // Cycle through stop → start so coordinator_id is set on the
+        // record (Phase 1 records start as Live with no coordinator_id,
+        // and reconcile only acts on records *we* own).
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+        mark_live(&s, "vol", &key_a()).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::write(vol_dir.join("volume.stopped"), "").unwrap();
+
+        reconcile_marker(&s, &vol_dir, "vol", &key_a()).await;
+        assert!(!vol_dir.join("volume.stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_ignores_foreign_owned_records() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        // A claims via stop.
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+
+        // B reconciles; A's record must not affect B's local state.
+        reconcile_marker(&s, &vol_dir, "vol", &key_b()).await;
+        assert!(!vol_dir.join("volume.stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_no_op_when_record_absent() {
+        let s = store();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+
+        reconcile_marker(&s, &vol_dir, "vol", &key_a()).await;
+        assert!(!vol_dir.join("volume.stopped").exists());
     }
 }

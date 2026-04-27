@@ -341,6 +341,12 @@ enum VolumeCommand {
     Stop {
         /// Volume name
         name: String,
+        /// Release ownership instead of just halting locally. Drains the
+        /// WAL, publishes a handoff snapshot, and flips the bucket-side
+        /// state to `released` so any coordinator can claim the name via
+        /// `volume start`. Equivalent to `volume release <name>`.
+        #[arg(long)]
+        release: bool,
     },
 
     /// Start a previously stopped volume
@@ -768,12 +774,24 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Stop { name } => {
-                if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+            VolumeCommand::Stop { name, release } => {
+                if release {
+                    match coordinator_client::release_volume(&socket_path, &name) {
+                        Ok(snap) => {
+                            println!("{name}: released at handoff snapshot {snap}");
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("{name}: stopped");
                 }
-                println!("{name}: stopped");
             }
 
             VolumeCommand::Start { name } => {
