@@ -1,6 +1,60 @@
 # Design: ublk shutdown leaves QUIESCED; deletion is explicit
 
-**Status:** Proposed.
+**Status:** Implemented.
+
+## Important correction to §Proposal
+
+The original proposal said "kill_dev (STOP_DEV) parks the device, queue threads
+exit, the daemon process exits". That is wrong. Empirical kernel behaviour
+(verified on 6.x with `UBLK_F_USER_RECOVERY`):
+
+- `STOP_DEV` (issued via `kill_dev` or `stop_dev`) is the explicit "tear down"
+  verb. The kernel transitions LIVE → **DEAD**, regardless of whether
+  `UBLK_F_USER_RECOVERY` is set.
+- The `QUIESCED` state is reached only via the kernel's daemon-exit detection
+  path: when the io_uring control fds close (process death), the kernel's
+  monitor work observes it, and *if* `UBLK_F_USER_RECOVERY` is set, transitions
+  LIVE → **QUIESCED**.
+
+So "leave the device QUIESCED" requires *not* calling STOP_DEV. The graceful
+shutdown path must look the same as a SIGKILL from the kernel's perspective —
+just exit the process. SIGKILL on the volume daemon (verified empirically) does
+in fact park the device cleanly; SIGTERM with our previous `kill_dev`-based
+handler did not.
+
+## Implementation notes
+
+- `src/ublk.rs` `spawn_ublk_signal_watcher` — on SIGTERM/SIGINT/SIGHUP the
+  watcher does `client.flush()` (a durability barrier; bounded by a 3 s
+  watchdog timer that force-exits if the actor stalls) and then
+  `process::exit(0)`. No `kill_dev`. The kernel parks the device on its own.
+- `src/ublk.rs` `run_volume_ublk` — the post-`run_target` cleanup is gone
+  (unreachable: the watcher exits the process before `run_target` ever
+  returns). The `Mutex<Option<Arc<UblkCtrl>>>` slot used to plumb a ctrl
+  handle to the watcher is also gone. `ublk.id` persists across all daemon
+  exits.
+- `elide-coordinator/src/ublk_sweep.rs` — startup reconciliation sweep that
+  enumerates `/sys/class/ublk-char/`, walks `<data_dir>/by_id/*/ublk.id`,
+  shells out to `elide ublk delete <id>` for orphan kernel devices (with a
+  per-device 10 s subprocess timeout), and removes binding files whose
+  kernel device has gone (e.g. after a host reboot). Wired into `daemon::run`
+  before the first scan tick.
+- `elide ublk delete` (existing CLI) remains the explicit deletion verb.
+- Open question §"Boot-time devices" is resolved: sweep step 4 clears
+  `ublk.id` files whose sysfs entry no longer exists; the next serve takes
+  `Route::Add { target_id: None }` and the kernel auto-allocates a fresh id.
+
+## Durability on graceful shutdown
+
+`VolumeClient::write` returns OK after the actor appends to the WAL, but
+`Volume::write` does not currently fsync before reply (see
+`project_nbd_fsync_ack_ordering` audit). Writes acked to the guest may not
+yet be on disk. The shutdown flush (`client.flush()` → `volume.wal_fsync()`)
+closes that window for graceful exits: any write the actor accepted before
+the flush request is durable when the flush returns. SIGKILL bypasses this,
+matching the existing crash-recovery contract — anything not durable is
+also not committed to the kernel and gets reissued on the next
+`START_USER_RECOVERY`.
 
 ## Problem
 

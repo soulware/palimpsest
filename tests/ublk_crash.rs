@@ -3,17 +3,25 @@
 //! These tests drive a real `/dev/ublkbN` device by spawning the elide
 //! binary as a subprocess (the test process itself cannot be SIGKILL'd
 //! without aborting the test), writing a pattern, signalling the daemon,
-//! respawning, and reading the pattern back. They validate the two
-//! complementary halves of `plan_route`:
+//! respawning, and reading the pattern back.
 //!
-//! - `sigkill_recovery` — daemon dies uncleanly, kernel marks the device
-//!   QUIESCED, `ublk.id` and the sysfs entry both survive, respawn takes
-//!   `Route::Recover` and USER_RECOVERY_REISSUE reissues buffered I/O.
+//! Under shutdown-park (docs/design-ublk-shutdown-park.md) graceful
+//! SIGTERM and SIGKILL converge on the same kernel state: the daemon
+//! exits without calling STOP_DEV, the kernel's monitor work observes
+//! the io_uring fds close, and with `UBLK_F_USER_RECOVERY` set the
+//! device transitions LIVE → QUIESCED. Sysfs entry survives, `ublk.id`
+//! survives, mount survives — respawn takes `Route::Recover` and
+//! `START_USER_RECOVERY` reissues any buffered I/O.
 //!
-//! - `sigterm_clean_restart` — daemon handles the signal, runs
-//!   `kill_dev` → `del_dev` → `clear_ublk_id`, sysfs entry and binding
-//!   file both disappear, respawn takes `Route::Add { target_id: None }`
-//!   and acked writes are still durable in the WAL.
+//! - `sigkill_recovery` — daemon dies uncleanly, no shutdown flush
+//!   runs, but acked writes (which fsync via the actor flush path)
+//!   read back after recovery. Reissued in-flight writes are the
+//!   USER_RECOVERY_REISSUE half of the contract.
+//!
+//! - `sigterm_clean_restart` — daemon handles the signal, runs the
+//!   shutdown flush (durability barrier for any acked-but-unsynced
+//!   writes), exits cleanly with status 0. Same kernel state as
+//!   sigkill_recovery, same Route::Recover on respawn.
 //!
 //! These run only in the `ci-kernel` lane (real kernel + ublk_drv + root).
 
@@ -124,10 +132,12 @@ fn wait_for_device(dev_id: i32) {
     panic!("ublk device /dev/ublkb{dev_id} did not appear within 20s");
 }
 
-/// Block until the sysfs entry for `dev_id` disappears, or panic after
-/// 10s. Used after SIGTERM to confirm the clean-shutdown path actually
-/// ran `del_dev` (not just `kill_dev`).
-fn wait_for_sysfs_gone(dev_id: i32) {
+/// Tear down the kernel device explicitly via the CLI and wait for the
+/// sysfs entry to disappear. Used at end-of-test cleanup; under
+/// shutdown-park the daemon never deletes the device on signal, so the
+/// only path to a clean kernel state is `elide ublk delete`.
+fn delete_and_wait_sysfs_gone(dev_id: i32) {
+    force_delete_device(dev_id);
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if !sysfs_entry_exists(dev_id) {
@@ -135,7 +145,7 @@ fn wait_for_sysfs_gone(dev_id: i32) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("/sys/class/ublk-char/ublkc{dev_id} still present 10s after signal");
+    panic!("/sys/class/ublk-char/ublkc{dev_id} still present 10s after `elide ublk delete`");
 }
 
 /// Reap the child after signalling it, bounded by a deadline. If the
@@ -379,10 +389,12 @@ fn sigkill_recovery() {
         "pattern at LBA 0 must survive SIGKILL + USER_RECOVERY_REISSUE"
     );
 
-    // Clean shutdown of the recovered daemon.
+    // Clean shutdown of the recovered daemon. Under shutdown-park the
+    // kernel device stays QUIESCED; explicit deletion is the test's
+    // responsibility.
     send_signal(&daemon, libc::SIGTERM);
     reap_clean(&mut daemon, "SIGTERM (cleanup)");
-    wait_for_sysfs_gone(DEV_ID_SIGKILL);
+    delete_and_wait_sysfs_gone(DEV_ID_SIGKILL);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -408,32 +420,36 @@ fn sigterm_clean_restart() {
     send_signal(&daemon, libc::SIGTERM);
     reap_clean(&mut daemon, "SIGTERM");
 
-    // Clean exit must tear down the kernel device and the on-disk
-    // binding. If either survives, the daemon didn't reach the
-    // post-`run_target` `del_dev` + `clear_ublk_id` path.
-    wait_for_sysfs_gone(DEV_ID_SIGTERM);
+    // Under shutdown-park, SIGTERM exits the daemon without calling
+    // STOP_DEV / DEL_DEV. The kernel parks the device in QUIESCED via
+    // daemon-exit detection; sysfs entry and `ublk.id` must both
+    // survive so the next serve takes Route::Recover.
     assert!(
-        !dir.join("ublk.id").exists(),
-        "ublk.id must be cleared on clean shutdown"
+        sysfs_entry_exists(DEV_ID_SIGTERM),
+        "sysfs entry should survive SIGTERM (device parked QUIESCED, not deleted)"
+    );
+    assert!(
+        dir.join("ublk.id").exists(),
+        "ublk.id must persist across clean shutdown for Route::Recover"
     );
 
-    // Round 2: respawn — plan_route now sees persisted=None,
-    // cli=Some(id), sysfs=false, so takes Route::Add { target_id:
-    // Some(id) } (a fresh ADD, not recovery). Data must still read
-    // back, because the WAL is the source of truth, not any in-memory
-    // kernel state.
+    // Round 2: respawn — plan_route sees persisted=Some(id),
+    // sysfs=true, so takes Route::Recover. The shutdown flush
+    // (`client.flush()` before exit) made the acked write durable; the
+    // recovery attaches fresh queue rings and reads return the same
+    // pattern.
     let mut daemon = spawn_daemon(&dir, DEV_ID_SIGTERM);
     wait_for_device(DEV_ID_SIGTERM);
 
     let read_back = read_pattern(DEV_ID_SIGTERM, 0, BLOCK);
     assert_eq!(
         read_back, data,
-        "acked writes must survive clean shutdown + fresh add"
+        "acked writes must survive SIGTERM + recovery"
     );
 
     send_signal(&daemon, libc::SIGTERM);
     reap_clean(&mut daemon, "SIGTERM (cleanup)");
-    wait_for_sysfs_gone(DEV_ID_SIGTERM);
+    delete_and_wait_sysfs_gone(DEV_ID_SIGTERM);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

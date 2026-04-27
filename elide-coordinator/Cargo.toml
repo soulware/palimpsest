@@ -27,6 +27,13 @@ toml         = { version = "0.8", default-features = false, features = ["parse",
 ulid         = "1"
 zstd         = "0.13"
 
+# libublk is Linux-only; the sweep uses it directly to delete orphan
+# kernel devices without spawning the elide binary as a subprocess. On
+# non-Linux targets the sweep compiles to a stub that does nothing
+# (sysfs path doesn't exist, no devices to reconcile).
+[target.'cfg(target_os = "linux")'.dependencies]
+libublk = "0.4"
+
 [features]
 # Gate the slow property-based test suites behind an explicit feature so that
 # `cargo test -p elide-coordinator` runs only the fast unit/integration tests.
