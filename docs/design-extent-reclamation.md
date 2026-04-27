@@ -1,6 +1,6 @@
 # Extent reclamation
 
-**Status:** Work in progress. The code described below is a proof-of-concept, not a finished feature. Do not cite anything in this doc when solving an unrelated correctness problem.
+**Status:** Primitive, scanner, CLI, and per-tick coordinator scheduling are landed. Threshold tuning is empirical work still pending. Do not cite anything in this doc when solving an unrelated correctness problem.
 
 ## What exists today
 
@@ -45,15 +45,11 @@ WAL records exist to make writes crash-replayable before they reach a segment. R
 
 A successful reclaim pass updates the lbamap to point at fresh compact entries and leaves the original hash's body in its source segment as an LBA-dead entry. The body is not deleted at apply time. GC reclaims it later when the containing segment crosses an eligibility threshold (dead-input, ≤ 16 MiB live, or density < 0.70). A dead body in an otherwise-dense segment stays on disk until enough surrounding entries also die — so `runs_rewritten > 0` from `elide volume reclaim` means "scheduled", not "freed on disk".
 
-## Coordinator wiring (open)
+## Coordinator wiring
 
-Two options once the primitive is worker-offloaded:
+Wired in `elide-coordinator/src/tasks.rs` alongside `sweep_pending` / `repack` / `delta_repack_post_snapshot`. Each drain tick calls `control::reclaim(&fork_dir, Some(1))`: the volume runs the scanner, takes the top-scoring candidate, and reclaims it. The cap of 1 per tick bounds per-tick latency; sustained bloat converges across ticks because the scanner sorts most-wasteful-first. Orphaned bodies from the reclaim output become ordinary sparse-segment candidates on the next GC tick. Skipped for readonly volumes and during import-serve phases (control.sock owned by the import process).
 
-1. **Pre-drain, scanner-gated** — in `tasks.rs`, alongside `sweep_pending` / `repack` / `delta_repack_post_snapshot`. Each tick: call a cheap `control::reclaim_scan` IPC that returns the top candidate's score; if it clears a configured bar, call `control::reclaim`. Symmetric with how `repack` is wired. Orphaned bodies from the reclaim output become ordinary sparse-segment candidates on the next GC tick.
-
-2. **Post-snapshot** — trigger once after `sign_snapshot_manifest`. Rationale: bloat accumulates across a snapshot's lifetime, and the snapshot floor is what lets GC actually reclaim the resulting orphans. Sharper knife; requires an explicit event hook.
-
-Lean is (1) as the first wiring: no new event path, symmetric with existing maintenance ops, and a single per-tick knob controls cadence.
+The pre-drain placement was picked over a post-snapshot hook because it needs no new event path, is symmetric with existing maintenance ops, and a single per-tick knob controls cadence.
 
 ### Concurrency constraint
 
