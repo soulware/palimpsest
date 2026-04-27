@@ -380,6 +380,20 @@ pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
     }
 }
 
+/// Release a volume's name back to the pool so any other coordinator can
+/// claim it via `volume start`. Drains WAL, publishes a handoff snapshot,
+/// halts the daemon, and flips `names/<name>` to `state=released` with
+/// the snapshot ULID recorded so the next claimant can fork from it.
+/// Returns the handoff snapshot ULID on success.
+pub fn release_volume(socket_path: &Path, name: &str) -> io::Result<String> {
+    let resp = call(socket_path, &format!("release {name}"))?;
+    match resp.split_once(' ') {
+        Some(("ok", snap)) => Ok(snap.trim().to_owned()),
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
 /// Start a previously-stopped volume. Coordinator clears `volume.stopped`
 /// and triggers a rescan so the supervisor relaunches the process.
 pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<()> {

@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use object_store::ObjectStore;
+use ulid::Ulid;
 
 use elide_core::name_record::{NameState, current_hostname};
 
@@ -133,6 +134,75 @@ pub async fn mark_stopped(
     Ok(MarkStoppedOutcome::Updated)
 }
 
+/// Outcome of a `mark_released` call.
+#[derive(Debug)]
+pub enum MarkReleasedOutcome {
+    /// `names/<name>` was updated to `Released`, recording
+    /// `handoff_snapshot` so the next claimant can fork from it.
+    Updated,
+    /// `names/<name>` did not exist in the bucket. The release verb
+    /// requires a published record (something to hand off); callers
+    /// should treat this as an error.
+    Absent,
+    /// `names/<name>` was already `Released` and matched our caller.
+    /// Idempotent success.
+    AlreadyReleased,
+}
+
+/// Transition `names/<name>` from `Live` or `Stopped` to `Released`,
+/// recording the handoff snapshot so the next claimant can fork from
+/// it. Ownership (`coordinator_id`) is preserved on the record as
+/// historical metadata; the next `volume start` will overwrite it.
+///
+/// This is the cross-coordinator-handoff verb. Callers must already
+/// have:
+///   1. drained the volume's WAL,
+///   2. published a snapshot covering everything drained,
+///   3. recorded the resulting `snap_ulid` here as `handoff_snapshot`.
+///
+/// The conditional PUT ensures no other coordinator has mutated the
+/// record between our read and our write.
+pub async fn mark_released(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    root_key: &[u8; 32],
+    handoff_snapshot: Ulid,
+) -> Result<MarkReleasedOutcome, LifecycleError> {
+    let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
+
+    let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
+        return Ok(MarkReleasedOutcome::Absent);
+    };
+
+    if let Some(existing) = record.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(LifecycleError::OwnershipConflict {
+            held_by: existing.to_owned(),
+        });
+    }
+
+    match record.state {
+        NameState::Live | NameState::Stopped => {}
+        NameState::Released => return Ok(MarkReleasedOutcome::AlreadyReleased),
+    }
+
+    record.state = NameState::Released;
+    record.handoff_snapshot = Some(handoff_snapshot);
+    if record.coordinator_id.is_none() {
+        record.coordinator_id = Some(coord_id);
+    }
+    if record.acquired_at.is_none() {
+        record.acquired_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    if record.hostname.is_none() {
+        record.hostname = current_hostname();
+    }
+
+    name_store::update_name_record(store, name, &record, version).await?;
+    Ok(MarkReleasedOutcome::Updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +296,81 @@ mod tests {
                 verb: "stop"
             }
         ));
+    }
+
+    fn snap() -> Ulid {
+        Ulid::from_string("01J1111111111111111111111V").unwrap()
+    }
+
+    #[tokio::test]
+    async fn mark_released_returns_absent_when_record_missing() {
+        let s = store();
+        let r = mark_released(&s, "missing", &key_a(), snap())
+            .await
+            .unwrap();
+        assert!(matches!(r, MarkReleasedOutcome::Absent));
+    }
+
+    #[tokio::test]
+    async fn mark_released_flips_live_to_released_with_handoff() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        assert!(matches!(outcome, MarkReleasedOutcome::Updated));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Released);
+        assert_eq!(got.handoff_snapshot, Some(snap()));
+        assert!(got.coordinator_id.is_some(), "coordinator_id backfilled");
+    }
+
+    #[tokio::test]
+    async fn mark_released_flips_stopped_to_released() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+
+        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        assert!(matches!(outcome, MarkReleasedOutcome::Updated));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Released);
+        assert_eq!(got.handoff_snapshot, Some(snap()));
+    }
+
+    #[tokio::test]
+    async fn mark_released_is_idempotent_for_same_owner() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        assert!(matches!(outcome, MarkReleasedOutcome::AlreadyReleased));
+    }
+
+    #[tokio::test]
+    async fn mark_released_refuses_other_owners_record() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        // A claims via stop.
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+
+        // B tries to release A's record.
+        let err = mark_released(&s, "vol", &key_b(), snap())
+            .await
+            .expect_err("B must be refused on A-owned record");
+        assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
     }
 }

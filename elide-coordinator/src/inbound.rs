@@ -273,6 +273,21 @@ async fn dispatch(
             stop_volume_op(args, data_dir, store, root_key).await
         }
 
+        "release" => {
+            if args.is_empty() {
+                return "err usage: release <volume>".to_string();
+            }
+            release_volume_op(
+                args,
+                data_dir,
+                snapshot_locks,
+                store,
+                part_size_bytes,
+                root_key,
+            )
+            .await
+        }
+
         "start" => {
             if args.is_empty() {
                 return "err usage: start <volume>".to_string();
@@ -1703,6 +1718,135 @@ async fn stop_volume_op(
             // Volume process wasn't running — marker is correct as-is.
             info!("[inbound] stopped volume {volume_name} (process was not running)");
             "ok".to_string()
+        }
+    }
+}
+
+/// Relinquish ownership of `<volume_name>` so any other coordinator can
+/// `volume start` it. Composes the existing snapshot path:
+///
+///   1. Refuse if NBD client connected, volume is readonly, or already
+///      stopped (release of a stopped volume requires `volume start`
+///      first to bring it up for the drain).
+///   2. Verify S3 ownership before doing the expensive drain.
+///   3. Drain WAL → publish handoff snapshot via `snapshot_volume`.
+///   4. Send shutdown RPC to halt the daemon.
+///   5. Write `volume.stopped` marker so the supervisor won't restart.
+///   6. Conditional PUT to `names/<name>` setting state=Released and
+///      recording the handoff snapshot ULID.
+async fn release_volume_op(
+    volume_name: &str,
+    data_dir: &Path,
+    snapshot_locks: &SnapshotLockRegistry,
+    store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
+    root_key: &[u8; 32],
+) -> String {
+    let link = data_dir.join("by_name").join(volume_name);
+    if !link.exists() {
+        return format!("err volume not found: {volume_name}");
+    }
+    let vol_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) => return format!("err resolving volume dir: {e}"),
+    };
+
+    if vol_dir.join("volume.readonly").exists() {
+        return "err volume is readonly; nothing to release".to_string();
+    }
+    if vol_dir.join("volume.stopped").exists() {
+        return "err volume is stopped — `volume start` it first, then release".to_string();
+    }
+    if !vol_dir.join("control.sock").exists() {
+        return format!("err volume '{volume_name}' is not running — start it first");
+    }
+
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
+        Some(resp) if resp == "ok true" => {
+            return "err nbd client is connected; disconnect it first".to_string();
+        }
+        _ => {}
+    }
+
+    // Verify ownership in S3 before kicking off the (expensive) drain.
+    use elide_coordinator::lifecycle;
+    use elide_core::name_record::NameState;
+    match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+        Ok(Some((rec, _))) => {
+            use elide_coordinator::portable::{coordinator_id, format_coordinator_id};
+            let self_id = format_coordinator_id(&coordinator_id(root_key));
+            if let Some(existing) = rec.coordinator_id.as_deref()
+                && existing != self_id
+            {
+                return format!(
+                    "err name '{volume_name}' is owned by coordinator {existing}; \
+                     use --force-takeover to override"
+                );
+            }
+            if rec.state == NameState::Released {
+                return format!("err name '{volume_name}' is already released");
+            }
+        }
+        Ok(None) => {
+            // No record yet — release of an unpublished volume is
+            // meaningless (nothing for the next claimant to fork from).
+            return format!("err name '{volume_name}' has no S3 record; drain the volume first");
+        }
+        Err(e) => {
+            return format!("err reading names/{volume_name}: {e}");
+        }
+    }
+
+    // Drain WAL → publish handoff snapshot. Reuses the existing
+    // snapshot_volume path; on success the response is `ok <snap_ulid>`.
+    let snap_resp = snapshot_volume(
+        volume_name,
+        data_dir,
+        snapshot_locks,
+        store,
+        part_size_bytes,
+    )
+    .await;
+    let snap_ulid_str = match snap_resp.strip_prefix("ok ") {
+        Some(s) => s.trim().to_owned(),
+        None => return format!("err snapshot for release failed: {snap_resp}"),
+    };
+    let snap_ulid = match ulid::Ulid::from_string(&snap_ulid_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err parsing snapshot ULID '{snap_ulid_str}': {e}"),
+    };
+
+    // Halt the daemon. Writing the marker first prevents the supervisor
+    // from restarting it between shutdown and our final state write.
+    if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
+        return format!("err writing volume.stopped: {e}");
+    }
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
+        Some(resp) if resp == "ok" => {}
+        Some(resp) => {
+            let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
+            return format!("err shutdown failed: {resp}");
+        }
+        None => {
+            // Volume process wasn't running by the time we reached
+            // this step. The snapshot succeeded though, so we proceed
+            // with the state flip.
+        }
+    }
+
+    // Final step: flip names/<name> to Released, recording the handoff
+    // snapshot. From this point any coordinator may claim the name.
+    match lifecycle::mark_released(store, volume_name, root_key, snap_ulid).await {
+        Ok(_) => {
+            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_ulid}");
+            format!("ok {snap_ulid}")
+        }
+        Err(e) => {
+            // Local state has already moved (volume is stopped, snapshot
+            // is published). The S3 record write failed — the operator
+            // can retry or use --force-takeover from a peer to recover.
+            warn!("[inbound] release {volume_name}: state flip failed: {e}");
+            format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
         }
     }
 }

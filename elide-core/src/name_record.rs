@@ -31,10 +31,11 @@
 //! version = 1
 //! vol_ulid = "01J0000000000000000000000V"
 //! coordinator_id = "01ABCDEFGHJKMNPQRSTVWXYZ23"
-//! state = "stopped"
+//! state = "released"
 //! parent = "01XYZ000000000000000000000/01SNP000000000000000000000"
 //! acquired_at = "2026-04-27T12:34:56Z"
 //! hostname = "host-a"
+//! handoff_snapshot = "01HND0FF000000000000000000"
 //! ```
 //!
 //! # Field semantics
@@ -57,6 +58,10 @@
 //!   from a released ancestor; absent on root volumes.
 //! - `acquired_at` — RFC3339, when the current ownership episode began.
 //! - `hostname` — advisory only; never compared for ownership decisions.
+//! - `handoff_snapshot` — ULID of the most recently published handoff
+//!   snapshot. Set when state transitions to `Released`; the next
+//!   coordinator claiming the name forks from
+//!   `<vol_ulid>/<handoff_snapshot>`.
 
 use std::fmt;
 
@@ -132,6 +137,15 @@ pub struct NameRecord {
     /// compared for ownership decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+
+    /// ULID of the most recently published handoff snapshot for this
+    /// name. Set when state transitions to `Released` so the next
+    /// claimant knows which snapshot to fork from. May also be set on
+    /// `Live`/`Stopped` records as a reference to the last published
+    /// release point. The next coordinator claiming a `Released` name
+    /// forks from `<vol_ulid>/<handoff_snapshot>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_snapshot: Option<Ulid>,
 }
 
 impl NameRecord {
@@ -150,6 +164,7 @@ impl NameRecord {
             parent: None,
             acquired_at: None,
             hostname: None,
+            handoff_snapshot: None,
         }
     }
 
@@ -222,22 +237,25 @@ mod tests {
 
     #[test]
     fn round_trip_full() {
+        let snap = Ulid::from_string("01J1111111111111111111111V").unwrap();
         let r = NameRecord {
             version: NameRecord::CURRENT_VERSION,
             vol_ulid: sample_ulid(),
             coordinator_id: Some("01ABCDEFGHJKMNPQRSTVWXYZ23".to_string()),
-            state: NameState::Stopped,
+            state: NameState::Released,
             parent: Some("01XYZ.../01ABC...".to_string()),
             acquired_at: Some("2026-04-27T12:34:56Z".to_string()),
             hostname: Some("host-a".to_string()),
+            handoff_snapshot: Some(snap),
         };
         let toml = r.to_toml().unwrap();
         let parsed = NameRecord::from_toml(&toml).unwrap();
         assert_eq!(parsed.coordinator_id, r.coordinator_id);
-        assert_eq!(parsed.state, NameState::Stopped);
+        assert_eq!(parsed.state, NameState::Released);
         assert_eq!(parsed.parent, r.parent);
         assert_eq!(parsed.acquired_at, r.acquired_at);
         assert_eq!(parsed.hostname, r.hostname);
+        assert_eq!(parsed.handoff_snapshot, Some(snap));
     }
 
     #[test]

@@ -349,6 +349,17 @@ enum VolumeCommand {
         name: String,
     },
 
+    /// Release a volume's name back to the pool. Drains the WAL, publishes
+    /// a handoff snapshot, halts the daemon, and flips the bucket-side
+    /// `names/<name>` record to `released` so any coordinator (this host
+    /// or another) may claim it via `volume start`. Use this to relocate
+    /// a named volume between hosts; use `volume stop` for a temporary
+    /// halt that retains ownership.
+    Release {
+        /// Volume name
+        name: String,
+    },
+
     /// Interact with the remote object store
     Remote {
         #[command(subcommand)]
@@ -771,6 +782,18 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("{name}: started");
+            }
+
+            VolumeCommand::Release { name } => {
+                match coordinator_client::release_volume(&socket_path, &name) {
+                    Ok(snap) => {
+                        println!("{name}: released at handoff snapshot {snap}");
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
 
             VolumeCommand::Remote { command } => {
