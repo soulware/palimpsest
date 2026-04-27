@@ -41,6 +41,7 @@ remaining work relative to the previous status.  Latest first.
 
 | Date | Document |
 |---|---|
+| 2026-04-27 | [docs/status-2026-04-27.md](docs/status-2026-04-27.md) |
 | 2026-04-20 | [docs/status-2026-04-20.md](docs/status-2026-04-20.md) |
 | 2026-04-09 | [docs/status-2026-04-09.md](docs/status-2026-04-09.md) |
 | 2026-03-30 | [docs/status-2026-03-30.md](docs/status-2026-03-30.md) |
