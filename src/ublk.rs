@@ -193,6 +193,99 @@ mod imp {
         }
     }
 
+    /// Classify a `UblkCtrlBuilder::build()` failure into permanent
+    /// (`Config`, supervisor parks volume.stopped) vs transient (`Other`,
+    /// supervisor retries with backoff). Keeps the underlying libublk
+    /// error verbatim in the message so the operator sees the actual
+    /// errno rather than a guess at what went wrong.
+    ///
+    /// Permanent: kernel module missing, daemon lacks CAP_SYS_ADMIN.
+    /// Transient: EBUSY/EEXIST from a stale or mid-deleting device,
+    /// the io_uring control ring failing to set up, anything else.
+    fn classify_build_error(
+        e: UblkError,
+        target_id: Option<i32>,
+        recovering: bool,
+    ) -> super::UblkRunError {
+        let phase = if recovering {
+            match target_id {
+                Some(id) => format!("RECOVER_DEV(id={id})"),
+                None => "RECOVER_DEV".to_owned(),
+            }
+        } else {
+            match target_id {
+                Some(id) => format!("ADD_DEV(id={id})"),
+                None => "ADD_DEV(auto-id)".to_owned(),
+            }
+        };
+
+        // libublk's Display for UringIOError(i32) drops the errno; render
+        // it ourselves so the operator sees the actual kernel response
+        // (EBUSY, EEXIST, ENODEV, …) rather than the bare "io_uring IO
+        // failure" string.
+        let rendered = match &e {
+            UblkError::UringIOError(neg_errno) => {
+                let errno = -neg_errno;
+                let name = errno_name(errno).unwrap_or("?");
+                format!("io_uring IO failure (errno {errno} {name})")
+            }
+            other => other.to_string(),
+        };
+        let detail = format!("ublk {phase} failed: {rendered}");
+
+        let permanent = match &e {
+            UblkError::UringIOError(neg_errno) => {
+                matches!(
+                    -neg_errno,
+                    libc::ENODEV | libc::EPERM | libc::EACCES | libc::ENOTTY
+                )
+            }
+            UblkError::IOError(io_err) => matches!(
+                io_err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ),
+            _ => false,
+        };
+
+        if permanent {
+            super::UblkRunError::Config(format!(
+                "{detail} — likely the ublk_drv kernel module is not loaded \
+                 or the daemon lacks CAP_SYS_ADMIN (rerun under sudo)"
+            ))
+        } else {
+            super::UblkRunError::Other(io::Error::other(detail))
+        }
+    }
+
+    /// Map a small set of common errnos to their symbolic names for log
+    /// readability. Returns `None` for codes we don't expect to see from
+    /// ublk control ioctls so the caller can just print the raw number.
+    fn errno_name(errno: i32) -> Option<&'static str> {
+        let name = match errno {
+            libc::EPERM => "EPERM",
+            libc::ENOENT => "ENOENT",
+            libc::EIO => "EIO",
+            libc::EBADF => "EBADF",
+            libc::EAGAIN => "EAGAIN",
+            libc::ENOMEM => "ENOMEM",
+            libc::EACCES => "EACCES",
+            libc::EFAULT => "EFAULT",
+            libc::EBUSY => "EBUSY",
+            libc::EEXIST => "EEXIST",
+            libc::ENODEV => "ENODEV",
+            libc::EINVAL => "EINVAL",
+            libc::ENFILE => "ENFILE",
+            libc::EMFILE => "EMFILE",
+            libc::ENOTTY => "ENOTTY",
+            libc::ENOSPC => "ENOSPC",
+            libc::EROFS => "EROFS",
+            libc::EOPNOTSUPP => "EOPNOTSUPP",
+            libc::ETIMEDOUT => "ETIMEDOUT",
+            _ => return None,
+        };
+        Some(name)
+    }
+
     /// Query a ublk device's current state via GET_DEV_INFO. Returns the
     /// raw `UBLK_S_DEV_*` value. Opens a fresh `UblkCtrl::new_simple`, so
     /// it is safe to call even when no daemon owns the device.
@@ -403,9 +496,16 @@ mod imp {
         let ctrl_flags = (libublk::sys::UBLK_F_USER_RECOVERY
             | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
 
-        // UblkCtrlBuilder::build() opens /dev/ublk-control. Failures here
-        // (missing module, no privilege, kernel too old) won't fix themselves
-        // by retrying — surface as Config so the supervisor stops respawning.
+        // UblkCtrlBuilder::build() opens /dev/ublk-control and issues
+        // ADD_DEV/RECOVER_DEV. Failures fall into two buckets:
+        //   * permanent host config (no kernel module, no privilege) →
+        //     return Config so the supervisor parks volume.stopped instead
+        //     of respawning in a loop;
+        //   * transient (EBUSY/EEXIST from a stale device, transient
+        //     io_uring trouble, kernel still finalizing a prior delete) →
+        //     return Other so the supervisor retries with backoff.
+        // `classify_build_error` makes that split and preserves the
+        // underlying libublk error verbatim in the message.
         let ctrl = Arc::new(
             UblkCtrlBuilder::default()
                 .name("elide")
@@ -416,13 +516,7 @@ mod imp {
                 .ctrl_flags(ctrl_flags)
                 .dev_flags(dev_lifecycle)
                 .build()
-                .map_err(|e| {
-                    super::UblkRunError::Config(format!(
-                        "ublk control device unavailable ({e}); \
-                         check that the ublk_drv kernel module is loaded \
-                         and that the daemon has CAP_SYS_ADMIN (rerun under sudo)"
-                    ))
-                })?,
+                .map_err(|e| classify_build_error(e, target_id, recovering))?,
         );
 
         // Publish the live ctrl so the ublk-signal watcher can kill_dev
@@ -1133,6 +1227,63 @@ mod imp {
             std::fs::write(dir.join(UBLK_ID_FILE), "not-a-number").unwrap();
             assert!(read_ublk_id(&dir).is_err());
             std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn classify_build_error_transient_for_busy_and_exists() {
+            for errno in [libc::EBUSY, libc::EEXIST, libc::ENOENT, libc::EAGAIN] {
+                let err = classify_build_error(
+                    UblkError::UringIOError(-errno),
+                    Some(0),
+                    /*recovering=*/ false,
+                );
+                assert!(
+                    matches!(err, super::super::UblkRunError::Other(_)),
+                    "errno {errno} should be transient (Other), got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(&format!("errno {errno}")),
+                    "expected errno {errno} in message, got: {msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn classify_build_error_permanent_for_priv_and_module() {
+            for errno in [libc::ENODEV, libc::EPERM, libc::EACCES, libc::ENOTTY] {
+                let err = classify_build_error(
+                    UblkError::UringIOError(-errno),
+                    None,
+                    /*recovering=*/ false,
+                );
+                assert!(
+                    matches!(err, super::super::UblkRunError::Config(_)),
+                    "errno {errno} should be permanent (Config), got {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn classify_build_error_renders_phase_and_recovery() {
+            let add = classify_build_error(UblkError::UringIOError(-libc::EBUSY), Some(2), false);
+            assert!(
+                add.to_string().contains("ADD_DEV(id=2)"),
+                "expected ADD_DEV phase: {add}"
+            );
+
+            let recover =
+                classify_build_error(UblkError::UringIOError(-libc::EBUSY), Some(2), true);
+            assert!(
+                recover.to_string().contains("RECOVER_DEV(id=2)"),
+                "expected RECOVER_DEV phase: {recover}"
+            );
+
+            let auto = classify_build_error(UblkError::UringIOError(-libc::EBUSY), None, false);
+            assert!(
+                auto.to_string().contains("ADD_DEV(auto-id)"),
+                "expected ADD_DEV(auto-id): {auto}"
+            );
         }
 
         #[test]
