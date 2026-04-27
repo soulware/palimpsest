@@ -203,6 +203,64 @@ pub async fn mark_released(
     Ok(MarkReleasedOutcome::Updated)
 }
 
+/// Outcome of a `mark_live` call (the local-resume path of `volume start`).
+#[derive(Debug)]
+pub enum MarkLiveOutcome {
+    /// `names/<name>` was updated from `Stopped` to `Live`.
+    Resumed,
+    /// `names/<name>` did not exist; the local start may proceed
+    /// without an S3 update (volume not yet drained).
+    Absent,
+    /// `names/<name>` was already `Live` and owned by us.
+    AlreadyLive,
+    /// `names/<name>` is `Released`; the caller needs the claim-from-
+    /// released path, not local resume.
+    Released,
+}
+
+/// Transition `names/<name>` from `Stopped` to `Live` (local resume).
+/// Refuses on ownership conflict or if the record is already `Released`
+/// (callers must take the claim-from-released path instead).
+pub async fn mark_live(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    root_key: &[u8; 32],
+) -> Result<MarkLiveOutcome, LifecycleError> {
+    let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
+
+    let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
+        return Ok(MarkLiveOutcome::Absent);
+    };
+
+    if let Some(existing) = record.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(LifecycleError::OwnershipConflict {
+            held_by: existing.to_owned(),
+        });
+    }
+
+    match record.state {
+        NameState::Live => return Ok(MarkLiveOutcome::AlreadyLive),
+        NameState::Stopped => {}
+        NameState::Released => return Ok(MarkLiveOutcome::Released),
+    }
+
+    record.state = NameState::Live;
+    if record.coordinator_id.is_none() {
+        record.coordinator_id = Some(coord_id);
+    }
+    if record.acquired_at.is_none() {
+        record.acquired_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    if record.hostname.is_none() {
+        record.hostname = current_hostname();
+    }
+
+    name_store::update_name_record(store, name, &record, version).await?;
+    Ok(MarkLiveOutcome::Resumed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +427,70 @@ mod tests {
 
         // B tries to release A's record.
         let err = mark_released(&s, "vol", &key_b(), snap())
+            .await
+            .expect_err("B must be refused on A-owned record");
+        assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn mark_live_returns_absent_when_record_missing() {
+        let s = store();
+        let r = mark_live(&s, "missing", &key_a()).await.unwrap();
+        assert!(matches!(r, MarkLiveOutcome::Absent));
+    }
+
+    #[tokio::test]
+    async fn mark_live_resumes_stopped_record() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+
+        let outcome = mark_live(&s, "vol", &key_a()).await.unwrap();
+        assert!(matches!(outcome, MarkLiveOutcome::Resumed));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Live);
+    }
+
+    #[tokio::test]
+    async fn mark_live_is_idempotent_when_already_live() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        // Phase 1 records start as Live with coordinator_id=None;
+        // mark_stopped→mark_live cycles through both states with our id set.
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+        mark_live(&s, "vol", &key_a()).await.unwrap();
+
+        let outcome = mark_live(&s, "vol", &key_a()).await.unwrap();
+        assert!(matches!(outcome, MarkLiveOutcome::AlreadyLive));
+    }
+
+    #[tokio::test]
+    async fn mark_live_signals_released_for_claim_path() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+
+        // Even from the original owner, mark_live on a Released record
+        // is not local-resume; the claim-from-released path is required.
+        let outcome = mark_live(&s, "vol", &key_a()).await.unwrap();
+        assert!(matches!(outcome, MarkLiveOutcome::Released));
+    }
+
+    #[tokio::test]
+    async fn mark_live_refuses_other_owners_record() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+
+        let err = mark_live(&s, "vol", &key_b())
             .await
             .expect_err("B must be refused on A-owned record");
         assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));

@@ -143,47 +143,48 @@ plain-text records are not parseable and are not migrated.
 This is where portability becomes real. Gate the new verb behaviour
 on the bucket-capability probe from Phase 0 — see Phase 4.
 
-#### `volume stop` (local stop, retain ownership)
+#### `volume stop` (local stop, retain ownership) — landed
 
-- [ ] Refuse if a client (NBD/ublk) is connected (existing check).
-- [ ] Issue the existing `shutdown` RPC: WAL fsync, daemon halts.
-- [ ] Conditional PUT to `names/<name>` flipping `state` from `live`
-  to `stopped`. `vol_ulid` and `coordinator_id` unchanged. **No
-  handoff snapshot.**
-- [ ] Local artefacts (cache, index, WAL, signing key) stay in place.
+- [x] Refuse if a client (NBD/ublk) is connected.
+- [x] Issue the existing `shutdown` RPC: WAL fsync, daemon halts.
+- [x] Conditional PUT to `names/<name>` flipping `state` from `live`
+  to `stopped` via `lifecycle::mark_stopped`. `vol_ulid` and
+  `coordinator_id` unchanged; backfills the latter (and
+  `acquired_at`, `hostname`) on Phase 1 records that left these
+  unset. **No handoff snapshot.**
+- [x] Local artefacts stay in place.
 
-#### `volume release` (relinquish ownership)
+#### `volume release` (relinquish ownership) — landed
 
-- [ ] If currently `live`, do `volume stop`'s pre-flight (refuse if
-  client connected, issue shutdown).
-- [ ] Drain WAL: promote pending records into segments, finish
-  in-flight uploads.
-- [ ] Publish a handoff snapshot with handoff metadata (releasing
-  `coordinator_id`, hostname, episode `acquired_at`).
-- [ ] Conditional PUT to `names/<name>` setting `state = "released"`,
-  keeping `vol_ulid` and recording the handoff snapshot ULID.
-  `coordinator_id` preserved as historical.
-- [ ] Discard WAL locally; keep `by_id/<vol_ulid>/` as cache or
-  delete at operator discretion.
-- [ ] `volume stop --release` as the convenience composition.
+- [x] Refuse if a client is connected, the volume is readonly,
+  already stopped, or has no S3 record yet.
+- [x] Verify ownership in S3 *before* the expensive drain.
+- [x] Drain WAL → publish handoff snapshot via the existing
+  `snapshot_volume` path; capture the snapshot ULID.
+- [x] Halt the daemon (write `volume.stopped`, send `shutdown`).
+- [x] Conditional PUT to `names/<name>` via
+  `lifecycle::mark_released`: `state = "released"`,
+  `handoff_snapshot = <snap_ulid>`, `coordinator_id` preserved as
+  historical.
+- [x] CLI: `elide volume release <name>`.
+- [ ] `volume stop --release` convenience composition (deferred to
+  a follow-up commit; the two underlying verbs already exist).
 
 #### `volume start <name>` — claim ownership
 
-Existing local start (when `state == "live"` or absent and the local
-volume directory exists) keeps working. New paths:
-
-- [ ] **Local-resume path** — `state == "stopped"` and
-  `coordinator_id == self`. Conditional PUT flipping `state` back to
-  `live`; restart the daemon. No new ULID, no fork, no snapshot.
-- [ ] **Claim-from-released path** — `state == "released"`. Mint
-  `<new_ulid>` and a fresh Ed25519 keypair; create
-  `by_id/<new_ulid>/` locally with `provenance.parent =
-  <released_vol_ulid>/<released_handoff_snap_ulid>`; publish
-  `volume.pub` and signed provenance; conditional PUT to
-  `names/<name>` claiming ownership. Begin serving.
-- [ ] **Refusal paths** — `state ∈ {live, stopped}` with
-  `coordinator_id != self`. Clear error pointing at
-  `--force-takeover`.
+- [x] **Local-resume path** — `state == "stopped"` and
+  `coordinator_id == self`. `lifecycle::mark_live` flips `state` back
+  to `live`; existing local-restart logic clears the marker and
+  notifies the supervisor. No new ULID, no fork, no snapshot.
+- [x] **Already-live path** — idempotent OK if record says we
+  already own it as Live (covers daemon-restart races).
+- [x] **Refusal paths** — foreign-owner records refuse with
+  pointer at `--force-takeover` (Phase 3).
+- [ ] **Claim-from-released path** — `state == "released"`. Currently
+  errors with "claim-from-released path is not yet implemented".
+  Implementation requires fork creation (mint new ULID + keypair,
+  pull handoff snapshot, materialise local fork, conditional PUT
+  to claim) — lands as a separate commit.
 
 #### Other Phase 2 work
 
@@ -191,11 +192,11 @@ volume directory exists) keeps working. New paths:
   reconcile each local volume directory against `names/<name>`. If
   the local marker disagrees with S3, S3 wins; update the marker to
   match.
-- [ ] **Tests:** unit tests for each state transition; integration
-  test exercising stop-on-A → start-on-A (local resume) and
-  release-on-A → start-on-B (cross-coordinator) against a real
-  bucket (Tigris in CI); proptest covering interleaved
-  stop/start/release/concurrent-claim sequences.
+- [ ] **Tests:** unit tests for each state transition (15 lifecycle
+  tests landed); integration test exercising stop-on-A → start-on-A
+  (local resume) and release-on-A → start-on-B (cross-coordinator)
+  against a real bucket (Tigris in CI); proptest covering
+  interleaved stop/start/release/concurrent-claim sequences.
 
 **Phase exit criteria:** a name can move cleanly between two
 coordinators when explicitly released, and stays put across a stop

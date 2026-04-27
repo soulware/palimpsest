@@ -292,7 +292,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: start <volume>".to_string();
             }
-            start_volume_op(args, data_dir, &rescan)
+            start_volume_op(args, data_dir, store, root_key, &rescan).await
         }
 
         "create" => {
@@ -1851,10 +1851,22 @@ async fn release_volume_op(
     }
 }
 
-fn start_volume_op(volume_name: &str, data_dir: &Path, rescan: &Notify) -> String {
+async fn start_volume_op(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return format!("err volume not found: {volume_name}");
+        // Local volume directory absent. The claim-from-released path
+        // (where we'd materialise a new fork from a released ancestor's
+        // handoff snapshot) lands in a follow-up commit; for now refuse.
+        return format!(
+            "err volume not found locally: {volume_name} \
+             (claim-from-released path not yet implemented)"
+        );
     }
     let vol_dir = match std::fs::canonicalize(&link) {
         Ok(p) => p,
@@ -1863,6 +1875,36 @@ fn start_volume_op(volume_name: &str, data_dir: &Path, rescan: &Notify) -> Strin
 
     if !vol_dir.join("volume.stopped").exists() {
         return "err volume is not stopped".to_string();
+    }
+
+    // Verify ownership in S3 before any local change. A foreign-owned
+    // record refuses; a Released record routes to the claim path
+    // (not yet implemented — point the operator at it).
+    use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
+    match mark_live(store, volume_name, root_key).await {
+        Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
+        Ok(MarkLiveOutcome::Absent) => {
+            // No S3 record yet — proceed with the local-only start. The
+            // next `drain_pending` will publish an initial Live record.
+        }
+        Ok(MarkLiveOutcome::Released) => {
+            return format!(
+                "err name '{volume_name}' is in state Released; \
+                 claim-from-released path is not yet implemented"
+            );
+        }
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            return format!(
+                "err name '{volume_name}' is owned by coordinator {held_by}; \
+                 use --force-takeover to override"
+            );
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in state {from:?}; cannot start");
+        }
+        Err(LifecycleError::Store(e)) => {
+            warn!("[inbound] start {volume_name}: failed to update names/<name>: {e}");
+        }
     }
 
     // NBD endpoint conflict check before clearing the marker.
