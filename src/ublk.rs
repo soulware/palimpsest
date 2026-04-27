@@ -469,29 +469,33 @@ mod imp {
         // ctrl we are about to del_dev below.
         *sig_ctrl.lock().expect("sig_ctrl poisoned") = None;
 
-        // Always attempt DEL_DEV so the kernel-side device does not linger
-        // after the daemon exits. run_target's internal stop_dev only stops
-        // the device; without del_dev the entry stays in /sys/class/ublk-char
-        // and the dev_id cannot be reused.
+        // Ensure the kernel-side device does not linger after the daemon
+        // exits. run_target's internal stop_dev only stops the device;
+        // without DEL_DEV the entry stays in /sys/class/ublk-char and the
+        // dev_id cannot be reused.
         //
-        // libublk explicitly warns that del_dev() deadlocks on a "for-add"
-        // control device (the very ctrl we built above). The safe pattern —
-        // also used in the DEAD-cleanup path during recovery probing — is to
-        // drop the for-add ctrl first so its /dev/ublk-control fd closes,
-        // then open a plain UblkCtrl::new_simple just for the delete. ENOENT
-        // is expected if the device was already removed out-of-band.
+        // libublk's Drop impl on a for-add UblkCtrl already issues a
+        // synchronous DEL_DEV (force_sync = true; self.del()), so for the
+        // ADD path the only thing required is to drop the Arc and let Drop
+        // run. For the RECOVER path Drop does NOT auto-delete, so we open
+        // a fresh new_simple ctrl and call del_dev on that — matching the
+        // safe pattern used in the DEAD-cleanup probe and `ublk delete` CLI.
+        // (Calling del_dev on the for-add ctrl directly would deadlock —
+        // documented in libublk-0.4.5/src/ctrl.rs.)
         let dev_id_for_cleanup = ctrl.dev_info().dev_id as i32;
         drop(ctrl);
-        match UblkCtrl::new_simple(dev_id_for_cleanup) {
-            Ok(simple) => {
-                if let Err(e) = simple.del_dev() {
-                    tracing::debug!("ublk del_dev on shutdown returned: {e}");
+        if recovering {
+            match UblkCtrl::new_simple(dev_id_for_cleanup) {
+                Ok(simple) => {
+                    if let Err(e) = simple.del_dev() {
+                        tracing::debug!("ublk del_dev on shutdown returned: {e}");
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "ublk new_simple({dev_id_for_cleanup}) for shutdown del_dev failed: {e}"
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        "ublk new_simple({dev_id_for_cleanup}) for shutdown del_dev failed: {e}"
+                    );
+                }
             }
         }
 
