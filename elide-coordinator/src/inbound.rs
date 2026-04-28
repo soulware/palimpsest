@@ -160,6 +160,13 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             volume_status(args, &ctx.data_dir)
         }
 
+        "status-remote" => {
+            if args.is_empty() {
+                return "err usage: status-remote <volume>".to_string();
+            }
+            volume_status_remote(args, &ctx.store, &ctx.coord_id).await
+        }
+
         "import" => {
             let (sub, sub_args) = match args.split_once(' ') {
                 Some((sub, rest)) => (sub, rest.trim()),
@@ -1002,6 +1009,83 @@ fn volume_status(volume_name: &str, data_dir: &Path) -> String {
     }
 
     "ok stopped".to_string()
+}
+
+/// Fetch `names/<name>` from the bucket and serialise it as a TOML body
+/// for the `status-remote` IPC verb. Includes an `eligibility` field
+/// computed against this coordinator's id so the CLI can show the
+/// operator whether the verb-level `start` would be accepted, refused,
+/// or routed through the claim-from-released path.
+///
+/// Response shape on success:
+/// ```text
+/// ok
+/// state = "live"
+/// vol_ulid = "01..."
+/// coordinator_id = "..."     # optional
+/// hostname = "..."           # optional
+/// claimed_at = "..."         # optional
+/// parent = "..."             # optional
+/// handoff_snapshot = "..."   # optional
+/// eligibility = "owned" | "foreign" | "reserved-for-self"
+///             | "reserved-for-other" | "released-claimable"
+///             | "readonly"
+/// ```
+async fn volume_status_remote(
+    volume_name: &str,
+    store: &Arc<dyn ObjectStore>,
+    coord_id: &str,
+) -> String {
+    use elide_core::name_record::NameState;
+
+    let record = match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+        Ok(Some((rec, _))) => rec,
+        Ok(None) => return format!("err name '{volume_name}' has no S3 record"),
+        Err(e) => return format!("err reading names/{volume_name}: {e}"),
+    };
+
+    let state_str = match record.state {
+        NameState::Live => "live",
+        NameState::Stopped => "stopped",
+        NameState::Released => "released",
+        NameState::Reserved => "reserved",
+        NameState::Readonly => "readonly",
+    };
+
+    let eligibility = match record.state {
+        NameState::Live | NameState::Stopped => match record.coordinator_id.as_deref() {
+            Some(owner) if owner == coord_id => "owned",
+            _ => "foreign",
+        },
+        NameState::Released => "released-claimable",
+        NameState::Reserved => match record.coordinator_id.as_deref() {
+            Some(target) if target == coord_id => "reserved-for-self",
+            _ => "reserved-for-other",
+        },
+        NameState::Readonly => "readonly",
+    };
+
+    let mut body = String::with_capacity(256);
+    body.push_str("ok\n");
+    body.push_str(&format!("state = \"{state_str}\"\n"));
+    body.push_str(&format!("vol_ulid = \"{}\"\n", record.vol_ulid));
+    if let Some(id) = &record.coordinator_id {
+        body.push_str(&format!("coordinator_id = \"{id}\"\n"));
+    }
+    if let Some(host) = &record.hostname {
+        body.push_str(&format!("hostname = \"{host}\"\n"));
+    }
+    if let Some(when) = &record.claimed_at {
+        body.push_str(&format!("claimed_at = \"{when}\"\n"));
+    }
+    if let Some(parent) = &record.parent {
+        body.push_str(&format!("parent = \"{parent}\"\n"));
+    }
+    if let Some(snap) = &record.handoff_snapshot {
+        body.push_str(&format!("handoff_snapshot = \"{snap}\"\n"));
+    }
+    body.push_str(&format!("eligibility = \"{eligibility}\"\n"));
+    body
 }
 
 // ── Volume delete ─────────────────────────────────────────────────────────────
@@ -3149,5 +3233,115 @@ mod tests {
         let mut s = "ab".repeat(32);
         s.replace_range(2..4, "zz");
         assert!(decode_hex32(&s).is_err());
+    }
+
+    // ── status-remote ─────────────────────────────────────────────────────
+
+    fn mem_store() -> Arc<dyn ObjectStore> {
+        Arc::new(object_store::memory::InMemory::new())
+    }
+
+    fn sample_ulid() -> ulid::Ulid {
+        ulid::Ulid::from_string("01J0000000000000000000000V").unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_remote_absent_name_returns_err() {
+        let store = mem_store();
+        let resp = volume_status_remote("ghost", &store, "coord-self").await;
+        assert!(resp.starts_with("err "), "got: {resp}");
+        assert!(resp.contains("no S3 record"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn status_remote_owned_live_record() {
+        let store = mem_store();
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        rec.coordinator_id = Some("coord-self".into());
+        rec.hostname = Some("host-A".into());
+        rec.claimed_at = Some("2026-04-28T00:00:00Z".into());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let resp = volume_status_remote("vol", &store, "coord-self").await;
+        assert!(resp.starts_with("ok\n"), "{resp}");
+        assert!(resp.contains("state = \"live\""));
+        assert!(resp.contains(&format!("vol_ulid = \"{}\"", sample_ulid())));
+        assert!(resp.contains("coordinator_id = \"coord-self\""));
+        assert!(resp.contains("hostname = \"host-A\""));
+        assert!(resp.contains("claimed_at = \"2026-04-28T00:00:00Z\""));
+        assert!(resp.contains("eligibility = \"owned\""));
+    }
+
+    #[tokio::test]
+    async fn status_remote_foreign_live_record() {
+        let store = mem_store();
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        rec.coordinator_id = Some("coord-other".into());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let resp = volume_status_remote("vol", &store, "coord-self").await;
+        assert!(resp.contains("state = \"live\""), "{resp}");
+        assert!(resp.contains("eligibility = \"foreign\""), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn status_remote_released_is_claimable() {
+        let store = mem_store();
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        rec.state = elide_core::name_record::NameState::Released;
+        rec.handoff_snapshot = Some(sample_ulid());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let resp = volume_status_remote("vol", &store, "coord-self").await;
+        assert!(resp.contains("state = \"released\""), "{resp}");
+        assert!(
+            resp.contains("eligibility = \"released-claimable\""),
+            "{resp}"
+        );
+        assert!(resp.contains("handoff_snapshot ="), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn status_remote_reserved_for_self_vs_other() {
+        let store = mem_store();
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        rec.state = elide_core::name_record::NameState::Reserved;
+        rec.coordinator_id = Some("coord-self".into());
+        elide_coordinator::name_store::create_name_record(&store, "self", &rec)
+            .await
+            .unwrap();
+
+        let mut rec2 = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        rec2.state = elide_core::name_record::NameState::Reserved;
+        rec2.coordinator_id = Some("coord-other".into());
+        elide_coordinator::name_store::create_name_record(&store, "other", &rec2)
+            .await
+            .unwrap();
+
+        let r1 = volume_status_remote("self", &store, "coord-self").await;
+        assert!(r1.contains("eligibility = \"reserved-for-self\""), "{r1}");
+
+        let r2 = volume_status_remote("other", &store, "coord-self").await;
+        assert!(r2.contains("eligibility = \"reserved-for-other\""), "{r2}");
+    }
+
+    #[tokio::test]
+    async fn status_remote_readonly() {
+        let store = mem_store();
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        rec.state = elide_core::name_record::NameState::Readonly;
+        elide_coordinator::name_store::create_name_record(&store, "img", &rec)
+            .await
+            .unwrap();
+
+        let resp = volume_status_remote("img", &store, "coord-self").await;
+        assert!(resp.contains("state = \"readonly\""), "{resp}");
+        assert!(resp.contains("eligibility = \"readonly\""), "{resp}");
     }
 }

@@ -290,6 +290,14 @@ enum VolumeCommand {
     Status {
         /// Volume name
         name: String,
+        /// Fetch `names/<name>` from the bucket and print the
+        /// authoritative cross-coordinator record (vol_ulid, state,
+        /// coordinator_id, hostname, claimed_at, parent,
+        /// handoff_snapshot) plus this coordinator's eligibility
+        /// (owned, foreign, released-claimable, …). Without this,
+        /// `volume status` is local-only and never reaches S3.
+        #[arg(long)]
+        remote: bool,
     },
 
     /// Import an OCI image into a new readonly volume (sync by default)
@@ -397,31 +405,6 @@ enum VolumeCommand {
         /// with `--force`.
         #[arg(long, value_name = "COORD_ID")]
         to: Option<String>,
-    },
-
-    /// Interact with the remote object store
-    Remote {
-        #[command(subcommand)]
-        command: RemoteCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum RemoteCommand {
-    /// List all named volumes available in the store
-    List,
-
-    /// Download a volume from the store as a readonly ancestor.
-    ///
-    /// Accepts either a volume name (resolved via `names/<name>` in the store)
-    /// or an explicit `<vol_ulid>[/<snap_ulid>]`. Pulled volumes land under
-    /// `by_id/<vol_ulid>/` with no `volume.name` and no `by_name/` symlink —
-    /// they are never supervised locally and exist only as fork ancestors.
-    /// The full ancestor chain is walked and every ancestor not already
-    /// present locally is pulled too.
-    Pull {
-        /// Volume spec: `<name>` or `<vol_ulid>` or `<vol_ulid>/<snap_ulid>`
-        spec: String,
     },
 }
 
@@ -648,16 +631,26 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Status { name } => {
-                let resp = coordinator_client::status(&socket_path, &name)
-                    .unwrap_or_else(|e| format!("err {e}"));
-                match resp.split_once(' ') {
-                    Some(("ok", rest)) => println!("{name}: {rest}"),
-                    Some(("err", msg)) => {
-                        eprintln!("{name}: {msg}");
-                        std::process::exit(1);
+            VolumeCommand::Status { name, remote } => {
+                if remote {
+                    match coordinator_client::status_remote(&socket_path, &name) {
+                        Ok(rs) => print_remote_status(&name, &rs),
+                        Err(e) => {
+                            eprintln!("{name}: {e}");
+                            std::process::exit(1);
+                        }
                     }
-                    _ => println!("{name}: {resp}"),
+                } else {
+                    let resp = coordinator_client::status(&socket_path, &name)
+                        .unwrap_or_else(|e| format!("err {e}"));
+                    match resp.split_once(' ') {
+                        Some(("ok", rest)) => println!("{name}: {rest}"),
+                        Some(("err", msg)) => {
+                            eprintln!("{name}: {msg}");
+                            std::process::exit(1);
+                        }
+                        _ => println!("{name}: {resp}"),
+                    }
                 }
             }
 
@@ -893,36 +886,6 @@ fn main() {
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(1);
-                    }
-                }
-            }
-
-            VolumeCommand::Remote { command } => {
-                let config = match resolve_fetch_config(&socket_path, &args.data_dir) {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        eprintln!(
-                            "error: no store configured — start the coordinator, create fetch.toml, or set ELIDE_S3_BUCKET"
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("error: loading store config: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                match command {
-                    RemoteCommand::List => {
-                        if let Err(e) = remote_list(&config) {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                    RemoteCommand::Pull { spec } => {
-                        if let Err(e) = remote_pull(&config, &spec, &args.data_dir, &socket_path) {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
                     }
                 }
             }
@@ -2007,69 +1970,27 @@ fn resolve_latest_remote_snapshot(
 
 const STOPPED_FILE: &str = "volume.stopped";
 
-/// List all named volumes in the remote store.
-///
-/// Performs a single `LIST names/` against the store and prints each name
-/// with its ULID. Does not require a running coordinator.
-fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
-    use futures::TryStreamExt;
-    use object_store::ObjectStore;
-    use object_store::path::Path as StorePath;
-
-    let store = elide::build_object_store(config)
-        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
-    let rt = tokio::runtime::Runtime::new()?;
-
-    let names_prefix = StorePath::from("names/");
-    let objects: Vec<_> = rt.block_on(async {
-        store
-            .list(Some(&names_prefix))
-            .try_collect()
-            .await
-            .map_err(|e| std::io::Error::other(format!("listing names/: {e}")))
-    })?;
-
-    if objects.is_empty() {
-        println!("(no volumes in store)");
-        return Ok(());
+/// Pretty-print a `RemoteStatus` for `elide volume status --remote`.
+fn print_remote_status(name: &str, rs: &coordinator_client::RemoteStatus) {
+    println!("{name}");
+    println!("  state           {}", rs.state);
+    println!("  vol_ulid        {}", rs.vol_ulid);
+    if let Some(id) = &rs.coordinator_id {
+        println!("  coordinator_id  {id}");
     }
-
-    for obj in &objects {
-        let name = obj.location.filename().unwrap_or("?");
-        let ulid = rt.block_on(async {
-            let data = store
-                .get(&obj.location)
-                .await
-                .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
-            let bytes = data
-                .bytes()
-                .await
-                .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
-            let body = std::str::from_utf8(&bytes).map_err(|e| {
-                std::io::Error::other(format!("names/{name} is not valid utf-8: {e}"))
-            })?;
-            elide_core::name_record::NameRecord::from_toml(body)
-                .map(|r| r.vol_ulid.to_string())
-                .map_err(|e| std::io::Error::other(format!("parsing names/{name}: {e}")))
-        })?;
-
-        // Check for snapshot availability (determines if this volume can be pulled).
-        let has_snapshot = rt.block_on(async {
-            let snap_prefix = StorePath::from(format!("by_id/{ulid}/snapshots/"));
-            let mut listing = store.list(Some(&snap_prefix));
-            // We only need to know if at least one snapshot exists.
-            use futures::StreamExt;
-            listing.next().await.is_some()
-        });
-
-        if has_snapshot {
-            println!("{name}  {ulid}  [snapshot]");
-        } else {
-            println!("{name}  {ulid}");
-        }
+    if let Some(host) = &rs.hostname {
+        println!("  hostname        {host}");
     }
-
-    Ok(())
+    if let Some(when) = &rs.claimed_at {
+        println!("  claimed_at      {when}");
+    }
+    if let Some(parent) = &rs.parent {
+        println!("  parent          {parent}");
+    }
+    if let Some(snap) = &rs.handoff_snapshot {
+        println!("  handoff_snap    {snap}");
+    }
+    println!("  eligibility     {}", rs.eligibility);
 }
 
 /// Pull a volume (and its full ancestor chain) from the remote store as

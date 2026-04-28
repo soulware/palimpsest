@@ -180,6 +180,34 @@ pub fn status(socket_path: &Path, volume: &str) -> io::Result<String> {
     call(socket_path, &format!("status {volume}"))
 }
 
+/// Authoritative bucket-side status of a named volume, plus this
+/// coordinator's eligibility to act on it. Reaches into S3 — only
+/// invoked when the operator passes `volume status --remote`.
+#[derive(Debug, Deserialize)]
+pub struct RemoteStatus {
+    pub state: String,
+    pub vol_ulid: String,
+    #[serde(default)]
+    pub coordinator_id: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub claimed_at: Option<String>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub handoff_snapshot: Option<String>,
+    pub eligibility: String,
+}
+
+/// Fetch `names/<volume>` from the bucket via the coordinator and parse
+/// the authoritative record. Returns an error when the name is absent
+/// from the bucket or the coordinator cannot reach S3.
+pub fn status_remote(socket_path: &Path, volume: &str) -> io::Result<RemoteStatus> {
+    let raw = call_all(socket_path, &format!("status-remote {volume}"))?;
+    parse_toml_response(&raw)
+}
+
 /// Ask the coordinator to start an OCI import.
 /// Returns the import ULID on success (internal; callers use the volume name).
 ///

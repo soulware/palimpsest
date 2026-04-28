@@ -101,12 +101,12 @@ Eviction is only safe on volumes with reachable S3 backing. The current CLI impl
 ## Bootstrap from the store
 
 ```
-elide volume remote list                  # LIST names/
-elide volume remote pull <name>           # create skeleton + rescan
+elide volume status --remote <name>       # GET names/<name> (authoritative record)
+elide volume start --remote <name>        # claim a Released/Reserved name; pulls the chain
 elide volume ls <name>                    # readable once prefetch completes
 ```
 
-`remote pull` resolves `names/<name>` → volume ULID, downloads `manifest.toml` and `volume.pub`, creates `<data_dir>/by_id/<ulid>/` with an empty `index/`, creates the `by_name/` symlink, and sends a rescan IPC. The coordinator's prefetch trigger (empty `index/` + no `pending/`) fires, downloading every segment's `.idx`; subsequent reads demand-fetch bodies.
+`start --remote` reads `names/<name>` from the bucket. If the record is `Released` (or `Reserved` for this coordinator), the CLI pulls the released ancestor and its chain into `<data_dir>/by_id/<ulid>/`, mints a fresh local fork, and conditionally rebinds `names/<name>` to the new fork. For `Live`/`Stopped` records held by another coordinator, see [`volume release --force`](#disaster-recovery).
 
 ## Post-import workflows
 
@@ -117,7 +117,7 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 
 ## Disaster recovery
 
-- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover with `volume remote pull <name>`. The recovered volume is permanently readonly (`volume.key` was never uploaded); create a writable replica from a snapshot (`volume create <name> --from <src>`) to continue writing.
+- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover with `volume release --force <name>` from another host (synthesises a handoff snapshot from the dead fork's S3-visible segments) followed by `volume start --remote <name>`. The recovered fork is fresh and writable.
 - **Lost private key.** S3 data remains readable (signatures verified with `volume.pub` in S3), but new writes are impossible. If snapshots exist, branch from the latest via `volume create --from <src>`. Snapshot markers are intentionally unsigned empty files, so an emergency branch point can be created by uploading an empty file to `by_id/<vol>/snapshots/<ulid>` with a ULID ≥ the latest segment.
 - **Unresponsive or dead upstream, need current state past the latest snapshot.** Today: `volume create --from <src> --force-snapshot` uploads a forker-attested "now" marker and branches from it. Proposed replacement: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design-replica-model.md](design-replica-model.md).
 - **Local `cache/` deletion.** Automatic recovery — `Volume::open` rebuilds from `index/*.idx` and reads demand-fetch bodies.

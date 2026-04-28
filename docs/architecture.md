@@ -449,8 +449,8 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` (explicit pin — recommended, forward-compatible), `<vol_ulid>` (bare; resolves to the latest snapshot), or `<name>` (local or remote lookup). Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design-replica-model.md](design-replica-model.md) for the direction of travel |
 | `elide volume create <name> --from <source> --force-snapshot` | Same as above, but uploads a new forker-attested "now" marker when the source has no usable snapshot. Interim mechanism; will be replaced by `volume materialize` (pending) |
 | `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.name`); rescan |
-| `elide volume remote list` | `LIST names/` against the store; print all named volumes with ULID and size |
-| `elide volume remote pull <name>` | Resolve name → ULID via `names/<name>`, download manifest, reconstruct local skeleton, trigger coordinator rescan; prefetch of segment indexes happens automatically on next coordinator tick |
+| `elide volume status --remote <name>` | `GET names/<name>` against the store; print the authoritative record (state, vol_ulid, coordinator_id, hostname, claimed_at, parent, handoff_snapshot) plus this coordinator's eligibility |
+| `elide volume start --remote <name>` | Claim a `Released` (or `Reserved`-for-self) name from the store: pull the released ancestor's chain, mint a fresh local fork, and conditionally rebind `names/<name>` to the new fork |
 
 `create` generates a fresh ULID for the new volume directory and sends a lightweight `rescan` to the coordinator after writing to disk. If the coordinator is not running, the rescan fails with a warning and the volume is discovered on the next startup or scan.
 

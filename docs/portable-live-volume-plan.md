@@ -470,18 +470,26 @@ The "feels like magic" UX work. Depends on Phase 0–3.
   reads `by_name/` and (with `--all`) `by_id/`, never reaches S3.
   Columns are `name`, `vol_ulid`, `mode`, `state`, `transport`,
   `pid` per the existing shape.
-- [ ] **`volume status <name>` gains `--remote`.**
-  - Default: local — what this coordinator knows about `<name>`.
-  - `--remote`: fetches `names/<name>` from S3 and prints the
-    authoritative record (`vol_ulid`, `state`, `coordinator_id`,
-    `hostname`, `claimed_at`) plus eligibility for this
-    coordinator. Errors clearly if `<name>` is not present in the
-    bucket.
-- [ ] **Hard-remove `volume remote`.** Delete the `Remote`
-  subcommand and `RemoteCommand` enum from `src/main.rs`. Delete
-  `remote_list` and `remote_pull` helpers and their callers. Remove
-  the `volume remote` documentation surface. Pre-existing scripts
-  break — clean break per decision 2.
+- [x] **`volume status <name>` gains `--remote`.** Local-only by
+  default; with `--remote` the new `status-remote` IPC verb fetches
+  `names/<name>` from the bucket and returns a TOML body carrying
+  `state`, `vol_ulid`, `coordinator_id`, `hostname`, `claimed_at`,
+  `parent`, `handoff_snapshot`, plus an `eligibility` field
+  (`owned` / `foreign` / `released-claimable` / `reserved-for-self`
+  / `reserved-for-other` / `readonly`) computed against this
+  coordinator's id. Absent records surface a clear error before any
+  parsing. 6 new unit tests against `InMemory` cover each
+  eligibility class plus the absent-name path.
+- [x] **Hard-remove `volume remote`.** Deleted the `Remote` subcommand
+  and `RemoteCommand` enum from `src/main.rs`, the dispatch arm, and
+  `remote_list`. **`remote_pull` is retained** — it is the canonical
+  helper used by `fork --from` (`FromSpec::ExplicitPin` /
+  `FromSpec::BareUlid` / `FromSpec::Name`) and the
+  `claim_released_name` path; deleting it would break shipped
+  functionality. Doc surface updated in `docs/operations.md`,
+  `docs/architecture.md`, `docs/formats.md` (the `volume remote list`
+  / `volume remote pull` rows are replaced by `volume status --remote`
+  and `volume start --remote` respectively).
 - [ ] **Error path for non-portable buckets.** When `volume start
   <name>` is invoked against a name not held by this coordinator,
   *and* the bucket-capability probe says no conditional PUT,
