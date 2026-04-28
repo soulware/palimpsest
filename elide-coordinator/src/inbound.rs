@@ -1789,7 +1789,7 @@ async fn stop_volume_op(
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             return format!(
                 "err name '{volume_name}' is owned by coordinator {held_by}; \
-                 use --force-takeover to override"
+                 run `volume release --force` to override"
             );
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {
@@ -2028,7 +2028,7 @@ async fn release_volume_op(
             {
                 return format!(
                     "err name '{volume_name}' is owned by coordinator {existing}; \
-                     use --force-takeover to override"
+                     run `volume release --force` to override"
                 );
             }
             if rec.state == NameState::Released {
@@ -2101,7 +2101,8 @@ async fn release_volume_op(
         Err(e) => {
             // Local state has already moved (volume is stopped, snapshot
             // is published). The S3 record write failed — the operator
-            // can retry or use --force-takeover from a peer to recover.
+            // can retry or run `volume release --force` from a peer to
+            // recover.
             warn!("[inbound] release {volume_name}: state flip failed: {e}");
             format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
         }
@@ -2323,7 +2324,7 @@ async fn start_volume_op(
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             return format!(
                 "err name '{volume_name}' is owned by coordinator {held_by}; \
-                 use --force-takeover to override"
+                 run `volume release --force` to override"
             );
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {

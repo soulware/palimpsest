@@ -105,7 +105,8 @@ intents"):
 
 - `live` — held by `coordinator_id`, daemon serving.
 - `stopped` — held by `coordinator_id`, daemon down on this host.
-  Other coordinators cannot claim without `--force-takeover`.
+  Other coordinators cannot claim until the name is released
+  (`volume release --force` from another host).
 - `released` — no current owner; any coordinator may `volume start`.
   `coordinator_id`, `claimed_at`, and `hostname` are cleared on
   release so the populated fields agree with the state.
@@ -178,10 +179,10 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
 
 #### `volume start <name>` — claim ownership
 
-`volume start` defaults to **local-only**; the bucket is only
-consulted when `--remote` (or `--force-takeover`) is passed.
-Defaulting local avoids surprising network pulls and unintended
-cross-host takeovers.
+`volume start` is always safe: it never overrides another
+coordinator. Defaults to **local-only**; the bucket is only
+consulted when `--remote` is passed. The override path lives on
+`volume release --force` (Phase 3), not on `start`.
 
 - [x] **Local-resume path** — `state == "stopped"` and
   `coordinator_id == self`. `lifecycle::mark_live` flips `state` back
@@ -192,8 +193,8 @@ cross-host takeovers.
 - [x] **In-place reclaim** — `state == "released"` and the released
   `vol_ulid` matches a local fork still on this host;
   `mark_reclaimed_local` flips back to `live` keeping the same ULID.
-- [x] **Refusal paths** — foreign-owner records refuse with
-  pointer at `--force-takeover` (Phase 3).
+- [x] **Refusal paths** — foreign-owner records refuse with a
+  pointer at `volume release --force` (Phase 3).
 - [x] **Claim-from-released path** — `state == "released"`,
   no local data. Currently runs on bare `volume start`; **needs to
   move behind `--remote`**. Coordinator's `start` op returns
@@ -239,13 +240,24 @@ works as today.
 
 ### Phase 3 — Force takeover
 
-- [ ] **`--force-takeover` flag on `volume start`.** Implies
-  `--remote` (always reaches S3). Same flow as the cross-coordinator
-  start path, but:
-  - Skip the `state == "live"` refusal.
-  - Skip the `If-Match` precondition on the `names/<name>` PUT
-    (use `If-None-Match: *` if the record is gone, otherwise
-    unconditional).
+The override path is split into two normal verbs:
+
+1. `volume release --force <name>` — unconditionally flip foreign
+   `live`/`stopped` records to `released`, no drain, handoff pinned
+   to the previous fork's last published snapshot.
+2. `volume start --remote <name>` — claim the now-released name
+   through the standard conditional-PUT path.
+
+This keeps `volume start` always-safe (never overrides another
+coordinator) and makes the dangerous step explicit and auditable.
+
+- [ ] **`--force` flag on `volume release`.** Skip the foreign-owner
+  refusal. Skip the `If-Match` precondition on the `names/<name>`
+  PUT (unconditional Overwrite). Do **not** drain the previous
+  owner's WAL — it's unreachable. The `handoff_snapshot` field on
+  the released record is set to the previous fork's last published
+  handoff snapshot (walk back through `parent` if the current fork
+  never published).
 - [ ] **Open question (carried, not resolved by this plan):**
   what's the parent pin when the current `names/<name>` value points
   at a fork that exists in S3 but has *never published a handoff
@@ -257,10 +269,11 @@ works as today.
   This connects to the broader recovery question of an implicit
   "now" snapshot. Track separately; do not block Phase 3 on it —
   ship with option (a) as the default and document it.
-- [ ] **Tests:** force-takeover after simulated coordinator death
+- [ ] **Tests:** force-release after simulated coordinator death
   (kill the writing process between snapshot publication and
-  `names/<name>` rewrite, then takeover from a second coordinator);
-  takeover when the previous fork has no published snapshots
+  `names/<name>` rewrite, then `release --force` + `start --remote`
+  from a second coordinator); force-release when the previous fork
+  has no published snapshots
   (option (a) fallback path).
 
 **Phase exit criteria:** an operator can recover a name from a dead
@@ -312,19 +325,20 @@ lookups go through `volume status --remote`.
 ### Phase 5 — Tests, docs, status
 
 - [ ] **End-to-end proptest.** Random sequences of {`create`,
-  `stop`, `start`, `force-takeover`, simulated crash} across two
-  simulated coordinators sharing a fake bucket; assert invariants
-  (single live owner per name; chain validity; provenance
+  `stop`, `start`, `release`, `release --force`, simulated crash}
+  across two simulated coordinators sharing a fake bucket; assert
+  invariants (single live owner per name; chain validity; provenance
   signatures verify; no orphan ULIDs in `names/`).
 - [ ] **Real-bucket integration test.** Tigris-backed test exercising
-  stop-on-A, start-on-B, repeated migration, force-takeover.
+  stop-on-A, start-on-B, repeated migration, force-release recovery.
   Probably gated by `ELIDE_S3_BUCKET` env var, similar to existing
   store tests.
 - [ ] **Documentation updates.**
   - `docs/architecture.md`: replace the "name lives in `by_name/`"
     section with the new authoritative-`names/` model.
   - `docs/operations.md`: add a "moving a volume between hosts"
-    runbook (`stop` on A → `start` on B; force-takeover semantics).
+    runbook (`stop` on A → `release` on A → `start --remote` on B;
+    `release --force` semantics for unreachable owners).
   - `docs/quickstart-tigris.md`: add a section showing two-host
     migration end to end.
   - `docs/status-2026-MM-DD.md`: a new status doc capturing the

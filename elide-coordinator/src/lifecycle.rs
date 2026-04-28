@@ -27,7 +27,7 @@ pub enum LifecycleError {
     /// The store-level operation failed (transient I/O, parse error, etc.).
     Store(NameStoreError),
     /// `names/<name>` is held by another coordinator. The caller may
-    /// retry with `--force-takeover` (Phase 3).
+    /// retry after `volume release --force` (Phase 3).
     OwnershipConflict { held_by: String },
     /// `names/<name>` is in a state that does not permit this transition
     /// (e.g. trying to mark `stopped` something already `released`).
@@ -40,7 +40,7 @@ impl std::fmt::Display for LifecycleError {
             Self::Store(e) => write!(f, "{e}"),
             Self::OwnershipConflict { held_by } => write!(
                 f,
-                "name is held by another coordinator ({held_by}); use --force-takeover to override"
+                "name is held by another coordinator ({held_by}); run `volume release --force` to override"
             ),
             Self::InvalidTransition { from, verb } => {
                 write!(f, "cannot {verb} a name in state {from:?}")

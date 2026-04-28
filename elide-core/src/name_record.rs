@@ -7,7 +7,7 @@
 //!
 //! The record is mutated only via S3 conditional PUTs; conditional-write
 //! atomicity on this single key carries name uniqueness, ownership
-//! transfer, and the explicit-skip semantics of `--force-takeover`.
+//! transfer, and the explicit-skip semantics of `--force`.
 //!
 //! # Wire format
 //!
@@ -92,7 +92,7 @@ pub enum NameState {
     #[default]
     Live,
     /// Held by `coordinator_id`; daemon down on this host. Other
-    /// coordinators cannot claim without `--force-takeover`.
+    /// coordinators cannot claim without `--force`.
     Stopped,
     /// No current owner. Any coordinator may `volume start` to claim.
     /// `coordinator_id`, `claimed_at`, and `hostname` are cleared on
