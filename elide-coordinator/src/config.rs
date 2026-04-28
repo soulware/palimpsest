@@ -280,8 +280,12 @@ impl StoreSection {
         if let Some(path) = &self.local_path {
             std::fs::create_dir_all(path)
                 .with_context(|| format!("creating local store dir: {}", path.display()))?;
+            // Wrap LocalFileSystem so PutMode::Update is honoured — the
+            // upstream impl returns NotImplemented for it, which would
+            // break the lifecycle verbs' If-Match read-modify-write.
+            let local = LocalFileSystem::new_with_prefix(path).context("building local store")?;
             Ok(Arc::new(
-                LocalFileSystem::new_with_prefix(path).context("building local store")?,
+                crate::local_cond_store::ConditionalLocalStore::new(local),
             ))
         } else if let Some(bucket) = &self.bucket {
             // Enable conditional PUT (`If-Match` ETag) so the lifecycle
