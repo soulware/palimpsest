@@ -93,9 +93,10 @@ Internal additions; no behaviour change. **Landed** in
   large (~10 methods) so this is deferred until we have an actual
   non-conformant backend in CI to validate against. Real-bucket
   validation against Tigris/MinIO lives in Phase 5.
-- [ ] **Open:** wire `coordinator_id()` into `daemon::run()` so
-  diagnostic output (`elide coordinator status` or similar) can show
-  the id. Pure plumbing; deferred until a caller needs it.
+- [x] **`coordinator_id()` wired to `daemon::run()`.** Logged at
+  startup (`info!("[coordinator] coordinator_id: {id}")`) and
+  threaded through `IpcContext` for inbound handlers; landed as
+  part of Phase 1.5 (`d1a9364`).
 
 **Phase exit criteria:** met. New APIs land in `portable` module;
 no caller uses them yet; full coordinator builds clean and the new
@@ -175,48 +176,22 @@ Ed25519 keypair held on the coordinator host. Required by Phase 3
 Also retrofits Phase 0's `coordinator_id` derivation to derive from
 the public key.
 
-- [ ] **Generate / load `coordinator.key` + `coordinator.pub`.** New
-  module `elide-coordinator/src/identity.rs` (or extend
-  `credential.rs`): on first start, generate a fresh Ed25519 keypair
-  with `ed25519_dalek::SigningKey::generate`, write
-  `<data_dir>/coordinator.key` (mode 0600) and
-  `<data_dir>/coordinator.pub` (mode 0644). On subsequent starts,
-  load from disk and verify the pub matches the key.
-- [ ] **Re-root `coordinator_id` on the public key.** Change
-  `portable::coordinator_id` to take the pubkey bytes and derive via
-  `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`.
-  Update `format_coordinator_id` callers; update unit tests.
-- [ ] **Derive macaroon root from the private key in-memory.**
-  In `daemon::run`, replace `load_or_generate_root_key` with
-  `load_or_generate_keypair` + an in-memory derivation:
-  `let macaroon_root = blake3::derive_key("elide macaroon-root v1",
-  &priv_bytes);`. The 32-byte result feeds the existing
-  `macaroon::mint` / `macaroon::verify` callers unchanged.
-- [ ] **Publish `coordinator.pub` to S3 on startup.** Conditional
-  PUT to `coordinators/<coordinator_id>/coordinator.pub` using the
-  `put_if_absent` helper from Phase 0. If a record already exists,
-  read it and compare against the local pub: equal → no-op, mismatch
-  → fail startup with a clear error (different coordinator already
-  claimed this id, which only happens if `coordinator_id` derivation
-  collides — vanishingly improbable for a 32-byte derivation, but
-  fail loudly rather than silently overwrite).
-- [ ] **Pubkey fetcher.** `fetch_coordinator_pub(store,
-  coordinator_id) -> Result<VerifyingKey>` reads the bucket pub,
-  verifies the embedded pub really derives to that `coordinator_id`
-  (recompute and compare), returns the `VerifyingKey`. Refuse on
-  mismatch.
-- [ ] **Migration / clean-break handling.** On startup, if
-  `coordinator.root_key` exists but `coordinator.key` does not,
-  generate the new keypair and **leave** the old root_key file in
-  place untouched (it's no longer read). Log a one-line warning
-  noting the file is now ignored. The new `coordinator_id` will
-  differ from any old one — Phase 2/3 lifecycle verbs handle stale
-  pointers via `release --force`.
-- [ ] **Tests:** keypair round-trip; `coordinator_id` derives
-  identically across restarts of the same install; pub publishing
-  is idempotent; pubkey fetcher rejects a tampered pub whose
-  derivation doesn't match the path; macaroon mint/verify still
-  work end-to-end against the in-memory-derived root.
+- [x] **Generate / load `coordinator.key` + `coordinator.pub`.**
+  Landed in `elide-coordinator/src/identity.rs` (`d1a9364`).
+- [x] **Re-root `coordinator_id` on the public key.**
+- [x] **Derive macaroon root from the private key in-memory.**
+- [x] **Publish `coordinator.pub` to S3 on startup**
+  (`identity::publish_pub`).
+- [x] **Pubkey fetcher** (`identity::fetch_coordinator_pub`) —
+  reads the bucket pub, recomputes `coordinator_id` from the bytes
+  and refuses on mismatch.
+- [x] **Migration / clean-break handling** — on first start of new
+  code, the coordinator generates `coordinator.key` /
+  `coordinator.pub` if absent, derives a new `coordinator_id` from
+  the new pub, and stops trusting any existing
+  `coordinator.root_key` file.
+- [x] **Tests** — round-trip, derivation determinism across
+  restarts, pub publish idempotency, tampered-pub rejection.
 
 **Phase exit criteria:** every coordinator has a verifiable Ed25519
 identity reachable from the bucket. `coordinator_id` is
@@ -254,8 +229,9 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
   `handoff_snapshot = <snap_ulid>`, `coordinator_id` preserved as
   historical.
 - [x] CLI: `elide volume release <name>`.
-- [ ] `volume stop --release` convenience composition (deferred to
-  a follow-up commit; the two underlying verbs already exist).
+- [x] `volume stop --release` convenience composition (landed in
+  `41f73d3`; the `--to <coord_id>` form composes with `--release` for
+  targeted handoff).
 
 #### `volume start <name>` — claim ownership
 
@@ -314,10 +290,11 @@ consulted when `--remote` is passed. The override path lives on
 
 #### Other Phase 2 work
 
-- [ ] **`volume.stopped` marker rule.** On coordinator startup,
-  reconcile each local volume directory against `names/<name>`. If
-  the local marker disagrees with S3, S3 wins; update the marker to
-  match.
+- [x] **`volume.stopped` marker rule.** `lifecycle::reconcile_marker`
+  runs in the coordinator's discovery pass (`daemon.rs`):
+  `state == Stopped` and marker absent → write the marker;
+  `state == Live` and marker present → remove. Best-effort, scoped to
+  records this coordinator owns, ignores foreign-owned records.
 - [ ] **Tests:** unit tests for each state transition (15 lifecycle
   tests landed); integration test exercising stop-on-A → start-on-A
   (local resume) and release-on-A → start-on-B (cross-coordinator)
@@ -489,14 +466,10 @@ is independently verifiable from bucket-public material.
 
 The "feels like magic" UX work. Depends on Phase 0–3.
 
-- [ ] **`volume list` stays local.**
-  - View: names this coordinator owns or has materialised data for.
-    Never lists `names/` in S3 — bucket may hold thousands of names
-    and unbounded enumeration is not a useful default.
-  - `--all` keeps its existing local-only meaning (include ancestor
-    forks); it does **not** reach S3.
-  - Columns: `name`, `vol_ulid`, `mode`, `state`, `transport`,
-    `pid` (current shape).
+- [x] **`volume list` stays local.** Already implemented this way:
+  reads `by_name/` and (with `--all`) `by_id/`, never reaches S3.
+  Columns are `name`, `vol_ulid`, `mode`, `state`, `transport`,
+  `pid` per the existing shape.
 - [ ] **`volume status <name>` gains `--remote`.**
   - Default: local — what this coordinator knows about `<name>`.
   - `--remote`: fetches `names/<name>` from S3 and prints the
