@@ -276,12 +276,13 @@ mod tests {
         let (signer, vk) = make_signer();
         upload_volume_pub(&store, vol_ulid, &vk).await;
 
-        // Three segments minted in increasing-ULID order, uploaded in
-        // a different order. We expect the result sorted by ULID.
-        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
-        let s1 = mint.next();
-        let s2 = mint.next();
-        let s3 = mint.next();
+        // Three segments in known-ascending ULID order, uploaded out
+        // of order. `increment()` is deterministic and strictly
+        // larger, so s1 < s2 < s3 by construction — no separate sort
+        // step needed to compute the expected output.
+        let s1 = Ulid::new();
+        let s2 = s1.increment().expect("increment");
+        let s3 = s2.increment().expect("increment");
         for (sid, payload) in [(s2, b"two".as_slice()), (s1, b"one"), (s3, b"three")] {
             let bytes = build_segment_bytes(signer.as_ref(), vec![seg_entry(0, 1, payload)]);
             store
@@ -319,9 +320,8 @@ mod tests {
         let (signer, vk) = make_signer();
         upload_volume_pub(&store, vol_ulid, &vk).await;
 
-        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
-        let good_id = mint.next();
-        let bad_id = mint.next();
+        let good_id = Ulid::new();
+        let bad_id = Ulid::new();
         let good = build_segment_bytes(signer.as_ref(), vec![seg_entry(0, 1, b"good")]);
         let mut bad = build_segment_bytes(signer.as_ref(), vec![seg_entry(0, 1, b"bad")]);
         // Flip a byte inside the index section so the signature check
@@ -378,8 +378,7 @@ mod tests {
         upload_volume_pub(&store, vol_ulid, &vk).await;
 
         // A real segment.
-        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
-        let seg_id = mint.next();
+        let seg_id = Ulid::new();
         let good = build_segment_bytes(signer.as_ref(), vec![seg_entry(0, 1, b"x")]);
         store
             .put(&segment_key(vol_ulid, seg_id), PutPayload::from(good))
@@ -387,7 +386,7 @@ mod tests {
             .unwrap();
 
         // A leftover .tmp upload (not a ULID key).
-        let tmp_key = StorePath::from(format!("by_id/{vol_ulid}/segments/{}.tmp", mint.next()));
+        let tmp_key = StorePath::from(format!("by_id/{vol_ulid}/segments/{}.tmp", Ulid::new()));
         store
             .put(&tmp_key, PutPayload::from(b"partial-upload".as_slice()))
             .await
@@ -413,9 +412,8 @@ mod tests {
         let (other_signer, _) = make_signer();
         upload_volume_pub(&store, vol_ulid, &advertised_vk).await;
 
-        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
-        let good_id = mint.next();
-        let foreign_id = mint.next();
+        let good_id = Ulid::new();
+        let foreign_id = Ulid::new();
         let good = build_segment_bytes(advertised_signer.as_ref(), vec![seg_entry(0, 1, b"legit")]);
         let foreign = build_segment_bytes(other_signer.as_ref(), vec![seg_entry(0, 1, b"foreign")]);
 
