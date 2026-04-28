@@ -341,9 +341,17 @@ the post-release race window: instead of `released` (anyone may
 claim), the record goes to `reserved` (only the named coordinator
 may claim). Composes with `--force`.
 
-- [ ] **`Reserved` state in `NameRecord`.** New variant in
-  `NameState`; round-trip + version tests; `mark_released_to`
-  lifecycle helper; reader changes in `start`/`status`.
+- [x] **`Reserved` state in `NameRecord`.** New variant in
+  `NameState`; round-trip + lowercase wire tests landed.
+  `mark_released_to(name, releasing_coord, target_coord, snap)`
+  flips `Live`/`Stopped` → `Reserved` with the target written into
+  `coordinator_id` (intended claimer). `mark_claimed` gains a
+  `Reserved → Live` arm gated on `coordinator_id == self`; foreign
+  claimants surface `OwnershipConflict { held_by: <target> }` before
+  the conditional PUT, closing the post-release race window.
+  Reserved is refused cleanly by `mark_stopped`, `mark_live`, and
+  `mark_reclaimed_local`. Reader changes in `start`/`status`
+  deferred to the `--remote` wiring task.
 - [ ] **Synthesised handoff snapshot record shape.** Extend the
   snapshot record with three optional fields, all populated only on
   the synthesised path:
