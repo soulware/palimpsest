@@ -2141,6 +2141,7 @@ async fn force_release_volume_op(
 /// final step is `mark_released_to` instead of `mark_released`. The
 /// resulting record is `Reserved` for `target_coord_id`, closing the
 /// post-release race window so only the named coordinator can claim.
+#[allow(clippy::too_many_arguments)]
 async fn release_to_volume_op(
     volume_name: &str,
     target_coord_id: &str,
@@ -2218,6 +2219,7 @@ async fn release_volume_op(
 /// `Released`) and `release_to_volume_op` (final flip = `Reserved`
 /// for a specific target). The drain → snapshot → halt path is
 /// identical; only the final `mark_*` call differs.
+#[allow(clippy::too_many_arguments)]
 async fn release_with_final_flip(
     volume_name: &str,
     final_flip: ReleaseFinalFlip,
