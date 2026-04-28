@@ -352,16 +352,24 @@ may claim). Composes with `--force`.
   Reserved is refused cleanly by `mark_stopped`, `mark_live`, and
   `mark_reclaimed_local`. Reader changes in `start`/`status`
   deferred to the `--remote` wiring task.
-- [ ] **Synthesised handoff snapshot record shape.** Extend the
-  snapshot record with three optional fields, all populated only on
-  the synthesised path:
-  - `synthesised_from_recovery: bool` (default false)
+- [x] **Synthesised handoff snapshot record shape.** Extended the
+  snapshot manifest format in `elide-core::signing` with three optional
+  fields populated only on the synthesised path:
+  - `synthesised_from_recovery: true`
   - `recovering_coordinator_id: <coord_id>`
   - `recovered_at: <rfc3339>`
 
-  Wire signature is over the canonical record bytes including these
-  fields. Tooling (`volume status`, `inspect-segment`, etc.) shows
-  the flag prominently when set.
+  `write_snapshot_manifest` gained an `Option<&SnapshotManifestRecovery>`
+  parameter; `read_snapshot_manifest` now returns a `SnapshotManifest`
+  struct carrying `segment_ulids` plus optional `recovery`. The signing
+  input is **domain-separated** when recovery metadata is present —
+  `"elide-snapshot-recovery-v1\0"` prefix + `coord_id\0recovered_at\0\0` —
+  so a non-recovery sig can't validate a manifest mutated to claim
+  recovery, and vice versa. 5 new tests cover round-trip, empty
+  segments, cross-class tamper, stripped-fields tamper, and partial
+  metadata. Existing 4 writers and 3 readers updated. Tooling display
+  of the flag is deferred to the verification-on-`start --remote`
+  task.
 - [ ] **Segment-listing replay.** New helper in
   `elide-coordinator/src/recovery.rs` (or similar): given a dead
   fork's `vol_ulid`, list all segment objects under

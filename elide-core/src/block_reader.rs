@@ -157,7 +157,7 @@ impl BlockReader {
         // Trust root: this volume's own volume.pub. Callers are expected to
         // have validated that they asked for this identity.
         let own_pubkey = signing::load_verifying_key(&dir, signing::VOLUME_PUB_FILE)?;
-        let own_segs = signing::read_snapshot_manifest(&dir, &own_pubkey, snap_ulid)?;
+        let own_segs = signing::read_snapshot_manifest(&dir, &own_pubkey, snap_ulid)?.segment_ulids;
         let own_lineage =
             signing::read_lineage_with_key(&dir, &own_pubkey, signing::VOLUME_PROVENANCE_FILE)?;
 
@@ -197,7 +197,8 @@ impl BlockReader {
                     parent.volume_ulid
                 ))
             })?;
-            let segs = signing::read_snapshot_manifest(&parent_dir, &manifest_vk, &parent_snap)?;
+            let segs = signing::read_snapshot_manifest(&parent_dir, &manifest_vk, &parent_snap)?
+                .segment_ulids;
             let parent_lineage = signing::read_lineage_with_key(
                 &parent_dir,
                 &parent_vk,

@@ -561,16 +561,71 @@ fn parse_provenance(
 //     <segment-ulid>
 //     <segment-ulid>
 //     ...
+//   [synthesised_from_recovery: true]
+//   [recovering_coordinator_id: <coord_id>]
+//   [recovered_at: <rfc3339>]
 //   sig: <hex-encoded 64-byte Ed25519 signature>
 //
-// ULIDs are sorted lexicographically (= chronologically for ULIDs). The
-// signature covers the NUL-separated concatenation of ULIDs in sorted
-// order; an empty manifest signs the empty byte string.
+// ULIDs are sorted lexicographically (= chronologically for ULIDs).
+//
+// The three bracketed fields are present only on **synthesised handoff
+// snapshots** minted by `volume release --force` (Phase 3 of the
+// portable-live-volume rollout): the recovering coordinator lists the
+// dead fork's S3 segments, verifies each one against `volume.pub`, and
+// signs the resulting list with its own `coordinator.key` rather than
+// the dead fork's volume key. The recovery metadata identifies which
+// coordinator did the recovery so verifiers can fetch the right pubkey
+// from `coordinators/<recovering_coordinator_id>/coordinator.pub`.
+//
+// Signing input: NUL-separated concatenation of sorted ULIDs for
+// non-recovery manifests; an empty manifest signs the empty byte
+// string. **Recovery manifests** sign a domain-separated message:
+// `"elide-snapshot-recovery-v1\0" + recovering_coordinator_id + "\0" +
+// recovered_at + "\0\0" + <sorted-ulids>`. The unique prefix prevents
+// cross-class signature reuse: a non-recovery sig won't validate a
+// manifest edited to claim recovery, and a recovery sig won't
+// validate a manifest with the recovery fields stripped.
 
 /// Build the filename for `snap_ulid`'s segments manifest
 /// (`<snap_ulid>.manifest`) inside a volume's `snapshots/` directory.
 pub fn snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
     format!("{snap_ulid}{SNAPSHOT_MANIFEST_SUFFIX}")
+}
+
+/// Domain-separation prefix for the recovery-manifest signing input.
+/// Bumping the suffix (`v1`, `v2`, …) invalidates all previously signed
+/// recovery manifests; chosen explicitly rather than implicitly so the
+/// signing input is self-describing.
+const RECOVERY_SIGNING_DOMAIN: &str = "elide-snapshot-recovery-v1";
+
+/// Recovery metadata attached to a synthesised handoff snapshot.
+///
+/// Populated only on snapshots minted by `volume release --force`: the
+/// recovering coordinator lists the dead fork's S3 segments, verifies
+/// each against the dead fork's `volume.pub`, then signs the resulting
+/// manifest with its own `coordinator.key` and writes these fields so
+/// verifiers know which coordinator pubkey to fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotManifestRecovery {
+    /// Coordinator id of the host that performed the recovery, in the
+    /// same Crockford-Base32 ULID-shape used elsewhere. Verifiers
+    /// resolve this to a pubkey via
+    /// `coordinators/<recovering_coordinator_id>/coordinator.pub`.
+    pub recovering_coordinator_id: String,
+    /// Wall-clock time (RFC3339) the recovery was performed. Advisory
+    /// metadata; not used in verification logic but signed-over so it
+    /// cannot be edited post-hoc.
+    pub recovered_at: String,
+}
+
+/// Result of parsing and verifying a snapshot manifest.
+#[derive(Debug, Clone)]
+pub struct SnapshotManifest {
+    /// Segment ULIDs in strictly ascending order.
+    pub segment_ulids: Vec<ulid::Ulid>,
+    /// Recovery metadata, if this is a synthesised handoff snapshot.
+    /// `None` for ordinary user/handoff snapshots.
+    pub recovery: Option<SnapshotManifestRecovery>,
 }
 
 /// Write a signed snapshot manifest for `snap_ulid`.
@@ -580,20 +635,28 @@ pub fn snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
 /// directory. The list is sorted and deduplicated before signing and
 /// serialisation.
 ///
+/// `recovery` is `Some(_)` only on synthesised handoff snapshots minted
+/// by `volume release --force`; in that case the signer must be the
+/// recovering coordinator's `coordinator.key` (not the dead fork's
+/// volume signing key). The signing input is domain-separated when
+/// recovery metadata is present so signatures of the two manifest
+/// classes cannot be cross-validated.
+///
 /// Writes `vol_dir/snapshots/<snap_ulid>.manifest` atomically.
 pub fn write_snapshot_manifest(
     vol_dir: &Path,
     signer: &dyn SegmentSigner,
     snap_ulid: &ulid::Ulid,
     segment_ulids: &[ulid::Ulid],
+    recovery: Option<&SnapshotManifestRecovery>,
 ) -> io::Result<()> {
     let mut sorted: Vec<String> = segment_ulids.iter().map(|u| u.to_string()).collect();
     sorted.sort();
     sorted.dedup();
 
-    let msg = manifest_signing_input(&sorted);
+    let msg = manifest_signing_input(&sorted, recovery);
     let sig = signer.sign(&msg);
-    let content = serialize_snapshot_manifest(&sorted, &sig);
+    let content = serialize_snapshot_manifest(&sorted, recovery, &sig);
 
     let path = vol_dir
         .join("snapshots")
@@ -601,20 +664,28 @@ pub fn write_snapshot_manifest(
     crate::segment::write_file_atomic(&path, content.as_bytes())
 }
 
-/// Read and verify a snapshot manifest, returning its sorted segment ULIDs.
+/// Read and verify a snapshot manifest, returning its sorted segment
+/// ULIDs and (for synthesised handoff snapshots) the recovery
+/// metadata.
 ///
-/// `verifying_key` is the Ed25519 verifying key of the volume that signed
-/// the manifest — for ancestor verification this comes from the child's
-/// `volume.provenance` (the embedded `parent_pubkey`), not from the
-/// ancestor directory's own `volume.pub`.
+/// `verifying_key` is the Ed25519 verifying key that signed the
+/// manifest:
+///   - for ordinary snapshots, the volume's signing pubkey (for
+///     ancestor verification this comes from the child's
+///     `volume.provenance`, not the ancestor directory's `volume.pub`);
+///   - for synthesised handoff snapshots, the recovering coordinator's
+///     `coordinator.pub`. Callers identify this case by reading the
+///     manifest first (via this function with the wrong key), or by
+///     consulting the surrounding context — typically the
+///     `names/<name>` record points the caller at the right pubkey.
 ///
-/// Fails if the file is missing, unparseable, the signature does not match,
-/// or the ULIDs are not in strictly ascending order.
+/// Fails if the file is missing, unparseable, the signature does not
+/// match, or the ULIDs are not in strictly ascending order.
 pub fn read_snapshot_manifest(
     vol_dir: &Path,
     verifying_key: &VerifyingKey,
     snap_ulid: &ulid::Ulid,
-) -> io::Result<Vec<ulid::Ulid>> {
+) -> io::Result<SnapshotManifest> {
     let filename = snapshot_manifest_filename(snap_ulid);
     let path = vol_dir.join("snapshots").join(&filename);
     let content = std::fs::read_to_string(&path).map_err(|e| {
@@ -624,13 +695,13 @@ pub fn read_snapshot_manifest(
         ))
     })?;
 
-    let (entries_str, sig_bytes) = parse_snapshot_manifest(&content, &filename)?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
+    let parsed = parse_snapshot_manifest(&content, &filename)?;
+    let sig_arr: [u8; 64] = parsed.sig.try_into().map_err(|_| {
         io::Error::other(format!("{filename} sig wrong length (expected 64 bytes)"))
     })?;
     let signature = Signature::from_bytes(&sig_arr);
 
-    let msg = manifest_signing_input(&entries_str);
+    let msg = manifest_signing_input(&parsed.entries, parsed.recovery.as_ref());
     verifying_key
         .verify(&msg, &signature)
         .map_err(|_| io::Error::other(format!("{filename} signature invalid")))?;
@@ -638,33 +709,55 @@ pub fn read_snapshot_manifest(
     // Parse each entry as a typed ULID, enforcing strictly ascending order
     // (sort + dedup is done at write time, so any deviation is tamper or
     // corruption).
-    let mut out: Vec<ulid::Ulid> = Vec::with_capacity(entries_str.len());
-    for entry in &entries_str {
-        let parsed = ulid::Ulid::from_string(entry).map_err(|e| {
+    let mut out: Vec<ulid::Ulid> = Vec::with_capacity(parsed.entries.len());
+    for entry in &parsed.entries {
+        let ulid = ulid::Ulid::from_string(entry).map_err(|e| {
             io::Error::other(format!(
                 "{filename} contains invalid segment ULID {entry:?}: {e}"
             ))
         })?;
         if let Some(last) = out.last()
-            && &parsed <= last
+            && &ulid <= last
         {
             return Err(io::Error::other(format!(
                 "{filename} segment ULIDs not in strictly ascending order at {entry}"
             )));
         }
-        out.push(parsed);
+        out.push(ulid);
     }
-    Ok(out)
+    Ok(SnapshotManifest {
+        segment_ulids: out,
+        recovery: parsed.recovery,
+    })
 }
 
-/// Signing input for a snapshot manifest: sorted ULIDs concatenated with
-/// NUL separators. Empty manifest signs the empty byte string.
-fn manifest_signing_input(sorted_ulids: &[String]) -> Vec<u8> {
-    let mut total = sorted_ulids.len().saturating_sub(1);
-    for u in sorted_ulids {
-        total += u.len();
+/// Signing input for a snapshot manifest.
+///
+/// Non-recovery manifests sign the NUL-separated concatenation of
+/// sorted ULIDs (an empty manifest signs the empty byte string).
+///
+/// Recovery manifests prepend a domain-separated header so their
+/// signatures live in a different signing-input space:
+///   `"elide-snapshot-recovery-v1\0" + coord_id + "\0" + recovered_at +
+///   "\0\0" + <NUL-joined ulids>`
+///
+/// The double-NUL separator between header and ULID list disambiguates
+/// the boundary unambiguously even when the segment list is empty.
+fn manifest_signing_input(
+    sorted_ulids: &[String],
+    recovery: Option<&SnapshotManifestRecovery>,
+) -> Vec<u8> {
+    let mut msg = Vec::new();
+    if let Some(r) = recovery {
+        msg.extend_from_slice(RECOVERY_SIGNING_DOMAIN.as_bytes());
+        msg.push(0u8);
+        msg.extend_from_slice(r.recovering_coordinator_id.as_bytes());
+        msg.push(0u8);
+        msg.extend_from_slice(r.recovered_at.as_bytes());
+        // Double-NUL separator between header and ULID list.
+        msg.push(0u8);
+        msg.push(0u8);
     }
-    let mut msg = Vec::with_capacity(total);
     for (i, u) in sorted_ulids.iter().enumerate() {
         if i > 0 {
             msg.push(0u8);
@@ -674,12 +767,25 @@ fn manifest_signing_input(sorted_ulids: &[String]) -> Vec<u8> {
     msg
 }
 
-fn serialize_snapshot_manifest(sorted_ulids: &[String], sig: &[u8; 64]) -> String {
+fn serialize_snapshot_manifest(
+    sorted_ulids: &[String],
+    recovery: Option<&SnapshotManifestRecovery>,
+    sig: &[u8; 64],
+) -> String {
     let mut content = String::new();
     content.push_str("segments:\n");
     for u in sorted_ulids {
         content.push_str("  ");
         content.push_str(u);
+        content.push('\n');
+    }
+    if let Some(r) = recovery {
+        content.push_str("synthesised_from_recovery: true\n");
+        content.push_str("recovering_coordinator_id: ");
+        content.push_str(&r.recovering_coordinator_id);
+        content.push('\n');
+        content.push_str("recovered_at: ");
+        content.push_str(&r.recovered_at);
         content.push('\n');
     }
     content.push_str("sig: ");
@@ -688,9 +794,18 @@ fn serialize_snapshot_manifest(sorted_ulids: &[String], sig: &[u8; 64]) -> Strin
     content
 }
 
-fn parse_snapshot_manifest(content: &str, filename: &str) -> io::Result<(Vec<String>, Vec<u8>)> {
+struct ParsedManifest {
+    entries: Vec<String>,
+    recovery: Option<SnapshotManifestRecovery>,
+    sig: Vec<u8>,
+}
+
+fn parse_snapshot_manifest(content: &str, filename: &str) -> io::Result<ParsedManifest> {
     let mut entries: Option<Vec<String>> = None;
     let mut sig: Option<Vec<u8>> = None;
+    let mut synthesised: bool = false;
+    let mut recovering_coordinator_id: Option<String> = None;
+    let mut recovered_at: Option<String> = None;
 
     let mut lines = content.lines().peekable();
     while let Some(line) = lines.next() {
@@ -707,13 +822,52 @@ fn parse_snapshot_manifest(content: &str, filename: &str) -> io::Result<(Vec<Str
             entries = Some(list);
         } else if let Some(v) = line.strip_prefix("sig: ") {
             sig = Some(decode_hex(v)?);
+        } else if let Some(v) = line.strip_prefix("synthesised_from_recovery: ") {
+            synthesised = match v {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(io::Error::other(format!(
+                        "{filename} synthesised_from_recovery has invalid value {other:?}"
+                    )));
+                }
+            };
+        } else if let Some(v) = line.strip_prefix("recovering_coordinator_id: ") {
+            recovering_coordinator_id = Some(v.to_owned());
+        } else if let Some(v) = line.strip_prefix("recovered_at: ") {
+            recovered_at = Some(v.to_owned());
         }
     }
 
     let entries =
         entries.ok_or_else(|| io::Error::other(format!("{filename} missing segments section")))?;
     let sig = sig.ok_or_else(|| io::Error::other(format!("{filename} missing sig line")))?;
-    Ok((entries, sig))
+
+    let recovery = match (synthesised, recovering_coordinator_id, recovered_at) {
+        (false, None, None) => None,
+        (true, Some(coord_id), Some(at)) => Some(SnapshotManifestRecovery {
+            recovering_coordinator_id: coord_id,
+            recovered_at: at,
+        }),
+        // Any partial combination is malformed: either all three
+        // recovery fields are present (and synthesised is true) or
+        // none are.
+        (synthesised, coord_id, at) => {
+            return Err(io::Error::other(format!(
+                "{filename} has inconsistent recovery metadata \
+                 (synthesised_from_recovery={synthesised}, \
+                 recovering_coordinator_id={}, recovered_at={})",
+                coord_id.as_deref().unwrap_or("<absent>"),
+                at.as_deref().unwrap_or("<absent>"),
+            )));
+        }
+    };
+
+    Ok(ParsedManifest {
+        entries,
+        recovery,
+        sig,
+    })
 }
 
 /// Test-only helper: write a signed `volume.provenance` with raw, unvalidated
@@ -811,12 +965,13 @@ mod tests {
             make_ulid("01BBBBBBBBBBBBBBBBBBBBBBBB"),
         ];
 
-        write_snapshot_manifest(tmp.path(), &key, &snap, &segs).unwrap();
+        write_snapshot_manifest(tmp.path(), &key, &snap, &segs, None).unwrap();
         let got = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap();
 
         let mut expected = segs.clone();
         expected.sort();
-        assert_eq!(got, expected);
+        assert_eq!(got.segment_ulids, expected);
+        assert!(got.recovery.is_none());
     }
 
     #[test]
@@ -829,9 +984,10 @@ mod tests {
         let key = signer_from(raw_key);
         let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
 
-        write_snapshot_manifest(tmp.path(), &key, &snap, &[]).unwrap();
+        write_snapshot_manifest(tmp.path(), &key, &snap, &[], None).unwrap();
         let got = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap();
-        assert!(got.is_empty());
+        assert!(got.segment_ulids.is_empty());
+        assert!(got.recovery.is_none());
     }
 
     #[test]
@@ -846,9 +1002,9 @@ mod tests {
         let dup = make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV");
         let segs = vec![dup, dup];
 
-        write_snapshot_manifest(tmp.path(), &key, &snap, &segs).unwrap();
+        write_snapshot_manifest(tmp.path(), &key, &snap, &segs, None).unwrap();
         let got = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap();
-        assert_eq!(got, vec![dup]);
+        assert_eq!(got.segment_ulids, vec![dup]);
     }
 
     #[test]
@@ -864,6 +1020,7 @@ mod tests {
             &signing_key,
             &snap,
             &[make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV")],
+            None,
         )
         .unwrap();
 
@@ -878,5 +1035,164 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng).verifying_key();
         let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert!(read_snapshot_manifest(tmp.path(), &key, &snap).is_err());
+    }
+
+    // ── Recovery (synthesised handoff snapshot) tests ────────────────
+
+    fn sample_recovery() -> SnapshotManifestRecovery {
+        SnapshotManifestRecovery {
+            recovering_coordinator_id: "01ABCDEFGHJKMNPQRSTVWXYZ23".to_owned(),
+            recovered_at: "2026-04-28T12:34:56Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn snapshot_manifest_recovery_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let verifying = raw_key.verifying_key();
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let segs = vec![
+            make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV"),
+            make_ulid("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+        ];
+        let rec = sample_recovery();
+
+        write_snapshot_manifest(tmp.path(), &key, &snap, &segs, Some(&rec)).unwrap();
+        let got = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap();
+
+        let mut expected = segs.clone();
+        expected.sort();
+        assert_eq!(got.segment_ulids, expected);
+        assert_eq!(got.recovery, Some(rec));
+    }
+
+    #[test]
+    fn snapshot_manifest_recovery_empty_segments() {
+        // A force-release against a dead fork that never published a
+        // single segment must still produce a verifiable recovery
+        // manifest (signed empty handoff).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let verifying = raw_key.verifying_key();
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let rec = sample_recovery();
+
+        write_snapshot_manifest(tmp.path(), &key, &snap, &[], Some(&rec)).unwrap();
+        let got = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap();
+        assert!(got.segment_ulids.is_empty());
+        assert_eq!(got.recovery, Some(rec));
+    }
+
+    #[test]
+    fn snapshot_manifest_recovery_signing_input_is_domain_separated() {
+        // A non-recovery signature must NOT validate a manifest whose
+        // bytes have been edited to claim recovery — the signing input
+        // is domain-separated so the two classes can't be cross-validated.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let verifying = raw_key.verifying_key();
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let segs = vec![make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV")];
+
+        // Write a non-recovery manifest, then mutate the file bytes to
+        // append the three recovery fields without re-signing.
+        write_snapshot_manifest(tmp.path(), &key, &snap, &segs, None).unwrap();
+        let path = tmp
+            .path()
+            .join("snapshots")
+            .join(snapshot_manifest_filename(&snap));
+        let original = std::fs::read_to_string(&path).unwrap();
+        // Surgically inject recovery fields just before `sig:`.
+        let recovery_block = "synthesised_from_recovery: true\n\
+                              recovering_coordinator_id: 01ABCDEFGHJKMNPQRSTVWXYZ23\n\
+                              recovered_at: 2026-04-28T12:34:56Z\n";
+        let tampered = original.replacen("sig: ", &format!("{recovery_block}sig: "), 1);
+        std::fs::write(&path, tampered).unwrap();
+
+        let err = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap_err();
+        assert!(
+            err.to_string().contains("signature invalid"),
+            "expected signature failure on cross-class mutation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_manifest_recovery_rejects_stripped_recovery_fields() {
+        // The reverse: a recovery manifest whose recovery fields are
+        // stripped must also fail verification — the signature was
+        // computed over the recovery signing input.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let verifying = raw_key.verifying_key();
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let segs = vec![make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV")];
+        let rec = sample_recovery();
+
+        write_snapshot_manifest(tmp.path(), &key, &snap, &segs, Some(&rec)).unwrap();
+        let path = tmp
+            .path()
+            .join("snapshots")
+            .join(snapshot_manifest_filename(&snap));
+        let original = std::fs::read_to_string(&path).unwrap();
+        // Strip all three recovery lines.
+        let stripped: String = original
+            .lines()
+            .filter(|l| {
+                !l.starts_with("synthesised_from_recovery:")
+                    && !l.starts_with("recovering_coordinator_id:")
+                    && !l.starts_with("recovered_at:")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, stripped).unwrap();
+
+        let err = read_snapshot_manifest(tmp.path(), &verifying, &snap).unwrap_err();
+        assert!(
+            err.to_string().contains("signature invalid"),
+            "expected signature failure on stripped recovery fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_manifest_recovery_rejects_partial_recovery_metadata() {
+        // A manifest with only some of the three recovery fields set
+        // is structurally invalid; the parser must refuse before the
+        // signature check (which would also fail).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let path = tmp
+            .path()
+            .join("snapshots")
+            .join(snapshot_manifest_filename(&snap));
+        std::fs::write(
+            &path,
+            "segments:\n  01BX5ZZKJKTSV4RRFFQ69G5FAV\n\
+             synthesised_from_recovery: true\n\
+             sig: 00\n",
+        )
+        .unwrap();
+
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        let err = read_snapshot_manifest(tmp.path(), &key, &snap).unwrap_err();
+        assert!(
+            err.to_string().contains("inconsistent recovery metadata"),
+            "expected inconsistent-recovery error, got: {err}"
+        );
     }
 }

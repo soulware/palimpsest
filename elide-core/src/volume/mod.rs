@@ -1849,6 +1849,7 @@ impl Volume {
             self.signer.as_ref(),
             &snap_ulid,
             &index_ulids,
+            None,
         )?;
 
         // Marker is written last — a partial sequence leaves no snapshot

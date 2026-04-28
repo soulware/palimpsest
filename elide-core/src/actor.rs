@@ -2643,7 +2643,13 @@ pub(crate) fn execute_sign_snapshot_manifest(
     let snapshots_dir = base_dir.join("snapshots");
     std::fs::create_dir_all(&snapshots_dir)?;
 
-    crate::signing::write_snapshot_manifest(&base_dir, signer.as_ref(), &snap_ulid, &seg_ulids)?;
+    crate::signing::write_snapshot_manifest(
+        &base_dir,
+        signer.as_ref(),
+        &snap_ulid,
+        &seg_ulids,
+        None,
+    )?;
 
     // Marker last — partial sequences leave no snapshot visible.
     std::fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;

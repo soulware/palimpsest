@@ -299,7 +299,8 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
             io::Error::other(format!("invalid snapshot ULID in provenance parent: {e}"))
         })?;
         let segments =
-            crate::signing::read_snapshot_manifest(&parent_dir, &manifest_verifying, &snap_ulid)?;
+            crate::signing::read_snapshot_manifest(&parent_dir, &manifest_verifying, &snap_ulid)?
+                .segment_ulids;
 
         let index_dir = parent_dir.join("index");
         for seg in &segments {

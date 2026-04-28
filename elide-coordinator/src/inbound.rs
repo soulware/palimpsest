@@ -1499,9 +1499,13 @@ async fn force_snapshot_now_op(
     };
 
     // Step 6: signed manifest + local marker.
-    if let Err(e) =
-        elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments)
-    {
+    if let Err(e) = elide_core::signing::write_snapshot_manifest(
+        &ancestor_dir,
+        &*signer,
+        &snap,
+        &segments,
+        None,
+    ) {
         return format!("err writing snapshot manifest: {e}");
     }
     let snap_dir = ancestor_dir.join("snapshots");

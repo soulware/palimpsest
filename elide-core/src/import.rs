@@ -247,7 +247,7 @@ pub fn import_image(
 
     // Write the signed snapshot manifest before the marker — partial
     // sequences leave no snapshot visible (the marker is written last).
-    crate::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &all_segment_ulids)?;
+    crate::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &all_segment_ulids, None)?;
 
     fs::write(snapshots_dir.join(&snap_ulid_str), "")?;
 
