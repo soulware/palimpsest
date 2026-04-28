@@ -13,4 +13,3 @@ cc 22497a3a6d7674f211cc1a8e1e04b8bdb3b46d526cdf0da16e6ad9dba575fd95 # shrinks to
 cc 1e2e2bbb304f56ad2bc8de5bdf0659cebe45bea176746e8a7eea3a5a1d6b5bad # shrinks to ops = [WriteLargeMulti { lba: 4, seed: 54 }, Flush, WriteLargeMulti { lba: 4, seed: 0 }, DrainWithRedact, WriteLargeMulti { lba: 0, seed: 54 }]
 cc 00beae3f5000d4abb913711617ba1d775a3f4e08d7f570e16c2c019cb5686cf1 # shrinks to ops = [WriteLargeMulti { lba: 1, seed: 0 }, WriteLargeMulti { lba: 2, seed: 1 }, ReclaimRange { start_lba: 24, lba_count: 2 }, Flush, DrainWithRedact, Crash]
 cc 13787da3531f26212fbb49a9e6aa6b8beec92f9b6daaa302a319dd7a20245531 # shrinks to ops = [WriteLarge { lba: 4, seed: 0 }, WriteLarge { lba: 4, seed: 1 }, PopulateFetched { lba: 0, seed: 0 }, HalfPromotePending, Repack, Crash]
-cc a978281ba28abb699f33ac4b1c491da6efedd24a45b65db82d893504458c85fc
