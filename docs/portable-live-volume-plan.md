@@ -370,15 +370,21 @@ may claim). Composes with `--force`.
   metadata. Existing 4 writers and 3 readers updated. Tooling display
   of the flag is deferred to the verification-on-`start --remote`
   task.
-- [ ] **Segment-listing replay.** New helper in
-  `elide-coordinator/src/recovery.rs` (or similar): given a dead
-  fork's `vol_ulid`, list all segment objects under
-  `by_id/<vol_ulid>/...`, fetch each segment's header + index
-  section (not the body), verify the Ed25519 signature against the
-  dead fork's `volume.pub` (also fetched from S3), and return a
-  sorted-by-ULID list of `(segment_ulid, etag, segment_size)` for
-  segments that pass verification. Segments failing signature check
-  are dropped with a per-segment warning.
+- [x] **Segment-listing replay.** Landed in
+  `elide-coordinator/src/recovery.rs`. `list_and_verify_segments`
+  lists `by_id/<vol_ulid>/segments/`, range-fetches each segment's
+  `header + [0, body_section_start)` (matching `prefetch::fetch_idx`),
+  and verifies the Ed25519 signature against the dead fork's
+  `volume.pub` via `elide_core::segment::verify_segment_bytes`.
+  Returns `RecoveredSegments { segments: Vec<VerifiedSegment>,
+  dropped: usize }` where `VerifiedSegment` carries
+  `(segment_ulid, etag, size)` and the list is sorted by ULID.
+  Segments failing verification (bad magic, invalid signature,
+  truncated, foreign-signed) are dropped with a per-segment
+  `warn!`. Non-ULID keys (stray `.tmp` uploads) are silently
+  skipped, not counted as drops. `fetch_volume_pub` is the
+  companion helper for pulling the dead fork's pubkey from S3.
+  8 unit tests against `InMemory`.
 - [ ] **Synthesise + sign the handoff snapshot.** Mint a fresh
   ULID, build the snapshot record naming the verified segment set
   with the recovery metadata fields populated, sign with
