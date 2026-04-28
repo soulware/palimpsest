@@ -166,18 +166,13 @@ pub enum MarkReleasedOutcome {
 /// operators inspecting the bucket. The next `mark_claimed` populates
 /// them fresh for the new owner.
 ///
-/// `handoff_snapshot` is `None` for the empty-volume edge case — a
-/// freshly-created name that was released without ever having data
-/// written to it. The next claimant gets a fresh root fork with no
-/// parent pin, semantically "release of an empty named volume".
-///
 /// This is the cross-coordinator-handoff verb. Callers must already
 /// have:
 ///   1. drained the volume's WAL,
-///   2. published a snapshot covering everything drained (or skipped
-///      this step because there was nothing to publish),
-///   3. recorded the resulting `snap_ulid` here as `handoff_snapshot`
-///      — `None` when nothing was published.
+///   2. published a snapshot covering everything drained (an empty
+///      volume publishes a snapshot with zero entries, which is fine —
+///      the claim path forks from it as a fresh empty root),
+///   3. recorded the resulting `snap_ulid` here as `handoff_snapshot`.
 ///
 /// The conditional PUT ensures no other coordinator has mutated the
 /// record between our read and our write.
@@ -185,7 +180,7 @@ pub async fn mark_released(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     root_key: &[u8; 32],
-    handoff_snapshot: Option<Ulid>,
+    handoff_snapshot: Ulid,
 ) -> Result<MarkReleasedOutcome, LifecycleError> {
     let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
 
@@ -213,7 +208,7 @@ pub async fn mark_released(
     }
 
     record.state = NameState::Released;
-    record.handoff_snapshot = handoff_snapshot;
+    record.handoff_snapshot = Some(handoff_snapshot);
     record.coordinator_id = None;
     record.claimed_at = None;
     record.hostname = None;
@@ -669,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_returns_absent_when_record_missing() {
         let s = store();
-        let r = mark_released(&s, "missing", &key_a(), Some(snap()))
+        let r = mark_released(&s, "missing", &key_a(), snap())
             .await
             .unwrap();
         assert!(matches!(r, MarkReleasedOutcome::Absent));
@@ -681,9 +676,7 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        let outcome = mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::Updated));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -698,31 +691,6 @@ mod tests {
         assert!(got.coordinator_id.is_none(), "coordinator_id cleared");
         assert!(got.claimed_at.is_none(), "claimed_at cleared");
         assert!(got.hostname.is_none(), "hostname cleared");
-    }
-
-    #[tokio::test]
-    async fn mark_released_with_no_handoff_snapshot_for_empty_volume() {
-        // Edge case: a freshly-created name that was released without
-        // ever having data written to it. The record goes to Released
-        // with `handoff_snapshot = None` so the next claimant gets a
-        // fresh root fork (no parent pin).
-        let s = store();
-        mark_initial(&s, "fresh", &key_a(), sample_ulid())
-            .await
-            .unwrap();
-
-        let outcome = mark_released(&s, "fresh", &key_a(), None).await.unwrap();
-        assert!(matches!(outcome, MarkReleasedOutcome::Updated));
-
-        let (got, _) = name_store::read_name_record(&s, "fresh")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.state, NameState::Released);
-        assert!(got.handoff_snapshot.is_none(), "no snapshot recorded");
-        // Identity fields still cleared as for any release.
-        assert!(got.coordinator_id.is_none());
-        assert!(got.claimed_at.is_none());
     }
 
     #[tokio::test]
@@ -741,9 +709,7 @@ mod tests {
         assert!(before.coordinator_id.is_some());
         assert!(before.claimed_at.is_some());
 
-        mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
 
         let (after, _) = name_store::read_name_record(&s, "vol")
             .await
@@ -765,9 +731,7 @@ mod tests {
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_stopped(&s, "vol", &key_a()).await.unwrap();
 
-        let outcome = mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::Updated));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -784,12 +748,8 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
-        let outcome = mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::AlreadyReleased));
     }
 
@@ -803,7 +763,7 @@ mod tests {
         mark_stopped(&s, "vol", &key_a()).await.unwrap();
 
         // B tries to release A's record.
-        let err = mark_released(&s, "vol", &key_b(), Some(snap()))
+        let err = mark_released(&s, "vol", &key_b(), snap())
             .await
             .expect_err("B must be refused on A-owned record");
         assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
@@ -852,9 +812,7 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
 
         // Even from the original owner, mark_live on a Released record
         // is not local-resume; the claim-from-released path is required.
@@ -965,9 +923,7 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
 
         // B claims A's released name with a freshly-minted ULID.
         let outcome = mark_claimed(&s, "vol", &key_b(), other_ulid())
@@ -998,9 +954,7 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_released(&s, "vol", &key_a(), Some(snap()))
-            .await
-            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
 
         let key_b_buf = key_b();
         let key_c = [0xEFu8; 32];
@@ -1205,7 +1159,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = mark_released(&s, "vol", &key_a(), Some(snap()))
+        let err = mark_released(&s, "vol", &key_a(), snap())
             .await
             .expect_err("readonly record cannot be released");
         assert!(matches!(

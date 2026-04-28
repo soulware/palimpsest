@@ -809,15 +809,14 @@ async fn snapshot_volume(
         return format!("err draining gc handoffs: {e:#}");
     }
 
-    // 4. Pick snap_ulid: the max ULID in index/. Empty forks cannot be
-    //    snapshotted — the coordinator must never mint ULIDs, so there
-    //    is no valid tag for a snapshot over zero segments. We surface
-    //    this as the sentinel `ok empty` rather than an error so callers
-    //    that legitimately want to publish an empty volume (e.g.
-    //    `volume release` on a freshly-created name) can act on it.
+    // 4. Pick snap_ulid: the max ULID in index/, or a freshly-minted
+    //    one when the volume has no segments. The volume's
+    //    `sign_snapshot_manifest` accepts either (see
+    //    `elide_core::volume::Volume::sign_snapshot_manifest` doc) —
+    //    an empty snapshot is just a signed manifest with zero
+    //    entries, valid for the claim path to fork from.
     let snap_ulid = match pick_snapshot_ulid(&fork_dir) {
-        Ok(Some(u)) => u,
-        Ok(None) => return "ok empty".to_string(),
+        Ok(u) => u,
         Err(e) => return format!("err picking snap_ulid: {e}"),
     };
 
@@ -891,7 +890,11 @@ async fn generate_snapshot_filemap(
 /// Returns `None` when `index/` is empty or missing — the coordinator must
 /// never mint ULIDs, so an empty fork has no valid snapshot tag and the
 /// caller rejects the snapshot request.
-fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+/// Pick the ULID to tag a snapshot with: the max segment ULID in
+/// `index/` if any are present, else a fresh `Ulid::new()`. Mirrors
+/// `force_snapshot_now_op` at `inbound.rs` (the ancestor-pin path),
+/// so empty volumes get a valid snapshot tag through both paths.
+fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
     let index_dir = fork_dir.join("index");
     let mut latest: Option<ulid::Ulid> = None;
     match std::fs::read_dir(&index_dir) {
@@ -912,7 +915,7 @@ fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    Ok(latest)
+    Ok(latest.unwrap_or_else(ulid::Ulid::new))
 }
 
 // ── Volume status ─────────────────────────────────────────────────────────────
@@ -1922,13 +1925,9 @@ async fn release_volume_op(
     }
 
     // Drain WAL → publish handoff snapshot. Reuses the existing
-    // snapshot_volume path; the response is one of:
-    //   - `ok <snap_ulid>` — drained, snapshot published.
-    //   - `ok empty`        — no segments to snapshot (freshly-created
-    //                         name with nothing written). Release
-    //                         proceeds without a handoff snapshot;
-    //                         the next claimant forks a fresh root.
-    //   - `err <msg>`       — drain or snapshot failed.
+    // snapshot_volume path. Empty volumes get a freshly-minted snapshot
+    // ULID like any other — they are published as a snapshot with zero
+    // segments, which the claim path forks from as a fresh empty root.
     let snap_resp = snapshot_volume(
         volume_name,
         data_dir,
@@ -1937,13 +1936,13 @@ async fn release_volume_op(
         part_size_bytes,
     )
     .await;
-    let snap_ulid: Option<ulid::Ulid> = match snap_resp.strip_prefix("ok ") {
-        Some(s) if s.trim() == "empty" => None,
-        Some(s) => match ulid::Ulid::from_string(s.trim()) {
-            Ok(u) => Some(u),
-            Err(e) => return format!("err parsing snapshot ULID '{}': {e}", s.trim()),
-        },
+    let snap_ulid_str = match snap_resp.strip_prefix("ok ") {
+        Some(s) => s.trim().to_owned(),
         None => return format!("err snapshot for release failed: {snap_resp}"),
+    };
+    let snap_ulid = match ulid::Ulid::from_string(&snap_ulid_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err parsing snapshot ULID '{snap_ulid_str}': {e}"),
     };
 
     // Halt the daemon. Writing the marker first prevents the supervisor
@@ -1965,28 +1964,18 @@ async fn release_volume_op(
     }
 
     // Final step: flip names/<name> to Released, recording the handoff
-    // snapshot (or `None` for the empty-volume case). From this point
-    // any coordinator may claim the name.
-    let snap_str: String = snap_ulid
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "none (empty volume)".to_owned());
+    // snapshot. From this point any coordinator may claim the name.
     match lifecycle::mark_released(store, volume_name, root_key, snap_ulid).await {
         Ok(_) => {
-            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_str}");
-            // Reply shape: clients expect `ok <ulid>`. For the empty
-            // case there is no ulid; emit the literal `empty` so the
-            // CLI can render a useful message.
-            match snap_ulid {
-                Some(u) => format!("ok {u}"),
-                None => "ok empty".to_string(),
-            }
+            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_ulid}");
+            format!("ok {snap_ulid}")
         }
         Err(e) => {
             // Local state has already moved (volume is stopped, snapshot
             // is published). The S3 record write failed — the operator
             // can retry or use --force-takeover from a peer to recover.
             warn!("[inbound] release {volume_name}: state flip failed: {e}");
-            format!("err snapshot {snap_str} published but names/<name> update failed: {e}")
+            format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
         }
     }
 }
