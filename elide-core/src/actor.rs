@@ -2413,11 +2413,27 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
         let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
             entries.drain(..).partition(|e| match e.kind {
+                // Thin entries (Zero/DedupRef/Delta) span `lba_length`
+                // LBAs and can be *partially* overwritten — a later Data
+                // write may shadow the head while leaving the tail live.
+                // Drop only when *no* LBA in the range still maps to
+                // this entry's hash; checking just `start_lba` would
+                // discard a partially-live entry whose tail is the only
+                // on-disk record of those LBAs' mapping, producing zero
+                // reads after crash + rebuild.
                 segment::EntryKind::Zero => {
-                    job.lbamap.hash_at(e.start_lba) == Some(crate::volume::ZERO_HASH)
+                    let end_lba = e.start_lba + e.lba_length as u64;
+                    job.lbamap
+                        .extents_in_range(e.start_lba, end_lba)
+                        .iter()
+                        .any(|r| r.hash == crate::volume::ZERO_HASH)
                 }
                 segment::EntryKind::DedupRef | segment::EntryKind::Delta => {
-                    job.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                    let end_lba = e.start_lba + e.lba_length as u64;
+                    job.lbamap
+                        .extents_in_range(e.start_lba, end_lba)
+                        .iter()
+                        .any(|r| r.hash == e.hash)
                 }
                 // Body-bearing kinds (Data, Inline, CanonicalData,
                 // CanonicalInline): kept whenever their hash is still
