@@ -450,31 +450,13 @@ async fn upload_manifest(
         }
     }
 
-    // The names/<name> → ULID entry is immutable for a given (name, ULID)
-    // pair; a rename produces a brand new key. We still gate on content so
-    // the uploaded/ copy is verifiable against what would be uploaded now.
-    let name_bytes = volume_id.as_bytes();
-    let names_sentinel = upload_sentinel(vol_dir, &format!("names_{name}"));
-    if !is_already_uploaded(&names_sentinel, name_bytes) {
-        let name_key = StorePath::from(format!("names/{name}"));
-        let name_len = name_bytes.len();
-        let started = Instant::now();
-        put_with_content_type(
-            store,
-            &name_key,
-            Bytes::copy_from_slice(name_bytes),
-            MIME_TEXT,
-        )
-        .await
-        .with_context(|| format!("uploading name entry to {name_key}"))?;
-        info!(
-            "[upload] {name_key} ({name_len} bytes in {:.2?})",
-            started.elapsed()
-        );
-        if let Err(e) = mark_uploaded(&names_sentinel, name_bytes) {
-            warn!("failed to mark names_{name} sentinel: {e}");
-        }
-    }
+    // The `names/<name>` record is owned by the lifecycle verbs in
+    // `crate::lifecycle`: `mark_initial` claims it at create / fork /
+    // import time, and `mark_stopped` / `mark_released` / `mark_live`
+    // / `mark_claimed` mutate it on state transitions. Drain has no
+    // business writing it — an unconditional PUT here would clobber
+    // the populated record (overwriting `coordinator_id`,
+    // `claimed_at`, `hostname`).
 
     Ok(())
 }
@@ -869,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_pending_uploads_manifest_and_name_entry() {
+    async fn drain_pending_uploads_manifest_and_does_not_touch_name_record() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
@@ -891,7 +873,7 @@ mod tests {
             .await
             .unwrap();
 
-        // manifest.toml should be present and parseable
+        // manifest.toml should be present and parseable.
         let manifest_key = StorePath::from(format!("by_id/{VOL_ULID}/manifest.toml"));
         let got = store
             .get(&manifest_key)
@@ -903,11 +885,13 @@ mod tests {
         assert_eq!(table["size"].as_integer(), Some(8192));
         assert_eq!(table["readonly"].as_bool(), Some(true));
 
-        // names/<name> should contain the ULID
+        // names/<name> is owned by the lifecycle verbs, not drain. The
+        // drain path must not touch it — assert no record was created.
         let name_key = StorePath::from("names/my-vol");
-        let got = store.get(&name_key).await.expect("name entry not in store");
-        let ulid_bytes = got.bytes().await.unwrap();
-        assert_eq!(std::str::from_utf8(&ulid_bytes).unwrap(), VOL_ULID);
+        assert!(
+            store.head(&name_key).await.is_err(),
+            "drain_pending must not write names/<name>; that is owned by mark_initial / lifecycle verbs"
+        );
 
         // uploaded/ holds verbatim copies of the uploaded bytes — diff-able
         // with standard tools against the store objects.
@@ -916,10 +900,9 @@ mod tests {
             std::fs::read_to_string(uploaded.join("manifest.toml")).unwrap(),
             content
         );
-        assert_eq!(
-            std::fs::read_to_string(uploaded.join("names_my-vol")).unwrap(),
-            VOL_ULID
-        );
+        // No `uploaded/names_<name>` sentinel either — drain doesn't write
+        // the record, so it has no sentinel to compare against.
+        assert!(!uploaded.join("names_my-vol").exists());
     }
 
     /// Volume-metadata upload is skipped on re-drain when the rendered bytes
@@ -954,10 +937,8 @@ mod tests {
         // objects reappear.
         let manifest_key = StorePath::from(format!("by_id/{VOL_ULID}/manifest.toml"));
         let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
-        let name_key = StorePath::from("names/stable");
         store.delete(&manifest_key).await.unwrap();
         store.delete(&pub_key).await.unwrap();
-        store.delete(&name_key).await.unwrap();
 
         drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
             .await
@@ -965,7 +946,6 @@ mod tests {
 
         assert!(store.head(&manifest_key).await.is_err());
         assert!(store.head(&pub_key).await.is_err());
-        assert!(store.head(&name_key).await.is_err());
 
         // Now change volume.pub content — re-drain must upload.
         std::fs::write(vol_dir.join("volume.pub"), b"rotated").unwrap();

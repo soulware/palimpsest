@@ -2284,7 +2284,7 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
         stats.new_segments += 1;
         // Replace the cloned entry on each SweptLiveEntry with the
         // post-write copy so the apply phase sees the new offsets.
-        for (sw, written) in merged_live.iter_mut().zip(entries.into_iter()) {
+        for (sw, written) in merged_live.iter_mut().zip(entries) {
             sw.entry = written;
         }
         Some(new_ulid)
@@ -2497,9 +2497,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             segment::fsync_dir(&final_path)?;
             stats.new_segments += 1;
 
-            for (entry, source_body_offset) in
-                live_entries.into_iter().zip(source_offsets.into_iter())
-            {
+            for (entry, source_body_offset) in live_entries.into_iter().zip(source_offsets) {
                 repacked_live.push(RepackedLiveEntry {
                     entry,
                     source_body_offset,

@@ -282,7 +282,7 @@ pub fn scan_reclaim_candidates(
         });
     }
 
-    candidates.sort_unstable_by(|a, b| b.dead_blocks.cmp(&a.dead_blocks));
+    candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.dead_blocks));
     candidates
 }
 

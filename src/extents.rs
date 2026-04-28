@@ -924,7 +924,7 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
     if !exact_renames.is_empty() {
         println!("\n  Exact renames:");
         let mut sorted = exact_renames.clone();
-        sorted.sort_by(|a, b| b.2.cmp(&a.2));
+        sorted.sort_by_key(|t| std::cmp::Reverse(t.2));
         for (old, new, bytes) in sorted.iter().take(20) {
             println!("    {:>7.1} KB  {} → {}", *bytes as f64 / 1024.0, old, new);
         }
@@ -936,7 +936,7 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
     if !size_candidates.is_empty() {
         println!("\n  Size-matched candidates (rename+modify — need similarity check to confirm):");
         let mut sorted = size_candidates.clone();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|t| std::cmp::Reverse(t.1));
         for (path, bytes) in sorted.iter().take(20) {
             println!("    {:>7.1} KB  {}", *bytes as f64 / 1024.0, path);
         }

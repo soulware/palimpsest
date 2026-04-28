@@ -35,21 +35,26 @@ use elide_coordinator::config::StoreSection;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry};
 use elide_core::process::pid_is_alive;
 
-#[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    socket_path: &Path,
-    data_dir: Arc<PathBuf>,
-    rescan: Arc<Notify>,
-    registry: ImportRegistry,
-    elide_import_bin: Arc<PathBuf>,
-    evict_registry: EvictRegistry,
-    snapshot_locks: SnapshotLockRegistry,
-    store: Arc<dyn ObjectStore>,
-    store_config: Arc<StoreSection>,
-    part_size_bytes: usize,
-    root_key: [u8; 32],
-    issuer: Arc<dyn CredentialIssuer>,
-) {
+/// Shared coordinator state threaded through every inbound op.
+///
+/// All fields are cheap to clone (Arc-wrapped or Copy), so per-connection
+/// fan-out in `serve` is a flat clone rather than a long argument list.
+#[derive(Clone)]
+pub struct IpcContext {
+    pub data_dir: Arc<PathBuf>,
+    pub rescan: Arc<Notify>,
+    pub registry: ImportRegistry,
+    pub elide_import_bin: Arc<PathBuf>,
+    pub evict_registry: EvictRegistry,
+    pub snapshot_locks: SnapshotLockRegistry,
+    pub store: Arc<dyn ObjectStore>,
+    pub store_config: Arc<StoreSection>,
+    pub part_size_bytes: usize,
+    pub root_key: [u8; 32],
+    pub issuer: Arc<dyn CredentialIssuer>,
+}
+
+pub async fn serve(socket_path: &Path, ctx: IpcContext) {
     let _ = std::fs::remove_file(socket_path);
 
     let listener = match UnixListener::bind(socket_path) {
@@ -84,50 +89,14 @@ pub async fn serve(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let data_dir = data_dir.clone();
-                let rescan = rescan.clone();
-                let registry = registry.clone();
-                let bin = elide_import_bin.clone();
-                let evict_reg = evict_registry.clone();
-                let snap_locks = snapshot_locks.clone();
-                let store = store.clone();
-                let store_cfg = store_config.clone();
-                let issuer = issuer.clone();
-                tokio::spawn(handle(
-                    stream,
-                    data_dir,
-                    rescan,
-                    registry,
-                    bin,
-                    evict_reg,
-                    snap_locks,
-                    store,
-                    store_cfg,
-                    part_size_bytes,
-                    root_key,
-                    issuer,
-                ));
+                tokio::spawn(handle(stream, ctx.clone()));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle(
-    stream: tokio::net::UnixStream,
-    data_dir: Arc<PathBuf>,
-    rescan: Arc<Notify>,
-    registry: ImportRegistry,
-    elide_import_bin: Arc<PathBuf>,
-    evict_registry: EvictRegistry,
-    snapshot_locks: SnapshotLockRegistry,
-    store: Arc<dyn ObjectStore>,
-    store_config: Arc<StoreSection>,
-    part_size_bytes: usize,
-    root_key: [u8; 32],
-    issuer: Arc<dyn CredentialIssuer>,
-) {
+async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     // Capture peer credentials before splitting the stream — needed for
     // SO_PEERCRED on the `register` and `credentials` ops. Other ops
     // ignore the peer pid; capturing once here keeps the code symmetric
@@ -150,45 +119,15 @@ async fn handle(
     // `import attach` is the one streaming operation — it keeps the connection
     // open and writes lines until the import completes.
     if let Some(name) = line.strip_prefix("import attach ") {
-        stream_import_by_name(name.trim(), &data_dir, &mut writer, &registry).await;
+        stream_import_by_name(name.trim(), &ctx.data_dir, &mut writer, &ctx.registry).await;
         return;
     }
 
-    let response = dispatch(
-        &line,
-        &data_dir,
-        rescan,
-        &registry,
-        &elide_import_bin,
-        &evict_registry,
-        &snapshot_locks,
-        &store,
-        &store_config,
-        part_size_bytes,
-        &root_key,
-        issuer.as_ref(),
-        peer_pid,
-    )
-    .await;
+    let response = dispatch(&line, &ctx, peer_pid).await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch(
-    line: &str,
-    data_dir: &Path,
-    rescan: Arc<Notify>,
-    registry: &ImportRegistry,
-    elide_import_bin: &Path,
-    evict_registry: &EvictRegistry,
-    snapshot_locks: &SnapshotLockRegistry,
-    store: &Arc<dyn ObjectStore>,
-    store_config: &StoreSection,
-    part_size_bytes: usize,
-    root_key: &[u8; 32],
-    issuer: &dyn CredentialIssuer,
-    peer_pid: Option<i32>,
-) -> String {
+async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String {
     if line.is_empty() {
         return "err empty request".to_string();
     }
@@ -200,7 +139,7 @@ async fn dispatch(
 
     match op {
         "rescan" => {
-            rescan.notify_one();
+            ctx.rescan.notify_one();
             "ok".to_string()
         }
 
@@ -208,7 +147,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: status <volume>".to_string();
             }
-            volume_status(args, data_dir)
+            volume_status(args, &ctx.data_dir)
         }
 
         "import" => {
@@ -221,7 +160,7 @@ async fn dispatch(
                     if sub_args.is_empty() {
                         return "err usage: import status <name>".to_string();
                     }
-                    import_status_by_name(sub_args, data_dir, registry).await
+                    import_status_by_name(sub_args, &ctx.data_dir, &ctx.registry).await
                 }
                 _ => {
                     // `import <name> <oci-ref> [extents:<name>[,<name>…]]`:
@@ -246,13 +185,16 @@ async fn dispatch(
                         None => (sub_args, Vec::new()),
                     };
                     start_import(
-                        sub,
-                        oci_ref,
-                        &extents_from,
-                        data_dir,
-                        elide_import_bin,
-                        registry,
-                        &rescan,
+                        import::ImportRequest {
+                            vol_name: sub,
+                            oci_ref,
+                            extents_from: &extents_from,
+                        },
+                        &ctx.data_dir,
+                        &ctx.elide_import_bin,
+                        &ctx.registry,
+                        &ctx.store,
+                        &ctx.rescan,
                     )
                     .await
                 }
@@ -263,21 +205,60 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: delete <volume>".to_string();
             }
-            delete_volume(args, data_dir)
+            delete_volume(args, &ctx.data_dir)
         }
 
         "stop" => {
             if args.is_empty() {
                 return "err usage: stop <volume>".to_string();
             }
-            stop_volume_op(args, data_dir).await
+            stop_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key).await
+        }
+
+        "release" => {
+            if args.is_empty() {
+                return "err usage: release <volume>".to_string();
+            }
+            release_volume_op(
+                args,
+                &ctx.data_dir,
+                &ctx.snapshot_locks,
+                &ctx.store,
+                ctx.part_size_bytes,
+                &ctx.root_key,
+                &ctx.rescan,
+            )
+            .await
+        }
+
+        "claim" => {
+            // claim <name> <new_vol_ulid>
+            //
+            // Atomically rebind a `Released` name to a freshly-minted
+            // local fork. The CLI orchestrates fork creation
+            // (mint ULID + keypair, materialise by_id/<new_ulid>/);
+            // this op handles only the conditional names/<name>
+            // mutation and notifies the supervisor.
+            let (name, new_ulid_str) = match args.split_once(' ') {
+                Some((n, u)) => (n.trim(), u.trim()),
+                None => return "err usage: claim <volume> <new_vol_ulid>".to_string(),
+            };
+            claim_volume_op(
+                name,
+                new_ulid_str,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.root_key,
+                &ctx.rescan,
+            )
+            .await
         }
 
         "start" => {
             if args.is_empty() {
                 return "err usage: start <volume>".to_string();
             }
-            start_volume_op(args, data_dir, &rescan)
+            start_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
         }
 
         "create" => {
@@ -285,7 +266,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: create <name> <size_bytes> [flags...]".to_string();
             }
-            create_volume_op(args, data_dir, &rescan)
+            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
         }
 
         "update" => {
@@ -293,7 +274,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: update <volume> [flags...]".to_string();
             }
-            update_volume_op(args, data_dir).await
+            update_volume_op(args, &ctx.data_dir).await
         }
 
         "pull-readonly" => {
@@ -301,7 +282,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: pull-readonly <vol_ulid>".to_string();
             }
-            pull_readonly_op(args, data_dir, store).await
+            pull_readonly_op(args, &ctx.data_dir, &ctx.store).await
         }
 
         "force-snapshot-now" => {
@@ -309,7 +290,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: force-snapshot-now <vol_ulid>".to_string();
             }
-            force_snapshot_now_op(args, data_dir, store).await
+            force_snapshot_now_op(args, &ctx.data_dir, &ctx.store).await
         }
 
         "fork-create" => {
@@ -317,7 +298,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
             }
-            fork_create_op(args, data_dir, &rescan)
+            fork_create_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
         }
 
         "evict" => {
@@ -328,28 +309,35 @@ async fn dispatch(
                 Some((name, ulid)) => (name, Some(ulid.trim().to_owned())),
                 None => (args, None),
             };
-            evict_volume(vol_name, ulid_str, data_dir, evict_registry).await
+            evict_volume(vol_name, ulid_str, &ctx.data_dir, &ctx.evict_registry).await
         }
 
         "snapshot" => {
             if args.is_empty() {
                 return "err usage: snapshot <volume>".to_string();
             }
-            snapshot_volume(args, data_dir, snapshot_locks, store, part_size_bytes).await
+            snapshot_volume(
+                args,
+                &ctx.data_dir,
+                &ctx.snapshot_locks,
+                &ctx.store,
+                ctx.part_size_bytes,
+            )
+            .await
         }
 
         "reclaim" => {
             if args.is_empty() {
                 return "err usage: reclaim <volume>".to_string();
             }
-            reclaim_volume(args, data_dir).await
+            reclaim_volume(args, &ctx.data_dir).await
         }
 
         // Vend the non-secret `[store]` config so CLI read operations
         // (remote list, remote pull, volume create --from) can build an
         // S3 client that matches the coordinator's. Returned as TOML so
         // the caller can round-trip through toml::from_str.
-        "get-store-config" => render_store_config(store_config),
+        "get-store-config" => render_store_config(&ctx.store_config),
 
         // Vend S3 credentials from the coordinator's env. Today this is
         // the long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; the
@@ -364,7 +352,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: register <volume-ulid>".to_string();
             }
-            register_volume(args, data_dir, peer_pid, root_key)
+            register_volume(args, &ctx.data_dir, peer_pid, &ctx.root_key)
         }
 
         // Macaroon-authenticated credential issuance. Verifies the MAC,
@@ -374,7 +362,13 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: credentials <macaroon>".to_string();
             }
-            issue_credentials(args, data_dir, peer_pid, root_key, issuer)
+            issue_credentials(
+                args,
+                &ctx.data_dir,
+                peer_pid,
+                &ctx.root_key,
+                ctx.issuer.as_ref(),
+            )
         }
 
         _ => {
@@ -464,21 +458,19 @@ fn toml_quote(s: &str) -> String {
 // ── Import operations ─────────────────────────────────────────────────────────
 
 async fn start_import(
-    vol_name: &str,
-    oci_ref: &str,
-    extents_from: &[String],
+    req: import::ImportRequest<'_>,
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
+    store: &Arc<dyn ObjectStore>,
     rescan: &Arc<Notify>,
 ) -> String {
     match import::spawn_import(
-        vol_name,
-        oci_ref,
-        extents_from,
+        req,
         data_dir,
         elide_import_bin,
         registry,
+        store.clone(),
         rescan.clone(),
     )
     .await
@@ -776,12 +768,14 @@ async fn snapshot_volume(
         return format!("err draining gc handoffs: {e:#}");
     }
 
-    // 4. Pick snap_ulid: the max ULID in index/. Empty forks cannot be
-    //    snapshotted — the coordinator must never mint ULIDs, so there
-    //    is no valid tag for a snapshot over zero segments.
+    // 4. Pick snap_ulid: the max ULID in index/, or a freshly-minted
+    //    one when the volume has no segments. The volume's
+    //    `sign_snapshot_manifest` accepts either (see
+    //    `elide_core::volume::Volume::sign_snapshot_manifest` doc) —
+    //    an empty snapshot is just a signed manifest with zero
+    //    entries, valid for the claim path to fork from.
     let snap_ulid = match pick_snapshot_ulid(&fork_dir) {
-        Ok(Some(u)) => u,
-        Ok(None) => return format!("err volume '{vol_name}' has no segments to snapshot"),
+        Ok(u) => u,
         Err(e) => return format!("err picking snap_ulid: {e}"),
     };
 
@@ -855,7 +849,11 @@ async fn generate_snapshot_filemap(
 /// Returns `None` when `index/` is empty or missing — the coordinator must
 /// never mint ULIDs, so an empty fork has no valid snapshot tag and the
 /// caller rejects the snapshot request.
-fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+/// Pick the ULID to tag a snapshot with: the max segment ULID in
+/// `index/` if any are present, else a fresh `Ulid::new()`. Mirrors
+/// `force_snapshot_now_op` at `inbound.rs` (the ancestor-pin path),
+/// so empty volumes get a valid snapshot tag through both paths.
+fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
     let index_dir = fork_dir.join("index");
     let mut latest: Option<ulid::Ulid> = None;
     match std::fs::read_dir(&index_dir) {
@@ -876,7 +874,10 @@ fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    Ok(latest)
+    // `Ulid::default()` is the nil ULID, not a fresh one — we explicitly
+    // want a freshly minted ULID when the index is empty.
+    #[allow(clippy::unwrap_or_default)]
+    Ok(latest.unwrap_or_else(ulid::Ulid::new))
 }
 
 // ── Volume status ─────────────────────────────────────────────────────────────
@@ -1012,7 +1013,13 @@ fn validate_volume_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
+async fn create_volume_op(
+    args: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
     // First two whitespace-separated tokens: name, size_bytes. Remainder is flags.
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let name = match iter.next() {
@@ -1075,8 +1082,41 @@ fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         return format!("err volume already exists: {name}");
     }
 
-    let vol_ulid = ulid::Ulid::new().to_string();
-    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
+    let vol_ulid = ulid::Ulid::new();
+    let vol_ulid_str = vol_ulid.to_string();
+    let vol_dir = data_dir.join("by_id").join(&vol_ulid_str);
+
+    // Claim the name in S3 *before* creating any local state. This
+    // closes the cross-coordinator race where two hosts run
+    // `volume create <name>` concurrently — the loser sees
+    // `AlreadyExists` and refuses, leaving no partial local artefacts.
+    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+    match mark_initial(store, name, root_key, vol_ulid).await {
+        Ok(MarkInitialOutcome::Claimed) => {}
+        Ok(MarkInitialOutcome::AlreadyExists {
+            existing_vol_ulid,
+            existing_state,
+            existing_owner,
+        }) => {
+            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+            return format!(
+                "err name '{name}' already exists in bucket \
+                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                 owner={owner})"
+            );
+        }
+        Err(LifecycleError::Store(e)) => {
+            return format!("err claiming name in bucket: {e}");
+        }
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            // mark_initial doesn't currently surface this, but match
+            // exhaustively so a future refactor doesn't silently drop it.
+            return format!("err name held by another coordinator: {held_by}");
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in unexpected state {from:?}");
+        }
+    }
 
     let result: std::io::Result<()> = (|| {
         std::fs::create_dir_all(&vol_dir)?;
@@ -1102,20 +1142,28 @@ fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         }
         .write(&vol_dir)?;
         std::fs::create_dir_all(&by_name_dir)?;
-        std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
+        std::os::unix::fs::symlink(format!("../by_id/{vol_ulid_str}"), by_name_dir.join(name))?;
         Ok(())
     })();
 
     if let Err(e) = result {
-        // Best-effort cleanup so a partial volume doesn't strand the name.
+        // Local setup failed. Best-effort: roll back local artefacts
+        // *and* the bucket-side claim so the name is free to retry.
         let _ = std::fs::remove_file(by_name_dir.join(name));
         let _ = std::fs::remove_dir_all(&vol_dir);
+        let name_key = object_store::path::Path::from(format!("names/{name}"));
+        if let Err(del_err) = store.delete(&name_key).await {
+            warn!(
+                "[inbound] create {name}: local setup failed and rollback \
+                 of names/<name> also failed: {del_err}"
+            );
+        }
         return format!("err create failed: {e}");
     }
 
     rescan.notify_one();
-    info!("[inbound] created volume {name} ({vol_ulid})");
-    format!("ok {vol_ulid}")
+    info!("[inbound] created volume {name} ({vol_ulid_str})");
+    format!("ok {vol_ulid_str}")
 }
 
 async fn update_volume_op(args: &str, data_dir: &Path) -> String {
@@ -1475,7 +1523,13 @@ async fn force_snapshot_now_op(
 /// omitted, falls back to `volume::fork_volume` (latest local snapshot).
 /// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
 /// recorded in the new fork's provenance for force-snapshot pins.
-fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
+async fn fork_create_op(
+    args: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let new_name = match iter.next() {
         Some(s) if !s.is_empty() => s,
@@ -1494,10 +1548,17 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         return format!("err invalid source ULID: {source_ulid_str}");
     }
 
-    // Pull off `snap=<ulid>` and `parent-key=<hex>` first; remaining tokens
-    // go to the transport-flag parser.
+    // Pull off `snap=<ulid>`, `parent-key=<hex>`, and `for-claim` first;
+    // remaining tokens go to the transport-flag parser. `for-claim`
+    // marks this fork-create as the materialise step of a
+    // claim-from-released flow: the name already exists in the bucket
+    // as `Released`, so we must NOT call `mark_initial` (which would
+    // fail with `AlreadyExists`). The CLI's subsequent `claim` IPC
+    // calls `mark_claimed` to atomically rebind the name to the new
+    // fork.
     let mut snap: Option<ulid::Ulid> = None;
     let mut parent_key: Option<elide_core::signing::VerifyingKey> = None;
+    let mut for_claim = false;
     let mut flag_tokens: Vec<&str> = Vec::new();
     for tok in rest.split_whitespace() {
         if let Some(v) = tok.strip_prefix("snap=") {
@@ -1514,6 +1575,8 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
                 Ok(k) => parent_key = Some(k),
                 Err(e) => return format!("err parent-key not a valid Ed25519 pubkey: {e}"),
             }
+        } else if tok == "for-claim" {
+            for_claim = true;
         } else {
             flag_tokens.push(tok);
         }
@@ -1559,12 +1622,66 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         return format!("err source volume {source_ulid_str} not found locally");
     }
 
-    let new_vol_ulid = ulid::Ulid::new().to_string();
+    let new_vol_ulid_value = ulid::Ulid::new();
+    let new_vol_ulid = new_vol_ulid_value.to_string();
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
 
+    // For brand-new names, claim in S3 *before* materialising the
+    // fork: lose the race cleanly with no partial local state if
+    // another coordinator already holds the name, and roll back the
+    // bucket-side claim if local fork-out fails. For the
+    // claim-from-released path (`for-claim` flag), the bucket record
+    // already exists as `Released` and the CLI's subsequent `claim`
+    // IPC handles the rebind via `mark_claimed`; we only do the
+    // local materialisation here.
+    if !for_claim {
+        use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+        match mark_initial(store, new_name, root_key, new_vol_ulid_value).await {
+            Ok(MarkInitialOutcome::Claimed) => {}
+            Ok(MarkInitialOutcome::AlreadyExists {
+                existing_vol_ulid,
+                existing_state,
+                existing_owner,
+            }) => {
+                let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+                return format!(
+                    "err name '{new_name}' already exists in bucket \
+                     (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                     owner={owner})"
+                );
+            }
+            Err(LifecycleError::Store(e)) => {
+                return format!("err claiming name in bucket: {e}");
+            }
+            Err(LifecycleError::OwnershipConflict { held_by }) => {
+                return format!("err name held by another coordinator: {held_by}");
+            }
+            Err(LifecycleError::InvalidTransition { from, .. }) => {
+                return format!("err names/<name> is in unexpected state {from:?}");
+            }
+        }
+    }
+
+    // Local-only rollback. After a successful `mark_initial` claim,
+    // every error-return path below also rolls back the bucket-side
+    // claim via `rollback_claim` so the name is free to retry. In the
+    // `for-claim` path no such record was created here, so
+    // `rollback_claim` is a no-op.
     let cleanup = |fork_dir: &Path, link: &Path| {
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir_all(fork_dir);
+    };
+    let rollback_claim = async || {
+        if for_claim {
+            return;
+        }
+        let key = object_store::path::Path::from(format!("names/{new_name}"));
+        if let Err(e) = store.delete(&key).await {
+            warn!(
+                "[inbound] fork-create {new_name}: local fork failed and \
+                 rollback of names/<name> also failed: {e}"
+            );
+        }
     };
 
     let fork_result: std::io::Result<()> = match (snap, parent_key) {
@@ -1579,6 +1696,7 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
     };
     if let Err(e) = fork_result {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err fork failed: {e}");
     }
 
@@ -1587,6 +1705,7 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         Ok(c) => c,
         Err(e) => {
             cleanup(&new_fork_dir, &symlink_path);
+            rollback_claim().await;
             return format!("err reading source volume config: {e}");
         }
     };
@@ -1594,6 +1713,7 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         Some(s) => s,
         None => {
             cleanup(&new_fork_dir, &symlink_path);
+            rollback_claim().await;
             return "err source volume has no size (import may not have completed)".to_string();
         }
     };
@@ -1606,14 +1726,17 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
     .write(&new_fork_dir))
     {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err writing volume config: {e}");
     }
     if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err creating by_name dir: {e}");
     }
     if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err creating by_name symlink: {e}");
     }
 
@@ -1624,7 +1747,12 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
 
 // ── Volume stop / start ───────────────────────────────────────────────────────
 
-async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
+async fn stop_volume_op(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return format!("err volume not found: {volume_name}");
@@ -1651,6 +1779,31 @@ async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
         _ => {}
     }
 
+    // Verify ownership in S3 before taking any local action: refuse early
+    // if names/<name> is held by another coordinator. A missing record is
+    // fine — the volume may not yet have been drained to S3, in which
+    // case the local stop proceeds and the S3 update is a no-op.
+    use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
+    match mark_stopped(store, volume_name, root_key).await {
+        Ok(_) => {}
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            return format!(
+                "err name '{volume_name}' is owned by coordinator {held_by}; \
+                 run `volume release --force` to override"
+            );
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in state {from:?}; cannot stop");
+        }
+        Err(LifecycleError::Store(e)) => {
+            // Transient store error or parse failure. The S3 record is
+            // unchanged; we can still proceed with the local stop, but
+            // surface the warning so operators know the bucket state may
+            // be stale.
+            warn!("[inbound] stop {volume_name}: failed to update names/<name>: {e}");
+        }
+    }
+
     // Write the marker before sending shutdown so the supervisor won't restart.
     if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
         return format!("err writing volume.stopped: {e}");
@@ -1663,7 +1816,9 @@ async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
         }
         Some(resp) => {
             // Roll back the marker so the supervisor doesn't strand a still-
-            // running volume.
+            // running volume. (Note: the S3 state has already flipped to
+            // Stopped; that's a soft inconsistency the operator can resolve
+            // by issuing `volume start` once the underlying issue is fixed.)
             let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
             format!("err shutdown failed: {resp}")
         }
@@ -1675,7 +1830,135 @@ async fn stop_volume_op(volume_name: &str, data_dir: &Path) -> String {
     }
 }
 
-fn start_volume_op(volume_name: &str, data_dir: &Path, rescan: &Notify) -> String {
+/// RAII guard that restores the original local state on drop.
+///
+/// Used by `release_volume_op` when it transparently restarts a
+/// stopped volume to perform the drain: the marker is cleaned up
+/// regardless of which exit path the function takes (success, error,
+/// panic), and on failure paths the `volume.stopped` marker is
+/// re-written so the volume returns to its pre-release state instead
+/// of being left running.
+struct DrainingMarkerGuard {
+    vol_dir: std::path::PathBuf,
+    /// Set to `true` once the release has reached a point where the
+    /// caller has explicitly written `volume.stopped` (i.e. the
+    /// release path's own halt step). Defuses the rollback so the
+    /// guard only removes the draining marker, leaving the volume
+    /// stopped as the release flow intends.
+    success: bool,
+}
+
+impl DrainingMarkerGuard {
+    fn new(vol_dir: std::path::PathBuf) -> Self {
+        Self {
+            vol_dir,
+            success: false,
+        }
+    }
+
+    /// Mark the release as having reached its own halt step — at this
+    /// point `volume.stopped` is back in place via the normal path
+    /// and we should *not* re-write it on drop.
+    fn defuse(&mut self) {
+        self.success = true;
+    }
+}
+
+impl Drop for DrainingMarkerGuard {
+    fn drop(&mut self) {
+        let draining = self.vol_dir.join("volume.draining");
+        if let Err(e) = std::fs::remove_file(&draining)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "[inbound] failed to remove draining marker {}: {e}",
+                draining.display()
+            );
+        }
+        if !self.success {
+            // Release failed before the explicit halt step. Re-write
+            // `volume.stopped` so the volume returns to its
+            // pre-release state — without this the supervisor would
+            // keep the (now transport-suppressed-then-restored)
+            // process running indefinitely.
+            let stopped = self.vol_dir.join("volume.stopped");
+            if let Err(e) = std::fs::write(&stopped, "")
+                && e.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                warn!(
+                    "[inbound] failed to restore volume.stopped after \
+                     aborted release at {}: {e}",
+                    stopped.display()
+                );
+            }
+            // The volume process is still running with the actor
+            // initialised; ask it to halt cleanly so the supervisor
+            // sees a clean exit and respects the marker we just
+            // wrote. Best-effort: a failed shutdown leaves the
+            // supervisor to notice the stopped marker on the next
+            // poll and not respawn after the eventual exit.
+            let vol_dir = self.vol_dir.clone();
+            tokio::spawn(async move {
+                let _ = elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await;
+            });
+        }
+    }
+}
+
+/// Poll until `control.sock` actually accepts a connection. Returns
+/// `true` as soon as a connect+accept succeeds, or `false` if
+/// `timeout` elapses first. Used by `release_volume_op` when
+/// transparently restarting a stopped volume so the snapshot path can
+/// talk to it.
+///
+/// File existence alone is not enough: the previous volume process
+/// can leave a stale socket file behind, and the new volume's
+/// `UnixListener::bind` does `remove_file` + `bind` — there is a
+/// window where the file exists but no listener is attached, so
+/// `connect()` returns `ECONNREFUSED`. We probe the connection itself
+/// and treat that as the readiness signal.
+async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> bool {
+    let socket = vol_dir.join("control.sock");
+    let deadline = std::time::Instant::now() + timeout;
+    let probe_step = std::time::Duration::from_millis(50);
+    while std::time::Instant::now() < deadline {
+        if socket.exists() {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(_) => return true,
+                Err(_) => {
+                    // Stale file (waiting for the new listener), or
+                    // listener is up but transient refusal — retry.
+                }
+            }
+        }
+        tokio::time::sleep(probe_step).await;
+    }
+    false
+}
+
+/// Relinquish ownership of `<volume_name>` so any other coordinator can
+/// `volume start` it. Composes the existing snapshot path:
+///
+/// 1. Refuse if the volume is readonly (no exclusive owner to release)
+///    or an NBD client is connected (must disconnect cleanly first).
+/// 2. If the volume is `stopped`, transparently bring it back up
+///    (clear the marker, notify the supervisor, wait for
+///    `control.sock`) — the drain step needs a running daemon.
+/// 3. Verify S3 ownership before doing the expensive drain.
+/// 4. Drain WAL → publish handoff snapshot via `snapshot_volume`.
+/// 5. Send shutdown RPC to halt the daemon.
+/// 6. Write `volume.stopped` marker so the supervisor won't restart.
+/// 7. Conditional PUT to `names/<name>` setting state=Released and
+///    recording the handoff snapshot ULID.
+async fn release_volume_op(
+    volume_name: &str,
+    data_dir: &Path,
+    snapshot_locks: &SnapshotLockRegistry,
+    store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return format!("err volume not found: {volume_name}");
@@ -1685,8 +1968,371 @@ fn start_volume_op(volume_name: &str, data_dir: &Path, rescan: &Notify) -> Strin
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
+    if vol_dir.join("volume.readonly").exists() {
+        return "err volume is readonly; nothing to release".to_string();
+    }
+
+    // If the volume is stopped, transparently bring it up in
+    // IPC-only mode so the snapshot/drain steps below have a running
+    // daemon to talk to without exposing the volume on its configured
+    // NBD/ublk transport. The `volume.draining` marker tells both the
+    // supervisor and the volume binary itself to suppress transport
+    // setup; from a client's perspective the volume is never visibly
+    // running during release.
+    //
+    // The `_draining_guard` removes the marker when this function
+    // returns, regardless of which exit path is taken (success, early
+    // error, panic). Without a guard the marker would leak on any of
+    // the many `return format!(...)` exits in the release flow.
+    let was_stopped = vol_dir.join("volume.stopped").exists();
+    let mut _draining_guard = if was_stopped {
+        if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
+            return format!("err writing volume.draining: {e}");
+        }
+        if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+            let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
+            return format!("err clearing volume.stopped for release: {e}");
+        }
+        rescan.notify_one();
+        let guard = DrainingMarkerGuard::new(vol_dir.clone());
+        if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
+            return format!(
+                "err timed out waiting for volume '{volume_name}' to come up for release"
+            );
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
+    if !vol_dir.join("control.sock").exists() {
+        return format!("err volume '{volume_name}' is not running — start it first");
+    }
+
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
+        Some(resp) if resp == "ok true" => {
+            return "err nbd client is connected; disconnect it first".to_string();
+        }
+        _ => {}
+    }
+
+    // Verify ownership in S3 before kicking off the (expensive) drain.
+    use elide_coordinator::lifecycle;
+    use elide_core::name_record::NameState;
+    match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+        Ok(Some((rec, _))) => {
+            use elide_coordinator::portable::{coordinator_id, format_coordinator_id};
+            let self_id = format_coordinator_id(&coordinator_id(root_key));
+            if let Some(existing) = rec.coordinator_id.as_deref()
+                && existing != self_id
+            {
+                return format!(
+                    "err name '{volume_name}' is owned by coordinator {existing}; \
+                     run `volume release --force` to override"
+                );
+            }
+            if rec.state == NameState::Released {
+                return format!("err name '{volume_name}' is already released");
+            }
+        }
+        Ok(None) => {
+            // No record yet — release of an unpublished volume is
+            // meaningless (nothing for the next claimant to fork from).
+            return format!("err name '{volume_name}' has no S3 record; drain the volume first");
+        }
+        Err(e) => {
+            return format!("err reading names/{volume_name}: {e}");
+        }
+    }
+
+    // Drain WAL → publish handoff snapshot. Reuses the existing
+    // snapshot_volume path. Empty volumes get a freshly-minted snapshot
+    // ULID like any other — they are published as a snapshot with zero
+    // segments, which the claim path forks from as a fresh empty root.
+    let snap_resp = snapshot_volume(
+        volume_name,
+        data_dir,
+        snapshot_locks,
+        store,
+        part_size_bytes,
+    )
+    .await;
+    let snap_ulid_str = match snap_resp.strip_prefix("ok ") {
+        Some(s) => s.trim().to_owned(),
+        None => return format!("err snapshot for release failed: {snap_resp}"),
+    };
+    let snap_ulid = match ulid::Ulid::from_string(&snap_ulid_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err parsing snapshot ULID '{snap_ulid_str}': {e}"),
+    };
+
+    // Halt the daemon. Writing the marker first prevents the supervisor
+    // from restarting it between shutdown and our final state write.
+    // From this point on the release is past the "could fail and need
+    // to leave the volume in a usable Stopped state" window — defuse
+    // the draining-marker guard so it doesn't fight the explicit
+    // halt step we're about to do.
+    if let Some(g) = _draining_guard.as_mut() {
+        g.defuse();
+    }
+    if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
+        return format!("err writing volume.stopped: {e}");
+    }
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
+        Some(resp) if resp == "ok" => {}
+        Some(resp) => {
+            let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
+            return format!("err shutdown failed: {resp}");
+        }
+        None => {
+            // Volume process wasn't running by the time we reached
+            // this step. The snapshot succeeded though, so we proceed
+            // with the state flip.
+        }
+    }
+
+    // Final step: flip names/<name> to Released, recording the handoff
+    // snapshot. From this point any coordinator may claim the name.
+    match lifecycle::mark_released(store, volume_name, root_key, snap_ulid).await {
+        Ok(_) => {
+            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_ulid}");
+            format!("ok {snap_ulid}")
+        }
+        Err(e) => {
+            // Local state has already moved (volume is stopped, snapshot
+            // is published). The S3 record write failed — the operator
+            // can retry or run `volume release --force` from a peer to
+            // recover.
+            warn!("[inbound] release {volume_name}: state flip failed: {e}");
+            format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
+        }
+    }
+}
+
+/// Claim a `Released` name for a freshly-minted local fork.
+///
+/// Pre-conditions enforced here:
+/// - `by_id/<new_vol_ulid>/` must exist locally (the CLI created it
+///   before calling).
+/// - `by_name/<name>` must point at it (or be absent — we create it
+///   if missing).
+/// - `names/<name>` must be in `Released` state and the CLI's
+///   conditional-PUT must succeed.
+///
+/// On success the name's S3 record is rebound to the new fork and
+/// the supervisor is notified to launch the daemon.
+async fn claim_volume_op(
+    volume_name: &str,
+    new_ulid_str: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
+    let new_ulid = match ulid::Ulid::from_string(new_ulid_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err invalid new_vol_ulid: {e}"),
+    };
+
+    // The new fork directory must already exist locally — the CLI is
+    // responsible for materialising it before invoking `claim`.
+    let new_dir = data_dir.join("by_id").join(new_ulid.to_string());
+    if !new_dir.exists() {
+        return format!(
+            "err new fork directory not found at {} — \
+             the CLI must materialise the fork before calling claim",
+            new_dir.display()
+        );
+    }
+
+    // Ensure by_name/<name> points at the new fork. Create it if absent;
+    // otherwise verify it already targets the right ULID. The supervisor
+    // task spawning depends on a discoverable directory, and the
+    // coordinator's reconcile_by_name pass also relies on this symlink.
+    let symlink_path = data_dir.join("by_name").join(volume_name);
+    let target = std::path::PathBuf::from(format!("../by_id/{new_ulid}"));
+    match std::fs::read_link(&symlink_path) {
+        Ok(existing) if existing == target => {}
+        Ok(other) => {
+            return format!(
+                "err by_name/{volume_name} already points at {} (expected ../by_id/{new_ulid})",
+                other.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            if let Err(e) = std::os::unix::fs::symlink(&target, &symlink_path) {
+                return format!("err creating by_name/{volume_name} symlink: {e}");
+            }
+        }
+        Err(e) => return format!("err reading by_name/{volume_name}: {e}"),
+    }
+
+    use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
+    match mark_claimed(store, volume_name, root_key, new_ulid).await {
+        Ok(MarkClaimedOutcome::Claimed) => {
+            rescan.notify_one();
+            info!("[inbound] claimed name {volume_name} for new fork {new_ulid}");
+            format!("ok {new_ulid}")
+        }
+        Ok(MarkClaimedOutcome::Absent) => {
+            format!("err names/{volume_name} does not exist; nothing to claim")
+        }
+        Ok(MarkClaimedOutcome::NotReleased { observed }) => {
+            format!(
+                "err names/{volume_name} is in state {observed:?}, not Released; \
+                 cannot claim"
+            )
+        }
+        Err(LifecycleError::Store(e)) => format!("err claim failed: {e}"),
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            format!(
+                "err name '{volume_name}' raced with another claim ({held_by} won); \
+                 your local fork at {new_ulid} can be re-purposed manually"
+            )
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            format!("err names/{volume_name} is in state {from:?}; cannot claim")
+        }
+    }
+}
+
+async fn start_volume_op(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
+    let link = data_dir.join("by_name").join(volume_name);
+    if !link.exists() {
+        // No local fork. The only valid path here is cross-coordinator
+        // claim of a `Released` name: read `names/<name>` from S3 and,
+        // if it's `Released`, surface the pin so the CLI can pull,
+        // fork, and `claim`. Anything else is an error.
+        return match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+            Ok(Some((rec, _))) => match rec.state {
+                elide_core::name_record::NameState::Released => {
+                    let snap = rec
+                        .handoff_snapshot
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "_".to_string());
+                    format!("released {} {}", rec.vol_ulid, snap)
+                }
+                elide_core::name_record::NameState::Readonly => {
+                    format!(
+                        "err name '{volume_name}' is readonly (immutable handle); \
+                         pull it with `volume pull` to serve locally"
+                    )
+                }
+                other => format!(
+                    "err name '{volume_name}' is held in state {other:?} \
+                     by another coordinator; nothing to start locally"
+                ),
+            },
+            Ok(None) => format!("err volume not found: {volume_name}"),
+            Err(e) => format!("err reading names/{volume_name}: {e}"),
+        };
+    }
+    let vol_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) => return format!("err resolving volume dir: {e}"),
+    };
+
     if !vol_dir.join("volume.stopped").exists() {
         return "err volume is not stopped".to_string();
+    }
+
+    // Verify ownership in S3 before any local change. A foreign-owned
+    // record refuses; a Released record routes to the claim path
+    // (not yet implemented — point the operator at it).
+    use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
+    match mark_live(store, volume_name, root_key).await {
+        Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
+        Ok(MarkLiveOutcome::Absent) => {
+            // No S3 record yet — proceed with the local-only start. The
+            // next `drain_pending` will publish an initial Live record.
+        }
+        Ok(MarkLiveOutcome::Released) => {
+            // Two sub-cases:
+            //   1. Local reclaim: the released vol_ulid matches the
+            //      ULID this `by_name/<name>` symlink already points
+            //      at — i.e. this coordinator owned the volume,
+            //      released it, and is now re-claiming. Nothing
+            //      changed locally; just flip the S3 state back to
+            //      Live with the same vol_ulid.
+            //   2. Cross-coordinator claim: the released vol_ulid is
+            //      foreign content. Surface the pin so the CLI can
+            //      pull, materialise a fresh fork, and `claim`.
+            let local_vol_ulid = match vol_dir.file_name().and_then(|n| n.to_str()) {
+                Some(s) => match ulid::Ulid::from_string(s) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        return format!("err local fork dir name '{s}' is not a valid ULID: {e}");
+                    }
+                },
+                None => return "err resolving local fork ULID".to_string(),
+            };
+
+            use elide_coordinator::lifecycle::{MarkReclaimedLocalOutcome, mark_reclaimed_local};
+            match mark_reclaimed_local(store, volume_name, root_key, local_vol_ulid).await {
+                Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
+                    // Fall through to clear `volume.stopped` and
+                    // notify the supervisor.
+                }
+                Ok(MarkReclaimedLocalOutcome::ForkMismatch {
+                    released_vol_ulid, ..
+                }) => {
+                    // The released record points at a different fork
+                    // than ours — this is the cross-coordinator path.
+                    // Re-read to extract the handoff snapshot.
+                    return match elide_coordinator::name_store::read_name_record(store, volume_name)
+                        .await
+                    {
+                        Ok(Some((rec, _))) => {
+                            let snap = rec
+                                .handoff_snapshot
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "_".to_string());
+                            format!("released {released_vol_ulid} {snap}")
+                        }
+                        Ok(None) | Err(_) => {
+                            format!("err name '{volume_name}' is Released but record is unreadable")
+                        }
+                    };
+                }
+                Ok(MarkReclaimedLocalOutcome::Absent) => {
+                    // No S3 record — proceed local-only (matches
+                    // MarkLiveOutcome::Absent above).
+                }
+                Ok(MarkReclaimedLocalOutcome::NotReleased { observed_state, .. }) => {
+                    // Race: state changed between mark_live (saw Released)
+                    // and our read here. Surface the new state cleanly.
+                    return format!(
+                        "err names/<name> changed underneath us; now in state {observed_state:?}"
+                    );
+                }
+                Err(LifecycleError::Store(e)) => {
+                    return format!("err in-place reclaim of {volume_name} failed: {e}");
+                }
+                Err(LifecycleError::OwnershipConflict { .. })
+                | Err(LifecycleError::InvalidTransition { .. }) => {
+                    return format!("err in-place reclaim of {volume_name} refused");
+                }
+            }
+        }
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            return format!(
+                "err name '{volume_name}' is owned by coordinator {held_by}; \
+                 run `volume release --force` to override"
+            );
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in state {from:?}; cannot start");
+        }
+        Err(LifecycleError::Store(e)) => {
+            warn!("[inbound] start {volume_name}: failed to update names/<name>: {e}");
+        }
     }
 
     // NBD endpoint conflict check before clearing the marker.

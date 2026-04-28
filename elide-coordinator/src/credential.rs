@@ -20,13 +20,25 @@ use rand_core::{OsRng, RngCore};
 use tracing::{info, warn};
 
 const ROOT_KEY_FILE: &str = "coordinator.root_key";
+/// Sibling file containing the public coordinator id derived from
+/// `coordinator.root_key` — Crockford-Base32 ULID-shaped, single line.
+/// Inspectable with `cat` so operators can correlate `names/<name>`
+/// `coordinator_id` entries against this host.
+const COORDINATOR_ID_FILE: &str = "coordinator.id";
 const ROOT_KEY_LEN: usize = 32;
 
 /// Load the coordinator root key from `<data_dir>/coordinator.root_key`,
 /// generating a fresh one (32 random bytes, mode 0600) on first start.
+///
+/// Also writes a sibling `coordinator.id` file with the public,
+/// derivable coordinator id — overwriting any existing copy so it
+/// stays in sync if `coordinator.root_key` is ever rotated. The id
+/// file is informational only (mode 0644, plain text); it never
+/// affects authorization, and re-deriving it from the root key is
+/// always cheap.
 pub fn load_or_generate_root_key(data_dir: &Path) -> io::Result<[u8; 32]> {
     let path = data_dir.join(ROOT_KEY_FILE);
-    match std::fs::read(&path) {
+    let key = match std::fs::read(&path) {
         Ok(bytes) => {
             if bytes.len() != ROOT_KEY_LEN {
                 return Err(io::Error::other(format!(
@@ -37,7 +49,7 @@ pub fn load_or_generate_root_key(data_dir: &Path) -> io::Result<[u8; 32]> {
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
-            Ok(key)
+            key
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let mut key = [0u8; 32];
@@ -60,10 +72,35 @@ pub fn load_or_generate_root_key(data_dir: &Path) -> io::Result<[u8; 32]> {
             }
             std::fs::rename(&tmp, &path)?;
             info!("[coordinator] generated root key at {}", path.display());
-            Ok(key)
+            key
         }
-        Err(e) => Err(e),
+        Err(e) => return Err(e),
+    };
+
+    write_coordinator_id_file(data_dir, &key)?;
+    Ok(key)
+}
+
+/// Write the derived coordinator id to `<data_dir>/coordinator.id`
+/// (atomic create-rename). Overwrites any existing file so the sidecar
+/// always matches the current root key.
+fn write_coordinator_id_file(data_dir: &Path, root_key: &[u8; 32]) -> io::Result<()> {
+    let id = crate::portable::format_coordinator_id(&crate::portable::coordinator_id(root_key));
+    let path = data_dir.join(COORDINATOR_ID_FILE);
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o644)
+            .open(&tmp)?;
+        f.write_all(id.as_bytes())?;
+        // Trailing newline so `cat coordinator.id` reads cleanly.
+        f.write_all(b"\n")?;
+        f.sync_all()?;
     }
+    std::fs::rename(&tmp, &path)
 }
 
 /// Credentials issued to a volume in response to an authenticated
@@ -161,5 +198,40 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(ROOT_KEY_FILE), b"too short").unwrap();
         assert!(load_or_generate_root_key(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn load_or_generate_writes_coordinator_id_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let key = load_or_generate_root_key(tmp.path()).unwrap();
+
+        let id_path = tmp.path().join(COORDINATOR_ID_FILE);
+        let body = std::fs::read_to_string(&id_path).unwrap();
+        let trimmed = body.trim_end();
+
+        // Round-trips through Ulid (proof it's the right format)…
+        ulid::Ulid::from_string(trimmed)
+            .expect("coordinator.id must be a 26-char Crockford-Base32 ULID");
+        // …and matches what `portable::format_coordinator_id` would derive
+        // from the same key.
+        let expected =
+            crate::portable::format_coordinator_id(&crate::portable::coordinator_id(&key));
+        assert_eq!(trimmed, expected);
+    }
+
+    #[test]
+    fn coordinator_id_sidecar_rewritten_to_match_existing_root_key() {
+        // Simulate an old data dir that has root_key but no id file.
+        let tmp = TempDir::new().unwrap();
+        let _ = load_or_generate_root_key(tmp.path()).unwrap();
+        let id_path = tmp.path().join(COORDINATOR_ID_FILE);
+        std::fs::remove_file(&id_path).unwrap();
+
+        // Loading again must recreate the sidecar.
+        let key = load_or_generate_root_key(tmp.path()).unwrap();
+        let body = std::fs::read_to_string(&id_path).unwrap();
+        let expected =
+            crate::portable::format_coordinator_id(&crate::portable::coordinator_id(&key));
+        assert_eq!(body.trim_end(), expected);
     }
 }

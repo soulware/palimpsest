@@ -51,7 +51,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use humantime_serde::re::humantime;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as StorePath;
 use object_store::{ClientOptions, ObjectStore};
@@ -280,13 +280,23 @@ impl StoreSection {
         if let Some(path) = &self.local_path {
             std::fs::create_dir_all(path)
                 .with_context(|| format!("creating local store dir: {}", path.display()))?;
+            // Wrap LocalFileSystem so PutMode::Update is honoured — the
+            // upstream impl returns NotImplemented for it, which would
+            // break the lifecycle verbs' If-Match read-modify-write.
+            let local = LocalFileSystem::new_with_prefix(path).context("building local store")?;
             Ok(Arc::new(
-                LocalFileSystem::new_with_prefix(path).context("building local store")?,
+                crate::local_cond_store::ConditionalLocalStore::new(local),
             ))
         } else if let Some(bucket) = &self.bucket {
+            // Enable conditional PUT (`If-Match` ETag) so the lifecycle
+            // verbs in `crate::lifecycle` can do read-modify-write on
+            // `names/<name>` records atomically. Tigris and current AWS
+            // S3 both support this; without it the S3 backend returns
+            // `Error::NotImplemented` for `PutMode::Update`.
             let mut builder = AmazonS3Builder::from_env()
                 .with_bucket_name(bucket)
-                .with_client_options(self.client_options());
+                .with_client_options(self.client_options())
+                .with_conditional_put(S3ConditionalPut::ETagMatch);
             if let Some(ep) = &self.endpoint {
                 builder = builder
                     .with_endpoint(ep)

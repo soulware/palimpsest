@@ -19,7 +19,7 @@ mod ublk_sweep;
 
 // Re-use the library's shared modules so types are identical across the
 // lib and bin compilation units.
-use elide_coordinator::config;
+use elide_coordinator::{config, portable};
 
 use std::path::PathBuf;
 use std::process;
@@ -93,6 +93,29 @@ async fn run() -> Result<()> {
             tracing::info!("[coordinator] store: {}", config.store.describe());
             config.store.probe(store.as_ref()).await?;
             tracing::info!("[coordinator] store: reachable");
+
+            // Verify conditional-PUT support up front: the lifecycle
+            // verbs (`mark_stopped`, `mark_released`,
+            // `claim_started_from_released`) all rely on `If-Match`
+            // ETag updates against `names/<name>`. Failing here is far
+            // clearer than warning on every `volume stop` later.
+            let probe_key = object_store::path::Path::from("__elide_caps_probe__");
+            let caps = portable::probe_capabilities(store.as_ref(), &probe_key)
+                .await
+                .context("probing bucket capabilities")?;
+            if !caps.conditional_put {
+                bail!(
+                    "object store ({}) does not support conditional PUT \
+                     (If-Match / If-None-Match); portable-live-volume \
+                     lifecycle verbs cannot run safely against this \
+                     backend. For S3/Tigris this typically means \
+                     `with_conditional_put(S3ConditionalPut::ETagMatch)` \
+                     was not set on the client",
+                    config.store.describe()
+                );
+            }
+            tracing::info!("[coordinator] store: conditional PUT supported");
+
             daemon::run(config, store).await
         }
         Command::Init { config, force } => init_config(&config, force),

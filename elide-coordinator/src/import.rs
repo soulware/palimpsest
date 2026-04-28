@@ -17,10 +17,13 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use object_store::ObjectStore;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 use ulid::Ulid;
+
+use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial_readonly};
 
 pub const LOCK_FILE: &str = "import.lock";
 
@@ -253,21 +256,33 @@ pub fn new_registry() -> ImportRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Spawn an import process for `vol_name` using OCI image `oci_ref`.
+/// Caller-supplied parameters for `spawn_import`. Bundled so the request
+/// fields stay together as a unit, separate from coordinator-side wiring.
+pub struct ImportRequest<'a> {
+    pub vol_name: &'a str,
+    pub oci_ref: &'a str,
+    pub extents_from: &'a [String],
+}
+
+/// Spawn an import process for `req.vol_name` using OCI image `req.oci_ref`.
 ///
 /// Generates a ULID for the new volume, creates `<data_dir>/by_id/<ulid>/`,
 /// writes `volume.name`, `volume.readonly`, and `import.lock`, then spawns
 /// `elide-import`. On success, creates the `<data_dir>/by_name/<vol_name>`
 /// symlink. Returns the import job ULID.
 pub async fn spawn_import(
-    vol_name: &str,
-    oci_ref: &str,
-    extents_from: &[String],
+    req: ImportRequest<'_>,
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
+    store: Arc<dyn ObjectStore>,
     rescan_notify: Arc<Notify>,
 ) -> std::io::Result<String> {
+    let ImportRequest {
+        vol_name,
+        oci_ref,
+        extents_from,
+    } = req;
     validate_volume_name(vol_name)?;
 
     let by_name_dir = data_dir.join("by_name");
@@ -288,29 +303,96 @@ pub async fn spawn_import(
     let extent_sources = build_extent_index_entries(extents_from, data_dir)?;
 
     // Generate a stable ULID for this volume (= S3 prefix).
-    let vol_ulid = Ulid::new().to_string();
+    let vol_ulid_value = Ulid::new();
+    let vol_ulid = vol_ulid_value.to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
-    std::fs::create_dir_all(&by_name_dir)?;
-    std::fs::create_dir_all(&vol_dir)?;
-    // Write volume.readonly immediately so a crashed import is never supervised
-    // as a writable volume.
-    std::fs::write(vol_dir.join("volume.readonly"), "")?;
-    // Write the name into volume.toml (size is added later by elide-core once
-    // the import completes).
-    elide_core::config::VolumeConfig {
-        name: Some(vol_name.to_owned()),
-        ..Default::default()
+    // Claim the name in S3 *before* creating any local state. Imports
+    // are readonly: the name binds to immutable content, no exclusive
+    // owner is recorded, and lifecycle verbs (`stop`/`release`/`start`)
+    // refuse the resulting record. Conditional-create still gives
+    // uniqueness: two coordinators racing to import the same name
+    // resolve cleanly (one wins, the other gets `AlreadyExists`).
+    match mark_initial_readonly(&store, vol_name, vol_ulid_value).await {
+        Ok(MarkInitialOutcome::Claimed) => {}
+        Ok(MarkInitialOutcome::AlreadyExists {
+            existing_vol_ulid,
+            existing_state,
+            existing_owner,
+        }) => {
+            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+            return Err(std::io::Error::other(format!(
+                "name '{vol_name}' already exists in bucket \
+                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                 owner={owner})"
+            )));
+        }
+        Err(LifecycleError::Store(e)) => {
+            return Err(std::io::Error::other(format!(
+                "claiming name in bucket: {e}"
+            )));
+        }
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            return Err(std::io::Error::other(format!(
+                "name held by another coordinator: {held_by}"
+            )));
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return Err(std::io::Error::other(format!(
+                "names/<name> is in unexpected state {from:?}"
+            )));
+        }
     }
-    .write(&vol_dir)?;
 
-    // Write the import lock.
-    let import_ulid = Ulid::new().to_string();
-    std::fs::write(vol_dir.join(LOCK_FILE), &import_ulid)?;
+    let rollback_claim = async |store: &Arc<dyn ObjectStore>, vol_name: &str| {
+        let key = object_store::path::Path::from(format!("names/{vol_name}"));
+        if let Err(e) = store.delete(&key).await {
+            warn!("[import] {vol_name}: rollback of names/<name> failed: {e}");
+        }
+    };
 
-    // Create the by_name symlink immediately so `import status/attach` can
-    // resolve the volume before the import completes. Removed on failure.
-    std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &symlink_path)?;
+    // From here on, any error must roll back the bucket-side claim
+    // before returning so the name is free to retry.
+    if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
+        rollback_claim(&store, vol_name).await;
+        return Err(e);
+    }
+    if let Err(e) = std::fs::create_dir_all(&vol_dir) {
+        rollback_claim(&store, vol_name).await;
+        return Err(e);
+    }
+    // Wrap the rest of the local setup so any error rolls back both
+    // local artefacts and the bucket-side claim.
+    let setup: std::io::Result<String> = (|| {
+        // Write volume.readonly immediately so a crashed import is never supervised
+        // as a writable volume.
+        std::fs::write(vol_dir.join("volume.readonly"), "")?;
+        // Write the name into volume.toml (size is added later by elide-core once
+        // the import completes).
+        elide_core::config::VolumeConfig {
+            name: Some(vol_name.to_owned()),
+            ..Default::default()
+        }
+        .write(&vol_dir)?;
+
+        // Write the import lock.
+        let import_ulid = Ulid::new().to_string();
+        std::fs::write(vol_dir.join(LOCK_FILE), &import_ulid)?;
+
+        // Create the by_name symlink immediately so `import status/attach` can
+        // resolve the volume before the import completes. Removed on failure.
+        std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &symlink_path)?;
+        Ok(import_ulid)
+    })();
+    let import_ulid = match setup {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = std::fs::remove_file(&symlink_path);
+            let _ = std::fs::remove_dir_all(&vol_dir);
+            rollback_claim(&store, vol_name).await;
+            return Err(e);
+        }
+    };
 
     let mut cmd = tokio::process::Command::new(elide_import_bin);
     cmd.arg(&vol_dir)
@@ -341,15 +423,28 @@ pub async fn spawn_import(
         });
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
-        std::io::Error::other(format!(
-            "failed to spawn {}: {e}",
-            elide_import_bin.display()
-        ))
-    })?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&symlink_path);
+            let _ = std::fs::remove_dir_all(&vol_dir);
+            rollback_claim(&store, vol_name).await;
+            return Err(std::io::Error::other(format!(
+                "failed to spawn {}: {e}",
+                elide_import_bin.display()
+            )));
+        }
+    };
 
     let pid = child.id().unwrap_or(0);
-    std::fs::write(vol_dir.join(PID_FILE), pid.to_string())?;
+    if let Err(e) = std::fs::write(vol_dir.join(PID_FILE), pid.to_string()) {
+        // Best-effort: kill the child since we won't be tracking it.
+        let _ = child.start_kill();
+        let _ = std::fs::remove_file(&symlink_path);
+        let _ = std::fs::remove_dir_all(&vol_dir);
+        rollback_claim(&store, vol_name).await;
+        return Err(e);
+    }
 
     let job = ImportJob::new(vol_dir.clone(), pid);
     registry
@@ -378,6 +473,8 @@ pub async fn spawn_import(
     }
 
     let import_ulid_clone = import_ulid.clone();
+    let async_store = store.clone();
+    let async_vol_name = vol_name.to_owned();
     tokio::spawn(async move {
         // Stream stderr into the job's output buffer.
         if let Some(stderr) = child.stderr.take() {
@@ -388,26 +485,36 @@ pub async fn spawn_import(
         }
 
         // Wait for the process to exit.
-        let final_state = match child.wait().await {
+        let (final_state, failed) = match child.wait().await {
             Ok(s) if s.success() => {
                 info!("[import {import_ulid_clone}] done");
-                ImportState::Done
+                (ImportState::Done, false)
             }
             Ok(s) => {
                 let msg = format!("exited with {s}");
                 warn!("[import {import_ulid_clone}] failed: {msg}");
-                // Remove the by_name symlink so the name is not reserved by a
-                // failed import (the vol_dir is left for post-mortem inspection).
-                let _ = std::fs::remove_file(&symlink_path);
-                ImportState::Failed(msg)
+                (ImportState::Failed(msg), true)
             }
             Err(e) => {
                 let msg = format!("wait error: {e}");
                 warn!("[import {import_ulid_clone}] failed: {msg}");
-                let _ = std::fs::remove_file(&symlink_path);
-                ImportState::Failed(msg)
+                (ImportState::Failed(msg), true)
             }
         };
+
+        if failed {
+            // Remove the by_name symlink so the name is not reserved by a
+            // failed import (the vol_dir is left for post-mortem inspection),
+            // and release the bucket-side claim so the name can be retried.
+            let _ = std::fs::remove_file(&symlink_path);
+            let key = object_store::path::Path::from(format!("names/{async_vol_name}"));
+            if let Err(e) = async_store.delete(&key).await {
+                warn!(
+                    "[import {import_ulid_clone}] failed import cleanup: \
+                     could not release names/{async_vol_name}: {e}"
+                );
+            }
+        }
 
         job.finish(final_state);
         let _ = std::fs::remove_file(vol_dir.join(LOCK_FILE));

@@ -71,6 +71,9 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // the credential issuer. Both are needed by the inbound socket to
     // serve `register` and `credentials`.
     let root_key = credential::load_or_generate_root_key(&config.data_dir)?;
+    let coordinator_id_str =
+        crate::portable::format_coordinator_id(&crate::portable::coordinator_id(&root_key));
+    info!("[coordinator] coordinator_id: {coordinator_id_str}");
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
 
     info!(
@@ -110,30 +113,21 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
     // Spawn the inbound socket server.
     {
-        let data_dir = data_dir.clone();
-        let notify = rescan_notify.clone();
-        let registry = import_registry.clone();
-        let bin = elide_import_bin.clone();
-        let evict_reg = evict_registry.clone();
-        let snap_locks = snapshot_locks.clone();
-        let store = store.clone();
-        let issuer = issuer.clone();
+        let ctx = inbound::IpcContext {
+            data_dir: data_dir.clone(),
+            rescan: rescan_notify.clone(),
+            registry: import_registry.clone(),
+            elide_import_bin: elide_import_bin.clone(),
+            evict_registry: evict_registry.clone(),
+            snapshot_locks: snapshot_locks.clone(),
+            store: store.clone(),
+            store_config,
+            part_size_bytes,
+            root_key,
+            issuer: issuer.clone(),
+        };
         tokio::spawn(async move {
-            inbound::serve(
-                &socket_path,
-                data_dir,
-                notify,
-                registry,
-                bin,
-                evict_reg,
-                snap_locks,
-                store,
-                store_config,
-                part_size_bytes,
-                root_key,
-                issuer,
-            )
-            .await;
+            inbound::serve(&socket_path, ctx).await;
         });
     }
 
@@ -183,6 +177,22 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             {
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] discovered volume: {label}");
+
+                // Reconcile the local volume.stopped marker against the
+                // bucket-side names/<name> state so the supervisor sees
+                // a consistent picture before launching. S3 wins; this is
+                // a best-effort recovery from prior drift (e.g. a `volume
+                // stop` whose S3 update succeeded but local marker write
+                // failed, or vice versa). Skipped for readonly volumes
+                // (imported bases have no name in the portable sense).
+                if !vol_dir.join("volume.readonly").exists()
+                    && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
+                {
+                    elide_coordinator::lifecycle::reconcile_marker(
+                        &store, &vol_dir, &name, &root_key,
+                    )
+                    .await;
+                }
 
                 let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(4);
                 evict_registry

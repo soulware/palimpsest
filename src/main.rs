@@ -341,10 +341,27 @@ enum VolumeCommand {
     Stop {
         /// Volume name
         name: String,
+        /// Release ownership instead of just halting locally. Drains the
+        /// WAL, publishes a handoff snapshot, and flips the bucket-side
+        /// state to `released` so any coordinator can claim the name via
+        /// `volume start`. Equivalent to `volume release <name>`.
+        #[arg(long)]
+        release: bool,
     },
 
     /// Start a previously stopped volume
     Start {
+        /// Volume name
+        name: String,
+    },
+
+    /// Release a volume's name back to the pool. Drains the WAL, publishes
+    /// a handoff snapshot, halts the daemon, and flips the bucket-side
+    /// `names/<name>` record to `released` so any coordinator (this host
+    /// or another) may claim it via `volume start`. Use this to relocate
+    /// a named volume between hosts; use `volume stop` for a temporary
+    /// halt that retains ownership.
+    Release {
         /// Volume name
         name: String,
     },
@@ -757,20 +774,66 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Stop { name } => {
-                if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+            VolumeCommand::Stop { name, release } => {
+                if release {
+                    match coordinator_client::release_volume(&socket_path, &name) {
+                        Ok(snap) => {
+                            println!("{name}: released at handoff snapshot {snap}");
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("{name}: stopped");
                 }
-                println!("{name}: stopped");
             }
 
             VolumeCommand::Start { name } => {
-                if let Err(e) = coordinator_client::start_volume(&socket_path, &name) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+                use coordinator_client::StartOutcome;
+                match coordinator_client::start_volume(&socket_path, &name) {
+                    Ok(StartOutcome::Started) => {
+                        println!("{name}: started");
+                    }
+                    Ok(StartOutcome::NeedsClaim {
+                        released_vol_ulid,
+                        handoff_snapshot,
+                    }) => {
+                        if let Err(e) = claim_released_name(
+                            &args.data_dir,
+                            &name,
+                            &released_vol_ulid,
+                            handoff_snapshot.as_deref(),
+                            &socket_path,
+                            &by_id_dir,
+                        ) {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                        println!("{name}: claimed and started");
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
                 }
-                println!("{name}: started");
+            }
+
+            VolumeCommand::Release { name } => {
+                match coordinator_client::release_volume(&socket_path, &name) {
+                    Ok(snap) => {
+                        println!("{name}: released at handoff snapshot {snap}");
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
 
             VolumeCommand::Remote { command } => {
@@ -819,7 +882,15 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
-            if ublk {
+            // `volume.draining` forces IPC-only mode: skip every
+            // transport (ublk + NBD) regardless of CLI flags. The
+            // coordinator sets this marker when transparently restarting
+            // a stopped volume to drain it for `volume release`, so the
+            // brief restart window can never expose the volume to a
+            // client. The supervisor also drops the transport flags in
+            // this case; this is the second line of defence.
+            let draining = fork_dir.join("volume.draining").exists();
+            if ublk && !draining {
                 if readonly {
                     panic!("ublk transport does not yet support --readonly");
                 }
@@ -835,7 +906,9 @@ fn main() {
                     }
                 }
             }
-            let nbd_bind = if let Some(path) = socket {
+            let nbd_bind = if draining {
+                None
+            } else if let Some(path) = socket {
                 Some(nbd::NbdBind::Unix(path))
             } else {
                 port.map(|p| nbd::NbdBind::Tcp { bind, port: p })
@@ -1459,9 +1532,146 @@ fn create_fork(
         snap_str.as_deref(),
         parent_key_hex.as_deref(),
         flags,
+        false, // brand-new name → mark_initial claims it
     )?;
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
     println!("{}", new_fork_dir.display());
+    Ok(())
+}
+
+/// Classification of a `by_name/<name>` symlink for the
+/// claim-from-released path. Determines whether the CLI may safely
+/// remove the existing symlink before fork-create writes a fresh one.
+#[derive(Debug, PartialEq, Eq)]
+enum SymlinkState {
+    /// No `by_name/<name>` entry exists.
+    Absent,
+    /// Symlink points at `by_id/<released_vol_ulid>` (the released
+    /// ancestor we're about to claim from), or the target no longer
+    /// exists. Either way, this host's record of the name is stale
+    /// and the entry can be removed safely.
+    Stale,
+    /// Symlink points at a different ULID that exists locally. Could
+    /// be a different volume sharing the name on this host. Refuse —
+    /// the operator must resolve manually.
+    PointsElsewhere { target: String },
+}
+
+/// Inspect `by_name/<name>` and decide how to handle it before
+/// claiming a released name.
+///
+/// Read the symlink target without following it; resolve to a ULID
+/// by extracting the final path component. The expected target shape
+/// is `../by_id/<ulid>` (relative) or `<data_dir>/by_id/<ulid>`
+/// (absolute).
+fn classify_symlink_for_claim(symlink: &Path, released_vol_ulid: &str) -> SymlinkState {
+    let target = match std::fs::read_link(symlink) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SymlinkState::Absent,
+        // Symlink exists but read_link failed — treat as stale.
+        Err(_) => return SymlinkState::Stale,
+    };
+
+    let target_ulid = target.file_name().and_then(|n| n.to_str());
+    let target_exists = symlink.exists();
+
+    match (target_ulid, target_exists) {
+        (Some(u), _) if u == released_vol_ulid => SymlinkState::Stale,
+        (_, false) => SymlinkState::Stale,
+        _ => SymlinkState::PointsElsewhere {
+            target: target.display().to_string(),
+        },
+    }
+}
+
+/// CLI orchestration of `volume start` against a `Released` name.
+///
+/// Composes existing fork-creation plumbing with the coordinator's
+/// `claim` IPC:
+///   1. Build the source pin from `released_vol_ulid` + `handoff_snapshot`.
+///   2. Pull the source if not local (via the existing `remote_pull`).
+///   3. Mint a fresh local fork via `fork-create` IPC.
+///   4. Issue `claim <name> <new_vol_ulid>` to atomically rebind the
+///      bucket-side name to the new fork. The conditional PUT inside
+///      `claim` resolves races: if another coordinator wins, our local
+///      fork is left in place as a usable orphan and the user is told.
+fn claim_released_name(
+    data_dir: &Path,
+    name: &str,
+    released_vol_ulid: &str,
+    handoff_snapshot: Option<&str>,
+    socket_path: &Path,
+    by_id_dir: &Path,
+) -> std::io::Result<()> {
+    let snap = handoff_snapshot.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "name '{name}' is Released but has no handoff snapshot recorded — \
+             the releasing coordinator did not publish one (older release?). \
+             Manual recovery required: see docs/operations.md"
+        ))
+    })?;
+    let from = format!("{released_vol_ulid}/{snap}");
+
+    // Stale-symlink recovery: if `by_name/<name>` already points at the
+    // released ancestor (this host previously owned the name and
+    // released it), or at a target that no longer exists (broken link
+    // from a deleted ULID dir), remove it. fork-create will write a
+    // fresh symlink pointing at the new ULID.
+    //
+    // Refuse if the symlink points at something else — that's split-
+    // brain or an unrelated volume, and the operator needs to
+    // resolve it manually.
+    let symlink = data_dir.join("by_name").join(name);
+    match classify_symlink_for_claim(&symlink, released_vol_ulid) {
+        SymlinkState::Absent => {}
+        SymlinkState::Stale => {
+            std::fs::remove_file(&symlink).map_err(|e| {
+                std::io::Error::other(format!("removing stale by_name/{name}: {e}"))
+            })?;
+            eprintln!("[claim] removed stale by_name/{name} (previous local fork)");
+        }
+        SymlinkState::PointsElsewhere { target } => {
+            return Err(std::io::Error::other(format!(
+                "by_name/{name} points at {target} which is not the released ancestor; \
+                 refusing to clobber a different volume — remove the symlink manually if intended"
+            )));
+        }
+    }
+
+    // Pull source if not local.
+    let source_dir = volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid);
+    if !source_dir.exists() {
+        let config = load_fetch_config(socket_path, data_dir, released_vol_ulid)?;
+        eprintln!("pulling {released_vol_ulid} from remote store...");
+        remote_pull(&config, &from, data_dir, socket_path)?;
+        if !volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid).exists() {
+            return Err(std::io::Error::other(format!(
+                "source volume {released_vol_ulid} not found in remote store"
+            )));
+        }
+    }
+
+    // Mint a fresh local fork. fork-create writes by_id/<new_ulid>/
+    // and the by_name/<name> symlink, returns the new vol_ulid.
+    // The bucket record already exists in `Released` state; the
+    // `for_claim=true` flag tells the coordinator to skip
+    // `mark_initial` so we don't trip the AlreadyExists guard. The
+    // `claim` IPC below rebinds the record via `mark_claimed`.
+    let new_vol_ulid = coordinator_client::fork_create(
+        socket_path,
+        name,
+        released_vol_ulid,
+        Some(snap),
+        None,
+        &[],
+        true,
+    )?;
+
+    // Atomically rebind the bucket-side name to our new fork. If the
+    // conditional PUT loses to another coordinator, surface the
+    // resulting error — the local fork is left in place for the
+    // operator to repurpose under a different name.
+    coordinator_client::claim_volume(socket_path, name, &new_vol_ulid)?;
     Ok(())
 }
 
@@ -1747,9 +1957,12 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
                 .bytes()
                 .await
                 .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
-            std::str::from_utf8(&bytes)
-                .map(|s| s.trim().to_owned())
-                .map_err(|e| std::io::Error::other(format!("names/{name} is not valid utf-8: {e}")))
+            let body = std::str::from_utf8(&bytes).map_err(|e| {
+                std::io::Error::other(format!("names/{name} is not valid utf-8: {e}"))
+            })?;
+            elide_core::name_record::NameRecord::from_toml(body)
+                .map(|r| r.vol_ulid.to_string())
+                .map_err(|e| std::io::Error::other(format!("parsing names/{name}: {e}")))
         })?;
 
         // Check for snapshot availability (determines if this volume can be pulled).
@@ -1879,12 +2092,11 @@ fn resolve_pull_spec(
             .await
             .map_err(|e| std::io::Error::other(format!("reading names/{spec}: {e}")))
     })?;
-    let ulid_str = std::str::from_utf8(&raw)
-        .map_err(|e| std::io::Error::other(format!("names/{spec}: {e}")))?
-        .trim();
-    let parsed = ulid::Ulid::from_string(ulid_str)
-        .map_err(|e| std::io::Error::other(format!("names/{spec} contains invalid ULID: {e}")))?;
-    Ok(parsed.to_string())
+    let body = std::str::from_utf8(&raw)
+        .map_err(|e| std::io::Error::other(format!("names/{spec}: {e}")))?;
+    let record = elide_core::name_record::NameRecord::from_toml(body)
+        .map_err(|e| std::io::Error::other(format!("parsing names/{spec}: {e}")))?;
+    Ok(record.vol_ulid.to_string())
 }
 
 /// Return `true` if a local copy of `<ulid>` exists.
@@ -1913,4 +2125,77 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod claim_symlink_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    const RELEASED: &str = "01J0000000000000000000000V";
+    const OTHER: &str = "01J9999999999999999999999V";
+
+    fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&by_name).unwrap();
+        (tmp, by_id, by_name)
+    }
+
+    #[test]
+    fn absent_when_symlink_missing() {
+        let (_t, _id, by_name) = setup();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Absent,
+        );
+    }
+
+    #[test]
+    fn stale_when_target_matches_released() {
+        let (_t, by_id, by_name) = setup();
+        std::fs::create_dir_all(by_id.join(RELEASED)).unwrap();
+        symlink(format!("../by_id/{RELEASED}"), by_name.join("vol")).unwrap();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Stale,
+        );
+    }
+
+    #[test]
+    fn stale_when_target_missing() {
+        let (_t, _id, by_name) = setup();
+        // Symlink dangling: target by_id directory does not exist.
+        symlink(format!("../by_id/{RELEASED}"), by_name.join("vol")).unwrap();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Stale,
+        );
+    }
+
+    #[test]
+    fn stale_when_dangling_to_other_ulid() {
+        let (_t, _id, by_name) = setup();
+        // Dangling link to a non-released ULID also classifies as
+        // Stale (target doesn't exist; safe to remove).
+        symlink(format!("../by_id/{OTHER}"), by_name.join("vol")).unwrap();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Stale,
+        );
+    }
+
+    #[test]
+    fn points_elsewhere_when_target_is_different_ulid() {
+        let (_t, by_id, by_name) = setup();
+        std::fs::create_dir_all(by_id.join(OTHER)).unwrap();
+        symlink(format!("../by_id/{OTHER}"), by_name.join("vol")).unwrap();
+        match classify_symlink_for_claim(&by_name.join("vol"), RELEASED) {
+            SymlinkState::PointsElsewhere { .. } => {}
+            other => panic!("expected PointsElsewhere, got {other:?}"),
+        }
+    }
 }
