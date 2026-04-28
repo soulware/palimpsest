@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial_readonly};
 
 pub const LOCK_FILE: &str = "import.lock";
 
@@ -270,7 +270,6 @@ pub async fn spawn_import(
     elide_import_bin: &Path,
     registry: &ImportRegistry,
     store: Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
     rescan_notify: Arc<Notify>,
 ) -> std::io::Result<String> {
     validate_volume_name(vol_name)?;
@@ -297,10 +296,13 @@ pub async fn spawn_import(
     let vol_ulid = vol_ulid_value.to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
-    // Claim the name in S3 *before* creating any local state. Mirrors
-    // the `volume create` and `fork-create` paths so all three claim
-    // sites converge on the same ownership-from-the-start invariant.
-    match mark_initial(&store, vol_name, root_key, vol_ulid_value).await {
+    // Claim the name in S3 *before* creating any local state. Imports
+    // are readonly: the name binds to immutable content, no exclusive
+    // owner is recorded, and lifecycle verbs (`stop`/`release`/`start`)
+    // refuse the resulting record. Conditional-create still gives
+    // uniqueness: two coordinators racing to import the same name
+    // resolve cleanly (one wins, the other gets `AlreadyExists`).
+    match mark_initial_readonly(&store, vol_name, vol_ulid_value).await {
         Ok(MarkInitialOutcome::Claimed) => {}
         Ok(MarkInitialOutcome::AlreadyExists {
             existing_vol_ulid,

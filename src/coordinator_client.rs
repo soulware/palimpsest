@@ -289,6 +289,9 @@ pub fn evict_volume(socket_path: &Path, name: &str, ulid: Option<&str>) -> io::R
 pub fn snapshot_volume(socket_path: &Path, name: &str) -> io::Result<String> {
     let resp = call(socket_path, &format!("snapshot {name}"))?;
     match resp.split_once(' ') {
+        Some(("ok", "empty")) => Err(io::Error::other(
+            "volume has no segments to snapshot (nothing has been written yet)",
+        )),
         Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
         _ => Err(io::Error::other(format!("unexpected response: {resp}"))),

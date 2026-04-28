@@ -83,7 +83,7 @@ pub fn current_hostname() -> Option<String> {
 
 /// Lifecycle state of a named volume.
 ///
-/// See the design doc § "Three states, two intents" for the operator
+/// See the design doc § "Four states, three intents" for the operator
 /// model behind these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,8 +95,15 @@ pub enum NameState {
     /// coordinators cannot claim without `--force-takeover`.
     Stopped,
     /// No current owner. Any coordinator may `volume start` to claim.
-    /// `coordinator_id` is preserved as historical metadata.
+    /// `coordinator_id`, `claimed_at`, and `hostname` are cleared on
+    /// release so the record's populated fields match the state.
     Released,
+    /// Name points at immutable content (e.g. an imported OCI image).
+    /// No exclusive owner; multiple coordinators may pull and serve
+    /// the same name concurrently. Lifecycle verbs (`stop` / `release`
+    /// / `start`) all refuse this state. See design doc § "Readonly
+    /// names".
+    Readonly,
 }
 
 /// Record stored at `names/<name>` in the bucket.
@@ -263,7 +270,12 @@ mod tests {
 
     #[test]
     fn each_state_round_trips() {
-        for state in [NameState::Live, NameState::Stopped, NameState::Released] {
+        for state in [
+            NameState::Live,
+            NameState::Stopped,
+            NameState::Released,
+            NameState::Readonly,
+        ] {
             let r = NameRecord {
                 state,
                 ..NameRecord::live_minimal(sample_ulid())

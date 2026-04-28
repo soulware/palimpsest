@@ -87,20 +87,36 @@ claimed_at = "<rfc3339>"
 hostname = "<owner-host-at-claim-time>"  # advisory only
 ```
 
-### Three states, two intents
+### Four states, three intents
 
-The lifecycle distinguishes "I want this volume's process down for a
-bit" (host maintenance, daemon restart) from "I'm done; someone else
-can have this name". Conflating them is a source of surprise — a
-coordinator that goes into maintenance and writes `state=stopped`
-should not be racing other coordinators for its own volume on the
-way back up. Three states make the intent explicit:
+The lifecycle distinguishes:
 
-| State | `coordinator_id` | Same coordinator can `start` | Other coordinator can `start` |
-|---|---|---|---|
-| `live` | this | n/a (already running) | only via `--force-takeover` |
-| `stopped` | this | yes | only via `--force-takeover` |
-| `released` | last-owner (historical) | yes | yes |
+1. "I want this volume's process down for a bit" (host maintenance,
+   daemon restart) from "I'm done; someone else can have this name".
+   A coordinator that goes into maintenance and writes
+   `state=stopped` should not be racing other coordinators for its
+   own volume on the way back up.
+2. **A name that *can* have an exclusive owner** (a writable volume
+   — only one coordinator may serve it at a time) from **a name
+   that points at immutable content** (an import — multiple
+   coordinators may serve it concurrently with no coordination,
+   because there is nothing to coordinate).
+
+Four states make these intents explicit:
+
+| State | `coordinator_id` | Mutable? | Same coordinator can `start` | Other coordinator can `start` |
+|---|---|---|---|---|
+| `live` | this | yes | n/a (already running) | only via `--force-takeover` |
+| `stopped` | this | yes | yes | only via `--force-takeover` |
+| `released` | empty | yes (after claim) | yes | yes |
+| `readonly` | empty | **no** | n/a (no daemon) | n/a (no daemon) |
+
+The first three are the writable lifecycle: a name moves through
+them as a single coordinator owns it, hands it off, or relinquishes
+it. The fourth, `readonly`, is the published-handle case: the name
+is bound permanently to immutable content, no exclusive owner is
+needed, and lifecycle verbs (`stop` / `release` / `start`) all
+refuse it cleanly. See § "Readonly names" below.
 
 Verbs and their state transitions:
 
@@ -129,6 +145,52 @@ Verbs and their state transitions:
 All transitions are conditional PUTs (`If-Match` on ETag, supported
 by S3 and Tigris). Conditional-write atomicity on this single object
 is the entire ownership protocol.
+
+### Readonly names
+
+A name in `state=readonly` points at immutable content (today: an
+imported OCI image). The on-wire shape:
+
+```toml
+version = 1
+vol_ulid = "<import_fork_ulid>"
+state = "readonly"
+```
+
+`coordinator_id`, `claimed_at`, and `hostname` are all empty —
+**there is no exclusive owner, by design**. Multiple coordinators
+may pull and serve the same readonly name concurrently with no
+coordination, because the underlying content cannot diverge.
+
+Properties:
+
+- **Conditional create still gives uniqueness.** `mark_initial`
+  uses `If-None-Match: *` on creation, so two coordinators racing
+  to import the same name resolve cleanly: one writes the record,
+  the other sees `AlreadyExists` and refuses. The name is
+  exclusively bound to one immutable artefact, even though no
+  coordinator owns it.
+- **Lifecycle verbs refuse readonly cleanly.** `mark_stopped`,
+  `mark_released`, `mark_live`, and `mark_claimed` all return
+  `InvalidTransition` (or `NotReleased`, for `mark_claimed`) on
+  observing `state=readonly`. The local IPC layer also short-
+  circuits earlier when it sees a `volume.readonly` marker on
+  disk, so these are defence-in-depth rather than the primary
+  refusal point.
+- **No handoff snapshot.** A readonly name is its own handoff: any
+  coordinator may pull `by_id/<vol_ulid>/` from the bucket and
+  serve the name without touching `names/<name>`.
+- **Re-import semantics:** rejected today (any existing record
+  causes `AlreadyExists`). A future refinement could allow
+  idempotent re-import when the supplied `vol_ulid` matches the
+  existing one; out of scope for the initial landing.
+
+When a writable volume might want a readonly handle (e.g. publish
+a snapshot as a stable tag), the same state can carry that intent
+— it is not import-specific. The writable lifecycle (`Live` →
+`Stopped` ↔ `Released`) and the published-handle lifecycle
+(`Readonly`, terminal) are intentionally separate so a name
+cannot accidentally cross between them.
 
 ### Object store requirements
 

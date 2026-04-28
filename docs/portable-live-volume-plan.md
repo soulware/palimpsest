@@ -94,7 +94,7 @@ Promote `names/<name>` from a plain-text ULID to structured TOML:
 version = 1
 vol_ulid = "<current_fork_ulid>"
 coordinator_id = "<owner-coordinator-id>"        # optional in Phase 1
-state = "live"                                    # "live" | "stopped" | "released"
+state = "live"                                    # "live" | "stopped" | "released" | "readonly"
 parent = "<prev_ulid>/<prev_snap_ulid>"           # absent on the root
 claimed_at = "<rfc3339>"                          # optional in Phase 1
 hostname = "<owner-host-at-claim-time>"           # advisory only
@@ -109,6 +109,11 @@ intents"):
 - `released` — no current owner; any coordinator may `volume start`.
   `coordinator_id`, `claimed_at`, and `hostname` are cleared on
   release so the populated fields agree with the state.
+- `readonly` — name points at immutable content (e.g. an imported
+  OCI image). No exclusive owner, no daemon to start; lifecycle
+  verbs refuse it cleanly. Multiple coordinators may pull and
+  serve the same name concurrently. See design doc § "Readonly
+  names".
 
 Phase 1 scope:
 

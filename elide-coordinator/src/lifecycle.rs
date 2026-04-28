@@ -119,6 +119,12 @@ pub async fn mark_stopped(
                 verb: "stop",
             });
         }
+        NameState::Readonly => {
+            return Err(LifecycleError::InvalidTransition {
+                from: NameState::Readonly,
+                verb: "stop",
+            });
+        }
     }
 
     record.state = NameState::Stopped;
@@ -160,11 +166,18 @@ pub enum MarkReleasedOutcome {
 /// operators inspecting the bucket. The next `mark_claimed` populates
 /// them fresh for the new owner.
 ///
+/// `handoff_snapshot` is `None` for the empty-volume edge case — a
+/// freshly-created name that was released without ever having data
+/// written to it. The next claimant gets a fresh root fork with no
+/// parent pin, semantically "release of an empty named volume".
+///
 /// This is the cross-coordinator-handoff verb. Callers must already
 /// have:
 ///   1. drained the volume's WAL,
-///   2. published a snapshot covering everything drained,
-///   3. recorded the resulting `snap_ulid` here as `handoff_snapshot`.
+///   2. published a snapshot covering everything drained (or skipped
+///      this step because there was nothing to publish),
+///   3. recorded the resulting `snap_ulid` here as `handoff_snapshot`
+///      — `None` when nothing was published.
 ///
 /// The conditional PUT ensures no other coordinator has mutated the
 /// record between our read and our write.
@@ -172,7 +185,7 @@ pub async fn mark_released(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     root_key: &[u8; 32],
-    handoff_snapshot: Ulid,
+    handoff_snapshot: Option<Ulid>,
 ) -> Result<MarkReleasedOutcome, LifecycleError> {
     let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
 
@@ -191,10 +204,16 @@ pub async fn mark_released(
     match record.state {
         NameState::Live | NameState::Stopped => {}
         NameState::Released => return Ok(MarkReleasedOutcome::AlreadyReleased),
+        NameState::Readonly => {
+            return Err(LifecycleError::InvalidTransition {
+                from: NameState::Readonly,
+                verb: "release",
+            });
+        }
     }
 
     record.state = NameState::Released;
-    record.handoff_snapshot = Some(handoff_snapshot);
+    record.handoff_snapshot = handoff_snapshot;
     record.coordinator_id = None;
     record.claimed_at = None;
     record.hostname = None;
@@ -244,6 +263,12 @@ pub async fn mark_live(
         NameState::Live => return Ok(MarkLiveOutcome::AlreadyLive),
         NameState::Stopped => {}
         NameState::Released => return Ok(MarkLiveOutcome::Released),
+        NameState::Readonly => {
+            return Err(LifecycleError::InvalidTransition {
+                from: NameState::Readonly,
+                verb: "start",
+            });
+        }
     }
 
     record.state = NameState::Live;
@@ -333,6 +358,60 @@ pub async fn mark_initial(
                 // Vanished between the failed create and the re-read
                 // (TTL? GC?). Surface as a transient store error so
                 // the caller can retry.
+                None => Err(LifecycleError::Store(NameStoreError::PreconditionFailed)),
+            }
+        }
+        Err(e) => Err(LifecycleError::Store(e)),
+    }
+}
+
+/// Atomically claim a fresh name in S3 for a **readonly** import.
+///
+/// Same conditional-create mechanics as `mark_initial` (one writer
+/// wins on `If-None-Match: *`), but the resulting record carries
+/// `state = Readonly` and *no* coordinator identity:
+/// `coordinator_id`, `claimed_at`, and `hostname` are all `None`,
+/// reflecting that imports have no exclusive owner. Multiple
+/// coordinators may pull and serve the same name concurrently
+/// (see design doc § "Readonly names").
+///
+/// Takes no `root_key` — there is no owner to identify. The
+/// conditional create still gives uniqueness: two coordinators
+/// racing to import the same name resolve cleanly (one wins,
+/// the other gets `AlreadyExists`).
+pub async fn mark_initial_readonly(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    vol_ulid: Ulid,
+) -> Result<MarkInitialOutcome, LifecycleError> {
+    if let Some((existing, _)) = name_store::read_name_record(store, name).await? {
+        return Ok(MarkInitialOutcome::AlreadyExists {
+            existing_vol_ulid: existing.vol_ulid,
+            existing_state: existing.state,
+            existing_owner: existing.coordinator_id,
+        });
+    }
+
+    let record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
+        vol_ulid,
+        coordinator_id: None,
+        state: NameState::Readonly,
+        parent: None,
+        claimed_at: None,
+        hostname: None,
+        handoff_snapshot: None,
+    };
+
+    match name_store::create_name_record(store, name, &record).await {
+        Ok(_) => Ok(MarkInitialOutcome::Claimed),
+        Err(NameStoreError::PreconditionFailed) => {
+            match name_store::read_name_record(store, name).await? {
+                Some((existing, _)) => Ok(MarkInitialOutcome::AlreadyExists {
+                    existing_vol_ulid: existing.vol_ulid,
+                    existing_state: existing.state,
+                    existing_owner: existing.coordinator_id,
+                }),
                 None => Err(LifecycleError::Store(NameStoreError::PreconditionFailed)),
             }
         }
@@ -590,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_returns_absent_when_record_missing() {
         let s = store();
-        let r = mark_released(&s, "missing", &key_a(), snap())
+        let r = mark_released(&s, "missing", &key_a(), Some(snap()))
             .await
             .unwrap();
         assert!(matches!(r, MarkReleasedOutcome::Absent));
@@ -602,7 +681,9 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::Updated));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -617,6 +698,31 @@ mod tests {
         assert!(got.coordinator_id.is_none(), "coordinator_id cleared");
         assert!(got.claimed_at.is_none(), "claimed_at cleared");
         assert!(got.hostname.is_none(), "hostname cleared");
+    }
+
+    #[tokio::test]
+    async fn mark_released_with_no_handoff_snapshot_for_empty_volume() {
+        // Edge case: a freshly-created name that was released without
+        // ever having data written to it. The record goes to Released
+        // with `handoff_snapshot = None` so the next claimant gets a
+        // fresh root fork (no parent pin).
+        let s = store();
+        mark_initial(&s, "fresh", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_released(&s, "fresh", &key_a(), None).await.unwrap();
+        assert!(matches!(outcome, MarkReleasedOutcome::Updated));
+
+        let (got, _) = name_store::read_name_record(&s, "fresh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Released);
+        assert!(got.handoff_snapshot.is_none(), "no snapshot recorded");
+        // Identity fields still cleared as for any release.
+        assert!(got.coordinator_id.is_none());
+        assert!(got.claimed_at.is_none());
     }
 
     #[tokio::test]
@@ -635,7 +741,9 @@ mod tests {
         assert!(before.coordinator_id.is_some());
         assert!(before.claimed_at.is_some());
 
-        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
 
         let (after, _) = name_store::read_name_record(&s, "vol")
             .await
@@ -657,7 +765,9 @@ mod tests {
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_stopped(&s, "vol", &key_a()).await.unwrap();
 
-        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::Updated));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -674,8 +784,12 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
-        let outcome = mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
+        let outcome = mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::AlreadyReleased));
     }
 
@@ -689,7 +803,7 @@ mod tests {
         mark_stopped(&s, "vol", &key_a()).await.unwrap();
 
         // B tries to release A's record.
-        let err = mark_released(&s, "vol", &key_b(), snap())
+        let err = mark_released(&s, "vol", &key_b(), Some(snap()))
             .await
             .expect_err("B must be refused on A-owned record");
         assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
@@ -738,7 +852,9 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
 
         // Even from the original owner, mark_live on a Released record
         // is not local-resume; the claim-from-released path is required.
@@ -849,7 +965,9 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
 
         // B claims A's released name with a freshly-minted ULID.
         let outcome = mark_claimed(&s, "vol", &key_b(), other_ulid())
@@ -880,7 +998,9 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+        mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .unwrap();
 
         let key_b_buf = key_b();
         let key_c = [0xEFu8; 32];
@@ -994,5 +1114,144 @@ mod tests {
             a.coordinator_id, b.coordinator_id,
             "different root keys produce different coordinator ids"
         );
+    }
+
+    // ── mark_initial_readonly ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_initial_readonly_claims_with_no_owner_identity() {
+        let s = store();
+        let outcome = mark_initial_readonly(&s, "ubuntu24", sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MarkInitialOutcome::Claimed));
+
+        let (got, _) = name_store::read_name_record(&s, "ubuntu24")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.vol_ulid, sample_ulid());
+        assert_eq!(got.state, NameState::Readonly);
+        assert!(got.coordinator_id.is_none(), "no exclusive owner");
+        assert!(got.claimed_at.is_none(), "no claim time recorded");
+        assert!(got.hostname.is_none(), "no hostname recorded");
+    }
+
+    #[tokio::test]
+    async fn mark_initial_readonly_refuses_when_name_already_exists() {
+        let s = store();
+        mark_initial_readonly(&s, "ubuntu24", sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_initial_readonly(&s, "ubuntu24", snap()).await.unwrap();
+        match outcome {
+            MarkInitialOutcome::AlreadyExists {
+                existing_vol_ulid,
+                existing_state,
+                ..
+            } => {
+                assert_eq!(existing_vol_ulid, sample_ulid());
+                assert_eq!(existing_state, NameState::Readonly);
+            }
+            _ => panic!("expected AlreadyExists, got {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_initial_readonly_collides_with_writable_record() {
+        // First a writable claim, then an attempt to import the same
+        // name → must be refused.
+        let s = store();
+        mark_initial(&s, "name", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_initial_readonly(&s, "name", snap()).await.unwrap();
+        assert!(matches!(
+            outcome,
+            MarkInitialOutcome::AlreadyExists {
+                existing_state: NameState::Live,
+                ..
+            }
+        ));
+    }
+
+    // ── Lifecycle verbs refuse Readonly records ─────────────────────────
+
+    #[tokio::test]
+    async fn mark_stopped_refuses_readonly_record() {
+        let s = store();
+        mark_initial_readonly(&s, "vol", sample_ulid())
+            .await
+            .unwrap();
+
+        let err = mark_stopped(&s, "vol", &key_a())
+            .await
+            .expect_err("readonly record cannot be stopped");
+        assert!(matches!(
+            err,
+            LifecycleError::InvalidTransition {
+                from: NameState::Readonly,
+                verb: "stop"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_released_refuses_readonly_record() {
+        let s = store();
+        mark_initial_readonly(&s, "vol", sample_ulid())
+            .await
+            .unwrap();
+
+        let err = mark_released(&s, "vol", &key_a(), Some(snap()))
+            .await
+            .expect_err("readonly record cannot be released");
+        assert!(matches!(
+            err,
+            LifecycleError::InvalidTransition {
+                from: NameState::Readonly,
+                verb: "release"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_live_refuses_readonly_record() {
+        let s = store();
+        mark_initial_readonly(&s, "vol", sample_ulid())
+            .await
+            .unwrap();
+
+        let err = mark_live(&s, "vol", &key_a())
+            .await
+            .expect_err("readonly record cannot transition to live");
+        assert!(matches!(
+            err,
+            LifecycleError::InvalidTransition {
+                from: NameState::Readonly,
+                verb: "start"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_reports_readonly_as_not_released() {
+        // mark_claimed observes Readonly via its existing NotReleased
+        // path — readonly records are not part of the claim-from-released
+        // flow.
+        let s = store();
+        mark_initial_readonly(&s, "vol", sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_claimed(&s, "vol", &key_a(), snap()).await.unwrap();
+        assert!(matches!(
+            outcome,
+            MarkClaimedOutcome::NotReleased {
+                observed: NameState::Readonly
+            }
+        ));
     }
 }

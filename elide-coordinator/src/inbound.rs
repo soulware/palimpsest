@@ -253,7 +253,6 @@ async fn dispatch(
                         elide_import_bin,
                         registry,
                         store,
-                        root_key,
                         &rescan,
                     )
                     .await
@@ -503,7 +502,6 @@ async fn start_import(
     elide_import_bin: &Path,
     registry: &ImportRegistry,
     store: &Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
     rescan: &Arc<Notify>,
 ) -> String {
     match import::spawn_import(
@@ -514,7 +512,6 @@ async fn start_import(
         elide_import_bin,
         registry,
         store.clone(),
-        root_key,
         rescan.clone(),
     )
     .await
@@ -814,10 +811,13 @@ async fn snapshot_volume(
 
     // 4. Pick snap_ulid: the max ULID in index/. Empty forks cannot be
     //    snapshotted — the coordinator must never mint ULIDs, so there
-    //    is no valid tag for a snapshot over zero segments.
+    //    is no valid tag for a snapshot over zero segments. We surface
+    //    this as the sentinel `ok empty` rather than an error so callers
+    //    that legitimately want to publish an empty volume (e.g.
+    //    `volume release` on a freshly-created name) can act on it.
     let snap_ulid = match pick_snapshot_ulid(&fork_dir) {
         Ok(Some(u)) => u,
-        Ok(None) => return format!("err volume '{vol_name}' has no segments to snapshot"),
+        Ok(None) => return "ok empty".to_string(),
         Err(e) => return format!("err picking snap_ulid: {e}"),
     };
 
@@ -1922,7 +1922,13 @@ async fn release_volume_op(
     }
 
     // Drain WAL → publish handoff snapshot. Reuses the existing
-    // snapshot_volume path; on success the response is `ok <snap_ulid>`.
+    // snapshot_volume path; the response is one of:
+    //   - `ok <snap_ulid>` — drained, snapshot published.
+    //   - `ok empty`        — no segments to snapshot (freshly-created
+    //                         name with nothing written). Release
+    //                         proceeds without a handoff snapshot;
+    //                         the next claimant forks a fresh root.
+    //   - `err <msg>`       — drain or snapshot failed.
     let snap_resp = snapshot_volume(
         volume_name,
         data_dir,
@@ -1931,13 +1937,13 @@ async fn release_volume_op(
         part_size_bytes,
     )
     .await;
-    let snap_ulid_str = match snap_resp.strip_prefix("ok ") {
-        Some(s) => s.trim().to_owned(),
+    let snap_ulid: Option<ulid::Ulid> = match snap_resp.strip_prefix("ok ") {
+        Some(s) if s.trim() == "empty" => None,
+        Some(s) => match ulid::Ulid::from_string(s.trim()) {
+            Ok(u) => Some(u),
+            Err(e) => return format!("err parsing snapshot ULID '{}': {e}", s.trim()),
+        },
         None => return format!("err snapshot for release failed: {snap_resp}"),
-    };
-    let snap_ulid = match ulid::Ulid::from_string(&snap_ulid_str) {
-        Ok(u) => u,
-        Err(e) => return format!("err parsing snapshot ULID '{snap_ulid_str}': {e}"),
     };
 
     // Halt the daemon. Writing the marker first prevents the supervisor
@@ -1959,18 +1965,28 @@ async fn release_volume_op(
     }
 
     // Final step: flip names/<name> to Released, recording the handoff
-    // snapshot. From this point any coordinator may claim the name.
+    // snapshot (or `None` for the empty-volume case). From this point
+    // any coordinator may claim the name.
+    let snap_str: String = snap_ulid
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none (empty volume)".to_owned());
     match lifecycle::mark_released(store, volume_name, root_key, snap_ulid).await {
         Ok(_) => {
-            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_ulid}");
-            format!("ok {snap_ulid}")
+            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_str}");
+            // Reply shape: clients expect `ok <ulid>`. For the empty
+            // case there is no ulid; emit the literal `empty` so the
+            // CLI can render a useful message.
+            match snap_ulid {
+                Some(u) => format!("ok {u}"),
+                None => "ok empty".to_string(),
+            }
         }
         Err(e) => {
             // Local state has already moved (volume is stopped, snapshot
             // is published). The S3 record write failed — the operator
             // can retry or use --force-takeover from a peer to recover.
             warn!("[inbound] release {volume_name}: state flip failed: {e}");
-            format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
+            format!("err snapshot {snap_str} published but names/<name> update failed: {e}")
         }
     }
 }
