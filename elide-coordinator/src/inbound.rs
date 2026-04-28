@@ -285,6 +285,7 @@ async fn dispatch(
                 store,
                 part_size_bytes,
                 root_key,
+                &rescan,
             )
             .await
         }
@@ -1852,15 +1853,32 @@ async fn stop_volume_op(
 /// Relinquish ownership of `<volume_name>` so any other coordinator can
 /// `volume start` it. Composes the existing snapshot path:
 ///
-///   1. Refuse if NBD client connected, volume is readonly, or already
-///      stopped (release of a stopped volume requires `volume start`
-///      first to bring it up for the drain).
-///   2. Verify S3 ownership before doing the expensive drain.
-///   3. Drain WAL → publish handoff snapshot via `snapshot_volume`.
-///   4. Send shutdown RPC to halt the daemon.
-///   5. Write `volume.stopped` marker so the supervisor won't restart.
-///   6. Conditional PUT to `names/<name>` setting state=Released and
+///   1. Refuse if the volume is readonly (no exclusive owner to release)
+///      or an NBD client is connected (must disconnect cleanly first).
+///   2. If the volume is `stopped`, transparently bring it back up
+///      (clear the marker, notify the supervisor, wait for
+///      `control.sock`) — the drain step needs a running daemon.
+///   3. Verify S3 ownership before doing the expensive drain.
+///   4. Drain WAL → publish handoff snapshot via `snapshot_volume`.
+///   5. Send shutdown RPC to halt the daemon.
+///   6. Write `volume.stopped` marker so the supervisor won't restart.
+///   7. Conditional PUT to `names/<name>` setting state=Released and
 ///      recording the handoff snapshot ULID.
+/// Poll for `control.sock` to appear under `vol_dir`. Returns `true`
+/// as soon as it exists, or `false` if `timeout` elapses first.
+/// Used by `release_volume_op` when transparently restarting a
+/// stopped volume so the snapshot path can talk to it.
+async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if vol_dir.join("control.sock").exists() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    vol_dir.join("control.sock").exists()
+}
+
 async fn release_volume_op(
     volume_name: &str,
     data_dir: &Path,
@@ -1868,6 +1886,7 @@ async fn release_volume_op(
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
     root_key: &[u8; 32],
+    rescan: &Notify,
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
@@ -1881,9 +1900,24 @@ async fn release_volume_op(
     if vol_dir.join("volume.readonly").exists() {
         return "err volume is readonly; nothing to release".to_string();
     }
+
+    // If the volume is stopped, transparently bring it up so the
+    // snapshot/drain steps below have a running daemon to talk to.
+    // Mirrors what `volume start` does: clear the marker, notify the
+    // supervisor to spawn the volume process, then wait for
+    // `control.sock` to appear.
     if vol_dir.join("volume.stopped").exists() {
-        return "err volume is stopped — `volume start` it first, then release".to_string();
+        if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+            return format!("err clearing volume.stopped for release: {e}");
+        }
+        rescan.notify_one();
+        if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
+            return format!(
+                "err timed out waiting for volume '{volume_name}' to come up for release"
+            );
+        }
     }
+
     if !vol_dir.join("control.sock").exists() {
         return format!("err volume '{volume_name}' is not running — start it first");
     }
@@ -2077,13 +2111,33 @@ async fn start_volume_op(
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        // Local volume directory absent. The claim-from-released path
-        // (where we'd materialise a new fork from a released ancestor's
-        // handoff snapshot) lands in a follow-up commit; for now refuse.
-        return format!(
-            "err volume not found locally: {volume_name} \
-             (claim-from-released path not yet implemented)"
-        );
+        // No local fork. The only valid path here is cross-coordinator
+        // claim of a `Released` name: read `names/<name>` from S3 and,
+        // if it's `Released`, surface the pin so the CLI can pull,
+        // fork, and `claim`. Anything else is an error.
+        return match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+            Ok(Some((rec, _))) => match rec.state {
+                elide_core::name_record::NameState::Released => {
+                    let snap = rec
+                        .handoff_snapshot
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "_".to_string());
+                    format!("released {} {}", rec.vol_ulid, snap)
+                }
+                elide_core::name_record::NameState::Readonly => {
+                    format!(
+                        "err name '{volume_name}' is readonly (immutable handle); \
+                         pull it with `volume pull` to serve locally"
+                    )
+                }
+                other => format!(
+                    "err name '{volume_name}' is held in state {other:?} \
+                     by another coordinator; nothing to start locally"
+                ),
+            },
+            Ok(None) => format!("err volume not found: {volume_name}"),
+            Err(e) => format!("err reading names/{volume_name}: {e}"),
+        };
     }
     let vol_dir = match std::fs::canonicalize(&link) {
         Ok(p) => p,
