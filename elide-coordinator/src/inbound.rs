@@ -1864,6 +1864,35 @@ async fn stop_volume_op(
 ///   6. Write `volume.stopped` marker so the supervisor won't restart.
 ///   7. Conditional PUT to `names/<name>` setting state=Released and
 ///      recording the handoff snapshot ULID.
+/// RAII guard that removes `<vol_dir>/volume.draining` on drop.
+/// Used by `release_volume_op` so the marker is cleaned up regardless
+/// of which exit path the function takes — leaving it in place would
+/// keep the volume in transport-suppressed mode on any subsequent
+/// restart.
+struct DrainingMarkerGuard {
+    vol_dir: std::path::PathBuf,
+}
+
+impl DrainingMarkerGuard {
+    fn new(vol_dir: std::path::PathBuf) -> Self {
+        Self { vol_dir }
+    }
+}
+
+impl Drop for DrainingMarkerGuard {
+    fn drop(&mut self) {
+        let path = self.vol_dir.join("volume.draining");
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "[inbound] failed to remove draining marker {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Poll for `control.sock` to appear under `vol_dir`. Returns `true`
 /// as soon as it exists, or `false` if `timeout` elapses first.
 /// Used by `release_volume_op` when transparently restarting a
@@ -1901,22 +1930,38 @@ async fn release_volume_op(
         return "err volume is readonly; nothing to release".to_string();
     }
 
-    // If the volume is stopped, transparently bring it up so the
-    // snapshot/drain steps below have a running daemon to talk to.
-    // Mirrors what `volume start` does: clear the marker, notify the
-    // supervisor to spawn the volume process, then wait for
-    // `control.sock` to appear.
-    if vol_dir.join("volume.stopped").exists() {
+    // If the volume is stopped, transparently bring it up in
+    // IPC-only mode so the snapshot/drain steps below have a running
+    // daemon to talk to without exposing the volume on its configured
+    // NBD/ublk transport. The `volume.draining` marker tells both the
+    // supervisor and the volume binary itself to suppress transport
+    // setup; from a client's perspective the volume is never visibly
+    // running during release.
+    //
+    // The `_draining_guard` removes the marker when this function
+    // returns, regardless of which exit path is taken (success, early
+    // error, panic). Without a guard the marker would leak on any of
+    // the many `return format!(...)` exits in the release flow.
+    let was_stopped = vol_dir.join("volume.stopped").exists();
+    let _draining_guard = if was_stopped {
+        if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
+            return format!("err writing volume.draining: {e}");
+        }
         if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+            let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
             return format!("err clearing volume.stopped for release: {e}");
         }
         rescan.notify_one();
+        let guard = DrainingMarkerGuard::new(vol_dir.clone());
         if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
             return format!(
                 "err timed out waiting for volume '{volume_name}' to come up for release"
             );
         }
-    }
+        Some(guard)
+    } else {
+        None
+    };
 
     if !vol_dir.join("control.sock").exists() {
         return format!("err volume '{volume_name}' is not running — start it first");

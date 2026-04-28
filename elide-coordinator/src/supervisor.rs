@@ -213,7 +213,15 @@ fn spawn_volume(
         cmd.env(k, v);
     }
 
-    if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) {
+    // `volume.draining` overrides the configured transport: spawn the
+    // daemon in IPC-only mode (no NBD listener, no ublk attach) so a
+    // coordinator-driven drain (e.g. `volume release` of a stopped
+    // volume) cannot accidentally expose the volume to external
+    // clients during the brief restart window. The marker is set by
+    // the coordinator before clearing `volume.stopped` and removed
+    // when the drain operation finishes.
+    let draining = fork_dir.join("volume.draining").exists();
+    if !draining && let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) {
         if let Some(nbd) = cfg.nbd {
             if let Some(socket) = nbd.socket {
                 // Resolve relative paths against the volume directory so that

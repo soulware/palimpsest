@@ -882,7 +882,15 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
-            if ublk {
+            // `volume.draining` forces IPC-only mode: skip every
+            // transport (ublk + NBD) regardless of CLI flags. The
+            // coordinator sets this marker when transparently restarting
+            // a stopped volume to drain it for `volume release`, so the
+            // brief restart window can never expose the volume to a
+            // client. The supervisor also drops the transport flags in
+            // this case; this is the second line of defence.
+            let draining = fork_dir.join("volume.draining").exists();
+            if ublk && !draining {
                 if readonly {
                     panic!("ublk transport does not yet support --readonly");
                 }
@@ -898,7 +906,9 @@ fn main() {
                     }
                 }
             }
-            let nbd_bind = if let Some(path) = socket {
+            let nbd_bind = if draining {
+                None
+            } else if let Some(path) = socket {
                 Some(nbd::NbdBind::Unix(path))
             } else {
                 port.map(|p| nbd::NbdBind::Tcp { bind, port: p })
