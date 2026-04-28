@@ -256,23 +256,33 @@ pub fn new_registry() -> ImportRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Spawn an import process for `vol_name` using OCI image `oci_ref`.
+/// Caller-supplied parameters for `spawn_import`. Bundled so the request
+/// fields stay together as a unit, separate from coordinator-side wiring.
+pub struct ImportRequest<'a> {
+    pub vol_name: &'a str,
+    pub oci_ref: &'a str,
+    pub extents_from: &'a [String],
+}
+
+/// Spawn an import process for `req.vol_name` using OCI image `req.oci_ref`.
 ///
 /// Generates a ULID for the new volume, creates `<data_dir>/by_id/<ulid>/`,
 /// writes `volume.name`, `volume.readonly`, and `import.lock`, then spawns
 /// `elide-import`. On success, creates the `<data_dir>/by_name/<vol_name>`
 /// symlink. Returns the import job ULID.
-#[allow(clippy::too_many_arguments)]
 pub async fn spawn_import(
-    vol_name: &str,
-    oci_ref: &str,
-    extents_from: &[String],
+    req: ImportRequest<'_>,
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
     store: Arc<dyn ObjectStore>,
     rescan_notify: Arc<Notify>,
 ) -> std::io::Result<String> {
+    let ImportRequest {
+        vol_name,
+        oci_ref,
+        extents_from,
+    } = req;
     validate_volume_name(vol_name)?;
 
     let by_name_dir = data_dir.join("by_name");

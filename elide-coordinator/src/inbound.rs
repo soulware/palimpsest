@@ -246,9 +246,11 @@ async fn dispatch(
                         None => (sub_args, Vec::new()),
                     };
                     start_import(
-                        sub,
-                        oci_ref,
-                        &extents_from,
+                        import::ImportRequest {
+                            vol_name: sub,
+                            oci_ref,
+                            extents_from: &extents_from,
+                        },
                         data_dir,
                         elide_import_bin,
                         registry,
@@ -495,11 +497,8 @@ fn toml_quote(s: &str) -> String {
 
 // ── Import operations ─────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn start_import(
-    vol_name: &str,
-    oci_ref: &str,
-    extents_from: &[String],
+    req: import::ImportRequest<'_>,
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
@@ -507,9 +506,7 @@ async fn start_import(
     rescan: &Arc<Notify>,
 ) -> String {
     match import::spawn_import(
-        vol_name,
-        oci_ref,
-        extents_from,
+        req,
         data_dir,
         elide_import_bin,
         registry,
