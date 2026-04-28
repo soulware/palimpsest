@@ -303,11 +303,14 @@ consulted when `--remote` is passed. The override path lives on
   points at the released ancestor (we previously owned and
   released this name) or is dangling. Refuses cleanly when the
   symlink targets an unrelated local ULID.
-- [ ] **Gate claim-from-released behind `--remote`.** Bare
+- [x] **Gate claim-from-released behind `--remote`.** Bare
   `volume start <name>` with no local data refuses with
-  `volume 'mydb' not found locally; to claim from bucket, run: elide
-  volume start --remote mydb`. The `--remote` flag opts into the
-  S3 path above.
+  `volume 'mydb' not found locally; to claim it from the bucket,
+  run: elide volume start --remote mydb`. The `--remote` flag is
+  parsed in the IPC verb (`start <name> [--remote]`) and only when
+  set does `start_volume_op` reach into S3 to read `names/<name>`.
+  Without it, the coordinator never touches the bucket — surprise
+  S3 pulls are now operator-explicit.
 
 #### Other Phase 2 work
 

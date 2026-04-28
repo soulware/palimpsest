@@ -355,10 +355,20 @@ enum VolumeCommand {
         to: Option<String>,
     },
 
-    /// Start a previously stopped volume
+    /// Start a previously stopped volume.
+    ///
+    /// Defaults to local-only: refuses if `<name>` has no local state
+    /// on this host. Use `--remote` to claim a released or reserved
+    /// name from the bucket — that path pulls the source fork's
+    /// ancestor chain, mints a fresh local fork, and atomically
+    /// rebinds `names/<name>`.
     Start {
         /// Volume name
         name: String,
+        /// Reach into the bucket to claim a released or reserved name.
+        /// Without this, bare `volume start` is local-only.
+        #[arg(long)]
+        remote: bool,
     },
 
     /// Release a volume's name back to the pool. Drains the WAL, publishes
@@ -824,9 +834,9 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Start { name } => {
+            VolumeCommand::Start { name, remote } => {
                 use coordinator_client::StartOutcome;
-                match coordinator_client::start_volume(&socket_path, &name) {
+                match coordinator_client::start_volume(&socket_path, &name, remote) {
                     Ok(StartOutcome::Started) => {
                         println!("{name}: started");
                     }
@@ -834,6 +844,11 @@ fn main() {
                         released_vol_ulid,
                         handoff_snapshot,
                     }) => {
+                        // The IPC only emits NeedsClaim when --remote
+                        // was set, so we know we're allowed to reach
+                        // into S3 here. Without --remote the IPC
+                        // refused with NotFoundLocally and we hit the
+                        // Err arm below.
                         if let Err(e) = claim_released_name(
                             &args.data_dir,
                             &name,

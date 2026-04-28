@@ -291,10 +291,40 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
         }
 
         "start" => {
+            // start <name> [--remote]
+            //
+            // Bare `start` is local-only: refuses if the volume has no
+            // local state on this coordinator. `--remote` opts into
+            // the bucket lookup and the claim-from-released path.
             if args.is_empty() {
-                return "err usage: start <volume>".to_string();
+                return "err usage: start <volume> [--remote]".to_string();
             }
-            start_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
+            let mut tokens = args.split_whitespace();
+            let name = match tokens.next() {
+                Some(n) => n,
+                None => return "err usage: start <volume> [--remote]".to_string(),
+            };
+            let mut remote = false;
+            for tok in tokens {
+                match tok {
+                    "--remote" => {
+                        if remote {
+                            return "err --remote specified twice".to_string();
+                        }
+                        remote = true;
+                    }
+                    other => return format!("err unrecognised start flag: {other}"),
+                }
+            }
+            start_volume_op(
+                name,
+                remote,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.coord_id,
+                &ctx.rescan,
+            )
+            .await
         }
 
         "create" => {
@@ -2543,8 +2573,10 @@ async fn claim_volume_op(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_volume_op(
     volume_name: &str,
+    remote: bool,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
@@ -2552,11 +2584,18 @@ async fn start_volume_op(
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        // No local fork. The only valid paths here are cross-coordinator
-        // claims of a `Released` name (any coordinator may claim) or a
-        // `Reserved` name where this coordinator is the named target
-        // (only the target may claim). Both surface the pin so the CLI
-        // can pull, fork, and `claim`. Anything else is an error.
+        // No local fork. Bare `start` is local-only — refuse without
+        // reaching into the bucket. The operator must opt into the
+        // claim-from-released / claim-from-reserved path explicitly
+        // via `--remote`, which avoids surprise S3 reads and forces
+        // the dangerous "claim foreign content" choice to be
+        // operator-explicit.
+        if !remote {
+            return format!(
+                "err volume '{volume_name}' not found locally; \
+                 to claim it from the bucket, run: elide volume start --remote {volume_name}"
+            );
+        }
         return match elide_coordinator::name_store::read_name_record(store, volume_name).await {
             Ok(Some((rec, _))) => match rec.state {
                 elide_core::name_record::NameState::Released => {

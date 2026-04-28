@@ -489,12 +489,21 @@ pub enum StartOutcome {
     },
 }
 
-/// Start a previously-stopped volume. Coordinator clears `volume.stopped`
-/// and triggers a rescan so the supervisor relaunches the process. If
-/// the bucket-side state is `Released`, returns `NeedsClaim` so the CLI
-/// can run the claim-from-released path.
-pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<StartOutcome> {
-    let resp = call(socket_path, &format!("start {name}"))?;
+/// Start a volume.
+///
+/// Defaults to **local-only**: if `<name>` has no local state on the
+/// coordinator's data dir, returns an error pointing the operator at
+/// `--remote`. With `remote = true`, the IPC reads `names/<name>` from
+/// the bucket; if the record is `Released` (or `Reserved` for this
+/// coordinator), returns `NeedsClaim` so the CLI can pull, fork, and
+/// claim. Bucket reads only happen when `remote` is set.
+pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<StartOutcome> {
+    let cmd = if remote {
+        format!("start {name} --remote")
+    } else {
+        format!("start {name}")
+    };
+    let resp = call(socket_path, &cmd)?;
     if resp == "ok" {
         return Ok(StartOutcome::Started);
     }
