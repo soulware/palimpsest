@@ -1864,48 +1864,109 @@ async fn stop_volume_op(
 ///   6. Write `volume.stopped` marker so the supervisor won't restart.
 ///   7. Conditional PUT to `names/<name>` setting state=Released and
 ///      recording the handoff snapshot ULID.
-/// RAII guard that removes `<vol_dir>/volume.draining` on drop.
-/// Used by `release_volume_op` so the marker is cleaned up regardless
-/// of which exit path the function takes — leaving it in place would
-/// keep the volume in transport-suppressed mode on any subsequent
-/// restart.
+/// RAII guard that restores the original local state on drop. Used by
+/// `release_volume_op` when it transparently restarts a stopped
+/// volume to perform the drain: the marker is cleaned up regardless
+/// of which exit path the function takes (success, error, panic),
+/// and on failure paths the `volume.stopped` marker is re-written so
+/// the volume returns to its pre-release state instead of being left
+/// running.
 struct DrainingMarkerGuard {
     vol_dir: std::path::PathBuf,
+    /// Set to `true` once the release has reached a point where the
+    /// caller has explicitly written `volume.stopped` (i.e. the
+    /// release path's own halt step). Defuses the rollback so the
+    /// guard only removes the draining marker, leaving the volume
+    /// stopped as the release flow intends.
+    success: bool,
 }
 
 impl DrainingMarkerGuard {
     fn new(vol_dir: std::path::PathBuf) -> Self {
-        Self { vol_dir }
+        Self {
+            vol_dir,
+            success: false,
+        }
+    }
+
+    /// Mark the release as having reached its own halt step — at this
+    /// point `volume.stopped` is back in place via the normal path
+    /// and we should *not* re-write it on drop.
+    fn defuse(&mut self) {
+        self.success = true;
     }
 }
 
 impl Drop for DrainingMarkerGuard {
     fn drop(&mut self) {
-        let path = self.vol_dir.join("volume.draining");
-        if let Err(e) = std::fs::remove_file(&path)
+        let draining = self.vol_dir.join("volume.draining");
+        if let Err(e) = std::fs::remove_file(&draining)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
                 "[inbound] failed to remove draining marker {}: {e}",
-                path.display()
+                draining.display()
             );
+        }
+        if !self.success {
+            // Release failed before the explicit halt step. Re-write
+            // `volume.stopped` so the volume returns to its
+            // pre-release state — without this the supervisor would
+            // keep the (now transport-suppressed-then-restored)
+            // process running indefinitely.
+            let stopped = self.vol_dir.join("volume.stopped");
+            if let Err(e) = std::fs::write(&stopped, "")
+                && e.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                warn!(
+                    "[inbound] failed to restore volume.stopped after \
+                     aborted release at {}: {e}",
+                    stopped.display()
+                );
+            }
+            // The volume process is still running with the actor
+            // initialised; ask it to halt cleanly so the supervisor
+            // sees a clean exit and respects the marker we just
+            // wrote. Best-effort: a failed shutdown leaves the
+            // supervisor to notice the stopped marker on the next
+            // poll and not respawn after the eventual exit.
+            let vol_dir = self.vol_dir.clone();
+            tokio::spawn(async move {
+                let _ = elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await;
+            });
         }
     }
 }
 
-/// Poll for `control.sock` to appear under `vol_dir`. Returns `true`
-/// as soon as it exists, or `false` if `timeout` elapses first.
-/// Used by `release_volume_op` when transparently restarting a
-/// stopped volume so the snapshot path can talk to it.
+/// Poll until `control.sock` actually accepts a connection. Returns
+/// `true` as soon as a connect+accept succeeds, or `false` if
+/// `timeout` elapses first. Used by `release_volume_op` when
+/// transparently restarting a stopped volume so the snapshot path can
+/// talk to it.
+///
+/// File existence alone is not enough: the previous volume process
+/// can leave a stale socket file behind, and the new volume's
+/// `UnixListener::bind` does `remove_file` + `bind` — there is a
+/// window where the file exists but no listener is attached, so
+/// `connect()` returns `ECONNREFUSED`. We probe the connection itself
+/// and treat that as the readiness signal.
 async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> bool {
+    let socket = vol_dir.join("control.sock");
     let deadline = std::time::Instant::now() + timeout;
+    let probe_step = std::time::Duration::from_millis(50);
     while std::time::Instant::now() < deadline {
-        if vol_dir.join("control.sock").exists() {
-            return true;
+        if socket.exists() {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(_) => return true,
+                Err(_) => {
+                    // Stale file (waiting for the new listener), or
+                    // listener is up but transient refusal — retry.
+                }
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(probe_step).await;
     }
-    vol_dir.join("control.sock").exists()
+    false
 }
 
 async fn release_volume_op(
@@ -1943,7 +2004,7 @@ async fn release_volume_op(
     // error, panic). Without a guard the marker would leak on any of
     // the many `return format!(...)` exits in the release flow.
     let was_stopped = vol_dir.join("volume.stopped").exists();
-    let _draining_guard = if was_stopped {
+    let mut _draining_guard = if was_stopped {
         if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
             return format!("err writing volume.draining: {e}");
         }
@@ -2026,6 +2087,13 @@ async fn release_volume_op(
 
     // Halt the daemon. Writing the marker first prevents the supervisor
     // from restarting it between shutdown and our final state write.
+    // From this point on the release is past the "could fail and need
+    // to leave the volume in a usable Stopped state" window — defuse
+    // the draining-marker guard so it doesn't fight the explicit
+    // halt step we're about to do.
+    if let Some(g) = _draining_guard.as_mut() {
+        g.defuse();
+    }
     if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
         return format!("err writing volume.stopped: {e}");
     }
