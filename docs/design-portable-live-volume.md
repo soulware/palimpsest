@@ -87,7 +87,7 @@ claimed_at = "<rfc3339>"
 hostname = "<owner-host-at-claim-time>"  # advisory only
 ```
 
-### Four states, three intents
+### Five states, three intents
 
 The lifecycle distinguishes:
 
@@ -96,27 +96,38 @@ The lifecycle distinguishes:
    A coordinator that goes into maintenance and writes
    `state=stopped` should not be racing other coordinators for its
    own volume on the way back up.
-2. **A name that *can* have an exclusive owner** (a writable volume
+2. "Anyone may claim this" (open release) from "this is being
+   handed to a specific coordinator" (targeted release). The latter
+   removes the post-release race window where a third coordinator
+   could grab the name.
+3. **A name that *can* have an exclusive owner** (a writable volume
    — only one coordinator may serve it at a time) from **a name
    that points at immutable content** (an import — multiple
    coordinators may serve it concurrently with no coordination,
    because there is nothing to coordinate).
 
-Four states make these intents explicit:
+Five states make these intents explicit:
 
-| State | `coordinator_id` | Mutable? | Same coordinator can `start` | Other coordinator can `start` |
+| State | `coordinator_id` | `claimed_at` / `hostname` | Mutable? | Who can claim |
 |---|---|---|---|---|
-| `live` | this | yes | n/a (already running) | only after `volume release --force` |
-| `stopped` | this | yes | yes | only after `volume release --force` |
-| `released` | empty | yes (after claim) | yes | yes |
-| `readonly` | empty | **no** | n/a (no daemon) | n/a (no daemon) |
+| `live` | current owner | populated | yes | already running here; others need `release --force` first |
+| `stopped` | current owner | populated | yes | this coordinator (local resume); others need `release --force` first |
+| `released` | empty | empty | yes (after claim) | any coordinator |
+| `reserved` | intended claimer | empty | yes (after claim) | only the named coordinator |
+| `readonly` | empty | empty | **no** | n/a (no daemon, multiple readers OK) |
 
-The first three are the writable lifecycle: a name moves through
-them as a single coordinator owns it, hands it off, or relinquishes
-it. The fourth, `readonly`, is the published-handle case: the name
-is bound permanently to immutable content, no exclusive owner is
-needed, and lifecycle verbs (`stop` / `release` / `start`) all
-refuse it cleanly. See § "Readonly names" below.
+Each state has a coherent field shape: `coordinator_id` consistently
+means "the coordinator this record is associated with"
+(current owner on live/stopped, intended claimer on reserved, no
+one on released/readonly); `claimed_at` and `hostname` consistently
+mean "when/where the *current* owner claimed" — populated only when
+there is a current owner.
+
+The first four are the writable lifecycle. `readonly` is the
+published-handle case: the name is bound permanently to immutable
+content, no exclusive owner is needed, and lifecycle verbs
+(`stop` / `release` / `start`) all refuse it cleanly. See §
+"Readonly names" below.
 
 Verbs and their state transitions:
 
@@ -127,9 +138,17 @@ Verbs and their state transitions:
 - **`volume release`** — relinquish ownership. `live → released` or
   `stopped → released`. Drains WAL → publishes handoff snapshot →
   flips `state` to `released` via conditional PUT, clearing
-  `coordinator_id`, `claimed_at`, and `hostname` so the record's
-  populated fields match the state. Any coordinator may now
-  `start`. Refuses on foreign ownership unless `--force` is passed.
+  `coordinator_id`, `claimed_at`, and `hostname`. Any coordinator
+  may now `start`. Refuses on foreign ownership unless `--force` is
+  passed.
+- **`volume release --to <coordinator_id>`** — targeted handoff.
+  Same drain + handoff-snapshot path as `release`, but flips state
+  to `reserved` and writes `coordinator_id = <X>` (the intended
+  claimer). `claimed_at` and `hostname` stay empty — X has not
+  claimed yet. Only X may `start --remote` against the resulting
+  record; other coordinators are refused before the conditional
+  PUT. Closes the post-release race window: there is no period where
+  the name is openly claimable by anyone other than X.
 - **`volume release --force`** — release a name held by **another
   coordinator**. The override path for "the previous owner is gone
   and not coming back". Skips the `If-Match` precondition on the
@@ -140,8 +159,15 @@ Verbs and their state transitions:
   `release --force`, a normal `volume start --remote <name>` claims
   the now-released name via the conditional-PUT path; concurrent
   claimers race cleanly.
+- **`volume release --force --to <coordinator_id>`** — composes the
+  two: unconditional override of foreign ownership *and* targeted
+  reservation in a single PUT. The post-force record is `reserved`,
+  not `released`; only X may claim. Useful for "the previous host
+  is gone, hand the volume directly to a known recipient" without
+  a race window.
 - **`volume stop --release`** — convenience for `stop` then
-  `release` in one verb.
+  `release` in one verb. `--release` accepts the same `--to` and
+  `--force` flags as standalone `release`.
 - **`volume start <name>`** — claim. Defaults to **local-only**:
   the coordinator must already have local state for `<name>`
   (a `by_name/<name>` symlink with usable on-disk data). Allowed
@@ -370,17 +396,22 @@ forces operators through the explicit two-step recovery flow
    ```
    Do **not** reach into S3.
 
-3. **`--remote` (claim-from-released).** Read `names/<name>`. If
-   `state == "released"`, mint a fresh `<new_ulid>`, generate a
+3. **`--remote` (claim).** Read `names/<name>`.
+   - `state == "released"` → claim allowed for any coordinator.
+   - `state == "reserved"` → claim allowed only when
+     `coordinator_id == self`. Otherwise refuse with a clear error
+     naming the intended claimer.
+   - Anything else → refuse with a pointer at
+     `volume release --force <name>` (followed by another
+     `start --remote`) for the unreachable-owner recovery path.
+
+   On a successful claim, mint a fresh `<new_ulid>`, generate a
    fresh Ed25519 keypair, create `by_id/<new_ulid>/` locally with
-   provenance pointing at the released fork's
+   provenance pointing at the previous fork's
    `<vol_ulid>/<handoff_snap_ulid>`, publish `volume.pub` and signed
    provenance. Conditional PUT to `names/<name>`:
    `vol_ulid = <new_ulid>`, `coordinator_id = self`, `state = "live"`,
-   `parent = <previous>`. Begin serving. If `state` is anything
-   other than `released`, refuse with a pointer at
-   `volume release --force <name>` (followed by another
-   `start --remote`) for the unreachable-owner recovery path.
+   `parent = <previous>`. Begin serving.
 
 One verb, two intents made explicit through a single flag: bare =
 local, `--remote` = claim a released name from the bucket. The
@@ -394,7 +425,8 @@ process exit (graceful or crash) is something else entirely:
 | Event | `names/<name>` | WAL | Snapshot taken | Recovery path |
 |---|---|---|---|---|
 | `volume stop <name>` | flipped to `state=stopped`, same `coordinator_id` | fsynced, retained on disk | no | this coordinator restarts and `volume start`s; other coordinators refused |
-| `volume release <name>` | flipped to `state=released`; `coordinator_id`, `claimed_at`, `hostname` cleared | drained, then discarded | yes — handoff snapshot | any coordinator may `volume start` |
+| `volume release <name>` | flipped to `state=released`; `coordinator_id`, `claimed_at`, `hostname` cleared | drained, then discarded | yes — handoff snapshot | any coordinator may `volume start --remote` |
+| `volume release --to <X> <name>` | flipped to `state=reserved`; `coordinator_id=<X>`; `claimed_at`/`hostname` cleared | drained, then discarded | yes — handoff snapshot | only `<X>` may `volume start --remote`; others refused |
 | Coordinator graceful shutdown (SIGTERM, Ctrl-C) | unchanged | fsynced, retained on disk | no | this coordinator restarts, sees its own `coordinator_id`, replays WAL, resumes serving — `state` was never flipped to `stopped`, so volumes that were `live` come back `live` |
 | Coordinator crash (SIGKILL, hardware) | unchanged | retained, possibly with unsynced tail | no | same as graceful — restart replays WAL. Unsynced tail is lost (matches the existing crash-recovery contract) |
 | `volume release --force` from elsewhere | rewritten without conditional check; flipped to `released`, identity cleared | abandoned (the dead coordinator's WAL is unreachable) | no new snapshot — handoff is pinned to the previous fork's last published snapshot | a subsequent `volume start --remote` claims it normally; any post-snapshot writes from the old owner that didn't reach S3 are lost |

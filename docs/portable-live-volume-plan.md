@@ -94,22 +94,27 @@ Promote `names/<name>` from a plain-text ULID to structured TOML:
 version = 1
 vol_ulid = "<current_fork_ulid>"
 coordinator_id = "<owner-coordinator-id>"        # optional in Phase 1
-state = "live"                                    # "live" | "stopped" | "released" | "readonly"
+state = "live"                                    # "live" | "stopped" | "released" | "reserved" | "readonly"
 parent = "<prev_ulid>/<prev_snap_ulid>"           # absent on the root
 claimed_at = "<rfc3339>"                          # optional in Phase 1
 hostname = "<owner-host-at-claim-time>"           # advisory only
 ```
 
-`state` is **three-valued** (see design doc § "Three states, two
+`state` is **five-valued** (see design doc § "Five states, three
 intents"):
 
 - `live` — held by `coordinator_id`, daemon serving.
 - `stopped` — held by `coordinator_id`, daemon down on this host.
   Other coordinators cannot claim until the name is released
   (`volume release --force` from another host).
-- `released` — no current owner; any coordinator may `volume start`.
-  `coordinator_id`, `claimed_at`, and `hostname` are cleared on
-  release so the populated fields agree with the state.
+- `released` — no current owner; any coordinator may
+  `volume start --remote`. `coordinator_id`, `claimed_at`, and
+  `hostname` are cleared on release.
+- `reserved` — released to a specific coordinator (`--to` flag).
+  `coordinator_id` carries the intended claimer; `claimed_at` and
+  `hostname` stay empty. Only the named coordinator may
+  `volume start --remote`; others refuse before the conditional PUT.
+  Closes the post-release race window for targeted handoff.
 - `readonly` — name points at immutable content (e.g. an imported
   OCI image). No exclusive owner, no daemon to start; lifecycle
   verbs refuse it cleanly. Multiple coordinators may pull and
@@ -238,7 +243,7 @@ works as today.
 
 ---
 
-### Phase 3 — Force takeover
+### Phase 3 — Force takeover and targeted handoff
 
 The override path is split into two normal verbs:
 
@@ -251,6 +256,14 @@ The override path is split into two normal verbs:
 This keeps `volume start` always-safe (never overrides another
 coordinator) and makes the dangerous step explicit and auditable.
 
+`--to <coordinator_id>` adds a targeted-handoff variant that closes
+the post-release race window: instead of `released` (anyone may
+claim), the record goes to `reserved` (only the named coordinator
+may claim). Composes with `--force`.
+
+- [ ] **`Reserved` state in `NameRecord`.** New variant in
+  `NameState`; round-trip + version tests; `mark_released_to`
+  lifecycle helper; reader changes in `start`/`status`.
 - [ ] **`--force` flag on `volume release`.** Skip the foreign-owner
   refusal. Skip the `If-Match` precondition on the `names/<name>`
   PUT (unconditional Overwrite). Do **not** drain the previous
@@ -258,6 +271,14 @@ coordinator) and makes the dangerous step explicit and auditable.
   the released record is set to the previous fork's last published
   handoff snapshot (walk back through `parent` if the current fork
   never published).
+- [ ] **`--to <coordinator_id>` flag on `volume release`.** Same
+  drain + handoff path as bare `release`, but writes
+  `state=reserved` with `coordinator_id=<X>` instead of `released`
+  with cleared identity. Composes with `--force` (which then skips
+  the foreign-owner check too). `mark_claimed` gains a
+  `Reserved → Live` arm that requires `coordinator_id == self`;
+  refusal for foreign-target reservations happens before the
+  conditional PUT, with an error naming the intended claimer.
 - [ ] **Open question (carried, not resolved by this plan):**
   what's the parent pin when the current `names/<name>` value points
   at a fork that exists in S3 but has *never published a handoff
@@ -273,8 +294,9 @@ coordinator) and makes the dangerous step explicit and auditable.
   (kill the writing process between snapshot publication and
   `names/<name>` rewrite, then `release --force` + `start --remote`
   from a second coordinator); force-release when the previous fork
-  has no published snapshots
-  (option (a) fallback path).
+  has no published snapshots (option (a) fallback path);
+  `release --to <X>` followed by `start --remote` on X (succeeds)
+  and on Y (refused before conditional PUT).
 
 **Phase exit criteria:** an operator can recover a name from a dead
 coordinator. The "no published snapshot" fallback behaviour is
