@@ -96,8 +96,8 @@ vol_ulid = "<current_fork_ulid>"
 coordinator_id = "<owner-coordinator-id>"        # optional in Phase 1
 state = "live"                                    # "live" | "stopped" | "released"
 parent = "<prev_ulid>/<prev_snap_ulid>"           # absent on the root
-acquired_at = "<rfc3339>"                         # optional in Phase 1
-hostname = "<owner-host-at-acquire-time>"         # advisory only
+claimed_at = "<rfc3339>"                          # optional in Phase 1
+hostname = "<owner-host-at-claim-time>"           # advisory only
 ```
 
 `state` is **three-valued** (see design doc § "Three states, two
@@ -107,7 +107,8 @@ intents"):
 - `stopped` — held by `coordinator_id`, daemon down on this host.
   Other coordinators cannot claim without `--force-takeover`.
 - `released` — no current owner; any coordinator may `volume start`.
-  `coordinator_id` is preserved as historical metadata.
+  `coordinator_id`, `claimed_at`, and `hostname` are cleared on
+  release so the populated fields agree with the state.
 
 Phase 1 scope:
 
@@ -123,7 +124,7 @@ Phase 1 scope:
   `elide-coordinator/src/upload.rs` to write
   `NameRecord::live_minimal(vol_ulid)` serialised as TOML with
   content-type `application/toml`. Optional fields
-  (`coordinator_id`, `acquired_at`, `hostname`) stay unpopulated;
+  (`coordinator_id`, `claimed_at`, `hostname`) stay unpopulated;
   Phase 2 lifecycle verbs will populate them on state transitions.
 - [x] Enable `ulid` `serde` feature in `elide-core/Cargo.toml` so
   `Ulid` round-trips through TOML directly.
@@ -150,7 +151,7 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
 - [x] Conditional PUT to `names/<name>` flipping `state` from `live`
   to `stopped` via `lifecycle::mark_stopped`. `vol_ulid` and
   `coordinator_id` unchanged; backfills the latter (and
-  `acquired_at`, `hostname`) on Phase 1 records that left these
+  `claimed_at`, `hostname`) on Phase 1 records that left these
   unset. **No handoff snapshot.**
 - [x] Local artefacts stay in place.
 

@@ -83,8 +83,8 @@ vol_ulid = "<current_fork_ulid>"
 coordinator_id = "<owner-coordinator-id>"
 state = "live"            # or "stopped" or "released"
 parent = "<prev_ulid>/<prev_snap_ulid>"   # absent on the root
-acquired_at = "<rfc3339>"
-hostname = "<owner-host-at-acquire-time>"  # advisory only
+claimed_at = "<rfc3339>"
+hostname = "<owner-host-at-claim-time>"  # advisory only
 ```
 
 ### Three states, two intents
@@ -110,8 +110,10 @@ Verbs and their state transitions:
   refused.
 - **`volume release`** — relinquish ownership. `live → released` or
   `stopped → released`. Drains WAL → publishes handoff snapshot →
-  flips `state` to `released` via conditional PUT (and clears
-  `coordinator_id` to historical). Any coordinator may now `start`.
+  flips `state` to `released` via conditional PUT, clearing
+  `coordinator_id`, `claimed_at`, and `hostname` so the record's
+  populated fields match the state. Any coordinator may now
+  `start`.
 - **`volume stop --release`** — convenience for `stop` then
   `release` in one verb.
 - **`volume start <name>`** — claim. Allowed when:
@@ -246,12 +248,13 @@ coordinator. Other coordinators are refused (without
 2. Drain WAL: promote pending records into segments, finish
    in-flight uploads.
 3. Publish a handoff snapshot covering everything published.
-   Record handoff metadata: releasing `coordinator_id`, hostname,
-   `acquired_at` of the current episode.
 4. Conditional PUT to `names/<name>` setting `state = "released"`,
    keeping `vol_ulid` pointing at the now-frozen fork and recording
-   the handoff snapshot. `coordinator_id` is preserved as a
-   *historical* record of the last owner.
+   the handoff snapshot. The owner-identity fields
+   (`coordinator_id`, `claimed_at`, `hostname`) are **cleared** so
+   the populated fields agree with the state: `Released` means
+   "no current owner". The next claimant repopulates them via
+   `mark_claimed`.
 5. The local `by_id/<vol_ulid>/` directory may be discarded (it's
    reproducible from S3) or kept as cache for fast reacquisition.
    **Never** keep the WAL — there is none past the published
@@ -295,7 +298,7 @@ process exit (graceful or crash) is something else entirely:
 | Event | `names/<name>` | WAL | Snapshot taken | Recovery path |
 |---|---|---|---|---|
 | `volume stop <name>` | flipped to `state=stopped`, same `coordinator_id` | fsynced, retained on disk | no | this coordinator restarts and `volume start`s; other coordinators refused |
-| `volume release <name>` | flipped to `state=released`, `coordinator_id` preserved as historical | drained, then discarded | yes — handoff snapshot | any coordinator may `volume start` |
+| `volume release <name>` | flipped to `state=released`; `coordinator_id`, `claimed_at`, `hostname` cleared | drained, then discarded | yes — handoff snapshot | any coordinator may `volume start` |
 | Coordinator graceful shutdown (SIGTERM, Ctrl-C) | unchanged | fsynced, retained on disk | no | this coordinator restarts, sees its own `coordinator_id`, replays WAL, resumes serving — `state` was never flipped to `stopped`, so volumes that were `live` come back `live` |
 | Coordinator crash (SIGKILL, hardware) | unchanged | retained, possibly with unsynced tail | no | same as graceful — restart replays WAL. Unsynced tail is lost (matches the existing crash-recovery contract) |
 | `--force-takeover` from elsewhere | rewritten by new coordinator without conditional check | abandoned (the dead coordinator's WAL is unreachable) | no — takeover forks from the previous handoff snapshot | new coordinator serves; any post-snapshot writes from the old owner that didn't reach S3 are lost |
@@ -336,7 +339,7 @@ Two kinds of snapshot, one on-disk shape:
   <vol_ulid>/<snap_ulid>`), bound catchup windows.
 - **Handoff snapshots** — minted automatically by `volume release`
   to give the next fork a parent pin. Carry extra metadata: the
-  releasing `coordinator_id`, hostname, episode `acquired_at`, and
+  releasing `coordinator_id`, hostname, episode `claimed_at`, and
   the snapshot ULID itself. Anchored under the *outgoing* fork's
   prefix. **`volume stop` does not mint a handoff snapshot** — it
   retains ownership locally, no fork is needed.

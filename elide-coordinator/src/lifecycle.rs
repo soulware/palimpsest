@@ -86,7 +86,7 @@ pub enum MarkStoppedOutcome {
 /// proceed (a freshly-created volume that was never drained may not
 /// yet have a record in the bucket).
 ///
-/// Populates `coordinator_id`, `acquired_at`, and `hostname` if they
+/// Populates `coordinator_id`, `claimed_at`, and `hostname` if they
 /// are not already set — this is the first lifecycle verb that has
 /// the context to record them, so it backfills the Phase 1 gap.
 pub async fn mark_stopped(
@@ -125,8 +125,8 @@ pub async fn mark_stopped(
     if record.coordinator_id.is_none() {
         record.coordinator_id = Some(coord_id);
     }
-    if record.acquired_at.is_none() {
-        record.acquired_at = Some(chrono::Utc::now().to_rfc3339());
+    if record.claimed_at.is_none() {
+        record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
     }
     if record.hostname.is_none() {
         record.hostname = current_hostname();
@@ -153,8 +153,12 @@ pub enum MarkReleasedOutcome {
 
 /// Transition `names/<name>` from `Live` or `Stopped` to `Released`,
 /// recording the handoff snapshot so the next claimant can fork from
-/// it. Ownership (`coordinator_id`) is preserved on the record as
-/// historical metadata; the next `volume start` will overwrite it.
+/// it. The owner-identity fields (`coordinator_id`, `claimed_at`,
+/// `hostname`) are **cleared** so the record matches its semantics:
+/// `Released` means "no current owner", and the populated fields
+/// would otherwise describe the previous owner — confusing for
+/// operators inspecting the bucket. The next `mark_claimed` populates
+/// them fresh for the new owner.
 ///
 /// This is the cross-coordinator-handoff verb. Callers must already
 /// have:
@@ -191,15 +195,9 @@ pub async fn mark_released(
 
     record.state = NameState::Released;
     record.handoff_snapshot = Some(handoff_snapshot);
-    if record.coordinator_id.is_none() {
-        record.coordinator_id = Some(coord_id);
-    }
-    if record.acquired_at.is_none() {
-        record.acquired_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-    if record.hostname.is_none() {
-        record.hostname = current_hostname();
-    }
+    record.coordinator_id = None;
+    record.claimed_at = None;
+    record.hostname = None;
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkReleasedOutcome::Updated)
@@ -252,8 +250,8 @@ pub async fn mark_live(
     if record.coordinator_id.is_none() {
         record.coordinator_id = Some(coord_id);
     }
-    if record.acquired_at.is_none() {
-        record.acquired_at = Some(chrono::Utc::now().to_rfc3339());
+    if record.claimed_at.is_none() {
+        record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
     }
     if record.hostname.is_none() {
         record.hostname = current_hostname();
@@ -261,6 +259,85 @@ pub async fn mark_live(
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkLiveOutcome::Resumed)
+}
+
+/// Outcome of a `mark_initial` call (the create-time claim of a fresh
+/// name).
+#[derive(Debug)]
+pub enum MarkInitialOutcome {
+    /// `names/<name>` was newly created and now points at `vol_ulid`,
+    /// owned by this coordinator, in state `Live`.
+    Claimed,
+    /// `names/<name>` already exists. The caller should refuse the
+    /// create — the name is taken (possibly by us from a previous
+    /// session, possibly by another coordinator). Includes the existing
+    /// owner string (if any) so the caller can produce a clean error.
+    AlreadyExists {
+        existing_vol_ulid: Ulid,
+        existing_state: NameState,
+        existing_owner: Option<String>,
+    },
+}
+
+/// Atomically claim a fresh name in S3 at `volume create` time.
+///
+/// Issues `If-None-Match: *` so two coordinators racing to create the
+/// same name resolve cleanly: one wins, the other gets `AlreadyExists`.
+/// On success the record is fully populated — `coordinator_id`,
+/// `claimed_at`, and `hostname` are all set up front, so the volume
+/// has a real owner from the moment its directory exists locally
+/// (no Phase-1 "ownership-blank-until-first-lifecycle-verb" gap).
+pub async fn mark_initial(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    root_key: &[u8; 32],
+    vol_ulid: Ulid,
+) -> Result<MarkInitialOutcome, LifecycleError> {
+    let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
+
+    // If a record already exists, surface its details so the caller can
+    // produce a useful error. We do this read first so the common
+    // success path (no record) issues exactly one PUT, but a name
+    // collision returns rich information without an extra round trip.
+    if let Some((existing, _)) = name_store::read_name_record(store, name).await? {
+        return Ok(MarkInitialOutcome::AlreadyExists {
+            existing_vol_ulid: existing.vol_ulid,
+            existing_state: existing.state,
+            existing_owner: existing.coordinator_id,
+        });
+    }
+
+    let record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
+        vol_ulid,
+        coordinator_id: Some(coord_id),
+        state: NameState::Live,
+        parent: None,
+        claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+        hostname: current_hostname(),
+        handoff_snapshot: None,
+    };
+
+    match name_store::create_name_record(store, name, &record).await {
+        Ok(_) => Ok(MarkInitialOutcome::Claimed),
+        // Lost a race against another coordinator that created the
+        // same name between our read and our conditional create.
+        // Re-read so the caller sees the winning record.
+        Err(NameStoreError::PreconditionFailed) => {
+            match name_store::read_name_record(store, name).await? {
+                Some((existing, _)) => Ok(MarkInitialOutcome::AlreadyExists {
+                    existing_vol_ulid: existing.vol_ulid,
+                    existing_state: existing.state,
+                    existing_owner: existing.coordinator_id,
+                }),
+                // Vanished between the failed create and the re-read
+                // (TTL? GC?). Surface as a transient store error so
+                // the caller can retry.
+                None => Err(LifecycleError::Store(NameStoreError::PreconditionFailed)),
+            }
+        }
+        Err(e) => Err(LifecycleError::Store(e)),
+    }
 }
 
 /// Outcome of a `mark_claimed` call (the claim-from-released path of
@@ -330,7 +407,7 @@ pub async fn mark_claimed(
         coordinator_id: Some(coord_id),
         state: NameState::Live,
         parent: parent_pin,
-        acquired_at: Some(chrono::Utc::now().to_rfc3339()),
+        claimed_at: Some(chrono::Utc::now().to_rfc3339()),
         hostname: current_hostname(),
         // The new fork hasn't published a handoff snapshot of its own
         // yet; that field is reset for the new ownership episode.
@@ -457,7 +534,7 @@ mod tests {
             .unwrap();
         assert_eq!(got.state, NameState::Stopped);
         assert!(got.coordinator_id.is_some(), "coordinator_id backfilled");
-        assert!(got.acquired_at.is_some(), "acquired_at backfilled");
+        assert!(got.claimed_at.is_some(), "claimed_at backfilled");
     }
 
     #[tokio::test]
@@ -534,7 +611,43 @@ mod tests {
             .unwrap();
         assert_eq!(got.state, NameState::Released);
         assert_eq!(got.handoff_snapshot, Some(snap()));
-        assert!(got.coordinator_id.is_some(), "coordinator_id backfilled");
+        // Owner-identity fields are cleared on release so the record's
+        // populated fields agree with its semantics: `Released` ==
+        // "no current owner".
+        assert!(got.coordinator_id.is_none(), "coordinator_id cleared");
+        assert!(got.claimed_at.is_none(), "claimed_at cleared");
+        assert!(got.hostname.is_none(), "hostname cleared");
+    }
+
+    #[tokio::test]
+    async fn mark_released_clears_owner_identity_from_populated_record() {
+        // Record has full ownership populated (mark_initial-style),
+        // verify mark_released wipes all three identity fields.
+        let s = store();
+        mark_initial(&s, "vol", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+
+        let (before, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.coordinator_id.is_some());
+        assert!(before.claimed_at.is_some());
+
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+
+        let (after, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.coordinator_id.is_none());
+        assert!(after.claimed_at.is_none());
+        assert!(after.hostname.is_none());
+        // vol_ulid and handoff_snapshot are still required for the
+        // claim-from-released path.
+        assert_eq!(after.vol_ulid, sample_ulid());
+        assert_eq!(after.handoff_snapshot, Some(snap()));
     }
 
     #[tokio::test]
@@ -801,5 +914,85 @@ mod tests {
 
         reconcile_marker(&s, &vol_dir, "vol", &key_a()).await;
         assert!(!vol_dir.join("volume.stopped").exists());
+    }
+
+    // ── mark_initial ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_initial_claims_fresh_name_with_full_ownership() {
+        let s = store();
+        let outcome = mark_initial(&s, "fresh", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MarkInitialOutcome::Claimed));
+
+        let (got, _) = name_store::read_name_record(&s, "fresh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.vol_ulid, sample_ulid());
+        assert_eq!(got.state, NameState::Live);
+        assert!(
+            got.coordinator_id.is_some(),
+            "coordinator_id populated at create time, not deferred"
+        );
+        assert!(got.claimed_at.is_some(), "claimed_at populated");
+    }
+
+    #[tokio::test]
+    async fn mark_initial_refuses_when_record_already_exists() {
+        let s = store();
+        // Pre-existing record under a different owner (key_b).
+        mark_initial(&s, "vol", &key_b(), sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_initial(&s, "vol", &key_a(), snap()).await.unwrap();
+        match outcome {
+            MarkInitialOutcome::AlreadyExists {
+                existing_vol_ulid,
+                existing_state,
+                existing_owner,
+            } => {
+                assert_eq!(existing_vol_ulid, sample_ulid());
+                assert_eq!(existing_state, NameState::Live);
+                assert!(existing_owner.is_some(), "owner surfaced for diagnostics");
+            }
+            _ => panic!("expected AlreadyExists, got {outcome:?}"),
+        }
+
+        // The existing record must not have been overwritten.
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.vol_ulid, sample_ulid(), "original ULID intact");
+    }
+
+    #[tokio::test]
+    async fn mark_initial_distinguishes_creators() {
+        // Two different coordinators creating two different names both
+        // succeed independently.
+        let s = store();
+        let u1 = sample_ulid();
+        let u2 = snap();
+
+        let r1 = mark_initial(&s, "alpha", &key_a(), u1).await.unwrap();
+        let r2 = mark_initial(&s, "beta", &key_b(), u2).await.unwrap();
+        assert!(matches!(r1, MarkInitialOutcome::Claimed));
+        assert!(matches!(r2, MarkInitialOutcome::Claimed));
+
+        let (a, _) = name_store::read_name_record(&s, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let (b, _) = name_store::read_name_record(&s, "beta")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            a.coordinator_id, b.coordinator_id,
+            "different root keys produce different coordinator ids"
+        );
     }
 }

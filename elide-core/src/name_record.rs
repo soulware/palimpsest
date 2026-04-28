@@ -22,7 +22,7 @@
 //! state = "live"
 //! ```
 //!
-//! Three lines. `coordinator_id`, `parent`, `acquired_at`, `hostname`
+//! Three lines. `coordinator_id`, `parent`, `claimed_at`, `hostname`
 //! are all `None` and skipped.
 //!
 //! ## Phase 2 fully-populated record (after lifecycle verbs land)
@@ -33,7 +33,7 @@
 //! coordinator_id = "01ABCDEFGHJKMNPQRSTVWXYZ23"
 //! state = "released"
 //! parent = "01XYZ000000000000000000000/01SNP000000000000000000000"
-//! acquired_at = "2026-04-27T12:34:56Z"
+//! claimed_at = "2026-04-27T12:34:56Z"
 //! hostname = "host-a"
 //! handoff_snapshot = "01HND0FF000000000000000000"
 //! ```
@@ -56,7 +56,9 @@
 //! - `parent` — `"<prev_vol_ulid>/<prev_snap_ulid>"`, the handoff
 //!   snapshot the current fork was minted from. Present on forks born
 //!   from a released ancestor; absent on root volumes.
-//! - `acquired_at` — RFC3339, when the current ownership episode began.
+//! - `claimed_at` — RFC3339, when the current claim episode began
+//!   (set by `mark_initial` and `mark_claimed`; cleared by
+//!   `mark_released` so a `Released` record carries no claim time).
 //! - `hostname` — advisory only; never compared for ownership decisions.
 //! - `handoff_snapshot` — ULID of the most recently published handoff
 //!   snapshot. Set when state transitions to `Released`; the next
@@ -128,12 +130,13 @@ pub struct NameRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
 
-    /// When the current ownership episode was acquired, RFC3339.
-    /// `None` for Phase 1 records.
+    /// When the current claim episode began, RFC3339. Set by
+    /// `mark_initial` and `mark_claimed`; cleared by `mark_released`.
+    /// `None` for Phase 1 records (legacy) and for `Released` records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acquired_at: Option<String>,
+    pub claimed_at: Option<String>,
 
-    /// Hostname recorded at acquire time. Advisory only — never
+    /// Hostname recorded at claim time. Advisory only — never
     /// compared for ownership decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -162,7 +165,7 @@ impl NameRecord {
             coordinator_id: None,
             state: NameState::Live,
             parent: None,
-            acquired_at: None,
+            claimed_at: None,
             hostname: None,
             handoff_snapshot: None,
         }
@@ -244,7 +247,7 @@ mod tests {
             coordinator_id: Some("01ABCDEFGHJKMNPQRSTVWXYZ23".to_string()),
             state: NameState::Released,
             parent: Some("01XYZ.../01ABC...".to_string()),
-            acquired_at: Some("2026-04-27T12:34:56Z".to_string()),
+            claimed_at: Some("2026-04-27T12:34:56Z".to_string()),
             hostname: Some("host-a".to_string()),
             handoff_snapshot: Some(snap),
         };
@@ -253,7 +256,7 @@ mod tests {
         assert_eq!(parsed.coordinator_id, r.coordinator_id);
         assert_eq!(parsed.state, NameState::Released);
         assert_eq!(parsed.parent, r.parent);
-        assert_eq!(parsed.acquired_at, r.acquired_at);
+        assert_eq!(parsed.claimed_at, r.claimed_at);
         assert_eq!(parsed.hostname, r.hostname);
         assert_eq!(parsed.handoff_snapshot, Some(snap));
     }

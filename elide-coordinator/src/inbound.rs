@@ -252,6 +252,8 @@ async fn dispatch(
                         data_dir,
                         elide_import_bin,
                         registry,
+                        store,
+                        root_key,
                         &rescan,
                     )
                     .await
@@ -315,7 +317,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: create <name> <size_bytes> [flags...]".to_string();
             }
-            create_volume_op(args, data_dir, &rescan)
+            create_volume_op(args, data_dir, store, root_key, &rescan).await
         }
 
         "update" => {
@@ -347,7 +349,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
             }
-            fork_create_op(args, data_dir, &rescan)
+            fork_create_op(args, data_dir, store, root_key, &rescan).await
         }
 
         "evict" => {
@@ -500,6 +502,8 @@ async fn start_import(
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
     rescan: &Arc<Notify>,
 ) -> String {
     match import::spawn_import(
@@ -509,6 +513,8 @@ async fn start_import(
         data_dir,
         elide_import_bin,
         registry,
+        store.clone(),
+        root_key,
         rescan.clone(),
     )
     .await
@@ -1042,7 +1048,13 @@ fn validate_volume_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
+async fn create_volume_op(
+    args: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
     // First two whitespace-separated tokens: name, size_bytes. Remainder is flags.
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let name = match iter.next() {
@@ -1105,8 +1117,41 @@ fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         return format!("err volume already exists: {name}");
     }
 
-    let vol_ulid = ulid::Ulid::new().to_string();
-    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
+    let vol_ulid = ulid::Ulid::new();
+    let vol_ulid_str = vol_ulid.to_string();
+    let vol_dir = data_dir.join("by_id").join(&vol_ulid_str);
+
+    // Claim the name in S3 *before* creating any local state. This
+    // closes the cross-coordinator race where two hosts run
+    // `volume create <name>` concurrently — the loser sees
+    // `AlreadyExists` and refuses, leaving no partial local artefacts.
+    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+    match mark_initial(store, name, root_key, vol_ulid).await {
+        Ok(MarkInitialOutcome::Claimed) => {}
+        Ok(MarkInitialOutcome::AlreadyExists {
+            existing_vol_ulid,
+            existing_state,
+            existing_owner,
+        }) => {
+            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+            return format!(
+                "err name '{name}' already exists in bucket \
+                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                 owner={owner})"
+            );
+        }
+        Err(LifecycleError::Store(e)) => {
+            return format!("err claiming name in bucket: {e}");
+        }
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            // mark_initial doesn't currently surface this, but match
+            // exhaustively so a future refactor doesn't silently drop it.
+            return format!("err name held by another coordinator: {held_by}");
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in unexpected state {from:?}");
+        }
+    }
 
     let result: std::io::Result<()> = (|| {
         std::fs::create_dir_all(&vol_dir)?;
@@ -1132,20 +1177,28 @@ fn create_volume_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         }
         .write(&vol_dir)?;
         std::fs::create_dir_all(&by_name_dir)?;
-        std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
+        std::os::unix::fs::symlink(format!("../by_id/{vol_ulid_str}"), by_name_dir.join(name))?;
         Ok(())
     })();
 
     if let Err(e) = result {
-        // Best-effort cleanup so a partial volume doesn't strand the name.
+        // Local setup failed. Best-effort: roll back local artefacts
+        // *and* the bucket-side claim so the name is free to retry.
         let _ = std::fs::remove_file(by_name_dir.join(name));
         let _ = std::fs::remove_dir_all(&vol_dir);
+        let name_key = object_store::path::Path::from(format!("names/{name}"));
+        if let Err(del_err) = store.delete(&name_key).await {
+            warn!(
+                "[inbound] create {name}: local setup failed and rollback \
+                 of names/<name> also failed: {del_err}"
+            );
+        }
         return format!("err create failed: {e}");
     }
 
     rescan.notify_one();
-    info!("[inbound] created volume {name} ({vol_ulid})");
-    format!("ok {vol_ulid}")
+    info!("[inbound] created volume {name} ({vol_ulid_str})");
+    format!("ok {vol_ulid_str}")
 }
 
 async fn update_volume_op(args: &str, data_dir: &Path) -> String {
@@ -1505,7 +1558,13 @@ async fn force_snapshot_now_op(
 /// omitted, falls back to `volume::fork_volume` (latest local snapshot).
 /// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
 /// recorded in the new fork's provenance for force-snapshot pins.
-fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
+async fn fork_create_op(
+    args: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let new_name = match iter.next() {
         Some(s) if !s.is_empty() => s,
@@ -1589,12 +1648,56 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         return format!("err source volume {source_ulid_str} not found locally");
     }
 
-    let new_vol_ulid = ulid::Ulid::new().to_string();
+    let new_vol_ulid_value = ulid::Ulid::new();
+    let new_vol_ulid = new_vol_ulid_value.to_string();
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
 
+    // Claim the name in S3 *before* materialising the fork. Same
+    // pattern as `create_volume_op`: lose the race cleanly with no
+    // partial local state if another coordinator already holds the
+    // name, and roll back the bucket-side claim if local fork-out
+    // fails.
+    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+    match mark_initial(store, new_name, root_key, new_vol_ulid_value).await {
+        Ok(MarkInitialOutcome::Claimed) => {}
+        Ok(MarkInitialOutcome::AlreadyExists {
+            existing_vol_ulid,
+            existing_state,
+            existing_owner,
+        }) => {
+            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+            return format!(
+                "err name '{new_name}' already exists in bucket \
+                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                 owner={owner})"
+            );
+        }
+        Err(LifecycleError::Store(e)) => {
+            return format!("err claiming name in bucket: {e}");
+        }
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            return format!("err name held by another coordinator: {held_by}");
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            return format!("err names/<name> is in unexpected state {from:?}");
+        }
+    }
+
+    // Local-only rollback. After a successful `mark_initial` claim,
+    // every error-return path below also rolls back the bucket-side
+    // claim via `delete_name_claim` so the name is free to retry.
     let cleanup = |fork_dir: &Path, link: &Path| {
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir_all(fork_dir);
+    };
+    let rollback_claim = async || {
+        let key = object_store::path::Path::from(format!("names/{new_name}"));
+        if let Err(e) = store.delete(&key).await {
+            warn!(
+                "[inbound] fork-create {new_name}: local fork failed and \
+                 rollback of names/<name> also failed: {e}"
+            );
+        }
     };
 
     let fork_result: std::io::Result<()> = match (snap, parent_key) {
@@ -1609,6 +1712,7 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
     };
     if let Err(e) = fork_result {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err fork failed: {e}");
     }
 
@@ -1617,6 +1721,7 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         Ok(c) => c,
         Err(e) => {
             cleanup(&new_fork_dir, &symlink_path);
+            rollback_claim().await;
             return format!("err reading source volume config: {e}");
         }
     };
@@ -1624,6 +1729,7 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
         Some(s) => s,
         None => {
             cleanup(&new_fork_dir, &symlink_path);
+            rollback_claim().await;
             return "err source volume has no size (import may not have completed)".to_string();
         }
     };
@@ -1636,14 +1742,17 @@ fn fork_create_op(args: &str, data_dir: &Path, rescan: &Notify) -> String {
     .write(&new_fork_dir))
     {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err writing volume config: {e}");
     }
     if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err creating by_name dir: {e}");
     }
     if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
         cleanup(&new_fork_dir, &symlink_path);
+        rollback_claim().await;
         return format!("err creating by_name symlink: {e}");
     }
 

@@ -71,6 +71,9 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // the credential issuer. Both are needed by the inbound socket to
     // serve `register` and `credentials`.
     let root_key = credential::load_or_generate_root_key(&config.data_dir)?;
+    let coordinator_id_str =
+        crate::portable::format_coordinator_id(&crate::portable::coordinator_id(&root_key));
+    info!("[coordinator] coordinator_id: {coordinator_id_str}");
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
 
     info!(
