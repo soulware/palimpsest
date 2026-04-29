@@ -138,7 +138,32 @@ pub fn rewrite_pending_with_deltas(
             .join("snapshots")
             .join(format!("{source_snap}.filemap"));
         if !source_filemap_path.exists() {
-            continue;
+            // Snapshot-time filemap generation no longer runs at release
+            // time (it dominated `volume release` wall time). Generate it
+            // here on demand. Local-only fetcher: a delta dictionary can
+            // only come from bytes we already have on disk, so an evicted
+            // source is unusable as a delta source regardless. If the scan
+            // fails, skip this source.
+            let source_snap_ulid = match Ulid::from_string(&source_snap) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let mk_fetcher: Box<crate::block_reader::FetcherFactory<'_>> = Box::new(|_| None);
+            if let Err(e) =
+                filemap::generate_from_snapshot(source_dir, &source_snap_ulid, mk_fetcher)
+            {
+                log::debug!(
+                    "delta_compute: failed to generate filemap for source {} snap {}: {e:#} \
+                     — skipping as delta source",
+                    source_dir.display(),
+                    source_snap
+                );
+                continue;
+            }
+            if !source_filemap_path.exists() {
+                // generate_from_snapshot returned Ok(false) — non-ext4 source.
+                continue;
+            }
         }
         let source_filemap = filemap::read(&source_filemap_path)?;
 

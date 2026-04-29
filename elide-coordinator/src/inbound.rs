@@ -920,20 +920,18 @@ async fn snapshot_volume(
         sign_started.elapsed()
     );
 
-    // 4b. Phase 4: regenerate the snapshot filemap for NBD-written volumes
-    //     that drained without one. For import-written snapshots this is a
-    //     no-op overwrite with byte-identical content (paths + LBA-map hashes
-    //     match what the import path already wrote). Inline so the upload
-    //     step below picks up the new file in the same pass; restart recovery
-    //     for crashed mid-write filemaps falls out of the .tmp+rename commit.
-    let filemap_started = std::time::Instant::now();
-    if let Err(e) = generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone()).await {
-        warn!("[snapshot {volume_id}] filemap generation failed for {snap_ulid}: {e:#}");
-    }
-    info!(
-        "[snapshot {volume_id}] generate_snapshot_filemap took {:.2?}",
-        filemap_started.elapsed()
-    );
+    // Phase 4 (snapshot-time filemap generation) used to run here. It
+    // dominated `volume release` wall time on freshly-pulled volumes —
+    // ext4 layout scan with per-fragment hash lookup that demand-fetched
+    // each missing block range across the ancestor chain (~100s on a
+    // cold local fork). The filemap is strictly additive and has only
+    // one consumer: `elide volume import --extents-from`. The import
+    // path now generates the source filemap on demand if missing, so
+    // the release-time work is wasted everywhere else.
+    //
+    // Imports continue to write the importing volume's filemap inline
+    // at import time (`elide-core/src/import.rs`); that path is fast
+    // because the importer already has ext4 layout in hand.
 
     // 5. Upload the new snapshot marker and manifest.
     let upload_started = std::time::Instant::now();
@@ -949,45 +947,6 @@ async fn snapshot_volume(
 
     info!("[snapshot {volume_id}] committed {snap_ulid}");
     format!("ok {snap_ulid}")
-}
-
-/// Phase 4: regenerate `snapshots/<snap_ulid>.filemap` from the sealed
-/// snapshot's segments. Runs blocking ext4 + LBA-map walk on a worker
-/// thread so the tokio reactor stays responsive.
-///
-/// Wires a `RemoteFetcher` so demand-fetch works for evicted segments
-/// — Phase 4 may run on a volume whose ext4 metadata blocks have been
-/// evicted to S3. The fetcher is constructed inside the closure (after the
-/// search-dir list is known) because each fetcher binds to a fork chain.
-async fn generate_snapshot_filemap(
-    fork_dir: &Path,
-    snap_ulid: ulid::Ulid,
-    store: Arc<dyn ObjectStore>,
-) -> std::io::Result<()> {
-    let fork_dir = fork_dir.to_owned();
-    let range_fetcher: Arc<dyn elide_fetch::RangeFetcher> =
-        Arc::new(elide_coordinator::range_fetcher::ObjectStoreRangeFetcher::new(store));
-    tokio::task::spawn_blocking(move || {
-        let range_fetcher_for_factory = range_fetcher.clone();
-        let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
-            Box::new(move |search_dirs: &[PathBuf]| {
-                // RemoteFetcher wants oldest-first; BlockReader hands us
-                // newest-first (fork → ancestors).
-                let oldest_first: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
-                elide_fetch::RemoteFetcher::from_store(
-                    range_fetcher_for_factory,
-                    &oldest_first,
-                    elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
-                )
-                .ok()
-                .map(|f| Box::new(f) as Box<dyn elide_core::segment::SegmentFetcher>)
-            });
-        let _wrote =
-            elide_core::filemap::generate_from_snapshot(&fork_dir, &snap_ulid, mk_fetcher)?;
-        Ok::<_, std::io::Error>(())
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("filemap join: {e}")))?
 }
 
 /// Pick a snapshot ULID as the max ULID in `fork_dir/index/`.
