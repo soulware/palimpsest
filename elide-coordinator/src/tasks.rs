@@ -143,7 +143,10 @@ pub async fn run_volume_tasks(
             .read_dir()
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
-    if !has_local_segments {
+    // Pulled ancestors are populated by the descendant writable fork's
+    // `prefetch_indexes` chain walk; running their own per-volume prefetch
+    // repeats every LIST/range-GET on the chain.
+    if !has_local_segments && !is_pulled_ancestor(&fork_dir) {
         // Publish prefetch progress to anyone waiting on `await-prefetch`.
         // The send target is the watch channel in `PrefetchTracker`; clones
         // already subscribed will see this transition from `None` → `Some`.
@@ -193,9 +196,10 @@ pub async fn run_volume_tasks(
             }
         }
     } else {
-        // No prefetch needed: the fork already has its full local index.
-        // Publish ready so any volume binary spawned by the supervisor (which
-        // unconditionally awaits) sees ready immediately.
+        // No prefetch needed: either the fork already has its full local
+        // index, or it's a pulled ancestor whose .idx files are populated by
+        // the descendant fork's chain walk. Publish ready so any waiter
+        // (await-prefetch IPC, supervisor) unblocks immediately.
         prefetch_done.send_replace(Some(Ok(())));
     }
 
@@ -437,6 +441,15 @@ pub fn read_volume_name(fork_dir: &Path) -> Option<String> {
     }
 }
 
+/// True when `fork_dir` is a pulled ancestor: a `by_id/<ulid>/` skeleton with
+/// no `volume.name`, materialized by a descendant fork's prefetch chain walk.
+/// Pulled ancestors have their `.idx` populated by that descendant's walk;
+/// running their own per-volume prefetch repeats every LIST/range-GET.
+/// Imported readonly bases have a name and so are NOT pulled ancestors.
+pub fn is_pulled_ancestor(fork_dir: &Path) -> bool {
+    read_volume_name(fork_dir).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +540,71 @@ mod tests {
         fs::write(vol.join("index").join(format!("{ulid}.idx")), b"idx").unwrap();
         let err = evict_one_body(&vol, ulid).unwrap_err();
         assert!(err.to_string().contains("not found in cache/"));
+    }
+
+    /// Pulled ancestor: skeleton dir with no `volume.name` in volume.toml.
+    /// `is_pulled_ancestor` must return true so per-volume prefetch is
+    /// skipped — the descendant fork's chain walk covers it.
+    #[test]
+    fn is_pulled_ancestor_true_when_no_name() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        elide_core::config::VolumeConfig {
+            name: None,
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol)
+        .unwrap();
+        fs::write(vol.join("volume.readonly"), "").unwrap();
+        assert!(is_pulled_ancestor(&vol));
+    }
+
+    /// Writable fork: has `volume.name`. Per-volume prefetch must run for it
+    /// since it owns the chain walk that populates ancestors.
+    #[test]
+    fn is_pulled_ancestor_false_for_named_writable() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        elide_core::config::VolumeConfig {
+            name: Some("my-fork".to_owned()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol)
+        .unwrap();
+        assert!(!is_pulled_ancestor(&vol));
+    }
+
+    /// Imported readonly base: has `volume.name` AND `volume.readonly`.
+    /// These are roots, not pulled ancestors — they need their own prefetch.
+    #[test]
+    fn is_pulled_ancestor_false_for_imported_readonly_base() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        elide_core::config::VolumeConfig {
+            name: Some("ubuntu-22.04".to_owned()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol)
+        .unwrap();
+        fs::write(vol.join("volume.readonly"), "").unwrap();
+        assert!(!is_pulled_ancestor(&vol));
+    }
+
+    /// Empty-string name is treated as no name — guards against config drift.
+    #[test]
+    fn is_pulled_ancestor_true_for_empty_name() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        elide_core::config::VolumeConfig {
+            name: Some(String::new()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol)
+        .unwrap();
+        assert!(is_pulled_ancestor(&vol));
     }
 }
