@@ -10,6 +10,7 @@ pub mod ls;
 pub mod nbd;
 pub mod ublk;
 pub mod verify;
+pub mod volume_open;
 
 use std::io;
 use std::path::{Path, PathBuf};
