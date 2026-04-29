@@ -841,14 +841,20 @@ async fn snapshot_volume(
     let _guard = lock.lock_owned().await;
 
     // 1. Promote WAL into pending/.
+    let promote_wal_started = std::time::Instant::now();
     if !elide_coordinator::control::promote_wal(&fork_dir).await {
         return "err promote_wal failed or volume unreachable".to_string();
     }
+    info!(
+        "[snapshot {volume_id}] promote_wal took {:.2?}",
+        promote_wal_started.elapsed()
+    );
 
     // 2. Inline drain: upload every pending segment, promote each, then
     //    upload any snapshot files already sitting under snapshots/.
     //    We run this before sign_snapshot_manifest so that index/ is populated
     //    with every segment up to the flush point.
+    let drain_started = std::time::Instant::now();
     match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store, part_size_bytes)
         .await
     {
@@ -858,6 +864,10 @@ async fn snapshot_volume(
         Ok(_) => {}
         Err(e) => return format!("err drain: {e:#}"),
     }
+    info!(
+        "[snapshot {volume_id}] drain_pending took {:.2?}",
+        drain_started.elapsed()
+    );
 
     // 3. Drain any outstanding GC handoffs so `index/` is in a stable
     //    post-GC state before the manifest is signed. Without this, a
@@ -871,13 +881,23 @@ async fn snapshot_volume(
     //    Safe under the snapshot lock: the tick loop's GC path
     //    `try_lock`s the same lock and skips the tick while we hold it,
     //    so there is no race with a concurrent apply_done_handoffs.
+    let apply_gc_started = std::time::Instant::now();
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
+    info!(
+        "[snapshot {volume_id}] apply_gc_handoffs took {:.2?}",
+        apply_gc_started.elapsed()
+    );
+    let apply_done_started = std::time::Instant::now();
     if let Err(e) =
         elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store, part_size_bytes)
             .await
     {
         return format!("err draining gc handoffs: {e:#}");
     }
+    info!(
+        "[snapshot {volume_id}] apply_done_handoffs took {:.2?}",
+        apply_done_started.elapsed()
+    );
 
     // 4. Pick snap_ulid: the max ULID in index/, or a freshly-minted
     //    one when the volume has no segments. The volume's
@@ -891,9 +911,14 @@ async fn snapshot_volume(
     };
 
     // 5. Tell the volume to sign and write the manifest + marker.
+    let sign_started = std::time::Instant::now();
     if !elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await {
         return format!("err sign_snapshot_manifest {snap_ulid} failed");
     }
+    info!(
+        "[snapshot {volume_id}] sign_snapshot_manifest took {:.2?}",
+        sign_started.elapsed()
+    );
 
     // 4b. Phase 4: regenerate the snapshot filemap for NBD-written volumes
     //     that drained without one. For import-written snapshots this is a
@@ -901,9 +926,14 @@ async fn snapshot_volume(
     //     match what the import path already wrote). Inline so the upload
     //     step below picks up the new file in the same pass; restart recovery
     //     for crashed mid-write filemaps falls out of the .tmp+rename commit.
+    let filemap_started = std::time::Instant::now();
     if let Err(e) = generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone()).await {
         warn!("[snapshot {volume_id}] filemap generation failed for {snap_ulid}: {e:#}");
     }
+    info!(
+        "[snapshot {volume_id}] generate_snapshot_filemap took {:.2?}",
+        filemap_started.elapsed()
+    );
 
     // 5. Upload the new snapshot marker and manifest.
     let upload_started = std::time::Instant::now();
