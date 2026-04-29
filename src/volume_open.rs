@@ -3,8 +3,17 @@
 // On a freshly-claimed fork the coordinator's prefetch task races
 // the supervisor: the volume binary may try to open the fork before
 // every ancestor manifest / index has been pulled. Rather than have
-// each transport re-implement this, the open helpers retry briefly
-// on missing-file errors and propagate everything else.
+// each transport re-implement this, the open helpers:
+//
+//   1. Block on the coordinator's `await-prefetch` IPC if a coordinator
+//      is reachable. That gives a strong "ancestors are populated"
+//      signal — we wait for the actual prefetch to complete, instead
+//      of just retrying on the symptom (NotFound during open).
+//   2. Then retry briefly on missing-file errors during `Volume::open`
+//      itself. This is the second line of defence: covers untracked
+//      forks (no coordinator), `force-snapshot-now` style races, and
+//      filesystem-level latency between the prefetch finishing and the
+//      `.idx` becoming visible to a peer process.
 
 use std::io;
 use std::path::Path;
@@ -12,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use elide_core::volume::{ReadonlyVolume, Volume};
 use tracing::warn;
+
+use crate::coordinator_client::{PREFETCH_AWAIT_BUDGET, await_prefetch, is_reachable};
 
 /// How long volume open retries wait in total before giving up when an
 /// ancestor artifact is missing. The common case is the coordinator's
@@ -38,6 +49,7 @@ fn is_missing_file_error(e: &io::Error) -> bool {
 /// Open a writable volume, retrying briefly on missing-file errors so
 /// the coordinator's prefetch task has time to land ancestor artifacts.
 pub fn open_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<Volume> {
+    wait_for_prefetch_if_coordinator_present(dir)?;
     let started = Instant::now();
     loop {
         match Volume::open(dir, by_id_dir) {
@@ -53,6 +65,7 @@ pub fn open_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<Volume
 
 /// Readonly counterpart to [`open_volume_with_retry`].
 pub fn open_readonly_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<ReadonlyVolume> {
+    wait_for_prefetch_if_coordinator_present(dir)?;
     let started = Instant::now();
     loop {
         match ReadonlyVolume::open(dir, by_id_dir) {
@@ -64,4 +77,35 @@ pub fn open_readonly_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Resu
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Block on the coordinator's `await-prefetch` IPC when a coordinator is
+/// reachable.
+///
+/// Layout: `dir = <data_dir>/by_id/<vol_ulid>`, so the coordinator socket
+/// lives at `<data_dir>/control.sock`. Standalone volumes (no coordinator,
+/// no socket) skip the wait — there is no prefetch task to wait for, and
+/// the per-call `Volume::open` retry loop still covers any residual
+/// missing-file window.
+fn wait_for_prefetch_if_coordinator_present(dir: &Path) -> io::Result<()> {
+    let Some((socket_path, vol_ulid)) = derive_coordinator_socket(dir) else {
+        return Ok(());
+    };
+    if !is_reachable(&socket_path) {
+        return Ok(());
+    }
+    await_prefetch(&socket_path, &vol_ulid, PREFETCH_AWAIT_BUDGET)
+}
+
+fn derive_coordinator_socket(dir: &Path) -> Option<(std::path::PathBuf, String)> {
+    let by_id = dir.parent()?;
+    let data_dir = by_id.parent()?;
+    let vol_ulid = dir.file_name()?.to_str()?.to_owned();
+    // Sanity: only treat the directory as ULID-named when the parent is
+    // literally `by_id`, so single-segment scratch volumes used in tests
+    // (e.g. `tempdir/vol-xyz`) never accidentally trigger an IPC.
+    if by_id.file_name()?.to_str()? != "by_id" {
+        return None;
+    }
+    Some((data_dir.join("control.sock"), vol_ulid))
 }

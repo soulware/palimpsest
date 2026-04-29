@@ -8,6 +8,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -108,6 +109,70 @@ pub fn get_store_config(socket_path: &Path) -> io::Result<StoreConfig> {
 pub fn get_store_creds(socket_path: &Path) -> io::Result<StoreCreds> {
     let raw = call_all(socket_path, "get-store-creds")?;
     parse_toml_response(&raw)
+}
+
+/// Default budget for [`await_prefetch`]. Longer than `OPEN_RETRY_BUDGET`
+/// because prefetch can include real S3 GETs across deep ancestor chains;
+/// short enough that a stalled coordinator surfaces a loud error before
+/// the supervisor's restart loop fires.
+pub const PREFETCH_AWAIT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Block until the coordinator's per-fork prefetch task publishes a
+/// terminal result, or until `budget` expires.
+///
+/// Returns `Ok(())` when prefetch is complete (or untracked, which is
+/// treated as ready). Returns `Err` when prefetch failed, when the
+/// coordinator is unreachable, or on timeout. Volume binaries call this
+/// before `Volume::open` to absorb the race between the coordinator's
+/// prefetch task and the supervisor spawning this process on a freshly
+/// claimed fork.
+pub fn await_prefetch(socket_path: &Path, vol_ulid: &str, budget: Duration) -> io::Result<()> {
+    let stream = UnixStream::connect(socket_path).map_err(|e| {
+        io::Error::other(format!(
+            "coordinator not running ({}): {e}",
+            socket_path.display()
+        ))
+    })?;
+    // Bound the full request including the coordinator's wait on the
+    // per-fork watch channel. Read timeout fires as `WouldBlock` /
+    // `TimedOut`; surface that as a clear error so the supervisor can
+    // log + retry rather than the volume hanging on a stuck prefetch.
+    stream
+        .set_read_timeout(Some(budget))
+        .map_err(|e| io::Error::other(format!("set read timeout: {e}")))?;
+    stream
+        .set_write_timeout(Some(budget))
+        .map_err(|e| io::Error::other(format!("set write timeout: {e}")))?;
+    let mut writer = &stream;
+    writeln!(writer, "await-prefetch {vol_ulid}")?;
+    writer.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut reader = io::BufReader::new(&stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(io::Error::other(format!(
+                "await-prefetch: coordinator did not respond within {budget:?}"
+            )));
+        }
+        Err(e) => return Err(e),
+    }
+    let resp = line.trim();
+    if resp == "ok" {
+        Ok(())
+    } else if let Some(msg) = resp.strip_prefix("err ") {
+        Err(io::Error::other(format!("await-prefetch: {msg}")))
+    } else {
+        Err(io::Error::other(format!(
+            "await-prefetch: unexpected response: {resp}"
+        )))
+    }
 }
 
 /// Mint a per-volume macaroon for the spawned volume process.
@@ -664,5 +729,104 @@ pub fn fork_create(
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
         Some(("ok", ulid)) => Ok(ulid.to_owned()),
         _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_socket() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.path().join(format!("c{n}.sock"));
+        (dir, path)
+    }
+
+    /// Spawn a thread that accepts one connection on `path`, reads one line,
+    /// optionally sleeps, then writes `response` and closes. Returns the
+    /// JoinHandle so the caller can await teardown.
+    fn spawn_one_shot_server(
+        path: std::path::PathBuf,
+        delay: Duration,
+        response: &'static str,
+    ) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = io::BufReader::new(&stream);
+            let mut line = String::new();
+            // The client may close mid-read in the timeout test; ignore.
+            let _ = reader.read_line(&mut line);
+            thread::sleep(delay);
+            // After the delay the client may already be gone (timeout).
+            // BrokenPipe is expected — don't unwrap.
+            let mut writer = &stream;
+            let _ = writeln!(writer, "{response}");
+            let _ = writer.flush();
+        })
+    }
+
+    #[test]
+    fn await_prefetch_returns_ok_on_ok_response() {
+        let (_guard, sock) = temp_socket();
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, "ok");
+        let r = await_prefetch(&sock, "01JQAAAAAAAAAAAAAAAAAAAAAA", Duration::from_secs(5));
+        server.join().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn await_prefetch_propagates_err_response() {
+        let (_guard, sock) = temp_socket();
+        let server =
+            spawn_one_shot_server(sock.clone(), Duration::ZERO, "err prefetch failed: boom");
+        let r = await_prefetch(&sock, "01JQAAAAAAAAAAAAAAAAAAAAAA", Duration::from_secs(5));
+        server.join().unwrap();
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("prefetch failed: boom"), "{e}");
+    }
+
+    /// Server sleeps past the budget; client must surface a timeout error
+    /// rather than hang. Read timeout fires as WouldBlock/TimedOut.
+    #[test]
+    fn await_prefetch_times_out_when_server_hangs() {
+        let (_guard, sock) = temp_socket();
+        let server = spawn_one_shot_server(sock.clone(), Duration::from_secs(2), "ok");
+        let r = await_prefetch(
+            &sock,
+            "01JQAAAAAAAAAAAAAAAAAAAAAA",
+            Duration::from_millis(200),
+        );
+        let _ = server.join();
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("did not respond within"),
+            "expected timeout error, got: {e}"
+        );
+    }
+
+    /// No socket file at all → caller gets a clear "coordinator not running"
+    /// error rather than a generic ENOENT. The `volume_open` wrapper checks
+    /// `is_reachable` first, but the IPC must also be safe to call directly.
+    #[test]
+    fn await_prefetch_errors_when_socket_absent() {
+        let dir = TempDir::new().unwrap();
+        let r = await_prefetch(
+            &dir.path().join("missing.sock"),
+            "01JQAAAAAAAAAAAAAAAAAAAAAA",
+            Duration::from_secs(1),
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("coordinator not running"), "{e}");
     }
 }

@@ -16,9 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::ObjectStore;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
+
+use crate::PrefetchState;
 
 use crate::config::GcConfig;
 use crate::control;
@@ -100,6 +102,7 @@ pub async fn run_volume_tasks(
     part_size_bytes: usize,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
     snapshot_locks: SnapshotLockRegistry,
+    prefetch_done: watch::Sender<PrefetchState>,
 ) {
     let volume_id = match upload::derive_names(&fork_dir) {
         Ok(id) => id,
@@ -108,6 +111,11 @@ pub async fn run_volume_tasks(
                 "[coordinator] cannot derive volume id for {}: {e}",
                 fork_dir.display()
             );
+            // Publish the error so any waiting `await-prefetch` IPC unblocks
+            // with a concrete reason rather than timing out. `send_replace`
+            // never fails when there are no live subscribers — the value
+            // stays in the channel for late subscribers.
+            prefetch_done.send_replace(Some(Err(format!("derive volume id: {e}"))));
             return;
         }
     };
@@ -136,7 +144,11 @@ pub async fn run_volume_tasks(
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
     if !has_local_segments {
-        let did_fetch = match prefetch::prefetch_indexes(&fork_dir, &store).await {
+        // Publish prefetch progress to anyone waiting on `await-prefetch`.
+        // The send target is the watch channel in `PrefetchTracker`; clones
+        // already subscribed will see this transition from `None` → `Some`.
+        let prefetch_result = prefetch::prefetch_indexes(&fork_dir, &store).await;
+        let did_fetch = match &prefetch_result {
             Ok(r) if r.fetched > 0 => {
                 info!(
                     "[prefetch {volume_id}{volume_name}] fetched {} index section(s)",
@@ -150,6 +162,14 @@ pub async fn run_volume_tasks(
                 false
             }
         };
+        // Publish the result so any volume binary blocked on `await-prefetch`
+        // unblocks before we move on to prewarm / drain. Errors propagate to
+        // the caller as the IPC response. `send_replace` stores the value
+        // even when there are no live subscribers, so a late `await-prefetch`
+        // call still sees it.
+        prefetch_done.send_replace(Some(
+            prefetch_result.map(|_| ()).map_err(|e| format!("{e:#}")),
+        ));
 
         if did_fetch {
             let prewarm_dir = fork_dir.clone();
@@ -172,6 +192,11 @@ pub async fn run_volume_tasks(
                 Err(e) => warn!("[prewarm {volume_id}{volume_name}] task error: {e}"),
             }
         }
+    } else {
+        // No prefetch needed: the fork already has its full local index.
+        // Publish ready so any volume binary spawned by the supervisor (which
+        // unconditionally awaits) sees ready immediately.
+        prefetch_done.send_replace(Some(Ok(())));
     }
 
     let mut tick = tokio::time::interval(drain_interval);

@@ -36,7 +36,10 @@ use crate::import;
 use crate::inbound;
 use crate::supervisor;
 use elide_coordinator::identity::CoordinatorIdentity;
-use elide_coordinator::{EvictRegistry, SnapshotLockRegistry, new_snapshot_lock_registry};
+use elide_coordinator::{
+    EvictRegistry, PrefetchTracker, SnapshotLockRegistry, new_prefetch_tracker,
+    new_snapshot_lock_registry, register_prefetch,
+};
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
     let drain_interval = config.supervisor.drain_interval;
@@ -120,6 +123,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // and every per-volume tick loop via try_lock).
     let snapshot_locks: SnapshotLockRegistry = new_snapshot_lock_registry();
 
+    // Per-fork prefetch tracker. Read by the `await-prefetch` IPC; written by
+    // the daemon on volume discovery (entry inserted before `run_volume_tasks`
+    // is spawned, so the volume binary's first IPC always finds an entry).
+    let prefetch_tracker: PrefetchTracker = new_prefetch_tracker();
+
     // Spawn the inbound socket server.
     {
         let ctx = inbound::IpcContext {
@@ -129,6 +137,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             elide_import_bin: elide_import_bin.clone(),
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),
+            prefetch_tracker: prefetch_tracker.clone(),
             store: store.clone(),
             store_config,
             part_size_bytes,
@@ -214,6 +223,31 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     .expect("evict registry poisoned")
                     .insert(vol_dir.clone(), evict_tx);
 
+                // Register the prefetch tracker entry BEFORE spawning the
+                // per-volume task and BEFORE the supervisor (which spawns the
+                // volume binary). Ordering: `await-prefetch` from the volume
+                // process always finds an entry; never races a missing key.
+                let prefetch_tx = match vol_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| ulid::Ulid::from_string(s).ok())
+                {
+                    Some(u) => Some(register_prefetch(&prefetch_tracker, u)),
+                    None => {
+                        warn!(
+                            "[coordinator] volume dir {} is not ULID-named; skipping prefetch tracking",
+                            vol_dir.display()
+                        );
+                        None
+                    }
+                };
+                let prefetch_tx = prefetch_tx.unwrap_or_else(|| {
+                    // Fall back to a discarded sender so the task signature
+                    // stays uniform; nobody can subscribe to it via the
+                    // tracker because we never registered the entry.
+                    tokio::sync::watch::channel(None).0
+                });
+
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),
                     store.clone(),
@@ -222,6 +256,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     part_size_bytes,
                     evict_rx,
                     snapshot_locks.clone(),
+                    prefetch_tx,
                 ));
 
                 // Readonly volumes (imported bases) have no live process —

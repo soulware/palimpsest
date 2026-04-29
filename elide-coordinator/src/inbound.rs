@@ -32,7 +32,7 @@ use crate::credential::CredentialIssuer;
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
-use elide_coordinator::{EvictRegistry, SnapshotLockRegistry};
+use elide_coordinator::{EvictRegistry, PrefetchTracker, SnapshotLockRegistry, subscribe_prefetch};
 use elide_core::process::pid_is_alive;
 
 /// Shared coordinator state threaded through every inbound op.
@@ -47,6 +47,7 @@ pub struct IpcContext {
     pub elide_import_bin: Arc<PathBuf>,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
+    pub prefetch_tracker: PrefetchTracker,
     pub store: Arc<dyn ObjectStore>,
     pub store_config: Arc<StoreSection>,
     pub part_size_bytes: usize,
@@ -364,6 +365,21 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 return "err usage: force-snapshot-now <vol_ulid>".to_string();
             }
             force_snapshot_now_op(args, &ctx.data_dir, &ctx.store).await
+        }
+
+        "await-prefetch" => {
+            // await-prefetch <vol_ulid>
+            //
+            // Block until the per-fork prefetch task has published a
+            // terminal result, then echo it. Volume binaries call this
+            // before `Volume::open` to absorb the supervisor-prefetch
+            // race on freshly-claimed forks. Untracked volumes return
+            // ok immediately (already prefetched / not under coordinator
+            // management).
+            if args.is_empty() {
+                return "err usage: await-prefetch <vol_ulid>".to_string();
+            }
+            await_prefetch_op(args, &ctx.prefetch_tracker).await
         }
 
         "fork-create" => {
@@ -1588,6 +1604,45 @@ async fn resolve_handoff_key_op(
             format!("ok recovery {hex}")
         }
         Err(e) => format!("err {e}"),
+    }
+}
+
+/// Wait for the per-fork prefetch result and echo it.
+///
+/// The IPC has no internal timeout — the volume-side caller bounds it. If
+/// the per-fork task disappears (channel closed without a final value, e.g.
+/// the volume directory was removed) we report that as an error rather than
+/// silently returning ok, so the caller can act on it.
+async fn await_prefetch_op(args: &str, tracker: &PrefetchTracker) -> String {
+    let vol_str = args.trim();
+    let vol_ulid = match ulid::Ulid::from_string(vol_str) {
+        Ok(u) => u,
+        Err(_) => return format!("err invalid ULID: {vol_str}"),
+    };
+
+    let mut rx = match subscribe_prefetch(tracker, &vol_ulid) {
+        Some(rx) => rx,
+        // Untracked: either already prefetched on a previous coordinator run,
+        // or this coordinator hasn't discovered the fork yet. Both cases are
+        // safe to treat as ready — Volume::open's own retry helper still
+        // absorbs the rare "fork not yet on disk" sub-race.
+        None => return "ok".to_string(),
+    };
+
+    loop {
+        // `borrow()` returns the most recently published value; if a value
+        // was already sent before we subscribed it is visible immediately.
+        if let Some(result) = rx.borrow().clone() {
+            return match result {
+                Ok(()) => "ok".to_string(),
+                Err(msg) => format!("err prefetch failed: {msg}"),
+            };
+        }
+        if rx.changed().await.is_err() {
+            // Sender was dropped before publishing — the per-fork task exited
+            // abnormally (volume removed mid-prefetch, panic, etc.).
+            return "err prefetch task exited without publishing a result".to_string();
+        }
     }
 }
 
@@ -4428,5 +4483,97 @@ mod tests {
         // through cleanly to the "no snapshot" branch.
         std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
         assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    // ----- await-prefetch -----
+
+    /// Untracked volume → ok. Used for volumes already-prefetched on a previous
+    /// coordinator run (no entry in the tracker yet) or running without
+    /// coordinator-managed prefetch at all.
+    #[tokio::test]
+    async fn await_prefetch_returns_ok_for_untracked_volume() {
+        let tracker = elide_coordinator::new_prefetch_tracker();
+        let resp = await_prefetch_op("01JQAAAAAAAAAAAAAAAAAAAAAA", &tracker).await;
+        assert_eq!(resp, "ok");
+    }
+
+    #[tokio::test]
+    async fn await_prefetch_rejects_invalid_ulid() {
+        let tracker = elide_coordinator::new_prefetch_tracker();
+        let resp = await_prefetch_op("not-a-ulid", &tracker).await;
+        assert!(resp.starts_with("err invalid ULID"), "{resp}");
+    }
+
+    /// Tracker already has a Done(Ok) entry → returns immediately, no blocking.
+    #[tokio::test]
+    async fn await_prefetch_returns_ok_when_already_done_success() {
+        let tracker = elide_coordinator::new_prefetch_tracker();
+        let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+        tx.send_replace(Some(Ok(())));
+        // Don't await with a timeout: if this blocks, the test blocks — that's
+        // a clearer failure than a timeout.
+        let resp = await_prefetch_op(&vol.to_string(), &tracker).await;
+        assert_eq!(resp, "ok");
+    }
+
+    /// Tracker has Done(Err) → surfaces the message, doesn't return ok.
+    #[tokio::test]
+    async fn await_prefetch_returns_err_when_already_done_failed() {
+        let tracker = elide_coordinator::new_prefetch_tracker();
+        let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+        tx.send_replace(Some(Err("S3 timeout".into())));
+        let resp = await_prefetch_op(&vol.to_string(), &tracker).await;
+        assert!(
+            resp.starts_with("err prefetch failed: S3 timeout"),
+            "{resp}"
+        );
+    }
+
+    /// In-progress entry: caller blocks; producer publishes Ok mid-wait;
+    /// caller unblocks with ok.
+    #[tokio::test]
+    async fn await_prefetch_blocks_until_publisher_sends_ok() {
+        let tracker = elide_coordinator::new_prefetch_tracker();
+        let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+
+        let tracker_clone = tracker.clone();
+        let waiter =
+            tokio::spawn(async move { await_prefetch_op(&vol.to_string(), &tracker_clone).await });
+
+        // Give the waiter a moment to subscribe before the publisher fires.
+        // Without this, the publisher might send before the waiter is even
+        // running; the test would still pass via initial-borrow, so this
+        // sleep specifically exercises the rx.changed() path.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send_replace(Some(Ok(())));
+
+        let resp = waiter.await.unwrap();
+        assert_eq!(resp, "ok");
+    }
+
+    /// In-progress entry, sender dropped (per-fork task panicked / volume
+    /// removed mid-prefetch) → IPC returns a clear error rather than hanging
+    /// or silently saying ok.
+    #[tokio::test]
+    async fn await_prefetch_returns_err_when_sender_dropped_without_value() {
+        let tracker = elide_coordinator::new_prefetch_tracker();
+        let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+
+        let tracker_clone = tracker.clone();
+        let waiter =
+            tokio::spawn(async move { await_prefetch_op(&vol.to_string(), &tracker_clone).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(tx);
+
+        let resp = waiter.await.unwrap();
+        assert!(
+            resp.starts_with("err prefetch task exited"),
+            "expected err prefetch task exited..., got {resp}"
+        );
     }
 }

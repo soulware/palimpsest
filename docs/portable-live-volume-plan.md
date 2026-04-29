@@ -577,10 +577,11 @@ the work fully closes:
    they refresh. Not blocking — fresh-fetch on every verification
    is correct and the cost is one small GET per `start --remote`
    against a synthesised snapshot.
-5. **ublk volume-open retry.** `src/ublk.rs:434` calls
-   `Volume::open` directly. The NBD path uses
-   `crate::volume_open::open_volume_with_retry` to absorb the
-   coordinator-prefetch / supervisor-spawn race on freshly-claimed
-   forks; ublk has the same race window. Switch ublk to the helper
-   once the current testing work lands. TODO comment at the call
-   site mirrors this note.
+5. **~~ublk volume-open retry.~~ Done.** ublk now goes through
+   `crate::volume_open::open_volume_with_retry` like NBD. That helper
+   was also extended with a synchronous coordinator handshake
+   (`await-prefetch <vol_ulid>` IPC) so both transports block on actual
+   prefetch completion — a strong signal — instead of just retrying on
+   the symptom (NotFound during open). The retry loop is kept as a
+   second line of defence for untracked forks and filesystem-visibility
+   latency. Volume-side budget is 60s with a clear timeout error.

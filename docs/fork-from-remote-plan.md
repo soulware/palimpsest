@@ -119,6 +119,41 @@ Known gaps that did not make this branch and should be tackled next:
    state has not fully drained/uploaded to the store, silently losing
    data from the remote copy. Needs a check, or a `--force` gate.
 
+7. **Duplicated ancestor prefetch on discovery.** Every directory under
+   `by_id/` is treated as a volume by `discover_volumes`, so each
+   ancestor pulled for a fresh `start --remote` also gets its own
+   `run_volume_tasks` and runs `prefetch_indexes` for itself. The new
+   fork's prefetch already covers the same ground via its ancestor
+   walk, so the per-ancestor task is doing redundant S3 work.
+
+   What actually duplicates (per `prefetch.rs:198–248`):
+   - Each `prefetch_fork` call always issues `LIST segments/` and
+     `LIST snapshots/` for that fork before the local-existence check
+     for individual `.idx` files.
+   - Range-GETs are guarded by `<dir>/index/<ulid>.idx` existing
+     locally. Sequential ordering = no extra range-GETs. Concurrent
+     ordering (the new fork's prefetch racing the per-ancestor task)
+     = both miss the existence check and double-fetch the `.idx`
+     bytes. Atomic tmp→rename keeps integrity intact.
+
+   Worst case for a 7-deep chain on cold start: ~56 redundant LIST
+   ops (each ancestor walks the chain from itself; sums to
+   2 × (1+2+…+7) = 56), plus up to 2× range-GETs per `.idx` under
+   concurrency.
+
+   Possible fixes:
+   - Skip `prefetch_indexes` in `run_volume_tasks` when the fork dir
+     has a `volume.parent` and was just materialised by an in-flight
+     claim (a marker file written during `pull_volume_skeleton`,
+     cleared once the parent fork's prefetch completes).
+   - Or: treat ancestor walks as the sole populator and make
+     per-volume `run_volume_tasks` skip prefetch entirely when
+     `volume.parent` exists — the parent's own walk will reach this
+     ancestor.
+
+   Not blocking — observed during `start --remote` of a 7-deep chain
+   on a fresh coordinator.
+
 ## Phases
 
 ### Phase 0 — confirmed cause, no code
