@@ -1990,27 +1990,34 @@ async fn stop_volume_op(
         _ => {}
     }
 
-    // Verify ownership in S3 before taking any local action: refuse early
-    // if names/<name> is held by another coordinator. A missing record is
-    // fine — the volume may not yet have been drained to S3, in which
-    // case the local stop proceeds and the S3 update is a no-op.
+    // `stop` is a local-lifecycle verb: its job is to halt the daemon
+    // on this host. The bucket update is best-effort.
+    //
+    // The bucket update only succeeds for the canonical case (record
+    // owned by us, Live → Stopped); every other case (no record,
+    // already stopped, foreign-owned, Released, Reserved, Readonly,
+    // transient store error) becomes a warning and we proceed with
+    // the local halt. The daemon may legitimately still be running
+    // while the bucket says Released — e.g. after a partial release
+    // that flipped the bucket but failed to halt the process — and
+    // `stop` must be able to recover from that. Halting our local
+    // daemon never affects other hosts.
     use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
     match mark_stopped(store, volume_name, coord_id).await {
         Ok(_) => {}
         Err(LifecycleError::OwnershipConflict { held_by }) => {
-            return format!(
-                "err name '{volume_name}' is owned by coordinator {held_by}; \
-                 run `volume release --force` to override"
+            warn!(
+                "[inbound] stop {volume_name}: names/<name> is owned by coordinator \
+                 {held_by}; halting locally, bucket record left untouched"
             );
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {
-            return format!("err names/<name> is in state {from:?}; cannot stop");
+            warn!(
+                "[inbound] stop {volume_name}: names/<name> is in state {from:?}; \
+                 halting locally, bucket record left untouched"
+            );
         }
         Err(LifecycleError::Store(e)) => {
-            // Transient store error or parse failure. The S3 record is
-            // unchanged; we can still proceed with the local stop, but
-            // surface the warning so operators know the bucket state may
-            // be stale.
             warn!("[inbound] stop {volume_name}: failed to update names/<name>: {e}");
         }
     }
@@ -2414,38 +2421,42 @@ async fn release_with_final_flip(
         return "err volume is readonly; nothing to release".to_string();
     }
 
-    // If the volume is stopped, transparently bring it up in
-    // IPC-only mode so the snapshot/drain steps below have a running
-    // daemon to talk to without exposing the volume on its configured
-    // NBD/ublk transport. The `volume.draining` marker tells both the
-    // supervisor and the volume binary itself to suppress transport
-    // setup; from a client's perspective the volume is never visibly
-    // running during release.
+    // `release` is composed of two distinct phases: drain+publish (needs
+    // a running daemon) and bucket-flip (no daemon needed). To keep the
+    // operator-visible state coherent we require the daemon to already
+    // be `stopped` — otherwise a release on a running volume would have
+    // to halt it inline, and any failure between halt and bucket-flip
+    // would leave the volume in a "Released-but-running" mismatch the
+    // operator can't easily recover from.
+    //
+    // The drain itself still needs an IPC-capable daemon, so we
+    // transparently bring the stopped volume back up in IPC-only mode
+    // here. The `volume.draining` marker tells both the supervisor and
+    // the volume binary to suppress transport setup; from a client's
+    // perspective the volume is never visibly running during release.
     //
     // The `_draining_guard` removes the marker when this function
     // returns, regardless of which exit path is taken (success, early
     // error, panic). Without a guard the marker would leak on any of
     // the many `return format!(...)` exits in the release flow.
-    let was_stopped = vol_dir.join("volume.stopped").exists();
-    let mut _draining_guard = if was_stopped {
-        if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
-            return format!("err writing volume.draining: {e}");
-        }
-        if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
-            let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
-            return format!("err clearing volume.stopped for release: {e}");
-        }
-        rescan.notify_one();
-        let guard = DrainingMarkerGuard::new(vol_dir.clone());
-        if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
-            return format!(
-                "err timed out waiting for volume '{volume_name}' to come up for release"
-            );
-        }
-        Some(guard)
-    } else {
-        None
-    };
+    if !vol_dir.join("volume.stopped").exists() {
+        return format!(
+            "err volume '{volume_name}' is running; \
+             stop it first with: elide volume stop {volume_name}"
+        );
+    }
+    if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
+        return format!("err writing volume.draining: {e}");
+    }
+    if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+        let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
+        return format!("err clearing volume.stopped for release: {e}");
+    }
+    rescan.notify_one();
+    let mut _draining_guard = Some(DrainingMarkerGuard::new(vol_dir.clone()));
+    if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
+        return format!("err timed out waiting for volume '{volume_name}' to come up for release");
+    }
 
     if !vol_dir.join("control.sock").exists() {
         return format!("err volume '{volume_name}' is not running — start it first");
@@ -3867,5 +3878,164 @@ mod tests {
         .await;
         assert!(resp.starts_with("err "), "{resp}");
         assert!(resp.contains("not found"), "{resp}");
+    }
+
+    // ── release / stop preconditions ──────────────────────────────────────
+    //
+    // Two bugs surfaced by manual testing:
+    //
+    //   1. `release` accepted a running volume and tried to halt it
+    //      inline. A failure between the inline halt and the bucket
+    //      flip would strand the volume in a "Released-but-running"
+    //      state. Fix: refuse if `volume.stopped` is absent.
+    //
+    //   2. `stop` refused when the bucket said Released/Reserved/
+    //      Readonly. But `stop` is a *local* lifecycle verb — its job
+    //      is to halt the daemon. The bucket update is best-effort.
+    //      A daemon left running while the bucket says Released
+    //      (e.g. because of bug 1) was unstoppable. Fix: warn-and-skip
+    //      the bucket update on InvalidTransition, halt locally
+    //      regardless.
+
+    /// Build a `by_name/<vol>` symlink pointing at a fresh
+    /// `by_id/<ulid>/` directory without a `volume.stopped` marker —
+    /// i.e. the on-disk shape of a (notionally) running volume.
+    fn make_running_volume(data_dir: &Path) -> ulid::Ulid {
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("by_name")).unwrap();
+        let link = data_dir.join("by_name").join("vol");
+        let target = std::path::PathBuf::from(format!("../by_id/{vol_ulid}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        vol_ulid
+    }
+
+    #[tokio::test]
+    async fn release_op_refuses_when_volume_is_running() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let snapshot_locks = SnapshotLockRegistry::default();
+        let rescan = Notify::new();
+
+        // Running volume: by_name symlink + by_id dir, NO volume.stopped.
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        // names/<vol> = Live owned by us — would have been the path
+        // through the rest of release_volume_op before this fix.
+        let mut rec = NameRecord::live_minimal(vol_ulid);
+        rec.coordinator_id = Some("coord-self".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp = release_volume_op(
+            "vol",
+            data_dir.path(),
+            &snapshot_locks,
+            &store,
+            8 * 1024 * 1024,
+            "coord-self",
+            &rescan,
+        )
+        .await;
+
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(
+            resp.contains("running") && resp.contains("volume stop"),
+            "expected operator to be pointed at `volume stop`, got: {resp}"
+        );
+
+        // The bucket record must be untouched — still Live.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Live);
+    }
+
+    #[tokio::test]
+    async fn stop_op_halts_locally_when_bucket_says_released() {
+        // Bug-2 reproducer: bucket is Released (e.g. from a partial
+        // earlier release), daemon is still running on this host. Stop
+        // must succeed, halting the daemon and leaving the bucket
+        // record unchanged (we don't own a Released record).
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        let mut rec = NameRecord::live_minimal(vol_ulid);
+        rec.state = NameState::Released;
+        rec.coordinator_id = None;
+        rec.handoff_snapshot = Some(ulid::Ulid::new());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp = stop_volume_op("vol", data_dir.path(), &store, "coord-self").await;
+        assert_eq!(
+            resp, "ok",
+            "stop must halt locally regardless of bucket state"
+        );
+
+        // Local marker now present.
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        assert!(
+            vol_dir.join("volume.stopped").exists(),
+            "volume.stopped marker should be written"
+        );
+
+        // Bucket record untouched: still Released, no coordinator_id.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Released);
+        assert!(still.coordinator_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_op_halts_locally_when_bucket_says_reserved() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        let mut rec = NameRecord::live_minimal(vol_ulid);
+        rec.state = NameState::Reserved;
+        rec.coordinator_id = Some("coord-target".into());
+        rec.handoff_snapshot = Some(ulid::Ulid::new());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp = stop_volume_op("vol", data_dir.path(), &store, "coord-self").await;
+        assert_eq!(resp, "ok");
+
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        assert!(vol_dir.join("volume.stopped").exists());
+
+        // Bucket record untouched.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Reserved);
+        assert_eq!(still.coordinator_id.as_deref(), Some("coord-target"));
+    }
+
+    #[tokio::test]
+    async fn stop_op_halts_locally_when_bucket_says_foreign_live() {
+        // Even split-brain bucket state must not block a local halt.
+        // If a daemon is running on our host while names/<name> is
+        // owned by another coordinator, halting our local process is
+        // the right cleanup — it doesn't affect their host. We leave
+        // the bucket record untouched.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        let mut rec = NameRecord::live_minimal(vol_ulid);
+        rec.coordinator_id = Some("coord-other".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp = stop_volume_op("vol", data_dir.path(), &store, "coord-self").await;
+        assert_eq!(resp, "ok");
+
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        assert!(vol_dir.join("volume.stopped").exists());
+
+        // Bucket record untouched — still owned by the other coordinator.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Live);
+        assert_eq!(still.coordinator_id.as_deref(), Some("coord-other"));
     }
 }
