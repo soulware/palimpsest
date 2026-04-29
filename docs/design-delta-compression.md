@@ -143,7 +143,7 @@ No filemap. No delta. Full extents only. The read path, segment format, and GC a
 | 1 | Delta format + PoC drain-time producer | **done** (superseded) |
 | 2 | `extent_index` lineage + cross-import dedup | **done** |
 | 3 | File-aware import + thin Delta + filemap producer | **done** |
-| 4 | Snapshot-time filemap generation | **deferred to import-time (April 2026)** |
+| 4 | Snapshot-time filemap generation | **explicit verb (April 2026)** |
 | 5 Tier 1 | Pre-drain delta (same-LBA prior extent) | **done** |
 | 5 Tier 2 | Filemap-driven cross-LBA source selection | deferred |
 | 6 | Content-similarity source selection | deferred |
@@ -162,9 +162,11 @@ The producer runs **in-process in `elide-import`** rather than in the coordinato
 
 Phase 3 also removed the Phase 1 PoC path at `elide-coordinator/src/delta.rs` and its `drain_pending()` hook. Two producers racing for the same entries with different source-selection rules was unnecessary complexity once the real path landed.
 
-**Phase 4 — snapshot-time filemap generation (deferred to import-time, April 2026).** Originally ran inline in the coordinator's snapshot sequence after `sign_snapshot_manifest`. Removed from the snapshot path: the ext4 layout scan + per-fragment hash lookup demand-fetched each missing block range across the ancestor chain and dominated `volume release` wall time on freshly-pulled volumes (~104s on an 8-deep chain). Phase 4 is strictly additive — failures never fail the snapshot — and the only consumer in the live system is `elide volume import --extents-from <volume>`, which is operator-invoked. So the cost was on the user-visible release path while the benefit landed on a separate manual command.
+**Phase 4 — snapshot-time filemap generation (explicit verb, April 2026).** Originally ran inline in the coordinator's snapshot sequence after `sign_snapshot_manifest`. Removed from the snapshot path: the ext4 layout scan + per-fragment hash lookup demand-fetched each missing block range across the ancestor chain and dominated `volume release` wall time on freshly-pulled volumes (~104s on an 8-deep chain). Phase 4 is strictly additive — failures never fail the snapshot — and the only consumer in the live system is `elide volume import --extents-from <volume>`, which is operator-invoked. So the cost was on the user-visible release path while the benefit landed on a separate manual command.
 
-The filemap is now generated lazily on demand in `delta_compute::rewrite_pending_with_deltas`: when a `--extents-from` source has no `<snap>.filemap`, the import path runs `filemap::generate_from_snapshot` against that source with a local-only fetcher. Sources whose segments are evicted can't act as delta sources anyway (the delta dictionary needs body bytes), so failing to generate the filemap is the same outcome — that source is skipped.
+The filemap is now generated only when explicitly requested via `elide volume generate-filemap <name> [--snapshot <ulid>]`. The verb resolves the volume locally, defaults `<ulid>` to the latest local snapshot when omitted, and runs `filemap::generate_from_snapshot` against the sealed snapshot with a coordinator-vended `RemoteFetcher` so demand-fetch from S3 works for evicted segments. The result is written atomically to `snapshots/<ulid>.filemap` and uploaded to S3 by the next drain.
+
+Operators wanting delta compression on a `volume import --extents-from <source>` invocation should run `elide volume generate-filemap <source>` first. Without a source filemap, the import path skips delta opportunities for that source and falls back to plain DATA entries — `delta_compute::rewrite_pending_with_deltas` `continue`s past sources whose `<snap>.filemap` is missing.
 
 Imports continue to write the importing volume's own filemap inline in `elide-core/src/import.rs`; that path is fast because the import already has ext4 layout in hand.
 

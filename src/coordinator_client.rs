@@ -388,6 +388,32 @@ pub fn snapshot_volume(socket_path: &Path, name: &str) -> io::Result<String> {
     }
 }
 
+/// Generate `snapshots/<snap_ulid>.filemap` for a local volume.
+///
+/// `snap_ulid` defaults to the volume's latest local snapshot when
+/// omitted. The coordinator opens the sealed snapshot (with demand-fetch
+/// against S3 for evicted segments), walks the ext4 layout, and writes
+/// the filemap. Used to seed delta-compression sources for subsequent
+/// `volume import --extents-from <name>` invocations.
+///
+/// Returns the snapshot ULID on success.
+pub fn generate_filemap(
+    socket_path: &Path,
+    name: &str,
+    snap_ulid: Option<&str>,
+) -> io::Result<String> {
+    let line = match snap_ulid {
+        Some(s) => format!("generate-filemap {name} {s}"),
+        None => format!("generate-filemap {name}"),
+    };
+    let resp = call(socket_path, &line)?;
+    match resp.split_once(' ') {
+        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
 /// Stats returned by `reclaim_volume`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReclaimStats {

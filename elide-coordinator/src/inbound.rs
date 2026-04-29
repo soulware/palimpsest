@@ -437,6 +437,17 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             .await
         }
 
+        "generate-filemap" => {
+            if args.is_empty() {
+                return "err usage: generate-filemap <volume> [<snap_ulid>]".to_string();
+            }
+            let (vol_name, snap_arg) = match args.split_once(' ') {
+                Some((name, snap)) => (name, Some(snap.trim())),
+                None => (args, None),
+            };
+            generate_filemap_op(vol_name, snap_arg, &ctx.data_dir, &ctx.store).await
+        }
+
         "reclaim" => {
             if args.is_empty() {
                 return "err usage: reclaim <volume>".to_string();
@@ -953,6 +964,100 @@ fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
     // want a freshly minted ULID when the index is empty.
     #[allow(clippy::unwrap_or_default)]
     Ok(latest.unwrap_or_else(ulid::Ulid::new))
+}
+
+// ── Snapshot filemap generation ───────────────────────────────────────────────
+
+/// Handle the `generate-filemap <vol> [<snap_ulid>]` IPC verb.
+///
+/// Looks up the volume by name, defaults `snap_ulid` to the latest local
+/// snapshot when omitted, and runs `filemap::generate_from_snapshot` against
+/// it with a coordinator-vended `RemoteFetcher` so demand-fetch works for
+/// evicted segments.
+///
+/// The filemap is the only piece of snapshot metadata that is expensive to
+/// produce (ext4 layout walk + per-fragment hash lookup). Used to be inline
+/// in `snapshot_volume` but the cost was wasted on the user-visible release
+/// path because the only consumer is `elide volume import --extents-from`.
+/// Operators wanting to seed a delta source now invoke this verb explicitly.
+async fn generate_filemap_op(
+    vol_name: &str,
+    snap_arg: Option<&str>,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> String {
+    let link = data_dir.join("by_name").join(vol_name);
+    let fork_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(_) => return format!("err volume not found: {vol_name}"),
+    };
+
+    let snap_ulid = match snap_arg {
+        Some(s) => match ulid::Ulid::from_string(s) {
+            Ok(u) => u,
+            Err(e) => return format!("err invalid snap_ulid '{s}': {e}"),
+        },
+        None => match elide_core::volume::latest_snapshot(&fork_dir) {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                return format!(
+                    "err volume '{vol_name}' has no local snapshot; \
+                     publish one first with `volume snapshot`"
+                );
+            }
+            Err(e) => return format!("err reading snapshots dir: {e}"),
+        },
+    };
+
+    let started = std::time::Instant::now();
+    if let Err(e) = generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone()).await {
+        return format!("err filemap generation failed for {snap_ulid}: {e:#}");
+    }
+    info!(
+        "[generate-filemap {vol_name}] snapshot {snap_ulid} written in {:.2?}",
+        started.elapsed()
+    );
+    format!("ok {snap_ulid}")
+}
+
+/// Open a sealed snapshot, walk its ext4 layout, and write
+/// `snapshots/<snap_ulid>.filemap`. Runs on a worker thread so the tokio
+/// reactor stays responsive.
+///
+/// Wires a `RemoteFetcher` so demand-fetch works for evicted segments —
+/// freshly-pulled forks have no local segment bodies, so the ext4 inode
+/// table reads must reach S3. The fetcher is constructed inside the
+/// closure (after the search-dir list is known) because each fetcher
+/// binds to a fork chain.
+async fn generate_snapshot_filemap(
+    fork_dir: &Path,
+    snap_ulid: ulid::Ulid,
+    store: Arc<dyn ObjectStore>,
+) -> std::io::Result<()> {
+    let fork_dir = fork_dir.to_owned();
+    let range_fetcher: Arc<dyn elide_fetch::RangeFetcher> =
+        Arc::new(elide_coordinator::range_fetcher::ObjectStoreRangeFetcher::new(store));
+    tokio::task::spawn_blocking(move || {
+        let range_fetcher_for_factory = range_fetcher.clone();
+        let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
+            Box::new(move |search_dirs: &[PathBuf]| {
+                // RemoteFetcher wants oldest-first; BlockReader hands us
+                // newest-first (fork → ancestors).
+                let oldest_first: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
+                elide_fetch::RemoteFetcher::from_store(
+                    range_fetcher_for_factory,
+                    &oldest_first,
+                    elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
+                )
+                .ok()
+                .map(|f| Box::new(f) as Box<dyn elide_core::segment::SegmentFetcher>)
+            });
+        let _wrote =
+            elide_core::filemap::generate_from_snapshot(&fork_dir, &snap_ulid, mk_fetcher)?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("filemap join: {e}")))?
 }
 
 // ── Volume status ─────────────────────────────────────────────────────────────
@@ -4539,5 +4644,45 @@ mod tests {
             resp.starts_with("err prefetch task exited"),
             "expected err prefetch task exited..., got {resp}"
         );
+    }
+
+    // ── generate-filemap argument validation ─────────────────────────────
+
+    #[tokio::test]
+    async fn generate_filemap_unknown_volume_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
+        let store = mem_store();
+        let resp = generate_filemap_op("ghost", None, tmp.path(), &store).await;
+        assert!(resp.starts_with("err volume not found"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn generate_filemap_invalid_snap_ulid_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let vol_dir = tmp.path().join("by_id").join(vol_ulid);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
+        let store = mem_store();
+        let resp = generate_filemap_op("vol", Some("not-a-ulid"), tmp.path(), &store).await;
+        assert!(resp.starts_with("err invalid snap_ulid"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn generate_filemap_no_snapshot_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let vol_dir = tmp.path().join("by_id").join(vol_ulid);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
+        let store = mem_store();
+        let resp = generate_filemap_op("vol", None, tmp.path(), &store).await;
+        assert!(resp.starts_with("err"), "{resp}");
+        assert!(resp.contains("no local snapshot"), "{resp}");
     }
 }

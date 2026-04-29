@@ -201,6 +201,26 @@ enum VolumeCommand {
         name: String,
     },
 
+    /// Generate the snapshot filemap for a volume.
+    ///
+    /// Walks the ext4 layout of the named snapshot (defaulting to the
+    /// latest local one) and writes `snapshots/<ulid>.filemap`. Demand-
+    /// fetches segment bytes from S3 if needed, so this works on
+    /// freshly-pulled volumes whose segments haven't been hydrated.
+    ///
+    /// The filemap is consumed by `volume import --extents-from <name>`
+    /// for file-aware delta compression. Run this against the source
+    /// volume before importing if you want delta savings — without it,
+    /// the import path skips delta opportunities for that source and
+    /// falls back to plain DATA entries.
+    GenerateFilemap {
+        /// Volume name
+        name: String,
+        /// Specific snapshot ULID (defaults to the latest local snapshot)
+        #[arg(long, value_name = "ULID")]
+        snapshot: Option<String>,
+    },
+
     /// Create a new volume.
     ///
     /// With `--from`, creates a writable replica branched from an existing
@@ -530,6 +550,17 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+
+            VolumeCommand::GenerateFilemap { name, snapshot } => {
+                match coordinator_client::generate_filemap(&socket_path, &name, snapshot.as_deref())
+                {
+                    Ok(ulid) => println!("{name}: filemap written for snapshot {ulid}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
 
             VolumeCommand::Create {
                 name,
