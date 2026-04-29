@@ -34,13 +34,20 @@ fn is_missing_file_error(e: &io::Error) -> bool {
     msg.contains("No such file or directory")
 }
 
+// These helpers are called from every volume-open path (NBD,
+// readonly NBD, and IPC-only — the last binds no NBD listener), so
+// the warnings should not mention NBD. Pin the tracing target to
+// `elide::volume` so log lines reflect the actual subsystem.
 fn open_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<Volume> {
     let started = Instant::now();
     loop {
         match Volume::open(dir, by_id_dir) {
             Ok(v) => return Ok(v),
             Err(e) if is_missing_file_error(&e) && started.elapsed() < OPEN_RETRY_BUDGET => {
-                warn!("volume open: ancestor artifact missing, retrying ({e})");
+                warn!(
+                    target: "elide::volume",
+                    "volume open: ancestor artifact missing, retrying ({e})"
+                );
                 std::thread::sleep(OPEN_RETRY_STEP);
             }
             Err(e) => return Err(e),
@@ -54,7 +61,10 @@ fn open_readonly_volume_with_retry(dir: &Path, by_id_dir: &Path) -> io::Result<R
         match ReadonlyVolume::open(dir, by_id_dir) {
             Ok(v) => return Ok(v),
             Err(e) if is_missing_file_error(&e) && started.elapsed() < OPEN_RETRY_BUDGET => {
-                warn!("volume open (readonly): ancestor artifact missing, retrying ({e})");
+                warn!(
+                    target: "elide::volume",
+                    "volume open (readonly): ancestor artifact missing, retrying ({e})"
+                );
                 std::thread::sleep(OPEN_RETRY_STEP);
             }
             Err(e) => return Err(e),
