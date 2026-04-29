@@ -594,14 +594,20 @@ pub fn release_volume(socket_path: &Path, name: &str, opts: ReleaseOpts<'_>) -> 
 
 /// Outcome of a `start_volume` call. The coordinator routes by the
 /// bucket-side `names/<name>` state; the response distinguishes the
-/// local-only path from the claim-from-released path that needs CLI
-/// orchestration.
+/// local-only path, the in-place reclaim of an own released name,
+/// and the cross-coordinator claim that needs CLI orchestration.
 pub enum StartOutcome {
     /// Daemon was started locally (state was Stopped, ours; or Live, ours;
     /// or no S3 record yet).
     Started,
-    /// Name is in `Released` state — the CLI needs to orchestrate fork
-    /// creation, then call `claim_volume` with the new ULID.
+    /// `Released` record's `vol_ulid` matched the local fork on disk —
+    /// the IPC flipped state back to `Live` keeping the same ULID. No
+    /// CLI orchestration was needed; the daemon is already started.
+    /// The CLI surfaces this distinction in its output.
+    Reclaimed,
+    /// `Released` record's `vol_ulid` is foreign content — the CLI
+    /// needs to pull, mint a fresh fork, and call `claim_volume` with
+    /// the new ULID.
     NeedsClaim {
         released_vol_ulid: String,
         handoff_snapshot: Option<String>,
@@ -610,12 +616,14 @@ pub enum StartOutcome {
 
 /// Start a volume.
 ///
-/// Defaults to **local-only**: if `<name>` has no local state on the
-/// coordinator's data dir, returns an error pointing the operator at
-/// `--remote`. With `remote = true`, the IPC reads `names/<name>` from
-/// the bucket; if the record is `Released` (or `Reserved` for this
-/// coordinator), returns `NeedsClaim` so the CLI can pull, fork, and
-/// claim. Bucket reads only happen when `remote` is set.
+/// Defaults to **local-only**: bucket-side state changes require
+/// `--remote`. Without it, the IPC refuses (1) when `<name>` has no
+/// local state, and (2) when the bucket-side `names/<name>` record is
+/// `Released` — both cases return an error pointing the operator at
+/// `--remote`. With `remote = true`, the IPC reclaims a `Released`
+/// record in place when the local fork's ULID matches (`Reclaimed`),
+/// or surfaces the cross-coordinator claim pin (`NeedsClaim`) when
+/// the released ULID is foreign content.
 pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<StartOutcome> {
     let cmd = if remote {
         format!("start {name} --remote")
@@ -625,6 +633,9 @@ pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<
     let resp = call(socket_path, &cmd)?;
     if resp == "ok" {
         return Ok(StartOutcome::Started);
+    }
+    if resp == "ok reclaimed" {
+        return Ok(StartOutcome::Reclaimed);
     }
     if let Some(rest) = resp.strip_prefix("released ") {
         let mut parts = rest.split_whitespace();
