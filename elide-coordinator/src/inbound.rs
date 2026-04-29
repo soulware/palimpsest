@@ -2397,6 +2397,17 @@ async fn release_volume_op(
 /// `Released`) and `release_to_volume_op` (final flip = `Reserved`
 /// for a specific target). The drain → snapshot → halt path is
 /// identical; only the final `mark_*` call differs.
+///
+/// Two execution paths:
+///
+/// 1. **Fast path** (clean stopped volume, nothing to drain): reuse
+///    the previously-published snapshot as the handoff, skip the
+///    daemon restart entirely. Costs one S3 GET (ownership) + one
+///    conditional PUT (flip).
+///
+/// 2. **Slow path** (WAL non-empty / pending uploads / GC handoffs /
+///    new segments since last snapshot): bring the daemon up in
+///    drain mode, run the existing snapshot pipeline, halt, flip.
 #[allow(clippy::too_many_arguments)]
 async fn release_with_final_flip(
     volume_name: &str,
@@ -2408,6 +2419,9 @@ async fn release_with_final_flip(
     coord_id: &str,
     rescan: &Notify,
 ) -> String {
+    let started = std::time::Instant::now();
+    info!("[release {volume_name}] start");
+
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return format!("err volume not found: {volume_name}");
@@ -2428,52 +2442,26 @@ async fn release_with_final_flip(
     // to halt it inline, and any failure between halt and bucket-flip
     // would leave the volume in a "Released-but-running" mismatch the
     // operator can't easily recover from.
-    //
-    // The drain itself still needs an IPC-capable daemon, so we
-    // transparently bring the stopped volume back up in IPC-only mode
-    // here. The `volume.draining` marker tells both the supervisor and
-    // the volume binary to suppress transport setup; from a client's
-    // perspective the volume is never visibly running during release.
-    //
-    // The `_draining_guard` removes the marker when this function
-    // returns, regardless of which exit path is taken (success, early
-    // error, panic). Without a guard the marker would leak on any of
-    // the many `return format!(...)` exits in the release flow.
     if !vol_dir.join("volume.stopped").exists() {
         return format!(
             "err volume '{volume_name}' is running; \
              stop it first with: elide volume stop {volume_name}"
         );
     }
-    if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
-        return format!("err writing volume.draining: {e}");
-    }
-    if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
-        let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
-        return format!("err clearing volume.stopped for release: {e}");
-    }
-    rescan.notify_one();
-    let mut _draining_guard = Some(DrainingMarkerGuard::new(vol_dir.clone()));
-    if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
-        return format!("err timed out waiting for volume '{volume_name}' to come up for release");
-    }
 
-    if !vol_dir.join("control.sock").exists() {
-        return format!("err volume '{volume_name}' is not running — start it first");
-    }
-
-    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
-        Some(resp) if resp == "ok true" => {
-            return "err nbd client is connected; disconnect it first".to_string();
-        }
-        _ => {}
-    }
-
-    // Verify ownership in S3 before kicking off the (expensive) drain.
-    use elide_coordinator::lifecycle;
+    // Verify ownership in S3 before doing any local state mutation.
+    // Pulled ahead of the daemon restart so a "wrong owner" or
+    // "already released" reply doesn't perturb the local volume.
     use elide_core::name_record::NameState;
+    let read_started = std::time::Instant::now();
     match elide_coordinator::name_store::read_name_record(store, volume_name).await {
         Ok(Some((rec, _))) => {
+            info!(
+                "[release {volume_name}] read names/<name>: state={:?} owner={:?} ({:.2?})",
+                rec.state,
+                rec.coordinator_id,
+                read_started.elapsed()
+            );
             if let Some(existing) = rec.coordinator_id.as_deref()
                 && existing != coord_id
             {
@@ -2487,8 +2475,6 @@ async fn release_with_final_flip(
             }
         }
         Ok(None) => {
-            // No record yet — release of an unpublished volume is
-            // meaningless (nothing for the next claimant to fork from).
             return format!("err name '{volume_name}' has no S3 record; drain the volume first");
         }
         Err(e) => {
@@ -2496,10 +2482,84 @@ async fn release_with_final_flip(
         }
     }
 
-    // Drain WAL → publish handoff snapshot. Reuses the existing
-    // snapshot_volume path. Empty volumes get a freshly-minted snapshot
-    // ULID like any other — they are published as a snapshot with zero
-    // segments, which the claim path forks from as a fresh empty root.
+    // Fast path: nothing has changed since the last published snapshot,
+    // so reuse it as the handoff. The next claimant forks from it
+    // identically to a freshly-minted one.
+    match release_fast_path_handoff(&vol_dir) {
+        Ok(Some(snap_ulid)) => {
+            info!(
+                "[release {volume_name}] fast path: reusing snapshot {snap_ulid} \
+                 (clean stopped volume, no daemon restart needed)"
+            );
+            let result =
+                perform_release_flip(volume_name, &final_flip, store, coord_id, snap_ulid).await;
+            info!(
+                "[release {volume_name}] complete in {:.2?}",
+                started.elapsed()
+            );
+            return result;
+        }
+        Ok(None) => {
+            info!(
+                "[release {volume_name}] slow path: WAL/pending/gc has work or \
+                 segments post-date last snapshot"
+            );
+        }
+        Err(e) => {
+            warn!(
+                "[release {volume_name}] fast-path inspection failed ({e}); \
+                 falling back to slow path"
+            );
+        }
+    }
+
+    // ── Slow path: bring daemon up in drain mode ────────────────────
+    //
+    // The drain step needs an IPC-capable daemon, so we transparently
+    // bring the stopped volume back up in IPC-only mode here. The
+    // `volume.draining` marker tells both the supervisor and the
+    // volume binary to suppress transport setup; from a client's
+    // perspective the volume is never visibly running during release.
+    //
+    // The `_draining_guard` removes the marker when this function
+    // returns, regardless of which exit path is taken (success, early
+    // error, panic).
+    if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
+        return format!("err writing volume.draining: {e}");
+    }
+    if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+        let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
+        return format!("err clearing volume.stopped for release: {e}");
+    }
+    rescan.notify_one();
+    let mut _draining_guard = Some(DrainingMarkerGuard::new(vol_dir.clone()));
+
+    let bringup_started = std::time::Instant::now();
+    info!("[release {volume_name}] bringing daemon up for drain");
+    if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
+        return format!("err timed out waiting for volume '{volume_name}' to come up for release");
+    }
+    info!(
+        "[release {volume_name}] daemon ready in {:.2?}",
+        bringup_started.elapsed()
+    );
+
+    if !vol_dir.join("control.sock").exists() {
+        return format!("err volume '{volume_name}' is not running — start it first");
+    }
+
+    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
+        Some(resp) if resp == "ok true" => {
+            return "err nbd client is connected; disconnect it first".to_string();
+        }
+        _ => {}
+    }
+
+    // Drain WAL → publish handoff snapshot. Empty volumes get a
+    // freshly-minted snapshot ULID; the claim path forks from a
+    // zero-entry snapshot as a fresh empty root.
+    let snap_started = std::time::Instant::now();
+    info!("[release {volume_name}] draining WAL and publishing handoff snapshot");
     let snap_resp = snapshot_volume(
         volume_name,
         data_dir,
@@ -2516,6 +2576,10 @@ async fn release_with_final_flip(
         Ok(u) => u,
         Err(e) => return format!("err parsing snapshot ULID '{snap_ulid_str}': {e}"),
     };
+    info!(
+        "[release {volume_name}] handoff snapshot {snap_ulid} published in {:.2?}",
+        snap_started.elapsed()
+    );
 
     // Halt the daemon. Writing the marker first prevents the supervisor
     // from restarting it between shutdown and our final state write.
@@ -2529,6 +2593,7 @@ async fn release_with_final_flip(
     if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
         return format!("err writing volume.stopped: {e}");
     }
+    info!("[release {volume_name}] halting daemon");
     match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
         Some(resp) if resp == "ok" => {}
         Some(resp) => {
@@ -2542,11 +2607,38 @@ async fn release_with_final_flip(
         }
     }
 
-    // Final step: flip names/<name> to Released or Reserved,
-    // recording the handoff snapshot. From this point the next
-    // claimant (any coordinator for `Released`, the named one for
-    // `Reserved`) may claim the name.
-    let flip_result = match &final_flip {
+    let result = perform_release_flip(volume_name, &final_flip, store, coord_id, snap_ulid).await;
+    info!(
+        "[release {volume_name}] complete in {:.2?}",
+        started.elapsed()
+    );
+    result
+}
+
+/// Final S3 conditional PUT flipping `names/<name>` to Released
+/// (plain) or Reserved (targeted handoff). Used by both the fast and
+/// slow paths since the bucket-side state machine is identical from
+/// here on.
+async fn perform_release_flip(
+    volume_name: &str,
+    final_flip: &ReleaseFinalFlip,
+    store: &Arc<dyn ObjectStore>,
+    coord_id: &str,
+    snap_ulid: ulid::Ulid,
+) -> String {
+    use elide_coordinator::lifecycle;
+    let flip_started = std::time::Instant::now();
+    let target_desc = match final_flip {
+        ReleaseFinalFlip::Released => "Released".to_owned(),
+        ReleaseFinalFlip::Reserved { target_coord_id } => {
+            format!("Reserved (target={target_coord_id})")
+        }
+    };
+    info!(
+        "[release {volume_name}] flipping names/<name> -> {target_desc} \
+         with handoff snapshot {snap_ulid}"
+    );
+    let flip_result = match final_flip {
         ReleaseFinalFlip::Released => {
             lifecycle::mark_released(store, volume_name, coord_id, snap_ulid)
                 .await
@@ -2560,13 +2652,17 @@ async fn release_with_final_flip(
     };
     match flip_result {
         Ok(()) => {
-            let kind = match &final_flip {
+            let kind = match final_flip {
                 ReleaseFinalFlip::Released => "released".to_owned(),
                 ReleaseFinalFlip::Reserved { target_coord_id } => {
                     format!("released-to {target_coord_id}")
                 }
             };
-            info!("[inbound] {kind} volume {volume_name} at handoff snapshot {snap_ulid}");
+            info!(
+                "[release {volume_name}] {kind} at handoff snapshot {snap_ulid} \
+                 (flip {:.2?})",
+                flip_started.elapsed()
+            );
             format!("ok {snap_ulid}")
         }
         Err(e) => {
@@ -2574,10 +2670,115 @@ async fn release_with_final_flip(
             // is published). The S3 record write failed — the operator
             // can retry or run `volume release --force` from a peer to
             // recover.
-            warn!("[inbound] release {volume_name}: state flip failed: {e}");
+            warn!("[release {volume_name}] state flip failed: {e}");
             format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
         }
     }
+}
+
+/// Decide whether `release` can short-circuit using the volume's most
+/// recently published snapshot as the handoff point.
+///
+/// Returns `Ok(Some(ulid))` when **all** of the following hold:
+///   - `wal/`, `pending/`, `gc/` are empty or absent (no in-flight work)
+///   - the latest segment in `index/` does not post-date the latest
+///     local snapshot marker (the snapshot covers everything)
+///   - that snapshot's S3 upload sentinel is present (manifest +
+///     marker + filemap are confirmed on S3 — without this, a future
+///     claimant could fail to fetch the manifest)
+///
+/// `Ok(None)` means slow path required; an `Err` is propagated to the
+/// caller as a fast-path inspection failure (also slow-path fallback).
+fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+    if !dir_is_empty_or_absent(&vol_dir.join("wal"))? {
+        return Ok(None);
+    }
+    if !dir_is_empty_or_absent(&vol_dir.join("pending"))? {
+        return Ok(None);
+    }
+    if !dir_is_empty_or_absent(&vol_dir.join("gc"))? {
+        return Ok(None);
+    }
+
+    let Some(snap_ulid) = latest_snapshot_marker(&vol_dir.join("snapshots"))? else {
+        return Ok(None);
+    };
+
+    // The snapshot triple (marker + filemap + .manifest) is uploaded
+    // atomically; the sentinel is written only after all three succeed.
+    // Its presence is the canonical "this snapshot is on S3" check.
+    let sentinel = vol_dir
+        .join("uploaded")
+        .join("snapshots")
+        .join(snap_ulid.to_string());
+    if !sentinel.exists() {
+        return Ok(None);
+    }
+
+    if let Some(seg) = latest_segment_ulid(&vol_dir.join("index"))?
+        && seg > snap_ulid
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(snap_ulid))
+}
+
+fn dir_is_empty_or_absent(p: &Path) -> std::io::Result<bool> {
+    match std::fs::read_dir(p) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Return the highest ULID among `snapshots/<ulid>` markers (skipping
+/// `<ulid>.manifest` / `<ulid>.filemap` siblings).
+fn latest_snapshot_marker(snap_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+    let entries = match std::fs::read_dir(snap_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut latest: Option<ulid::Ulid> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        // Skip filemap/manifest siblings: `<ulid>.filemap`,
+        // `<ulid>.manifest`. Plain marker is the bare ULID.
+        if s.contains('.') {
+            continue;
+        }
+        if let Ok(u) = ulid::Ulid::from_string(s)
+            && latest.is_none_or(|cur| u > cur)
+        {
+            latest = Some(u);
+        }
+    }
+    Ok(latest)
+}
+
+/// Return the highest ULID among `index/<ulid>.idx` files.
+fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+    let entries = match std::fs::read_dir(index_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut latest: Option<ulid::Ulid> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Some(stem) = s.strip_suffix(".idx") else {
+            continue;
+        };
+        if let Ok(u) = ulid::Ulid::from_string(stem)
+            && latest.is_none_or(|cur| u > cur)
+        {
+            latest = Some(u);
+        }
+    }
+    Ok(latest)
 }
 
 /// Claim a `Released` name for a freshly-minted local fork.
@@ -4037,5 +4238,195 @@ mod tests {
         let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
         assert_eq!(still.state, NameState::Live);
         assert_eq!(still.coordinator_id.as_deref(), Some("coord-other"));
+    }
+
+    // ── release fast-path predicate ────────────────────────────────────
+    //
+    // `release_fast_path_handoff` decides whether a `volume release` can
+    // skip the daemon restart and reuse the previously-published
+    // snapshot. Each branch below exercises one ineligibility reason
+    // plus one happy path. Per CLAUDE.md "monotonic ULIDs in tests" we
+    // mint via `UlidMint` whenever ordering matters.
+
+    use elide_core::ulid_mint::UlidMint;
+
+    /// Set up the on-disk skeleton a clean stopped volume would have
+    /// after at least one snapshot has been published and uploaded.
+    fn fast_path_clean_volume(snap_ulid: ulid::Ulid) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        // Snapshot marker (bare-ULID file).
+        std::fs::write(tmp.path().join("snapshots").join(snap_ulid.to_string()), "").unwrap();
+        // Upload sentinel: volume/<id>/uploaded/snapshots/<ulid>.
+        std::fs::create_dir_all(tmp.path().join("uploaded").join("snapshots")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(snap_ulid.to_string()),
+            "",
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn fast_path_eligible_when_clean_with_uploaded_snapshot() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        let got = release_fast_path_handoff(tmp.path()).unwrap();
+        assert_eq!(got, Some(snap));
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_wal_non_empty() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(
+            tmp.path().join("wal").join("01JANYSEGULID00000000000000"),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_pending_non_empty() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(tmp.path().join("pending").join("seg"), "x").unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_gc_non_empty() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(
+            tmp.path().join("gc").join("01JANYGCULID0000000000000000"),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_no_snapshot_published() {
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_snapshot_not_yet_uploaded() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        // Remove the sentinel: snapshot is signed locally but not on S3.
+        std::fs::remove_file(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(snap.to_string()),
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_segment_post_dates_snapshot() {
+        let mut mint = UlidMint::new(ulid::Ulid::nil());
+        let snap = mint.next();
+        let later_segment = mint.next();
+        assert!(later_segment > snap, "UlidMint must mint monotonically");
+        let tmp = fast_path_clean_volume(snap);
+        // A new segment landed in `index/` after the last snapshot —
+        // slow path must run so the new snapshot covers it.
+        std::fs::write(
+            tmp.path()
+                .join("index")
+                .join(format!("{later_segment}.idx")),
+            "",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_eligible_when_segment_predates_snapshot() {
+        let mut mint = UlidMint::new(ulid::Ulid::nil());
+        let earlier_segment = mint.next();
+        let snap = mint.next();
+        assert!(snap > earlier_segment);
+        let tmp = fast_path_clean_volume(snap);
+        // Older segment is already covered by the snapshot — fine.
+        std::fs::write(
+            tmp.path()
+                .join("index")
+                .join(format!("{earlier_segment}.idx")),
+            "",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), Some(snap));
+    }
+
+    #[test]
+    fn fast_path_picks_latest_snapshot_when_multiple_present() {
+        let mut mint = UlidMint::new(ulid::Ulid::nil());
+        let older_snap = mint.next();
+        let newer_snap = mint.next();
+        let tmp = fast_path_clean_volume(newer_snap);
+        // Older marker + sentinel (the volume kept history).
+        std::fs::write(
+            tmp.path().join("snapshots").join(older_snap.to_string()),
+            "",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(older_snap.to_string()),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(newer_snap)
+        );
+    }
+
+    #[test]
+    fn fast_path_ignores_filemap_and_manifest_siblings() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        // The snapshots dir has marker plus .filemap and .manifest
+        // siblings; only the bare-ULID marker should be considered.
+        std::fs::write(
+            tmp.path().join("snapshots").join(format!("{snap}.filemap")),
+            "fm",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.manifest")),
+            "mf",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), Some(snap));
+    }
+
+    #[test]
+    fn fast_path_treats_missing_subdirs_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        // No wal/, pending/, gc/, index/ directories yet — a brand-new
+        // volume that just happens to have no snapshot. Should fall
+        // through cleanly to the "no snapshot" branch.
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
     }
 }

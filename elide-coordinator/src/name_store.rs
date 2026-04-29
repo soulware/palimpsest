@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutResult, UpdateVersion};
+use tracing::debug;
 
 use elide_core::name_record::{NameRecord, ParseNameRecordError};
 
@@ -98,14 +99,24 @@ pub async fn read_name_record(
     name: &str,
 ) -> Result<Option<(NameRecord, UpdateVersion)>, NameStoreError> {
     let key = name_key(name);
+    let started = std::time::Instant::now();
     let got = match store.get(&key).await {
         Ok(g) => g,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(object_store::Error::NotFound { .. }) => {
+            debug!("[name_store] GET {key} -> 404 ({:.2?})", started.elapsed());
+            return Ok(None);
+        }
         Err(e) => return Err(NameStoreError::Store(e)),
     };
     let meta = got.meta.clone();
     let bytes = got.bytes().await.map_err(NameStoreError::Store)?;
     let record = parse(&bytes)?;
+    debug!(
+        "[name_store] GET {key} -> {} bytes, state={:?} ({:.2?})",
+        bytes.len(),
+        record.state,
+        started.elapsed()
+    );
     let version = UpdateVersion {
         e_tag: meta.e_tag,
         version: meta.version,
@@ -124,7 +135,13 @@ pub async fn create_name_record(
 ) -> Result<UpdateVersion, NameStoreError> {
     let body = serialise(record)?;
     let key = name_key(name);
+    let started = std::time::Instant::now();
     let r = put_if_absent(store.as_ref(), &key, body).await?;
+    debug!(
+        "[name_store] PUT-IF-ABSENT {key} state={:?} ({:.2?})",
+        record.state,
+        started.elapsed()
+    );
     Ok(put_result_to_version(r))
 }
 
@@ -141,7 +158,13 @@ pub async fn update_name_record(
 ) -> Result<UpdateVersion, NameStoreError> {
     let body = serialise(record)?;
     let key = name_key(name);
+    let started = std::time::Instant::now();
     let r = put_with_match(store.as_ref(), &key, body, expected).await?;
+    debug!(
+        "[name_store] PUT-IF-MATCH {key} state={:?} ({:.2?})",
+        record.state,
+        started.elapsed()
+    );
     Ok(put_result_to_version(r))
 }
 
@@ -159,10 +182,16 @@ pub async fn overwrite_name_record(
 ) -> Result<UpdateVersion, NameStoreError> {
     let body = serialise(record)?;
     let key = name_key(name);
+    let started = std::time::Instant::now();
     let r = store
         .put(&key, body.into())
         .await
         .map_err(NameStoreError::Store)?;
+    debug!(
+        "[name_store] PUT (force) {key} state={:?} ({:.2?})",
+        record.state,
+        started.elapsed()
+    );
     Ok(put_result_to_version(r))
 }
 
