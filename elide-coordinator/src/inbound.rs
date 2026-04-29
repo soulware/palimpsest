@@ -1009,6 +1009,21 @@ async fn generate_filemap_op(
         },
     };
 
+    // Pre-check that the snapshot the caller asked for is actually
+    // sealed on disk. `BlockReader::open_snapshot` would surface a
+    // generic NotFound otherwise; a verb-level check makes the error
+    // reflect the user's intent ("you named a snapshot that doesn't
+    // exist locally" vs. "something deep in the reader failed").
+    let manifest_path = fork_dir
+        .join("snapshots")
+        .join(format!("{snap_ulid}.manifest"));
+    if !manifest_path.exists() {
+        return format!(
+            "err snapshot {snap_ulid} not found locally for volume '{vol_name}' \
+             (no snapshots/{snap_ulid}.manifest); pull or snapshot first"
+        );
+    }
+
     let started = std::time::Instant::now();
     if let Err(e) = generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone()).await {
         return format!("err filemap generation failed for {snap_ulid}: {e:#}");
@@ -4684,5 +4699,25 @@ mod tests {
         let resp = generate_filemap_op("vol", None, tmp.path(), &store).await;
         assert!(resp.starts_with("err"), "{resp}");
         assert!(resp.contains("no local snapshot"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn generate_filemap_explicit_unknown_snapshot_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let vol_dir = tmp.path().join("by_id").join(vol_ulid);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
+        let store = mem_store();
+        // Valid ULID, but no matching snapshots/<ulid>.manifest on disk.
+        let bogus = "01J0000000000000000000000V";
+        let resp = generate_filemap_op("vol", Some(bogus), tmp.path(), &store).await;
+        assert!(resp.starts_with("err"), "{resp}");
+        assert!(
+            resp.contains("not found locally") && resp.contains(bogus),
+            "{resp}"
+        );
     }
 }
