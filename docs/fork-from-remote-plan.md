@@ -119,6 +119,19 @@ Known gaps that did not make this branch and should be tackled next:
    state has not fully drained/uploaded to the store, silently losing
    data from the remote copy. Needs a check, or a `--force` gate.
 
+7. **Duplicated prefetch on discovery.** Every directory under `by_id/`
+   is treated as a volume by `discover_volumes`, so each ancestor pulled
+   for a fresh `start --remote` gets its own `run_volume_tasks` and runs
+   `prefetch_indexes` for itself — covering segments the new fork's own
+   `prefetch_indexes` already pulls as part of its ancestor walk. Work is
+   idempotent (on-disk segments are skipped) but a deep chain pays the
+   list-segments / range-GET cost twice. Possible fixes: skip per-fork
+   prefetch when the dir was just materialised as a pulled ancestor
+   skeleton (marker file?), or have the new fork's prefetch be the sole
+   ancestor populator and treat ancestor `run_volume_tasks` as no-op for
+   prefetch. Not blocking — observed during `start --remote` of a
+   7-deep chain on a fresh coordinator.
+
 ## Phases
 
 ### Phase 0 — confirmed cause, no code
