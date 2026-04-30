@@ -2105,15 +2105,8 @@ fn resolve_latest_remote_snapshot(
 
 /// Pretty-print a `StatusRemoteReply` for `elide volume status --remote`.
 fn print_remote_status(name: &str, rs: &coordinator_client::StatusRemoteReply) {
-    use elide_core::name_record::NameState;
-    let state_str = match rs.state {
-        NameState::Live => "live",
-        NameState::Stopped => "stopped",
-        NameState::Released => "released",
-        NameState::Readonly => "readonly",
-    };
     println!("{name}");
-    println!("  state           {state_str}");
+    println!("  state           {}", rs.state);
     println!("  vol_ulid        {}", rs.vol_ulid);
     if let Some(id) = &rs.coordinator_id {
         println!("  coordinator_id  {id}");
