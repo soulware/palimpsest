@@ -3090,6 +3090,11 @@ async fn start_volume_op(
     // Verify ownership in S3 before any local change. A foreign-owned
     // record refuses; a Released record routes to the claim path
     // (not yet implemented — point the operator at it).
+    //
+    // `reclaimed` records whether we took the in-place reclaim path
+    // (Released → Live with the same vol_ulid we already had on
+    // disk). The CLI surfaces this distinction in its output.
+    let mut reclaimed = false;
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
     match mark_live(store, volume_name, coord_id).await {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
@@ -3098,13 +3103,27 @@ async fn start_volume_op(
             // next `drain_pending` will publish an initial Live record.
         }
         Ok(MarkLiveOutcome::Released) => {
-            // Two sub-cases:
+            // The bucket-side record is `Released` — the prior owner
+            // (possibly us, possibly another coordinator) handed it
+            // back to the pool. Reclaiming requires `--remote`
+            // regardless of whether a stale local fork still exists,
+            // so the operator explicitly opts into the bucket-side
+            // state change.
+            if !remote {
+                return format!(
+                    "err name '{volume_name}' is Released; \
+                     reclaim with: elide volume start --remote {volume_name}"
+                );
+            }
+            // Two sub-cases routed below:
             //   1. Local reclaim: the released vol_ulid matches the
             //      ULID this `by_name/<name>` symlink already points
             //      at — i.e. this coordinator owned the volume,
             //      released it, and is now re-claiming. Nothing
             //      changed locally; just flip the S3 state back to
-            //      Live with the same vol_ulid.
+            //      Live with the same vol_ulid. The IPC reports
+            //      `ok reclaimed` so the CLI can surface the
+            //      distinction from a plain Stopped → Live resume.
             //   2. Cross-coordinator claim: the released vol_ulid is
             //      foreign content. Surface the pin so the CLI can
             //      pull, materialise a fresh fork, and `claim`.
@@ -3122,7 +3141,10 @@ async fn start_volume_op(
             match mark_reclaimed_local(store, volume_name, coord_id, local_vol_ulid).await {
                 Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
                     // Fall through to clear `volume.stopped` and
-                    // notify the supervisor.
+                    // notify the supervisor. Record that this was an
+                    // in-place reclaim so the response distinguishes
+                    // it from a plain Stopped → Live resume.
+                    reclaimed = true;
                 }
                 Ok(MarkReclaimedLocalOutcome::ForkMismatch {
                     released_vol_ulid, ..
@@ -3196,7 +3218,11 @@ async fn start_volume_op(
     }
     rescan.notify_one();
     info!("[inbound] started volume {volume_name}");
-    "ok".to_string()
+    if reclaimed {
+        "ok reclaimed".to_string()
+    } else {
+        "ok".to_string()
+    }
 }
 
 // ── Macaroon-authenticated credential vending ────────────────────────────────
@@ -4218,6 +4244,108 @@ mod tests {
         .await;
         assert!(resp.starts_with("err "), "{resp}");
         assert!(resp.contains("not found"), "{resp}");
+    }
+
+    /// Materialise a bare local fork directory + by_name symlink +
+    /// volume.stopped marker so `start_volume_op` routes through the
+    /// "local fork present" branch. Mirrors the on-disk shape left
+    /// behind by `volume stop` (and preserved across `volume release`).
+    fn setup_local_stopped_fork(data_dir: &Path, name: &str, vol: ulid::Ulid) {
+        let by_id = data_dir.join("by_id").join(vol.to_string());
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::write(by_id.join("volume.stopped"), b"").unwrap();
+        let by_name = data_dir.join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(format!("../by_id/{vol}"), by_name.join(name)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_local_against_released_refuses_without_remote() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        // Local fork still on disk (the post-release shape: stop +
+        // release leave by_name and the fork dir intact).
+        let vol = ulid::Ulid::new();
+        setup_local_stopped_fork(data_dir.path(), "vol", vol);
+
+        // Bucket-side record is Released by us (coordinator_id is
+        // cleared on release, matching the lifecycle).
+        let snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(vol);
+        rec.state = NameState::Released;
+        rec.handoff_snapshot = Some(snap);
+        rec.coordinator_id = None;
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", false, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("Released"), "{resp}");
+        assert!(resp.contains("--remote"), "{resp}");
+
+        // Bucket record must still be Released — bare start did not
+        // touch it.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Released);
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_own_released_in_place_reclaim_emits_ok_reclaimed() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        // Same fork ULID locally and in the released record — the
+        // in-place reclaim path.
+        let vol = ulid::Ulid::new();
+        setup_local_stopped_fork(data_dir.path(), "vol", vol);
+
+        let snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(vol);
+        rec.state = NameState::Released;
+        rec.handoff_snapshot = Some(snap);
+        rec.coordinator_id = None;
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert_eq!(resp, "ok reclaimed");
+
+        // Bucket record now Live, owned by us, same vol_ulid.
+        let (now, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(now.state, NameState::Live);
+        assert_eq!(now.coordinator_id.as_deref(), Some("coord-self"));
+        assert_eq!(now.vol_ulid, vol);
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_foreign_released_returns_claim_pin() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        // Local fork from a previous life (A_ulid). Released record
+        // points at a different ULID (B_ulid) — another coordinator
+        // claimed, wrote, released. A's bare `start --remote` must
+        // surface the cross-coord claim pin so the CLI orchestrates
+        // a fresh fork.
+        let mut mint = elide_core::ulid_mint::UlidMint::new(ulid::Ulid::nil());
+        let a_ulid = mint.next();
+        let b_ulid = mint.next();
+        setup_local_stopped_fork(data_dir.path(), "vol", a_ulid);
+
+        let snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(b_ulid);
+        rec.state = NameState::Released;
+        rec.handoff_snapshot = Some(snap);
+        rec.coordinator_id = None;
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert_eq!(resp, format!("released {b_ulid} {snap}"));
     }
 
     // ── release / stop preconditions ──────────────────────────────────────

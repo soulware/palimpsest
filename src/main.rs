@@ -385,16 +385,29 @@ enum VolumeCommand {
 
     /// Start a previously stopped volume.
     ///
-    /// Defaults to local-only: refuses if `<name>` has no local state
-    /// on this host. Use `--remote` to claim a released or reserved
-    /// name from the bucket — that path pulls the source fork's
-    /// ancestor chain, mints a fresh local fork, and atomically
-    /// rebinds `names/<name>`.
+    /// Defaults to local-only: refuses any operation that needs to
+    /// change the bucket-side `names/<name>` ownership record.
+    /// Specifically, bare `volume start` refuses when (1) `<name>`
+    /// has no local state on this host, or (2) the bucket-side record
+    /// is `Released` (even if a local fork from a previous life is
+    /// still on disk). Both cases require `--remote`.
+    ///
+    /// With `--remote`, claiming a `Released` record splits two ways:
+    ///   - In-place reclaim if the local fork's ULID matches the
+    ///     released ULID (this host owned the name, released, and is
+    ///     re-claiming): cheap, no pull, same fork ULID kept.
+    ///   - Cross-coordinator claim otherwise: pulls only the delta
+    ///     since the last local ancestor, mints a fresh local fork
+    ///     descending from the released snapshot, and atomically
+    ///     rebinds `names/<name>`. Any prior local fork remains on
+    ///     disk and serves as ancestor cache where applicable.
     Start {
         /// Volume name
         name: String,
-        /// Reach into the bucket to claim a released or reserved name.
-        /// Without this, bare `volume start` is local-only.
+        /// Required to (re)claim a `Released` or `Reserved` name —
+        /// the bucket-side record is read and rebound. Without this,
+        /// bare `volume start` is purely local (resume of a Stopped
+        /// fork we already own).
         #[arg(long)]
         remote: bool,
     },
@@ -864,15 +877,24 @@ fn main() {
                     Ok(StartOutcome::Started) => {
                         println!("{name}: started");
                     }
+                    Ok(StartOutcome::Reclaimed) => {
+                        // In-place reclaim of a Released name owned by
+                        // this host: the local fork was already on
+                        // disk, the IPC just flipped the bucket-side
+                        // state back to Live. Distinct output so the
+                        // operator sees that an S3 state change
+                        // happened, not a plain Stopped → Live resume.
+                        println!("{name}: reclaimed and started");
+                    }
                     Ok(StartOutcome::NeedsClaim {
                         released_vol_ulid,
                         handoff_snapshot,
                     }) => {
-                        // The IPC only emits NeedsClaim when --remote
-                        // was set, so we know we're allowed to reach
-                        // into S3 here. Without --remote the IPC
-                        // refused with NotFoundLocally and we hit the
-                        // Err arm below.
+                        // Cross-coordinator claim: --remote was set
+                        // and the released vol_ulid is foreign content.
+                        // The IPC refuses NeedsClaim without --remote,
+                        // so reaching this arm means we may pull and
+                        // mint a new local fork.
                         if let Err(e) = claim_released_name(
                             &args.data_dir,
                             &name,
@@ -1595,46 +1617,39 @@ fn create_fork(
 }
 
 /// Classification of a `by_name/<name>` symlink for the
-/// claim-from-released path. Determines whether the CLI may safely
-/// remove the existing symlink before fork-create writes a fresh one.
+/// claim-from-released path. Reaching this code requires the operator
+/// to have passed `--remote` (the IPC refuses bare `start` against a
+/// `Released` record), so any pre-existing symlink is treated as a
+/// stale local pin to be replaced — only the previous target is
+/// reported for the operator log.
 #[derive(Debug, PartialEq, Eq)]
 enum SymlinkState {
     /// No `by_name/<name>` entry exists.
     Absent,
-    /// Symlink points at `by_id/<released_vol_ulid>` (the released
-    /// ancestor we're about to claim from), or the target no longer
-    /// exists. Either way, this host's record of the name is stale
-    /// and the entry can be removed safely.
-    Stale,
-    /// Symlink points at a different ULID that exists locally. Could
-    /// be a different volume sharing the name on this host. Refuse —
-    /// the operator must resolve manually.
-    PointsElsewhere { target: String },
+    /// Symlink exists and will be removed before fork-create writes a
+    /// fresh one. `previous_target` is the target ULID parsed from the
+    /// symlink (the orphaned local fork) when readable, used for the
+    /// operator log message; `None` if the symlink target couldn't be
+    /// parsed (broken read_link, malformed path).
+    Stale { previous_target: Option<String> },
 }
 
 /// Inspect `by_name/<name>` and decide how to handle it before
-/// claiming a released name.
-///
-/// Read the symlink target without following it; resolve to a ULID
-/// by extracting the final path component. The expected target shape
-/// is `../by_id/<ulid>` (relative) or `<data_dir>/by_id/<ulid>`
-/// (absolute).
-fn classify_symlink_for_claim(symlink: &Path, released_vol_ulid: &str) -> SymlinkState {
-    let target = match std::fs::read_link(symlink) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SymlinkState::Absent,
-        // Symlink exists but read_link failed — treat as stale.
-        Err(_) => return SymlinkState::Stale,
-    };
-
-    let target_ulid = target.file_name().and_then(|n| n.to_str());
-    let target_exists = symlink.exists();
-
-    match (target_ulid, target_exists) {
-        (Some(u), _) if u == released_vol_ulid => SymlinkState::Stale,
-        (_, false) => SymlinkState::Stale,
-        _ => SymlinkState::PointsElsewhere {
-            target: target.display().to_string(),
+/// claiming a released name. The symlink target is read without
+/// following it; the trailing path component is the previous fork's
+/// ULID (target shape: `../by_id/<ulid>` relative or
+/// `<data_dir>/by_id/<ulid>` absolute).
+fn classify_symlink_for_claim(symlink: &Path) -> SymlinkState {
+    match std::fs::read_link(symlink) {
+        Ok(target) => SymlinkState::Stale {
+            previous_target: target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SymlinkState::Absent,
+        Err(_) => SymlinkState::Stale {
+            previous_target: None,
         },
     }
 }
@@ -1667,29 +1682,27 @@ fn claim_released_name(
     })?;
     let from = format!("{released_vol_ulid}/{snap}");
 
-    // Stale-symlink recovery: if `by_name/<name>` already points at the
-    // released ancestor (this host previously owned the name and
-    // released it), or at a target that no longer exists (broken link
-    // from a deleted ULID dir), remove it. fork-create will write a
-    // fresh symlink pointing at the new ULID.
-    //
-    // Refuse if the symlink points at something else — that's split-
-    // brain or an unrelated volume, and the operator needs to
-    // resolve it manually.
+    // Stale-symlink recovery: any pre-existing `by_name/<name>` entry
+    // is replaced — the operator opted in by passing `--remote` (the
+    // IPC refuses bare `start` against a `Released` record). The
+    // previous fork's ULID is logged so the operator knows which
+    // `by_id/<ulid>/` directory remains on disk: if it's an ancestor
+    // of the claimed snapshot it serves as transparent ancestor
+    // cache, otherwise it's a true orphan eligible for cleanup.
     let symlink = data_dir.join("by_name").join(name);
-    match classify_symlink_for_claim(&symlink, released_vol_ulid) {
+    match classify_symlink_for_claim(&symlink) {
         SymlinkState::Absent => {}
-        SymlinkState::Stale => {
+        SymlinkState::Stale { previous_target } => {
             std::fs::remove_file(&symlink).map_err(|e| {
                 std::io::Error::other(format!("removing stale by_name/{name}: {e}"))
             })?;
-            eprintln!("[claim] removed stale by_name/{name} (previous local fork)");
-        }
-        SymlinkState::PointsElsewhere { target } => {
-            return Err(std::io::Error::other(format!(
-                "by_name/{name} points at {target} which is not the released ancestor; \
-                 refusing to clobber a different volume — remove the symlink manually if intended"
-            )));
+            match previous_target {
+                Some(prev) => eprintln!(
+                    "[claim] removed stale by_name/{name} (was {prev}; \
+                     by_id/{prev}/ retained on disk)"
+                ),
+                None => eprintln!("[claim] removed stale by_name/{name}"),
+            }
         }
     }
 
@@ -2189,19 +2202,27 @@ mod claim_symlink_tests {
     fn absent_when_symlink_missing() {
         let (_t, _id, by_name) = setup();
         assert_eq!(
-            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            classify_symlink_for_claim(&by_name.join("vol")),
             SymlinkState::Absent,
         );
     }
 
     #[test]
     fn stale_when_target_matches_released() {
+        // In-place reclaim: previous symlink targets the same ULID
+        // we're about to claim. Reaching this code via the cross-
+        // coord claim path is unreachable in practice (the IPC's
+        // mark_reclaimed_local short-circuits and returns
+        // `ok reclaimed`), but the classifier still reports it as
+        // Stale with the previous_target carrying the ULID.
         let (_t, by_id, by_name) = setup();
         std::fs::create_dir_all(by_id.join(RELEASED)).unwrap();
         symlink(format!("../by_id/{RELEASED}"), by_name.join("vol")).unwrap();
         assert_eq!(
-            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
-            SymlinkState::Stale,
+            classify_symlink_for_claim(&by_name.join("vol")),
+            SymlinkState::Stale {
+                previous_target: Some(RELEASED.to_owned()),
+            },
         );
     }
 
@@ -2211,31 +2232,29 @@ mod claim_symlink_tests {
         // Symlink dangling: target by_id directory does not exist.
         symlink(format!("../by_id/{RELEASED}"), by_name.join("vol")).unwrap();
         assert_eq!(
-            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
-            SymlinkState::Stale,
+            classify_symlink_for_claim(&by_name.join("vol")),
+            SymlinkState::Stale {
+                previous_target: Some(RELEASED.to_owned()),
+            },
         );
     }
 
     #[test]
-    fn stale_when_dangling_to_other_ulid() {
-        let (_t, _id, by_name) = setup();
-        // Dangling link to a non-released ULID also classifies as
-        // Stale (target doesn't exist; safe to remove).
-        symlink(format!("../by_id/{OTHER}"), by_name.join("vol")).unwrap();
-        assert_eq!(
-            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
-            SymlinkState::Stale,
-        );
-    }
-
-    #[test]
-    fn points_elsewhere_when_target_is_different_ulid() {
+    fn stale_when_target_is_different_existing_ulid() {
+        // Cross-coordinator claim: another coordinator has claimed,
+        // written, and released the name; A's local symlink still
+        // points at A's old fork. Operator passed --remote so we
+        // remove the symlink and report the previous target — the
+        // orphaned by_id/<prev>/ stays on disk and serves as
+        // ancestor cache if it's part of the claimed chain.
         let (_t, by_id, by_name) = setup();
         std::fs::create_dir_all(by_id.join(OTHER)).unwrap();
         symlink(format!("../by_id/{OTHER}"), by_name.join("vol")).unwrap();
-        match classify_symlink_for_claim(&by_name.join("vol"), RELEASED) {
-            SymlinkState::PointsElsewhere { .. } => {}
-            other => panic!("expected PointsElsewhere, got {other:?}"),
-        }
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol")),
+            SymlinkState::Stale {
+                previous_target: Some(OTHER.to_owned()),
+            },
+        );
     }
 }

@@ -106,7 +106,12 @@ elide volume start --remote <name>        # claim a Released/Reserved name; pull
 elide volume ls <name>                    # readable once prefetch completes
 ```
 
-`start --remote` reads `names/<name>` from the bucket. If the record is `Released` (or `Reserved` for this coordinator), the CLI pulls the released ancestor and its chain into `<data_dir>/by_id/<ulid>/`, mints a fresh local fork, and conditionally rebinds `names/<name>` to the new fork. For `Live`/`Stopped` records held by another coordinator, see [`volume release --force`](#disaster-recovery).
+`start --remote` reads `names/<name>` from the bucket. If the record is `Released` (or `Reserved` for this coordinator), the claim splits two ways:
+
+- **In-place reclaim** when the released `vol_ulid` matches a local fork still on disk (this host owned the name, released it, now re-claims). The IPC flips state back to `Live` keeping the same ULID — no pull, no fork mint. Reported as `<name>: reclaimed and started`. This sub-case still requires `--remote` because the bucket-side ownership record is being changed.
+- **Cross-coordinator claim** otherwise. The CLI pulls the released ancestor's chain into `<data_dir>/by_id/<ulid>/` (only the delta since the last local ancestor — any prior local fork is reused as ancestor cache by the chain walk, since `remote_pull` stops walking up the chain at the first locally-present ancestor), mints a fresh local fork, and conditionally rebinds `names/<name>` to the new fork. Reported as `<name>: claimed and started`. Any prior local fork remains on disk; if it's part of the claimed chain it serves as ancestor cache, otherwise it is a true orphan eligible for cleanup.
+
+For `Live`/`Stopped` records held by another coordinator, see [`volume release --force`](#disaster-recovery).
 
 ## Post-import workflows
 

@@ -174,17 +174,22 @@ Verbs and their state transitions:
   `release` in one verb. `--release` accepts the same `--to` and
   `--force` flags as standalone `release`.
 - **`volume start <name>`** — claim. Defaults to **local-only**:
-  the coordinator must already have local state for `<name>`
-  (a `by_name/<name>` symlink with usable on-disk data). Allowed
-  local cases: (a) record absent locally but a stopped fork exists
-  for resume, (b) prior in-place reclaim of a `released` record this
-  host last owned. Names with no local data are refused with a
-  pointer to `volume start --remote <name>`. **`--remote`** opts
-  into the S3 claim-from-released path: pulls the released fork's
-  ancestor chain and mints a fresh local fork. `volume start` never
-  overrides another coordinator's ownership — to recover a name held
-  by an unreachable peer, the operator runs `volume release --force`
-  first, then `volume start --remote`.
+  bare `start` may resume a `stopped` fork this coordinator owns,
+  but never changes the bucket-side ownership record. It refuses
+  in two cases that both require `--remote`:
+  (a) `<name>` has no local state (no `by_name/<name>` symlink),
+  (b) the bucket-side record is `released` (even if a stale local
+  fork from a previous life is still on disk — re-acquiring a name
+  the operator handed back to the pool is an explicit decision).
+  **`--remote`** opts into the S3 claim path. Two sub-cases route
+  internally: in-place reclaim when the local fork's ULID matches
+  the released ULID (cheap, no pull, same fork kept) vs cross-
+  coordinator claim otherwise (pull only the delta since the last
+  local ancestor, mint a fresh fork, atomically rebind). Any prior
+  local fork stays on disk and serves as ancestor cache where
+  applicable. `volume start` never overrides another coordinator's
+  ownership — recovery of a name held by an unreachable peer is
+  `volume release --force` first, then `volume start --remote`.
 - **Coordinator graceful shutdown / crash** — does not change
   `state`. A coordinator coming back up sees its own
   `coordinator_id` in `live` or `stopped` records and resumes; no
@@ -439,33 +444,60 @@ coordinator. Other coordinators are refused (recovery requires
 ### `volume start <name>` — claim ownership
 
 `volume start` is always safe: it never overrides another
-coordinator's ownership. Defaults to **local-only**. It will not
+coordinator's ownership. Defaults to **local-only**, where
+"local-only" means *no bucket-side state change*. It will not
 reach into S3 unless `--remote` is passed. Defaulting local avoids
 surprising network pulls; refusing to override foreign ownership
 forces operators through the explicit two-step recovery flow
 (`volume release --force` + `volume start --remote`).
 
-1. **Local resolution.** Look up `<name>` against this
-   coordinator's local state (`by_name/<name>` plus any locally
-   known record). Allowed local cases:
+1. **Bare `start` (local-only).** The coordinator reads
+   `names/<name>` to verify ownership but performs no bucket-side
+   write. Allowed:
    - already running here (`state=live`, `coordinator_id=self`) —
      idempotent no-op,
    - local resume (`state=stopped`, `coordinator_id=self`) — reuse
      the existing fork; flip `state` back to `live` via conditional
      PUT; restart the daemon. No new ULID, no snapshot, no fork.
-   - in-place reclaim (record was `released` but the released
-     `vol_ulid` matches a local fork this host still has) — flip
-     to `live` via `mark_reclaimed_local` keeping the same ULID.
+     (This *is* a bucket write — a CAS that flips
+     `stopped → live` keeping ownership; "local-only" describes
+     the *ownership* surface, not whether the record is touched.)
 
-2. **No local state for `<name>`.** Refuse with a clear error:
-   ```
-   error: volume 'mydb' not found locally.
-     to claim it from the bucket, run: elide volume start --remote mydb
-   ```
-   Do **not** reach into S3.
+   Refused (each routed to `--remote`):
+   - `<name>` has no local state — refuse with:
+     ```
+     error: volume 'mydb' not found locally.
+       to claim it from the bucket, run: elide volume start --remote mydb
+     ```
+   - `state == "released"` (even when a stale local fork exists
+     from a previous life this host owned) — refuse with:
+     ```
+     error: name 'mydb' is Released; reclaim with: elide volume start --remote mydb
+     ```
+     Reclaiming a name handed back to the pool is an explicit
+     operator decision; bare `start` never silently flips the
+     bucket-side ownership.
 
-3. **`--remote` (claim).** Read `names/<name>`.
+2. **`--remote` (claim).** Read `names/<name>`.
    - `state == "released"` → claim allowed for any coordinator.
+     Two sub-cases route automatically:
+     - **In-place reclaim** when the released `vol_ulid` matches a
+       local fork this host still has: `mark_reclaimed_local` flips
+       `released → live` keeping the same ULID. No pull, no fork
+       mint. Reported as `<name>: reclaimed and started`.
+     - **Cross-coordinator claim** otherwise: pull from the released
+       ancestor, mint a fresh `<new_ulid>`, generate a fresh
+       Ed25519 keypair, create `by_id/<new_ulid>/` with provenance
+       pointing at the previous fork's
+       `<vol_ulid>/<handoff_snap_ulid>`, publish `volume.pub` and
+       signed provenance. Conditional PUT to `names/<name>`:
+       `vol_ulid = <new_ulid>`, `coordinator_id = self`,
+       `state = "live"`, `parent = <previous>`. Begin serving.
+       Reported as `<name>: claimed and started`. Any prior local
+       fork stays on disk and is reused as ancestor cache by the
+       chain walk in `remote_pull` if it's part of the claimed
+       chain (so the network fetch only covers the delta since
+       the fork point).
    - `state == "reserved"` → claim allowed only when
      `coordinator_id == self`. Otherwise refuse with a clear error
      naming the intended claimer.
@@ -473,17 +505,10 @@ forces operators through the explicit two-step recovery flow
      `volume release --force <name>` (followed by another
      `start --remote`) for the unreachable-owner recovery path.
 
-   On a successful claim, mint a fresh `<new_ulid>`, generate a
-   fresh Ed25519 keypair, create `by_id/<new_ulid>/` locally with
-   provenance pointing at the previous fork's
-   `<vol_ulid>/<handoff_snap_ulid>`, publish `volume.pub` and signed
-   provenance. Conditional PUT to `names/<name>`:
-   `vol_ulid = <new_ulid>`, `coordinator_id = self`, `state = "live"`,
-   `parent = <previous>`. Begin serving.
-
 One verb, two intents made explicit through a single flag: bare =
-local, `--remote` = claim a released name from the bucket. The
-override path lives on `volume release --force`, not here.
+no ownership change, `--remote` = (re)claim a name from the
+bucket. The override path lives on `volume release --force`, not
+here.
 
 ### `volume stop` and `volume release` are not coordinator shutdown
 
