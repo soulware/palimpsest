@@ -1913,9 +1913,10 @@ async fn fork_create_op(
     if let Err(e) = validate_volume_name(new_name) {
         return format!("err {e}");
     }
-    if ulid::Ulid::from_string(source_ulid_str).is_err() {
-        return format!("err invalid source ULID: {source_ulid_str}");
-    }
+    let source_vol_ulid = match ulid::Ulid::from_string(source_ulid_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err invalid source ULID {source_ulid_str}: {e}"),
+    };
 
     // Pull off `snap=<ulid>`, `parent-key=<hex>`, and `for-claim` first;
     // remaining tokens go to the transport-flag parser. `for-claim`
@@ -2051,6 +2052,38 @@ async fn fork_create_op(
         return format!("err uploading volume.pub: {e:#}");
     }
 
+    // Read source volume config: `src_cfg.name` feeds the
+    // `ForkedFrom` journal entry below, and `src_cfg.size` is
+    // inherited into the new fork's `volume.toml` further down. Done
+    // before the bucket claim so a malformed source fails cleanly
+    // without leaving a half-claimed name.
+    let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup(&new_fork_dir, &symlink_path);
+            return format!("err reading source volume config: {e}");
+        }
+    };
+    let size = match src_cfg.size {
+        Some(s) => s,
+        None => {
+            cleanup(&new_fork_dir, &symlink_path);
+            return "err source volume has no size (import may not have completed)".to_string();
+        }
+    };
+
+    // Snap actually used for the fork. `snap.is_some()` matches the
+    // explicit-pin call sites; otherwise `fork_volume` above
+    // resolved `latest_snapshot(&source_dir)` internally and we
+    // recompute it here so the journal records the same value.
+    // Resolution failure here only suppresses the `ForkedFrom`
+    // event; the lifecycle proceeds with `Created` as a fallback.
+    let resolved_snap = snap.or_else(|| {
+        elide_core::volume::latest_snapshot(&source_dir)
+            .ok()
+            .flatten()
+    });
+
     // Phase 3: for brand-new names, claim in S3. For the
     // claim-from-released path (`for-claim` flag), the bucket record
     // already exists as `Released` and the CLI's subsequent `claim`
@@ -2061,11 +2094,37 @@ async fn fork_create_op(
         match mark_initial(store, new_name, coord_id, new_vol_ulid_value).await {
             Ok(MarkInitialOutcome::Claimed) => {
                 name_claimed_in_bucket = true;
+                // `volume create --from` mints a fork, so the
+                // opening journal entry on the new name is
+                // `ForkedFrom` (not `Created`). Falls back to
+                // `Created` only when fork context cannot be
+                // reconstructed — typically a ULID-only ancestor
+                // with no `name` in its `volume.toml`. Both the
+                // source name and snap have to be present; a
+                // partial `ForkedFrom` would publish a less useful
+                // record than just stating "this name appeared".
+                let kind = match (resolved_snap, src_cfg.name.clone()) {
+                    (Some(source_snap_ulid), Some(source_name)) => {
+                        elide_core::name_event::EventKind::ForkedFrom {
+                            source_name,
+                            source_vol_ulid,
+                            source_snap_ulid,
+                        }
+                    }
+                    _ => {
+                        warn!(
+                            "[inbound] fork-create {new_name}: source \
+                             {source_ulid_str} missing name or snap; emitting \
+                             Created in lieu of ForkedFrom"
+                        );
+                        elide_core::name_event::EventKind::Created
+                    }
+                };
                 elide_coordinator::name_event_store::emit_best_effort(
                     store,
                     identity.as_ref(),
                     new_name,
-                    elide_core::name_event::EventKind::Created,
+                    kind,
                     new_vol_ulid_value,
                 )
                 .await;
@@ -2098,23 +2157,6 @@ async fn fork_create_op(
         }
     }
 
-    // Inherit size from source; require it to be set.
-    let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            cleanup(&new_fork_dir, &symlink_path);
-            rollback_claim(name_claimed_in_bucket).await;
-            return format!("err reading source volume config: {e}");
-        }
-    };
-    let size = match src_cfg.size {
-        Some(s) => s,
-        None => {
-            cleanup(&new_fork_dir, &symlink_path);
-            rollback_claim(name_claimed_in_bucket).await;
-            return "err source volume has no size (import may not have completed)".to_string();
-        }
-    };
     if let Err(e) = (elide_core::config::VolumeConfig {
         name: Some(new_name.to_owned()),
         size: Some(size),
