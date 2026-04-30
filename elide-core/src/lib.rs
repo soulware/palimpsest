@@ -9,6 +9,7 @@ pub mod gc_apply;
 pub mod gc_plan;
 pub mod import;
 pub mod lbamap;
+pub mod name_event;
 pub mod name_record;
 pub mod process;
 pub mod segment;

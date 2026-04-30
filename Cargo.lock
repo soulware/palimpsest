@@ -1121,6 +1121,7 @@ dependencies = [
  "arc-swap",
  "bitflags",
  "blake3",
+ "chrono",
  "criterion",
  "crossbeam-channel",
  "ed25519-dalek",

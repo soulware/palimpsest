@@ -984,11 +984,11 @@ pub(crate) fn write_raw_provenance_for_test(
     crate::segment::write_file_atomic(&dir.join(VOLUME_PROVENANCE_FILE), content.as_bytes())
 }
 
-pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+pub fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn decode_hex(s: &str) -> io::Result<Vec<u8>> {
+pub fn decode_hex(s: &str) -> io::Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(io::Error::other("hex string has odd length"));
     }
