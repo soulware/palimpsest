@@ -32,7 +32,10 @@ use crate::credential::CredentialIssuer;
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
-use elide_coordinator::{EvictRegistry, PrefetchTracker, SnapshotLockRegistry, subscribe_prefetch};
+use elide_coordinator::{
+    EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
+    subscribe_prefetch,
+};
 use elide_core::process::pid_is_alive;
 
 /// Shared coordinator state threaded through every inbound op.
@@ -404,7 +407,15 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
             }
-            fork_create_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
+            fork_create_op(
+                args,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.coord_id,
+                &ctx.rescan,
+                &ctx.prefetch_tracker,
+            )
+            .await
         }
 
         "resolve-handoff-key" => {
@@ -1878,6 +1889,7 @@ async fn fork_create_op(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
     rescan: &Notify,
+    prefetch_tracker: &PrefetchTracker,
 ) -> String {
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let new_name = match iter.next() {
@@ -2088,6 +2100,18 @@ async fn fork_create_op(
         rollback_claim().await;
         return format!("err creating by_name symlink: {e}");
     }
+
+    // Pre-register the prefetch tracker entry before notifying the daemon's
+    // discovery loop. This closes the race where the CLI's
+    // `await-prefetch <new_vol_ulid>` (called immediately after this IPC
+    // returns) could land before the daemon has discovered the new fork
+    // and registered the entry — in which case `await-prefetch` would
+    // hit the "untracked → ok" path and falsely report prefetch complete.
+    // `register_prefetch_or_get` is idempotent: when discovery later runs,
+    // it gets back the same `Arc<Sender>` and passes it to
+    // `run_volume_tasks`. Drop the local Arc immediately; the tracker
+    // holds the entry until the per-fork task's Drop guard removes it.
+    let _ = register_prefetch_or_get(prefetch_tracker, new_vol_ulid_value);
 
     rescan.notify_one();
     info!("[inbound] forked volume {new_name} ({new_vol_ulid}) from {source_ulid_str}");
@@ -4203,7 +4227,7 @@ mod tests {
     async fn await_prefetch_returns_ok_when_already_done_success() {
         let tracker = elide_coordinator::new_prefetch_tracker();
         let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+        let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
         tx.send_replace(Some(Ok(())));
         // Don't await with a timeout: if this blocks, the test blocks — that's
         // a clearer failure than a timeout.
@@ -4216,7 +4240,7 @@ mod tests {
     async fn await_prefetch_returns_err_when_already_done_failed() {
         let tracker = elide_coordinator::new_prefetch_tracker();
         let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+        let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
         tx.send_replace(Some(Err("S3 timeout".into())));
         let resp = await_prefetch_op(&vol.to_string(), &tracker).await;
         assert!(
@@ -4231,7 +4255,7 @@ mod tests {
     async fn await_prefetch_blocks_until_publisher_sends_ok() {
         let tracker = elide_coordinator::new_prefetch_tracker();
         let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+        let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
 
         let tracker_clone = tracker.clone();
         let waiter =
@@ -4255,14 +4279,20 @@ mod tests {
     async fn await_prefetch_returns_err_when_sender_dropped_without_value() {
         let tracker = elide_coordinator::new_prefetch_tracker();
         let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-        let tx = elide_coordinator::register_prefetch(&tracker, vol);
+        let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
 
         let tracker_clone = tracker.clone();
         let waiter =
             tokio::spawn(async move { await_prefetch_op(&vol.to_string(), &tracker_clone).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Simulate the per-fork task exiting: drop the task's local
+        // Arc<Sender> AND remove the tracker entry (the Drop guard in
+        // run_volume_tasks does this on real exit). With both gone, the
+        // underlying watch channel has no more senders and the waiter
+        // unblocks with Err.
         drop(tx);
+        elide_coordinator::unregister_prefetch(&tracker, &vol);
 
         let resp = waiter.await.unwrap();
         assert!(

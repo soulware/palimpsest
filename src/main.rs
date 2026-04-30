@@ -822,12 +822,39 @@ fn main() {
             }
 
             VolumeCommand::Start { name, claim } => {
-                if claim
-                    && let Err(e) =
+                if claim {
+                    // run_claim's foreign-claim path streams the prefetch
+                    // already; no second await needed here.
+                    if let Err(e) =
                         run_claim(&args.data_dir, &name, false, &socket_path, &by_id_dir)
-                {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+                    {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                } else if let Some(vol_ulid) = resolve_local_volume_ulid(&args.data_dir, &name) {
+                    // Plain start. Common case: volume was claimed and
+                    // started before, prefetch is long done — quick probe
+                    // returns Ok instantly and we stay silent. Edge case:
+                    // a previous claim's streaming was Ctrl-C'd before
+                    // completion, or the coordinator restarted mid-
+                    // prefetch — quick probe times out, we surface the
+                    // wait so start isn't a silent multi-second hang.
+                    install_prefetch_ctrlc_handler(&name, "[start]");
+                    let quick = std::time::Duration::from_millis(250);
+                    if coordinator_client::await_prefetch(&socket_path, &vol_ulid, quick).is_err() {
+                        eprintln!("[start] waiting for ancestor prefetch...");
+                        match coordinator_client::await_prefetch(
+                            &socket_path,
+                            &vol_ulid,
+                            coordinator_client::PREFETCH_AWAIT_BUDGET,
+                        ) {
+                            Ok(()) => eprintln!("[start] ready"),
+                            Err(e) => eprintln!(
+                                "[start] prefetch did not finish in time ({e}); \
+                                 coordinator continues in background"
+                            ),
+                        }
+                    }
                 }
                 if let Err(e) = coordinator_client::start_volume(&socket_path, &name) {
                     eprintln!("error: {e}");
@@ -1689,7 +1716,69 @@ fn orchestrate_foreign_claim(
     )?;
 
     coordinator_client::rebind_name(socket_path, name, &new_vol_ulid)?;
+
+    // Surface the coordinator's background prefetch to the user. The
+    // bucket-side claim and local fork are already durable above; the
+    // prefetch task on the coordinator pulls the ancestor `.idx` files
+    // (and runs boot-prewarm) so a subsequent `volume start` is offline-
+    // ready. The CLI is just a subscriber to the existing
+    // `await-prefetch` IPC; Ctrl-C kills only the subscriber, never the
+    // coordinator's prefetch work.
+    install_prefetch_ctrlc_handler(name, "[claim]");
+    eprintln!("[claim] prefetching ancestor index...");
+    match coordinator_client::await_prefetch(
+        socket_path,
+        &new_vol_ulid,
+        coordinator_client::PREFETCH_AWAIT_BUDGET,
+    ) {
+        Ok(()) => eprintln!("[claim] ready"),
+        Err(e) => {
+            // Don't fail the claim — the bucket-side claim succeeded and
+            // the local fork is committed. The error here is most
+            // commonly the 60s subscriber-side budget expiring while the
+            // coordinator's prefetch task is still running (deep ancestor
+            // chain, slow network); it can also be a real prefetch
+            // failure. In both cases the coordinator continues on its
+            // own and `volume start` will await prefetch again before
+            // opening the volume.
+            eprintln!(
+                "[claim] prefetch did not finish in time ({e}); \
+                 coordinator continues in background"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Install a process-wide Ctrl-C handler for prefetch waits.
+///
+/// The handler prints a "continuing in background" message tagged with
+/// `label` (e.g. `"[claim]"`, `"[start]"`) and exits 130 (sigint
+/// convention). The coordinator's prefetch task is server-side and
+/// runs to completion regardless; this handler only signals that the
+/// CLI subscriber has gone away.
+fn install_prefetch_ctrlc_handler(name: &str, label: &'static str) {
+    let name_for_ctrlc = name.to_owned();
+    ctrlc::set_handler(move || {
+        eprintln!(
+            "\n{label} prefetch continuing in background for {name_for_ctrlc}; \
+             coordinator will report completion in its log"
+        );
+        std::process::exit(130);
+    })
+    .ok();
+}
+
+/// Resolve a local volume name to its ULID by reading the
+/// `by_name/<name>` symlink. Returns `None` if the symlink is absent,
+/// is broken, or points to a non-ULID directory.
+fn resolve_local_volume_ulid(data_dir: &Path, name: &str) -> Option<String> {
+    let symlink = data_dir.join("by_name").join(name);
+    let target = std::fs::read_link(&symlink).ok()?;
+    let last = target.file_name().and_then(|n| n.to_str())?;
+    // Parse-don't-validate: round-trip through the ULID type so the
+    // returned string is canonical.
+    Some(ulid::Ulid::from_string(last).ok()?.to_string())
 }
 
 /// Ask a running coordinator for its store config and (for S3) credentials.

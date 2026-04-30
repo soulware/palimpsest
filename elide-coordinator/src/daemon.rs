@@ -38,7 +38,7 @@ use crate::supervisor;
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, new_prefetch_tracker,
-    new_snapshot_lock_registry, register_prefetch,
+    new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
 };
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
@@ -191,10 +191,18 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 continue;
             }
             let vol_ino = vol_dir.metadata().map(|m| m.ino()).unwrap_or(0);
-            if known
-                .insert(vol_dir.clone(), vol_ino)
-                .is_none_or(|old| old != vol_ino)
-            {
+            let prev_ino = known.insert(vol_dir.clone(), vol_ino);
+            // Two trigger conditions for spawning per-volume tasks:
+            //   - first discovery (`prev_ino` is None) — may pick up a
+            //     prefetch tracker entry that `fork_create_op` already
+            //     registered, via the idempotent `register_prefetch_or_get`.
+            //   - inode-change rediscovery (delete-and-recreate at the
+            //     same ULID, e.g. `volume delete` followed by `remote
+            //     pull`) — must force-replace the tracker entry so any
+            //     pre-existing subscribers from the previous incarnation
+            //     see `changed() -> Err` and retry.
+            let force_replace = matches!(prev_ino, Some(old) if old != vol_ino);
+            if prev_ino.is_none() || force_replace {
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] discovered volume: {label}");
 
@@ -223,16 +231,26 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     .expect("evict registry poisoned")
                     .insert(vol_dir.clone(), evict_tx);
 
-                // Register the prefetch tracker entry BEFORE spawning the
+                // Obtain the prefetch tracker sender BEFORE spawning the
                 // per-volume task and BEFORE the supervisor (which spawns the
                 // volume binary). Ordering: `await-prefetch` from the volume
-                // process always finds an entry; never races a missing key.
+                // process or CLI always finds an entry; never races a missing
+                // key. For first discovery use the idempotent or-get (so we
+                // pick up any pre-registration done by `fork_create_op`); for
+                // inode-change rediscovery force-replace so prior subscribers
+                // see `Err`.
                 let prefetch_tx = match vol_dir
                     .file_name()
                     .and_then(|n| n.to_str())
                     .and_then(|s| ulid::Ulid::from_string(s).ok())
                 {
-                    Some(u) => Some(register_prefetch(&prefetch_tracker, u)),
+                    Some(u) => {
+                        if force_replace {
+                            Some(replace_prefetch(&prefetch_tracker, u))
+                        } else {
+                            Some(register_prefetch_or_get(&prefetch_tracker, u))
+                        }
+                    }
                     None => {
                         warn!(
                             "[coordinator] volume dir {} is not ULID-named; skipping prefetch tracking",
@@ -245,7 +263,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     // Fall back to a discarded sender so the task signature
                     // stays uniform; nobody can subscribe to it via the
                     // tracker because we never registered the entry.
-                    tokio::sync::watch::channel(None).0
+                    Arc::new(tokio::sync::watch::channel(None).0)
                 });
 
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
@@ -257,6 +275,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     evict_rx,
                     snapshot_locks.clone(),
                     prefetch_tx,
+                    prefetch_tracker.clone(),
                 ));
 
                 // Readonly volumes (imported bases) have no live process —

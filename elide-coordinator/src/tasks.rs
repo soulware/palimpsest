@@ -27,7 +27,7 @@ use crate::control;
 use crate::gc;
 use crate::prefetch;
 use crate::upload;
-use crate::{SnapshotLockRegistry, snapshot_lock_for};
+use crate::{PrefetchTracker, SnapshotLockRegistry, snapshot_lock_for, unregister_prefetch};
 
 /// Name of the import lock file inside a volume directory.
 /// Present while an import job is actively writing to the volume; drain and GC
@@ -102,8 +102,36 @@ pub async fn run_volume_tasks(
     part_size_bytes: usize,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
     snapshot_locks: SnapshotLockRegistry,
-    prefetch_done: watch::Sender<PrefetchState>,
+    prefetch_done: Arc<watch::Sender<PrefetchState>>,
+    prefetch_tracker: PrefetchTracker,
 ) {
+    // Drop guard: when this task exits (clean break, await-point cancellation
+    // on JoinSet abort, or panic) the tracker entry is removed. Combined with
+    // `prefetch_done` (the task's own `Arc<Sender>`) being dropped at function
+    // exit, this leaves the underlying watch channel with no senders, so any
+    // pending `await-prefetch` subscriber sees `changed() -> Err` rather than
+    // hanging forever. Declared *before* the volume_id parse so the cleanup
+    // also runs on the early-return error path below.
+    struct PrefetchEntryGuard {
+        tracker: PrefetchTracker,
+        vol_ulid: Option<ulid::Ulid>,
+    }
+    impl Drop for PrefetchEntryGuard {
+        fn drop(&mut self) {
+            if let Some(u) = self.vol_ulid {
+                unregister_prefetch(&self.tracker, &u);
+            }
+        }
+    }
+    let parsed_ulid = fork_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok());
+    let _prefetch_guard = PrefetchEntryGuard {
+        tracker: prefetch_tracker,
+        vol_ulid: parsed_ulid,
+    };
+
     let volume_id = match upload::derive_names(&fork_dir) {
         Ok(id) => id,
         Err(e) => {
