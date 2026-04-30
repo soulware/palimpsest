@@ -414,71 +414,18 @@ pub fn generate_filemap(
     }
 }
 
-/// Stats returned by `reclaim_volume`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ReclaimStats {
-    /// Number of scanner candidates the volume considered.
-    pub candidates_scanned: usize,
-    /// Total contiguous runs rewritten via internal-origin writes.
-    pub runs_rewritten: u64,
-    /// Total bytes committed to fresh compact entries.
-    pub bytes_rewritten: u64,
-    /// Number of candidates whose phase-3 commit discarded due to
-    /// concurrent mutation. Not an error — they can be retried.
-    pub discarded: usize,
-}
-
-/// Trigger an alias-merge extent reclamation pass on a running volume.
-///
-/// The coordinator resolves the volume name to its fork directory and
-/// relays a `reclaim` IPC to the volume's control.sock. The volume
-/// scans its current snapshot for bloated-hash candidates and reclaims
-/// them most-wasteful-first using default thresholds. Heavy work runs
-/// off the actor thread, so NBD writes are not blocked for the full
-/// duration of the pass.
-pub fn reclaim_volume(socket_path: &Path, name: &str) -> io::Result<ReclaimStats> {
-    let resp = call(socket_path, &format!("reclaim {name}"))?;
-    let rest = match resp.strip_prefix("ok ") {
-        Some(r) => r,
-        None => match resp.strip_prefix("err ") {
-            Some(msg) => return Err(io::Error::other(msg.to_owned())),
-            None => return Err(io::Error::other(format!("unexpected response: {resp}"))),
-        },
+/// Remove the local instance of a volume (by_name symlink + by_id/<ulid>/
+/// directory). The volume must be stopped first. With `force = false`,
+/// the coordinator additionally requires that all local writes have been
+/// flushed and uploaded to S3 (`pending/` and `wal/` empty). Bucket-side
+/// records and segments are untouched.
+pub fn remove_volume(socket_path: &Path, name: &str, force: bool) -> io::Result<()> {
+    let req = if force {
+        format!("remove {name} force")
+    } else {
+        format!("remove {name}")
     };
-    let mut parts = rest.splitn(4, ' ');
-    let parse_err = |field: &str| io::Error::other(format!("malformed reclaim response: {field}"));
-    let candidates_scanned: usize = parts
-        .next()
-        .ok_or_else(|| parse_err("candidates"))?
-        .parse()
-        .map_err(|_| parse_err("candidates"))?;
-    let runs_rewritten: u64 = parts
-        .next()
-        .ok_or_else(|| parse_err("runs"))?
-        .parse()
-        .map_err(|_| parse_err("runs"))?;
-    let bytes_rewritten: u64 = parts
-        .next()
-        .ok_or_else(|| parse_err("bytes"))?
-        .parse()
-        .map_err(|_| parse_err("bytes"))?;
-    let discarded: usize = parts
-        .next()
-        .ok_or_else(|| parse_err("discarded"))?
-        .trim()
-        .parse()
-        .map_err(|_| parse_err("discarded"))?;
-    Ok(ReclaimStats {
-        candidates_scanned,
-        runs_rewritten,
-        bytes_rewritten,
-        discarded,
-    })
-}
-
-/// Stop all processes for a volume and remove its directory.
-pub fn delete_volume(socket_path: &Path, name: &str) -> io::Result<()> {
-    let resp = call(socket_path, &format!("delete {name}"))?;
+    let resp = call(socket_path, &req)?;
     match resp.split_once(' ') {
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
         _ if resp == "ok" => Ok(()),

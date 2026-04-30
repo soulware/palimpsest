@@ -340,29 +340,24 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Reclaim fragmented storage via alias-merge extent rewriting.
+    /// Remove the local instance of a volume.
     ///
-    /// Scans the volume for hashes whose stored payload has detectable
-    /// dead weight (from in-place overwrites that split the original
-    /// entry) and rewrites them as fresh compact entries via the
-    /// internal-origin write path. The old bloated bodies are left
-    /// orphaned for coordinator GC to reclaim on its next pass.
+    /// Removes the on-disk fork (`by_id/<ulid>/`) and its `by_name/<name>`
+    /// symlink. Does not delete bucket-side records or segments — this is
+    /// a local-instance verb, not a `purge`.
     ///
-    /// Runs entirely on the volume; heavy work (read + hash + compress)
-    /// happens off the actor thread so NBD writes are not blocked for
-    /// the full duration of the pass.
-    ///
-    /// Safe on any running volume. Idempotent — re-running against
-    /// already-compact state is a fast no-op.
-    Reclaim {
+    /// The volume must be stopped first. Without `--force`, the local
+    /// state must be fully flushed and uploaded to S3 (no segments in
+    /// `pending/`, no records in `wal/`); otherwise `--force` is required
+    /// to discard the unflushed local state.
+    Remove {
         /// Volume name
         name: String,
-    },
-
-    /// Stop all processes for a volume and remove its directory
-    Delete {
-        /// Volume name
-        name: String,
+        /// Skip the "all writes flushed and uploaded" check and discard
+        /// any local segments still pending upload or WAL records still
+        /// unflushed. Use only if you don't need the local-only state.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Stop a running volume (flushes and halts the NBD server; drain/GC continue)
@@ -799,43 +794,8 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Reclaim { name } => {
-                match coordinator_client::reclaim_volume(&socket_path, &name) {
-                    Ok(stats) => {
-                        if stats.candidates_scanned == 0 {
-                            println!("nothing to reclaim");
-                        } else {
-                            println!(
-                                "reclaimed {} run{} ({} bytes) from {} candidate{}{}",
-                                stats.runs_rewritten,
-                                if stats.runs_rewritten == 1 { "" } else { "s" },
-                                stats.bytes_rewritten,
-                                stats.candidates_scanned,
-                                if stats.candidates_scanned == 1 {
-                                    ""
-                                } else {
-                                    "s"
-                                },
-                                if stats.discarded > 0 {
-                                    format!(
-                                        " ({} discarded due to concurrent writes)",
-                                        stats.discarded
-                                    )
-                                } else {
-                                    String::new()
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            VolumeCommand::Delete { name } => {
-                if let Err(e) = coordinator_client::delete_volume(&socket_path, &name) {
+            VolumeCommand::Remove { name, force } => {
+                if let Err(e) = coordinator_client::remove_volume(&socket_path, &name, force) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }

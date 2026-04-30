@@ -394,7 +394,7 @@ The `volume.stopped` marker persists across coordinator restarts. A quiesced hos
 
 **Foreground Ctrl-C** does not write `volume.stopped`. There is no need — the coordinator is exiting anyway. On next coordinator start, volumes will be started normally (or re-adopted if still running).
 
-**Relationship to `volume delete`:** `delete` does not set `volume.stopped` — it removes the directory entirely. `stop` is the right operation when you want the volume to remain but not serve I/O.
+**Relationship to `volume remove`:** `remove` requires `volume.stopped` to already be present — the volume must be halted first. `stop` is the right operation when you want the volume to remain but not serve I/O. `stop` is symmetric across writable and readonly volumes: in both modes it halts the local daemon and writes `volume.stopped`; the bucket-side `Live → Stopped` transition only applies to writable records (readonly records are already in their own terminal state).
 
 ### IPC is optional
 
@@ -462,7 +462,7 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume status <name\|ulid>` | Is the volume process running? |
 | `elide volume stop <name\|ulid>` | Stop the volume process and set `volume.stopped` |
 | `elide volume start <name\|ulid>` | Clear `volume.stopped`; coordinator restarts the volume |
-| `elide volume delete <name\|ulid>` | Stop all processes, then remove the volume directory |
+| `elide volume remove <name\|ulid> [--force]` | Remove the local instance (by_id directory + by_name link); requires `volume.stopped` and a fully-uploaded fork unless `--force` |
 | `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import job ULID |
 | `elide volume import status <job-ulid>` | Poll import state: running / done / failed |
 | `elide volume import attach <job-ulid>` | Stream import output until completion |
@@ -764,17 +764,24 @@ A crash (coordinator or import process) can leave `import.lock` behind with no m
 
 The volume directory is left intact — it may contain partial segment data useful for debugging. After the stale lock is removed, the coordinator resumes normal supervision of the volume.
 
-### `volume delete`
+### `volume remove`
 
-`elide volume delete <name>` is the recovery and cleanup command:
+`elide volume remove <name> [--force]` removes the local instance of a volume. It is a *local* verb — bucket-side records and segments under `by_id/<volume_ulid>/` in S3 are untouched. Other coordinators can still claim the name via `volume claim`.
 
-1. Send SIGTERM to any running volume process (via `volume.pid`)
-2. Send SIGTERM to any running import process (via `import.pid`)
-3. Remove stale `import.lock` if present (import process already dead)
-4. Remove the volume directory tree (`<vol-dir>` and all contents)
-5. Respond `ok`
+Preconditions:
 
-After `volume delete`, `volume import <name> <oci-ref>` starts fresh with a clean directory.
+- `volume.stopped` must be present (i.e. `volume stop` was run first). Removing a running daemon is refused with `volume is running; stop it first`.
+- Without `--force`: the fork must be fully durable in S3 — `pending/` empty (no segments awaiting upload) **and** `wal/` empty (no unflushed records). Otherwise the command refuses and points at `volume snapshot <name>` to flush, or `--force` to discard.
+- With `--force`: the second check is skipped and any local-only segments or WAL records are discarded.
+
+Once the preconditions hold, the coordinator:
+
+1. Sends SIGTERM to any running import process (via `import.pid`) and removes a stale `import.lock`
+2. Removes the `by_name/<name>` symlink
+3. Removes the `by_id/<volume_ulid>/` directory tree
+4. Responds `ok`
+
+After `volume remove`, the volume name is free to be reused (e.g. `volume import <name> <oci-ref>` starts fresh, or `volume claim <name>` re-binds a Released bucket-side record on this host).
 
 ### Output retention
 

@@ -134,6 +134,8 @@ Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 ## Clean up
 
 ```sh
-./target/debug/elide volume delete vm1
-./target/debug/elide volume delete ubuntu-22.04
+./target/debug/elide volume stop vm1
+./target/debug/elide volume remove vm1
+./target/debug/elide volume stop ubuntu-22.04
+./target/debug/elide volume remove ubuntu-22.04
 ```

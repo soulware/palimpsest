@@ -219,11 +219,17 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             }
         }
 
-        "delete" => {
-            if args.is_empty() {
-                return "err usage: delete <volume>".to_string();
+        "remove" => {
+            // Format: "remove <volume> [force]"
+            let mut parts = args.split_whitespace();
+            let Some(name) = parts.next() else {
+                return "err usage: remove <volume> [force]".to_string();
+            };
+            let force = matches!(parts.next(), Some("force"));
+            if parts.next().is_some() {
+                return "err usage: remove <volume> [force]".to_string();
             }
-            delete_volume(args, &ctx.data_dir)
+            remove_volume(name, force, &ctx.data_dir)
         }
 
         "stop" => {
@@ -457,13 +463,6 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 None => (args, None),
             };
             generate_filemap_op(vol_name, snap_arg, &ctx.data_dir, &ctx.store).await
-        }
-
-        "reclaim" => {
-            if args.is_empty() {
-                return "err usage: reclaim <volume>".to_string();
-            }
-            reclaim_volume(args, &ctx.data_dir).await
         }
 
         // Vend the non-secret `[store]` config so CLI read operations
@@ -719,51 +718,6 @@ async fn stream_import_by_name(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-    }
-}
-
-// ── Volume reclaim ───────────────────────────────────────────────────────────
-
-/// Run an alias-merge extent reclamation pass on a named volume.
-///
-/// The coordinator's only job is to resolve the volume name to a fork
-/// directory and relay a `reclaim` IPC to the volume's control.sock.
-/// No coordinator state is involved — reclaim never touches S3, GC state,
-/// or the snapshot lock. The volume-side handler does scan + execute
-/// against its current snapshot with default thresholds.
-///
-/// Returns
-/// "ok <candidates_scanned> <runs_rewritten> <bytes_rewritten> <discarded>"
-/// on success, or "err <message>" if the volume is not running or the
-/// underlying IPC fails.
-async fn reclaim_volume(vol_name: &str, data_dir: &Path) -> String {
-    let link = data_dir.join("by_name").join(vol_name);
-    let fork_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(_) => return format!("err volume not found: {vol_name}"),
-    };
-    if !fork_dir.join("control.sock").exists() {
-        return format!("err volume '{vol_name}' is not running — start it first");
-    }
-    info!("[reclaim {vol_name}] starting pass");
-    match elide_coordinator::control::reclaim(&fork_dir, None).await {
-        Some(stats) => {
-            info!(
-                "[reclaim {vol_name}] done: scanned={} runs_rewritten={} bytes_rewritten={} discarded={}",
-                stats.candidates_scanned,
-                stats.runs_rewritten,
-                stats.bytes_rewritten,
-                stats.discarded,
-            );
-            format!(
-                "ok {} {} {} {}",
-                stats.candidates_scanned,
-                stats.runs_rewritten,
-                stats.bytes_rewritten,
-                stats.discarded
-            )
-        }
-        None => format!("err reclaim IPC failed for volume '{vol_name}'"),
     }
 }
 
@@ -1194,37 +1148,76 @@ async fn volume_status_remote(
     body
 }
 
-// ── Volume delete ─────────────────────────────────────────────────────────────
+// ── Volume remove ─────────────────────────────────────────────────────────────
 
-fn delete_volume(volume_name: &str, data_dir: &Path) -> String {
+/// Remove the local instance of a volume.
+///
+/// Removes the on-disk fork (`by_id/<ulid>/`) and its `by_name/<name>`
+/// symlink. Does not delete bucket-side records or segments — this is a
+/// local-instance verb, not a `purge`.
+///
+/// Preconditions (without `force`):
+///  - `volume.stopped` must be present (the local daemon is halted)
+///  - `pending/` and `wal/` must be empty (all writes are durable in S3)
+///
+/// `force = true` skips the second check, accepting that any local-only
+/// pending segments or unflushed WAL records will be discarded.
+fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return format!("err volume not found: {volume_name}");
     }
 
-    // Resolve the symlink to get the actual by_id/<ulid>/ directory.
     let vol_dir = match std::fs::canonicalize(&link) {
         Ok(p) => p,
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
-    // Refuse to delete a running writable volume — must be stopped first.
-    if !vol_dir.join("volume.readonly").exists() && !vol_dir.join("volume.stopped").exists() {
+    if !vol_dir.join("volume.stopped").exists() {
         return "err volume is running; stop it first with: elide volume stop <name>".to_string();
+    }
+
+    if !force && let Some(reason) = unflushed_state_reason(&vol_dir) {
+        return format!(
+            "err {reason}; take a snapshot first with: elide volume snapshot <name> \
+             — or pass --force to discard the unflushed local state"
+        );
     }
 
     import::kill_all_for_volume(&vol_dir);
 
-    // Remove the by_name symlink first, then the volume directory.
     let _ = std::fs::remove_file(&link);
 
     match std::fs::remove_dir_all(&vol_dir) {
         Ok(()) => {
-            info!("[inbound] deleted volume {volume_name}");
+            info!("[inbound] removed volume {volume_name}");
             "ok".to_string()
         }
-        Err(e) => format!("err delete failed: {e}"),
+        Err(e) => format!("err remove failed: {e}"),
     }
+}
+
+/// Returns a human-readable reason if the fork has on-disk state that
+/// has not been flushed and uploaded to S3, or `None` if the fork is
+/// fully durable. Used to gate `remove` and decide whether `--force` is
+/// required.
+///
+/// "Fully durable" means: no segments awaiting upload (`pending/` empty)
+/// and no unflushed WAL records (`wal/` empty). Both directories are
+/// populated by writes and emptied by the drain pipeline.
+fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
+    let dir_has_entries = |sub: &str| {
+        std::fs::read_dir(vol_dir.join(sub))
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    };
+    if dir_has_entries("pending") {
+        return Some("local segments are pending upload to S3".to_string());
+    }
+    if dir_has_entries("wal") {
+        return Some("local WAL has unflushed writes".to_string());
+    }
+    None
 }
 
 // ── Volume create / update ────────────────────────────────────────────────────
@@ -2134,13 +2127,12 @@ async fn stop_volume_op(
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
-    if vol_dir.join("volume.readonly").exists() {
-        return "err volume is readonly; nothing to stop".to_string();
-    }
     if vol_dir.join("volume.stopped").exists() {
         // Already stopped — idempotent success.
         return "ok".to_string();
     }
+
+    let readonly = vol_dir.join("volume.readonly").exists();
 
     // Refuse to stop while an NBD client is connected. ublk volumes have
     // no NBD client and `connected` will simply return false.
@@ -2152,34 +2144,39 @@ async fn stop_volume_op(
     }
 
     // `stop` is a local-lifecycle verb: its job is to halt the daemon
-    // on this host. The bucket update is best-effort.
+    // on this host. The bucket update is best-effort and only applies
+    // to writable volumes — readonly volumes have a `Readonly` bucket
+    // record that is its own terminal state, so there is no Live → Stopped
+    // transition to make.
     //
-    // The bucket update only succeeds for the canonical case (record
-    // owned by us, Live → Stopped); every other case (no record,
-    // already stopped, foreign-owned, Released, Readonly,
+    // For writable volumes, the bucket update only succeeds for the
+    // canonical case (record owned by us, Live → Stopped); every other
+    // case (no record, already stopped, foreign-owned, Released,
     // transient store error) becomes a warning and we proceed with
     // the local halt. The daemon may legitimately still be running
     // while the bucket says Released — e.g. after a partial release
     // that flipped the bucket but failed to halt the process — and
     // `stop` must be able to recover from that. Halting our local
     // daemon never affects other hosts.
-    use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
-    match mark_stopped(store, volume_name, coord_id).await {
-        Ok(_) => {}
-        Err(LifecycleError::OwnershipConflict { held_by }) => {
-            warn!(
-                "[inbound] stop {volume_name}: names/<name> is owned by coordinator \
-                 {held_by}; halting locally, bucket record left untouched"
-            );
-        }
-        Err(LifecycleError::InvalidTransition { from, .. }) => {
-            warn!(
-                "[inbound] stop {volume_name}: names/<name> is in state {from:?}; \
-                 halting locally, bucket record left untouched"
-            );
-        }
-        Err(LifecycleError::Store(e)) => {
-            warn!("[inbound] stop {volume_name}: failed to update names/<name>: {e}");
+    if !readonly {
+        use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
+        match mark_stopped(store, volume_name, coord_id).await {
+            Ok(_) => {}
+            Err(LifecycleError::OwnershipConflict { held_by }) => {
+                warn!(
+                    "[inbound] stop {volume_name}: names/<name> is owned by coordinator \
+                     {held_by}; halting locally, bucket record left untouched"
+                );
+            }
+            Err(LifecycleError::InvalidTransition { from, .. }) => {
+                warn!(
+                    "[inbound] stop {volume_name}: names/<name> is in state {from:?}; \
+                     halting locally, bucket record left untouched"
+                );
+            }
+            Err(LifecycleError::Store(e)) => {
+                warn!("[inbound] stop {volume_name}: failed to update names/<name>: {e}");
+            }
         }
     }
 
