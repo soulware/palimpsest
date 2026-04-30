@@ -1042,31 +1042,8 @@ fn volume_status(volume_name: &str, data_dir: &Path) -> String {
         return format!("err volume not found: {volume_name}");
     }
     // The OS follows the symlink transparently for all path ops below.
-    let vol_dir = link;
-
-    // Check if intentionally stopped.
-    if vol_dir.join("volume.stopped").exists() {
-        return "ok stopped (manual)".to_string();
-    }
-
-    // Check for an active import.
-    if vol_dir.join(import::LOCK_FILE).exists() {
-        let ulid = std::fs::read_to_string(vol_dir.join(import::LOCK_FILE))
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        return format!("ok importing {ulid}");
-    }
-
-    // Check if a volume process is running.
-    if let Ok(text) = std::fs::read_to_string(vol_dir.join("volume.pid"))
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && pid_is_alive(pid)
-    {
-        return "ok running".to_string();
-    }
-
-    "ok stopped".to_string()
+    let lifecycle = elide_coordinator::volume_state::VolumeLifecycle::from_dir(&link);
+    format!("ok {}", lifecycle.wire_body())
 }
 
 /// Fetch `names/<name>` from the bucket and serialise it as a TOML body

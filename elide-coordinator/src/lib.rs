@@ -14,6 +14,7 @@ pub mod recovery;
 pub mod retention;
 pub mod tasks;
 pub mod upload;
+pub mod volume_state;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
