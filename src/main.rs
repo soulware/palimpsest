@@ -1088,11 +1088,37 @@ enum ListFilter {
     All,
 }
 
+use elide_coordinator::volume_state::{VolumeLifecycle, VolumeMode};
+
+/// Cell value for the STATE column in `elide volume list`. Wraps the
+/// coordinator-derived `VolumeLifecycle` with two CLI-only sentinels:
+///
+/// - `Ancestor` — pulled ancestor volume that has no `by_name/` entry
+///   and is never supervised. Lifecycle classification doesn't apply.
+/// - `CoordinatorDown` — coordinator IPC is unreachable, so on-disk
+///   markers may not reflect what the supervisor would do. Render
+///   `-` rather than guessing.
+enum CliVolumeState {
+    Lifecycle(VolumeLifecycle),
+    Ancestor,
+    CoordinatorDown,
+}
+
+impl CliVolumeState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Lifecycle(l) => l.label(),
+            Self::Ancestor => "ancestor",
+            Self::CoordinatorDown => "-",
+        }
+    }
+}
+
 struct VolumeRow {
     name: String,
     ulid: String,
-    mode: &'static str,
-    state: &'static str,
+    mode: VolumeMode,
+    state: CliVolumeState,
     transport: String,
     pid: String,
 }
@@ -1189,7 +1215,12 @@ fn list_volumes(
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
     let ulid_w = rows.iter().map(|r| r.ulid.len()).max().unwrap_or(4).max(4);
     let mode_w = 4;
-    let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
+    let state_w = rows
+        .iter()
+        .map(|r| r.state.label().len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
     let transport_w = rows
         .iter()
         .map(|r| r.transport.len())
@@ -1203,7 +1234,12 @@ fn list_volumes(
     for r in &rows {
         println!(
             "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<transport_w$}  {}",
-            r.name, r.ulid, r.mode, r.state, r.transport, r.pid
+            r.name,
+            r.ulid,
+            r.mode.label(),
+            r.state.label(),
+            r.transport,
+            r.pid
         );
     }
     if !coordinator_up {
@@ -1238,43 +1274,28 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: b
         .and_then(|s| ulid::Ulid::from_string(s).ok())
         .map(|u| u.to_string())
         .unwrap_or_else(|| "-".to_owned());
-    let mode = if is_readonly { "ro" } else { "rw" };
+    let mode = if is_readonly {
+        VolumeMode::Ro
+    } else {
+        VolumeMode::Rw
+    };
     // Pulled ancestors (no by_name/ symlink, no volume.name) are never
     // supervised — render a static "ancestor" state instead of inferring
     // lifecycle from markers that don't apply.
-    if name == "-" && is_readonly {
-        return VolumeRow {
-            name,
-            ulid,
-            mode,
-            state: "ancestor",
-            transport,
-            pid: "-".to_owned(),
-        };
-    }
-    if !coordinator_up {
-        return VolumeRow {
-            name,
-            ulid,
-            mode,
-            state: "-",
-            transport,
-            pid: "-".to_owned(),
-        };
-    }
-    let live_pid = read_volume_pid(vol_dir).filter(|&p| elide_core::process::pid_is_alive(p));
-    let state = if vol_dir.join(STOPPED_FILE).exists() {
-        "stopped (manual)"
-    } else if vol_dir.join("import.lock").exists() {
-        "importing"
-    } else if live_pid.is_some() {
-        "running"
+    let state = if name == "-" && is_readonly {
+        CliVolumeState::Ancestor
+    } else if !coordinator_up {
+        CliVolumeState::CoordinatorDown
     } else {
-        "stopped"
+        CliVolumeState::Lifecycle(VolumeLifecycle::from_dir(vol_dir))
     };
-    let pid = live_pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".to_owned());
+    let pid = match &state {
+        CliVolumeState::Lifecycle(l) => l
+            .pid()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        _ => "-".to_owned(),
+    };
     VolumeRow {
         name,
         ulid,
@@ -1311,14 +1332,6 @@ fn transport_summary(vol_dir: &Path) -> String {
         };
     }
     "-".to_owned()
-}
-
-/// Read the supervised volume's pid from `volume.pid`. Returns `None` if the
-/// file is missing, unreadable, or contains garbage.
-fn read_volume_pid(vol_dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(vol_dir.join("volume.pid"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 /// Encode the CLI's typed transport flags as the space-separated tokens
@@ -2092,8 +2105,6 @@ fn resolve_latest_remote_snapshot(
         ))
     })
 }
-
-const STOPPED_FILE: &str = "volume.stopped";
 
 /// Pretty-print a `RemoteStatus` for `elide volume status --remote`.
 fn print_remote_status(name: &str, rs: &coordinator_client::RemoteStatus) {
