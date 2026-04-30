@@ -9,7 +9,11 @@
 //         `elide serve-volume`
 //   - The first scan fires immediately at startup to clear any backlog and
 //     adopt any volume processes already running.
-//   - Shutdown on Ctrl+C: all tasks are aborted. Volume processes are detached
+//   - Shutdown on Ctrl+C: all tasks are aborted and then drained with a
+//     bounded timeout so cancellation propagates while the tokio runtime is
+//     still healthy. Skipping the drain can panic the time driver if a task
+//     (e.g. an `object_store` retry mid-backoff) registers a `tokio::time`
+//     timer after runtime shutdown begins. Volume processes are detached
 //     (setsid) and continue running after the coordinator exits.
 //
 // Directory layout expected:
@@ -128,7 +132,19 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // is spawned, so the volume binary's first IPC always finds an entry).
     let prefetch_tracker: PrefetchTracker = new_prefetch_tracker();
 
-    // Spawn the inbound socket server.
+    // Maps each known volume path to its directory inode.  The inode detects
+    // delete-and-recreate: if the same path reappears with a different inode
+    // (e.g. `volume delete` followed by `volume remote pull` of the same ULID),
+    // we treat it as a new discovery and spawn fresh tasks.
+    let mut known: HashMap<PathBuf, u64> = HashMap::new();
+    // Single JoinSet for all spawned tasks (per-volume drain/GC,
+    // supervisors, inbound socket, reaper). On Ctrl-C we abort_all and
+    // drain so cancellation propagates while the runtime is still alive
+    // — see the module-level shutdown note.
+    let mut tasks: JoinSet<()> = JoinSet::new();
+
+    // Inbound socket server: spawn into `tasks` so it is aborted and
+    // drained on Ctrl-C alongside the per-volume tasks.
     {
         let ctx = inbound::IpcContext {
             data_dir: data_dir.clone(),
@@ -146,28 +162,22 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             identity: identity.clone(),
             issuer: issuer.clone(),
         };
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             inbound::serve(&socket_path, ctx).await;
         });
     }
 
     // Coordinator-wide retention reaper. One ticker fans out
-    // per-owned-volume reap operations (non-blocking spawn). Cadence is
-    // derived from the configured retention; see GcConfig::reaper_cadence.
-    // Retention is read on each tick from the captured config.
-    elide_coordinator::reaper::start(
+    // per-owned-volume reap operations (non-blocking spawn inside
+    // `tick_once`). Cadence is derived from the configured retention;
+    // see GcConfig::reaper_cadence. Retention is read on each tick from
+    // the captured config.
+    tasks.spawn(elide_coordinator::reaper::run(
         store.clone(),
         config.data_dir.clone(),
         gc_config.reaper_cadence(),
         gc_config.retention_window,
-    );
-
-    // Maps each known volume path to its directory inode.  The inode detects
-    // delete-and-recreate: if the same path reappears with a different inode
-    // (e.g. `volume delete` followed by `volume remote pull` of the same ULID),
-    // we treat it as a new discovery and spawn fresh tasks.
-    let mut known: HashMap<PathBuf, u64> = HashMap::new();
-    let mut tasks: JoinSet<()> = JoinSet::new();
+    ));
 
     let mut scan_tick = tokio::time::interval(scan_interval);
     scan_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -327,6 +337,23 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 // themselves.
                 for vol_dir in known.keys() {
                     let _ = std::fs::remove_file(vol_dir.join("volume.pid"));
+                }
+
+                // Drain the JoinSet so abort propagates while the
+                // runtime is still in normal state. Without this, an
+                // in-flight `object_store` retry calling
+                // `tokio::time::sleep` for backoff can race the
+                // runtime's time-driver shutdown and panic with
+                // "A Tokio 1.x context was found, but it is being
+                // shutdown."
+                let drain = async {
+                    while tasks.join_next().await.is_some() {}
+                };
+                if tokio::time::timeout(Duration::from_secs(2), drain)
+                    .await
+                    .is_err()
+                {
+                    warn!("[coordinator] shutdown drain timed out; some tasks did not unwind");
                 }
 
                 break;
