@@ -16,7 +16,9 @@ use object_store::ObjectStore;
 use tracing::warn;
 use ulid::Ulid;
 
-use elide_core::name_record::{NameState, current_hostname};
+use elide_core::name_record::{
+    Lifecycle, NameRecord, NameState, TransitionCheck, current_hostname,
+};
 
 use crate::name_store::{self, NameStoreError};
 
@@ -30,7 +32,36 @@ pub enum LifecycleError {
     OwnershipConflict { held_by: String },
     /// `names/<name>` is in a state that does not permit this transition
     /// (e.g. trying to mark `stopped` something already `released`).
-    InvalidTransition { from: NameState, verb: &'static str },
+    InvalidTransition { from: NameState, verb: Lifecycle },
+}
+
+/// Refuse if `record` is owned by a different coordinator. A `None`
+/// `coordinator_id` is treated as unowned (Phase 1 record without owner
+/// plumbing) and any coordinator may proceed.
+fn check_owner(record: &NameRecord, coord_id: &str) -> Result<(), LifecycleError> {
+    if let Some(existing) = record.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(LifecycleError::OwnershipConflict {
+            held_by: existing.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Backfill owner-identity fields if absent. Phase 1 records arrive
+/// without `coordinator_id`/`claimed_at`/`hostname`; the first lifecycle
+/// verb that has the context populates them in place.
+fn ensure_owner_fields(record: &mut NameRecord, coord_id: &str) {
+    if record.coordinator_id.is_none() {
+        record.coordinator_id = Some(coord_id.to_owned());
+    }
+    if record.claimed_at.is_none() {
+        record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    if record.hostname.is_none() {
+        record.hostname = current_hostname();
+    }
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -97,37 +128,21 @@ pub async fn mark_stopped(
         return Ok(MarkStoppedOutcome::Absent);
     };
 
-    // Ownership check: the record must be owned by us, or unowned (Phase 1
-    // records have no coordinator_id and any coordinator may claim).
-    if let Some(existing) = record.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(LifecycleError::OwnershipConflict {
-            held_by: existing.to_owned(),
-        });
-    }
+    check_owner(&record, coord_id)?;
 
-    match record.state {
-        NameState::Live => {}
-        NameState::Stopped => return Ok(MarkStoppedOutcome::AlreadyStopped),
-        NameState::Released | NameState::Readonly => {
+    match record.state.check_transition(Lifecycle::Stop) {
+        TransitionCheck::Proceed => {}
+        TransitionCheck::Idempotent => return Ok(MarkStoppedOutcome::AlreadyStopped),
+        TransitionCheck::Reroute | TransitionCheck::Refuse => {
             return Err(LifecycleError::InvalidTransition {
                 from: record.state,
-                verb: "stop",
+                verb: Lifecycle::Stop,
             });
         }
     }
 
     record.state = NameState::Stopped;
-    if record.coordinator_id.is_none() {
-        record.coordinator_id = Some(coord_id.to_owned());
-    }
-    if record.claimed_at.is_none() {
-        record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-    if record.hostname.is_none() {
-        record.hostname = current_hostname();
-    }
+    ensure_owner_fields(&mut record, coord_id);
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkStoppedOutcome::Updated)
@@ -177,21 +192,15 @@ pub async fn mark_released(
         return Ok(MarkReleasedOutcome::Absent);
     };
 
-    if let Some(existing) = record.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(LifecycleError::OwnershipConflict {
-            held_by: existing.to_owned(),
-        });
-    }
+    check_owner(&record, coord_id)?;
 
-    match record.state {
-        NameState::Live | NameState::Stopped => {}
-        NameState::Released => return Ok(MarkReleasedOutcome::AlreadyReleased),
-        NameState::Readonly => {
+    match record.state.check_transition(Lifecycle::Release) {
+        TransitionCheck::Proceed => {}
+        TransitionCheck::Idempotent => return Ok(MarkReleasedOutcome::AlreadyReleased),
+        TransitionCheck::Reroute | TransitionCheck::Refuse => {
             return Err(LifecycleError::InvalidTransition {
                 from: record.state,
-                verb: "release",
+                verb: Lifecycle::Release,
             });
         }
     }
@@ -249,10 +258,12 @@ pub async fn mark_released_force(
         return Ok(ForceReleaseOutcome::Absent);
     };
 
-    match current.state {
-        NameState::Live | NameState::Stopped => {}
-        other @ (NameState::Released | NameState::Readonly) => {
-            return Ok(ForceReleaseOutcome::InvalidState { observed: other });
+    match current.state.check_transition(Lifecycle::ForceRelease) {
+        TransitionCheck::Proceed => {}
+        TransitionCheck::Idempotent | TransitionCheck::Reroute | TransitionCheck::Refuse => {
+            return Ok(ForceReleaseOutcome::InvalidState {
+                observed: current.state,
+            });
         }
     }
 
@@ -304,36 +315,22 @@ pub async fn mark_live(
         return Ok(MarkLiveOutcome::Absent);
     };
 
-    if let Some(existing) = record.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(LifecycleError::OwnershipConflict {
-            held_by: existing.to_owned(),
-        });
-    }
+    check_owner(&record, coord_id)?;
 
-    match record.state {
-        NameState::Live => return Ok(MarkLiveOutcome::AlreadyLive),
-        NameState::Stopped => {}
-        NameState::Released => return Ok(MarkLiveOutcome::Released),
-        NameState::Readonly => {
+    match record.state.check_transition(Lifecycle::Start) {
+        TransitionCheck::Proceed => {}
+        TransitionCheck::Idempotent => return Ok(MarkLiveOutcome::AlreadyLive),
+        TransitionCheck::Reroute => return Ok(MarkLiveOutcome::Released),
+        TransitionCheck::Refuse => {
             return Err(LifecycleError::InvalidTransition {
                 from: record.state,
-                verb: "start",
+                verb: Lifecycle::Start,
             });
         }
     }
 
     record.state = NameState::Live;
-    if record.coordinator_id.is_none() {
-        record.coordinator_id = Some(coord_id.to_owned());
-    }
-    if record.claimed_at.is_none() {
-        record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-    if record.hostname.is_none() {
-        record.hostname = current_hostname();
-    }
+    ensure_owner_fields(&mut record, coord_id);
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkLiveOutcome::Resumed)
@@ -390,11 +387,14 @@ pub async fn mark_reclaimed_local(
         return Ok(MarkReclaimedLocalOutcome::Absent);
     };
 
-    if record.state != NameState::Released {
-        return Ok(MarkReclaimedLocalOutcome::NotReleased {
-            observed_state: record.state,
-            observed_vol_ulid: record.vol_ulid,
-        });
+    match record.state.check_transition(Lifecycle::Claim) {
+        TransitionCheck::Proceed => {}
+        TransitionCheck::Idempotent | TransitionCheck::Reroute | TransitionCheck::Refuse => {
+            return Ok(MarkReclaimedLocalOutcome::NotReleased {
+                observed_state: record.state,
+                observed_vol_ulid: record.vol_ulid,
+            });
+        }
     }
 
     if record.vol_ulid != local_vol_ulid {
@@ -595,10 +595,13 @@ pub async fn mark_claimed(
         return Ok(MarkClaimedOutcome::Absent);
     };
 
-    if existing.state != NameState::Released {
-        return Ok(MarkClaimedOutcome::NotReleased {
-            observed: existing.state,
-        });
+    match existing.state.check_transition(Lifecycle::Claim) {
+        TransitionCheck::Proceed => {}
+        TransitionCheck::Idempotent | TransitionCheck::Reroute | TransitionCheck::Refuse => {
+            return Ok(MarkClaimedOutcome::NotReleased {
+                observed: existing.state,
+            });
+        }
     }
 
     let parent_pin = existing
@@ -787,7 +790,7 @@ mod tests {
             err,
             LifecycleError::InvalidTransition {
                 from: NameState::Released,
-                verb: "stop"
+                verb: Lifecycle::Stop,
             }
         ));
     }
@@ -1373,7 +1376,7 @@ mod tests {
             err,
             LifecycleError::InvalidTransition {
                 from: NameState::Readonly,
-                verb: "stop"
+                verb: Lifecycle::Stop,
             }
         ));
     }
@@ -1392,7 +1395,7 @@ mod tests {
             err,
             LifecycleError::InvalidTransition {
                 from: NameState::Readonly,
-                verb: "release"
+                verb: Lifecycle::Release,
             }
         ));
     }
@@ -1411,7 +1414,7 @@ mod tests {
             err,
             LifecycleError::InvalidTransition {
                 from: NameState::Readonly,
-                verb: "start"
+                verb: Lifecycle::Start,
             }
         ));
     }

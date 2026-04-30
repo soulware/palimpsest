@@ -106,6 +106,106 @@ pub enum NameState {
     Readonly,
 }
 
+/// Operator-facing lifecycle verb. The single source of truth for the
+/// names callers use when describing a transition (`InvalidTransition`
+/// errors, log messages, the `check_transition` table below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// `volume stop` — flip `Live` → `Stopped`, retain ownership.
+    Stop,
+    /// `volume release` — flip `Live`/`Stopped` → `Released`, drop ownership.
+    Release,
+    /// `volume start` (local resume) — flip `Stopped` → `Live`.
+    Start,
+    /// `volume release --force` — unconditional flip to `Released`.
+    ForceRelease,
+    /// `volume claim` — flip `Released` → `Live`/`Stopped` under new ownership.
+    Claim,
+}
+
+impl Lifecycle {
+    /// Lowercase operator-facing name, e.g. `"stop"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Release => "release",
+            Self::Start => "start",
+            Self::ForceRelease => "force-release",
+            Self::Claim => "claim",
+        }
+    }
+}
+
+impl fmt::Display for Lifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Result of consulting the `NameState × Lifecycle` transition table.
+///
+/// Callers translate each variant into their verb-specific outcome
+/// (e.g. `MarkStoppedOutcome::AlreadyStopped` for `Idempotent` under
+/// `Stop`). The table itself lives in `NameState::check_transition`,
+/// which is the only place the legal-transition matrix is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionCheck {
+    /// Source state is in the verb's legal source set; mutate and write.
+    Proceed,
+    /// Source state already matches the verb's target; the transition
+    /// is a no-op for an owner-compatible record.
+    Idempotent,
+    /// The verb does not apply to this source state, but a sibling
+    /// verb does. Currently only fires for `Start` against a `Released`
+    /// record, where the caller should route to the claim path.
+    Reroute,
+    /// The verb is illegal for this source state and no sibling covers
+    /// it (e.g. `Stop` on `Readonly`). Callers surface this as a
+    /// `LifecycleError::InvalidTransition` or a verb-specific outcome
+    /// (`NotReleased`, `InvalidState`).
+    Refuse,
+}
+
+impl NameState {
+    /// Look up `(self, verb)` in the legal-transition matrix. The
+    /// matrix is the single source of truth for which lifecycle verbs
+    /// apply to which source states; callers must not re-derive it.
+    ///
+    /// | from \ verb  | Stop       | Release    | Start      | ForceRelease | Claim   |
+    /// |--------------|------------|------------|------------|--------------|---------|
+    /// | Live         | Proceed    | Proceed    | Idempotent | Proceed      | Refuse  |
+    /// | Stopped      | Idempotent | Proceed    | Proceed    | Proceed      | Refuse  |
+    /// | Released     | Refuse     | Idempotent | Reroute    | Refuse       | Proceed |
+    /// | Readonly     | Refuse     | Refuse     | Refuse     | Refuse       | Refuse  |
+    pub fn check_transition(self, verb: Lifecycle) -> TransitionCheck {
+        use Lifecycle as V;
+        use NameState as S;
+        use TransitionCheck::*;
+        match (self, verb) {
+            // Stop
+            (S::Live, V::Stop) => Proceed,
+            (S::Stopped, V::Stop) => Idempotent,
+            (S::Released | S::Readonly, V::Stop) => Refuse,
+            // Release
+            (S::Live | S::Stopped, V::Release) => Proceed,
+            (S::Released, V::Release) => Idempotent,
+            (S::Readonly, V::Release) => Refuse,
+            // Start (local resume of a Stopped record)
+            (S::Live, V::Start) => Idempotent,
+            (S::Stopped, V::Start) => Proceed,
+            (S::Released, V::Start) => Reroute,
+            (S::Readonly, V::Start) => Refuse,
+            // ForceRelease (unconditional override; refuses targets that
+            // are already ownerless or have no owner to override)
+            (S::Live | S::Stopped, V::ForceRelease) => Proceed,
+            (S::Released | S::Readonly, V::ForceRelease) => Refuse,
+            // Claim (only valid against a Released record)
+            (S::Released, V::Claim) => Proceed,
+            (S::Live | S::Stopped | S::Readonly, V::Claim) => Refuse,
+        }
+    }
+}
+
 /// Record stored at `names/<name>` in the bucket.
 ///
 /// All cross-host ownership transfer goes through conditional PUTs on
@@ -283,6 +383,60 @@ mod tests {
             let toml = r.to_toml().unwrap();
             let parsed = NameRecord::from_toml(&toml).unwrap();
             assert_eq!(parsed.state, state);
+        }
+    }
+
+    #[test]
+    fn check_transition_table() {
+        use Lifecycle as V;
+        use NameState as S;
+        use TransitionCheck::*;
+        let cases: &[(S, V, TransitionCheck)] = &[
+            // Stop
+            (S::Live, V::Stop, Proceed),
+            (S::Stopped, V::Stop, Idempotent),
+            (S::Released, V::Stop, Refuse),
+            (S::Readonly, V::Stop, Refuse),
+            // Release
+            (S::Live, V::Release, Proceed),
+            (S::Stopped, V::Release, Proceed),
+            (S::Released, V::Release, Idempotent),
+            (S::Readonly, V::Release, Refuse),
+            // Start
+            (S::Live, V::Start, Idempotent),
+            (S::Stopped, V::Start, Proceed),
+            (S::Released, V::Start, Reroute),
+            (S::Readonly, V::Start, Refuse),
+            // ForceRelease
+            (S::Live, V::ForceRelease, Proceed),
+            (S::Stopped, V::ForceRelease, Proceed),
+            (S::Released, V::ForceRelease, Refuse),
+            (S::Readonly, V::ForceRelease, Refuse),
+            // Claim
+            (S::Live, V::Claim, Refuse),
+            (S::Stopped, V::Claim, Refuse),
+            (S::Released, V::Claim, Proceed),
+            (S::Readonly, V::Claim, Refuse),
+        ];
+        for (from, verb, want) in cases {
+            assert_eq!(
+                from.check_transition(*verb),
+                *want,
+                "({from:?}, {verb:?}) expected {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_verb_display_matches_as_str() {
+        for v in [
+            Lifecycle::Stop,
+            Lifecycle::Release,
+            Lifecycle::Start,
+            Lifecycle::ForceRelease,
+            Lifecycle::Claim,
+        ] {
+            assert_eq!(format!("{v}"), v.as_str());
         }
     }
 
