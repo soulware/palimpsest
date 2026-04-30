@@ -21,27 +21,29 @@ use ulid::Ulid;
 
 use crate::retention::{parse_marker_body, parse_marker_key, segment_key_for};
 
-/// Spawn the coordinator-wide reaper ticker.
+/// Coordinator-wide reaper ticker as a single future. The caller spawns
+/// it into a `JoinSet` so it participates in coordinated shutdown — if
+/// the parent task were detached, runtime tear-down on Ctrl-C would
+/// race with in-flight `object_store` retries and panic the time
+/// driver.
 ///
 /// Cadence is `gc_config.reaper_cadence()` (= `max(retention/10, 1s)`).
 /// `retention` is read on each tick so that operator changes to the
 /// `retention_window` config apply immediately to all in-flight
 /// markers — see `docs/design-replica-model.md` (*Marker record*) for
 /// why we derive rather than stamp.
-pub fn start(
+pub async fn run(
     store: Arc<dyn ObjectStore>,
     data_dir: PathBuf,
     cadence: Duration,
     retention: Duration,
 ) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(cadence);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            tick_once(&store, &data_dir, retention).await;
-        }
-    });
+    let mut tick = tokio::time::interval(cadence);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        tick_once(&store, &data_dir, retention).await;
+    }
 }
 
 /// One tick. Discovers owned volumes under `data_dir`, spawns one
