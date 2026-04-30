@@ -33,7 +33,10 @@ use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
-use elide_coordinator::ipc::{self, Envelope, IpcError, Request, StatusRemoteReply, StatusReply};
+use elide_coordinator::ipc::{
+    self, ClaimReply, Envelope, IpcError, RebindNameReply, ReleaseReply, Request,
+    StatusRemoteReply, StatusReply,
+};
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
@@ -184,6 +187,64 @@ async fn dispatch_json<W: AsyncWriteExt + Unpin>(line: &str, ctx: &IpcContext, w
             let env: Envelope<StatusRemoteReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
+        Request::Stop { volume } => {
+            let result = stop_volume_op(&volume, &ctx.data_dir, &ctx.store, &ctx.coord_id).await;
+            let env: Envelope<()> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Release { volume, force } => {
+            let result = if force {
+                force_release_volume_op(&volume, &ctx.data_dir, &ctx.store, &ctx.identity).await
+            } else {
+                release_volume_op(
+                    &volume,
+                    &ctx.data_dir,
+                    &ctx.snapshot_locks,
+                    &ctx.store,
+                    ctx.part_size_bytes,
+                    &ctx.identity,
+                    &ctx.rescan,
+                )
+                .await
+            };
+            let env: Envelope<ReleaseReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Claim { volume } => {
+            let result =
+                claim_volume_bucket_op(&volume, &ctx.data_dir, &ctx.store, &ctx.identity).await;
+            let env: Envelope<ClaimReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Start { volume } => {
+            let result = start_volume_op(
+                &volume,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.coord_id,
+                &ctx.rescan,
+            )
+            .await;
+            let env: Envelope<()> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::RebindName {
+            volume,
+            new_vol_ulid,
+        } => {
+            let result = rebind_name_op(
+                &volume,
+                new_vol_ulid,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.identity,
+                &ctx.rescan,
+                &ctx.prefetch_tracker,
+            )
+            .await;
+            let env: Envelope<RebindNameReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
     }
 }
 
@@ -198,11 +259,12 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
     };
 
     match op {
-        // `rescan`, `status`, `status-remote` are JSON-only verbs —
-        // see `dispatch_json`. The line dispatcher returns an error if
-        // a client sends them as line commands so the migration
-        // doesn't silently keep working under the old wire.
-        "rescan" | "status" | "status-remote" => {
+        // The following verbs are JSON-only — see `dispatch_json`.
+        // The line dispatcher returns an error if a client sends them
+        // as line commands so the migration doesn't silently keep
+        // working under the old wire.
+        "rescan" | "status" | "status-remote" | "stop" | "release" | "claim" | "start"
+        | "rebind-name" => {
             format!("err verb '{op}' is JSON-only; clients must send NDJSON")
         }
 
@@ -269,108 +331,6 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 return "err usage: remove <volume> [force]".to_string();
             }
             remove_volume(name, force, &ctx.data_dir)
-        }
-
-        "stop" => {
-            if args.is_empty() {
-                return "err usage: stop <volume>".to_string();
-            }
-            stop_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id).await
-        }
-
-        "release" => {
-            if args.is_empty() {
-                return "err usage: release <volume> [--force]".to_string();
-            }
-            let parsed = match parse_release_args(args) {
-                Ok(p) => p,
-                Err(msg) => return format!("err {msg}"),
-            };
-            if parsed.force {
-                force_release_volume_op(parsed.name, &ctx.data_dir, &ctx.store, &ctx.identity).await
-            } else {
-                release_volume_op(
-                    parsed.name,
-                    &ctx.data_dir,
-                    &ctx.snapshot_locks,
-                    &ctx.store,
-                    ctx.part_size_bytes,
-                    &ctx.identity,
-                    &ctx.rescan,
-                )
-                .await
-            }
-        }
-
-        "rebind-name" => {
-            // rebind-name <name> <new_vol_ulid>
-            //
-            // Internal helper called by the CLI's claim orchestration
-            // path. Atomically rebinds a `Released` name to a
-            // freshly-minted local fork, leaving the bucket state in
-            // `Stopped`. The CLI then issues a `start` IPC if the
-            // composed `volume start --claim` flow was requested.
-            let (name, new_ulid_str) = match args.split_once(' ') {
-                Some((n, u)) => (n.trim(), u.trim()),
-                None => return "err usage: rebind-name <volume> <new_vol_ulid>".to_string(),
-            };
-            rebind_name_op(
-                name,
-                new_ulid_str,
-                &ctx.data_dir,
-                &ctx.store,
-                &ctx.identity,
-                &ctx.rescan,
-                &ctx.prefetch_tracker,
-            )
-            .await
-        }
-
-        "claim" => {
-            // claim <name>
-            //
-            // Bucket-side claim flow. Inspects `names/<name>` and:
-            //   - if Released and our fork ULID matches the released
-            //     ULID, reclaim in-place to `Stopped`;
-            //   - if Released with a foreign ULID, return
-            //     `released <vol_ulid> <snap>` so the CLI can pull,
-            //     mint a fresh fork, and call `rebind-name`;
-            //   - if Live or Stopped owned by another coordinator,
-            //     refuse — the operator must run `release --force`
-            //     first to override an unreachable owner.
-            //
-            // Result leaves the volume `Stopped` (no daemon launched).
-            // Use a follow-up `start` to bring the daemon up.
-            let mut tokens = args.split_whitespace();
-            let name = match tokens.next() {
-                Some(n) => n,
-                None => return "err usage: claim <volume>".to_string(),
-            };
-            if tokens.next().is_some() {
-                return "err usage: claim <volume>".to_string();
-            }
-            claim_volume_bucket_op(name, &ctx.data_dir, &ctx.store, &ctx.identity).await
-        }
-
-        "start" => {
-            // start <name>
-            //
-            // Pure local resume. Refuses if the volume has no local
-            // state on this coordinator, or if the bucket-side state
-            // is `Released`/`Readonly`. To claim a `Released` name,
-            // the CLI must call `claim` first.
-            if args.is_empty() {
-                return "err usage: start <volume>".to_string();
-            }
-            let mut tokens = args.split_whitespace();
-            let name = match tokens.next() {
-                Some(n) => n,
-                None => return "err usage: start <volume>".to_string(),
-            };
-            if let Some(other) = tokens.next() {
-                return format!("err unrecognised start flag: {other}");
-            }
-            start_volume_op(name, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
         }
 
         "create" => {
@@ -2178,30 +2138,31 @@ async fn stop_volume_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
-) -> String {
+) -> Result<(), IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return format!("err volume not found: {volume_name}");
+        return Err(IpcError::not_found(format!(
+            "volume not found: {volume_name}"
+        )));
     }
-    let vol_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(e) => return format!("err resolving volume dir: {e}"),
-    };
+    let vol_dir = std::fs::canonicalize(&link)
+        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
 
     if vol_dir.join(STOPPED_FILE).exists() {
         // Already stopped — idempotent success.
-        return "ok".to_string();
+        return Ok(());
     }
 
     let readonly = vol_dir.join("volume.readonly").exists();
 
     // Refuse to stop while an NBD client is connected. ublk volumes have
     // no NBD client and `connected` will simply return false.
-    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
-        Some(resp) if resp == "ok true" => {
-            return "err nbd client is connected; disconnect it first".to_string();
-        }
-        _ => {}
+    if let Some(resp) = elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await
+        && resp == "ok true"
+    {
+        return Err(IpcError::conflict(
+            "nbd client is connected; disconnect it first",
+        ));
     }
 
     // `stop` is a local-lifecycle verb: its job is to halt the daemon
@@ -2242,14 +2203,13 @@ async fn stop_volume_op(
     }
 
     // Write the marker before sending shutdown so the supervisor won't restart.
-    if let Err(e) = std::fs::write(vol_dir.join(STOPPED_FILE), "") {
-        return format!("err writing volume.stopped: {e}");
-    }
+    std::fs::write(vol_dir.join(STOPPED_FILE), "")
+        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
 
     match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
         Some(resp) if resp == "ok" => {
             info!("[inbound] stopped volume {volume_name}");
-            "ok".to_string()
+            Ok(())
         }
         Some(resp) => {
             // Roll back the marker so the supervisor doesn't strand a still-
@@ -2257,12 +2217,12 @@ async fn stop_volume_op(
             // Stopped; that's a soft inconsistency the operator can resolve
             // by issuing `volume start` once the underlying issue is fixed.)
             let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            format!("err shutdown failed: {resp}")
+            Err(IpcError::internal(format!("shutdown failed: {resp}")))
         }
         None => {
             // Volume process wasn't running — marker is correct as-is.
             info!("[inbound] stopped volume {volume_name} (process was not running)");
-            "ok".to_string()
+            Ok(())
         }
     }
 }
@@ -2373,34 +2333,6 @@ async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> 
     false
 }
 
-/// Parsed shape of a `release` IPC line.
-///
-/// Wire format (after the leading `release` verb): `<name> [--force]`.
-struct ParsedReleaseArgs<'a> {
-    name: &'a str,
-    force: bool,
-}
-
-fn parse_release_args(args: &str) -> Result<ParsedReleaseArgs<'_>, String> {
-    let mut tokens = args.split_whitespace();
-    let name = tokens
-        .next()
-        .ok_or_else(|| "usage: release <volume> [--force]".to_owned())?;
-    let mut force = false;
-    for tok in tokens {
-        match tok {
-            "--force" => {
-                if force {
-                    return Err("--force specified twice".to_owned());
-                }
-                force = true;
-            }
-            other => return Err(format!("unrecognised release flag: {other}")),
-        }
-    }
-    Ok(ParsedReleaseArgs { name, force })
-}
-
 /// `volume release --force`.
 ///
 /// Override path for an unreachable previous owner: synthesise a
@@ -2418,7 +2350,7 @@ async fn force_release_volume_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-) -> String {
+) -> Result<ReleaseReply, IpcError> {
     use elide_coordinator::lifecycle::{self, ForceReleaseOutcome};
     use elide_coordinator::recovery;
 
@@ -2427,10 +2359,10 @@ async fn force_release_volume_op(
     // running fork it would leave on-disk state diverging from the
     // bucket record. The operator wants `volume stop` first.
     if local_daemon_running(data_dir, volume_name) {
-        return format!(
-            "err volume '{volume_name}' is running on this host; \
+        return Err(IpcError::conflict(format!(
+            "volume '{volume_name}' is running on this host; \
              stop it first with: elide volume stop {volume_name}"
-        );
+        )));
     }
 
     // Read the current record to learn which dead fork to recover from.
@@ -2441,15 +2373,21 @@ async fn force_release_volume_op(
                 match rec.state {
                     NameState::Live | NameState::Stopped => rec.vol_ulid,
                     other => {
-                        return format!(
-                            "err names/{volume_name} is in state {other:?}; \
-                         force-release only overrides Live or Stopped records"
-                        );
+                        return Err(IpcError::conflict(format!(
+                            "names/{volume_name} is in state {other:?}; \
+                             force-release only overrides Live or Stopped records"
+                        )));
                     }
                 }
             }
-            Ok(None) => return format!("err name '{volume_name}' has no S3 record"),
-            Err(e) => return format!("err reading names/{volume_name}: {e}"),
+            Ok(None) => {
+                return Err(IpcError::not_found(format!(
+                    "name '{volume_name}' has no S3 record"
+                )));
+            }
+            Err(e) => {
+                return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
+            }
         };
 
     // Recovery pipeline: fetch dead fork's pubkey, list+verify
@@ -2460,24 +2398,22 @@ async fn force_release_volume_op(
     // segment could have been signed-and-verified under a missing key,
     // so the dead fork is provably empty: publish an empty synthesised
     // handoff and flip to Released.
-    let dead_pub = match recovery::fetch_volume_pub_optional(store, dead_vol_ulid).await {
-        Ok(k) => k,
-        Err(e) => {
-            return format!("err fetching volume.pub for released fork {dead_vol_ulid}: {e:#}");
-        }
-    };
+    let dead_pub = recovery::fetch_volume_pub_optional(store, dead_vol_ulid)
+        .await
+        .map_err(|e| {
+            IpcError::store(format!(
+                "fetching volume.pub for released fork {dead_vol_ulid}: {e:#}"
+            ))
+        })?;
     let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
         Some(dead_pub) => {
-            let recovered =
-                match recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return format!(
-                            "err listing/verifying segments for released fork \
-                             {dead_vol_ulid}: {e:#}"
-                        );
-                    }
-                };
+            let recovered = recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub)
+                .await
+                .map_err(|e| {
+                    IpcError::store(format!(
+                        "listing/verifying segments for released fork {dead_vol_ulid}: {e:#}"
+                    ))
+                })?;
             let ulids: Vec<ulid::Ulid> =
                 recovered.segments.iter().map(|s| s.segment_ulid).collect();
             info!(
@@ -2498,7 +2434,7 @@ async fn force_release_volume_op(
         }
     };
 
-    let published = match recovery::mint_and_publish_synthesised_snapshot(
+    let published = recovery::mint_and_publish_synthesised_snapshot(
         store,
         dead_vol_ulid,
         &segment_ulids,
@@ -2506,10 +2442,7 @@ async fn force_release_volume_op(
         identity.coordinator_id_str(),
     )
     .await
-    {
-        Ok(p) => p,
-        Err(e) => return format!("err publishing synthesised snapshot: {e}"),
-    };
+    .map_err(|e| IpcError::store(format!("publishing synthesised snapshot: {e}")))?;
 
     // Unconditional flip of names/<name>.
     let outcome = lifecycle::mark_released_force(store, volume_name, published.snap_ulid).await;
@@ -2538,21 +2471,27 @@ async fn force_release_volume_op(
             )
             .await;
 
-            format!("ok {}", published.snap_ulid)
+            Ok(ReleaseReply {
+                handoff_snapshot: published.snap_ulid,
+            })
         }
         Ok(ForceReleaseOutcome::Absent) => {
             // Race: record disappeared between our read and our write.
-            format!("err names/{volume_name} vanished between read and force-write")
+            Err(IpcError::precondition_failed(format!(
+                "names/{volume_name} vanished between read and force-write"
+            )))
         }
         Ok(ForceReleaseOutcome::InvalidState { observed }) => {
             // Race: state changed under us. The synthesised snapshot
             // is still published (harmless); operator can retry.
-            format!("err names/{volume_name} changed underneath us; now in state {observed:?}")
+            Err(IpcError::precondition_failed(format!(
+                "names/{volume_name} changed underneath us; now in state {observed:?}"
+            )))
         }
-        Err(e) => format!(
-            "err force-release flip failed (synthesised snapshot {} already published): {e}",
+        Err(e) => Err(IpcError::store(format!(
+            "force-release flip failed (synthesised snapshot {} already published): {e}",
             published.snap_ulid
-        ),
+        ))),
     }
 }
 
@@ -2590,22 +2529,22 @@ async fn release_volume_op(
     part_size_bytes: usize,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
-) -> String {
+) -> Result<ReleaseReply, IpcError> {
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
 
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return format!("err volume not found: {volume_name}");
+        return Err(IpcError::not_found(format!(
+            "volume not found: {volume_name}"
+        )));
     }
-    let vol_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(e) => return format!("err resolving volume dir: {e}"),
-    };
+    let vol_dir = std::fs::canonicalize(&link)
+        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
 
     if vol_dir.join("volume.readonly").exists() {
-        return "err volume is readonly; nothing to release".to_string();
+        return Err(IpcError::conflict("volume is readonly; nothing to release"));
     }
 
     // `release` is composed of two distinct phases: drain+publish (needs
@@ -2616,10 +2555,10 @@ async fn release_volume_op(
     // would leave the volume in a "Released-but-running" mismatch the
     // operator can't easily recover from.
     if !vol_dir.join(STOPPED_FILE).exists() {
-        return format!(
-            "err volume '{volume_name}' is running; \
+        return Err(IpcError::conflict(format!(
+            "volume '{volume_name}' is running; \
              stop it first with: elide volume stop {volume_name}"
-        );
+        )));
     }
 
     // Verify ownership in S3 before doing any local state mutation.
@@ -2638,20 +2577,24 @@ async fn release_volume_op(
             if let Some(existing) = rec.coordinator_id.as_deref()
                 && existing != coord_id
             {
-                return format!(
-                    "err name '{volume_name}' is owned by coordinator {existing}; \
+                return Err(IpcError::conflict(format!(
+                    "name '{volume_name}' is owned by coordinator {existing}; \
                      run `volume release --force` to override"
-                );
+                )));
             }
             if rec.state == NameState::Released {
-                return format!("err name '{volume_name}' is already released");
+                return Err(IpcError::conflict(format!(
+                    "name '{volume_name}' is already released"
+                )));
             }
         }
         Ok(None) => {
-            return format!("err name '{volume_name}' has no S3 record; drain the volume first");
+            return Err(IpcError::not_found(format!(
+                "name '{volume_name}' has no S3 record; drain the volume first"
+            )));
         }
         Err(e) => {
-            return format!("err reading names/{volume_name}: {e}");
+            return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
         }
     }
 
@@ -2696,12 +2639,13 @@ async fn release_volume_op(
     // The `_draining_guard` removes the marker when this function
     // returns, regardless of which exit path is taken (success, early
     // error, panic).
-    if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
-        return format!("err writing volume.draining: {e}");
-    }
+    std::fs::write(vol_dir.join("volume.draining"), "")
+        .map_err(|e| IpcError::internal(format!("writing volume.draining: {e}")))?;
     if let Err(e) = std::fs::remove_file(vol_dir.join(STOPPED_FILE)) {
         let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
-        return format!("err clearing volume.stopped for release: {e}");
+        return Err(IpcError::internal(format!(
+            "clearing volume.stopped for release: {e}"
+        )));
     }
     rescan.notify_one();
     let mut _draining_guard = Some(DrainingMarkerGuard::new(vol_dir.clone()));
@@ -2709,7 +2653,9 @@ async fn release_volume_op(
     let bringup_started = std::time::Instant::now();
     info!("[release {volume_name}] bringing daemon up for drain");
     if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
-        return format!("err timed out waiting for volume '{volume_name}' to come up for release");
+        return Err(IpcError::internal(format!(
+            "timed out waiting for volume '{volume_name}' to come up for release"
+        )));
     }
     info!(
         "[release {volume_name}] daemon ready in {:.2?}",
@@ -2717,14 +2663,17 @@ async fn release_volume_op(
     );
 
     if !vol_dir.join("control.sock").exists() {
-        return format!("err volume '{volume_name}' is not running — start it first");
+        return Err(IpcError::internal(format!(
+            "volume '{volume_name}' is not running — start it first"
+        )));
     }
 
-    match elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await {
-        Some(resp) if resp == "ok true" => {
-            return "err nbd client is connected; disconnect it first".to_string();
-        }
-        _ => {}
+    if let Some(resp) = elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await
+        && resp == "ok true"
+    {
+        return Err(IpcError::conflict(
+            "nbd client is connected; disconnect it first",
+        ));
     }
 
     // Drain WAL → publish handoff snapshot. Empty volumes get a
@@ -2742,12 +2691,14 @@ async fn release_volume_op(
     .await;
     let snap_ulid_str = match snap_resp.strip_prefix("ok ") {
         Some(s) => s.trim().to_owned(),
-        None => return format!("err snapshot for release failed: {snap_resp}"),
+        None => {
+            return Err(IpcError::internal(format!(
+                "snapshot for release failed: {snap_resp}"
+            )));
+        }
     };
-    let snap_ulid = match ulid::Ulid::from_string(&snap_ulid_str) {
-        Ok(u) => u,
-        Err(e) => return format!("err parsing snapshot ULID '{snap_ulid_str}': {e}"),
-    };
+    let snap_ulid = ulid::Ulid::from_string(&snap_ulid_str)
+        .map_err(|e| IpcError::internal(format!("parsing snapshot ULID '{snap_ulid_str}': {e}")))?;
     info!(
         "[release {volume_name}] handoff snapshot {snap_ulid} published in {:.2?}",
         snap_started.elapsed()
@@ -2762,15 +2713,14 @@ async fn release_volume_op(
     if let Some(g) = _draining_guard.as_mut() {
         g.defuse();
     }
-    if let Err(e) = std::fs::write(vol_dir.join(STOPPED_FILE), "") {
-        return format!("err writing volume.stopped: {e}");
-    }
+    std::fs::write(vol_dir.join(STOPPED_FILE), "")
+        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
     info!("[release {volume_name}] halting daemon");
     match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
         Some(resp) if resp == "ok" => {}
         Some(resp) => {
             let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            return format!("err shutdown failed: {resp}");
+            return Err(IpcError::internal(format!("shutdown failed: {resp}")));
         }
         None => {
             // Volume process wasn't running by the time we reached
@@ -2793,7 +2743,7 @@ async fn perform_release_flip(
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     snap_ulid: ulid::Ulid,
-) -> String {
+) -> Result<ReleaseReply, IpcError> {
     use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
     let flip_started = std::time::Instant::now();
     info!(
@@ -2819,18 +2769,24 @@ async fn perform_release_flip(
                 vol_ulid,
             )
             .await;
-            format!("ok {snap_ulid}")
+            Ok(ReleaseReply {
+                handoff_snapshot: snap_ulid,
+            })
         }
         Ok(_) => {
             info!(
                 "[release {volume_name}] release flip was idempotent or absent \
                  (no event emitted)"
             );
-            format!("ok {snap_ulid}")
+            Ok(ReleaseReply {
+                handoff_snapshot: snap_ulid,
+            })
         }
         Err(e) => {
             warn!("[release {volume_name}] state flip failed: {e}");
-            format!("err snapshot {snap_ulid} published but names/<name> update failed: {e}")
+            Err(IpcError::store(format!(
+                "snapshot {snap_ulid} published but names/<name> update failed: {e}"
+            )))
         }
     }
 }
@@ -2954,19 +2910,14 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
 /// daemon launch was requested.
 async fn rebind_name_op(
     volume_name: &str,
-    new_ulid_str: &str,
+    new_vol_ulid: ulid::Ulid,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
     prefetch_tracker: &PrefetchTracker,
-) -> String {
+) -> Result<RebindNameReply, IpcError> {
     let coord_id = identity.coordinator_id_str();
-    let new_ulid = match ulid::Ulid::from_string(new_ulid_str) {
-        Ok(u) => u,
-        Err(e) => return format!("err invalid new_vol_ulid: {e}"),
-    };
-
     // Pre-register the prefetch tracker entry, mirroring `fork_create_op`.
     // For the regular foreign-claim flow this is redundant (the
     // preceding `fork_create_op` already pre-registered), but on the
@@ -2975,78 +2926,86 @@ async fn rebind_name_op(
     // between the original aborted attempt and this resume, and
     // discovery hasn't completed yet. `register_prefetch_or_get` is
     // idempotent so the redundant case is a no-op.
-    let _ = register_prefetch_or_get(prefetch_tracker, new_ulid);
+    let _ = register_prefetch_or_get(prefetch_tracker, new_vol_ulid);
 
-    let new_dir = data_dir.join("by_id").join(new_ulid.to_string());
+    let new_dir = data_dir.join("by_id").join(new_vol_ulid.to_string());
     if !new_dir.exists() {
-        return format!(
-            "err new fork directory not found at {} — \
+        return Err(IpcError::not_found(format!(
+            "new fork directory not found at {} — \
              the CLI must materialise the fork before calling rebind-name",
             new_dir.display()
-        );
+        )));
     }
 
     // Ensure volume.stopped is present so the supervisor doesn't
     // launch the daemon when notified — claim leaves the volume
     // halted; start brings it up.
-    if let Err(e) = std::fs::write(new_dir.join(STOPPED_FILE), "") {
-        return format!("err writing volume.stopped on new fork: {e}");
-    }
+    std::fs::write(new_dir.join(STOPPED_FILE), "")
+        .map_err(|e| IpcError::internal(format!("writing volume.stopped on new fork: {e}")))?;
 
     let symlink_path = data_dir.join("by_name").join(volume_name);
-    let target = std::path::PathBuf::from(format!("../by_id/{new_ulid}"));
+    let target = std::path::PathBuf::from(format!("../by_id/{new_vol_ulid}"));
     match std::fs::read_link(&symlink_path) {
         Ok(existing) if existing == target => {}
         Ok(other) => {
-            return format!(
-                "err by_name/{volume_name} already points at {} (expected ../by_id/{new_ulid})",
+            return Err(IpcError::conflict(format!(
+                "by_name/{volume_name} already points at {} (expected ../by_id/{new_vol_ulid})",
                 other.display()
-            );
+            )));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(unix)]
-            if let Err(e) = std::os::unix::fs::symlink(&target, &symlink_path) {
-                return format!("err creating by_name/{volume_name} symlink: {e}");
-            }
+            std::os::unix::fs::symlink(&target, &symlink_path).map_err(|e| {
+                IpcError::internal(format!("creating by_name/{volume_name} symlink: {e}"))
+            })?;
         }
-        Err(e) => return format!("err reading by_name/{volume_name}: {e}"),
+        Err(e) => {
+            return Err(IpcError::internal(format!(
+                "reading by_name/{volume_name}: {e}"
+            )));
+        }
     }
 
     use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
     use elide_core::name_record::NameState;
-    match mark_claimed(store, volume_name, coord_id, new_ulid, NameState::Stopped).await {
+    match mark_claimed(
+        store,
+        volume_name,
+        coord_id,
+        new_vol_ulid,
+        NameState::Stopped,
+    )
+    .await
+    {
         Ok(MarkClaimedOutcome::Claimed) => {
             rescan.notify_one();
-            info!("[inbound] rebound name {volume_name} to new fork {new_ulid} (stopped)");
+            info!("[inbound] rebound name {volume_name} to new fork {new_vol_ulid} (stopped)");
             elide_coordinator::name_event_store::emit_best_effort(
                 store,
                 identity.as_ref(),
                 volume_name,
                 elide_core::name_event::EventKind::Claimed,
-                new_ulid,
+                new_vol_ulid,
             )
             .await;
-            format!("ok {new_ulid}")
+            Ok(RebindNameReply { new_vol_ulid })
         }
-        Ok(MarkClaimedOutcome::Absent) => {
-            format!("err names/{volume_name} does not exist; nothing to claim")
-        }
-        Ok(MarkClaimedOutcome::NotReleased { observed }) => {
-            format!(
-                "err names/{volume_name} is in state {observed:?}, not Released; \
-                 cannot claim"
-            )
-        }
-        Err(LifecycleError::Store(e)) => format!("err claim failed: {e}"),
+        Ok(MarkClaimedOutcome::Absent) => Err(IpcError::not_found(format!(
+            "names/{volume_name} does not exist; nothing to claim"
+        ))),
+        Ok(MarkClaimedOutcome::NotReleased { observed }) => Err(IpcError::conflict(format!(
+            "names/{volume_name} is in state {observed:?}, not Released; cannot claim"
+        ))),
+        Err(LifecycleError::Store(e)) => Err(IpcError::store(format!("claim failed: {e}"))),
         Err(LifecycleError::OwnershipConflict { held_by }) => {
-            format!(
-                "err name '{volume_name}' raced with another claim ({held_by} won); \
-                 your local fork at {new_ulid} can be re-purposed manually"
-            )
+            Err(IpcError::precondition_failed(format!(
+                "name '{volume_name}' raced with another claim ({held_by} won); \
+                 your local fork at {new_vol_ulid} can be re-purposed manually"
+            )))
         }
-        Err(LifecycleError::InvalidTransition { from, .. }) => {
-            format!("err names/{volume_name} is in state {from:?}; cannot claim")
-        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => Err(IpcError::conflict(format!(
+            "names/{volume_name} is in state {from:?}; cannot claim"
+        ))),
     }
 }
 
@@ -3071,7 +3030,7 @@ async fn claim_volume_bucket_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-) -> String {
+) -> Result<ClaimReply, IpcError> {
     let coord_id = identity.coordinator_id_str();
     use elide_core::name_record::NameState;
 
@@ -3079,22 +3038,21 @@ async fn claim_volume_bucket_op(
     // daemon contradicts that — refuse and point the operator at
     // `volume stop` first.
     if local_daemon_running(data_dir, volume_name) {
-        return format!(
-            "err volume '{volume_name}' is running on this host; \
+        return Err(IpcError::conflict(format!(
+            "volume '{volume_name}' is running on this host; \
              stop it first with: elide volume stop {volume_name}"
-        );
+        )));
     }
 
-    let record_opt = match elide_coordinator::name_store::read_name_record(store, volume_name).await
-    {
-        Ok(r) => r,
-        Err(e) => return format!("err reading names/{volume_name}: {e}"),
-    };
+    let record_opt = elide_coordinator::name_store::read_name_record(store, volume_name)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
 
-    let record = match record_opt {
-        Some((rec, _)) => rec,
-        None => return format!("err name '{volume_name}' has no S3 record; nothing to claim"),
-    };
+    let (record, _version) = record_opt.ok_or_else(|| {
+        IpcError::not_found(format!(
+            "name '{volume_name}' has no S3 record; nothing to claim"
+        ))
+    })?;
 
     match record.state {
         NameState::Released => {
@@ -3134,58 +3092,62 @@ async fn claim_volume_bucket_op(
                             record.vol_ulid,
                         )
                         .await;
-                        "ok reclaimed".to_string()
+                        Ok(ClaimReply::Reclaimed)
                     }
-                    Ok(MarkReclaimedLocalOutcome::Absent) => {
-                        format!("err names/{volume_name} vanished between read and reclaim")
-                    }
+                    Ok(MarkReclaimedLocalOutcome::Absent) => Err(IpcError::precondition_failed(
+                        format!("names/{volume_name} vanished between read and reclaim"),
+                    )),
                     Ok(MarkReclaimedLocalOutcome::NotReleased { observed_state, .. }) => {
-                        format!(
-                            "err names/{volume_name} changed underneath us; now in state \
+                        Err(IpcError::precondition_failed(format!(
+                            "names/{volume_name} changed underneath us; now in state \
                              {observed_state:?}"
-                        )
+                        )))
                     }
                     Ok(MarkReclaimedLocalOutcome::ForkMismatch {
                         released_vol_ulid, ..
                     }) => {
                         // Race: someone rebound between our read and write.
-                        let snap = record
-                            .handoff_snapshot
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "_".to_string());
-                        format!("released {released_vol_ulid} {snap}")
+                        // Surface as MustClaimFresh routing — same shape as
+                        // the foreign-content path below.
+                        Ok(ClaimReply::MustClaimFresh {
+                            released_vol_ulid,
+                            handoff_snapshot: record.handoff_snapshot,
+                        })
                     }
-                    Err(LifecycleError::Store(e)) => format!("err reclaim failed: {e}"),
+                    Err(LifecycleError::Store(e)) => {
+                        Err(IpcError::store(format!("reclaim failed: {e}")))
+                    }
                     Err(LifecycleError::OwnershipConflict { .. })
-                    | Err(LifecycleError::InvalidTransition { .. }) => {
-                        format!("err in-place reclaim of {volume_name} refused")
-                    }
+                    | Err(LifecycleError::InvalidTransition { .. }) => Err(IpcError::conflict(
+                        format!("in-place reclaim of {volume_name} refused"),
+                    )),
                 }
             } else {
                 // Foreign content — CLI must orchestrate the claim.
-                let snap = record
-                    .handoff_snapshot
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "_".to_string());
-                format!("released {} {}", record.vol_ulid, snap)
+                Ok(ClaimReply::MustClaimFresh {
+                    released_vol_ulid: record.vol_ulid,
+                    handoff_snapshot: record.handoff_snapshot,
+                })
             }
         }
-        NameState::Live | NameState::Stopped => {
-            match record.coordinator_id.as_deref() {
-                Some(owner) if owner == coord_id => {
-                    // Already ours — nothing to claim.
-                    format!("err name '{volume_name}' is already held by this coordinator")
-                }
-                Some(owner) => format!("err name '{volume_name}' is held by coordinator {owner}"),
-                None => {
-                    format!("err name '{volume_name}' has no coordinator_id (malformed record)")
-                }
+        NameState::Live | NameState::Stopped => match record.coordinator_id.as_deref() {
+            Some(owner) if owner == coord_id => {
+                // Already ours — nothing to claim.
+                Err(IpcError::conflict(format!(
+                    "name '{volume_name}' is already held by this coordinator"
+                )))
             }
-        }
-        NameState::Readonly => format!(
-            "err name '{volume_name}' is readonly (immutable handle); \
+            Some(owner) => Err(IpcError::conflict(format!(
+                "name '{volume_name}' is held by coordinator {owner}"
+            ))),
+            None => Err(IpcError::internal(format!(
+                "name '{volume_name}' has no coordinator_id (malformed record)"
+            ))),
+        },
+        NameState::Readonly => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is readonly (immutable handle); \
              pull it with `volume pull` to serve locally"
-        ),
+        ))),
     }
 }
 
@@ -3195,21 +3157,19 @@ async fn start_volume_op(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
     rescan: &Notify,
-) -> String {
+) -> Result<(), IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return format!(
-            "err volume '{volume_name}' not found locally; \
+        return Err(IpcError::not_found(format!(
+            "volume '{volume_name}' not found locally; \
              to claim it from the bucket, run: elide volume claim {volume_name}"
-        );
+        )));
     }
-    let vol_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(e) => return format!("err resolving volume dir: {e}"),
-    };
+    let vol_dir = std::fs::canonicalize(&link)
+        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
 
     if !vol_dir.join(STOPPED_FILE).exists() {
-        return "err volume is not stopped".to_string();
+        return Err(IpcError::conflict("volume is not stopped"));
     }
 
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
@@ -3219,19 +3179,21 @@ async fn start_volume_op(
             // No S3 record yet — proceed local-only.
         }
         Ok(MarkLiveOutcome::Released) => {
-            return format!(
-                "err name '{volume_name}' is Released; \
+            return Err(IpcError::conflict(format!(
+                "name '{volume_name}' is Released; \
                  reclaim with: elide volume claim {volume_name}"
-            );
+            )));
         }
         Err(LifecycleError::OwnershipConflict { held_by }) => {
-            return format!(
-                "err name '{volume_name}' is owned by coordinator {held_by}; \
+            return Err(IpcError::conflict(format!(
+                "name '{volume_name}' is owned by coordinator {held_by}; \
                  run `volume release --force` to override"
-            );
+            )));
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {
-            return format!("err names/<name> is in state {from:?}; cannot start");
+            return Err(IpcError::conflict(format!(
+                "names/<name> is in state {from:?}; cannot start"
+            )));
         }
         Err(LifecycleError::Store(e)) => {
             warn!("[inbound] start {volume_name}: failed to update names/<name>: {e}");
@@ -3240,21 +3202,20 @@ async fn start_volume_op(
 
     match elide_core::config::find_nbd_conflict(&vol_dir, data_dir) {
         Ok(Some(conflict)) => {
-            return format!(
-                "err nbd endpoint {} conflicts with volume '{}'",
+            return Err(IpcError::conflict(format!(
+                "nbd endpoint {} conflicts with volume '{}'",
                 conflict.endpoint, conflict.name,
-            );
+            )));
         }
         Ok(None) => {}
-        Err(e) => return format!("err nbd conflict check: {e}"),
+        Err(e) => return Err(IpcError::internal(format!("nbd conflict check: {e}"))),
     }
 
-    if let Err(e) = std::fs::remove_file(vol_dir.join(STOPPED_FILE)) {
-        return format!("err clearing volume.stopped: {e}");
-    }
+    std::fs::remove_file(vol_dir.join(STOPPED_FILE))
+        .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
     rescan.notify_one();
     info!("[inbound] started volume {volume_name}");
-    "ok".to_string()
+    Ok(())
 }
 
 // ── Macaroon-authenticated credential vending ────────────────────────────────
@@ -3831,12 +3792,11 @@ mod tests {
     async fn force_release_op_overwrites_live_to_released() {
         let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
 
-        let resp =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
-
-        assert!(resp.starts_with("ok "), "{resp}");
-        let snap_str = resp.strip_prefix("ok ").unwrap();
-        let snap_ulid = ulid::Ulid::from_string(snap_str).expect("snapshot ULID");
+        let reply =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect("force-release should succeed");
+        let snap_ulid = reply.handoff_snapshot;
 
         // names/<vol> is now Released, references the dead fork.
         let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
@@ -3871,12 +3831,15 @@ mod tests {
             .await
             .unwrap();
 
-        let resp =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
-        assert!(resp.starts_with("err "), "{resp}");
+        let err = force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+            .await
+            .expect_err("already-released record must refuse");
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
         assert!(
-            resp.contains("force-release only overrides Live or Stopped"),
-            "{resp}"
+            err.message
+                .contains("force-release only overrides Live or Stopped"),
+            "{}",
+            err.message
         );
     }
 
@@ -3886,11 +3849,12 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let resp =
+        let err =
             force_release_volume_op("ghost", TempDir::new().unwrap().path(), &store, &identity)
-                .await;
-        assert!(resp.starts_with("err "), "{resp}");
-        assert!(resp.contains("no S3 record"), "{resp}");
+                .await
+                .expect_err("ghost name must error");
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::NotFound);
+        assert!(err.message.contains("no S3 record"), "{}", err.message);
     }
 
     #[tokio::test]
@@ -3910,11 +3874,11 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let resp =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
-        assert!(resp.starts_with("ok "), "{resp}");
-        let snap_str = resp.strip_prefix("ok ").unwrap();
-        let snap_ulid = ulid::Ulid::from_string(snap_str).expect("snapshot ULID");
+        let reply =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect("force-release on missing-pub fork should succeed");
+        let snap_ulid = reply.handoff_snapshot;
 
         let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
         assert_eq!(rec.state, NameState::Released);
@@ -3981,13 +3945,14 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let resp =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
-        assert!(resp.starts_with("ok "), "{resp}");
+        let reply =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect("force-release with one tampered segment must still succeed");
+        let snap_str = reply.handoff_snapshot.to_string();
 
         // Verify the synthesised manifest contains exactly one segment ULID
         // — the good one. Read the manifest body and look for both ids.
-        let snap_str = resp.strip_prefix("ok ").unwrap();
         use futures::TryStreamExt;
         let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
         let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
@@ -4070,7 +4035,7 @@ mod tests {
         rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let resp = release_volume_op(
+        let err = release_volume_op(
             "vol",
             data_dir.path(),
             &snapshot_locks,
@@ -4079,12 +4044,14 @@ mod tests {
             &identity,
             &rescan,
         )
-        .await;
+        .await
+        .expect_err("running volume must refuse release");
 
-        assert!(resp.starts_with("err "), "{resp}");
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
         assert!(
-            resp.contains("running") && resp.contains("volume stop"),
-            "expected operator to be pointed at `volume stop`, got: {resp}"
+            err.message.contains("running") && err.message.contains("volume stop"),
+            "expected operator to be pointed at `volume stop`, got: {}",
+            err.message
         );
 
         // The bucket record must be untouched — still Live.
@@ -4109,11 +4076,9 @@ mod tests {
         rec.handoff_snapshot = Some(ulid::Ulid::new());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let resp = stop_volume_op("vol", data_dir.path(), &store, "coord-self").await;
-        assert_eq!(
-            resp, "ok",
-            "stop must halt locally regardless of bucket state"
-        );
+        stop_volume_op("vol", data_dir.path(), &store, "coord-self")
+            .await
+            .expect("stop must halt locally regardless of bucket state");
 
         // Local marker now present.
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
@@ -4144,8 +4109,9 @@ mod tests {
         rec.coordinator_id = Some("coord-other".into());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let resp = stop_volume_op("vol", data_dir.path(), &store, "coord-self").await;
-        assert_eq!(resp, "ok");
+        stop_volume_op("vol", data_dir.path(), &store, "coord-self")
+            .await
+            .expect("stop must halt locally despite foreign bucket state");
 
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
         assert!(vol_dir.join(STOPPED_FILE).exists());

@@ -230,6 +230,7 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "verb", rename_all = "kebab-case")]
 pub enum Request {
+    // ── Iteration 1: status family ───────────────────────────────────
     /// Trigger an immediate fork-discovery pass. No payload.
     Rescan,
     /// Report a volume's local lifecycle (running / stopped / importing).
@@ -237,6 +238,26 @@ pub enum Request {
     /// Fetch the bucket-side `names/<volume>` record plus this
     /// coordinator's eligibility to act on it.
     StatusRemote { volume: String },
+
+    // ── Iteration 2: lifecycle ───────────────────────────────────────
+    /// Halt the local volume daemon. Empty success reply.
+    Stop { volume: String },
+    /// Drain WAL → publish handoff snapshot → flip `names/<name>`
+    /// to Released. With `force = true`, override an unreachable
+    /// foreign owner (synthesises a handoff from S3-visible segments).
+    Release {
+        volume: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Bucket-side claim flow against a `Released` record. Either
+    /// reclaims in place or signals the CLI to mint a fresh fork.
+    Claim { volume: String },
+    /// Local resume of a `Stopped` volume. Empty success reply.
+    Start { volume: String },
+    /// Atomically rebind a `Released` name to a freshly-minted local
+    /// fork. Internal helper called by the CLI's claim orchestration.
+    RebindName { volume: String, new_vol_ulid: Ulid },
 }
 
 /// Reply for [`Request::Status`].
@@ -262,6 +283,46 @@ pub struct StatusRemoteReply {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub handoff_snapshot: Option<Ulid>,
     pub eligibility: Eligibility,
+}
+
+/// Reply for [`Request::Release`] (with or without `force`). The
+/// `handoff_snapshot` field carries the snapshot ULID that the next
+/// claimant will fork from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReply {
+    pub handoff_snapshot: Ulid,
+}
+
+/// Reply for [`Request::RebindName`]. Echoes the new fork's ULID for
+/// confirmation; the coordinator atomically rebound `names/<volume>`
+/// to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebindNameReply {
+    pub new_vol_ulid: Ulid,
+}
+
+/// Reply for [`Request::Claim`]. The bucket-side claim flow is
+/// non-deterministic in shape: an in-place reclaim succeeds with no
+/// further action, but a foreign-content claim returns the routing
+/// info the CLI needs to materialise a fresh fork and call
+/// `rebind-name`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ClaimReply {
+    /// In-place reclaim. The local fork's ULID matched the released
+    /// record's; the bucket flipped from `Released` to `Stopped` with
+    /// the same `vol_ulid`. No CLI orchestration is needed.
+    Reclaimed,
+    /// The released record's `vol_ulid` is foreign content. The CLI
+    /// must pull the source, mint a fresh local fork, and call
+    /// `rebind-name` with the new ULID. `handoff_snapshot` is the
+    /// snapshot the new fork will inherit from; absent when the
+    /// released record has no recorded handoff yet.
+    MustClaimFresh {
+        released_vol_ulid: Ulid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        handoff_snapshot: Option<Ulid>,
+    },
 }
 
 #[cfg(test)]

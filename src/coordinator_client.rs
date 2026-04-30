@@ -13,7 +13,9 @@ use std::time::Duration;
 use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
-pub use elide_coordinator::ipc::{IpcErrorKind, StatusRemoteReply, StatusReply};
+pub use elide_coordinator::ipc::{
+    ClaimReply, IpcErrorKind, RebindNameReply, ReleaseReply, StatusRemoteReply, StatusReply,
+};
 pub use elide_coordinator::volume_state::VolumeLifecycle;
 
 /// Send a typed JSON request and parse a typed JSON reply.
@@ -457,12 +459,13 @@ pub fn remove_volume(socket_path: &Path, name: &str, force: bool) -> io::Result<
 /// file and that socket are root-owned when the coordinator runs under sudo,
 /// so this path is what makes `volume stop` work for non-root CLI callers.
 pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
-    let resp = call(socket_path, &format!("stop {name}"))?;
-    match resp.split_once(' ') {
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ if resp == "ok" => Ok(()),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    call_typed::<()>(
+        socket_path,
+        &Request::Stop {
+            volume: name.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Outcome of a `resolve_handoff_key` call.
@@ -527,17 +530,15 @@ pub fn resolve_handoff_key(
 /// owner is unreachable. The recovering coordinator synthesises a
 /// handoff snapshot from S3-visible segments and unconditionally
 /// rewrites the record.
-pub fn release_volume(socket_path: &Path, name: &str, force: bool) -> io::Result<String> {
-    let mut cmd = format!("release {name}");
-    if force {
-        cmd.push_str(" --force");
-    }
-    let resp = call(socket_path, &cmd)?;
-    match resp.split_once(' ') {
-        Some(("ok", snap)) => Ok(snap.trim().to_owned()),
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+pub fn release_volume(socket_path: &Path, name: &str, force: bool) -> io::Result<ReleaseReply> {
+    call_typed(
+        socket_path,
+        &Request::Release {
+            volume: name.to_owned(),
+            force,
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Start a volume locally. Pure local resume — flips an owned
@@ -545,14 +546,13 @@ pub fn release_volume(socket_path: &Path, name: &str, force: bool) -> io::Result
 /// state, or if the bucket says `Released`. To take a `Released`
 /// name, call `claim_volume_bucket` first.
 pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<()> {
-    let resp = call(socket_path, &format!("start {name}"))?;
-    if resp == "ok" {
-        return Ok(());
-    }
-    if let Some(msg) = resp.strip_prefix("err ") {
-        return Err(io::Error::other(msg.to_owned()));
-    }
-    Err(io::Error::other(format!("unexpected response: {resp}")))
+    call_typed::<()>(
+        socket_path,
+        &Request::Start {
+            volume: name.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Outcome of a `claim_volume_bucket` call.
@@ -583,25 +583,23 @@ pub enum ClaimOutcome {
 /// claimants are arbitrated by the conditional PUT inside
 /// `mark_claimed`, not by an unconditional rewrite.
 pub fn claim_volume_bucket(socket_path: &Path, name: &str) -> io::Result<ClaimOutcome> {
-    let resp = call(socket_path, &format!("claim {name}"))?;
-    if resp == "ok reclaimed" {
-        return Ok(ClaimOutcome::Reclaimed);
-    }
-    if let Some(rest) = resp.strip_prefix("released ") {
-        let mut parts = rest.split_whitespace();
-        let vol = parts
-            .next()
-            .ok_or_else(|| io::Error::other(format!("malformed released response: {resp}")))?;
-        let snap = parts.next();
-        return Ok(ClaimOutcome::NeedsClaim {
-            released_vol_ulid: vol.to_owned(),
-            handoff_snapshot: snap.filter(|s| *s != "_").map(str::to_owned),
-        });
-    }
-    if let Some(msg) = resp.strip_prefix("err ") {
-        return Err(io::Error::other(msg.to_owned()));
-    }
-    Err(io::Error::other(format!("unexpected response: {resp}")))
+    let reply: ClaimReply = call_typed(
+        socket_path,
+        &Request::Claim {
+            volume: name.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(match reply {
+        ClaimReply::Reclaimed => ClaimOutcome::Reclaimed,
+        ClaimReply::MustClaimFresh {
+            released_vol_ulid,
+            handoff_snapshot,
+        } => ClaimOutcome::NeedsClaim {
+            released_vol_ulid: released_vol_ulid.to_string(),
+            handoff_snapshot: handoff_snapshot.map(|s| s.to_string()),
+        },
+    })
 }
 
 /// Atomically rebind a `Released` name to a freshly-minted local fork,
@@ -609,12 +607,17 @@ pub fn claim_volume_bucket(socket_path: &Path, name: &str) -> io::Result<ClaimOu
 /// materialised `by_id/<new_vol_ulid>/` before calling this. Returns
 /// the new ULID on success.
 pub fn rebind_name(socket_path: &Path, name: &str, new_vol_ulid: &str) -> io::Result<String> {
-    let resp = call(socket_path, &format!("rebind-name {name} {new_vol_ulid}"))?;
-    match resp.split_once(' ') {
-        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let parsed = ulid::Ulid::from_string(new_vol_ulid)
+        .map_err(|e| io::Error::other(format!("invalid new_vol_ulid: {e}")))?;
+    let reply: RebindNameReply = call_typed(
+        socket_path,
+        &Request::RebindName {
+            volume: name.to_owned(),
+            new_vol_ulid: parsed,
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.new_vol_ulid.to_string())
 }
 
 /// Create a fresh writable volume. Returns the new volume's ULID. Routes

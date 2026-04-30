@@ -806,8 +806,11 @@ fn main() {
                 }
                 if release {
                     match coordinator_client::release_volume(&socket_path, &name, false) {
-                        Ok(snap) => {
-                            println!("{name}: released at handoff snapshot {snap}");
+                        Ok(reply) => {
+                            println!(
+                                "{name}: released at handoff snapshot {}",
+                                reply.handoff_snapshot
+                            );
                         }
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -873,11 +876,14 @@ fn main() {
 
             VolumeCommand::Release { name, force } => {
                 match coordinator_client::release_volume(&socket_path, &name, force) {
-                    Ok(snap) => {
+                    Ok(reply) => {
                         let kind = if force {
-                            format!("force-released at synthesised handoff snapshot {snap}")
+                            format!(
+                                "force-released at synthesised handoff snapshot {}",
+                                reply.handoff_snapshot
+                            )
                         } else {
-                            format!("released at handoff snapshot {snap}")
+                            format!("released at handoff snapshot {}", reply.handoff_snapshot)
                         };
                         println!("{name}: {kind}");
                     }
