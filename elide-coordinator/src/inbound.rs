@@ -287,7 +287,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
         }
 
         "claim" => {
-            // claim <name> [--force]
+            // claim <name>
             //
             // Bucket-side claim flow. Inspects `names/<name>` and:
             //   - if Released and our fork ULID matches the released
@@ -295,40 +295,21 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             //   - if Released with a foreign ULID, return
             //     `released <vol_ulid> <snap>` so the CLI can pull,
             //     mint a fresh fork, and call `rebind-name`;
-            //   - with --force, behaves like running `release --force`
-            //     internally first, then claiming.
+            //   - if Live or Stopped owned by another coordinator,
+            //     refuse — the operator must run `release --force`
+            //     first to override an unreachable owner.
             //
             // Result leaves the volume `Stopped` (no daemon launched).
             // Use a follow-up `start` to bring the daemon up.
-            if args.is_empty() {
-                return "err usage: claim <volume> [--force]".to_string();
-            }
             let mut tokens = args.split_whitespace();
             let name = match tokens.next() {
                 Some(n) => n,
-                None => return "err usage: claim <volume> [--force]".to_string(),
+                None => return "err usage: claim <volume>".to_string(),
             };
-            let mut force = false;
-            for tok in tokens {
-                match tok {
-                    "--force" => {
-                        if force {
-                            return "err --force specified twice".to_string();
-                        }
-                        force = true;
-                    }
-                    other => return format!("err unrecognised claim flag: {other}"),
-                }
+            if tokens.next().is_some() {
+                return "err usage: claim <volume>".to_string();
             }
-            claim_volume_bucket_op(
-                name,
-                force,
-                &ctx.data_dir,
-                &ctx.store,
-                &ctx.coord_id,
-                &ctx.identity,
-            )
-            .await
+            claim_volume_bucket_op(name, &ctx.data_dir, &ctx.store, &ctx.coord_id).await
         }
 
         "start" => {
@@ -2100,10 +2081,10 @@ async fn fork_create_op(
 /// has no `volume.stopped` marker — i.e. this host is actively
 /// serving (or supposed to be serving) `<name>`.
 ///
-/// Used by recovery verbs (`release --force`, `claim`, `claim --force`)
-/// to refuse when the operator has typo'd a verb at their own running
-/// volume: those verbs are designed for unreachable peers and would
-/// otherwise leave on-disk state diverging from the bucket record.
+/// Used by recovery verbs (`release --force`, `claim`) to refuse when
+/// the operator has typo'd a verb at their own running volume: those
+/// verbs are designed for unreachable peers and would otherwise leave
+/// on-disk state diverging from the bucket record.
 fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
     let link = data_dir.join("by_name").join(volume_name);
     match std::fs::canonicalize(&link) {
@@ -2909,24 +2890,27 @@ async fn rebind_name_op(
     }
 }
 
-/// `volume claim <name> [--force]` IPC handler.
+/// `volume claim <name>` IPC handler.
 ///
 /// Inspects `names/<name>` and either:
 ///   - reclaims in place (own released fork still on disk) → `ok reclaimed`
 ///   - directs the CLI to orchestrate a foreign claim → `released <vol_ulid> <snap>`
-///   - with `--force` overrides foreign Live/Stopped ownership by
-///     synthesising a handoff snapshot then directing CLI orchestration.
+///   - refuses if the record is `Live`/`Stopped` and owned by another
+///     coordinator. The operator must run `release --force` first to
+///     declare the previous owner dead and flip the record to
+///     `Released`. Splitting the verbs keeps the claim step
+///     CAS-protected (via `mark_claimed`) so concurrent claimants
+///     are arbitrated by the conditional PUT, not by the unconditional
+///     overwrite that `release --force` performs.
 ///
 /// The result always leaves the volume `Stopped` (no daemon launched).
 /// The CLI calls `start` afterwards if `volume start --claim` was the
 /// composed flow.
 async fn claim_volume_bucket_op(
     volume_name: &str,
-    force: bool,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> String {
     use elide_core::name_record::NameState;
 
@@ -2949,29 +2933,6 @@ async fn claim_volume_bucket_op(
     let record = match record_opt {
         Some((rec, _)) => rec,
         None => return format!("err name '{volume_name}' has no S3 record; nothing to claim"),
-    };
-
-    // --force on a Live/Stopped foreign-owned record: synthesise a
-    // handoff snapshot and rewrite the record to Released, then fall
-    // through into the regular claim path.
-    let record = if force
-        && matches!(record.state, NameState::Live | NameState::Stopped)
-        && record
-            .coordinator_id
-            .as_deref()
-            .is_some_and(|id| id != coord_id)
-    {
-        match force_release_volume_op(volume_name, data_dir, store, identity).await {
-            r if r.starts_with("ok") => {}
-            err => return err,
-        }
-        match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-            Ok(Some((rec, _))) => rec,
-            Ok(None) => return format!("err name '{volume_name}' vanished after force-release"),
-            Err(e) => return format!("err re-reading names/{volume_name}: {e}"),
-        }
-    } else {
-        record
     };
 
     match record.state {
@@ -3048,7 +3009,9 @@ async fn claim_volume_bucket_op(
                 }
                 Some(owner) => format!(
                     "err name '{volume_name}' is held by coordinator {owner}; \
-                     run with --force to override"
+                     if that owner is unreachable, run \
+                     `elide volume release --force {volume_name}` first \
+                     to declare it dead, then re-run claim"
                 ),
                 None => {
                     format!("err name '{volume_name}' has no coordinator_id (malformed record)")

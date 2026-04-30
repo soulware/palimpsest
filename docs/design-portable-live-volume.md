@@ -166,12 +166,14 @@ Verbs and their state transitions:
   since the last local ancestor, mint a fresh fork, atomically
   rebind). Any prior local fork stays on disk and serves as
   ancestor cache where applicable. Result is `Stopped`; daemon is
-  not launched. Use `volume start` afterwards, or compose with
-  `volume start --claim`.
-- **`volume claim --force <name>`** — recovery shortcut. Equivalent
-  to `volume release --force` followed by `volume claim`: synthesises
-  a handoff snapshot for a foreign Live/Stopped record, then claims
-  it. Same data-loss boundary as `release --force`.
+  not launched. **Always CAS-protected.** Refuses if the record is
+  `Live`/`Stopped` and foreign-owned — recovery in that case is the
+  two-step sequence `volume release --force` (the unconditional
+  override that flips the record to `Released`) then `volume claim`
+  (CAS-protected). Splitting the two means concurrent recoveries
+  are arbitrated by the conditional PUT inside `mark_claimed`, not
+  by an unconditional rewrite. Use `volume start` afterwards, or
+  compose with `volume start --claim`.
 - **Coordinator graceful shutdown / crash** — does not change
   `state`. A coordinator coming back up sees its own
   `coordinator_id` in `live` or `stopped` records and resumes; no
