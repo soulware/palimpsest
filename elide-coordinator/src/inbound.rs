@@ -285,6 +285,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 &ctx.store,
                 &ctx.coord_id,
                 &ctx.rescan,
+                &ctx.prefetch_tracker,
             )
             .await
         }
@@ -2862,11 +2863,22 @@ async fn rebind_name_op(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
     rescan: &Notify,
+    prefetch_tracker: &PrefetchTracker,
 ) -> String {
     let new_ulid = match ulid::Ulid::from_string(new_ulid_str) {
         Ok(u) => u,
         Err(e) => return format!("err invalid new_vol_ulid: {e}"),
     };
+
+    // Pre-register the prefetch tracker entry, mirroring `fork_create_op`.
+    // For the regular foreign-claim flow this is redundant (the
+    // preceding `fork_create_op` already pre-registered), but on the
+    // claim-resume path the CLI skips `fork_create_op` and the orphan
+    // fork's tracker entry may be missing — e.g. coordinator restarted
+    // between the original aborted attempt and this resume, and
+    // discovery hasn't completed yet. `register_prefetch_or_get` is
+    // idempotent so the redundant case is a no-op.
+    let _ = register_prefetch_or_get(prefetch_tracker, new_ulid);
 
     let new_dir = data_dir.join("by_id").join(new_ulid.to_string());
     if !new_dir.exists() {

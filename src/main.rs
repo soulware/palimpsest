@@ -1603,6 +1603,47 @@ fn classify_symlink_for_claim(symlink: &Path) -> SymlinkState {
     }
 }
 
+/// Decide whether the local fork at `by_id/<prev_ulid>/` is exactly
+/// what a fresh `fork_create` would mint for this claim — i.e., it has
+/// a verifiable signed provenance recording `expected_parent_ulid` as
+/// the parent volume and `expected_snap` as the branch snapshot.
+///
+/// Returns `true` only when:
+///   - `by_id/<prev_ulid>/` exists,
+///   - `volume.provenance` is present and verifies under
+///     `volume.pub` in the same directory,
+///   - the lineage records a parent matching `expected_parent_ulid`
+///     and `expected_snap`.
+///
+/// On any failure (missing dir, missing files, signature mismatch,
+/// parent mismatch, no parent at all) returns `false` — the caller
+/// then falls back to the regular "remove stale symlink, fork-create
+/// fresh" path. Provenance verification means we never reuse a fork
+/// whose signed lineage we can't trust.
+fn orphan_matches_intended_fork(
+    by_id_dir: &Path,
+    prev_ulid: &str,
+    expected_parent_ulid: &str,
+    expected_snap: &str,
+) -> bool {
+    let prev_dir = by_id_dir.join(prev_ulid);
+    if !prev_dir.is_dir() {
+        return false;
+    }
+    let lineage = match elide_core::signing::read_lineage_verifying_signature(
+        &prev_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    ) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    match lineage.parent {
+        Some(p) => p.volume_ulid == expected_parent_ulid && p.snapshot_ulid == expected_snap,
+        None => false,
+    }
+}
+
 /// CLI orchestration of `volume claim`.
 ///
 /// Calls the coordinator's `claim` IPC and dispatches:
@@ -1654,28 +1695,50 @@ fn orchestrate_foreign_claim(
     })?;
     let from = format!("{released_vol_ulid}/{snap}");
 
-    // Stale-symlink recovery: any pre-existing `by_name/<name>` entry
-    // is replaced. The previous fork's ULID is logged so the operator
-    // knows which `by_id/<ulid>/` directory remains on disk: if it's
-    // an ancestor of the claimed snapshot it serves as transparent
-    // ancestor cache, otherwise it's a true orphan eligible for
-    // cleanup.
+    // Stale-symlink recovery. Two cases for a pre-existing
+    // `by_name/<name>` entry:
+    //
+    //   1. **Resumable orphan** — Ctrl-C'd a prior `volume claim` run
+    //      after `fork_create` succeeded but before `rebind_name`. The
+    //      orphan fork at `by_id/<prev>/` is exactly what a fresh
+    //      `fork_create` would mint: its signed provenance records the
+    //      same parent ULID and snapshot ULID we're about to fork from.
+    //      Reuse it: skip `fork_create`, call `rebind_name` directly on
+    //      the existing ULID. This makes claim retry idempotent — no
+    //      orphan accumulation, no wasted ULID minting, no wasted I/O.
+    //
+    //   2. **True stale entry** — symlink left over from an unrelated
+    //      operation (the orphan's provenance doesn't match this claim,
+    //      or the target dir is missing/corrupted). Remove the symlink
+    //      and proceed with a fresh `fork_create`. The previous
+    //      `by_id/<prev>/` is left on disk — if it's an ancestor of
+    //      the claimed snapshot it serves as a transparent ancestor
+    //      cache, otherwise it's a true orphan eligible for cleanup.
     let symlink = data_dir.join("by_name").join(name);
-    match classify_symlink_for_claim(&symlink) {
-        SymlinkState::Absent => {}
-        SymlinkState::Stale { previous_target } => {
-            std::fs::remove_file(&symlink).map_err(|e| {
-                std::io::Error::other(format!("removing stale by_name/{name}: {e}"))
-            })?;
-            match previous_target {
-                Some(prev) => eprintln!(
-                    "[claim] removed stale by_name/{name} (was {prev}; \
-                     by_id/{prev}/ retained on disk)"
-                ),
-                None => eprintln!("[claim] removed stale by_name/{name}"),
+    let resume_existing_ulid: Option<String> = match classify_symlink_for_claim(&symlink) {
+        SymlinkState::Absent => None,
+        SymlinkState::Stale { previous_target } => match previous_target {
+            Some(prev_ulid)
+                if orphan_matches_intended_fork(by_id_dir, &prev_ulid, released_vol_ulid, snap) =>
+            {
+                eprintln!("[claim] resuming aborted prior attempt: reusing local fork {prev_ulid}");
+                Some(prev_ulid)
             }
-        }
-    }
+            other => {
+                std::fs::remove_file(&symlink).map_err(|e| {
+                    std::io::Error::other(format!("removing stale by_name/{name}: {e}"))
+                })?;
+                match other {
+                    Some(prev) => eprintln!(
+                        "[claim] removed stale by_name/{name} (was {prev}; \
+                         by_id/{prev}/ retained on disk)"
+                    ),
+                    None => eprintln!("[claim] removed stale by_name/{name}"),
+                }
+                None
+            }
+        },
+    };
 
     let source_dir = volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid);
     if !source_dir.exists() {
@@ -1689,31 +1752,40 @@ fn orchestrate_foreign_claim(
         }
     }
 
-    let parent_key_hex = match coordinator_client::resolve_handoff_key(
-        socket_path,
-        released_vol_ulid,
-        snap,
-    )? {
-        coordinator_client::HandoffKey::Normal => None,
-        coordinator_client::HandoffKey::Recovery {
-            manifest_pubkey_hex,
-        } => {
-            eprintln!(
-                "[claim] handoff snapshot {snap} is synthesised — verifying under recovering coordinator's key"
-            );
-            Some(manifest_pubkey_hex)
+    let new_vol_ulid = match resume_existing_ulid {
+        Some(ulid) => ulid,
+        None => {
+            // Fresh fork path: resolve the handoff key (only used as
+            // fork_create input, so skipped on resume) and mint a new
+            // local fork. The signed provenance written by
+            // `fork_volume_at` will record this ULID so a subsequent
+            // resume can recognise this attempt as a match.
+            let parent_key_hex = match coordinator_client::resolve_handoff_key(
+                socket_path,
+                released_vol_ulid,
+                snap,
+            )? {
+                coordinator_client::HandoffKey::Normal => None,
+                coordinator_client::HandoffKey::Recovery {
+                    manifest_pubkey_hex,
+                } => {
+                    eprintln!(
+                        "[claim] handoff snapshot {snap} is synthesised — verifying under recovering coordinator's key"
+                    );
+                    Some(manifest_pubkey_hex)
+                }
+            };
+            coordinator_client::fork_create(
+                socket_path,
+                name,
+                released_vol_ulid,
+                Some(snap),
+                parent_key_hex.as_deref(),
+                &[],
+                true,
+            )?
         }
     };
-
-    let new_vol_ulid = coordinator_client::fork_create(
-        socket_path,
-        name,
-        released_vol_ulid,
-        Some(snap),
-        parent_key_hex.as_deref(),
-        &[],
-        true,
-    )?;
 
     coordinator_client::rebind_name(socket_path, name, &new_vol_ulid)?;
 
@@ -2267,5 +2339,94 @@ mod claim_symlink_tests {
                 previous_target: Some(OTHER.to_owned()),
             },
         );
+    }
+
+    /// Helper: write a fork directory with a signed provenance
+    /// recording `parent_ulid` and `snap_ulid` as the parent ref. This
+    /// mirrors the on-disk shape `fork_volume_at` produces, without
+    /// requiring a full source volume with snapshots.
+    fn write_orphan_fork(dir: &std::path::Path, parent_ulid: &str, snap_ulid: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let key = elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        // Stable dummy parent pubkey — the resume check verifies the
+        // *child's* signature with the child's volume.pub and matches
+        // only on the recorded parent ULID + snapshot ULID; the
+        // parent_pubkey field is not examined by `orphan_matches_intended_fork`.
+        let parent_pubkey = [0u8; 32];
+        let lineage = elide_core::signing::ProvenanceLineage {
+            parent: Some(elide_core::signing::ParentRef {
+                volume_ulid: parent_ulid.to_owned(),
+                snapshot_ulid: snap_ulid.to_owned(),
+                pubkey: parent_pubkey,
+                manifest_pubkey: None,
+            }),
+            extent_index: Vec::new(),
+        };
+        elide_core::signing::write_provenance(
+            dir,
+            &key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &lineage,
+        )
+        .unwrap();
+    }
+
+    const ORPHAN: &str = "01J5555555555555555555555V";
+    const SNAP: &str = "01J6666666666666666666666V";
+    const OTHER_SNAP: &str = "01J7777777777777777777777V";
+
+    #[test]
+    fn orphan_matches_when_provenance_records_expected_parent_and_snap() {
+        let (_t, by_id, _by_name) = setup();
+        write_orphan_fork(&by_id.join(ORPHAN), RELEASED, SNAP);
+        assert!(orphan_matches_intended_fork(&by_id, ORPHAN, RELEASED, SNAP));
+    }
+
+    #[test]
+    fn orphan_doesnt_match_when_parent_ulid_differs() {
+        // Orphan from a previous attempt that forked from a different
+        // released ULID — must not be reused.
+        let (_t, by_id, _by_name) = setup();
+        write_orphan_fork(&by_id.join(ORPHAN), OTHER, SNAP);
+        assert!(!orphan_matches_intended_fork(
+            &by_id, ORPHAN, RELEASED, SNAP
+        ));
+    }
+
+    #[test]
+    fn orphan_doesnt_match_when_snap_differs() {
+        // Same parent but different branch snapshot — must not reuse.
+        let (_t, by_id, _by_name) = setup();
+        write_orphan_fork(&by_id.join(ORPHAN), RELEASED, OTHER_SNAP);
+        assert!(!orphan_matches_intended_fork(
+            &by_id, ORPHAN, RELEASED, SNAP
+        ));
+    }
+
+    #[test]
+    fn orphan_doesnt_match_when_dir_missing() {
+        let (_t, by_id, _by_name) = setup();
+        // No write_orphan_fork call — directory absent.
+        assert!(!orphan_matches_intended_fork(
+            &by_id, ORPHAN, RELEASED, SNAP
+        ));
+    }
+
+    #[test]
+    fn orphan_doesnt_match_when_provenance_corrupted() {
+        // Provenance file present but empty — signature verification
+        // fails, must not be treated as resumable.
+        let (_t, by_id, _by_name) = setup();
+        let dir = by_id.join(ORPHAN);
+        write_orphan_fork(&dir, RELEASED, SNAP);
+        std::fs::write(dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE), "").unwrap();
+        assert!(!orphan_matches_intended_fork(
+            &by_id, ORPHAN, RELEASED, SNAP
+        ));
     }
 }
