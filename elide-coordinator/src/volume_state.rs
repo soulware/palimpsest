@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use elide_core::process::pid_is_alive;
+use serde::{Deserialize, Serialize};
 
 /// Per-volume daemon pidfile. Written by the volume process on
 /// startup; presence + liveness drives the `Running` classification.
@@ -34,7 +35,8 @@ pub const IMPORT_LOCK_FILE: &str = "import.lock";
 
 /// Read/write mode for a volume. Readonly is set on imported OCI
 /// volumes; everything else is read/write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VolumeMode {
     /// Read-only (typically an imported OCI image).
     Ro,
@@ -65,7 +67,8 @@ impl std::fmt::Display for VolumeMode {
 ///   2. `import.lock` exists → `Importing { import_ulid }`
 ///   3. `volume.pid` names a live process → `Running { pid }`
 ///   4. otherwise → `Stopped`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum VolumeLifecycle {
     /// Daemon is running with the embedded pid.
     Running { pid: u32 },

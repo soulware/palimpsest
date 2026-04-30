@@ -33,6 +33,7 @@ use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
+use elide_coordinator::ipc::{self, Envelope, IpcError, Request, StatusRemoteReply, StatusReply};
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
@@ -132,6 +133,15 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     };
     let line = line.trim().to_owned();
 
+    // JSON path: typed verbs go through `dispatch_json`. The first
+    // non-whitespace `{` is the discriminator — legacy line commands
+    // never start with `{`. Migrated verbs are JSON-only on both ends;
+    // they no longer have arms in the legacy line dispatcher below.
+    if line.starts_with('{') {
+        dispatch_json(&line, &ctx, &mut writer).await;
+        return;
+    }
+
     // `import attach` is the one streaming operation — it keeps the connection
     // open and writes lines until the import completes.
     if let Some(name) = line.strip_prefix("import attach ") {
@@ -141,6 +151,40 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
 
     let response = dispatch(&line, &ctx, peer_pid).await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
+}
+
+/// Typed JSON dispatch for migrated verbs. Each match arm runs the
+/// verb-specific handler, wraps the result in an [`Envelope`], and
+/// writes a single line back. Unknown verbs would fail at the
+/// `serde_json::from_str` step — `serde` rejects unrecognised
+/// variants by default for internally-tagged enums.
+async fn dispatch_json<W: AsyncWriteExt + Unpin>(line: &str, ctx: &IpcContext, writer: &mut W) {
+    let request: Request = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => {
+            let env: Envelope<()> =
+                Envelope::err(IpcError::bad_request(format!("parse request: {e}")));
+            let _ = ipc::write_message(writer, &env).await;
+            return;
+        }
+    };
+
+    match request {
+        Request::Rescan => {
+            ctx.rescan.notify_one();
+            let env: Envelope<()> = Envelope::ok(());
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Status { volume } => {
+            let env: Envelope<StatusReply> = volume_status_typed(&volume, &ctx.data_dir).into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::StatusRemote { volume } => {
+            let result = volume_status_remote_typed(&volume, &ctx.store, &ctx.coord_id).await;
+            let env: Envelope<StatusRemoteReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+    }
 }
 
 async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String {
@@ -154,23 +198,12 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
     };
 
     match op {
-        "rescan" => {
-            ctx.rescan.notify_one();
-            "ok".to_string()
-        }
-
-        "status" => {
-            if args.is_empty() {
-                return "err usage: status <volume>".to_string();
-            }
-            volume_status(args, &ctx.data_dir)
-        }
-
-        "status-remote" => {
-            if args.is_empty() {
-                return "err usage: status-remote <volume>".to_string();
-            }
-            volume_status_remote(args, &ctx.store, &ctx.coord_id).await
+        // `rescan`, `status`, `status-remote` are JSON-only verbs —
+        // see `dispatch_json`. The line dispatcher returns an error if
+        // a client sends them as line commands so the migration
+        // doesn't silently keep working under the old wire.
+        "rescan" | "status" | "status-remote" => {
+            format!("err verb '{op}' is JSON-only; clients must send NDJSON")
         }
 
         "import" => {
@@ -1037,79 +1070,52 @@ async fn generate_snapshot_filemap(
 
 // ── Volume status ─────────────────────────────────────────────────────────────
 
-fn volume_status(volume_name: &str, data_dir: &Path) -> String {
-    // Resolve name via by_name/ symlink → by_id/<ulid>/.
+/// Typed implementation of the `status` verb. Returned to the JSON
+/// dispatcher as-is; legacy callers exist as a separate adapter.
+fn volume_status_typed(volume_name: &str, data_dir: &Path) -> Result<StatusReply, IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return format!("err volume not found: {volume_name}");
+        return Err(IpcError::not_found(format!(
+            "volume not found: {volume_name}"
+        )));
     }
     // The OS follows the symlink transparently for all path ops below.
     let lifecycle = elide_coordinator::volume_state::VolumeLifecycle::from_dir(&link);
-    format!("ok {}", lifecycle.wire_body())
+    Ok(StatusReply { lifecycle })
 }
 
-/// Fetch `names/<name>` from the bucket and serialise it as a TOML body
-/// for the `status-remote` IPC verb. Includes an `eligibility` field
-/// computed against this coordinator's id so the CLI can show the
-/// operator whether the verb-level `start` would be accepted, refused,
-/// or routed through the claim-from-released path.
-///
-/// Response shape on success:
-/// ```text
-/// ok
-/// state = "live"
-/// vol_ulid = "01..."
-/// coordinator_id = "..."     # optional
-/// hostname = "..."           # optional
-/// claimed_at = "..."         # optional
-/// parent = "..."             # optional
-/// handoff_snapshot = "..."   # optional
-/// eligibility = "owned" | "foreign" | "released-claimable" | "readonly"
-/// ```
-/// The eligibility values correspond to [`Eligibility`].
-async fn volume_status_remote(
+/// Typed implementation of the `status-remote` verb. Reads
+/// `names/<volume>` from the bucket and classifies this coordinator's
+/// eligibility against it.
+async fn volume_status_remote_typed(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
-) -> String {
-    use elide_core::name_record::NameState;
-
+) -> Result<StatusRemoteReply, IpcError> {
     let record = match elide_coordinator::name_store::read_name_record(store, volume_name).await {
         Ok(Some((rec, _))) => rec,
-        Ok(None) => return format!("err name '{volume_name}' has no S3 record"),
-        Err(e) => return format!("err reading names/{volume_name}: {e}"),
-    };
-
-    let state_str = match record.state {
-        NameState::Live => "live",
-        NameState::Stopped => "stopped",
-        NameState::Released => "released",
-        NameState::Readonly => "readonly",
+        Ok(None) => {
+            return Err(IpcError::not_found(format!(
+                "name '{volume_name}' has no S3 record"
+            )));
+        }
+        Err(e) => {
+            return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
+        }
     };
 
     let eligibility = Eligibility::from_record(&record, coord_id);
 
-    let mut body = String::with_capacity(256);
-    body.push_str("ok\n");
-    body.push_str(&format!("state = \"{state_str}\"\n"));
-    body.push_str(&format!("vol_ulid = \"{}\"\n", record.vol_ulid));
-    if let Some(id) = &record.coordinator_id {
-        body.push_str(&format!("coordinator_id = \"{id}\"\n"));
-    }
-    if let Some(host) = &record.hostname {
-        body.push_str(&format!("hostname = \"{host}\"\n"));
-    }
-    if let Some(when) = &record.claimed_at {
-        body.push_str(&format!("claimed_at = \"{when}\"\n"));
-    }
-    if let Some(parent) = &record.parent {
-        body.push_str(&format!("parent = \"{parent}\"\n"));
-    }
-    if let Some(snap) = &record.handoff_snapshot {
-        body.push_str(&format!("handoff_snapshot = \"{snap}\"\n"));
-    }
-    body.push_str(&format!("eligibility = \"{eligibility}\"\n"));
-    body
+    Ok(StatusRemoteReply {
+        state: record.state,
+        vol_ulid: record.vol_ulid,
+        coordinator_id: record.coordinator_id,
+        hostname: record.hostname,
+        claimed_at: record.claimed_at,
+        parent: record.parent,
+        handoff_snapshot: record.handoff_snapshot,
+        eligibility,
+    })
 }
 
 // ── Volume remove ─────────────────────────────────────────────────────────────
@@ -3573,9 +3579,11 @@ mod tests {
     #[tokio::test]
     async fn status_remote_absent_name_returns_err() {
         let store = mem_store();
-        let resp = volume_status_remote("ghost", &store, "coord-self").await;
-        assert!(resp.starts_with("err "), "got: {resp}");
-        assert!(resp.contains("no S3 record"), "{resp}");
+        let err = volume_status_remote_typed("ghost", &store, "coord-self")
+            .await
+            .expect_err("absent name should return an error");
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::NotFound);
+        assert!(err.message.contains("no S3 record"), "{}", err.message);
     }
 
     #[tokio::test]
@@ -3589,14 +3597,15 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = volume_status_remote("vol", &store, "coord-self").await;
-        assert!(resp.starts_with("ok\n"), "{resp}");
-        assert!(resp.contains("state = \"live\""));
-        assert!(resp.contains(&format!("vol_ulid = \"{}\"", sample_ulid())));
-        assert!(resp.contains("coordinator_id = \"coord-self\""));
-        assert!(resp.contains("hostname = \"host-A\""));
-        assert!(resp.contains("claimed_at = \"2026-04-28T00:00:00Z\""));
-        assert!(resp.contains("eligibility = \"owned\""));
+        let reply = volume_status_remote_typed("vol", &store, "coord-self")
+            .await
+            .unwrap();
+        assert_eq!(reply.state, elide_core::name_record::NameState::Live);
+        assert_eq!(reply.vol_ulid, sample_ulid());
+        assert_eq!(reply.coordinator_id.as_deref(), Some("coord-self"));
+        assert_eq!(reply.hostname.as_deref(), Some("host-A"));
+        assert_eq!(reply.claimed_at.as_deref(), Some("2026-04-28T00:00:00Z"));
+        assert_eq!(reply.eligibility, Eligibility::Owned);
     }
 
     #[tokio::test]
@@ -3608,9 +3617,11 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = volume_status_remote("vol", &store, "coord-self").await;
-        assert!(resp.contains("state = \"live\""), "{resp}");
-        assert!(resp.contains("eligibility = \"foreign\""), "{resp}");
+        let reply = volume_status_remote_typed("vol", &store, "coord-self")
+            .await
+            .unwrap();
+        assert_eq!(reply.state, elide_core::name_record::NameState::Live);
+        assert_eq!(reply.eligibility, Eligibility::Foreign);
     }
 
     #[tokio::test]
@@ -3623,13 +3634,12 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = volume_status_remote("vol", &store, "coord-self").await;
-        assert!(resp.contains("state = \"released\""), "{resp}");
-        assert!(
-            resp.contains("eligibility = \"released-claimable\""),
-            "{resp}"
-        );
-        assert!(resp.contains("handoff_snapshot ="), "{resp}");
+        let reply = volume_status_remote_typed("vol", &store, "coord-self")
+            .await
+            .unwrap();
+        assert_eq!(reply.state, elide_core::name_record::NameState::Released);
+        assert_eq!(reply.eligibility, Eligibility::ReleasedClaimable);
+        assert_eq!(reply.handoff_snapshot, Some(sample_ulid()));
     }
 
     #[tokio::test]
@@ -3641,9 +3651,11 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = volume_status_remote("img", &store, "coord-self").await;
-        assert!(resp.contains("state = \"readonly\""), "{resp}");
-        assert!(resp.contains("eligibility = \"readonly\""), "{resp}");
+        let reply = volume_status_remote_typed("img", &store, "coord-self")
+            .await
+            .unwrap();
+        assert_eq!(reply.state, elide_core::name_record::NameState::Readonly);
+        assert_eq!(reply.eligibility, Eligibility::Readonly);
     }
 
     // ── force_release_volume_op ───────────────────────────────────────────

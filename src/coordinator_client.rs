@@ -10,7 +10,40 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
+
+pub use elide_coordinator::ipc::{IpcErrorKind, StatusRemoteReply, StatusReply};
+pub use elide_coordinator::volume_state::VolumeLifecycle;
+
+/// Send a typed JSON request and parse a typed JSON reply.
+///
+/// Returns:
+/// - `Ok(Ok(reply))` — server returned `Envelope::Ok`.
+/// - `Ok(Err(IpcError))` — server returned a typed error.
+/// - `Err(io::Error)` — transport failure (socket missing, bad JSON, etc.).
+fn call_typed<R>(socket_path: &Path, request: &Request) -> io::Result<Result<R, IpcError>>
+where
+    R: for<'de> Deserialize<'de>,
+{
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        io::Error::other(format!(
+            "coordinator not running ({}): {e}",
+            socket_path.display()
+        ))
+    })?;
+    let line = serde_json::to_string(request)
+        .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
+    writeln!(stream, "{line}")?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut reader = io::BufReader::new(stream);
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line)?;
+    let env: Envelope<R> = serde_json::from_str(response_line.trim())
+        .map_err(|e| io::Error::other(format!("parse reply: {e}")))?;
+    Ok(env.into_result())
+}
 
 fn call(socket_path: &Path, cmd: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
@@ -232,45 +265,31 @@ pub fn register_and_get_creds(socket_path: &Path, volume_ulid: &str) -> io::Resu
 
 /// Trigger an immediate fork discovery pass.
 pub fn rescan(socket_path: &Path) -> io::Result<()> {
-    let resp = call(socket_path, "rescan")?;
-    if resp == "ok" {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("unexpected response: {resp}")))
-    }
+    call_typed::<()>(socket_path, &Request::Rescan)?.map_err(io::Error::other)
 }
 
 /// Query the running state of a named volume.
-pub fn status(socket_path: &Path, volume: &str) -> io::Result<String> {
-    call(socket_path, &format!("status {volume}"))
-}
-
-/// Authoritative bucket-side status of a named volume, plus this
-/// coordinator's eligibility to act on it. Reaches into S3 — only
-/// invoked when the operator passes `volume status --remote`.
-#[derive(Debug, Deserialize)]
-pub struct RemoteStatus {
-    pub state: String,
-    pub vol_ulid: String,
-    #[serde(default)]
-    pub coordinator_id: Option<String>,
-    #[serde(default)]
-    pub hostname: Option<String>,
-    #[serde(default)]
-    pub claimed_at: Option<String>,
-    #[serde(default)]
-    pub parent: Option<String>,
-    #[serde(default)]
-    pub handoff_snapshot: Option<String>,
-    pub eligibility: String,
+pub fn status(socket_path: &Path, volume: &str) -> io::Result<StatusReply> {
+    call_typed(
+        socket_path,
+        &Request::Status {
+            volume: volume.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Fetch `names/<volume>` from the bucket via the coordinator and parse
 /// the authoritative record. Returns an error when the name is absent
 /// from the bucket or the coordinator cannot reach S3.
-pub fn status_remote(socket_path: &Path, volume: &str) -> io::Result<RemoteStatus> {
-    let raw = call_all(socket_path, &format!("status-remote {volume}"))?;
-    parse_toml_response(&raw)
+pub fn status_remote(socket_path: &Path, volume: &str) -> io::Result<StatusRemoteReply> {
+    call_typed(
+        socket_path,
+        &Request::StatusRemote {
+            volume: volume.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Ask the coordinator to start an OCI import.
@@ -797,5 +816,49 @@ mod tests {
         );
         let e = r.unwrap_err().to_string();
         assert!(e.contains("coordinator not running"), "{e}");
+    }
+
+    // ── JSON / typed client tests ─────────────────────────────────────
+
+    /// rescan: client sends `{"verb":"rescan"}`, server replies
+    /// `{"outcome":"ok","data":null}`.
+    #[test]
+    fn rescan_round_trips_typed_envelope() {
+        let (_guard, sock) = temp_socket();
+        let server = spawn_one_shot_server(
+            sock.clone(),
+            Duration::ZERO,
+            r#"{"outcome":"ok","data":null}"#,
+        );
+        rescan(&sock).expect("rescan should succeed");
+        server.join().unwrap();
+    }
+
+    /// status-remote: client sends a typed request, server replies with a
+    /// fully-populated `StatusRemoteReply`. Confirms field-by-field that
+    /// the typed reply round-trips.
+    #[test]
+    fn status_remote_parses_typed_reply() {
+        use elide_coordinator::eligibility::Eligibility;
+        use elide_core::name_record::NameState;
+        let (_guard, sock) = temp_socket();
+        let body = r#"{"outcome":"ok","data":{"state":"live","vol_ulid":"01J0000000000000000000000V","coordinator_id":"coord-self","eligibility":"owned"}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
+        let reply = status_remote(&sock, "vol").expect("status-remote should succeed");
+        server.join().unwrap();
+        assert_eq!(reply.state, NameState::Live);
+        assert_eq!(reply.coordinator_id.as_deref(), Some("coord-self"));
+        assert_eq!(reply.eligibility, Eligibility::Owned);
+    }
+
+    /// Typed errors come back as `Err` with the kind preserved.
+    #[test]
+    fn status_remote_propagates_typed_error_kind() {
+        let (_guard, sock) = temp_socket();
+        let body = r#"{"outcome":"err","error":{"kind":"not-found","message":"name 'ghost' has no S3 record"}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
+        let err = status_remote(&sock, "ghost").expect_err("ghost name should error");
+        server.join().unwrap();
+        assert!(err.to_string().contains("no S3 record"), "{err}");
     }
 }

@@ -3,6 +3,7 @@ pub mod control;
 pub mod eligibility;
 pub mod gc;
 pub mod identity;
+pub mod ipc;
 pub mod lifecycle;
 pub mod local_cond_store;
 pub mod name_store;

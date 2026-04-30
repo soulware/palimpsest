@@ -7,9 +7,11 @@
 //! TOML reply; the typed form is the source of truth on both sides.
 
 use elide_core::name_record::{NameRecord, NameState};
+use serde::{Deserialize, Serialize};
 
 /// This coordinator's eligibility relative to a foreign `NameRecord`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Eligibility {
     /// `state ∈ {Live, Stopped}` and `coordinator_id` matches our id.
     Owned,

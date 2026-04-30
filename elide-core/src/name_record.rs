@@ -106,6 +106,26 @@ pub enum NameState {
     Readonly,
 }
 
+impl NameState {
+    /// Lowercase wire-format string. Matches the `serde(rename_all)`
+    /// shape so callers can use either the `Display` impl or this
+    /// method without divergence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Stopped => "stopped",
+            Self::Released => "released",
+            Self::Readonly => "readonly",
+        }
+    }
+}
+
+impl fmt::Display for NameState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Operator-facing lifecycle verb. The single source of truth for the
 /// names callers use when describing a transition (`InvalidTransition`
 /// errors, log messages, the `check_transition` table below).
