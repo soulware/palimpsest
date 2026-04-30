@@ -551,25 +551,20 @@ pub enum ClaimOutcome {
     },
 }
 
-/// `volume claim <name> [--force]` IPC: bucket-side claim flow.
+/// `volume claim <name>` IPC: bucket-side claim flow.
 ///
 /// On success, the volume is left in `Stopped` state — no daemon is
 /// launched. The CLI calls `start_volume` afterwards if a composed
 /// `start --claim` flow was requested.
 ///
-/// With `force`, foreign `Live`/`Stopped` ownership is overridden by
-/// synthesising a handoff snapshot internally before claiming
-/// (equivalent to `release --force` then `claim`).
-pub fn claim_volume_bucket(
-    socket_path: &Path,
-    name: &str,
-    force: bool,
-) -> io::Result<ClaimOutcome> {
-    let mut cmd = format!("claim {name}");
-    if force {
-        cmd.push_str(" --force");
-    }
-    let resp = call(socket_path, &cmd)?;
+/// Always CAS-protected. To override an unreachable owner, the
+/// operator must first run `volume release --force <name>` (the
+/// unconditional override), then call this verb against the now-
+/// `Released` record. Splitting the two steps means concurrent
+/// claimants are arbitrated by the conditional PUT inside
+/// `mark_claimed`, not by an unconditional rewrite.
+pub fn claim_volume_bucket(socket_path: &Path, name: &str) -> io::Result<ClaimOutcome> {
+    let resp = call(socket_path, &format!("claim {name}"))?;
     if resp == "ok reclaimed" {
         return Ok(ClaimOutcome::Reclaimed);
     }
