@@ -119,7 +119,14 @@ signature = "<ed25519-sig-over-canonical-form>"
   writers may both name the same `prev_event_ulid` — but it lets a
   reader detect when an emitter was unaware of a concurrent event,
   which is useful provenance for force-release and rename
-  reconciliation.
+  reconciliation. Emitters source this value from in-memory state in
+  the warm case ("the event I just emitted" or "the latest I observed
+  while watching this name"); a LIST of `events/<name>/` is only
+  required on cold paths — fresh claim of a name the coordinator has
+  never owned, or recovery after restart with no cached state.
+  Steady-state event emission does not pay LIST cost. Backward
+  chaining via `prev_event_ulid` lets readers verify history once they
+  have an entry point but does not help locate the head of the log.
 
 ## Event kinds
 
