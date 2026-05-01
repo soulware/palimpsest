@@ -360,11 +360,29 @@ pub enum Request {
     /// `fork-create` as `parent-key=<hex>`).
     ResolveHandoffKey { vol_ulid: Ulid, snap_ulid: Ulid },
 
-    // ── Iteration 5: read-only history ───────────────────────────────
+    // ── Read-only history ────────────────────────────────────────────
     /// List the per-name event log at `events/<volume>/`,
     /// verifying each entry's signature against the emitting
     /// coordinator's published pubkey.
     NameEvents { volume: String },
+
+    // ── Creds + cleanup (final iteration) ────────────────────────────
+    /// Vend the non-secret `[store]` config (bucket / endpoint /
+    /// region or local_path). Used by CLI read paths to build an S3
+    /// client that matches the coordinator's view of the world.
+    GetStoreConfig,
+    /// Vend long-lived S3 credentials from the coordinator's env.
+    GetStoreCreds,
+    /// Mint a per-volume macaroon for a spawned volume process.
+    /// PID-bound via SO_PEERCRED on the connecting socket — the
+    /// coordinator refuses if the peer's PID doesn't match the
+    /// volume's recorded `volume.pid`.
+    Register { volume_ulid: Ulid },
+    /// Macaroon-authenticated short-lived credential issuance.
+    /// Verifies the MAC, re-checks SO_PEERCRED matches the macaroon's
+    /// `pid` caveat, then delegates to the configured
+    /// `CredentialIssuer`.
+    Credentials { macaroon: String },
 }
 
 /// Reply for [`Request::Status`].
@@ -524,6 +542,42 @@ pub struct EvictReply {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenerateFilemapReply {
     pub snap_ulid: Ulid,
+}
+
+/// Reply for [`Request::GetStoreConfig`]. Either `local_path` is
+/// set, or `bucket` is set (with optional `endpoint` / `region`).
+/// All fields are optional on the wire so an "everything-defaulted"
+/// store still serialises cleanly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoreConfigReply {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub local_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub region: Option<String>,
+}
+
+/// Reply for [`Request::GetStoreCreds`] and [`Request::Credentials`].
+/// `expiry_unix` is set only on issued (short-lived) creds — the
+/// long-lived env-creds path leaves it `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoreCredsReply {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub expiry_unix: Option<u64>,
+}
+
+/// Reply for [`Request::Register`]. The macaroon is base64-encoded;
+/// the caller passes it back as-is in [`Request::Credentials`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterReply {
+    pub macaroon: String,
 }
 
 /// Reply for [`Request::ResolveHandoffKey`]. `Normal` means the

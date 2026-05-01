@@ -1,12 +1,13 @@
 // Client for the coordinator inbound socket.
 //
-// Connects to control.sock, sends one command, reads one response line.
-// A new connection is made per call — the protocol is request-response-close.
+// Connects to control.sock, sends one typed JSON request, reads one or
+// more typed JSON envelopes. A new connection is made per call — the
+// protocol is request-response-close.
 //
 // Exception: `import_attach_by_name` reads a sequence of typed
 // `ImportAttachEvent` envelopes until the import terminates.
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -17,10 +18,18 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
-    NameEventEntry, NameEventsReply, PullReadonlyReply, RebindNameReply, ReleaseReply,
-    ResolveHandoffKeyReply, SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply,
-    UpdateReply,
+    NameEventEntry, NameEventsReply, PullReadonlyReply, RebindNameReply, RegisterReply,
+    ReleaseReply, ResolveHandoffKeyReply, SignatureStatus, SnapshotReply, StatusRemoteReply,
+    StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
 };
+
+/// Backwards-compatible aliases for the public client API. The
+/// underlying types now live in `elide_coordinator::ipc` so server
+/// and client share the wire shape; the alias re-exports keep the
+/// `coordinator_client::StoreConfig` / `StoreCreds` names that
+/// callers throughout the workspace already use.
+pub type StoreConfig = StoreConfigReply;
+pub type StoreCreds = StoreCredsReply;
 pub use elide_coordinator::volume_state::VolumeLifecycle;
 
 /// Send a typed JSON request and parse a typed JSON reply.
@@ -52,80 +61,6 @@ where
     Ok(env.into_result())
 }
 
-fn call(socket_path: &Path, cmd: &str) -> io::Result<String> {
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-        io::Error::other(format!(
-            "coordinator not running ({}): {e}",
-            socket_path.display()
-        ))
-    })?;
-    writeln!(stream, "{cmd}")?;
-    stream.flush()?;
-    // Ignore ENOTCONN: the coordinator may have already closed its end by the
-    // time we shut down our write half, which is harmless.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut reader = io::BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    Ok(line.trim().to_owned())
-}
-
-/// Like `call`, but reads the entire response body until EOF — for commands
-/// that return a multi-line TOML body (`get-store-config`, `get-store-creds`).
-fn call_all(socket_path: &Path, cmd: &str) -> io::Result<String> {
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-        io::Error::other(format!(
-            "coordinator not running ({}): {e}",
-            socket_path.display()
-        ))
-    })?;
-    writeln!(stream, "{cmd}")?;
-    stream.flush()?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf)?;
-    Ok(buf)
-}
-
-/// Non-secret store config as served by the coordinator's `get-store-config`
-/// command. Either `local_path` is set, or `bucket` is set (with optional
-/// `endpoint` / `region`).
-#[derive(Debug, Deserialize)]
-pub struct StoreConfig {
-    pub local_path: Option<String>,
-    pub bucket: Option<String>,
-    pub endpoint: Option<String>,
-    pub region: Option<String>,
-}
-
-/// Short-lived store credentials as served by `get-store-creds`. Today these
-/// are the coordinator's long-lived AWS env creds; the same shape will carry
-/// macaroon-scoped tokens in the future.
-#[derive(Debug, Deserialize)]
-pub struct StoreCreds {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
-}
-
-/// Parse a `get-store-*` response: `ok\n<TOML>\n…` or `err <message>\n`.
-fn parse_toml_response<T: for<'de> Deserialize<'de>>(raw: &str) -> io::Result<T> {
-    let trimmed = raw.trim_start();
-    if let Some(body) = trimmed
-        .strip_prefix("ok\n")
-        .or_else(|| trimmed.strip_prefix("ok\r\n"))
-    {
-        toml::from_str(body).map_err(|e| io::Error::other(format!("parse response: {e}")))
-    } else if let Some(msg) = trimmed.strip_prefix("err ") {
-        Err(io::Error::other(msg.trim().to_owned()))
-    } else {
-        Err(io::Error::other(format!(
-            "unexpected response shape: {}",
-            trimmed.lines().next().unwrap_or("")
-        )))
-    }
-}
-
 /// Returns true if the coordinator is currently listening on `socket_path`.
 ///
 /// A successful `connect()` is sufficient evidence — we don't send a command
@@ -140,15 +75,13 @@ pub fn is_reachable(socket_path: &Path) -> bool {
 /// region, or local_path). This is the static counterpart to
 /// `get_store_creds`.
 pub fn get_store_config(socket_path: &Path) -> io::Result<StoreConfig> {
-    let raw = call_all(socket_path, "get-store-config")?;
-    parse_toml_response(&raw)
+    call_typed(socket_path, &Request::GetStoreConfig)?.map_err(io::Error::other)
 }
 
 /// Ask the coordinator for S3 credentials (long-lived today, macaroon-scoped
 /// later). Errors if the coordinator's env has no credentials configured.
 pub fn get_store_creds(socket_path: &Path) -> io::Result<StoreCreds> {
-    let raw = call_all(socket_path, "get-store-creds")?;
-    parse_toml_response(&raw)
+    call_typed(socket_path, &Request::GetStoreCreds)?.map_err(io::Error::other)
 }
 
 /// Default budget for [`await_prefetch`]. Longer than `OPEN_RETRY_BUDGET`
@@ -222,14 +155,16 @@ pub fn await_prefetch(socket_path: &Path, vol_ulid: &str, budget: Duration) -> i
 /// where the parent has not yet written `volume.pid`; the caller in
 /// `register_and_get_creds` retries on that condition.
 pub fn register_volume(socket_path: &Path, volume_ulid: &str) -> io::Result<String> {
-    let resp = call(socket_path, &format!("register {volume_ulid}"))?;
-    if let Some(macaroon) = resp.strip_prefix("ok ") {
-        Ok(macaroon.to_owned())
-    } else if let Some(msg) = resp.strip_prefix("err ") {
-        Err(io::Error::other(msg.to_owned()))
-    } else {
-        Err(io::Error::other(format!("unexpected response: {resp}")))
-    }
+    let parsed = ulid::Ulid::from_string(volume_ulid)
+        .map_err(|e| io::Error::other(format!("invalid volume_ulid: {e}")))?;
+    let reply: RegisterReply = call_typed(
+        socket_path,
+        &Request::Register {
+            volume_ulid: parsed,
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.macaroon)
 }
 
 /// Exchange a registered macaroon for short-lived S3 credentials.
@@ -238,8 +173,13 @@ pub fn register_volume(socket_path: &Path, volume_ulid: &str) -> io::Result<Stri
 /// and the volume's recorded `volume.pid` before delegating to the
 /// configured `CredentialIssuer`.
 pub fn macaroon_credentials(socket_path: &Path, macaroon: &str) -> io::Result<StoreCreds> {
-    let raw = call_all(socket_path, &format!("credentials {macaroon}"))?;
-    parse_toml_response(&raw)
+    call_typed(
+        socket_path,
+        &Request::Credentials {
+            macaroon: macaroon.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Combined registration + credential fetch with retry.

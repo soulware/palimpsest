@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::ObjectStore;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Notify;
@@ -36,8 +36,9 @@ use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    NameEventsReply, PullReadonlyReply, RebindNameReply, ReleaseReply, Request,
-    ResolveHandoffKeyReply, SnapshotReply, StatusRemoteReply, StatusReply, UpdateReply,
+    NameEventsReply, PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, Request,
+    ResolveHandoffKeyReply, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
+    StoreCredsReply, UpdateReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -120,9 +121,9 @@ pub async fn serve(socket_path: &Path, ctx: IpcContext) {
 
 async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     // Capture peer credentials before splitting the stream — needed for
-    // SO_PEERCRED on the `register` and `credentials` ops. Other ops
-    // ignore the peer pid; capturing once here keeps the code symmetric
-    // and avoids a second syscall later.
+    // SO_PEERCRED on the `register` and `credentials` verbs. Other
+    // verbs ignore the peer pid; capturing once here keeps the code
+    // symmetric and avoids a second syscall later.
     let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
 
     let (reader, mut writer) = stream.into_split();
@@ -138,27 +139,22 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     };
     let line = line.trim().to_owned();
 
-    // JSON path: typed verbs go through `dispatch_json`. The first
-    // non-whitespace `{` is the discriminator — legacy line commands
-    // never start with `{`. Migrated verbs are JSON-only on both ends;
-    // they no longer have arms in the legacy line dispatcher below.
-    if line.starts_with('{') {
-        dispatch_json(&line, &ctx, &mut writer).await;
-        return;
-    }
-
-    let response = dispatch(&line, &ctx, peer_pid).await;
-    let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
+    dispatch_json(&line, &ctx, peer_pid, &mut writer).await;
 }
 
-/// Typed JSON dispatch for migrated verbs. Each match arm runs the
-/// verb-specific handler, wraps the result in an [`Envelope`], and
-/// writes one or more reply messages back. Most verbs reply with a
-/// single envelope; the streaming variant (`ImportAttach`) writes a
+/// Typed JSON dispatch. Each match arm runs the verb-specific
+/// handler, wraps the result in an [`Envelope`], and writes one or
+/// more reply messages back. Most verbs reply with a single
+/// envelope; the streaming variant (`ImportAttach`) writes a
 /// sequence terminated by either an `Ok(Done)` or `Err`. Unknown
 /// verbs fail at the `serde_json::from_str` step — `serde` rejects
 /// unrecognised variants by default for internally-tagged enums.
-async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf) {
+async fn dispatch_json(
+    line: &str,
+    ctx: &IpcContext,
+    peer_pid: Option<i32>,
+    writer: &mut OwnedWriteHalf,
+) {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -377,167 +373,91 @@ async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf
             let env: Envelope<NameEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-    }
-}
-
-async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String {
-    if line.is_empty() {
-        return "err empty request".to_string();
-    }
-
-    let (op, args) = match line.split_once(' ') {
-        Some((op, args)) => (op, args.trim()),
-        None => (line, ""),
-    };
-
-    match op {
-        // The following verbs are JSON-only — see `dispatch_json`.
-        // The line dispatcher returns an error if a client sends them
-        // as line commands so the migration doesn't silently keep
-        // working under the old wire.
-        "rescan"
-        | "status"
-        | "status-remote"
-        | "stop"
-        | "release"
-        | "claim"
-        | "start"
-        | "rebind-name"
-        | "create"
-        | "update"
-        | "pull-readonly"
-        | "fork-create"
-        | "import"
-        | "snapshot"
-        | "force-snapshot-now"
-        | "evict"
-        | "generate-filemap"
-        | "await-prefetch"
-        | "remove"
-        | "resolve-handoff-key" => {
-            format!("err verb '{op}' is JSON-only; clients must send NDJSON")
+        Request::GetStoreConfig => {
+            let reply = render_store_config(&ctx.store_config);
+            let env: Envelope<StoreConfigReply> = Envelope::ok(reply);
+            let _ = ipc::write_message(writer, &env).await;
         }
-
-        // Vend the non-secret `[store]` config so CLI read operations
-        // (remote list, remote pull, volume create --from) can build an
-        // S3 client that matches the coordinator's. Returned as TOML so
-        // the caller can round-trip through toml::from_str.
-        "get-store-config" => render_store_config(&ctx.store_config),
-
-        // Vend S3 credentials from the coordinator's env. Today this is
-        // the long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; the
-        // same wire format will carry macaroon-issued short-lived
-        // credentials when that lands.
-        "get-store-creds" => render_store_creds(),
-
-        // Macaroon mint for a spawned volume process. Authenticated by
-        // SO_PEERCRED on the connecting socket — we accept only when the
-        // peer's PID matches the volume's recorded `volume.pid`.
-        "register" => {
-            if args.is_empty() {
-                return "err usage: register <volume-ulid>".to_string();
-            }
-            register_volume(args, &ctx.data_dir, peer_pid, &ctx.macaroon_root)
+        Request::GetStoreCreds => {
+            let env: Envelope<StoreCredsReply> = render_store_creds().into();
+            let _ = ipc::write_message(writer, &env).await;
         }
-
-        // Macaroon-authenticated credential issuance. Verifies the MAC,
-        // re-checks SO_PEERCRED matches the macaroon's `pid` caveat,
-        // then delegates to the configured `CredentialIssuer`.
-        "credentials" => {
-            if args.is_empty() {
-                return "err usage: credentials <macaroon>".to_string();
-            }
-            issue_credentials(
-                args,
+        Request::Register { volume_ulid } => {
+            let result = register_volume(volume_ulid, &ctx.data_dir, peer_pid, &ctx.macaroon_root);
+            let env: Envelope<RegisterReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Credentials { macaroon } => {
+            let result = issue_credentials(
+                &macaroon,
                 &ctx.data_dir,
                 peer_pid,
                 &ctx.macaroon_root,
                 ctx.issuer.as_ref(),
-            )
-        }
-
-        _ => {
-            warn!("[inbound] unexpected op: {op:?}");
-            format!("err unknown op: {op}")
+            );
+            let env: Envelope<StoreCredsReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
         }
     }
 }
 
 // ── Store config / creds vending ──────────────────────────────────────────────
 
-/// Response for `get-store-config`: a multi-line TOML body naming either a
-/// local store path or an S3 bucket/endpoint/region. Intentionally contains
-/// no secrets.
-fn render_store_config(store: &StoreSection) -> String {
-    let mut body = String::from("ok\n");
+/// Resolve the store config the CLI should see. If neither a local
+/// path nor a bucket is configured, falls back to `./elide_store` to
+/// match the coordinator's own default — the CLI builds an
+/// object_store from this and must agree with the coordinator on
+/// where the bytes live.
+fn render_store_config(store: &StoreSection) -> StoreConfigReply {
     if let Some(path) = &store.local_path {
-        body.push_str(&format!(
-            "local_path = {}\n",
-            toml_quote(&path.display().to_string())
-        ));
-        return body;
+        return StoreConfigReply {
+            local_path: Some(path.display().to_string()),
+            ..Default::default()
+        };
     }
     if let Some(bucket) = &store.bucket {
-        body.push_str(&format!("bucket = {}\n", toml_quote(bucket)));
-        if let Some(ep) = &store.endpoint {
-            body.push_str(&format!("endpoint = {}\n", toml_quote(ep)));
-        }
-        if let Some(region) = &store.region {
-            body.push_str(&format!("region = {}\n", toml_quote(region)));
-        }
-        return body;
+        return StoreConfigReply {
+            bucket: Some(bucket.clone()),
+            endpoint: store.endpoint.clone(),
+            region: store.region.clone(),
+            ..Default::default()
+        };
     }
-    // No explicit store configured — coordinator's own fallback is
-    // `./elide_store`, so surface that so the CLI sees the same default.
-    body.push_str("local_path = \"elide_store\"\n");
-    body
+    StoreConfigReply {
+        local_path: Some("elide_store".to_owned()),
+        ..Default::default()
+    }
 }
 
-/// Response for `get-store-creds`: TOML-bodied access key + secret + optional
-/// session token read from the coordinator's env. Returns `err` when the
-/// coordinator's env has no credentials — callers should treat that as
-/// fatal rather than silently swap in their own env.
-fn render_store_creds() -> String {
+/// Read AWS env-creds. Errors if the coordinator's env has no
+/// credentials — callers should treat that as fatal rather than
+/// silently swap in their own env.
+fn render_store_creds() -> Result<StoreCredsReply, IpcError> {
     let ak = match std::env::var("AWS_ACCESS_KEY_ID") {
         Ok(v) if !v.is_empty() => v,
-        _ => return "err no credentials configured in coordinator env".to_string(),
+        _ => {
+            return Err(IpcError::not_found(
+                "no credentials configured in coordinator env",
+            ));
+        }
     };
     let sk = match std::env::var("AWS_SECRET_ACCESS_KEY") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            return "err AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing".to_string();
+            return Err(IpcError::internal(
+                "AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing",
+            ));
         }
     };
-    let mut body = String::from("ok\n");
-    body.push_str(&format!("access_key_id = {}\n", toml_quote(&ak)));
-    body.push_str(&format!("secret_access_key = {}\n", toml_quote(&sk)));
-    if let Ok(tok) = std::env::var("AWS_SESSION_TOKEN")
-        && !tok.is_empty()
-    {
-        body.push_str(&format!("session_token = {}\n", toml_quote(&tok)));
-    }
-    body
-}
-
-/// Quote a string as a TOML basic string. The values we serialise (bucket
-/// names, URLs, AWS keys) never contain characters that would require
-/// `r"..."` literals or multi-line strings.
-fn toml_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    let session_token = std::env::var("AWS_SESSION_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    Ok(StoreCredsReply {
+        access_key_id: ak,
+        secret_access_key: sk,
+        session_token,
+        expiry_unix: None,
+    })
 }
 
 // ── Import operations ─────────────────────────────────────────────────────────
@@ -3235,34 +3155,28 @@ fn check_peer_pid(vol_dir: &Path, peer_pid: Option<i32>) -> Result<i32, String> 
 }
 
 fn register_volume(
-    volume_ulid: &str,
+    volume_ulid: ulid::Ulid,
     data_dir: &Path,
     peer_pid: Option<i32>,
     macaroon_root: &[u8; 32],
-) -> String {
-    // Parse the ULID at the boundary so we never thread a raw string to the
-    // caveat or the filesystem path.
-    let ulid = match ulid::Ulid::from_string(volume_ulid) {
-        Ok(u) => u.to_string(),
-        Err(e) => return format!("err invalid volume ulid: {e}"),
-    };
-    let vol_dir = data_dir.join("by_id").join(&ulid);
+) -> Result<RegisterReply, IpcError> {
+    let ulid_str = volume_ulid.to_string();
+    let vol_dir = data_dir.join("by_id").join(&ulid_str);
     if !vol_dir.exists() {
-        return "err unknown volume".to_string();
+        return Err(IpcError::not_found("unknown volume"));
     }
-    let pid = match check_peer_pid(&vol_dir, peer_pid) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+    let pid = check_peer_pid(&vol_dir, peer_pid).map_err(IpcError::forbidden)?;
     let m = macaroon::mint(
         macaroon_root,
         vec![
-            Caveat::Volume(ulid),
+            Caveat::Volume(ulid_str),
             Caveat::Scope(Scope::Credentials),
             Caveat::Pid(pid),
         ],
     );
-    format!("ok {}", m.encode())
+    Ok(RegisterReply {
+        macaroon: m.encode(),
+    })
 }
 
 fn issue_credentials(
@@ -3271,31 +3185,26 @@ fn issue_credentials(
     peer_pid: Option<i32>,
     macaroon_root: &[u8; 32],
     issuer: &dyn CredentialIssuer,
-) -> String {
-    let m = match Macaroon::parse(macaroon_str) {
-        Ok(m) => m,
-        Err(e) => return format!("err parse macaroon: {e}"),
-    };
+) -> Result<StoreCredsReply, IpcError> {
+    let m = Macaroon::parse(macaroon_str)
+        .map_err(|e| IpcError::bad_request(format!("parse macaroon: {e}")))?;
     if !macaroon::verify(macaroon_root, &m) {
         // Generic message — don't help an attacker distinguish "wrong key"
         // from "tampered caveats".
-        return "err invalid macaroon".to_string();
+        return Err(IpcError::forbidden("invalid macaroon"));
     }
     if m.scope() != Some(Scope::Credentials) {
-        return "err macaroon scope mismatch".to_string();
+        return Err(IpcError::forbidden("macaroon scope mismatch"));
     }
-    let Some(volume_ulid) = m.volume() else {
-        return "err macaroon missing volume caveat".to_string();
-    };
-    let Some(macaroon_pid) = m.pid() else {
-        return "err macaroon missing pid caveat".to_string();
-    };
-    let peer_pid = match peer_pid {
-        Some(p) => p,
-        None => return "err peer pid unavailable".to_string(),
-    };
+    let volume_ulid = m
+        .volume()
+        .ok_or_else(|| IpcError::forbidden("macaroon missing volume caveat"))?;
+    let macaroon_pid = m
+        .pid()
+        .ok_or_else(|| IpcError::forbidden("macaroon missing pid caveat"))?;
+    let peer_pid = peer_pid.ok_or_else(|| IpcError::forbidden("peer pid unavailable"))?;
     if peer_pid != macaroon_pid {
-        return "err peer pid does not match macaroon".to_string();
+        return Err(IpcError::forbidden("peer pid does not match macaroon"));
     }
     if let Some(not_after) = m.not_after() {
         let now = std::time::SystemTime::now()
@@ -3303,38 +3212,25 @@ fn issue_credentials(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if now >= not_after {
-            return "err macaroon expired".to_string();
+            return Err(IpcError::forbidden("macaroon expired"));
         }
     }
     // Re-validate that volume.pid still matches — covers the case where the
     // original process has exited and the PID was reused.
     let vol_dir = data_dir.join("by_id").join(volume_ulid);
-    if let Err(e) = check_peer_pid(&vol_dir, Some(peer_pid)) {
-        return e;
-    }
+    check_peer_pid(&vol_dir, Some(peer_pid)).map_err(IpcError::forbidden)?;
     if !pid_is_alive(peer_pid as u32) {
-        return "err peer pid not alive".to_string();
+        return Err(IpcError::forbidden("peer pid not alive"));
     }
-    let creds = match issuer.issue(volume_ulid) {
-        Ok(c) => c,
-        Err(e) => return format!("err issue: {e}"),
-    };
-    let mut body = String::from("ok\n");
-    body.push_str(&format!(
-        "access_key_id = {}\n",
-        toml_quote(&creds.access_key_id)
-    ));
-    body.push_str(&format!(
-        "secret_access_key = {}\n",
-        toml_quote(&creds.secret_access_key)
-    ));
-    if let Some(tok) = &creds.session_token {
-        body.push_str(&format!("session_token = {}\n", toml_quote(tok)));
-    }
-    if let Some(exp) = creds.expiry_unix {
-        body.push_str(&format!("expiry_unix = {exp}\n"));
-    }
-    body
+    let creds = issuer
+        .issue(volume_ulid)
+        .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
+    Ok(StoreCredsReply {
+        access_key_id: creds.access_key_id,
+        secret_access_key: creds.secret_access_key,
+        session_token: creds.session_token,
+        expiry_unix: creds.expiry_unix,
+    })
 }
 
 #[cfg(test)]
@@ -3366,149 +3262,178 @@ mod tests {
         [0x42; 32]
     }
 
+    fn ulid_from(s: &str) -> ulid::Ulid {
+        ulid::Ulid::from_string(s).unwrap()
+    }
+
     #[test]
     fn register_succeeds_when_peer_pid_matches_volume_pid() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        setup_volume(tmp.path(), ulid, 4242);
-        let resp = register_volume(ulid, tmp.path(), Some(4242), &key());
-        assert!(resp.starts_with("ok "), "expected ok, got {resp}");
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        setup_volume(tmp.path(), ulid_str, 4242);
+        let reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(4242), &key())
+            .expect("matching pid → ok");
+        assert!(!reply.macaroon.is_empty());
     }
 
     #[test]
     fn register_rejects_pid_mismatch() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        setup_volume(tmp.path(), ulid, 4242);
-        let resp = register_volume(ulid, tmp.path(), Some(9999), &key());
-        assert!(resp.starts_with("err"), "expected err, got {resp}");
-        assert!(resp.contains("does not match"));
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        setup_volume(tmp.path(), ulid_str, 4242);
+        let err = register_volume(ulid_from(ulid_str), tmp.path(), Some(9999), &key())
+            .expect_err("mismatched pid should error");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
+        assert!(err.message.contains("does not match"), "{err}");
     }
 
     #[test]
     fn register_rejects_when_volume_pid_missing() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         // Create the volume dir but no volume.pid yet — this is the spawn-write
         // race the volume-side retry absorbs.
-        std::fs::create_dir_all(tmp.path().join("by_id").join(ulid)).unwrap();
-        let resp = register_volume(ulid, tmp.path(), Some(4242), &key());
-        assert!(resp.contains("not registered"), "{resp}");
+        std::fs::create_dir_all(tmp.path().join("by_id").join(ulid_str)).unwrap();
+        let err = register_volume(ulid_from(ulid_str), tmp.path(), Some(4242), &key())
+            .expect_err("missing pid file should error");
+        assert!(err.message.contains("not registered"), "{err}");
     }
 
     #[test]
     fn register_rejects_unknown_volume() {
         let tmp = TempDir::new().unwrap();
-        let resp = register_volume("01JQAAAAAAAAAAAAAAAAAAAAAA", tmp.path(), Some(4242), &key());
-        assert!(resp.contains("unknown volume"), "{resp}");
-    }
-
-    #[test]
-    fn register_rejects_invalid_ulid() {
-        let tmp = TempDir::new().unwrap();
-        let resp = register_volume("not-a-ulid", tmp.path(), Some(4242), &key());
-        assert!(resp.contains("invalid volume ulid"), "{resp}");
+        let err = register_volume(
+            ulid_from("01JQAAAAAAAAAAAAAAAAAAAAAA"),
+            tmp.path(),
+            Some(4242),
+            &key(),
+        )
+        .expect_err("unknown volume should error");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains("unknown volume"), "{err}");
     }
 
     #[test]
     fn credentials_round_trip_with_live_pid() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         // Use our own pid so the pid_is_alive check passes inside the handler.
         let my_pid = std::process::id() as i32;
-        setup_volume(tmp.path(), ulid, my_pid);
-        let mint_resp = register_volume(ulid, tmp.path(), Some(my_pid), &key());
-        let macaroon = mint_resp.strip_prefix("ok ").unwrap();
+        setup_volume(tmp.path(), ulid_str, my_pid);
+        let mint_reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(my_pid), &key())
+            .expect("register should succeed");
         let issuer = FixedIssuer;
-        let resp = issue_credentials(macaroon, tmp.path(), Some(my_pid), &key(), &issuer);
-        assert!(resp.starts_with("ok\n"), "expected ok body, got {resp}");
-        assert!(resp.contains("access_key_id = \"AK\""));
-        assert!(resp.contains("secret_access_key = \"SK\""));
+        let creds = issue_credentials(
+            &mint_reply.macaroon,
+            tmp.path(),
+            Some(my_pid),
+            &key(),
+            &issuer,
+        )
+        .expect("credentials should succeed");
+        assert_eq!(creds.access_key_id, "AK");
+        assert_eq!(creds.secret_access_key, "SK");
     }
 
     #[test]
     fn credentials_rejects_wrong_root_key() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
-        setup_volume(tmp.path(), ulid, my_pid);
-        let mint_resp = register_volume(ulid, tmp.path(), Some(my_pid), &key());
-        let macaroon = mint_resp.strip_prefix("ok ").unwrap();
+        setup_volume(tmp.path(), ulid_str, my_pid);
+        let mint_reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(my_pid), &key())
+            .expect("register should succeed");
         let mut other = key();
         other[0] ^= 0xFF;
         let issuer = FixedIssuer;
-        let resp = issue_credentials(macaroon, tmp.path(), Some(my_pid), &other, &issuer);
-        assert!(resp.contains("invalid macaroon"), "{resp}");
+        let err = issue_credentials(
+            &mint_reply.macaroon,
+            tmp.path(),
+            Some(my_pid),
+            &other,
+            &issuer,
+        )
+        .expect_err("wrong root key should fail");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
+        assert!(err.message.contains("invalid macaroon"), "{err}");
     }
 
     #[test]
     fn credentials_rejects_pid_mismatch() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
-        setup_volume(tmp.path(), ulid, my_pid);
-        let mint_resp = register_volume(ulid, tmp.path(), Some(my_pid), &key());
-        let macaroon = mint_resp.strip_prefix("ok ").unwrap();
+        setup_volume(tmp.path(), ulid_str, my_pid);
+        let mint_reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(my_pid), &key())
+            .expect("register should succeed");
         let issuer = FixedIssuer;
         // Present a different peer pid than the macaroon was minted for.
-        let resp = issue_credentials(macaroon, tmp.path(), Some(my_pid + 1), &key(), &issuer);
+        let err = issue_credentials(
+            &mint_reply.macaroon,
+            tmp.path(),
+            Some(my_pid + 1),
+            &key(),
+            &issuer,
+        )
+        .expect_err("pid mismatch should fail");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(
-            resp.contains("does not match macaroon") || resp.contains("does not match volume.pid"),
-            "{resp}"
+            err.message.contains("does not match macaroon")
+                || err.message.contains("does not match volume.pid"),
+            "{err}"
         );
     }
 
     #[test]
     fn credentials_rejects_tampered_caveat() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
-        setup_volume(tmp.path(), ulid, my_pid);
+        setup_volume(tmp.path(), ulid_str, my_pid);
         // Mint a macaroon for a different volume — the verify call rejects
         // because the volume caveat is wrong even though MAC matches.
-        let other_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
-        setup_volume(tmp.path(), other_ulid, my_pid);
-        let mint_resp = register_volume(other_ulid, tmp.path(), Some(my_pid), &key());
-        let macaroon = mint_resp.strip_prefix("ok ").unwrap();
-        // Now hand-edit the macaroon to claim it's for `ulid`. We can do that
-        // by re-minting with a tampered caveat list and copying the original
-        // MAC — but that fails verify, which is what we want to assert.
-        let parsed = Macaroon::parse(macaroon).unwrap();
+        let other_ulid_str = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        setup_volume(tmp.path(), other_ulid_str, my_pid);
+        let mint_reply =
+            register_volume(ulid_from(other_ulid_str), tmp.path(), Some(my_pid), &key())
+                .expect("register should succeed");
+        let parsed = Macaroon::parse(&mint_reply.macaroon).unwrap();
         let mut caveats: Vec<Caveat> = parsed.caveats().to_vec();
         for c in &mut caveats {
             if let Caveat::Volume(v) = c {
-                *v = ulid.to_owned();
+                *v = ulid_str.to_owned();
             }
         }
-        // Construct a forged macaroon with the original MAC but rewritten
-        // caveats. We have to drop into the same module to do this since
-        // the struct fields are private — exposing a helper would broaden
-        // the API just for the test, so reuse the encode round-trip with
-        // the *new* mint and confirm verify fails for the *old* MAC.
-        let forged = macaroon::mint(&[0u8; 32], caveats); // wrong key
+        // Construct a forged macaroon with rewritten caveats under a wrong
+        // key — verify must fail.
+        let forged = macaroon::mint(&[0u8; 32], caveats);
         let issuer = FixedIssuer;
-        let resp = issue_credentials(&forged.encode(), tmp.path(), Some(my_pid), &key(), &issuer);
-        assert!(resp.contains("invalid macaroon"), "{resp}");
+        let err = issue_credentials(&forged.encode(), tmp.path(), Some(my_pid), &key(), &issuer)
+            .expect_err("tampered caveat should fail");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
+        assert!(err.message.contains("invalid macaroon"), "{err}");
     }
 
     #[test]
     fn credentials_rejects_expired_macaroon() {
         let tmp = TempDir::new().unwrap();
-        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
-        setup_volume(tmp.path(), ulid, my_pid);
+        setup_volume(tmp.path(), ulid_str, my_pid);
         let m = macaroon::mint(
             &key(),
             vec![
-                Caveat::Volume(ulid.to_owned()),
+                Caveat::Volume(ulid_str.to_owned()),
                 Caveat::Scope(macaroon::Scope::Credentials),
                 Caveat::Pid(my_pid),
                 Caveat::NotAfter(1), // unix second 1 — long ago
             ],
         );
         let issuer = FixedIssuer;
-        let resp = issue_credentials(&m.encode(), tmp.path(), Some(my_pid), &key(), &issuer);
-        assert!(resp.contains("expired"), "{resp}");
+        let err = issue_credentials(&m.encode(), tmp.path(), Some(my_pid), &key(), &issuer)
+            .expect_err("expired macaroon should fail");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
+        assert!(err.message.contains("expired"), "{err}");
     }
 
     #[test]
