@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn volume_events_parses_populated_reply() {
         let (_guard, sock) = temp_socket();
-        let body = r#"{"outcome":"ok","data":{"events":[{"event":{"version":1,"event_ulid":"01J0000000000000000000000V","at":"2024-01-01T00:00:00.000Z","coordinator_id":"coord-a","vol_ulid":"01J0000000000000000000000W","kind":"created","signature":"00"},"signature_status":{"status":"valid"}}]}}"#;
+        let body = r#"{"outcome":"ok","data":{"events":[{"event":{"version":1,"event_ulid":"01J0000000000000000000000V","at":"2024-01-01T00:00:00.000Z","name":"vol","coordinator_id":"coord-a","vol_ulid":"01J0000000000000000000000W","kind":"created","signature":"00"},"signature_status":{"status":"valid"}}]}}"#;
         let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
         let reply = volume_events(&sock, "vol").expect("volume-events should succeed");
         server.join().unwrap();
