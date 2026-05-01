@@ -34,8 +34,9 @@ use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
-    self, ClaimReply, Envelope, IpcError, RebindNameReply, ReleaseReply, Request,
-    StatusRemoteReply, StatusReply,
+    self, ClaimReply, CreateReply, Envelope, ForkCreateReply, ImportAttachEvent, ImportStartReply,
+    ImportStatusReply, IpcError, PullReadonlyReply, RebindNameReply, ReleaseReply, Request,
+    StatusRemoteReply, StatusReply, UpdateReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -145,23 +146,18 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
         return;
     }
 
-    // `import attach` is the one streaming operation — it keeps the connection
-    // open and writes lines until the import completes.
-    if let Some(name) = line.strip_prefix("import attach ") {
-        stream_import_by_name(name.trim(), &ctx.data_dir, &mut writer, &ctx.registry).await;
-        return;
-    }
-
     let response = dispatch(&line, &ctx, peer_pid).await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
 /// Typed JSON dispatch for migrated verbs. Each match arm runs the
 /// verb-specific handler, wraps the result in an [`Envelope`], and
-/// writes a single line back. Unknown verbs would fail at the
-/// `serde_json::from_str` step — `serde` rejects unrecognised
-/// variants by default for internally-tagged enums.
-async fn dispatch_json<W: AsyncWriteExt + Unpin>(line: &str, ctx: &IpcContext, writer: &mut W) {
+/// writes one or more reply messages back. Most verbs reply with a
+/// single envelope; the streaming variant (`ImportAttach`) writes a
+/// sequence terminated by either an `Ok(Done)` or `Err`. Unknown
+/// verbs fail at the `serde_json::from_str` step — `serde` rejects
+/// unrecognised variants by default for internally-tagged enums.
+async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf) {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -245,6 +241,87 @@ async fn dispatch_json<W: AsyncWriteExt + Unpin>(line: &str, ctx: &IpcContext, w
             let env: Envelope<RebindNameReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
+        Request::Create {
+            volume,
+            size_bytes,
+            flags,
+        } => {
+            let result = create_volume_op(
+                &volume,
+                size_bytes,
+                &flags,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.identity,
+                &ctx.rescan,
+            )
+            .await;
+            let env: Envelope<CreateReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Update { volume, flags } => {
+            let result = update_volume_op(&volume, &flags, &ctx.data_dir).await;
+            let env: Envelope<UpdateReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::PullReadonly { vol_ulid } => {
+            let result = pull_readonly_op(vol_ulid, &ctx.data_dir, &ctx.store).await;
+            let env: Envelope<PullReadonlyReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ForkCreate {
+            new_name,
+            source_vol_ulid,
+            snap,
+            parent_key_hex,
+            for_claim,
+            flags,
+        } => {
+            let result = fork_create_op(
+                &new_name,
+                source_vol_ulid,
+                snap,
+                parent_key_hex.as_deref(),
+                for_claim,
+                &flags,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.identity,
+                &ctx.rescan,
+                &ctx.prefetch_tracker,
+            )
+            .await;
+            let env: Envelope<ForkCreateReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ImportStart {
+            volume,
+            oci_ref,
+            extents_from,
+        } => {
+            let result = start_import(
+                &volume,
+                &oci_ref,
+                &extents_from,
+                &ctx.data_dir,
+                &ctx.elide_import_bin,
+                &ctx.registry,
+                &ctx.store,
+                &ctx.rescan,
+                &ctx.identity,
+            )
+            .await;
+            let env: Envelope<ImportStartReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ImportStatus { volume } => {
+            let result = import_status_by_name(&volume, &ctx.data_dir, &ctx.registry).await;
+            let env: Envelope<ImportStatusReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ImportAttach { volume } => {
+            stream_import_by_name(&volume, &ctx.data_dir, writer, &ctx.registry).await;
+        }
     }
 }
 
@@ -264,60 +341,8 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
         // as line commands so the migration doesn't silently keep
         // working under the old wire.
         "rescan" | "status" | "status-remote" | "stop" | "release" | "claim" | "start"
-        | "rebind-name" => {
+        | "rebind-name" | "create" | "update" | "pull-readonly" | "fork-create" | "import" => {
             format!("err verb '{op}' is JSON-only; clients must send NDJSON")
-        }
-
-        "import" => {
-            let (sub, sub_args) = match args.split_once(' ') {
-                Some((sub, rest)) => (sub, rest.trim()),
-                None => (args, ""),
-            };
-            match sub {
-                "status" => {
-                    if sub_args.is_empty() {
-                        return "err usage: import status <name>".to_string();
-                    }
-                    import_status_by_name(sub_args, &ctx.data_dir, &ctx.registry).await
-                }
-                _ => {
-                    // `import <name> <oci-ref> [extents:<name>[,<name>…]]`:
-                    //   sub = volume name
-                    //   sub_args = oci-ref [space extents:<name,name…>]
-                    if sub_args.is_empty() {
-                        return "err usage: import <name> <oci-ref> [extents:<name>[,<name>…]]"
-                            .to_string();
-                    }
-                    let (oci_ref, extents_from) = match sub_args.split_once(' ') {
-                        Some((oci, rest)) => match rest.trim().strip_prefix("extents:") {
-                            Some(list) if !list.is_empty() => {
-                                let names: Vec<String> =
-                                    list.split(',').map(|s| s.to_owned()).collect();
-                                (oci, names)
-                            }
-                            _ => {
-                                return "err malformed import args; expected extents:<name>[,…]"
-                                    .to_string();
-                            }
-                        },
-                        None => (sub_args, Vec::new()),
-                    };
-                    start_import(
-                        import::ImportRequest {
-                            vol_name: sub,
-                            oci_ref,
-                            extents_from: &extents_from,
-                        },
-                        &ctx.data_dir,
-                        &ctx.elide_import_bin,
-                        &ctx.registry,
-                        &ctx.store,
-                        &ctx.rescan,
-                        &ctx.identity,
-                    )
-                    .await
-                }
-            }
         }
 
         "remove" => {
@@ -331,30 +356,6 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 return "err usage: remove <volume> [force]".to_string();
             }
             remove_volume(name, force, &ctx.data_dir)
-        }
-
-        "create" => {
-            // create <name> <size_bytes> [<flag>...]
-            if args.is_empty() {
-                return "err usage: create <name> <size_bytes> [flags...]".to_string();
-            }
-            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.identity, &ctx.rescan).await
-        }
-
-        "update" => {
-            // update <name> [<flag>...]
-            if args.is_empty() {
-                return "err usage: update <volume> [flags...]".to_string();
-            }
-            update_volume_op(args, &ctx.data_dir).await
-        }
-
-        "pull-readonly" => {
-            // pull-readonly <vol_ulid>
-            if args.is_empty() {
-                return "err usage: pull-readonly <vol_ulid>".to_string();
-            }
-            pull_readonly_op(args, &ctx.data_dir, &ctx.store).await
         }
 
         "force-snapshot-now" => {
@@ -378,22 +379,6 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 return "err usage: await-prefetch <vol_ulid>".to_string();
             }
             await_prefetch_op(args, &ctx.prefetch_tracker).await
-        }
-
-        "fork-create" => {
-            // fork-create <new_name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [<flags>...]
-            if args.is_empty() {
-                return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
-            }
-            fork_create_op(
-                args,
-                &ctx.data_dir,
-                &ctx.store,
-                &ctx.identity,
-                &ctx.rescan,
-                &ctx.prefetch_tracker,
-            )
-            .await
         }
 
         "resolve-handoff-key" => {
@@ -578,16 +563,24 @@ fn toml_quote(s: &str) -> String {
 
 // ── Import operations ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn start_import(
-    req: import::ImportRequest<'_>,
+    volume: &str,
+    oci_ref: &str,
+    extents_from: &[String],
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
     store: &Arc<dyn ObjectStore>,
     rescan: &Arc<Notify>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-) -> String {
-    match import::spawn_import(
+) -> Result<ImportStartReply, IpcError> {
+    let req = import::ImportRequest {
+        vol_name: volume,
+        oci_ref,
+        extents_from,
+    };
+    let ulid_str = import::spawn_import(
         req,
         data_dir,
         elide_import_bin,
@@ -597,10 +590,10 @@ async fn start_import(
         identity.clone(),
     )
     .await
-    {
-        Ok(ulid) => format!("ok {ulid}"),
-        Err(e) => format!("err {e}"),
-    }
+    .map_err(|e| IpcError::internal(format!("{e}")))?;
+    let import_ulid = ulid::Ulid::from_string(&ulid_str)
+        .map_err(|e| IpcError::internal(format!("import ulid {ulid_str:?}: {e}")))?;
+    Ok(ImportStartReply { import_ulid })
 }
 
 /// Resolve a volume name to its import ULID via `import.lock`, if present.
@@ -611,17 +604,21 @@ fn import_ulid_for_volume(name: &str, data_dir: &Path) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 
-async fn import_status_by_name(name: &str, data_dir: &Path, registry: &ImportRegistry) -> String {
+async fn import_status_by_name(
+    name: &str,
+    data_dir: &Path,
+    registry: &ImportRegistry,
+) -> Result<ImportStatusReply, IpcError> {
     let vol_dir = data_dir.join("by_name").join(name);
     if !vol_dir.exists() {
-        return format!("err volume not found: {name}");
+        return Err(IpcError::not_found(format!("volume not found: {name}")));
     }
     let Some(ulid) = import_ulid_for_volume(name, data_dir) else {
         // No active import lock — if volume is readonly the import completed.
         if vol_dir.join("volume.readonly").exists() {
-            return "ok done".to_string();
+            return Ok(ImportStatusReply::Done);
         }
-        return format!("err no active import for: {name}");
+        return Err(IpcError::not_found(format!("no active import for: {name}")));
     };
     let job = registry
         .lock()
@@ -630,38 +627,49 @@ async fn import_status_by_name(name: &str, data_dir: &Path, registry: &ImportReg
         .cloned();
     match job {
         // import.lock exists but not in registry (coordinator restarted mid-import)
-        None => "ok running".to_string(),
+        None => Ok(ImportStatusReply::Running),
         Some(job) => match job.state() {
-            ImportState::Running => "ok running".to_string(),
-            ImportState::Done => "ok done".to_string(),
-            ImportState::Failed(msg) => format!("err failed: {msg}"),
+            ImportState::Running => Ok(ImportStatusReply::Running),
+            ImportState::Done => Ok(ImportStatusReply::Done),
+            ImportState::Failed(msg) => Err(IpcError::internal(format!("import failed: {msg}"))),
         },
     }
 }
 
-/// Stream buffered and live import output to `writer`, closing with a terminal
-/// `ok done` or `err failed: <msg>` line when the import completes.
+/// Stream buffered and live import output to `writer` as a sequence of
+/// [`Envelope<ImportAttachEvent>`] messages, terminating with either
+/// `ImportAttachEvent::Done` (success) or `Envelope::Err` (failure).
 async fn stream_import_by_name(
     name: &str,
     data_dir: &Path,
     writer: &mut OwnedWriteHalf,
     registry: &ImportRegistry,
 ) {
+    async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
+        let env: Envelope<ImportAttachEvent> = Envelope::err(error);
+        let _ = ipc::write_message(writer, &env).await;
+    }
+
     let vol_dir = data_dir.join("by_name").join(name);
     if !vol_dir.exists() {
-        let _ = writer
-            .write_all(format!("err volume not found: {name}\n").as_bytes())
-            .await;
+        write_err(
+            writer,
+            IpcError::not_found(format!("volume not found: {name}")),
+        )
+        .await;
         return;
     }
     let Some(ulid) = import_ulid_for_volume(name, data_dir) else {
         // No active import — if volume is readonly the import already completed.
         if vol_dir.join("volume.readonly").exists() {
-            let _ = writer.write_all(b"ok done\n").await;
+            let env: Envelope<ImportAttachEvent> = Envelope::ok(ImportAttachEvent::Done);
+            let _ = ipc::write_message(writer, &env).await;
         } else {
-            let _ = writer
-                .write_all(format!("err no active import for: {name}\n").as_bytes())
-                .await;
+            write_err(
+                writer,
+                IpcError::not_found(format!("no active import for: {name}")),
+            )
+            .await;
         }
         return;
     };
@@ -673,10 +681,12 @@ async fn stream_import_by_name(
         .cloned();
     let Some(job) = job else {
         // import.lock exists but not in registry (coordinator restarted mid-import).
-        // We can't stream output we never buffered; just report running.
-        let _ = writer
-            .write_all(b"err import output unavailable (coordinator restarted)\n")
-            .await;
+        // We can't stream output we never buffered.
+        write_err(
+            writer,
+            IpcError::internal("import output unavailable (coordinator restarted)"),
+        )
+        .await;
         return;
     };
 
@@ -684,11 +694,10 @@ async fn stream_import_by_name(
     loop {
         let lines = job.read_from(offset);
         for line in &lines {
-            if writer
-                .write_all(format!("{line}\n").as_bytes())
-                .await
-                .is_err()
-            {
+            let env: Envelope<ImportAttachEvent> = Envelope::ok(ImportAttachEvent::Line {
+                content: line.clone(),
+            });
+            if ipc::write_message(writer, &env).await.is_err() {
                 return; // client disconnected
             }
         }
@@ -696,13 +705,12 @@ async fn stream_import_by_name(
 
         match job.state() {
             ImportState::Done => {
-                let _ = writer.write_all(b"ok done\n").await;
+                let env: Envelope<ImportAttachEvent> = Envelope::ok(ImportAttachEvent::Done);
+                let _ = ipc::write_message(writer, &env).await;
                 return;
             }
             ImportState::Failed(msg) => {
-                let _ = writer
-                    .write_all(format!("err failed: {msg}\n").as_bytes())
-                    .await;
+                write_err(writer, IpcError::internal(format!("import failed: {msg}"))).await;
                 return;
             }
             ImportState::Running => {
@@ -1218,46 +1226,33 @@ fn validate_volume_name(name: &str) -> Result<(), String> {
 }
 
 async fn create_volume_op(
-    args: &str,
+    name: &str,
+    size_bytes: u64,
+    flags: &[String],
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
-) -> String {
+) -> Result<CreateReply, IpcError> {
     let coord_id = identity.coordinator_id_str();
-    // First two whitespace-separated tokens: name, size_bytes. Remainder is flags.
-    let mut iter = args.splitn(3, ' ').map(str::trim);
-    let name = match iter.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return "err usage: create <name> <size_bytes> [flags...]".to_string(),
-    };
-    let size_str = match iter.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return "err usage: create <name> <size_bytes> [flags...]".to_string(),
-    };
-    let flag_str = iter.next().unwrap_or("");
 
-    if let Err(e) = validate_volume_name(name) {
-        return format!("err {e}");
+    validate_volume_name(name).map_err(IpcError::bad_request)?;
+    if size_bytes == 0 {
+        return Err(IpcError::bad_request("size must be non-zero"));
     }
-    let bytes: u64 = match size_str.parse() {
-        Ok(b) if b > 0 => b,
-        Ok(_) => return "err size must be non-zero".to_string(),
-        Err(e) => return format!("err bad size {size_str:?}: {e}"),
-    };
 
-    let patch = match parse_transport_flags(flag_str) {
-        Ok(p) => p,
-        Err(e) => return format!("err {e}"),
-    };
+    let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
     if patch.no_nbd || patch.no_ublk {
-        return "err no-nbd / no-ublk are not valid on create (volume starts without transport)"
-            .to_string();
+        return Err(IpcError::bad_request(
+            "no-nbd / no-ublk are not valid on create (volume starts without transport)",
+        ));
     }
     if (patch.nbd_port.is_some() || patch.nbd_bind.is_some() || patch.nbd_socket.is_some())
         && (patch.ublk || patch.ublk_id.is_some())
     {
-        return "err nbd-* flags are mutually exclusive with ublk".to_string();
+        return Err(IpcError::bad_request(
+            "nbd-* flags are mutually exclusive with ublk",
+        ));
     }
 
     let nbd_cfg = if let Some(socket) = patch.nbd_socket {
@@ -1284,7 +1279,7 @@ async fn create_volume_op(
 
     let by_name_dir = data_dir.join("by_name");
     if by_name_dir.join(name).exists() {
-        return format!("err volume already exists: {name}");
+        return Err(IpcError::conflict(format!("volume already exists: {name}")));
     }
 
     let vol_ulid = ulid::Ulid::new();
@@ -1315,7 +1310,7 @@ async fn create_volume_op(
         Ok(k) => k,
         Err(e) => {
             cleanup_local();
-            return format!("err create failed: {e}");
+            return Err(IpcError::internal(format!("create failed: {e}")));
         }
     };
 
@@ -1326,7 +1321,7 @@ async fn create_volume_op(
         elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, store).await
     {
         cleanup_local();
-        return format!("err uploading volume.pub: {e:#}");
+        return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
 
     // Phase 3: claim the name in S3. After this point the names/<name>
@@ -1352,25 +1347,29 @@ async fn create_volume_op(
         }) => {
             cleanup_local();
             let owner = existing_owner.as_deref().unwrap_or("<unowned>");
-            return format!(
-                "err name '{name}' already exists in bucket \
+            return Err(IpcError::conflict(format!(
+                "name '{name}' already exists in bucket \
                  (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
                  owner={owner})"
-            );
+            )));
         }
         Err(LifecycleError::Store(e)) => {
             cleanup_local();
-            return format!("err claiming name in bucket: {e}");
+            return Err(IpcError::store(format!("claiming name in bucket: {e}")));
         }
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             // mark_initial doesn't currently surface this, but match
             // exhaustively so a future refactor doesn't silently drop it.
             cleanup_local();
-            return format!("err name held by another coordinator: {held_by}");
+            return Err(IpcError::conflict(format!(
+                "name held by another coordinator: {held_by}"
+            )));
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {
             cleanup_local();
-            return format!("err names/<name> is in unexpected state {from:?}");
+            return Err(IpcError::conflict(format!(
+                "names/<name> is in unexpected state {from:?}"
+            )));
         }
     }
 
@@ -1384,7 +1383,7 @@ async fn create_volume_op(
         )?;
         elide_core::config::VolumeConfig {
             name: Some(name.to_owned()),
-            size: Some(bytes),
+            size: Some(size_bytes),
             nbd: nbd_cfg,
             ublk: ublk_cfg,
         }
@@ -1407,40 +1406,33 @@ async fn create_volume_op(
                  of names/<name> also failed: {del_err}"
             );
         }
-        return format!("err create failed: {e}");
+        return Err(IpcError::internal(format!("create failed: {e}")));
     }
 
     rescan.notify_one();
     info!("[inbound] created volume {name} ({vol_ulid_str})");
-    format!("ok {vol_ulid_str}")
+    Ok(CreateReply { vol_ulid })
 }
 
-async fn update_volume_op(args: &str, data_dir: &Path) -> String {
-    let (name, flag_str) = match args.split_once(' ') {
-        Some((n, rest)) => (n.trim(), rest.trim()),
-        None => (args.trim(), ""),
-    };
+async fn update_volume_op(
+    name: &str,
+    flags: &[String],
+    data_dir: &Path,
+) -> Result<UpdateReply, IpcError> {
     if name.is_empty() {
-        return "err usage: update <volume> [flags...]".to_string();
+        return Err(IpcError::bad_request("usage: update <volume> [flags...]"));
     }
     let link = data_dir.join("by_name").join(name);
     if !link.exists() {
-        return format!("err volume not found: {name}");
+        return Err(IpcError::not_found(format!("volume not found: {name}")));
     }
-    let vol_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(e) => return format!("err resolving volume dir: {e}"),
-    };
+    let vol_dir = std::fs::canonicalize(&link)
+        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
 
-    let patch = match parse_transport_flags(flag_str) {
-        Ok(p) => p,
-        Err(e) => return format!("err {e}"),
-    };
+    let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
 
-    let mut cfg = match elide_core::config::VolumeConfig::read(&vol_dir) {
-        Ok(c) => c,
-        Err(e) => return format!("err reading volume.toml: {e}"),
-    };
+    let mut cfg = elide_core::config::VolumeConfig::read(&vol_dir)
+        .map_err(|e| IpcError::internal(format!("reading volume.toml: {e}")))?;
 
     // Mirror the CLI's apply order: nbd flags first, then ublk. The setters
     // clear the opposite transport so the two sections remain mutually
@@ -1474,9 +1466,8 @@ async fn update_volume_op(args: &str, data_dir: &Path) -> String {
         cfg.nbd = None;
     }
 
-    if let Err(e) = cfg.write(&vol_dir) {
-        return format!("err writing volume.toml: {e}");
-    }
+    cfg.write(&vol_dir)
+        .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
 
     // Restart the volume process so it picks up the new config. ECONNREFUSED /
     // ENOENT mean the volume isn't running — fine, the new config takes effect
@@ -1484,12 +1475,12 @@ async fn update_volume_op(args: &str, data_dir: &Path) -> String {
     match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
         Some(resp) if resp == "ok" => {
             info!("[inbound] updated volume {name}; restart triggered");
-            "ok restarting".to_string()
+            Ok(UpdateReply { restarted: true })
         }
-        Some(resp) => format!("err shutdown failed: {resp}"),
+        Some(resp) => Err(IpcError::internal(format!("shutdown failed: {resp}"))),
         None => {
             info!("[inbound] updated volume {name}; not running");
-            "ok not-running".to_string()
+            Ok(UpdateReply { restarted: false })
         }
     }
 }
@@ -1515,54 +1506,53 @@ fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
 /// `volume.pub`, and `volume.provenance`, writes the ancestor under
 /// `data_dir/by_id/<vol_ulid>/`, and returns the parent ULID parsed from
 /// the (signature-verified) provenance, or empty if this is a root volume.
-async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectStore>) -> String {
+async fn pull_readonly_op(
+    vol_ulid: ulid::Ulid,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<PullReadonlyReply, IpcError> {
     use object_store::path::Path as StorePath;
 
-    let volume_id = args.trim();
-    if ulid::Ulid::from_string(volume_id).is_err() {
-        return format!("err invalid ULID: {volume_id}");
-    }
-
-    let vol_dir = data_dir.join("by_id").join(volume_id);
+    let volume_id = vol_ulid.to_string();
+    let vol_dir = data_dir.join("by_id").join(&volume_id);
     if vol_dir.exists() {
-        return format!("err volume already present locally: {volume_id}");
+        return Err(IpcError::conflict(format!(
+            "volume already present locally: {volume_id}"
+        )));
     }
 
     // Step 1: fetch manifest.toml.
     let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
     let manifest_bytes = match store.get(&manifest_key).await {
-        Ok(d) => match d.bytes().await {
-            Ok(b) => b,
-            Err(e) => return format!("err reading manifest: {e}"),
-        },
+        Ok(d) => d
+            .bytes()
+            .await
+            .map_err(|e| IpcError::store(format!("reading manifest: {e}")))?,
         Err(object_store::Error::NotFound { .. }) => {
-            return format!("err manifest not found in store for volume {volume_id}");
+            return Err(IpcError::not_found(format!(
+                "manifest not found in store for volume {volume_id}"
+            )));
         }
-        Err(e) => return format!("err downloading manifest: {e}"),
+        Err(e) => return Err(IpcError::store(format!("downloading manifest: {e}"))),
     };
-    let manifest: toml::Table = match std::str::from_utf8(&manifest_bytes)
-        .map_err(|e| format!("manifest is not valid utf-8: {e}"))
-        .and_then(|s| toml::from_str(s).map_err(|e| format!("parsing manifest.toml: {e}")))
-    {
-        Ok(t) => t,
-        Err(e) => return format!("err {e}"),
-    };
-    let size = match manifest.get("size").and_then(|v| v.as_integer()) {
-        Some(s) => s,
-        None => return "err manifest.toml missing 'size'".to_string(),
-    };
+    let manifest: toml::Table = std::str::from_utf8(&manifest_bytes)
+        .map_err(|e| IpcError::internal(format!("manifest is not valid utf-8: {e}")))
+        .and_then(|s| {
+            toml::from_str(s).map_err(|e| IpcError::internal(format!("parsing manifest.toml: {e}")))
+        })?;
+    let size = manifest
+        .get("size")
+        .and_then(|v| v.as_integer())
+        .ok_or_else(|| IpcError::internal("manifest.toml missing 'size'"))?;
 
     // Step 2: fetch volume.pub.
-    let pub_key_bytes = match store
+    let pub_key_bytes = store
         .get(&StorePath::from(format!("by_id/{volume_id}/volume.pub")))
         .await
-    {
-        Ok(d) => match d.bytes().await {
-            Ok(b) => b,
-            Err(e) => return format!("err reading volume.pub: {e}"),
-        },
-        Err(e) => return format!("err downloading volume.pub: {e}"),
-    };
+        .map_err(|e| IpcError::store(format!("downloading volume.pub: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| IpcError::store(format!("reading volume.pub: {e}")))?;
 
     // Step 3: fetch volume.provenance. NotFound is hard error.
     let provenance_bytes = match store
@@ -1571,14 +1561,20 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
         )))
         .await
     {
-        Ok(d) => match d.bytes().await {
-            Ok(b) => b,
-            Err(e) => return format!("err reading volume.provenance: {e}"),
-        },
+        Ok(d) => d
+            .bytes()
+            .await
+            .map_err(|e| IpcError::store(format!("reading volume.provenance: {e}")))?,
         Err(object_store::Error::NotFound { .. }) => {
-            return format!("err volume.provenance not found in store for volume {volume_id}");
+            return Err(IpcError::not_found(format!(
+                "volume.provenance not found in store for volume {volume_id}"
+            )));
         }
-        Err(e) => return format!("err downloading volume.provenance: {e}"),
+        Err(e) => {
+            return Err(IpcError::store(format!(
+                "downloading volume.provenance: {e}"
+            )));
+        }
     };
 
     // Step 4: write the ancestor entry. No name carried over from manifest:
@@ -1604,27 +1600,33 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
     })();
     if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&vol_dir);
-        return format!("err writing pulled ancestor: {e}");
+        return Err(IpcError::internal(format!("writing pulled ancestor: {e}")));
     }
 
     // Step 5: parse and verify provenance to find the parent.
-    let parent_ulid = match elide_core::signing::read_lineage_verifying_signature(
+    let parent = match elide_core::signing::read_lineage_verifying_signature(
         &vol_dir,
         elide_core::signing::VOLUME_PUB_FILE,
         elide_core::signing::VOLUME_PROVENANCE_FILE,
     ) {
-        Ok(lineage) => lineage.parent.map(|p| p.volume_ulid.to_string()),
+        Ok(lineage) => lineage
+            .parent
+            .map(|p| {
+                ulid::Ulid::from_string(&p.volume_ulid).map_err(|e| {
+                    IpcError::internal(format!("malformed parent ULID {:?}: {e}", p.volume_ulid))
+                })
+            })
+            .transpose()?,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&vol_dir);
-            return format!("err verifying provenance for {volume_id}: {e}");
+            return Err(IpcError::internal(format!(
+                "verifying provenance for {volume_id}: {e}"
+            )));
         }
     };
 
     info!("[inbound] pulled ancestor {volume_id}");
-    match parent_ulid {
-        Some(p) => format!("ok {p}"),
-        None => "ok".to_string(),
-    }
+    Ok(PullReadonlyReply { parent })
 }
 
 /// Synthesize a "now" snapshot for a readonly source volume.
@@ -1850,73 +1852,42 @@ async fn force_snapshot_now_op(
 /// omitted, falls back to `volume::fork_volume` (latest local snapshot).
 /// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
 /// recorded in the new fork's provenance for force-snapshot pins.
+#[allow(clippy::too_many_arguments)]
 async fn fork_create_op(
-    args: &str,
+    new_name: &str,
+    source_vol_ulid: ulid::Ulid,
+    snap: Option<ulid::Ulid>,
+    parent_key_hex: Option<&str>,
+    for_claim: bool,
+    flags: &[String],
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
     prefetch_tracker: &PrefetchTracker,
-) -> String {
+) -> Result<ForkCreateReply, IpcError> {
     let coord_id = identity.coordinator_id_str();
-    let mut iter = args.splitn(3, ' ').map(str::trim);
-    let new_name = match iter.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string(),
-    };
-    let source_ulid_str = match iter.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string(),
-    };
-    let rest = iter.next().unwrap_or("");
+    validate_volume_name(new_name).map_err(IpcError::bad_request)?;
+    let source_ulid_str = source_vol_ulid.to_string();
 
-    if let Err(e) = validate_volume_name(new_name) {
-        return format!("err {e}");
-    }
-    let source_vol_ulid = match ulid::Ulid::from_string(source_ulid_str) {
-        Ok(u) => u,
-        Err(e) => return format!("err invalid source ULID {source_ulid_str}: {e}"),
-    };
-
-    // Pull off `snap=<ulid>`, `parent-key=<hex>`, and `for-claim` first;
-    // remaining tokens go to the transport-flag parser. `for-claim`
-    // marks this fork-create as the materialise step of a
-    // claim-from-released flow: the name already exists in the bucket
-    // as `Released`, so we must NOT call `mark_initial` (which would
-    // fail with `AlreadyExists`). The CLI's subsequent `claim` IPC
-    // calls `mark_claimed` to atomically rebind the name to the new
-    // fork.
-    let mut snap: Option<ulid::Ulid> = None;
-    let mut parent_key: Option<elide_core::signing::VerifyingKey> = None;
-    let mut for_claim = false;
-    let mut flag_tokens: Vec<&str> = Vec::new();
-    for tok in rest.split_whitespace() {
-        if let Some(v) = tok.strip_prefix("snap=") {
-            match ulid::Ulid::from_string(v) {
-                Ok(u) => snap = Some(u),
-                Err(e) => return format!("err bad snap ULID {v:?}: {e}"),
-            }
-        } else if let Some(v) = tok.strip_prefix("parent-key=") {
-            let arr = match decode_hex32(v) {
-                Ok(a) => a,
-                Err(e) => return format!("err bad parent-key: {e}"),
-            };
-            match elide_core::signing::VerifyingKey::from_bytes(&arr) {
-                Ok(k) => parent_key = Some(k),
-                Err(e) => return format!("err parent-key not a valid Ed25519 pubkey: {e}"),
-            }
-        } else if tok == "for-claim" {
-            for_claim = true;
-        } else {
-            flag_tokens.push(tok);
+    let parent_key = match parent_key_hex {
+        Some(hex) => {
+            let arr = decode_hex32(hex)
+                .map_err(|e| IpcError::bad_request(format!("bad parent-key: {e}")))?;
+            Some(
+                elide_core::signing::VerifyingKey::from_bytes(&arr).map_err(|e| {
+                    IpcError::bad_request(format!("parent-key not a valid Ed25519 pubkey: {e}"))
+                })?,
+            )
         }
-    }
-    let patch = match parse_transport_flags(&flag_tokens.join(" ")) {
-        Ok(p) => p,
-        Err(e) => return format!("err {e}"),
+        None => None,
     };
+
+    let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
     if patch.no_nbd || patch.no_ublk {
-        return "err no-nbd / no-ublk are not valid on fork-create".to_string();
+        return Err(IpcError::bad_request(
+            "no-nbd / no-ublk are not valid on fork-create",
+        ));
     }
     let nbd_cfg = if let Some(socket) = patch.nbd_socket {
         Some(elide_core::config::NbdConfig {
@@ -1943,13 +1914,17 @@ async fn fork_create_op(
     let by_name_dir = data_dir.join("by_name");
     let symlink_path = by_name_dir.join(new_name);
     if symlink_path.exists() {
-        return format!("err volume already exists: {new_name}");
+        return Err(IpcError::conflict(format!(
+            "volume already exists: {new_name}"
+        )));
     }
 
     let by_id_dir = data_dir.join("by_id");
-    let source_dir = elide_core::volume::resolve_ancestor_dir(&by_id_dir, source_ulid_str);
+    let source_dir = elide_core::volume::resolve_ancestor_dir(&by_id_dir, &source_ulid_str);
     if !source_dir.exists() {
-        return format!("err source volume {source_ulid_str} not found locally");
+        return Err(IpcError::not_found(format!(
+            "source volume {source_ulid_str} not found locally"
+        )));
     }
 
     let new_vol_ulid_value = ulid::Ulid::new();
@@ -1993,7 +1968,7 @@ async fn fork_create_op(
     };
     if let Err(e) = fork_result {
         cleanup(&new_fork_dir, &symlink_path);
-        return format!("err fork failed: {e}");
+        return Err(IpcError::internal(format!("fork failed: {e}")));
     }
 
     // Phase 2: publish volume.pub to S3 *before* claiming the name.
@@ -2009,7 +1984,7 @@ async fn fork_create_op(
             .await
     {
         cleanup(&new_fork_dir, &symlink_path);
-        return format!("err uploading volume.pub: {e:#}");
+        return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
 
     // Read source volume config: `src_cfg.name` feeds the
@@ -2021,14 +1996,18 @@ async fn fork_create_op(
         Ok(c) => c,
         Err(e) => {
             cleanup(&new_fork_dir, &symlink_path);
-            return format!("err reading source volume config: {e}");
+            return Err(IpcError::internal(format!(
+                "reading source volume config: {e}"
+            )));
         }
     };
     let size = match src_cfg.size {
         Some(s) => s,
         None => {
             cleanup(&new_fork_dir, &symlink_path);
-            return "err source volume has no size (import may not have completed)".to_string();
+            return Err(IpcError::conflict(
+                "source volume has no size (import may not have completed)",
+            ));
         }
     };
 
@@ -2096,23 +2075,27 @@ async fn fork_create_op(
             }) => {
                 cleanup(&new_fork_dir, &symlink_path);
                 let owner = existing_owner.as_deref().unwrap_or("<unowned>");
-                return format!(
-                    "err name '{new_name}' already exists in bucket \
+                return Err(IpcError::conflict(format!(
+                    "name '{new_name}' already exists in bucket \
                      (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
                      owner={owner})"
-                );
+                )));
             }
             Err(LifecycleError::Store(e)) => {
                 cleanup(&new_fork_dir, &symlink_path);
-                return format!("err claiming name in bucket: {e}");
+                return Err(IpcError::store(format!("claiming name in bucket: {e}")));
             }
             Err(LifecycleError::OwnershipConflict { held_by }) => {
                 cleanup(&new_fork_dir, &symlink_path);
-                return format!("err name held by another coordinator: {held_by}");
+                return Err(IpcError::conflict(format!(
+                    "name held by another coordinator: {held_by}"
+                )));
             }
             Err(LifecycleError::InvalidTransition { from, .. }) => {
                 cleanup(&new_fork_dir, &symlink_path);
-                return format!("err names/<name> is in unexpected state {from:?}");
+                return Err(IpcError::conflict(format!(
+                    "names/<name> is in unexpected state {from:?}"
+                )));
             }
         }
     }
@@ -2127,17 +2110,17 @@ async fn fork_create_op(
     {
         cleanup(&new_fork_dir, &symlink_path);
         rollback_claim(name_claimed_in_bucket).await;
-        return format!("err writing volume config: {e}");
+        return Err(IpcError::internal(format!("writing volume config: {e}")));
     }
     if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
         cleanup(&new_fork_dir, &symlink_path);
         rollback_claim(name_claimed_in_bucket).await;
-        return format!("err creating by_name dir: {e}");
+        return Err(IpcError::internal(format!("creating by_name dir: {e}")));
     }
     if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
         cleanup(&new_fork_dir, &symlink_path);
         rollback_claim(name_claimed_in_bucket).await;
-        return format!("err creating by_name symlink: {e}");
+        return Err(IpcError::internal(format!("creating by_name symlink: {e}")));
     }
 
     // Pre-register the prefetch tracker entry before notifying the daemon's
@@ -2154,7 +2137,9 @@ async fn fork_create_op(
 
     rescan.notify_one();
     info!("[inbound] forked volume {new_name} ({new_vol_ulid}) from {source_ulid_str}");
-    format!("ok {new_vol_ulid}")
+    Ok(ForkCreateReply {
+        new_vol_ulid: new_vol_ulid_value,
+    })
 }
 
 // ── Volume stop / start ───────────────────────────────────────────────────────

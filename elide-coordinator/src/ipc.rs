@@ -258,6 +258,60 @@ pub enum Request {
     /// Atomically rebind a `Released` name to a freshly-minted local
     /// fork. Internal helper called by the CLI's claim orchestration.
     RebindName { volume: String, new_vol_ulid: Ulid },
+
+    // ── Iteration 3: creation + readonly ─────────────────────────────
+    /// Mint a fresh writable volume. `flags` is the same transport-flag
+    /// list the CLI accepts on the command line (`nbd-port=N`,
+    /// `nbd-bind=…`, `ublk`, `ublk-id=N`, `nbd-socket=…`).
+    Create {
+        volume: String,
+        size_bytes: u64,
+        #[serde(default)]
+        flags: Vec<String>,
+    },
+    /// Patch transport configuration on an existing volume and restart
+    /// the daemon if it's running.
+    Update {
+        volume: String,
+        #[serde(default)]
+        flags: Vec<String>,
+    },
+    /// Pull one readonly ancestor (manifest + volume.pub + provenance)
+    /// from the store. Returns the parent ULID parsed from the verified
+    /// provenance, or `None` if the ancestor is a root volume.
+    PullReadonly { vol_ulid: Ulid },
+    /// Mint a fresh writable fork from a local source. `for_claim`
+    /// switches off the bucket-side `mark_initial` step — the
+    /// claim-from-released flow handles the rebind via a subsequent
+    /// `claim` call.
+    ForkCreate {
+        new_name: String,
+        source_vol_ulid: Ulid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        snap: Option<Ulid>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        parent_key_hex: Option<String>,
+        #[serde(default)]
+        for_claim: bool,
+        #[serde(default)]
+        flags: Vec<String>,
+    },
+    /// Spawn an OCI → volume import in the background. Returns the
+    /// import ULID immediately; the actual import runs detached and is
+    /// observed via `ImportAttach` / `ImportStatus`.
+    ImportStart {
+        volume: String,
+        oci_ref: String,
+        #[serde(default)]
+        extents_from: Vec<String>,
+    },
+    /// Poll the state of an in-flight import by volume name.
+    ImportStatus { volume: String },
+    /// Stream an in-flight import's output. Server replies with a
+    /// sequence of [`Envelope<ImportAttachEvent>`] messages: one per
+    /// output line, then a terminal `Done`. Failure terminates with an
+    /// `Envelope::Err`.
+    ImportAttach { volume: String },
 }
 
 /// Reply for [`Request::Status`].
@@ -323,6 +377,70 @@ pub enum ClaimReply {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         handoff_snapshot: Option<Ulid>,
     },
+}
+
+/// Reply for [`Request::Create`] and [`Request::ForkCreate`]. The new
+/// volume's ULID is what the caller stamps into local state for any
+/// follow-up IPCs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateReply {
+    pub vol_ulid: Ulid,
+}
+
+/// Reply for [`Request::ForkCreate`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkCreateReply {
+    pub new_vol_ulid: Ulid,
+}
+
+/// Reply for [`Request::Update`]. `restarted = true` means the daemon
+/// was running and the coordinator triggered a restart so it picks up
+/// the new transport config; `false` means the volume was not running
+/// and the new config takes effect on next start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateReply {
+    pub restarted: bool,
+}
+
+/// Reply for [`Request::PullReadonly`]. `parent` is `None` for a root
+/// ancestor; otherwise it carries the verified parent ULID parsed from
+/// the just-fetched provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullReadonlyReply {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent: Option<Ulid>,
+}
+
+/// Reply for [`Request::ImportStart`]. The import runs detached; the
+/// CLI uses [`Request::ImportAttach`] to stream output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportStartReply {
+    pub import_ulid: Ulid,
+}
+
+/// Reply for [`Request::ImportStatus`]. Failures (no active import,
+/// import failed) come back as `Envelope::Err`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum ImportStatusReply {
+    /// Import is in progress.
+    Running,
+    /// Import completed successfully. The volume is readonly.
+    Done,
+}
+
+/// Streaming event for [`Request::ImportAttach`]. The server writes
+/// one [`Envelope<ImportAttachEvent>`] per message until the import
+/// terminates: `Line` events carry one buffered/live output line;
+/// `Done` is the terminal success marker. Failure terminates with an
+/// `Envelope::Err` instead of a `Done`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ImportAttachEvent {
+    /// One line of import output.
+    Line { content: String },
+    /// Import completed successfully — last message in the stream.
+    Done,
 }
 
 #[cfg(test)]

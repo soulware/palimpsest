@@ -654,13 +654,12 @@ fn main() {
                     nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, ublk_id, no_ublk,
                 );
                 match coordinator_client::update_volume(&socket_path, &name, &flags) {
-                    Ok(note) if note == "restarting" => {
+                    Ok(reply) if reply.restarted => {
                         println!("volume restarting with new config")
                     }
-                    Ok(note) if note == "not-running" => {
+                    Ok(_) => {
                         println!("volume not running; config will take effect on next start")
                     }
-                    Ok(other) => println!("ok {other}"),
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(1);
@@ -690,15 +689,14 @@ fn main() {
 
             VolumeCommand::Import(import_args) => match import_args.command {
                 Some(ImportSubcommand::Status { name }) => {
-                    let resp = coordinator_client::import_status_by_name(&socket_path, &name)
-                        .unwrap_or_else(|e| format!("err {e}"));
-                    match resp.split_once(' ') {
-                        Some(("ok", state)) => println!("{name}: {state}"),
-                        Some(("err", msg)) => {
-                            eprintln!("{name}: {msg}");
+                    use coordinator_client::ImportStatusReply;
+                    match coordinator_client::import_status_by_name(&socket_path, &name) {
+                        Ok(ImportStatusReply::Running) => println!("{name}: running"),
+                        Ok(ImportStatusReply::Done) => println!("{name}: done"),
+                        Err(e) => {
+                            eprintln!("{name}: {e}");
                             std::process::exit(1);
                         }
-                        _ => println!("{name}: {resp}"),
                     }
                 }
                 Some(ImportSubcommand::Attach { name }) => {
