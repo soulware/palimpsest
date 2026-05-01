@@ -456,17 +456,31 @@ mod tests {
         let s = store();
         let (_tmp, id) = fresh_identity();
 
-        let first = emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+        let a = emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
             .await
             .expect("first");
-        let second = emit_event(&s, &id, "vol", EventKind::Claimed, vol_ulid())
+        let b = emit_event(&s, &id, "vol", EventKind::Claimed, vol_ulid())
             .await
             .expect("second");
 
+        // `emit_event` mints via `Ulid::new()`, which is monotonic
+        // *across* milliseconds but not *within* one — two back-to-
+        // back emits in the same ms can come out in either ULID
+        // order (see CLAUDE.md "Monotonic ULIDs in tests"). The
+        // invariant under test here is `list_events`' sort order,
+        // so check both emitted ULIDs are present and the listing
+        // is ascending, without assuming emit order matches ULID
+        // order.
         let listed = list_events(&s, "vol").await.expect("list");
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].event_ulid, first.event_ulid);
-        assert_eq!(listed[1].event_ulid, second.event_ulid);
+        assert!(
+            listed[0].event_ulid < listed[1].event_ulid,
+            "list_events must return events in ascending ULID order"
+        );
+        let listed_ulids: std::collections::HashSet<_> =
+            listed.iter().map(|e| e.event_ulid).collect();
+        assert!(listed_ulids.contains(&a.event_ulid));
+        assert!(listed_ulids.contains(&b.event_ulid));
     }
 
     #[tokio::test]
