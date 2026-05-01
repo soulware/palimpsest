@@ -35,6 +35,7 @@
 
 use std::io;
 
+use elide_core::name_event::NameEvent;
 use elide_core::name_record::NameState;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -358,6 +359,12 @@ pub enum Request {
     /// coordinator's already-verified pubkey, ready to embed in
     /// `fork-create` as `parent-key=<hex>`).
     ResolveHandoffKey { vol_ulid: Ulid, snap_ulid: Ulid },
+
+    // ── Iteration 5: read-only history ───────────────────────────────
+    /// List the per-name event log at `names/<volume>/events/`,
+    /// verifying each entry's signature against the emitting
+    /// coordinator's published pubkey.
+    NameEvents { volume: String },
 }
 
 /// Reply for [`Request::Status`].
@@ -530,6 +537,49 @@ pub struct GenerateFilemapReply {
 pub enum ResolveHandoffKeyReply {
     Normal,
     Recovery { manifest_pubkey_hex: String },
+}
+
+/// Outcome of verifying a [`NameEvent::signature`] against the
+/// emitting coordinator's published `coordinator.pub`.
+///
+/// The CLI renders these as one-character markers in the operator
+/// log: `Valid` is silent, the others get a sigil so a tampered or
+/// orphaned event is visible at a glance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum SignatureStatus {
+    /// Signature verified against the emitting coordinator's
+    /// published pubkey.
+    Valid,
+    /// Pubkey was fetched, but `verify` rejected the signature.
+    /// Either the event was tampered with after signing or the
+    /// emitter signed under a different key than the one published
+    /// at `coordinators/<id>/coordinator.pub`.
+    Invalid { reason: String },
+    /// Could not fetch the emitting coordinator's pubkey from the
+    /// bucket. Typical causes: emitter never published its pubkey,
+    /// network/I-O failure, or `coordinator_id` mismatch with the
+    /// stored bytes.
+    KeyUnavailable { reason: String },
+    /// Event has no `signature` field. Should not happen for events
+    /// written by this codebase — surfaced rather than hidden so a
+    /// hand-edited or pre-signing-era record is obvious.
+    Missing,
+}
+
+/// One entry in [`NameEventsReply`] — the parsed event paired with
+/// its signature verification outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NameEventEntry {
+    pub event: NameEvent,
+    pub signature_status: SignatureStatus,
+}
+
+/// Reply for [`Request::NameEvents`]. Entries are sorted by
+/// `event_ulid` ascending — the canonical history order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NameEventsReply {
+    pub events: Vec<NameEventEntry>,
 }
 
 #[cfg(test)]

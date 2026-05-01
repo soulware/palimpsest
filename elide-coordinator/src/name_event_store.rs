@@ -9,6 +9,7 @@
 //! written exactly once via `If-None-Match: *` — duplicate ULIDs
 //! would be a programmer error, not a race.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -19,9 +20,10 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use elide_core::name_event::{EventKind, NameEvent};
-use elide_core::signing;
+use elide_core::signing::{self, VerifyingKey};
 
-use crate::identity::CoordinatorIdentity;
+use crate::identity::{self, CoordinatorIdentity};
+use crate::ipc::{NameEventEntry, SignatureStatus};
 use crate::portable::{ConditionalPutError, put_if_absent};
 
 /// Errors from `name_event_store` operations.
@@ -204,6 +206,150 @@ pub async fn emit_event(
     Ok(event)
 }
 
+/// List every event under `names/<name>/events/`, parsed and
+/// sorted ascending by `event_ulid`.
+///
+/// Listed objects whose filename does not parse as `<ulid>.toml`,
+/// or whose body fails to parse as a [`NameEvent`], are dropped
+/// with a `warn!` — a corrupt file should be visible in the log
+/// but must not block the operator from inspecting the rest.
+pub async fn list_events(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+) -> Result<Vec<NameEvent>, NameEventStoreError> {
+    let prefix = event_prefix(name);
+    let objects: Vec<_> = store.list(Some(&prefix)).try_collect().await?;
+
+    let mut events = Vec::with_capacity(objects.len());
+    for obj in objects {
+        let Some(filename) = obj.location.filename() else {
+            continue;
+        };
+        let Some(stem) = filename.strip_suffix(".toml") else {
+            continue;
+        };
+        if Ulid::from_string(stem).is_err() {
+            continue;
+        }
+        let body = match store.get(&obj.location).await {
+            Ok(g) => match g.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("[name_event_store] read {key}: {e}", key = obj.location);
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("[name_event_store] get {key}: {e}", key = obj.location);
+                continue;
+            }
+        };
+        let text = match std::str::from_utf8(&body) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "[name_event_store] {key}: not UTF-8: {e}",
+                    key = obj.location
+                );
+                continue;
+            }
+        };
+        match NameEvent::from_toml(text) {
+            Ok(event) => events.push(event),
+            Err(e) => {
+                warn!("[name_event_store] parse {key}: {e}", key = obj.location);
+            }
+        }
+    }
+    events.sort_by_key(|e| e.event_ulid);
+    Ok(events)
+}
+
+/// Verify `event.signature` against `verifying_key`. The pubkey is
+/// assumed to already match the event's `coordinator_id` (the
+/// caller resolves it via [`identity::fetch_coordinator_pub`],
+/// which enforces the binding).
+pub fn verify_event_signature(event: &NameEvent, verifying_key: &VerifyingKey) -> SignatureStatus {
+    use ed25519_dalek::Verifier;
+
+    let Some(sig_hex) = event.signature.as_deref() else {
+        return SignatureStatus::Missing;
+    };
+    let sig_bytes = match signing::decode_hex(sig_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            return SignatureStatus::Invalid {
+                reason: format!("signature hex decode: {e}"),
+            };
+        }
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            return SignatureStatus::Invalid {
+                reason: format!("signature wrong length ({}, want 64)", sig_bytes.len()),
+            };
+        }
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    match verifying_key.verify(&event.signing_payload(), &signature) {
+        Ok(()) => SignatureStatus::Valid,
+        Err(e) => SignatureStatus::Invalid {
+            reason: format!("signature did not verify: {e}"),
+        },
+    }
+}
+
+/// Read every event under `names/<name>/events/` and pair each
+/// with a [`SignatureStatus`].
+///
+/// Coordinator pubkeys are fetched once per unique `coordinator_id`
+/// observed in the log and cached for the duration of the call.
+/// Fetch failures collapse into `SignatureStatus::KeyUnavailable`
+/// for every event signed by that coordinator — the per-event
+/// status surfaces the failure rather than aborting the whole read.
+pub async fn list_and_verify_events(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+) -> Result<Vec<NameEventEntry>, NameEventStoreError> {
+    let events = list_events(store, name).await?;
+
+    // Cache: Some(key) on success, None when fetch failed (with the
+    // failure reason carried in `key_failures`).
+    let mut keys: HashMap<String, Option<VerifyingKey>> = HashMap::new();
+    let mut key_failures: HashMap<String, String> = HashMap::new();
+
+    let mut entries = Vec::with_capacity(events.len());
+    for event in events {
+        let coord_id = event.coordinator_id.clone();
+        if !keys.contains_key(&coord_id) {
+            match identity::fetch_coordinator_pub(store.as_ref(), &coord_id).await {
+                Ok(vk) => {
+                    keys.insert(coord_id.clone(), Some(vk));
+                }
+                Err(e) => {
+                    key_failures.insert(coord_id.clone(), format!("{e}"));
+                    keys.insert(coord_id.clone(), None);
+                }
+            }
+        }
+        let status = match keys.get(&coord_id).and_then(|opt| opt.as_ref()) {
+            Some(vk) => verify_event_signature(&event, vk),
+            None => SignatureStatus::KeyUnavailable {
+                reason: key_failures
+                    .get(&coord_id)
+                    .cloned()
+                    .unwrap_or_else(|| "pubkey unavailable".to_string()),
+            },
+        };
+        entries.push(NameEventEntry {
+            event,
+            signature_status: status,
+        });
+    }
+    Ok(entries)
+}
+
 /// Best-effort companion to [`emit_event`]. Used by lifecycle call
 /// sites that have just completed a successful CAS on
 /// `names/<name>` and need to append the corresponding journal
@@ -303,5 +449,154 @@ mod tests {
         let bytes = s.get(&key).await.unwrap().bytes().await.unwrap();
         let parsed = NameEvent::from_toml(std::str::from_utf8(&bytes).unwrap()).unwrap();
         assert_eq!(parsed, ev);
+    }
+
+    #[tokio::test]
+    async fn list_events_returns_sorted_history() {
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+
+        let a = emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+            .await
+            .expect("first");
+        let b = emit_event(&s, &id, "vol", EventKind::Claimed, vol_ulid())
+            .await
+            .expect("second");
+
+        // `emit_event` mints via `Ulid::new()`, which is monotonic
+        // *across* milliseconds but not *within* one — two back-to-
+        // back emits in the same ms can come out in either ULID
+        // order (see CLAUDE.md "Monotonic ULIDs in tests"). The
+        // invariant under test here is `list_events`' sort order,
+        // so check both emitted ULIDs are present and the listing
+        // is ascending, without assuming emit order matches ULID
+        // order.
+        let listed = list_events(&s, "vol").await.expect("list");
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed[0].event_ulid < listed[1].event_ulid,
+            "list_events must return events in ascending ULID order"
+        );
+        let listed_ulids: std::collections::HashSet<_> =
+            listed.iter().map(|e| e.event_ulid).collect();
+        assert!(listed_ulids.contains(&a.event_ulid));
+        assert!(listed_ulids.contains(&b.event_ulid));
+    }
+
+    #[tokio::test]
+    async fn list_events_skips_corrupt_files() {
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+
+        let good = emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+            .await
+            .expect("good emit");
+
+        // Inject a non-ULID-named file (must be silently ignored) and
+        // a ULID-named file that fails to parse as a NameEvent (must
+        // also be skipped, with a warn).
+        s.put(
+            &StorePath::from("names/vol/events/garbage.txt"),
+            Bytes::from_static(b"hi").into(),
+        )
+        .await
+        .expect("put garbage");
+        let bogus_ulid = Ulid::from_string("01J9999999999999999999999X").unwrap();
+        s.put(
+            &event_key("vol", bogus_ulid),
+            Bytes::from_static(b"not toml at all").into(),
+        )
+        .await
+        .expect("put bogus");
+
+        let listed = list_events(&s, "vol").await.expect("list");
+        assert_eq!(listed.len(), 1, "only the parseable event survives");
+        assert_eq!(listed[0].event_ulid, good.event_ulid);
+    }
+
+    #[tokio::test]
+    async fn list_and_verify_marks_valid_when_pubkey_published() {
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+        id.publish_pub(s.as_ref()).await.expect("publish pub");
+
+        emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+            .await
+            .expect("emit");
+
+        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].signature_status, SignatureStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn list_and_verify_reports_key_unavailable_without_published_pub() {
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+        // Deliberately do NOT publish_pub.
+
+        emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+            .await
+            .expect("emit");
+
+        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].signature_status,
+            SignatureStatus::KeyUnavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_and_verify_reports_invalid_for_tampered_event() {
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+        id.publish_pub(s.as_ref()).await.expect("publish pub");
+
+        let original = emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+            .await
+            .expect("emit");
+
+        // Hand-tamper the on-disk event: keep the signature but flip
+        // the kind. The event still parses; the signature should not
+        // verify against the new payload.
+        let key = event_key("vol", original.event_ulid);
+        let mut tampered = original.clone();
+        tampered.kind = EventKind::Claimed;
+        let body = tampered.to_toml().expect("serialise");
+        // PUT overwrites — InMemory has no conditional semantics for this.
+        s.put(&key, Bytes::from(body.into_bytes()).into())
+            .await
+            .expect("overwrite");
+
+        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].signature_status,
+            SignatureStatus::Invalid { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_and_verify_caches_pubkey_per_coordinator() {
+        // Two events from the same coordinator — pubkey fetch must
+        // happen once. Sanity-check by publishing the pubkey, then
+        // emitting two events and confirming both verify.
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+        id.publish_pub(s.as_ref()).await.expect("publish pub");
+
+        emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+            .await
+            .expect("first");
+        emit_event(&s, &id, "vol", EventKind::Claimed, vol_ulid())
+            .await
+            .expect("second");
+
+        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            assert_eq!(e.signature_status, SignatureStatus::Valid);
+        }
     }
 }

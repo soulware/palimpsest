@@ -320,6 +320,21 @@ enum VolumeCommand {
         remote: bool,
     },
 
+    /// Show the per-name event log for a volume.
+    ///
+    /// Lists every entry in `names/<name>/events/`, one per line, in
+    /// chronological order. Each event's signature is verified
+    /// against the emitting coordinator's published pubkey; events
+    /// whose signature is invalid or whose pubkey can't be fetched
+    /// are flagged with a sigil rather than hidden.
+    Events {
+        /// Volume name
+        name: String,
+        /// Emit one JSON object per event instead of the human form.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Import an OCI image into a new readonly volume (sync by default)
     Import(ImportArgs),
 
@@ -683,6 +698,30 @@ fn main() {
                             eprintln!("{name}: {e}");
                             std::process::exit(1);
                         }
+                    }
+                }
+            }
+
+            VolumeCommand::Events { name, json } => {
+                match coordinator_client::name_events(&socket_path, &name) {
+                    Ok(reply) => {
+                        if json {
+                            for entry in &reply.events {
+                                match serde_json::to_string(entry) {
+                                    Ok(s) => println!("{s}"),
+                                    Err(e) => {
+                                        eprintln!("{name}: serialise event: {e}");
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                        } else {
+                            print_name_events(&reply);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{name}: {e}");
+                        std::process::exit(1);
                     }
                 }
             }
@@ -2108,6 +2147,79 @@ fn resolve_latest_remote_snapshot(
 }
 
 /// Pretty-print a `StatusRemoteReply` for `elide volume status --remote`.
+fn print_name_events(reply: &coordinator_client::NameEventsReply) {
+    use coordinator_client::SignatureStatus;
+    use elide_core::name_event::EventKind;
+
+    if reply.events.is_empty() {
+        println!("(no events)");
+        return;
+    }
+
+    for entry in &reply.events {
+        let ev = &entry.event;
+        // Sigil column: a single character, padded to width 1, so the
+        // log lines stay aligned. Empty for valid signatures keeps
+        // the common case visually quiet.
+        let sigil = match &entry.signature_status {
+            SignatureStatus::Valid => ' ',
+            SignatureStatus::Invalid { .. } => '!',
+            SignatureStatus::KeyUnavailable { .. } => '?',
+            SignatureStatus::Missing => '-',
+        };
+        let when = ev.at.format("%Y-%m-%d %H:%M:%SZ");
+        let kind_label = ev.kind.as_str();
+        let coord = &ev.coordinator_id;
+        let vol = ev.vol_ulid;
+        let extra = match &ev.kind {
+            EventKind::Created | EventKind::Claimed => String::new(),
+            EventKind::Released { handoff_snapshot } => {
+                format!(" handoff={handoff_snapshot}")
+            }
+            EventKind::ForceReleased {
+                handoff_snapshot,
+                displaced_coordinator_id,
+            } => {
+                format!(" handoff={handoff_snapshot} displaced={displaced_coordinator_id}")
+            }
+            EventKind::ForkedFrom {
+                source_name,
+                source_vol_ulid,
+                source_snap_ulid,
+            } => {
+                format!(" source={source_name}@{source_vol_ulid}/{source_snap_ulid}")
+            }
+            EventKind::RenamedTo { new_name } => format!(" to={new_name}"),
+            EventKind::RenamedFrom {
+                old_name,
+                inherits_log_from,
+            } => {
+                format!(" from={old_name} inherits={inherits_log_from}")
+            }
+        };
+        println!("{sigil} {when}  {kind_label:<14} vol={vol}  by={coord}{extra}");
+    }
+
+    // Footer: any non-Valid statuses get explained, so the operator
+    // sees the failure reason without re-running with --json.
+    let mut had_explanation = false;
+    for entry in &reply.events {
+        let reason = match &entry.signature_status {
+            SignatureStatus::Valid => continue,
+            SignatureStatus::Invalid { reason } => format!("invalid: {reason}"),
+            SignatureStatus::KeyUnavailable { reason } => {
+                format!("key unavailable: {reason}")
+            }
+            SignatureStatus::Missing => "no signature on event".to_string(),
+        };
+        if !had_explanation {
+            println!();
+            had_explanation = true;
+        }
+        println!("  {} {}", entry.event.event_ulid, reason);
+    }
+}
+
 fn print_remote_status(name: &str, rs: &coordinator_client::StatusRemoteReply) {
     println!("{name}");
     println!("  state           {}", rs.state);

@@ -36,8 +36,8 @@ use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    PullReadonlyReply, RebindNameReply, ReleaseReply, Request, ResolveHandoffKeyReply,
-    SnapshotReply, StatusRemoteReply, StatusReply, UpdateReply,
+    NameEventsReply, PullReadonlyReply, RebindNameReply, ReleaseReply, Request,
+    ResolveHandoffKeyReply, SnapshotReply, StatusRemoteReply, StatusReply, UpdateReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -370,6 +370,11 @@ async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf
         } => {
             let result = resolve_handoff_key_op(vol_ulid, snap_ulid, &ctx.store).await;
             let env: Envelope<ResolveHandoffKeyReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::NameEvents { volume } => {
+            let result = volume_events_typed(&volume, &ctx.store).await;
+            let env: Envelope<NameEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
     }
@@ -1058,6 +1063,21 @@ async fn volume_status_remote_typed(
         handoff_snapshot: record.handoff_snapshot,
         eligibility,
     })
+}
+
+/// Typed implementation of the `name-events` verb. Lists every
+/// event under `names/<volume>/events/`, parsed and signature-
+/// verified. A missing prefix returns an empty list — every name
+/// has a journal even if no events have been emitted yet, so
+/// "empty log" is not the same as "name doesn't exist".
+async fn volume_events_typed(
+    volume_name: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<NameEventsReply, IpcError> {
+    let entries = elide_coordinator::name_event_store::list_and_verify_events(store, volume_name)
+        .await
+        .map_err(|e| IpcError::store(format!("listing events for {volume_name}: {e}")))?;
+    Ok(NameEventsReply { events: entries })
 }
 
 // ── Volume remove ─────────────────────────────────────────────────────────────

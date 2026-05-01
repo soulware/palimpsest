@@ -181,8 +181,9 @@ impl CoordinatorIdentity {
 /// `coordinator_id` must derive from the fetched bytes.
 ///
 /// Used by claimants on `start --remote` to verify a synthesised
-/// handoff snapshot's signature against the recovering coordinator.
-#[allow(dead_code)]
+/// handoff snapshot's signature against the recovering coordinator,
+/// and by [`crate::name_event_store::list_and_verify_events`] to
+/// verify per-name event log signatures.
 pub async fn fetch_coordinator_pub(
     store: &dyn ObjectStore,
     coord_id_str: &str,

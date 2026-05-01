@@ -17,8 +17,9 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
-    PullReadonlyReply, RebindNameReply, ReleaseReply, ResolveHandoffKeyReply, SnapshotReply,
-    StatusRemoteReply, StatusReply, UpdateReply,
+    NameEventEntry, NameEventsReply, PullReadonlyReply, RebindNameReply, ReleaseReply,
+    ResolveHandoffKeyReply, SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply,
+    UpdateReply,
 };
 pub use elide_coordinator::volume_state::VolumeLifecycle;
 
@@ -291,6 +292,20 @@ pub fn status_remote(socket_path: &Path, volume: &str) -> io::Result<StatusRemot
     call_typed(
         socket_path,
         &Request::StatusRemote {
+            volume: volume.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
+}
+
+/// List the per-name event log under `names/<volume>/events/`.
+/// Each entry includes a `signature_status` reporting whether the
+/// emitting coordinator's pubkey was reachable and the signature
+/// verified.
+pub fn name_events(socket_path: &Path, volume: &str) -> io::Result<NameEventsReply> {
+    call_typed(
+        socket_path,
+        &Request::NameEvents {
             volume: volume.to_owned(),
         },
     )?
@@ -966,5 +981,31 @@ mod tests {
             import_attach_by_name(&sock, "vol", &mut out).expect_err("premature EOF should error");
         server.join().unwrap();
         assert!(err.to_string().contains("closed before terminal"), "{err}");
+    }
+
+    /// name-events: empty list deserialises cleanly and the typed
+    /// reply preserves the empty `events` Vec.
+    #[test]
+    fn name_events_parses_empty_reply() {
+        let (_guard, sock) = temp_socket();
+        let body = r#"{"outcome":"ok","data":{"events":[]}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
+        let reply = name_events(&sock, "vol").expect("name-events should succeed");
+        server.join().unwrap();
+        assert!(reply.events.is_empty());
+    }
+
+    /// name-events: a populated reply round-trips through the typed
+    /// envelope. Confirms `signature_status` decodes from its
+    /// `{"status":"valid"}` wire shape.
+    #[test]
+    fn name_events_parses_populated_reply() {
+        let (_guard, sock) = temp_socket();
+        let body = r#"{"outcome":"ok","data":{"events":[{"event":{"version":1,"event_ulid":"01J0000000000000000000000V","at":"2024-01-01T00:00:00.000Z","coordinator_id":"coord-a","vol_ulid":"01J0000000000000000000000W","kind":"created","signature":"00"},"signature_status":{"status":"valid"}}]}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
+        let reply = name_events(&sock, "vol").expect("name-events should succeed");
+        server.join().unwrap();
+        assert_eq!(reply.events.len(), 1);
+        assert_eq!(reply.events[0].signature_status, SignatureStatus::Valid);
     }
 }
