@@ -113,26 +113,33 @@ The trust root is the existing S3 state — `names/<name>` records the current c
 
 ### Token shape
 
-The volume process (which holds `volume.key`) mints a short-lived bearer token signed with its fork's private key:
+**The fetching process signs.** For v1 (`.idx`-only), the prefetch path runs in the coordinator process, so the coordinator signs tokens with `coordinator.key`. If body fetch is added later it would run on the volume's read path in the volume process and sign with `volume.key`. Either way, peer-side verification looks up the appropriate pubkey in S3 (`coordinators/<id>/coordinator.pub` or `by_id/<fork>/volume.pub`) and the same prefix-membership check applies.
+
+For v1:
 
 ```
 PeerFetchToken {
-  volume_name:  String,    // which names/<name> to look up
-  fork_ulid:    String,    // which volume.provenance / volume.pub to verify against
-  issued_at:    u64,       // unix-seconds; bounds replay window
-  signature:    [u8; 64],  // Ed25519 over the above, using fork's volume.key
+  volume_name:    String,    // which names/<name> to look up
+  coordinator_id: String,    // which coordinators/<id>/coordinator.pub to verify against
+  issued_at:      u64,       // unix-seconds; bounds replay window
+  signature:      [u8; 64],  // Ed25519 over the above, using coordinator.key
 }
 ```
 
 Carried in `Authorization: Bearer <base64(token)>`.
 
-### Peer verification
+### Peer verification (v1)
 
 1. Decode the token; check `issued_at` is within a freshness window (e.g. ±60 s).
-2. Read `names/<volume_name>` from S3. Confirm the current claim record points to `fork_ulid`. Mismatch → 401.
-3. Read `by_id/<fork_ulid>/volume.pub` from S3. Verify the token signature against it. Mismatch → 401.
-4. Read `by_id/<fork_ulid>/volume.provenance` from S3. Walk the signed ancestor chain to produce the authorised prefix set: `by_id/<fork_ulid>/`, plus each ancestor's `by_id/<ancestor_ulid>/`.
+2. Read `coordinators/<coordinator_id>/coordinator.pub` from S3. Verify the token signature against it. Mismatch → 401.
+3. ETag-conditional GET `names/<volume_name>` from S3. Confirm the current claim record's `coordinator_id` matches the token's `coordinator_id`. Mismatch → 401.
+4. Resolve the fork: `names/<volume_name>` → `vol_ulid`. Read `by_id/<vol_ulid>/volume.provenance` from S3. Walk the signed ancestor chain to produce the authorised prefix set: `by_id/<vol_ulid>/`, plus each ancestor's `by_id/<ancestor_ulid>/`.
 5. For each requested path, check prefix membership. Out of scope → 404 (no leak about presence).
+
+The coordinator-key model has two operational benefits over per-volume signing:
+
+- **No IPC for token minting.** The coordinator has its own key in memory; signing is in-process. Per-volume signing would require a coord → volume IPC round-trip per token (or per token-cache-miss).
+- **One token per coord can fan out across multiple volumes.** A single coordinator can re-use the same auth pattern to fetch indexes for any volume it claims, since the auth check is "is the requesting coord the current claimer?" — naturally true for every volume the coord owns.
 
 **v1 does not cache the auth lookups.** Each peer request triggers fresh S3 GETs for steps 2–4. The cost is bounded:
 
@@ -150,7 +157,7 @@ If auth lookups become a measurable bottleneck (e.g. very high request rates fro
 - **No shared secrets between hosts.** A and B do not need to pre-establish trust. A learns about B's fork from S3 the first time B asks; ETag-conditional GETs make subsequent checks cheap.
 - **Handoff fence and auth fence coincide.** When B successfully CAS-claims `names/<name>`, A's next read of that key sees B as claimer. The S3 CAS that defines "B is now the holder" is also the moment B becomes peer-authorised. No separate "tell A about B" step.
 - **Force-release fence and auth fence coincide.** This is the load-bearing property of the no-cache design. `release --force` exists to fence a split-brain old host by flipping `names/<name>` via CAS (see `docs/design-force-release-fencing.md`). Because every peer request re-validates `names/<name>` against S3 in the same round-trip as the fetch, the moment the CAS lands, the old fork's tokens stop authorising — no TTL gap, no stale-claim window during which a fenced-out host can still pull bytes from peers. Any time-bounded cache would have created exactly the gap `--force` is trying to close.
-- **The "Released" interregnum is naturally safe.** Between `release --force` and the new `claim`, `names/<name>` records no current claimer, so no token's `fork_ulid` can match. Peer fetch is dormant during that window; clients fall through to S3 (which is the original behaviour anyway).
+- **The "Released" interregnum is naturally safe.** Between `release --force` and the new `claim`, `names/<name>` records no current claimer, so no token's `coordinator_id` can match. Peer fetch is dormant during that window; clients fall through to S3 (which is the original behaviour anyway).
 - **Image-pull case fits naturally.** Each fetching host's own fork has its own claim on its own name; the ancestor prefixes are reachable through that fork's signed ancestry. Same auth code path as handoff.
 - **No new S3 artifacts.** Uses `names/<name>`, `volume.pub`, `volume.provenance` — all of which already exist with the right semantics.
 
