@@ -15,8 +15,9 @@ use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
-    ClaimReply, CreateReply, ForkCreateReply, ImportAttachEvent, ImportStartReply,
-    ImportStatusReply, IpcErrorKind, PullReadonlyReply, RebindNameReply, ReleaseReply,
+    ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
+    GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
+    PullReadonlyReply, RebindNameReply, ReleaseReply, ResolveHandoffKeyReply, SnapshotReply,
     StatusRemoteReply, StatusReply, UpdateReply,
 };
 pub use elide_coordinator::volume_state::VolumeLifecycle;
@@ -165,6 +166,8 @@ pub const PREFETCH_AWAIT_BUDGET: Duration = Duration::from_secs(60);
 /// prefetch task and the supervisor spawning this process on a freshly
 /// claimed fork.
 pub fn await_prefetch(socket_path: &Path, vol_ulid: &str, budget: Duration) -> io::Result<()> {
+    let parsed = ulid::Ulid::from_string(vol_ulid)
+        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
     let stream = UnixStream::connect(socket_path).map_err(|e| {
         io::Error::other(format!(
             "coordinator not running ({}): {e}",
@@ -181,13 +184,16 @@ pub fn await_prefetch(socket_path: &Path, vol_ulid: &str, budget: Duration) -> i
     stream
         .set_write_timeout(Some(budget))
         .map_err(|e| io::Error::other(format!("set write timeout: {e}")))?;
+    let request = Request::AwaitPrefetch { vol_ulid: parsed };
+    let line = serde_json::to_string(&request)
+        .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
     let mut writer = &stream;
-    writeln!(writer, "await-prefetch {vol_ulid}")?;
+    writeln!(writer, "{line}")?;
     writer.flush()?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut reader = io::BufReader::new(&stream);
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
+    let mut response_line = String::new();
+    match reader.read_line(&mut response_line) {
         Ok(_) => {}
         Err(e)
             if matches!(
@@ -201,16 +207,10 @@ pub fn await_prefetch(socket_path: &Path, vol_ulid: &str, budget: Duration) -> i
         }
         Err(e) => return Err(e),
     }
-    let resp = line.trim();
-    if resp == "ok" {
-        Ok(())
-    } else if let Some(msg) = resp.strip_prefix("err ") {
-        Err(io::Error::other(format!("await-prefetch: {msg}")))
-    } else {
-        Err(io::Error::other(format!(
-            "await-prefetch: unexpected response: {resp}"
-        )))
-    }
+    let env: Envelope<()> = serde_json::from_str(response_line.trim())
+        .map_err(|e| io::Error::other(format!("parse reply: {e}")))?;
+    env.into_result()
+        .map_err(|e| io::Error::other(format!("await-prefetch: {e}")))
 }
 
 /// Mint a per-volume macaroon for the spawned volume process.
@@ -393,18 +393,22 @@ pub fn import_attach_by_name(
 ///
 /// Returns the number of segments evicted.
 pub fn evict_volume(socket_path: &Path, name: &str, ulid: Option<&str>) -> io::Result<usize> {
-    let cmd = match ulid {
-        Some(u) => format!("evict {name} {u}"),
-        None => format!("evict {name}"),
+    let segment_ulid = match ulid {
+        Some(s) => Some(
+            ulid::Ulid::from_string(s)
+                .map_err(|e| io::Error::other(format!("invalid segment ulid: {e}")))?,
+        ),
+        None => None,
     };
-    let resp = call(socket_path, &cmd)?;
-    match resp.split_once(' ') {
-        Some(("ok", n)) => n
-            .parse::<usize>()
-            .map_err(|e| io::Error::other(format!("unexpected response: {resp}: {e}"))),
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let reply: EvictReply = call_typed(
+        socket_path,
+        &Request::Evict {
+            volume: name.to_owned(),
+            segment_ulid,
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.evicted)
 }
 
 /// Trigger a coordinator-orchestrated snapshot of a running volume.
@@ -416,12 +420,14 @@ pub fn evict_volume(socket_path: &Path, name: &str, ulid: Option<&str>) -> io::R
 ///
 /// Returns the snapshot ULID on success.
 pub fn snapshot_volume(socket_path: &Path, name: &str) -> io::Result<String> {
-    let resp = call(socket_path, &format!("snapshot {name}"))?;
-    match resp.split_once(' ') {
-        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let reply: SnapshotReply = call_typed(
+        socket_path,
+        &Request::Snapshot {
+            volume: name.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.snap_ulid.to_string())
 }
 
 /// Generate `snapshots/<snap_ulid>.filemap` for a local volume.
@@ -438,16 +444,22 @@ pub fn generate_filemap(
     name: &str,
     snap_ulid: Option<&str>,
 ) -> io::Result<String> {
-    let line = match snap_ulid {
-        Some(s) => format!("generate-filemap {name} {s}"),
-        None => format!("generate-filemap {name}"),
+    let snap_ulid = match snap_ulid {
+        Some(s) => Some(
+            ulid::Ulid::from_string(s)
+                .map_err(|e| io::Error::other(format!("invalid snap ulid: {e}")))?,
+        ),
+        None => None,
     };
-    let resp = call(socket_path, &line)?;
-    match resp.split_once(' ') {
-        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let reply: GenerateFilemapReply = call_typed(
+        socket_path,
+        &Request::GenerateFilemap {
+            volume: name.to_owned(),
+            snap_ulid,
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.snap_ulid.to_string())
 }
 
 /// Remove the local instance of a volume (by_name symlink + by_id/<ulid>/
@@ -456,17 +468,14 @@ pub fn generate_filemap(
 /// flushed and uploaded to S3 (`pending/` and `wal/` empty). Bucket-side
 /// records and segments are untouched.
 pub fn remove_volume(socket_path: &Path, name: &str, force: bool) -> io::Result<()> {
-    let req = if force {
-        format!("remove {name} force")
-    } else {
-        format!("remove {name}")
-    };
-    let resp = call(socket_path, &req)?;
-    match resp.split_once(' ') {
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ if resp == "ok" => Ok(()),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    call_typed::<()>(
+        socket_path,
+        &Request::Remove {
+            volume: name.to_owned(),
+            force,
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Stop a volume's supervised process. Coordinator writes the stopped marker
@@ -517,22 +526,26 @@ pub fn resolve_handoff_key(
     vol_ulid: &str,
     snap_ulid: &str,
 ) -> io::Result<HandoffKey> {
-    let resp = call(
+    let vol_ulid = ulid::Ulid::from_string(vol_ulid)
+        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
+    let snap_ulid = ulid::Ulid::from_string(snap_ulid)
+        .map_err(|e| io::Error::other(format!("invalid snap_ulid: {e}")))?;
+    let reply: ResolveHandoffKeyReply = call_typed(
         socket_path,
-        &format!("resolve-handoff-key {vol_ulid} {snap_ulid}"),
-    )?;
-    if resp == "ok normal" {
-        return Ok(HandoffKey::Normal);
-    }
-    if let Some(rest) = resp.strip_prefix("ok recovery ") {
-        return Ok(HandoffKey::Recovery {
-            manifest_pubkey_hex: rest.trim().to_owned(),
-        });
-    }
-    if let Some(msg) = resp.strip_prefix("err ") {
-        return Err(io::Error::other(msg.to_owned()));
-    }
-    Err(io::Error::other(format!("unexpected response: {resp}")))
+        &Request::ResolveHandoffKey {
+            vol_ulid,
+            snap_ulid,
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(match reply {
+        ResolveHandoffKeyReply::Normal => HandoffKey::Normal,
+        ResolveHandoffKeyReply::Recovery {
+            manifest_pubkey_hex,
+        } => HandoffKey::Recovery {
+            manifest_pubkey_hex,
+        },
+    })
 }
 
 /// Release a volume's name back to the pool so any other coordinator can
@@ -685,15 +698,12 @@ pub fn pull_readonly(socket_path: &Path, vol_ulid: &str) -> io::Result<Option<St
 /// Synthesize a "now" snapshot for a readonly source. Returns
 /// `(snap_ulid, ephemeral_pubkey_hex)`.
 pub fn force_snapshot_now(socket_path: &Path, vol_ulid: &str) -> io::Result<(String, String)> {
-    let resp = call(socket_path, &format!("force-snapshot-now {vol_ulid}"))?;
-    if let Some(("err", msg)) = resp.split_once(' ') {
-        return Err(io::Error::other(msg.to_owned()));
-    }
-    let mut parts = resp.split_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("ok"), Some(snap), Some(pubkey)) => Ok((snap.to_owned(), pubkey.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let parsed = ulid::Ulid::from_string(vol_ulid)
+        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
+    let reply: ForceSnapshotNowReply =
+        call_typed(socket_path, &Request::ForceSnapshotNow { vol_ulid: parsed })?
+            .map_err(io::Error::other)?;
+    Ok((reply.snap_ulid.to_string(), reply.attestation_pubkey_hex))
 }
 
 /// Fork a new writable volume from a local source. Returns the new volume ULID.
@@ -777,7 +787,11 @@ mod tests {
     #[test]
     fn await_prefetch_returns_ok_on_ok_response() {
         let (_guard, sock) = temp_socket();
-        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, "ok");
+        let server = spawn_one_shot_server(
+            sock.clone(),
+            Duration::ZERO,
+            r#"{"outcome":"ok","data":null}"#,
+        );
         let r = await_prefetch(&sock, "01JQAAAAAAAAAAAAAAAAAAAAAA", Duration::from_secs(5));
         server.join().unwrap();
         assert!(r.is_ok(), "{r:?}");
@@ -786,8 +800,11 @@ mod tests {
     #[test]
     fn await_prefetch_propagates_err_response() {
         let (_guard, sock) = temp_socket();
-        let server =
-            spawn_one_shot_server(sock.clone(), Duration::ZERO, "err prefetch failed: boom");
+        let server = spawn_one_shot_server(
+            sock.clone(),
+            Duration::ZERO,
+            r#"{"outcome":"err","error":{"kind":"internal","message":"prefetch failed: boom"}}"#,
+        );
         let r = await_prefetch(&sock, "01JQAAAAAAAAAAAAAAAAAAAAAA", Duration::from_secs(5));
         server.join().unwrap();
         let e = r.unwrap_err().to_string();
@@ -799,7 +816,11 @@ mod tests {
     #[test]
     fn await_prefetch_times_out_when_server_hangs() {
         let (_guard, sock) = temp_socket();
-        let server = spawn_one_shot_server(sock.clone(), Duration::from_secs(2), "ok");
+        let server = spawn_one_shot_server(
+            sock.clone(),
+            Duration::from_secs(2),
+            r#"{"outcome":"ok","data":null}"#,
+        );
         let r = await_prefetch(
             &sock,
             "01JQAAAAAAAAAAAAAAAAAAAAAA",

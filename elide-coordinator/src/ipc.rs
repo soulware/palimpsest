@@ -312,6 +312,52 @@ pub enum Request {
     /// output line, then a terminal `Done`. Failure terminates with an
     /// `Envelope::Err`.
     ImportAttach { volume: String },
+
+    // ── Iteration 4: maintenance ─────────────────────────────────────
+    /// Coordinator-orchestrated snapshot of a running volume: flush
+    /// WAL → drain pending → sign manifest → upload. Returns the
+    /// snapshot ULID.
+    Snapshot { volume: String },
+    /// Synthesise a "now" snapshot for a readonly source volume by
+    /// pinning currently-prefetched segments under an ephemeral
+    /// attestation key. Used by force-claim to mint a handoff against
+    /// an unreachable owner.
+    ForceSnapshotNow { vol_ulid: Ulid },
+    /// Evict S3-confirmed segment bodies from a volume's `cache/`. With
+    /// `segment_ulid = None`, evicts every confirmed body; with `Some`,
+    /// evicts only that one segment.
+    Evict {
+        volume: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        segment_ulid: Option<Ulid>,
+    },
+    /// Generate `snapshots/<snap_ulid>.filemap` for a sealed snapshot.
+    /// Defaults to the latest local snapshot when `snap_ulid` is omitted.
+    GenerateFilemap {
+        volume: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        snap_ulid: Option<Ulid>,
+    },
+    /// Block until the per-fork prefetch task publishes a terminal
+    /// result. Untracked volumes (not under coordinator management or
+    /// already prefetched) return success immediately.
+    AwaitPrefetch { vol_ulid: Ulid },
+    /// Remove the local instance of a volume: `by_name/<volume>`
+    /// symlink + `by_id/<vol_ulid>/` directory. Bucket records are
+    /// untouched. With `force = false`, refuses if `pending/` or
+    /// `wal/` is non-empty.
+    Remove {
+        volume: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Resolve which Ed25519 key the snapshot manifest at
+    /// `by_id/<vol_ulid>/snapshots/<snap_ulid>.manifest` is signed by.
+    /// The reply carries either `Normal` (use the source volume's
+    /// `volume.pub`) or `Recovery { hex }` (the recovering
+    /// coordinator's already-verified pubkey, ready to embed in
+    /// `fork-create` as `parent-key=<hex>`).
+    ResolveHandoffKey { vol_ulid: Ulid, snap_ulid: Ulid },
 }
 
 /// Reply for [`Request::Status`].
@@ -441,6 +487,49 @@ pub enum ImportAttachEvent {
     Line { content: String },
     /// Import completed successfully — last message in the stream.
     Done,
+}
+
+/// Reply for [`Request::Snapshot`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotReply {
+    pub snap_ulid: Ulid,
+}
+
+/// Reply for [`Request::ForceSnapshotNow`]. The attestation pubkey is
+/// hex-encoded so callers can pass it through to `fork-create` as a
+/// `parent-key=<hex>` token without re-encoding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForceSnapshotNowReply {
+    pub snap_ulid: Ulid,
+    pub attestation_pubkey_hex: String,
+}
+
+/// Reply for [`Request::Evict`]. `evicted` counts segment bodies
+/// reclaimed from `cache/`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvictReply {
+    pub evicted: usize,
+}
+
+/// Reply for [`Request::GenerateFilemap`]. Echoes the snapshot ULID
+/// the filemap was written for — useful when the caller passed
+/// `snap_ulid = None` and wants to learn the resolved value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerateFilemapReply {
+    pub snap_ulid: Ulid,
+}
+
+/// Reply for [`Request::ResolveHandoffKey`]. `Normal` means the
+/// manifest is signed by the source volume's own key (the source
+/// volume's `volume.pub` is the verifying key); `Recovery` means the
+/// manifest is a synthesised handoff snapshot signed by a recovering
+/// coordinator under an attestation key — the carried hex is the
+/// already-verified Ed25519 pubkey.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ResolveHandoffKeyReply {
+    Normal,
+    Recovery { manifest_pubkey_hex: String },
 }
 
 #[cfg(test)]
