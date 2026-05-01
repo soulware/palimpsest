@@ -88,6 +88,13 @@ pub struct CoordinatorConfig {
     /// GC configuration.
     #[serde(default)]
     pub gc: GcConfig,
+
+    /// Peer-fetch configuration. Optional; absence keeps peer fetch
+    /// fully disabled (no HTTP server bound, no `peer-endpoint.toml`
+    /// published, prefetch path skips the peer tier). v1 ships
+    /// off-by-default.
+    #[serde(default)]
+    pub peer_fetch: PeerFetchConfig,
 }
 
 impl CoordinatorConfig {
@@ -437,6 +444,17 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # density_threshold = 0.70    # compact when live_bytes / file_bytes < threshold
 # interval          = "10s"   # how often GC runs per fork
 # retention_window  = "10m"   # how long GC inputs stay in S3 before reaping
+
+[peer_fetch]
+# Setting `port` enables peer fetch: the coordinator binds an HTTP server on
+# this port and advertises it at `coordinators/<id>/peer-endpoint.toml` for
+# other coordinators on the LAN. Leaving `port` unset keeps peer fetch fully
+# disabled — no server, no advertisement, no peer tier in the prefetch path.
+# v1 ships off-by-default.
+#
+# port = 8443                  # absent → peer fetch disabled
+# bind = "0.0.0.0"             # interface to bind on; default 0.0.0.0
+# host = "host.example.com"    # advertised hostname for peers; default gethostname()
 "#;
 
 /// Load and parse a `coordinator.toml` file.
@@ -462,7 +480,53 @@ impl Default for CoordinatorConfig {
             elide_bin: default_elide_bin(),
             elide_import_bin: default_elide_import_bin(),
             gc: GcConfig::default(),
+            peer_fetch: PeerFetchConfig::default(),
         }
+    }
+}
+
+/// Peer-fetch configuration. v1 is opt-in: setting `port` enables the
+/// HTTP server and the `coordinators/<id>/peer-endpoint.toml`
+/// advertisement. Leaving it unset keeps peer fetch fully disabled.
+#[derive(Deserialize, Default, Clone)]
+pub struct PeerFetchConfig {
+    /// TCP port for the peer-fetch HTTP server. Absent → peer fetch
+    /// disabled (no server bound, no advertised endpoint, prefetch
+    /// path skips the peer tier).
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Address the HTTP server binds on. Default: `0.0.0.0`. Only
+    /// relevant when `port` is set.
+    #[serde(default)]
+    pub bind: Option<String>,
+
+    /// Hostname or IP advertised in `peer-endpoint.toml` for other
+    /// coordinators to dial. Default: the result of `gethostname()`,
+    /// which is correct on LANs with mDNS or DNS resolution. Set
+    /// explicitly when the host's name is not routable from peer
+    /// coordinators (e.g. when running behind a NAT or a load
+    /// balancer). Only relevant when `port` is set.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+impl PeerFetchConfig {
+    /// Bind address, defaulting to `0.0.0.0`.
+    pub fn bind_addr(&self) -> &str {
+        self.bind.as_deref().unwrap_or("0.0.0.0")
+    }
+
+    /// Advertised host. Falls back to the cached coordinator hostname
+    /// if `host` is unset; if `gethostname()` also failed, falls back
+    /// to the bind address (which works for `127.0.0.1` localhost-only
+    /// setups but won't be routable across hosts — operators should
+    /// set `host` explicitly in that case).
+    pub fn advertised_host(&self, fallback_hostname: Option<&str>) -> String {
+        self.host
+            .clone()
+            .or_else(|| fallback_hostname.map(str::to_owned))
+            .unwrap_or_else(|| self.bind_addr().to_owned())
     }
 }
 
@@ -555,6 +619,55 @@ mod tests {
         assert_eq!(cfg.gc.retention_window, defaults.gc.retention_window);
         assert_eq!(cfg.store.request_timeout, defaults.store.request_timeout);
         assert_eq!(cfg.store.connect_timeout, defaults.store.connect_timeout);
+    }
+
+    #[test]
+    fn peer_fetch_defaults_off() {
+        let cfg = CoordinatorConfig::default();
+        assert!(cfg.peer_fetch.port.is_none());
+        assert!(cfg.peer_fetch.bind.is_none());
+        assert!(cfg.peer_fetch.host.is_none());
+    }
+
+    #[test]
+    fn peer_fetch_section_parses() {
+        let toml_str = r#"
+            [peer_fetch]
+            port = 8443
+            bind = "127.0.0.1"
+            host = "host.example.com"
+        "#;
+        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.peer_fetch.port, Some(8443));
+        assert_eq!(cfg.peer_fetch.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cfg.peer_fetch.host.as_deref(), Some("host.example.com"));
+    }
+
+    #[test]
+    fn peer_fetch_bind_addr_defaults_to_all_interfaces() {
+        let cfg = PeerFetchConfig::default();
+        assert_eq!(cfg.bind_addr(), "0.0.0.0");
+    }
+
+    #[test]
+    fn peer_fetch_advertised_host_prefers_explicit_then_hostname_then_bind() {
+        let with_explicit = PeerFetchConfig {
+            host: Some("explicit.example".to_owned()),
+            ..PeerFetchConfig::default()
+        };
+        assert_eq!(
+            with_explicit.advertised_host(Some("ignored.example")),
+            "explicit.example"
+        );
+
+        let no_explicit = PeerFetchConfig::default();
+        assert_eq!(
+            no_explicit.advertised_host(Some("host.from.gethostname")),
+            "host.from.gethostname"
+        );
+
+        let no_explicit_no_hostname = PeerFetchConfig::default();
+        assert_eq!(no_explicit_no_hostname.advertised_host(None), "0.0.0.0");
     }
 
     #[test]

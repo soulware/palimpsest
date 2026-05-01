@@ -1096,6 +1096,7 @@ dependencies = [
  "ed25519-dalek",
  "elide-core",
  "elide-fetch",
+ "elide-peer-fetch",
  "futures",
  "humantime-serde",
  "libublk",
@@ -1184,9 +1185,15 @@ dependencies = [
 name = "elide-peer-fetch"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
+ "bytes",
  "ed25519-dalek",
+ "object_store",
  "rand_core 0.6.4",
+ "serde",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

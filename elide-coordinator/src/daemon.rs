@@ -92,6 +92,26 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     if let Err(e) = identity.publish_pub(coord_wide.as_ref()).await {
         return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
     }
+    // If peer-fetch is configured, advertise our endpoint at
+    // `coordinators/<id>/peer-endpoint.toml` so other coordinators
+    // can find us during handoff discovery. Sibling write to
+    // `coordinator.pub`. Absence of `peer_fetch.port` keeps the whole
+    // mechanism off — no server, no advertisement, no peer tier.
+    if let Some(port) = config.peer_fetch.port {
+        let host = config.peer_fetch.advertised_host(identity.hostname());
+        let endpoint = elide_peer_fetch::PeerEndpoint::new(host, port);
+        if let Err(e) = endpoint
+            .publish(coord_wide.as_ref(), identity.coordinator_id_str())
+            .await
+        {
+            return Err(anyhow::anyhow!("publish peer-endpoint.toml: {e}"));
+        }
+        info!(
+            "[coordinator] peer-fetch endpoint advertised: {} (bind {})",
+            endpoint.url(),
+            config.peer_fetch.bind_addr(),
+        );
+    }
     let coord_id_str: String = identity.coordinator_id_str().to_owned();
     let macaroon_root: [u8; 32] = *identity.macaroon_root();
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());

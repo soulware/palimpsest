@@ -5,8 +5,14 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+async-trait   = "0.1"
 base64        = "0.22"
+bytes         = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+object_store  = "0.11"
+serde         = { version = "1", features = ["derive"] }
+toml          = { version = "0.8", default-features = false, features = ["parse", "display"] }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
+tokio     = { version = "1", features = ["macros", "rt"] }

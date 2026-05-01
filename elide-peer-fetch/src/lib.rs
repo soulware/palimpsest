@@ -12,11 +12,18 @@
 //!   signature and `names/<volume>` to confirm the requester is the
 //!   current claimer.
 //!
-//! Subsequent items in the v1 plan (HTTP server, client, endpoint
-//! registry, prefetch integration) will land alongside this token type.
+//! - [`PeerEndpoint`] — coordinator-published advertisement at
+//!   `coordinators/<id>/peer-endpoint.toml` of where its peer-fetch
+//!   HTTP server can be reached. Coordinators read this during
+//!   handoff discovery to dial the previous claimer.
+//!
+//! Subsequent items in the v1 plan (HTTP server, client, prefetch
+//! integration) will land alongside these.
 
+pub mod endpoint;
 pub mod token;
 
+pub use endpoint::{EndpointParseError, PeerEndpoint};
 pub use token::{
     DEFAULT_FRESHNESS_WINDOW_SECS, DOMAIN_TAG, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };
