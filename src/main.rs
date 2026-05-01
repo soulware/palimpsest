@@ -322,7 +322,7 @@ enum VolumeCommand {
 
     /// Show the per-name event log for a volume.
     ///
-    /// Lists every entry in `names/<name>/events/`, one per line, in
+    /// Lists every entry in `events/<name>/`, one per line, in
     /// chronological order. Each event's signature is verified
     /// against the emitting coordinator's published pubkey; events
     /// whose signature is invalid or whose pubkey can't be fetched

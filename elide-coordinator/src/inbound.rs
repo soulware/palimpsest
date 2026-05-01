@@ -1066,7 +1066,7 @@ async fn volume_status_remote_typed(
 }
 
 /// Typed implementation of the `name-events` verb. Lists every
-/// event under `names/<volume>/events/`, parsed and signature-
+/// event under `events/<volume>/`, parsed and signature-
 /// verified. A missing prefix returns an empty list — every name
 /// has a journal even if no events have been emitted yet, so
 /// "empty log" is not the same as "name doesn't exist".

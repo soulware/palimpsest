@@ -361,7 +361,7 @@ pub enum Request {
     ResolveHandoffKey { vol_ulid: Ulid, snap_ulid: Ulid },
 
     // ── Iteration 5: read-only history ───────────────────────────────
-    /// List the per-name event log at `names/<volume>/events/`,
+    /// List the per-name event log at `events/<volume>/`,
     /// verifying each entry's signature against the emitting
     /// coordinator's published pubkey.
     NameEvents { volume: String },

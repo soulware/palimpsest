@@ -1,13 +1,15 @@
-//! Bucket-level read/write helpers for `names/<name>/events/`.
+//! Bucket-level read/write helpers for the per-name event log.
 //!
 //! Pairs with [`crate::name_store`] (which manages the
-//! `names/<name>` pointer object) by storing the append-only event
-//! log under the corresponding `events/` prefix. See
-//! `docs/design-name-event-log.md` for the design.
+//! `names/<name>` pointer object). The event log lives under a
+//! separate top-level prefix so the pointer key and the event
+//! prefix never collide on the same parent — `aws s3 ls names/`
+//! lists names and nothing else; `aws s3 ls events/` lists logs.
+//! See `docs/design-name-event-log.md`.
 //!
-//! Keys: `names/<name>/events/<event_ulid>.toml`. Each object is
-//! written exactly once via `If-None-Match: *` — duplicate ULIDs
-//! would be a programmer error, not a race.
+//! Keys: `events/<name>/<event_ulid>.toml`. Each object is written
+//! exactly once via `If-None-Match: *` — duplicate ULIDs would be
+//! a programmer error, not a race.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,11 +84,11 @@ impl From<ConditionalPutError> for NameEventStoreError {
 }
 
 fn event_prefix(name: &str) -> StorePath {
-    StorePath::from(format!("names/{name}/events/"))
+    StorePath::from(format!("events/{name}/"))
 }
 
 fn event_key(name: &str, event_ulid: Ulid) -> StorePath {
-    StorePath::from(format!("names/{name}/events/{event_ulid}.toml"))
+    StorePath::from(format!("events/{name}/{event_ulid}.toml"))
 }
 
 /// Sign `event` in place using `identity`'s coordinator key. The
@@ -99,7 +101,7 @@ fn sign_event(event: &mut NameEvent, identity: &CoordinatorIdentity) {
 }
 
 /// PUT a fully-formed signed event at
-/// `names/<name>/events/<event_ulid>.toml` using `If-None-Match: *`.
+/// `events/<name>/<event_ulid>.toml` using `If-None-Match: *`.
 ///
 /// Refuses to write an unsigned event — the log invariant is that
 /// every event on the wire is signed, so accepting an unsigned one
@@ -127,7 +129,7 @@ pub async fn append_event(
 }
 
 /// Return the highest `event_ulid` present under
-/// `names/<name>/events/`, or `None` if the prefix is empty.
+/// `events/<name>/`, or `None` if the prefix is empty.
 ///
 /// Listed objects whose filename does not parse as `<ulid>.toml`
 /// are silently skipped — they aren't event records this code
@@ -158,7 +160,7 @@ pub async fn latest_event_ulid(
 }
 
 /// Mint a fresh event, sign it with `identity`, and append it to
-/// `names/<name>/events/`.
+/// `events/<name>/`.
 ///
 /// Steps:
 ///   1. Look up `prev_event_ulid` (best-effort — list failures fall
@@ -206,7 +208,7 @@ pub async fn emit_event(
     Ok(event)
 }
 
-/// List every event under `names/<name>/events/`, parsed and
+/// List every event under `events/<name>/`, parsed and
 /// sorted ascending by `event_ulid`.
 ///
 /// Listed objects whose filename does not parse as `<ulid>.toml`,
@@ -300,7 +302,7 @@ pub fn verify_event_signature(event: &NameEvent, verifying_key: &VerifyingKey) -
     }
 }
 
-/// Read every event under `names/<name>/events/` and pair each
+/// Read every event under `events/<name>/` and pair each
 /// with a [`SignatureStatus`].
 ///
 /// Coordinator pubkeys are fetched once per unique `coordinator_id`
@@ -496,7 +498,7 @@ mod tests {
         // a ULID-named file that fails to parse as a NameEvent (must
         // also be skipped, with a warn).
         s.put(
-            &StorePath::from("names/vol/events/garbage.txt"),
+            &StorePath::from("events/vol/garbage.txt"),
             Bytes::from_static(b"hi").into(),
         )
         .await

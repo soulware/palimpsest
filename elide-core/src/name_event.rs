@@ -1,4 +1,4 @@
-//! `names/<name>/events/<event_ulid>.toml` append-only journal entry.
+//! `events/<name>/<event_ulid>.toml` append-only journal entry.
 //!
 //! See `docs/design-name-event-log.md`. Each event records one
 //! lifecycle transition of a named volume. The pointer at
@@ -128,7 +128,7 @@ pub enum EventKind {
     RenamedTo { new_name: String },
     /// Opening event for the *new* name. `inherits_log_from` is the
     /// old name; readers reconstructing full history walk back into
-    /// `names/<old>/events/`.
+    /// `events/<old>/`.
     RenamedFrom {
         old_name: String,
         inherits_log_from: String,
@@ -153,14 +153,14 @@ impl EventKind {
 }
 
 /// Append-only journal entry stored at
-/// `names/<name>/events/<event_ulid>.toml`.
+/// `events/<name>/<event_ulid>.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameEvent {
     /// Schema version. Bumped on fresh-bucket-only breaking changes.
     pub version: u32,
 
     /// Total-order key. Determines the canonical ordering of events
-    /// when listing `names/<name>/events/` and is the *source of
+    /// when listing `events/<name>/` and is the *source of
     /// truth* for the emit time.
     pub event_ulid: Ulid,
 

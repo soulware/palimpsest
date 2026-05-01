@@ -14,7 +14,7 @@ record stops/starts, force-releases, or renames, and it cannot be
 walked from the human-facing name without already knowing the current
 `vol_ulid`.
 
-This proposal adds a per-name event log under `names/<name>/events/`,
+This proposal adds a per-name event log under `events/<name>/`,
 written append-only as a coordinator transitions a name's state. The
 log is the durable, ordered, signed history of every operation that
 has touched the name. The pointer at `names/<name>` remains
@@ -44,18 +44,23 @@ pointer that already exists.
 
 ```
 names/<name>                              — current state pointer (existing)
-names/<name>/events/<event_ulid>.toml     — append-only journal (new)
+events/<name>/<event_ulid>.toml           — append-only journal (new)
 ```
 
-The pointer key (`names/<name>`) and the prefix (`names/<name>/`)
-coexist: S3 keys are flat strings, so an object at `names/foo` and
-objects at `names/foo/events/...` are unrelated keys that happen to
-share a substring. No directory-vs-object collision.
+Events live under a separate top-level prefix from the pointer.
+The pointer key (`names/<name>`) and the event prefix
+(`events/<name>/`) never share a parent, so `aws s3 ls names/`
+returns names and only names; `aws s3 ls events/` returns event
+logs and only event logs. Operators inspecting the bucket never
+have to mentally separate "is this key the pointer or a prefix
+for events?". A "delete a name" verb (not yet a verb in elide)
+would walk both prefixes, which is the same cost as one prefix
+plus a single key delete.
 
 Each event is a small TOML object named by its ULID. The ULID
 provides:
 
-- **Total order.** Listing `names/<name>/events/` and sorting
+- **Total order.** Listing `events/<name>/` and sorting
   lexicographically yields the canonical history.
 - **Origin time.** The ULID's millisecond prefix records when the
   emitting coordinator wrote the event (advisory; not a fence).
@@ -150,13 +155,15 @@ Steps:
    re-creation of `<old>` and as a forward link for log walkers.
 2. Conditional create (`If-None-Match: *`) of `names/<new>` with the
    same `vol_ulid`, `coordinator_id`, and `state = stopped`.
-3. Emit `renamed_to` into `names/<old>/events/`.
-4. Emit `renamed_from` into `names/<new>/events/`, with
+3. Emit `renamed_to` into `events/<old>/`.
+4. Emit `renamed_from` into `events/<new>/`, with
    `inherits_log_from = "<old>"`.
 
 Walking the log forward across renames: follow `renamed_to`. Walking
 backward: follow `renamed_from` / `inherits_log_from`. Both
-directions terminate at the original `created` event.
+directions terminate at the original `created` event. Each `<name>`
+in the chain has its own `events/<name>/` prefix; the walk
+crosses between sibling prefixes, never up and down a hierarchy.
 
 The fork chain (`vol_ulid` ancestry) is unchanged. Rename is purely a
 human-facing rebinding; the underlying volume identity is untouched.
@@ -176,7 +183,7 @@ The pointer at `names/<name>` remains the single CAS-protected
 source of truth for transitions. The log is **journal, not protocol**:
 
 - Every successful CAS on `names/<name>` is followed by a best-
-  effort PUT into `names/<name>/events/`. If the emitter crashes
+  effort PUT into `events/<name>/`. If the emitter crashes
   between the two writes, the log has a gap; the pointer is still
   authoritative. The next emitter's `prev_event_ulid` will skip the
   gap, leaving an auditable hole.
@@ -204,7 +211,7 @@ pointer.
 transition is at most a few KB), and a name that lives for years
 producing a few hundred events is well below any operationally
 interesting threshold. Archival — moving old events under
-`names/<name>/events/archived/<year>/...` or rolling them into a
+`events/<name>/archived/<year>/...` or rolling them into a
 single signed manifest — is deferred until we have a concrete
 reason. Until then, "list and sort" stays the canonical reader.
 

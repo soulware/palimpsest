@@ -298,7 +298,7 @@ pub fn status_remote(socket_path: &Path, volume: &str) -> io::Result<StatusRemot
     .map_err(io::Error::other)
 }
 
-/// List the per-name event log under `names/<volume>/events/`.
+/// List the per-name event log under `events/<volume>/`.
 /// Each entry includes a `signature_status` reporting whether the
 /// emitting coordinator's pubkey was reachable and the signature
 /// verified.
