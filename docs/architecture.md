@@ -402,29 +402,39 @@ The coordinator skips compaction and GC steps gracefully if `control.sock` is ab
 
 ## Control Socket Protocol
 
-The volume process listens on `<vol-dir>/control.sock`. The coordinator connects, sends one request line, reads one response line, and closes the connection. Protocol is newline-delimited plain text.
+The volume process listens on `<vol-dir>/control.sock`. The coordinator connects, sends one typed JSON request, reads one typed JSON reply, and closes the connection. Wire format is NDJSON: one JSON object per line, terminated by `\n`.
 
-**Request format:** `<op> [args...]\n`
+Protocol primitives are shared with the coordinator's inbound socket (see *Coordinator inbound socket* below):
 
-**Response format:**
-- `ok [values...]\n` — success, with optional return values
-- `err <message>\n` — error; coordinator logs a warning and proceeds
+- Request shape: a typed `VolumeRequest` enum tagged by `verb` (kebab-case). Defined in `elide_core::volume_ipc`.
+- Reply shape: `Envelope<T>` with an `outcome` discriminator — either `{"outcome":"ok","data":<verb-specific>}` or `{"outcome":"err","error":{"kind":"<kind>","message":"…"}}`. Defined in `elide_core::ipc`.
 
-**Supported operations:**
+Error `kind` is one of: `not-found`, `conflict`, `precondition-failed`, `bad-request`, `forbidden`, `store`, `internal`. Callers branch on `kind`; `message` is operator-readable free text.
 
-| Operation | Request | Response |
-|-----------|---------|----------|
-| Flush WAL | `flush` | `ok` |
-| Sweep small pending segments | `sweep_pending` | `ok <segs> <new_segs> <bytes> <extents>` |
-| Repack sparse pending segments | `repack <min_live_ratio>` | `ok <segs> <new_segs> <bytes> <extents>` |
-| GC checkpoint | `gc_checkpoint` | `ok <gc_ulid>` |
-| Promote segment to cache | `promote <ulid>` | `ok` |
+**Supported verbs:**
 
-**`gc_checkpoint` detail:** pre-mints two ULIDs from the volume's monotonic mint — `u_gc` and `u_flush` — flushes the current WAL under `u_flush` (so all in-flight writes are in `pending/` and visible to the coordinator), and returns `u_gc` as the output segment ULID for the single GC pass. Using the volume's mint (not the coordinator's clock) is deliberate — it ensures the GC output ULID is always in the correct order relative to the volume's write history regardless of clock skew between hosts.
+| Verb | Request payload | Reply payload |
+|---|---|---|
+| `flush` | — | `null` |
+| `promote-wal` | — | `null` |
+| `sweep-pending` | — | `{stats: CompactionStats}` |
+| `repack` | `{min_live_ratio: f64}` | `{stats: CompactionStats}` |
+| `delta-repack` | — | `{stats: DeltaRepackStats}` |
+| `gc-checkpoint` | — | `{gc_ulid: Ulid}` |
+| `apply-gc-handoffs` | — | `{processed: u32}` |
+| `redact` | `{segment_ulid: Ulid}` | `null` |
+| `snapshot-manifest` | `{snap_ulid: Ulid}` | `null` |
+| `promote` | `{segment_ulid: Ulid}` | `null` |
+| `finalize-gc-handoff` | `{gc_ulid: Ulid}` | `null` |
+| `reclaim` | `{cap?: u32}` | `{candidates_scanned, runs_rewritten, bytes_rewritten, discarded}` |
+| `connected` | — | `{connected: bool}` |
+| `shutdown` | — | `null` (process then exits) |
 
-**`promote <ulid>` detail:** called by the coordinator after confirming a segment has been uploaded to S3 (drain path) or after uploading a GC output. The volume copies the body section from `pending/<ulid>` (drain path) or `gc/<ulid>` (GC path) into `cache/<ulid>.body` and writes an all-present bitset to `cache/<ulid>.present`. On the drain path the volume also deletes `pending/<ulid>` — the coordinator never deletes it. On the GC path the coordinator deletes `gc/<ulid>` after receiving `ok` (see GC cleanup ordering below). If the volume is not running, the coordinator defers promote: on the drain path it leaves `pending/<ulid>` in place and retries on the next tick; on the GC path it proceeds without populating the local cache.
+**`gc-checkpoint` detail:** pre-mints two ULIDs from the volume's monotonic mint — `u_gc` and `u_flush` — flushes the current WAL under `u_flush` (so all in-flight writes are in `pending/` and visible to the coordinator), and returns `u_gc` as the output segment ULID for the single GC pass. Using the volume's mint (not the coordinator's clock) is deliberate — it ensures the GC output ULID is always in the correct order relative to the volume's write history regardless of clock skew between hosts.
 
-**Compaction stats fields** (`sweep_pending` / `repack` response): `segs` = segments consumed, `new_segs` = segments produced, `bytes` = bytes freed, `extents` = extents removed.
+**`promote` detail:** called by the coordinator after confirming a segment has been uploaded to S3 (drain path) or after uploading a GC output. The volume copies the body section from `pending/<ulid>` (drain path) or `gc/<ulid>` (GC path) into `cache/<ulid>.body` and writes an all-present bitset to `cache/<ulid>.present`. On the drain path the volume also deletes `pending/<ulid>` — the coordinator never deletes it. On the GC path the coordinator deletes `gc/<ulid>` after receiving the success envelope (see GC cleanup ordering below). If the volume is not running, the coordinator defers promote: on the drain path it leaves `pending/<ulid>` in place and retries on the next tick; on the GC path it proceeds without populating the local cache.
+
+**`CompactionStats` fields:** `segments_compacted` = segments consumed, `new_segments` = segments produced, `bytes_freed` = bytes freed, `extents_removed` = extents removed.
 
 The socket is absent when the volume is not running. All coordinator IPC calls treat a missing socket as a silent no-op and proceed with the remaining drain/GC steps that do not require volume cooperation.
 
@@ -505,38 +515,23 @@ The `elide` CLI derives the coordinator socket path from `--data-dir`:
 
 The coordinator listens on `<data-dir>/control.sock` for commands from the `elide` CLI. Volume processes each listen on `<vol-dir>/control.sock` for commands from the coordinator. Same socket filename, different directory level — the path encodes what you're talking to.
 
-Same text line protocol as the volume control socket: `<op> [args...]\n` → `ok [values...]\n` / `err <message>\n`.
+Wire format is identical to the volume control socket: NDJSON `Request` envelopes in, `Envelope<Reply>` envelopes out (see *Control Socket Protocol* above for the shared shape). The `Request` enum is defined in `elide_coordinator::ipc` and is tagged by `verb` (kebab-case).
 
-**Implemented operations:**
+**Verb groups:**
 
-| Operation | Request | Response |
-|---|---|---|
-| Trigger immediate fork discovery | `rescan` | `ok` |
-| Query volume process state | `status <volume>` | `ok running` / `ok stopped` / `ok importing <ulid>` |
-| Start OCI import | `import <name> <oci-ref>` | `ok <ulid>` |
-| Poll import state | `import status <ulid>` | `ok running` / `ok done` / `err failed: <msg>` |
-| Stream import output | `import attach <ulid>` | lines… then `ok done` or `err failed: <msg>` |
-| Stop processes and remove volume | `delete <volume>` | `ok` |
+| Group | Verbs |
+|---|---|
+| Status / discovery | `rescan`, `status`, `status-remote`, `volume-events` |
+| Lifecycle | `start`, `stop`, `release` (`{force?}`), `claim`, `rebind-name` |
+| Creation / readonly | `create`, `update`, `pull-readonly`, `fork-create`, `import-start`, `import-status`, `import-attach` |
+| Maintenance | `snapshot`, `force-snapshot-now`, `evict`, `generate-filemap`, `await-prefetch`, `remove`, `resolve-handoff-key` |
+| Credentials | `get-store-config`, `get-store-creds`, `register`, `credentials` |
 
-`import` and `import status` follow the standard one-request / one-response model. `import attach` is the exception: the coordinator streams buffered and live output lines until the import completes, then sends a terminal `ok done\n` or `err failed: <message>\n` and closes the connection. If the import has already finished, the stored output is replayed immediately followed by the terminal line.
+Most verbs follow the standard one-request / one-reply model. `import-attach` is the streaming exception: the coordinator emits a sequence of `Envelope<ImportAttachEvent>` messages (one per output line) terminated by either `Done` or an `Err` envelope, then closes the connection. If the import has already finished, the buffered output is replayed before the terminal envelope.
 
-`rescan` is the lightweight hook used by `create` and `fork`. The coordinator runs a discovery pass immediately and starts supervising any new volumes found.
+`rescan` is the lightweight hook used by `create` and `fork-create`. The coordinator runs a discovery pass immediately and starts supervising any new volumes found.
 
-**Planned — volume stop/start and quiesce** (see *Volume stop/start and coordinator quiesce* above):
-
-| Operation | Request | Response |
-|---|---|---|
-| Stop a single volume | `stop <volume>` | `ok` |
-| Start a stopped volume | `start <volume>` | `ok` |
-| Stop all volumes | `quiesce` | `ok` |
-| Start all stopped volumes | `resume` | `ok` |
-
-**Planned — S3 credential distribution** (see *S3 credential distribution via macaroons* below):
-
-| Operation | Request | Response |
-|---|---|---|
-| Register volume process, receive macaroon | `register <volume>` | `ok <macaroon>` |
-| Exchange macaroon for S3 credentials | `credentials <macaroon>` | `ok <key> <secret> <session-token> <expiry-unix>` |
+**Authentication.** `register { volume_ulid }` uses SO_PEERCRED to bind the issued macaroon to the connecting volume process's PID — the coordinator refuses if the peer's PID does not match the volume's recorded `volume.pid`. `credentials { macaroon }` re-checks SO_PEERCRED against the macaroon's `pid` caveat, then delegates to the configured `CredentialIssuer`. See *S3 credential distribution via macaroons* below.
 
 The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**. See *Isolation model* below for what this does and does not enforce.
 
@@ -612,23 +607,23 @@ The coordinator holds a **root key** (32 random bytes, generated at first start,
 The PID is only known after the volume process is spawned, so the macaroon cannot be minted before spawn. Instead, the volume registers with the coordinator on startup:
 
 1. Coordinator spawns volume process, records PID in `volume.pid`
-2. Volume connects to `control.sock` and sends `register <volume-ulid>`
+2. Volume connects to `control.sock` and sends `{"verb":"register","volume_ulid":"<ulid>"}`
 3. Coordinator reads peer credentials from the Unix socket connection → obtains peer PID
-4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>`? If not, reject
-5. Coordinator mints a macaroon with the caveats above (including `pid = <peer-pid>`) and responds with it
+4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>`? If not, replies with an `Envelope::Err { kind: "forbidden" }`
+5. Coordinator mints a macaroon with the caveats above (including `pid = <peer-pid>`) and replies `{"outcome":"ok","data":{"macaroon":"…"}}`
 6. Volume stores the macaroon in memory for all subsequent `credentials` requests
 
-The supervisor writes `volume.pid` immediately after `Command::spawn()` returns, but a fast-starting volume can reach step 2 before that write completes. The volume retries `register` a handful of times on `err volume not registered` to absorb that window.
+The supervisor writes `volume.pid` immediately after `Command::spawn()` returns, but a fast-starting volume can reach step 2 before that write completes. The volume retries `register` a handful of times on a `forbidden` reply to absorb that window.
 
 ### Credential exchange flow
 
 When the volume needs S3 credentials (at startup or before expiry):
 
-1. Volume sends `credentials <macaroon>` to `control.sock`
+1. Volume sends `{"verb":"credentials","macaroon":"…"}` to `control.sock`
 2. Coordinator verifies the HMAC chain (proves it minted this token)
 3. Coordinator checks all caveats: volume/fork match, scope is `credentials`, `pid` matches `SO_PEERCRED` of the current connection
 4. Coordinator issues short-lived read-only credentials scoped to the volume's S3 prefix — `by_id/<volume-ulid>/*` (see *Directory layout on disk and in S3* above). The issuance mechanism depends on the backend; see *Credential backends* below.
-5. Returns `ok <access-key> <secret-key> <session-token> <expiry-unix>`
+5. Replies `{"outcome":"ok","data":{access_key, secret_key, session_token, expiry_unix}}`
 
 The PID check on every request (step 3) means the macaroon is useless even if exfiltrated — it can only be presented from the original process. The HMAC chain means no volume can forge a token for a different volume.
 
