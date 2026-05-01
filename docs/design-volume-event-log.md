@@ -75,6 +75,7 @@ version = 1
 event_ulid = "<ulid>"
 kind = "claimed"                          # see catalogue below
 at = "2026-04-30T12:34:56Z"               # rfc3339, advisory
+name = "<volume-name>"                    # duplicates the path segment; signed
 coordinator_id = "<emitting-coordinator>"
 hostname = "<emitter-host>"               # advisory; absent if gethostname() failed
 vol_ulid = "<vol_ulid_at_this_event>"     # current fork at emit time
@@ -95,6 +96,15 @@ signature = "<ed25519-sig-over-canonical-form>"
   substitution between events and other coordinator-signed
   artefacts (e.g. synthesised handoff snapshots) without requiring
   a second key.
+- **`name`** duplicates the `<name>` segment of the on-disk key
+  (`events/<name>/<event_ulid>.toml`). The path is already
+  authoritative for "which name does this event belong to"; the
+  in-body field exists so a raw `cat` of an event file is
+  self-describing, and so the signature binds the event to a
+  specific name. Without it, a bucket-rewriter could copy a signed
+  event under `events/<other>/` and the signature would still
+  verify — the field closes that gap by including the name in the
+  canonical signing payload.
 - **`hostname`** mirrors `NameRecord.hostname`: a human-meaningful
   host name captured by the emitting coordinator, advisory only,
   never compared for ownership. Stamped on every event so an audit

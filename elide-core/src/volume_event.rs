@@ -179,6 +179,16 @@ pub struct VolumeEvent {
     #[serde(with = "rfc3339_millis_z")]
     pub at: DateTime<Utc>,
 
+    /// The volume name this event belongs to. Duplicates the
+    /// `<name>` segment of the on-disk key
+    /// (`events/<name>/<event_ulid>.toml`) so the body is
+    /// self-describing — a `cat` of the file shows the name without
+    /// needing the path. Included in the canonical signing payload
+    /// so the signature binds the event to a specific name; a
+    /// bucket-rewriter cannot relocate an event under a different
+    /// name without invalidating the signature.
+    pub name: String,
+
     /// Emitter's coordinator id (Crockford-Base32 ULID-shape, as in
     /// `name_record.rs`).
     pub coordinator_id: String,
@@ -230,6 +240,7 @@ impl VolumeEvent {
     /// than panicking to keep this library-grade code panic-free).
     pub fn new(
         event_ulid: Ulid,
+        name: String,
         coordinator_id: String,
         hostname: Option<String>,
         vol_ulid: Ulid,
@@ -241,6 +252,7 @@ impl VolumeEvent {
             version: Self::CURRENT_VERSION,
             event_ulid,
             at,
+            name,
             coordinator_id,
             hostname,
             vol_ulid,
@@ -265,6 +277,7 @@ impl VolumeEvent {
         // `at` deliberately omitted — it is a strict derivative of
         // `event_ulid`, enforced by the parse-time invariant. Signing
         // it would only re-state a fact already covered.
+        push_field(&mut buf, "name", &self.name);
         push_field(&mut buf, "coordinator_id", &self.coordinator_id);
         // `hostname` is signed even though it's advisory: the
         // signature ensures a reader can trust the recorded
@@ -417,6 +430,7 @@ mod tests {
     fn sample_event(kind: EventKind) -> VolumeEvent {
         VolumeEvent::new(
             event_ulid(),
+            "vol".to_string(),
             "01ABCDEFGHJKMNPQRSTVWXYZ23".to_string(),
             Some("test-host".to_string()),
             vol_ulid(),
@@ -508,6 +522,18 @@ mod tests {
         // values are distinguished — `None` vs absent-but-empty is
         // not a security-relevant distinction.
         assert_eq!(c.signing_payload(), d.signing_payload());
+    }
+
+    #[test]
+    fn signing_payload_changes_with_name() {
+        // `name` is signed: a bucket-rewriter that copies an event
+        // file under a different `events/<other>/` prefix must not
+        // be able to keep the original signature valid.
+        let mut a = sample_event(EventKind::Claimed);
+        let mut b = sample_event(EventKind::Claimed);
+        a.name = "alpha".to_string();
+        b.name = "beta".to_string();
+        assert_ne!(a.signing_payload(), b.signing_payload());
     }
 
     #[test]

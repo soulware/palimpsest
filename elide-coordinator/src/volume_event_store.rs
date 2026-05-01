@@ -196,6 +196,7 @@ pub async fn emit_event(
     let event_ulid = Ulid::new();
     let mut event = VolumeEvent::new(
         event_ulid,
+        name.to_owned(),
         identity.coordinator_id_str().to_owned(),
         identity.hostname().map(str::to_owned),
         vol_ulid,
@@ -414,6 +415,7 @@ mod tests {
             .expect("first emit");
         assert!(ev.signature.is_some(), "emitted event must be signed");
         assert_eq!(ev.coordinator_id, id.coordinator_id_str());
+        assert_eq!(ev.name, "vol", "emitted event must carry the volume name");
 
         let latest = latest_event_ulid(&s, "vol")
             .await
