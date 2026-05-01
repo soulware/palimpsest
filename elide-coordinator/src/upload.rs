@@ -670,10 +670,13 @@ mod tests {
 
     /// Spawn a mock volume control socket at `<fork_dir>/control.sock`.
     ///
-    /// Responds "ok" to any command. For "promote <ulid>" also performs the
-    /// volume's promote behaviour: copies the segment body from pending/ into
-    /// cache/ and deletes the pending/ file (drain path).
+    /// Replies `Envelope::Ok` to any request. For [`VolumeRequest::Promote`]
+    /// also performs the volume's promote behaviour: copies the segment body
+    /// from pending/ into cache/ and deletes the pending/ file (drain path).
     async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+        use elide_core::ipc::Envelope;
+        use elide_core::volume_ipc::VolumeRequest;
+
         let socket_path = fork_dir.join("control.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let handle = tokio::spawn(async move {
@@ -688,9 +691,11 @@ mod tests {
                     let mut buf = BufReader::new(r);
                     let mut line = String::new();
                     let _ = buf.read_line(&mut line).await;
-                    let line = line.trim().to_owned();
-                    if let Some(ulid_str) = line.strip_prefix("promote ") {
-                        let ulid_str = ulid_str.to_owned();
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if let Ok(VolumeRequest::Promote { segment_ulid }) =
+                        serde_json::from_str::<VolumeRequest>(trimmed)
+                    {
+                        let ulid_str = segment_ulid.to_string();
                         let src = dir.join("pending").join(&ulid_str);
                         if src.exists() {
                             let cache = dir.join("cache");
@@ -701,7 +706,10 @@ mod tests {
                             std::fs::remove_file(&src).ok();
                         }
                     }
-                    w.write_all(b"ok\n").await.ok();
+                    let reply = Envelope::<()>::ok(());
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    w.write_all(&bytes).await.ok();
                 });
             }
         });

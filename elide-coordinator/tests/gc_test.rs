@@ -187,6 +187,9 @@ impl Drop for MockSocket {
 }
 
 async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+    use elide_core::ipc::Envelope;
+    use elide_core::volume_ipc::VolumeRequest;
+
     let socket_path = fork_dir.join("control.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
     let handle = tokio::spawn(async move {
@@ -200,9 +203,10 @@ async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
                 let (r, mut w) = stream.into_split();
                 let mut lines = BufReader::new(r).lines();
                 if let Ok(Some(line)) = lines.next_line().await
-                    && let Some(ulid_str) = line.strip_prefix("promote ")
+                    && let Ok(VolumeRequest::Promote { segment_ulid }) =
+                        serde_json::from_str::<VolumeRequest>(&line)
                 {
-                    let ulid_str = ulid_str.trim().to_owned();
+                    let ulid_str = segment_ulid.to_string();
                     // Check gc/ first (GC handoff path), then pending/ (drain path).
                     let gc_src = dir.join("gc").join(&ulid_str);
                     let pending_src = dir.join("pending").join(&ulid_str);
@@ -225,7 +229,10 @@ async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
                         }
                     }
                 }
-                w.write_all(b"ok\n").await.ok();
+                let reply = Envelope::<()>::ok(());
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                w.write_all(&bytes).await.ok();
             });
         }
     });

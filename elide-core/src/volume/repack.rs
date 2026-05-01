@@ -18,7 +18,7 @@ use crate::{
 use super::{Volume, latest_snapshot};
 
 /// Results from a single compaction run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CompactionStats {
     /// Number of input segments consumed (deleted after compaction).
     pub segments_compacted: usize,
@@ -31,7 +31,7 @@ pub struct CompactionStats {
 }
 
 /// Stats from a single `delta_repack_post_snapshot` pass.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct DeltaRepackStats {
     /// Number of post-snapshot segments inspected.
     pub segments_scanned: usize,

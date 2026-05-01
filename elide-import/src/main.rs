@@ -399,6 +399,9 @@ fn serve_loop(
     index_dir: &Path,
     cache_dir: &Path,
 ) -> anyhow::Result<()> {
+    use elide_core::ipc::{Envelope, IpcError};
+    use elide_core::volume_ipc::VolumeRequest;
+
     loop {
         if count_pending(pending_dir) == 0 {
             break;
@@ -411,24 +414,32 @@ fn serve_loop(
         if reader.read_line(&mut line).is_err() {
             continue;
         }
-        let cmd = line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
-        if let Some(ulid_str) = cmd.strip_prefix("promote ") {
-            let ulid_str = ulid_str.trim();
-            // Validate ULID before using it as a path component.
-            let Ok(_ulid) = ulid::Ulid::from_string(ulid_str) else {
-                let _ = writer.write_all(b"err invalid ulid\n");
+        let request: VolumeRequest = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                let env =
+                    Envelope::<()>::err(IpcError::bad_request(format!("invalid request: {e}")));
+                let mut bytes = serde_json::to_vec(&env)?;
+                bytes.push(b'\n');
+                let _ = writer.write_all(&bytes);
                 continue;
-            };
-            handle_promote(ulid_str, pending_dir, index_dir, cache_dir);
+            }
+        };
+
+        if let VolumeRequest::Promote { segment_ulid } = &request {
+            handle_promote(&segment_ulid.to_string(), pending_dir, index_dir, cache_dir);
         }
-        // All commands (including promote) receive "ok\n".
-        // Non-promote commands (flush, sweep_pending, repack, gc_checkpoint,
-        // redact) are no-ops — the coordinator handles their absence
-        // gracefully. `redact` in particular is a no-op for import-produced
-        // segments because they have no hash-dead DATA (nothing has been
-        // overwritten yet in a freshly-imported volume).
-        let _ = writer.write_all(b"ok\n");
+        // All requests (including non-promote ones like flush, sweep,
+        // repack, gc-checkpoint, redact) receive an Ok envelope. Non-
+        // promote requests are no-ops — the coordinator handles their
+        // absence gracefully, and `redact` in particular is a no-op for
+        // import-produced segments because they have no hash-dead DATA.
+        let env = Envelope::<()>::ok(());
+        let mut bytes = serde_json::to_vec(&env)?;
+        bytes.push(b'\n');
+        let _ = writer.write_all(&bytes);
     }
     Ok(())
 }

@@ -1,27 +1,25 @@
 // Coordinator-side client for the volume control socket.
 //
-// The volume process listens on <fork_dir>/control.sock.  Each operation is a
-// single-connection round trip: send one line, receive one line, close.
+// The volume process listens on `<fork_dir>/control.sock`. Each operation
+// is a single-connection round trip: send one typed JSON request line,
+// receive one typed JSON reply line, close.
 //
-// Protocol:
-//   Request:  "<op> [args...]\n"
-//   Success:  "ok [values...]\n"
-//   Error:    "err <message>\n"
+// Wire types live in `elide_core::ipc` (envelope + error) and
+// `elide_core::volume_ipc` (request + reply payloads).
 //
-// Supported operations:
-//   flush                      →  "ok"
-//   sweep_pending              →  "ok <segs> <bytes> <extents>"
-//   repack <min_live_ratio>    →  "ok <segs> <bytes> <extents>"
-//   gc_checkpoint              →  "ok <gc_ulid>"
-//   apply_gc_handoffs          →  "ok <n>"
-//   promote <ulid>             →  "ok"
-//
-// If the socket is absent (volume not running), all functions return None and
-// log a warning.  Callers decide whether to abort or proceed without the op.
+// If the socket is absent (volume not running) most public functions
+// return `None` / `false` and log a warning. Callers decide whether to
+// abort or proceed without the op.
 
 use std::path::Path;
 
+use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::{CompactionStats, DeltaRepackStats};
+use elide_core::volume_ipc::{
+    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, DeltaRepackReply, GcCheckpointReply,
+    ReclaimReply, VolumeRequest,
+};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::warn;
@@ -31,79 +29,39 @@ use ulid::Ulid;
 /// Returns `true` on success.
 /// Returns `false` and logs a warning if the socket is absent or the call fails.
 pub async fn flush(fork_dir: &Path) -> bool {
-    match call(fork_dir, "flush").await {
-        Some(resp) if resp.trim() == "ok" => true,
-        Some(resp) => {
-            warn!(
-                "[control] flush for {} returned unexpected response: {resp:?}",
-                fork_dir.display()
-            );
-            false
-        }
-        None => false,
-    }
+    call_unit(fork_dir, &VolumeRequest::Flush).await
 }
 
 /// Promote the volume WAL to a `pending/` segment.  Blocks until the
 /// segment is on disk.  Returns `true` on success.
 /// Returns `false` and logs a warning if the socket is absent or the call fails.
 pub async fn promote_wal(fork_dir: &Path) -> bool {
-    match call(fork_dir, "promote_wal").await {
-        Some(resp) if resp.trim() == "ok" => true,
-        Some(resp) => {
-            warn!(
-                "[control] promote_wal for {} returned unexpected response: {resp:?}",
-                fork_dir.display()
-            );
-            false
-        }
-        None => false,
-    }
+    call_unit(fork_dir, &VolumeRequest::PromoteWal).await
 }
 
 /// Sweep small pending segments.  Returns compaction stats on success.
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
 pub async fn sweep_pending(fork_dir: &Path) -> Option<CompactionStats> {
-    parse_compaction_stats(fork_dir, call(fork_dir, "sweep_pending").await)
+    let reply: CompactionReply = call_typed(fork_dir, &VolumeRequest::SweepPending).await?;
+    Some(reply.stats)
 }
 
 /// Repack sparse pending segments below `min_live_ratio`.
 /// Returns compaction stats on success.
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
 pub async fn repack(fork_dir: &Path, min_live_ratio: f64) -> Option<CompactionStats> {
-    let req = format!("repack {min_live_ratio}");
-    parse_compaction_stats(fork_dir, call(fork_dir, &req).await)
+    let reply: CompactionReply =
+        call_typed(fork_dir, &VolumeRequest::Repack { min_live_ratio }).await?;
+    Some(reply.stats)
 }
 
 /// Rewrite post-snapshot pending segments with zstd-dictionary deltas
-/// against same-LBA extents from the latest sealed snapshot. Phase 5 Tier 1.
+/// against same-LBA extents from the latest sealed snapshot.
 /// Returns delta-repack stats on success.
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
 pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackStats> {
-    let response = call(fork_dir, "delta_repack").await?;
-    let rest = match response.strip_prefix("ok ") {
-        Some(r) => r.trim(),
-        None => {
-            warn!(
-                "[control] unexpected delta_repack response for {}: {response:?}",
-                fork_dir.display()
-            );
-            return None;
-        }
-    };
-    let mut parts = rest.splitn(5, ' ');
-    let segments_scanned: usize = parts.next()?.parse().ok()?;
-    let segments_rewritten: usize = parts.next()?.parse().ok()?;
-    let entries_converted: usize = parts.next()?.parse().ok()?;
-    let original_body_bytes: u64 = parts.next()?.parse().ok()?;
-    let delta_body_bytes: u64 = parts.next()?.trim().parse().ok()?;
-    Some(DeltaRepackStats {
-        segments_scanned,
-        segments_rewritten,
-        entries_converted,
-        original_body_bytes,
-        delta_body_bytes,
-    })
+    let reply: DeltaRepackReply = call_typed(fork_dir, &VolumeRequest::DeltaRepack).await?;
+    Some(reply.stats)
 }
 
 /// Call gc_checkpoint on the volume process for `fork_dir`.
@@ -112,110 +70,41 @@ pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackSt
 /// Returns `None` and logs a warning if the socket is absent (volume not
 /// running) or if the call fails for any reason.
 pub async fn gc_checkpoint(fork_dir: &Path) -> Option<Ulid> {
-    let response = call(fork_dir, "gc_checkpoint").await?;
-    let rest = response.strip_prefix("ok ")?;
-    match Ulid::from_string(rest.trim()) {
-        Ok(u) => Some(u),
-        Err(_) => {
-            warn!(
-                "[control] gc_checkpoint for {} returned malformed response",
-                fork_dir.display()
-            );
-            None
-        }
-    }
+    let reply: GcCheckpointReply = call_typed(fork_dir, &VolumeRequest::GcCheckpoint).await?;
+    Some(reply.gc_ulid)
 }
 
 /// Apply staged GC handoffs on the volume process for `fork_dir`.
 ///
-/// Called by the coordinator before `apply_done_handoffs` to ensure the
-/// volume's in-memory extent index reflects all committed GC decisions. This
-/// is critical for restart safety: after a restart the volume rebuilds its
-/// extent index from on-disk `.idx` files (which still point to old segments),
-/// so any `.staged` handoffs from a previous session must be re-applied before
-/// old segments are deleted.
-///
 /// Returns the number of handoffs processed.  Returns 0 if the socket is
 /// absent or the call fails (non-fatal: the next idle tick will retry).
 pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
-    match call(fork_dir, "apply_gc_handoffs").await {
-        Some(resp) => resp
-            .strip_prefix("ok ")
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0),
-        None => 0,
-    }
+    let reply: Option<ApplyGcHandoffsReply> =
+        call_typed(fork_dir, &VolumeRequest::ApplyGcHandoffs).await;
+    reply.map(|r| r.processed as usize).unwrap_or(0)
 }
 
-/// Redact a pending segment: hole-punch hash-dead DATA entries in place so
-/// deleted data never leaves the host via S3 upload. Called before
-/// `upload_segment`.
-///
-/// Returns `true` on success. Returns `false` if the socket is absent or fails.
-pub async fn redact_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
-    let req = format!("redact {ulid}");
-    match call(fork_dir, &req).await {
-        Some(resp) if resp.trim() == "ok" => true,
-        Some(resp) => {
-            warn!(
-                "[control] redact {ulid} for {} returned unexpected response: {resp:?}",
-                fork_dir.display()
-            );
-            false
-        }
-        None => false,
-    }
+/// Redact a pending segment: hole-punch hash-dead DATA entries in place
+/// before S3 upload. Returns `true` on success.
+pub async fn redact_segment(fork_dir: &Path, segment_ulid: Ulid) -> bool {
+    call_unit(fork_dir, &VolumeRequest::Redact { segment_ulid }).await
 }
 
-/// Sign and write a snapshot manifest (`snapshots/<snap_ulid>.manifest`)
-/// plus the `snapshots/<snap_ulid>` marker via the volume's control socket.
-///
-/// Called by the coordinator snapshot handler after a synchronous drain has
-/// moved every in-flight segment from `pending/` into `index/`. The volume
-/// enumerates its own `index/` at handler time and writes a full, signed
-/// manifest listing every segment ULID that belongs to the snapshot.
-///
-/// Returns `true` on success. Returns `false` with a warning if the socket
-/// is absent or the call fails.
+/// Sign and write a snapshot manifest plus the snapshot marker.
+/// Returns `true` on success.
 pub async fn sign_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
-    let req = format!("snapshot_manifest {snap_ulid}");
-    match call(fork_dir, &req).await {
-        Some(resp) if resp.trim() == "ok" => true,
-        Some(resp) => {
-            warn!(
-                "[control] snapshot_manifest {snap_ulid} for {} returned unexpected response: {resp:?}",
-                fork_dir.display()
-            );
-            false
-        }
-        None => false,
-    }
+    call_unit(fork_dir, &VolumeRequest::SnapshotManifest { snap_ulid }).await
 }
 
 /// Promote a segment to the volume's local cache after confirmed S3 upload.
-///
-/// Sends `promote <ulid>` to the volume's control socket.  The volume copies
-/// the segment body to `cache/<ulid>.body`, writes `cache/<ulid>.present`, and
-/// (on the drain path) deletes `pending/<ulid>`.
-///
-/// Returns `true` on success.  Returns `false` if the socket is absent (volume
-/// not running) or the call fails.  The coordinator retries on the next tick.
-pub async fn promote_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
-    let req = format!("promote {ulid}");
-    match call(fork_dir, &req).await {
-        Some(resp) if resp.trim() == "ok" => true,
-        Some(resp) => {
-            warn!(
-                "[control] promote {ulid} for {} returned unexpected response: {resp:?}",
-                fork_dir.display()
-            );
-            false
-        }
-        None => false,
-    }
+/// Returns `true` on success.
+pub async fn promote_segment(fork_dir: &Path, segment_ulid: Ulid) -> bool {
+    call_unit(fork_dir, &VolumeRequest::Promote { segment_ulid }).await
 }
 
-/// Stats from a single `reclaim` IPC call to the volume's control socket.
+/// Stats from a single `reclaim` IPC call. Mirrors
+/// [`elide_core::volume_ipc::ReclaimReply`] with the historical
+/// coordinator-internal `usize` fields preserved for callers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReclaimIpcStats {
     /// Number of candidates the scanner identified (upper bound on reclaim attempts).
@@ -224,82 +113,101 @@ pub struct ReclaimIpcStats {
     pub runs_rewritten: u64,
     /// Total bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
-    /// Number of candidates whose phase-3 commit discarded (unrelated
-    /// concurrent mutation). Discarded candidates are not retried here —
-    /// the next tick / call will re-observe them if still bloated.
+    /// Number of candidates whose phase-3 commit discarded.
     pub discarded: usize,
+}
+
+impl From<ReclaimReply> for ReclaimIpcStats {
+    fn from(r: ReclaimReply) -> Self {
+        Self {
+            candidates_scanned: r.candidates_scanned as usize,
+            runs_rewritten: r.runs_rewritten,
+            bytes_rewritten: r.bytes_rewritten,
+            discarded: r.discarded as usize,
+        }
+    }
 }
 
 /// Run an alias-merge extent reclamation pass on the volume.
 ///
-/// The volume-side handler scans for bloated-hash candidates using
-/// default thresholds (most-wasteful first) and rewrites them via the
-/// three-phase primitive. Heavy work (fetch / hash / compress) runs off
-/// the actor thread; NBD writes are not blocked for the pass duration.
-///
-/// `cap` bounds how many candidates the handler will process in this
-/// call:
-/// * `None` — unlimited (CLI / ad-hoc full-sweep).
-/// * `Some(n)` — process at most `n`; any remaining candidates are
-///   picked up on the next call. Tick-loop callers pass a small cap
-///   (typically `1`) to bound per-tick latency.
-///
-/// Returns `Some(stats)` on success. Returns `None` if the socket is
-/// absent (volume not running) or the call fails — callers decide
-/// whether to surface that as an error or a "nothing to reclaim".
+/// `cap` bounds how many candidates the handler will process this call.
 pub async fn reclaim(fork_dir: &Path, cap: Option<u32>) -> Option<ReclaimIpcStats> {
-    let req = match cap {
-        Some(n) => format!("reclaim {n}"),
-        None => "reclaim".to_string(),
-    };
-    let response = call(fork_dir, &req).await?;
-    let rest = match response.strip_prefix("ok ") {
-        Some(r) => r.trim(),
-        None => {
-            warn!(
-                "[control] unexpected reclaim response for {}: {response:?}",
-                fork_dir.display()
-            );
-            return None;
-        }
-    };
-    let mut parts = rest.splitn(4, ' ');
-    let candidates_scanned: usize = parts.next()?.parse().ok()?;
-    let runs_rewritten: u64 = parts.next()?.parse().ok()?;
-    let bytes_rewritten: u64 = parts.next()?.parse().ok()?;
-    let discarded: usize = parts.next()?.trim().parse().ok()?;
-    Some(ReclaimIpcStats {
-        candidates_scanned,
-        runs_rewritten,
-        bytes_rewritten,
-        discarded,
-    })
+    let reply: ReclaimReply = call_typed(fork_dir, &VolumeRequest::Reclaim { cap }).await?;
+    Some(reply.into())
 }
 
 /// Finalize a completed GC handoff by asking the volume to delete the
-/// bare `gc/<ulid>` file (the volume-applied, coordinator-upload-pending
-/// marker under the self-describing handoff protocol).
+/// bare `gc/<gc_ulid>` file. Returns `true` on success.
+pub async fn finalize_gc_handoff(fork_dir: &Path, gc_ulid: Ulid) -> bool {
+    call_unit(fork_dir, &VolumeRequest::FinalizeGcHandoff { gc_ulid }).await
+}
+
+/// Result of an `is_connected` query against the volume control socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectedStatus {
+    /// Socket reachable; an NBD client is currently connected.
+    Connected,
+    /// Socket reachable; no NBD client is connected.
+    Disconnected,
+    /// Socket unreachable (volume not running, or transient I/O failure).
+    Unavailable,
+}
+
+/// Query whether an NBD client is currently connected to the volume.
+pub async fn is_connected(fork_dir: &Path) -> ConnectedStatus {
+    match call_typed::<ConnectedReply>(fork_dir, &VolumeRequest::Connected).await {
+        Some(r) if r.connected => ConnectedStatus::Connected,
+        Some(_) => ConnectedStatus::Disconnected,
+        None => ConnectedStatus::Unavailable,
+    }
+}
+
+/// Outcome of a `shutdown` call against the volume control socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// Volume accepted the shutdown and (the process now exiting).
+    Acknowledged,
+    /// Socket was unreachable — process likely already gone.
+    NotRunning,
+    /// The volume reported an error; the message comes from the volume.
+    Failed(String),
+}
+
+/// Ask the volume process to flush its WAL and exit cleanly.
 ///
-/// Called by `apply_done_handoffs` after the new segment has been promoted
-/// and the old S3 objects have been deleted. Routing the delete through the
-/// volume actor keeps every `gc/` mutation serialised with the idle-tick
-/// `apply_gc_handoffs` path, so there is no race between the coordinator
-/// removing a file and the actor trying to read it.
-///
-/// Returns `true` on success.  Returns `false` if the socket is absent or
-/// the call fails; the coordinator retries on the next tick.
-pub async fn finalize_gc_handoff(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
-    let req = format!("finalize_gc_handoff {ulid}");
-    match call(fork_dir, &req).await {
-        Some(resp) if resp.trim() == "ok" => true,
-        Some(resp) => {
-            warn!(
-                "[control] finalize_gc_handoff {ulid} for {} returned unexpected response: {resp:?}",
-                fork_dir.display()
-            );
-            false
+/// On success the volume's reply lands first, then the process calls
+/// `exit(0)`. On the wire we treat both "Ok envelope" and "EOF before
+/// envelope" as `Acknowledged`, since the volume may close the socket
+/// before flushing the JSON line in some kernel-buffer interleavings.
+pub async fn shutdown(fork_dir: &Path) -> ShutdownOutcome {
+    let socket = fork_dir.join("control.sock");
+    if !socket.exists() {
+        return ShutdownOutcome::NotRunning;
+    }
+    let mut stream = match UnixStream::connect(&socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            return classify_socket_err(&socket, "shutdown", e);
         }
-        None => false,
+    };
+    let req = serde_json::to_vec(&VolumeRequest::Shutdown).unwrap_or_default();
+    let mut buf = req;
+    buf.push(b'\n');
+    if let Err(e) = stream.write_all(&buf).await {
+        return ShutdownOutcome::Failed(format!("write: {e}"));
+    }
+    if let Err(e) = stream.flush().await {
+        return ShutdownOutcome::Failed(format!("flush: {e}"));
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) => ShutdownOutcome::Acknowledged,
+        Ok(_) => match parse_envelope::<()>(&line) {
+            Ok(_) => ShutdownOutcome::Acknowledged,
+            Err(e) => ShutdownOutcome::Failed(e.message),
+        },
+        Err(e) => ShutdownOutcome::Failed(format!("read: {e}")),
     }
 }
 
@@ -307,77 +215,102 @@ pub async fn finalize_gc_handoff(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Parse an "ok <segs> <bytes> <extents>" response into `CompactionStats`.
-fn parse_compaction_stats(fork_dir: &Path, response: Option<String>) -> Option<CompactionStats> {
-    let response = response?;
-    let rest = match response.strip_prefix("ok ") {
-        Some(r) => r.trim(),
-        None => {
-            warn!(
-                "[control] unexpected compaction response for {}: {response:?}",
-                fork_dir.display()
-            );
-            return None;
-        }
-    };
-    let mut parts = rest.splitn(4, ' ');
-    let segs: usize = parts.next()?.parse().ok()?;
-    let new_segs: usize = parts.next()?.parse().ok()?;
-    let bytes: u64 = parts.next()?.parse().ok()?;
-    let extents: usize = parts.next()?.trim().parse().ok()?;
-    Some(CompactionStats {
-        segments_compacted: segs,
-        new_segments: new_segs,
-        bytes_freed: bytes,
-        extents_removed: extents,
-    })
+/// Send a request expected to produce a unit (`()`) reply.
+async fn call_unit(fork_dir: &Path, request: &VolumeRequest) -> bool {
+    matches!(call_typed::<()>(fork_dir, request).await, Some(()))
 }
 
-/// Send `op` to the volume's control socket from the coordinator binary's
-/// inbound IPC handlers. Thin wrapper around the private [`call`] so its
-/// internal helpers remain private. Public because the coordinator bin and
-/// lib are distinct crates within the same package.
-pub async fn call_for_inbound(fork_dir: &Path, op: &str) -> Option<String> {
-    call(fork_dir, op).await
-}
-
-/// Send `op` to the control socket.  Returns the full response line (including
-/// the "ok"/"err" prefix) on success, or `None` if the socket is absent or
-/// any I/O error occurs.
-async fn call(fork_dir: &Path, op: &str) -> Option<String> {
+/// Send a request and parse the reply as `T`. Returns `None` if the
+/// socket is absent, the call fails at transport level, or the volume
+/// returned an error envelope.
+async fn call_typed<T>(fork_dir: &Path, request: &VolumeRequest) -> Option<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let socket = fork_dir.join("control.sock");
     if !socket.exists() {
         return None;
     }
-    let result: std::io::Result<String> = async {
+    let result: std::io::Result<T> = async {
         let mut stream = UnixStream::connect(&socket).await?;
-        stream.write_all(format!("{op}\n").as_bytes()).await?;
-        stream.flush().await?;
+        write_request(&mut stream, request).await?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        let line = line.trim_end_matches('\n').to_owned();
-        if let Some(msg) = line.strip_prefix("err ") {
-            Err(std::io::Error::other(msg.to_owned()))
-        } else {
-            Ok(line)
+        match parse_envelope::<T>(&line) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
     .await;
     match result {
-        Ok(line) => Some(line),
+        Ok(v) => Some(v),
         Err(e) => {
-            // ECONNREFUSED / ENOENT are expected while the volume process is
-            // starting up or has not yet been spawned; log at debug only.
+            let verb = verb_label(request);
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) {
-                tracing::debug!("[control] {op} for {} not ready: {e}", fork_dir.display());
+                tracing::debug!("[control] {verb} for {} not ready: {e}", fork_dir.display());
             } else {
-                warn!("[control] {op} for {} failed: {e}", fork_dir.display());
+                warn!("[control] {verb} for {} failed: {e}", fork_dir.display());
             }
             None
         }
+    }
+}
+
+/// Render the verb tag for a [`VolumeRequest`] for tracing.
+fn verb_label(request: &VolumeRequest) -> &'static str {
+    match request {
+        VolumeRequest::Flush => "flush",
+        VolumeRequest::PromoteWal => "promote-wal",
+        VolumeRequest::SweepPending => "sweep-pending",
+        VolumeRequest::Repack { .. } => "repack",
+        VolumeRequest::DeltaRepack => "delta-repack",
+        VolumeRequest::GcCheckpoint => "gc-checkpoint",
+        VolumeRequest::ApplyGcHandoffs => "apply-gc-handoffs",
+        VolumeRequest::Redact { .. } => "redact",
+        VolumeRequest::SnapshotManifest { .. } => "snapshot-manifest",
+        VolumeRequest::Promote { .. } => "promote",
+        VolumeRequest::FinalizeGcHandoff { .. } => "finalize-gc-handoff",
+        VolumeRequest::Reclaim { .. } => "reclaim",
+        VolumeRequest::Connected => "connected",
+        VolumeRequest::Shutdown => "shutdown",
+    }
+}
+
+async fn write_request<W, T>(writer: &mut W, request: &T) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
+    let mut buf = serde_json::to_vec(request)?;
+    buf.push(b'\n');
+    writer.write_all(&buf).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+fn parse_envelope<T>(line: &str) -> Result<T, IpcError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+    let envelope: Envelope<T> = serde_json::from_str(trimmed)
+        .map_err(|e| IpcError::internal(format!("malformed reply: {e}")))?;
+    envelope.into_result()
+}
+
+fn classify_socket_err(socket: &Path, verb: &str, e: std::io::Error) -> ShutdownOutcome {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    ) {
+        tracing::debug!("[control] {verb} for {} not ready: {e}", socket.display());
+        ShutdownOutcome::NotRunning
+    } else {
+        warn!("[control] {verb} for {} failed: {e}", socket.display());
+        ShutdownOutcome::Failed(e.to_string())
     }
 }
