@@ -427,12 +427,14 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::ResolveName { name } => {
-            let result = resolve_name_op(&name, &ctx.store).await;
+            let store = ctx.stores.coordinator_wide();
+            let result = resolve_name_op(&name, &store).await;
             let env: Envelope<ResolveNameReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::LatestSnapshot { vol_ulid } => {
-            let result = latest_snapshot_op(vol_ulid, &ctx.store).await;
+            let store = ctx.stores.for_volume(&vol_ulid);
+            let result = latest_snapshot_op(vol_ulid, &store).await;
             let env: Envelope<LatestSnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
