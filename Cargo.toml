@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "elide-core", "elide-fetch", "elide-import", "elide-coordinator"]
+members = [".", "elide-core", "elide-fetch", "elide-import", "elide-coordinator", "elide-peer-fetch"]
 resolver = "2"
 
 [package]
