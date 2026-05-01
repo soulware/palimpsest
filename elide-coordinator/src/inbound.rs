@@ -185,7 +185,14 @@ async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Stop { volume } => {
-            let result = stop_volume_op(&volume, &ctx.data_dir, &ctx.store, &ctx.coord_id).await;
+            let result = stop_volume_op(
+                &volume,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.coord_id,
+                ctx.identity.hostname(),
+            )
+            .await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -219,6 +226,7 @@ async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf
                 &ctx.data_dir,
                 &ctx.store,
                 &ctx.coord_id,
+                ctx.identity.hostname(),
                 &ctx.rescan,
             )
             .await;
@@ -1319,7 +1327,7 @@ async fn create_volume_op(
     // volume.pub is already uploaded — recovery via `release --force`
     // is always possible from here on.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-    match mark_initial(store, name, coord_id, vol_ulid).await {
+    match mark_initial(store, name, coord_id, identity.hostname(), vol_ulid).await {
         Ok(MarkInitialOutcome::Claimed) => {
             elide_coordinator::name_event_store::emit_best_effort(
                 store,
@@ -1996,7 +2004,15 @@ async fn fork_create_op(
     // just uploaded is what makes that rebind safe.
     if !for_claim {
         use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-        match mark_initial(store, new_name, coord_id, new_vol_ulid_value).await {
+        match mark_initial(
+            store,
+            new_name,
+            coord_id,
+            identity.hostname(),
+            new_vol_ulid_value,
+        )
+        .await
+        {
             Ok(MarkInitialOutcome::Claimed) => {
                 name_claimed_in_bucket = true;
                 // `volume create --from` mints a fork, so the
@@ -2131,6 +2147,7 @@ async fn stop_volume_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
+    hostname: Option<&str>,
 ) -> Result<(), IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
@@ -2175,7 +2192,7 @@ async fn stop_volume_op(
     // daemon never affects other hosts.
     if !readonly {
         use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
-        match mark_stopped(store, volume_name, coord_id).await {
+        match mark_stopped(store, volume_name, coord_id, hostname).await {
             Ok(_) => {}
             Err(LifecycleError::OwnershipConflict { held_by }) => {
                 warn!(
@@ -2957,6 +2974,7 @@ async fn rebind_name_op(
         store,
         volume_name,
         coord_id,
+        identity.hostname(),
         new_vol_ulid,
         NameState::Stopped,
     )
@@ -3059,6 +3077,7 @@ async fn claim_volume_bucket_op(
                     store,
                     volume_name,
                     coord_id,
+                    identity.hostname(),
                     record.vol_ulid,
                     NameState::Stopped,
                 )
@@ -3141,6 +3160,7 @@ async fn start_volume_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
+    hostname: Option<&str>,
     rescan: &Notify,
 ) -> Result<(), IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
@@ -3158,7 +3178,7 @@ async fn start_volume_op(
     }
 
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
-    match mark_live(store, volume_name, coord_id).await {
+    match mark_live(store, volume_name, coord_id, hostname).await {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
         Ok(MarkLiveOutcome::Absent) => {
             // No S3 record yet — proceed local-only.
@@ -4062,7 +4082,7 @@ mod tests {
         rec.handoff_snapshot = Some(ulid::Ulid::new());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        stop_volume_op("vol", data_dir.path(), &store, "coord-self")
+        stop_volume_op("vol", data_dir.path(), &store, "coord-self", None)
             .await
             .expect("stop must halt locally regardless of bucket state");
 
@@ -4095,7 +4115,7 @@ mod tests {
         rec.coordinator_id = Some("coord-other".into());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        stop_volume_op("vol", data_dir.path(), &store, "coord-self")
+        stop_volume_op("vol", data_dir.path(), &store, "coord-self", None)
             .await
             .expect("stop must halt locally despite foreign bucket state");
 

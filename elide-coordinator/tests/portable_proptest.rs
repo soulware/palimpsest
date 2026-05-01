@@ -161,8 +161,14 @@ impl World {
             Op::Create { name, coord } => {
                 let vol_ulid = self.mint_fork().await;
                 let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
-                let _ = lifecycle::mark_initial(&self.store, name_for(*name), &coord_id, vol_ulid)
-                    .await;
+                let _ = lifecycle::mark_initial(
+                    &self.store,
+                    name_for(*name),
+                    &coord_id,
+                    None,
+                    vol_ulid,
+                )
+                .await;
             }
 
             Op::Release { name, coord } => {
@@ -233,6 +239,7 @@ impl World {
                     &self.store,
                     name_for(*name),
                     &coord_id,
+                    None,
                     new_vol,
                     NameState::Live,
                 )

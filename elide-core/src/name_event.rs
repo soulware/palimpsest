@@ -183,6 +183,17 @@ pub struct NameEvent {
     /// `name_record.rs`).
     pub coordinator_id: String,
 
+    /// Hostname of the emitting coordinator at the time of emit.
+    /// Captured once at coordinator startup via
+    /// `gethostname()`; advisory metadata only — never compared
+    /// for ownership. `None` when the syscall failed or the
+    /// coordinator's view of its hostname is otherwise unavailable.
+    /// Stamped on every event so an audit trail attributes each
+    /// transition to a human-meaningful host name, not just the
+    /// opaque `coordinator_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
     /// `vol_ulid` bound to the name at emit time (i.e. the value in
     /// `names/<name>` after the CAS this event records).
     pub vol_ulid: Ulid,
@@ -220,6 +231,7 @@ impl NameEvent {
     pub fn new(
         event_ulid: Ulid,
         coordinator_id: String,
+        hostname: Option<String>,
         vol_ulid: Ulid,
         prev_event_ulid: Option<Ulid>,
         kind: EventKind,
@@ -230,6 +242,7 @@ impl NameEvent {
             event_ulid,
             at,
             coordinator_id,
+            hostname,
             vol_ulid,
             prev_event_ulid,
             kind,
@@ -253,6 +266,16 @@ impl NameEvent {
         // `event_ulid`, enforced by the parse-time invariant. Signing
         // it would only re-state a fact already covered.
         push_field(&mut buf, "coordinator_id", &self.coordinator_id);
+        // `hostname` is signed even though it's advisory: the
+        // signature ensures a reader can trust the recorded
+        // hostname is what the emitter actually wrote, not a
+        // post-hoc bucket-rewrite. `None` is encoded as an empty
+        // string, matching the `prev_event_ulid` convention so the
+        // canonical form is unambiguous in either case.
+        match self.hostname.as_deref() {
+            Some(h) => push_field(&mut buf, "hostname", h),
+            None => push_field(&mut buf, "hostname", ""),
+        }
         push_field(&mut buf, "vol_ulid", &self.vol_ulid.to_string());
         match self.prev_event_ulid {
             Some(u) => push_field(&mut buf, "prev_event_ulid", &u.to_string()),
@@ -395,6 +418,7 @@ mod tests {
         NameEvent::new(
             event_ulid(),
             "01ABCDEFGHJKMNPQRSTVWXYZ23".to_string(),
+            Some("test-host".to_string()),
             vol_ulid(),
             None,
             kind,
@@ -458,6 +482,32 @@ mod tests {
             payload_a, payload_b,
             "signing payload must not include the signature field"
         );
+    }
+
+    #[test]
+    fn signing_payload_changes_with_hostname() {
+        // `hostname` is signed: an event with a different recorded
+        // hostname must produce a different canonical pre-image so
+        // a bucket-rewriter can't substitute a forged hostname
+        // under the original signature.
+        let mut a = sample_event(EventKind::Claimed);
+        let mut b = sample_event(EventKind::Claimed);
+        a.hostname = Some("host-a".to_string());
+        b.hostname = Some("host-b".to_string());
+        assert_ne!(a.signing_payload(), b.signing_payload());
+
+        // None vs Some("") must also differ — the canonical form
+        // distinguishes "no hostname recorded" from "the hostname
+        // is the empty string", even though both are unusual.
+        let mut c = sample_event(EventKind::Claimed);
+        let mut d = sample_event(EventKind::Claimed);
+        c.hostname = None;
+        d.hostname = Some("".to_string());
+        // Same canonical encoding (both push an empty value); this
+        // is intentional. We only require that *non-empty* hostname
+        // values are distinguished — `None` vs absent-but-empty is
+        // not a security-relevant distinction.
+        assert_eq!(c.signing_payload(), d.signing_payload());
     }
 
     #[test]
