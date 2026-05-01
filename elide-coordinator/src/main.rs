@@ -91,6 +91,10 @@ async fn run() -> Result<()> {
             }
             let store = config.store.build()?;
             tracing::info!("[coordinator] store: {}", config.store.describe());
+            tracing::info!(
+                "[coordinator] store scoping: passthrough (single key for every \
+                 op; per-volume scoping not yet wired)"
+            );
             config.store.probe(store.as_ref()).await?;
             tracing::info!("[coordinator] store: reachable");
 
@@ -116,7 +120,9 @@ async fn run() -> Result<()> {
             }
             tracing::info!("[coordinator] store: conditional PUT supported");
 
-            daemon::run(config, store).await
+            let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
+                std::sync::Arc::new(elide_coordinator::stores::PassthroughStores::new(store));
+            daemon::run(config, stores).await
         }
         Command::Init { config, force } => init_config(&config, force),
     }

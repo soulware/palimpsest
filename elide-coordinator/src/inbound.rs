@@ -60,7 +60,7 @@ pub struct IpcContext {
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
     pub prefetch_tracker: PrefetchTracker,
-    pub store: Arc<dyn ObjectStore>,
+    pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
     pub store_config: Arc<StoreSection>,
     pub part_size_bytes: usize,
     /// Crockford-Base32 ULID-shaped coordinator id, derived once at
@@ -176,15 +176,19 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::StatusRemote { volume } => {
-            let result = volume_status_remote_typed(&volume, &ctx.store, &ctx.coord_id).await;
+            // Reads names/<volume>: coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
+            let result = volume_status_remote_typed(&volume, &store, &ctx.coord_id).await;
             let env: Envelope<StatusRemoteReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Stop { volume } => {
+            // Conditional PUT on names/<volume>: coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
             let result = stop_volume_op(
                 &volume,
                 &ctx.data_dir,
-                &ctx.store,
+                &store,
                 &ctx.coord_id,
                 ctx.identity.hostname(),
             )
@@ -193,14 +197,17 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Release { volume, force } => {
+            // Mixed: per-volume snapshot publish + names/<volume> flip.
+            // Coordinator-wide today; future Tigris work splits this.
+            let store = ctx.stores.coordinator_wide();
             let result = if force {
-                force_release_volume_op(&volume, &ctx.data_dir, &ctx.store, &ctx.identity).await
+                force_release_volume_op(&volume, &ctx.data_dir, &store, &ctx.identity).await
             } else {
                 release_volume_op(
                     &volume,
                     &ctx.data_dir,
                     &ctx.snapshot_locks,
-                    &ctx.store,
+                    &store,
                     ctx.part_size_bytes,
                     &ctx.identity,
                     &ctx.rescan,
@@ -211,16 +218,20 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Claim { volume } => {
+            // Conditional PUT on names/<volume>: coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
             let result =
-                claim_volume_bucket_op(&volume, &ctx.data_dir, &ctx.store, &ctx.identity).await;
+                claim_volume_bucket_op(&volume, &ctx.data_dir, &store, &ctx.identity).await;
             let env: Envelope<ClaimReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Start { volume } => {
+            // Conditional PUT on names/<volume>: coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
             let result = start_volume_op(
                 &volume,
                 &ctx.data_dir,
-                &ctx.store,
+                &store,
                 &ctx.coord_id,
                 ctx.identity.hostname(),
                 &ctx.rescan,
@@ -233,11 +244,13 @@ async fn dispatch_json(
             volume,
             new_vol_ulid,
         } => {
+            // Conditional PUT on names/<volume>: coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
             let result = rebind_name_op(
                 &volume,
                 new_vol_ulid,
                 &ctx.data_dir,
-                &ctx.store,
+                &store,
                 &ctx.identity,
                 &ctx.rescan,
                 &ctx.prefetch_tracker,
@@ -251,12 +264,14 @@ async fn dispatch_json(
             size_bytes,
             flags,
         } => {
+            // Mixed: names/<volume> claim + per-volume artefacts.
+            let store = ctx.stores.coordinator_wide();
             let result = create_volume_op(
                 &volume,
                 size_bytes,
                 &flags,
                 &ctx.data_dir,
-                &ctx.store,
+                &store,
                 &ctx.identity,
                 &ctx.rescan,
             )
@@ -270,7 +285,9 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::PullReadonly { vol_ulid } => {
-            let result = pull_readonly_op(vol_ulid, &ctx.data_dir, &ctx.store).await;
+            // Reads only under by_id/<vol_ulid>/: per-volume.
+            let store = ctx.stores.for_volume(&vol_ulid);
+            let result = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await;
             let env: Envelope<PullReadonlyReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -282,6 +299,8 @@ async fn dispatch_json(
             for_claim,
             flags,
         } => {
+            // Mixed: names/<new_name> mark_initial + per-volume copy.
+            let store = ctx.stores.coordinator_wide();
             let result = fork_create_op(
                 &new_name,
                 source_vol_ulid,
@@ -290,7 +309,7 @@ async fn dispatch_json(
                 for_claim,
                 &flags,
                 &ctx.data_dir,
-                &ctx.store,
+                &store,
                 &ctx.identity,
                 &ctx.rescan,
                 &ctx.prefetch_tracker,
@@ -304,6 +323,9 @@ async fn dispatch_json(
             oci_ref,
             extents_from,
         } => {
+            // Mixed: names/<volume> mark_initial; the spawned import
+            // subprocess writes locally only.
+            let store = ctx.stores.coordinator_wide();
             let result = start_import(
                 &volume,
                 &oci_ref,
@@ -311,7 +333,7 @@ async fn dispatch_json(
                 &ctx.data_dir,
                 &ctx.elide_import_bin,
                 &ctx.registry,
-                &ctx.store,
+                &store,
                 &ctx.rescan,
                 &ctx.identity,
             )
@@ -328,11 +350,15 @@ async fn dispatch_json(
             stream_import_by_name(&volume, &ctx.data_dir, writer, &ctx.registry).await;
         }
         Request::Snapshot { volume } => {
+            // Per-volume artefact upload + events/<volume>/ emit.
+            // Coordinator-wide today; future Tigris work splits the
+            // upload from the event emit.
+            let store = ctx.stores.coordinator_wide();
             let result = snapshot_volume(
                 &volume,
                 &ctx.data_dir,
                 &ctx.snapshot_locks,
-                &ctx.store,
+                &store,
                 ctx.part_size_bytes,
             )
             .await;
@@ -340,7 +366,12 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::ForceSnapshotNow { vol_ulid } => {
-            let result = force_snapshot_now_op(vol_ulid, &ctx.data_dir, &ctx.store).await;
+            // Reads include the ancestor chain (prefetch_indexes), so
+            // the scope is broader than for_volume(vol_ulid). Future
+            // Tigris work refactors prefetch_indexes to take
+            // ScopedStores and fetch each ancestor under its own scope.
+            let store = ctx.stores.coordinator_wide();
+            let result = force_snapshot_now_op(vol_ulid, &ctx.data_dir, &store).await;
             let env: Envelope<ForceSnapshotNowReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -354,7 +385,11 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::GenerateFilemap { volume, snap_ulid } => {
-            let result = generate_filemap_op(&volume, snap_ulid, &ctx.data_dir, &ctx.store).await;
+            // Demand-fetches segment bodies from the ancestor chain
+            // for filemap generation: cross-volume reads, so
+            // coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
+            let result = generate_filemap_op(&volume, snap_ulid, &ctx.data_dir, &store).await;
             let env: Envelope<GenerateFilemapReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -372,12 +407,17 @@ async fn dispatch_json(
             vol_ulid,
             snap_ulid,
         } => {
-            let result = resolve_handoff_key_op(vol_ulid, snap_ulid, &ctx.store).await;
+            // Reads only by_id/<vol_ulid>/snapshots/<snap>.manifest:
+            // per-volume.
+            let store = ctx.stores.for_volume(&vol_ulid);
+            let result = resolve_handoff_key_op(vol_ulid, snap_ulid, &store).await;
             let env: Envelope<ResolveHandoffKeyReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume } => {
-            let result = volume_events_typed(&volume, &ctx.store).await;
+            // Reads events/<volume>/: coordinator-wide.
+            let store = ctx.stores.coordinator_wide();
+            let result = volume_events_typed(&volume, &store).await;
             let env: Envelope<VolumeEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }

@@ -14,6 +14,7 @@ pub mod range_fetcher;
 pub mod reaper;
 pub mod recovery;
 pub mod retention;
+pub mod stores;
 pub mod tasks;
 pub mod upload;
 pub mod volume_event_store;

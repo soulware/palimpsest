@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use elide_coordinator::stores::ScopedStores;
 use humantime_serde::re::humantime;
-use object_store::ObjectStore;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -46,7 +46,7 @@ use elide_coordinator::{
     new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
 };
 
-pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
+pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Result<()> {
     let drain_interval = config.supervisor.drain_interval;
     let scan_interval = config.supervisor.scan_interval;
     let elide_bin = config.elide_bin.clone();
@@ -86,7 +86,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         "[coordinator] coordinator_id: {}",
         identity.coordinator_id_str()
     );
-    if let Err(e) = identity.publish_pub(store.as_ref()).await {
+    // Publishing coordinator.pub is a coordinator-wide write
+    // (`coordinator/<id>.pub`), not a per-volume op.
+    let coord_wide = stores.coordinator_wide();
+    if let Err(e) = identity.publish_pub(coord_wide.as_ref()).await {
         return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
     }
     let coord_id_str: String = identity.coordinator_id_str().to_owned();
@@ -155,7 +158,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),
             prefetch_tracker: prefetch_tracker.clone(),
-            store: store.clone(),
+            stores: stores.clone(),
             store_config,
             part_size_bytes,
             coord_id: coord_id_str.clone(),
@@ -173,8 +176,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // `tick_once`). Cadence is derived from the configured retention;
     // see GcConfig::reaper_cadence. Retention is read on each tick from
     // the captured config.
+    //
+    // Sweeps `names/` for owned volumes — coordinator-wide scope.
     tasks.spawn(elide_coordinator::reaper::run(
-        store.clone(),
+        stores.coordinator_wide(),
         config.data_dir.clone(),
         gc_config.reaper_cadence(),
         gc_config.retention_window,
@@ -227,8 +232,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 if !vol_dir.join("volume.readonly").exists()
                     && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
                 {
+                    // Reads/writes names/<name>: coordinator-wide.
+                    let coord_wide = stores.coordinator_wide();
                     elide_coordinator::lifecycle::reconcile_marker(
-                        &store,
+                        &coord_wide,
                         &vol_dir,
                         &name,
                         &coord_id_str,
@@ -277,9 +284,22 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     Arc::new(tokio::sync::watch::channel(None).0)
                 });
 
+                // Per-volume drain / GC / prefetch loop. Pick the
+                // volume-scoped store handle; under passthrough this is
+                // the same handle as `coordinator_wide()`, but it
+                // documents the intent so a future Tigris IAM impl can
+                // hand each volume its own scoped key.
+                let vol_store = match vol_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| ulid::Ulid::from_string(s).ok())
+                {
+                    Some(u) => stores.for_volume(&u),
+                    None => stores.coordinator_wide(),
+                };
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),
-                    store.clone(),
+                    vol_store,
                     drain_interval,
                     gc_config.clone(),
                     part_size_bytes,
