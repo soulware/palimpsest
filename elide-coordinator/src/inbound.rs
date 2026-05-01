@@ -34,9 +34,10 @@ use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
-    self, ClaimReply, CreateReply, Envelope, ForkCreateReply, ImportAttachEvent, ImportStartReply,
-    ImportStatusReply, IpcError, PullReadonlyReply, RebindNameReply, ReleaseReply, Request,
-    StatusRemoteReply, StatusReply, UpdateReply,
+    self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
+    GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
+    PullReadonlyReply, RebindNameReply, ReleaseReply, Request, ResolveHandoffKeyReply,
+    SnapshotReply, StatusRemoteReply, StatusReply, UpdateReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -322,6 +323,55 @@ async fn dispatch_json(line: &str, ctx: &IpcContext, writer: &mut OwnedWriteHalf
         Request::ImportAttach { volume } => {
             stream_import_by_name(&volume, &ctx.data_dir, writer, &ctx.registry).await;
         }
+        Request::Snapshot { volume } => {
+            let result = snapshot_volume(
+                &volume,
+                &ctx.data_dir,
+                &ctx.snapshot_locks,
+                &ctx.store,
+                ctx.part_size_bytes,
+            )
+            .await;
+            let env: Envelope<SnapshotReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ForceSnapshotNow { vol_ulid } => {
+            let result = force_snapshot_now_op(vol_ulid, &ctx.data_dir, &ctx.store).await;
+            let env: Envelope<ForceSnapshotNowReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Evict {
+            volume,
+            segment_ulid,
+        } => {
+            let result =
+                evict_volume(&volume, segment_ulid, &ctx.data_dir, &ctx.evict_registry).await;
+            let env: Envelope<EvictReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::GenerateFilemap { volume, snap_ulid } => {
+            let result = generate_filemap_op(&volume, snap_ulid, &ctx.data_dir, &ctx.store).await;
+            let env: Envelope<GenerateFilemapReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::AwaitPrefetch { vol_ulid } => {
+            let result = await_prefetch_op(vol_ulid, &ctx.prefetch_tracker).await;
+            let env: Envelope<()> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::Remove { volume, force } => {
+            let result = remove_volume(&volume, force, &ctx.data_dir);
+            let env: Envelope<()> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ResolveHandoffKey {
+            vol_ulid,
+            snap_ulid,
+        } => {
+            let result = resolve_handoff_key_op(vol_ulid, snap_ulid, &ctx.store).await;
+            let env: Envelope<ResolveHandoffKeyReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
     }
 }
 
@@ -340,103 +390,27 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
         // The line dispatcher returns an error if a client sends them
         // as line commands so the migration doesn't silently keep
         // working under the old wire.
-        "rescan" | "status" | "status-remote" | "stop" | "release" | "claim" | "start"
-        | "rebind-name" | "create" | "update" | "pull-readonly" | "fork-create" | "import" => {
+        "rescan"
+        | "status"
+        | "status-remote"
+        | "stop"
+        | "release"
+        | "claim"
+        | "start"
+        | "rebind-name"
+        | "create"
+        | "update"
+        | "pull-readonly"
+        | "fork-create"
+        | "import"
+        | "snapshot"
+        | "force-snapshot-now"
+        | "evict"
+        | "generate-filemap"
+        | "await-prefetch"
+        | "remove"
+        | "resolve-handoff-key" => {
             format!("err verb '{op}' is JSON-only; clients must send NDJSON")
-        }
-
-        "remove" => {
-            // Format: "remove <volume> [force]"
-            let mut parts = args.split_whitespace();
-            let Some(name) = parts.next() else {
-                return "err usage: remove <volume> [force]".to_string();
-            };
-            let force = matches!(parts.next(), Some("force"));
-            if parts.next().is_some() {
-                return "err usage: remove <volume> [force]".to_string();
-            }
-            remove_volume(name, force, &ctx.data_dir)
-        }
-
-        "force-snapshot-now" => {
-            // force-snapshot-now <vol_ulid>
-            if args.is_empty() {
-                return "err usage: force-snapshot-now <vol_ulid>".to_string();
-            }
-            force_snapshot_now_op(args, &ctx.data_dir, &ctx.store).await
-        }
-
-        "await-prefetch" => {
-            // await-prefetch <vol_ulid>
-            //
-            // Block until the per-fork prefetch task has published a
-            // terminal result, then echo it. Volume binaries call this
-            // before `Volume::open` to absorb the supervisor-prefetch
-            // race on freshly-claimed forks. Untracked volumes return
-            // ok immediately (already prefetched / not under coordinator
-            // management).
-            if args.is_empty() {
-                return "err usage: await-prefetch <vol_ulid>".to_string();
-            }
-            await_prefetch_op(args, &ctx.prefetch_tracker).await
-        }
-
-        "resolve-handoff-key" => {
-            // resolve-handoff-key <vol_ulid> <snap_ulid>
-            //
-            // Used by the CLI's claim-from-released path to decide
-            // which Ed25519 pubkey to verify the handoff snapshot
-            // manifest under. Returns:
-            //   ok normal              -- regular manifest, use the
-            //                             source volume's volume.pub
-            //   ok recovery <hex_pub>  -- synthesised manifest, the
-            //                             named pubkey has already
-            //                             been verified to derive to
-            //                             the recording coordinator id
-            //   err <message>          -- manifest missing, malformed,
-            //                             or signature verification
-            //                             failed
-            let (vol_str, snap_str) = match args.split_once(' ') {
-                Some((v, s)) => (v.trim(), s.trim()),
-                None => return "err usage: resolve-handoff-key <vol_ulid> <snap_ulid>".to_string(),
-            };
-            resolve_handoff_key_op(vol_str, snap_str, &ctx.store).await
-        }
-
-        "evict" => {
-            if args.is_empty() {
-                return "err usage: evict <volume> [<ulid>]".to_string();
-            }
-            let (vol_name, ulid_str) = match args.split_once(' ') {
-                Some((name, ulid)) => (name, Some(ulid.trim().to_owned())),
-                None => (args, None),
-            };
-            evict_volume(vol_name, ulid_str, &ctx.data_dir, &ctx.evict_registry).await
-        }
-
-        "snapshot" => {
-            if args.is_empty() {
-                return "err usage: snapshot <volume>".to_string();
-            }
-            snapshot_volume(
-                args,
-                &ctx.data_dir,
-                &ctx.snapshot_locks,
-                &ctx.store,
-                ctx.part_size_bytes,
-            )
-            .await
-        }
-
-        "generate-filemap" => {
-            if args.is_empty() {
-                return "err usage: generate-filemap <volume> [<snap_ulid>]".to_string();
-            }
-            let (vol_name, snap_arg) = match args.split_once(' ') {
-                Some((name, snap)) => (name, Some(snap.trim())),
-                None => (args, None),
-            };
-            generate_filemap_op(vol_name, snap_arg, &ctx.data_dir, &ctx.store).await
         }
 
         // Vend the non-secret `[store]` config so CLI read operations
@@ -728,23 +702,21 @@ async fn stream_import_by_name(
 /// never races with the GC pass's collect_stats → compact_segments window.
 async fn evict_volume(
     vol_name: &str,
-    ulid_str: Option<String>,
+    segment_ulid: Option<ulid::Ulid>,
     data_dir: &Path,
     evict_registry: &EvictRegistry,
-) -> String {
+) -> Result<EvictReply, IpcError> {
     // Resolve name → fork directory path using the same construction as
     // daemon.rs (data_dir.join("by_id/<ulid>")), so the key matches the
     // EvictRegistry entry.  canonicalize() returns an absolute path which
     // would not match when data_dir is relative.
     let link = data_dir.join("by_name").join(vol_name);
-    let target = match std::fs::read_link(&link) {
-        Ok(t) => t,
-        Err(_) => return format!("err volume not found: {vol_name}"),
-    };
+    let target = std::fs::read_link(&link)
+        .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
     // The symlink target is ../by_id/<ulid>; extract just the ULID component.
-    let Some(ulid_component) = target.file_name() else {
-        return format!("err malformed volume symlink: {vol_name}");
-    };
+    let ulid_component = target
+        .file_name()
+        .ok_or_else(|| IpcError::internal(format!("malformed volume symlink: {vol_name}")))?;
     let fork_dir = data_dir.join("by_id").join(ulid_component);
 
     // Look up the fork's evict sender.
@@ -753,19 +725,21 @@ async fn evict_volume(
         .expect("evict registry poisoned")
         .get(&fork_dir)
         .cloned();
-    let Some(sender) = sender else {
-        return format!("err volume not managed by coordinator: {vol_name}");
-    };
+    let sender = sender.ok_or_else(|| {
+        IpcError::conflict(format!("volume not managed by coordinator: {vol_name}"))
+    })?;
 
-    // Send the request and wait for the result.
+    // Send the request and wait for the result. The fork task accepts an
+    // owned ULID string for legacy reasons; encode the typed `Ulid` back.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let ulid_str = segment_ulid.map(|u| u.to_string());
     if sender.send((ulid_str, reply_tx)).await.is_err() {
-        return "err fork task no longer running".to_string();
+        return Err(IpcError::internal("fork task no longer running"));
     }
     match reply_rx.await {
-        Ok(Ok(n)) => format!("ok {n}"),
-        Ok(Err(e)) => format!("err {e}"),
-        Err(_) => "err fork task dropped reply".to_string(),
+        Ok(Ok(n)) => Ok(EvictReply { evicted: n }),
+        Ok(Err(e)) => Err(IpcError::internal(format!("{e}"))),
+        Err(_) => Err(IpcError::internal("fork task dropped reply")),
     }
 }
 
@@ -794,30 +768,32 @@ async fn snapshot_volume(
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
-) -> String {
+) -> Result<SnapshotReply, IpcError> {
     let link = data_dir.join("by_name").join(vol_name);
-    let fork_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(_) => return format!("err volume not found: {vol_name}"),
-    };
+    let fork_dir = std::fs::canonicalize(&link)
+        .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
     if !fork_dir.join("control.sock").exists() {
-        return format!("err volume '{vol_name}' is not running — start it first");
+        return Err(IpcError::conflict(format!(
+            "volume '{vol_name}' is not running — start it first"
+        )));
     }
     if fork_dir.join("volume.readonly").exists() {
-        return format!("err volume '{vol_name}' is readonly");
+        return Err(IpcError::conflict(format!(
+            "volume '{vol_name}' is readonly"
+        )));
     }
 
-    let volume_id = match elide_coordinator::upload::derive_names(&fork_dir) {
-        Ok(id) => id,
-        Err(e) => return format!("err deriving volume id: {e}"),
-    };
+    let volume_id = elide_coordinator::upload::derive_names(&fork_dir)
+        .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
 
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
     let _guard = lock.lock_owned().await;
 
     // 1. Promote WAL into pending/.
     if !elide_coordinator::control::promote_wal(&fork_dir).await {
-        return "err promote_wal failed or volume unreachable".to_string();
+        return Err(IpcError::internal(
+            "promote_wal failed or volume unreachable",
+        ));
     }
 
     // 2. Inline drain: upload every pending segment, promote each, then
@@ -828,10 +804,13 @@ async fn snapshot_volume(
         .await
     {
         Ok(r) if r.failed > 0 => {
-            return format!("err drain reported {} failed segment(s)", r.failed);
+            return Err(IpcError::store(format!(
+                "drain reported {} failed segment(s)",
+                r.failed
+            )));
         }
         Ok(_) => {}
-        Err(e) => return format!("err drain: {e:#}"),
+        Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
     }
 
     // 3. Drain any outstanding GC handoffs so `index/` is in a stable
@@ -847,12 +826,9 @@ async fn snapshot_volume(
     //    `try_lock`s the same lock and skips the tick while we hold it,
     //    so there is no race with a concurrent apply_done_handoffs.
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
-    if let Err(e) =
-        elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store, part_size_bytes)
-            .await
-    {
-        return format!("err draining gc handoffs: {e:#}");
-    }
+    elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store, part_size_bytes)
+        .await
+        .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
 
     // 4. Pick snap_ulid: the max ULID in index/, or a freshly-minted
     //    one when the volume has no segments. The volume's
@@ -860,14 +836,14 @@ async fn snapshot_volume(
     //    `elide_core::volume::Volume::sign_snapshot_manifest` doc) —
     //    an empty snapshot is just a signed manifest with zero
     //    entries, valid for the claim path to fork from.
-    let snap_ulid = match pick_snapshot_ulid(&fork_dir) {
-        Ok(u) => u,
-        Err(e) => return format!("err picking snap_ulid: {e}"),
-    };
+    let snap_ulid = pick_snapshot_ulid(&fork_dir)
+        .map_err(|e| IpcError::internal(format!("picking snap_ulid: {e}")))?;
 
     // 5. Tell the volume to sign and write the manifest + marker.
     if !elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await {
-        return format!("err sign_snapshot_manifest {snap_ulid} failed");
+        return Err(IpcError::internal(format!(
+            "sign_snapshot_manifest {snap_ulid} failed"
+        )));
     }
 
     // Phase 4 (snapshot-time filemap generation) used to run here. It
@@ -884,14 +860,12 @@ async fn snapshot_volume(
     // because the importer already has ext4 layout in hand.
 
     // 5. Upload the new snapshot marker and manifest.
-    if let Err(e) =
-        elide_coordinator::upload::upload_snapshots_and_filemaps(&fork_dir, &volume_id, store).await
-    {
-        return format!("err uploading snapshot files: {e:#}");
-    }
+    elide_coordinator::upload::upload_snapshots_and_filemaps(&fork_dir, &volume_id, store)
+        .await
+        .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
 
     info!("[snapshot {volume_id}] committed {snap_ulid}");
-    format!("ok {snap_ulid}")
+    Ok(SnapshotReply { snap_ulid })
 }
 
 /// Pick a snapshot ULID as the max ULID in `fork_dir/index/`.
@@ -946,30 +920,25 @@ fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
 /// Operators wanting to seed a delta source now invoke this verb explicitly.
 async fn generate_filemap_op(
     vol_name: &str,
-    snap_arg: Option<&str>,
+    snap_arg: Option<ulid::Ulid>,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-) -> String {
+) -> Result<GenerateFilemapReply, IpcError> {
     let link = data_dir.join("by_name").join(vol_name);
-    let fork_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(_) => return format!("err volume not found: {vol_name}"),
-    };
+    let fork_dir = std::fs::canonicalize(&link)
+        .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
 
     let snap_ulid = match snap_arg {
-        Some(s) => match ulid::Ulid::from_string(s) {
-            Ok(u) => u,
-            Err(e) => return format!("err invalid snap_ulid '{s}': {e}"),
-        },
+        Some(u) => u,
         None => match elide_core::volume::latest_snapshot(&fork_dir) {
             Ok(Some(u)) => u,
             Ok(None) => {
-                return format!(
-                    "err volume '{vol_name}' has no local snapshot; \
+                return Err(IpcError::not_found(format!(
+                    "volume '{vol_name}' has no local snapshot; \
                      publish one first with `volume snapshot`"
-                );
+                )));
             }
-            Err(e) => return format!("err reading snapshots dir: {e}"),
+            Err(e) => return Err(IpcError::internal(format!("reading snapshots dir: {e}"))),
         },
     };
 
@@ -982,21 +951,23 @@ async fn generate_filemap_op(
         .join("snapshots")
         .join(format!("{snap_ulid}.manifest"));
     if !manifest_path.exists() {
-        return format!(
-            "err snapshot {snap_ulid} not found locally for volume '{vol_name}' \
+        return Err(IpcError::not_found(format!(
+            "snapshot {snap_ulid} not found locally for volume '{vol_name}' \
              (no snapshots/{snap_ulid}.manifest); pull or snapshot first"
-        );
+        )));
     }
 
     let started = std::time::Instant::now();
-    if let Err(e) = generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone()).await {
-        return format!("err filemap generation failed for {snap_ulid}: {e:#}");
-    }
+    generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone())
+        .await
+        .map_err(|e| {
+            IpcError::internal(format!("filemap generation failed for {snap_ulid}: {e:#}"))
+        })?;
     info!(
         "[generate-filemap {vol_name}] snapshot {snap_ulid} written in {:.2?}",
         started.elapsed()
     );
-    format!("ok {snap_ulid}")
+    Ok(GenerateFilemapReply { snap_ulid })
 }
 
 /// Open a sealed snapshot, walk its ext4 layout, and write
@@ -1103,39 +1074,38 @@ async fn volume_status_remote_typed(
 ///
 /// `force = true` skips the second check, accepting that any local-only
 /// pending segments or unflushed WAL records will be discarded.
-fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> String {
+fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Result<(), IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return format!("err volume not found: {volume_name}");
+        return Err(IpcError::not_found(format!(
+            "volume not found: {volume_name}"
+        )));
     }
 
-    let vol_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
-        Err(e) => return format!("err resolving volume dir: {e}"),
-    };
+    let vol_dir = std::fs::canonicalize(&link)
+        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
 
     if !vol_dir.join(STOPPED_FILE).exists() {
-        return "err volume is running; stop it first with: elide volume stop <name>".to_string();
+        return Err(IpcError::conflict(
+            "volume is running; stop it first with: elide volume stop <name>",
+        ));
     }
 
     if !force && let Some(reason) = unflushed_state_reason(&vol_dir) {
-        return format!(
-            "err {reason}; take a snapshot first with: elide volume snapshot <name> \
+        return Err(IpcError::conflict(format!(
+            "{reason}; take a snapshot first with: elide volume snapshot <name> \
              — or pass --force to discard the unflushed local state"
-        );
+        )));
     }
 
     import::kill_all_for_volume(&vol_dir);
 
     let _ = std::fs::remove_file(&link);
 
-    match std::fs::remove_dir_all(&vol_dir) {
-        Ok(()) => {
-            info!("[inbound] removed volume {volume_name}");
-            "ok".to_string()
-        }
-        Err(e) => format!("err remove failed: {e}"),
-    }
+    std::fs::remove_dir_all(&vol_dir)
+        .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
+    info!("[inbound] removed volume {volume_name}");
+    Ok(())
 }
 
 /// Returns a human-readable reason if the fork has on-disk state that
@@ -1638,23 +1608,14 @@ async fn pull_readonly_op(
 /// Implementation of the `resolve-handoff-key` IPC verb. See the
 /// dispatch comment for the wire format.
 async fn resolve_handoff_key_op(
-    vol_str: &str,
-    snap_str: &str,
+    vol_ulid: ulid::Ulid,
+    snap_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
-) -> String {
+) -> Result<ResolveHandoffKeyReply, IpcError> {
     use elide_coordinator::recovery::{HandoffVerifier, resolve_handoff_verifier};
 
-    let vol_ulid = match ulid::Ulid::from_string(vol_str) {
-        Ok(u) => u,
-        Err(e) => return format!("err invalid vol_ulid {vol_str:?}: {e}"),
-    };
-    let snap_ulid = match ulid::Ulid::from_string(snap_str) {
-        Ok(u) => u,
-        Err(e) => return format!("err invalid snap_ulid {snap_str:?}: {e}"),
-    };
-
     match resolve_handoff_verifier(store, vol_ulid, snap_ulid).await {
-        Ok(HandoffVerifier::Normal) => "ok normal".to_owned(),
+        Ok(HandoffVerifier::Normal) => Ok(ResolveHandoffKeyReply::Normal),
         Ok(HandoffVerifier::Synthesised {
             manifest_pubkey, ..
         }) => {
@@ -1664,9 +1625,11 @@ async fn resolve_handoff_key_op(
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect();
-            format!("ok recovery {hex}")
+            Ok(ResolveHandoffKeyReply::Recovery {
+                manifest_pubkey_hex: hex,
+            })
         }
-        Err(e) => format!("err {e}"),
+        Err(e) => Err(IpcError::internal(format!("{e}"))),
     }
 }
 
@@ -1676,20 +1639,17 @@ async fn resolve_handoff_key_op(
 /// the per-fork task disappears (channel closed without a final value, e.g.
 /// the volume directory was removed) we report that as an error rather than
 /// silently returning ok, so the caller can act on it.
-async fn await_prefetch_op(args: &str, tracker: &PrefetchTracker) -> String {
-    let vol_str = args.trim();
-    let vol_ulid = match ulid::Ulid::from_string(vol_str) {
-        Ok(u) => u,
-        Err(_) => return format!("err invalid ULID: {vol_str}"),
-    };
-
+async fn await_prefetch_op(
+    vol_ulid: ulid::Ulid,
+    tracker: &PrefetchTracker,
+) -> Result<(), IpcError> {
     let mut rx = match subscribe_prefetch(tracker, &vol_ulid) {
         Some(rx) => rx,
         // Untracked: either already prefetched on a previous coordinator run,
         // or this coordinator hasn't discovered the fork yet. Both cases are
         // safe to treat as ready — Volume::open's own retry helper still
         // absorbs the rare "fork not yet on disk" sub-race.
-        None => return "ok".to_string(),
+        None => return Ok(()),
     };
 
     loop {
@@ -1697,55 +1657,50 @@ async fn await_prefetch_op(args: &str, tracker: &PrefetchTracker) -> String {
         // was already sent before we subscribed it is visible immediately.
         if let Some(result) = rx.borrow().clone() {
             return match result {
-                Ok(()) => "ok".to_string(),
-                Err(msg) => format!("err prefetch failed: {msg}"),
+                Ok(()) => Ok(()),
+                Err(msg) => Err(IpcError::internal(format!("prefetch failed: {msg}"))),
             };
         }
         if rx.changed().await.is_err() {
             // Sender was dropped before publishing — the per-fork task exited
             // abnormally (volume removed mid-prefetch, panic, etc.).
-            return "err prefetch task exited without publishing a result".to_string();
+            return Err(IpcError::internal(
+                "prefetch task exited without publishing a result",
+            ));
         }
     }
 }
 
 async fn force_snapshot_now_op(
-    args: &str,
+    vol_ulid: ulid::Ulid,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-) -> String {
+) -> Result<ForceSnapshotNowReply, IpcError> {
     use futures::TryStreamExt;
     use object_store::PutPayload;
     use object_store::path::Path as StorePath;
 
-    let volume_id = args.trim();
-    if ulid::Ulid::from_string(volume_id).is_err() {
-        return format!("err invalid ULID: {volume_id}");
-    }
-
-    let ancestor_dir = data_dir.join("by_id").join(volume_id);
+    let volume_id = vol_ulid.to_string();
+    let ancestor_dir = data_dir.join("by_id").join(&volume_id);
     if !ancestor_dir.exists() {
-        return format!("err volume not found locally: {volume_id}");
+        return Err(IpcError::not_found(format!(
+            "volume not found locally: {volume_id}"
+        )));
     }
 
     // Step 1: prefetch indexes from S3.
-    if let Err(e) = elide_coordinator::prefetch::prefetch_indexes(&ancestor_dir, store).await {
-        return format!("err prefetching ancestor indexes: {e:#}");
-    }
+    elide_coordinator::prefetch::prefetch_indexes(&ancestor_dir, store)
+        .await
+        .map_err(|e| IpcError::store(format!("prefetching ancestor indexes: {e:#}")))?;
 
     // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
     let index_dir = ancestor_dir.join("index");
     let mut segments: Vec<ulid::Ulid> = Vec::new();
     let mut max_seg: Option<ulid::Ulid> = None;
-    let entries = match std::fs::read_dir(&index_dir) {
-        Ok(e) => e,
-        Err(e) => return format!("err reading index dir: {e}"),
-    };
+    let entries = std::fs::read_dir(&index_dir)
+        .map_err(|e| IpcError::internal(format!("reading index dir: {e}")))?;
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => return format!("err reading index entry: {e}"),
-        };
+        let entry = entry.map_err(|e| IpcError::internal(format!("reading index entry: {e}")))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(stem) = name.strip_suffix(".idx") else {
@@ -1758,28 +1713,27 @@ async fn force_snapshot_now_op(
             }
         }
     }
-    let snap = match max_seg {
-        Some(m) => m,
-        None => ulid::Ulid::new(),
-    };
+    // `Ulid::default()` is the nil ULID, not a fresh one — explicitly mint.
+    #[allow(clippy::unwrap_or_default)]
+    let snap = max_seg.unwrap_or_else(ulid::Ulid::new);
     let snap_str = snap.to_string();
 
     // Step 3 + 4: upload marker, verify pinned segments still present.
-    let marker_key = match elide_coordinator::upload::snapshot_key(volume_id, &snap_str) {
-        Ok(k) => k,
-        Err(e) => return format!("err snapshot_key: {e}"),
-    };
+    let marker_key = elide_coordinator::upload::snapshot_key(&volume_id, &snap_str)
+        .map_err(|e| IpcError::internal(format!("snapshot_key: {e}")))?;
     let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
     let pinned: std::collections::HashSet<ulid::Ulid> = segments.iter().copied().collect();
 
-    if let Err(e) = store.put(&marker_key, PutPayload::from_static(b"")).await {
-        return format!("err uploading snapshot marker: {e}");
-    }
+    store
+        .put(&marker_key, PutPayload::from_static(b""))
+        .await
+        .map_err(|e| IpcError::store(format!("uploading snapshot marker: {e}")))?;
 
-    let objects = match store.list(Some(&seg_prefix)).try_collect::<Vec<_>>().await {
-        Ok(v) => v,
-        Err(e) => return format!("err listing segments for verification: {e}"),
-    };
+    let objects = store
+        .list(Some(&seg_prefix))
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| IpcError::store(format!("listing segments for verification: {e}")))?;
     let present: std::collections::HashSet<ulid::Ulid> = objects
         .iter()
         .filter_map(|o| o.location.filename())
@@ -1798,50 +1752,42 @@ async fn force_snapshot_now_op(
         } else {
             String::new()
         };
-        return format!(
-            "err force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
+        return Err(IpcError::conflict(format!(
+            "force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
              (owner GC raced us); missing: [{}]{}",
             missing.len(),
             pinned.len(),
             preview.join(", "),
             suffix,
-        );
+        )));
     }
 
     // Step 5: load-or-create the per-source attestation key.
-    let (signer, vk) = match elide_core::signing::load_or_create_keypair(
+    let (signer, vk) = elide_core::signing::load_or_create_keypair(
         &ancestor_dir,
         elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
         elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
-    ) {
-        Ok(s) => s,
-        Err(e) => return format!("err attestation keypair: {e}"),
-    };
+    )
+    .map_err(|e| IpcError::internal(format!("attestation keypair: {e}")))?;
 
     // Step 6: signed manifest + local marker.
-    if let Err(e) = elide_core::signing::write_snapshot_manifest(
-        &ancestor_dir,
-        &*signer,
-        &snap,
-        &segments,
-        None,
-    ) {
-        return format!("err writing snapshot manifest: {e}");
-    }
+    elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments, None)
+        .map_err(|e| IpcError::internal(format!("writing snapshot manifest: {e}")))?;
     let snap_dir = ancestor_dir.join("snapshots");
-    if let Err(e) = std::fs::create_dir_all(&snap_dir) {
-        return format!("err creating snapshots dir: {e}");
-    }
-    if let Err(e) = std::fs::write(snap_dir.join(&snap_str), b"") {
-        return format!("err writing local marker: {e}");
-    }
+    std::fs::create_dir_all(&snap_dir)
+        .map_err(|e| IpcError::internal(format!("creating snapshots dir: {e}")))?;
+    std::fs::write(snap_dir.join(&snap_str), b"")
+        .map_err(|e| IpcError::internal(format!("writing local marker: {e}")))?;
 
     info!(
         "[inbound] attested now-snapshot {snap_str} for {volume_id} ({} segments)",
         segments.len()
     );
     let pubkey_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    format!("ok {snap_str} {pubkey_hex}")
+    Ok(ForceSnapshotNowReply {
+        snap_ulid: snap,
+        attestation_pubkey_hex: pubkey_hex,
+    })
 }
 
 /// Fork an existing source volume into a new writable volume.
@@ -2708,24 +2654,16 @@ async fn release_volume_op(
     // zero-entry snapshot as a fresh empty root.
     let snap_started = std::time::Instant::now();
     info!("[release {volume_name}] draining WAL and publishing handoff snapshot");
-    let snap_resp = snapshot_volume(
+    let snap_ulid = snapshot_volume(
         volume_name,
         data_dir,
         snapshot_locks,
         store,
         part_size_bytes,
     )
-    .await;
-    let snap_ulid_str = match snap_resp.strip_prefix("ok ") {
-        Some(s) => s.trim().to_owned(),
-        None => {
-            return Err(IpcError::internal(format!(
-                "snapshot for release failed: {snap_resp}"
-            )));
-        }
-    };
-    let snap_ulid = ulid::Ulid::from_string(&snap_ulid_str)
-        .map_err(|e| IpcError::internal(format!("parsing snapshot ULID '{snap_ulid_str}': {e}")))?;
+    .await
+    .map_err(|e| IpcError::internal(format!("snapshot for release failed: {e}")))?
+    .snap_ulid;
     info!(
         "[release {volume_name}] handoff snapshot {snap_ulid} published in {:.2?}",
         snap_started.elapsed()
@@ -3383,6 +3321,7 @@ fn issue_credentials(
 mod tests {
     use super::*;
     use crate::credential::IssuedCredentials;
+    use elide_coordinator::ipc::IpcErrorKind;
     use tempfile::TempDir;
 
     struct FixedIssuer;
@@ -4347,15 +4286,10 @@ mod tests {
     #[tokio::test]
     async fn await_prefetch_returns_ok_for_untracked_volume() {
         let tracker = elide_coordinator::new_prefetch_tracker();
-        let resp = await_prefetch_op("01JQAAAAAAAAAAAAAAAAAAAAAA", &tracker).await;
-        assert_eq!(resp, "ok");
-    }
-
-    #[tokio::test]
-    async fn await_prefetch_rejects_invalid_ulid() {
-        let tracker = elide_coordinator::new_prefetch_tracker();
-        let resp = await_prefetch_op("not-a-ulid", &tracker).await;
-        assert!(resp.starts_with("err invalid ULID"), "{resp}");
+        let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        await_prefetch_op(vol, &tracker)
+            .await
+            .expect("untracked → ok");
     }
 
     /// Tracker already has a Done(Ok) entry → returns immediately, no blocking.
@@ -4367,8 +4301,9 @@ mod tests {
         tx.send_replace(Some(Ok(())));
         // Don't await with a timeout: if this blocks, the test blocks — that's
         // a clearer failure than a timeout.
-        let resp = await_prefetch_op(&vol.to_string(), &tracker).await;
-        assert_eq!(resp, "ok");
+        await_prefetch_op(vol, &tracker)
+            .await
+            .expect("already-done → ok");
     }
 
     /// Tracker has Done(Err) → surfaces the message, doesn't return ok.
@@ -4378,11 +4313,10 @@ mod tests {
         let vol = ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
         let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
         tx.send_replace(Some(Err("S3 timeout".into())));
-        let resp = await_prefetch_op(&vol.to_string(), &tracker).await;
-        assert!(
-            resp.starts_with("err prefetch failed: S3 timeout"),
-            "{resp}"
-        );
+        let err = await_prefetch_op(vol, &tracker)
+            .await
+            .expect_err("done(err) should surface");
+        assert!(err.message.contains("S3 timeout"), "{err}");
     }
 
     /// In-progress entry: caller blocks; producer publishes Ok mid-wait;
@@ -4394,8 +4328,7 @@ mod tests {
         let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
 
         let tracker_clone = tracker.clone();
-        let waiter =
-            tokio::spawn(async move { await_prefetch_op(&vol.to_string(), &tracker_clone).await });
+        let waiter = tokio::spawn(async move { await_prefetch_op(vol, &tracker_clone).await });
 
         // Give the waiter a moment to subscribe before the publisher fires.
         // Without this, the publisher might send before the waiter is even
@@ -4404,8 +4337,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         tx.send_replace(Some(Ok(())));
 
-        let resp = waiter.await.unwrap();
-        assert_eq!(resp, "ok");
+        waiter.await.unwrap().expect("publisher → ok");
     }
 
     /// In-progress entry, sender dropped (per-fork task panicked / volume
@@ -4418,8 +4350,7 @@ mod tests {
         let tx = elide_coordinator::register_prefetch_or_get(&tracker, vol);
 
         let tracker_clone = tracker.clone();
-        let waiter =
-            tokio::spawn(async move { await_prefetch_op(&vol.to_string(), &tracker_clone).await });
+        let waiter = tokio::spawn(async move { await_prefetch_op(vol, &tracker_clone).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Simulate the per-fork task exiting: drop the task's local
@@ -4430,10 +4361,13 @@ mod tests {
         drop(tx);
         elide_coordinator::unregister_prefetch(&tracker, &vol);
 
-        let resp = waiter.await.unwrap();
+        let err = waiter
+            .await
+            .unwrap()
+            .expect_err("dropped sender should error");
         assert!(
-            resp.starts_with("err prefetch task exited"),
-            "expected err prefetch task exited..., got {resp}"
+            err.message.contains("prefetch task exited"),
+            "expected 'prefetch task exited...', got: {err}"
         );
     }
 
@@ -4444,22 +4378,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
         let store = mem_store();
-        let resp = generate_filemap_op("ghost", None, tmp.path(), &store).await;
-        assert!(resp.starts_with("err volume not found"), "{resp}");
-    }
-
-    #[tokio::test]
-    async fn generate_filemap_invalid_snap_ulid_returns_err() {
-        let tmp = TempDir::new().unwrap();
-        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        let vol_dir = tmp.path().join("by_id").join(vol_ulid);
-        std::fs::create_dir_all(&vol_dir).unwrap();
-        let by_name = tmp.path().join("by_name");
-        std::fs::create_dir_all(&by_name).unwrap();
-        std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
-        let store = mem_store();
-        let resp = generate_filemap_op("vol", Some("not-a-ulid"), tmp.path(), &store).await;
-        assert!(resp.starts_with("err invalid snap_ulid"), "{resp}");
+        let err = generate_filemap_op("ghost", None, tmp.path(), &store)
+            .await
+            .expect_err("ghost volume should error");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains("volume not found"), "{err}");
     }
 
     #[tokio::test]
@@ -4472,9 +4395,11 @@ mod tests {
         std::fs::create_dir_all(&by_name).unwrap();
         std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
         let store = mem_store();
-        let resp = generate_filemap_op("vol", None, tmp.path(), &store).await;
-        assert!(resp.starts_with("err"), "{resp}");
-        assert!(resp.contains("no local snapshot"), "{resp}");
+        let err = generate_filemap_op("vol", None, tmp.path(), &store)
+            .await
+            .expect_err("no snapshot should error");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains("no local snapshot"), "{err}");
     }
 
     #[tokio::test]
@@ -4488,12 +4413,14 @@ mod tests {
         std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
         let store = mem_store();
         // Valid ULID, but no matching snapshots/<ulid>.manifest on disk.
-        let bogus = "01J0000000000000000000000V";
-        let resp = generate_filemap_op("vol", Some(bogus), tmp.path(), &store).await;
-        assert!(resp.starts_with("err"), "{resp}");
+        let bogus = ulid::Ulid::from_string("01J0000000000000000000000V").unwrap();
+        let err = generate_filemap_op("vol", Some(bogus), tmp.path(), &store)
+            .await
+            .expect_err("missing manifest should error");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
         assert!(
-            resp.contains("not found locally") && resp.contains(bogus),
-            "{resp}"
+            err.message.contains("not found locally") && err.message.contains(&bogus.to_string()),
+            "{err}"
         );
     }
 }
