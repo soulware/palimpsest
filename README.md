@@ -38,6 +38,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/promote-segment-offload-plan.md](docs/promote-segment-offload-plan.md) | Plan: offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
 | [docs/design-ublk-transport.md](docs/design-ublk-transport.md) | Design: ublk as preferred host-local transport alongside NBD — multi-queue async handler, USER_RECOVERY_REISSUE crash recovery, phased rollout (steps 1–3 landed, 4–5 open) |
 | [docs/design-ublk-shutdown-park.md](docs/design-ublk-shutdown-park.md) | Design (proposed): shutdown leaves ublk device QUIESCED for recovery; deletion becomes an explicit verb. Makes `stop → start` reliable while a filesystem is still mounted |
+| [docs/design-peer-segment-fetch.md](docs/design-peer-segment-fetch.md) | Exploration: opportunistic LAN peer-fetch tier in front of S3 for index/body bytes. Targets cross-host handoff (release → claim) and large-fleet image pull. URL space mirrors S3 paths; auth mirrors per-volume IAM prefix scope. |
 
 ## Status updates
 
