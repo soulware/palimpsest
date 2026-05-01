@@ -1382,13 +1382,14 @@ async fn update_volume_op(
     // Restart the volume process so it picks up the new config. ECONNREFUSED /
     // ENOENT mean the volume isn't running — fine, the new config takes effect
     // on next start.
-    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
-        Some(resp) if resp == "ok" => {
+    use elide_coordinator::control::ShutdownOutcome;
+    match elide_coordinator::control::shutdown(&vol_dir).await {
+        ShutdownOutcome::Acknowledged => {
             info!("[inbound] updated volume {name}; restart triggered");
             Ok(UpdateReply { restarted: true })
         }
-        Some(resp) => Err(IpcError::internal(format!("shutdown failed: {resp}"))),
-        None => {
+        ShutdownOutcome::Failed(msg) => Err(IpcError::internal(format!("shutdown failed: {msg}"))),
+        ShutdownOutcome::NotRunning => {
             info!("[inbound] updated volume {name}; not running");
             Ok(UpdateReply { restarted: false })
         }
@@ -2069,9 +2070,9 @@ async fn stop_volume_op(
     let readonly = vol_dir.join("volume.readonly").exists();
 
     // Refuse to stop while an NBD client is connected. ublk volumes have
-    // no NBD client and `connected` will simply return false.
-    if let Some(resp) = elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await
-        && resp == "ok true"
+    // no NBD client and `is_connected` returns Disconnected.
+    if elide_coordinator::control::is_connected(&vol_dir).await
+        == elide_coordinator::control::ConnectedStatus::Connected
     {
         return Err(IpcError::conflict(
             "nbd client is connected; disconnect it first",
@@ -2119,20 +2120,21 @@ async fn stop_volume_op(
     std::fs::write(vol_dir.join(STOPPED_FILE), "")
         .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
 
-    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
-        Some(resp) if resp == "ok" => {
+    use elide_coordinator::control::ShutdownOutcome;
+    match elide_coordinator::control::shutdown(&vol_dir).await {
+        ShutdownOutcome::Acknowledged => {
             info!("[inbound] stopped volume {volume_name}");
             Ok(())
         }
-        Some(resp) => {
+        ShutdownOutcome::Failed(msg) => {
             // Roll back the marker so the supervisor doesn't strand a still-
             // running volume. (Note: the S3 state has already flipped to
             // Stopped; that's a soft inconsistency the operator can resolve
             // by issuing `volume start` once the underlying issue is fixed.)
             let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            Err(IpcError::internal(format!("shutdown failed: {resp}")))
+            Err(IpcError::internal(format!("shutdown failed: {msg}")))
         }
-        None => {
+        ShutdownOutcome::NotRunning => {
             // Volume process wasn't running — marker is correct as-is.
             info!("[inbound] stopped volume {volume_name} (process was not running)");
             Ok(())
@@ -2209,7 +2211,7 @@ impl Drop for DrainingMarkerGuard {
             // poll and not respawn after the eventual exit.
             let vol_dir = self.vol_dir.clone();
             tokio::spawn(async move {
-                let _ = elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await;
+                let _ = elide_coordinator::control::shutdown(&vol_dir).await;
             });
         }
     }
@@ -2581,8 +2583,8 @@ async fn release_volume_op(
         )));
     }
 
-    if let Some(resp) = elide_coordinator::control::call_for_inbound(&vol_dir, "connected").await
-        && resp == "ok true"
+    if elide_coordinator::control::is_connected(&vol_dir).await
+        == elide_coordinator::control::ConnectedStatus::Connected
     {
         return Err(IpcError::conflict(
             "nbd client is connected; disconnect it first",
@@ -2621,16 +2623,19 @@ async fn release_volume_op(
     std::fs::write(vol_dir.join(STOPPED_FILE), "")
         .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
     info!("[release {volume_name}] halting daemon");
-    match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
-        Some(resp) if resp == "ok" => {}
-        Some(resp) => {
-            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            return Err(IpcError::internal(format!("shutdown failed: {resp}")));
-        }
-        None => {
-            // Volume process wasn't running by the time we reached
-            // this step. The snapshot succeeded though, so we proceed
-            // with the state flip.
+    {
+        use elide_coordinator::control::ShutdownOutcome;
+        match elide_coordinator::control::shutdown(&vol_dir).await {
+            ShutdownOutcome::Acknowledged => {}
+            ShutdownOutcome::Failed(msg) => {
+                let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
+                return Err(IpcError::internal(format!("shutdown failed: {msg}")));
+            }
+            ShutdownOutcome::NotRunning => {
+                // Volume process wasn't running by the time we reached
+                // this step. The snapshot succeeded though, so we proceed
+                // with the state flip.
+            }
         }
     }
 

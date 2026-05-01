@@ -1348,10 +1348,14 @@ mod tests {
 
     /// Spawn a mock volume control socket at `<fork_dir>/control.sock`.
     ///
-    /// Responds "ok" to any command, and for "promote <ulid>" also performs
-    /// the volume's promote behaviour: copies the segment body from gc/ or
-    /// pending/ into cache/, and deletes the pending/ file on the drain path.
+    /// Replies `Envelope::Ok` to any request, and for [`VolumeRequest::Promote`]
+    /// also performs the volume's promote behaviour: copies the segment body
+    /// from gc/ or pending/ into cache/, and deletes the source file in both
+    /// drain and GC paths.
     async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+        use elide_core::ipc::Envelope;
+        use elide_core::volume_ipc::VolumeRequest;
+
         let socket_path = fork_dir.join("control.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let handle = tokio::spawn(async move {
@@ -1366,16 +1370,14 @@ mod tests {
                     let mut buf = BufReader::new(r);
                     let mut line = String::new();
                     let _ = buf.read_line(&mut line).await;
-                    let line = line.trim().to_owned();
-                    if let Some(ulid_str) = line.strip_prefix("promote ") {
-                        let ulid_str = ulid_str.to_owned();
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if let Ok(VolumeRequest::Promote { segment_ulid }) =
+                        serde_json::from_str::<VolumeRequest>(trimmed)
+                    {
+                        let ulid_str = segment_ulid.to_string();
                         let gc_src = dir.join("gc").join(&ulid_str);
                         let pending_src = dir.join("pending").join(&ulid_str);
-                        let (src, is_drain) = if gc_src.exists() {
-                            (gc_src, false)
-                        } else {
-                            (pending_src, true)
-                        };
+                        let src = if gc_src.exists() { gc_src } else { pending_src };
                         if src.exists() {
                             let cache = dir.join("cache");
                             std::fs::create_dir_all(&cache).ok();
@@ -1386,9 +1388,11 @@ mod tests {
                             // drain and GC paths (cache holds the body now).
                             std::fs::remove_file(&src).ok();
                         }
-                        let _ = is_drain;
                     }
-                    w.write_all(b"ok\n").await.ok();
+                    let reply = Envelope::<()>::ok(());
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    w.write_all(&bytes).await.ok();
                 });
             }
         });
