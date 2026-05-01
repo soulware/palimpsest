@@ -148,10 +148,45 @@ If auth lookups become a measurable bottleneck (e.g. very high request rates fro
 
 | Use case | Discovery |
 |---|---|
-| Volume release/claim handoff | The previous claimer is recorded in the volume's S3 manifest (`names/<name>`). B asks A specifically. |
+| Volume release/claim handoff | Look at the immediately previous event in `events/<name>/`. If it's a clean `released`, use the emitting coordinator as peer; otherwise fall back to S3. |
 | Image pull at scale | TBD. No central peer registry exists today. Options include mDNS on the LAN, a `peers/<host>.json` rendezvous file in S3, or static config. Deferred until handoff lands. |
 
-For handoff, the peer is *known* (the host the caller is taking over from). For image pull, the peer is *anyone with the bytes*, and identifying that "anyone" is the harder question — left open.
+### Handoff discovery flow
+
+`names/<name>` cannot help: in the `released` state the schema explicitly clears `coordinator_id`, `claimed_at`, and `hostname` (per `docs/design-portable-live-volume.md`). The previous owner is recorded in the volume event log (`docs/design-volume-event-log.md`), specifically the `released` event for that name.
+
+**Peer-fetch discovery piggy-backs on the claim flow at zero extra cost.** A coordinator running `volume claim` already has to find the latest event in `events/<name>/` so it can populate `prev_event_ulid` on its own `claimed` event. By the time the claim CAS lands, that event is already in B's hands.
+
+The claim sequence:
+
+1. B reads `names/<name>` → sees `released`.
+2. B locates the latest event in `events/<name>/` — needed for `prev_event_ulid` regardless of peer-fetch.
+3. B does the conditional PUT on `names/<name>` → flips to `live`.
+4. B emits its own `claimed` event referencing the prior event.
+
+Peer-fetch then inspects the same event B already has:
+
+- If `kind == "released"` and the signature verifies against `coordinators/<event.coordinator_id>/coordinator.pub`: the prior owner is identified. Resolve their endpoint via `coordinators/<event.coordinator_id>/peer-endpoint.toml` (proposed; see below) and use as peer.
+- **Anything else** (`force_released`, missing event, signature failure, missing endpoint, unreachable peer, …): skip peer; fetch direct from S3.
+
+The "anything-other-than-clean-released → S3" rule keeps the logic boring: one happy path, and every failure mode at every layer collapses to the same fallback.
+
+For `force_released` specifically, the event's emitter is the *recovering* coordinator (the one that ran `--force`), not the prior owner. The whole point of `--force` is "the prior owner is gone and not coming back" — so even though the event identifies a coordinator, that coordinator has no relationship to whichever host had the volume's cache warm. Direct S3 is the only sensible fallback.
+
+`prev_event_ulid` on each event chains backward through history; useful for verifying that no concurrent event was missed but not for *finding* the head of the log. Whatever mechanism the event-log design adopts for find-latest (LIST + sort by default, with `events/<name>/HEAD` pointer or inverted-ULID keys as future optimisations) is shared between claim and peer-fetch.
+
+### Coordinator endpoint registry (proposed)
+
+The handoff discovery step assumes a way to resolve `coordinator_id` → reachable endpoint. The natural slot is sibling to the already-proposed `coordinators/<coordinator_id>/coordinator.pub`:
+
+```
+coordinators/<coordinator_id>/coordinator.pub        — already proposed
+coordinators/<coordinator_id>/peer-endpoint.toml     — new
+```
+
+`peer-endpoint.toml` records `host`, `port`, and any TLS hints. A coordinator updates its own endpoint at startup; absence or unreachability flows naturally into the "fall back to S3" branch above.
+
+Embedding the endpoint in the `released` event itself is an alternative but ties endpoint information to volume history records and goes stale if the coordinator's address changes. The registry keeps the event log a record of *what happened*, separate from *where to reach a host today*.
 
 ## Out of scope for v1
 
