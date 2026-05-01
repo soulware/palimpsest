@@ -45,13 +45,20 @@ const MACAROON_ROOT_CONTEXT: &str = "elide macaroon-root v1";
 
 /// In-memory coordinator identity bundle.
 ///
-/// All material derives from the on-disk `coordinator.key`. The
-/// signing key is private to this struct; callers reach the
-/// derived id and macaroon root through the accessor methods.
+/// All material derives from the on-disk `coordinator.key`, with
+/// one exception: `hostname` is captured once at startup via
+/// [`elide_core::name_record::current_hostname`]. Hostname is
+/// advisory metadata only — never compared for ownership — so
+/// caching across the coordinator's lifetime is intentional and
+/// avoids a `gethostname()` syscall on every name-record CAS and
+/// every event emit. A host renamed without a coordinator
+/// restart will continue to record the old name; that's
+/// acceptable for an advisory field.
 pub struct CoordinatorIdentity {
     signing_key: SigningKey,
     coordinator_id_str: String,
     macaroon_root: [u8; 32],
+    hostname: Option<String>,
 }
 
 /// Treat the coordinator's identity keypair as a `SegmentSigner` so
@@ -70,6 +77,7 @@ impl std::fmt::Debug for CoordinatorIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoordinatorIdentity")
             .field("coordinator_id", &self.coordinator_id_str)
+            .field("hostname", &self.hostname)
             .field("signing_key", &"<redacted>")
             .field("macaroon_root", &"<redacted>")
             .finish()
@@ -98,16 +106,29 @@ impl CoordinatorIdentity {
         let macaroon_root =
             blake3::derive_key(MACAROON_ROOT_CONTEXT, signing_key.as_bytes().as_slice());
 
+        let hostname = elide_core::name_record::current_hostname();
+
         Ok(Self {
             signing_key,
             coordinator_id_str,
             macaroon_root,
+            hostname,
         })
     }
 
     /// Crockford-Base32 ULID-shaped coordinator id.
     pub fn coordinator_id_str(&self) -> &str {
         &self.coordinator_id_str
+    }
+
+    /// Hostname captured at startup, or `None` if `gethostname()`
+    /// failed or returned non-UTF-8 bytes. Advisory metadata only —
+    /// stamped into `NameRecord` and `NameEvent` artefacts so
+    /// operators inspecting the bucket can correlate
+    /// `coordinator_id` against a human-meaningful host name.
+    /// Never compared for ownership decisions.
+    pub fn hostname(&self) -> Option<&str> {
+        self.hostname.as_deref()
     }
 
     /// 32-byte MAC root for `macaroon::mint` / `macaroon::verify`.

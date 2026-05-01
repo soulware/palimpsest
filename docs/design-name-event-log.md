@@ -76,6 +76,7 @@ event_ulid = "<ulid>"
 kind = "claimed"                          # see catalogue below
 at = "2026-04-30T12:34:56Z"               # rfc3339, advisory
 coordinator_id = "<emitting-coordinator>"
+hostname = "<emitter-host>"               # advisory; absent if gethostname() failed
 vol_ulid = "<vol_ulid_at_this_event>"     # current fork at emit time
 prev_event_ulid = "<ulid>"                # last event this emitter saw; absent on first event
 signature = "<ed25519-sig-over-canonical-form>"
@@ -94,6 +95,15 @@ signature = "<ed25519-sig-over-canonical-form>"
   substitution between events and other coordinator-signed
   artefacts (e.g. synthesised handoff snapshots) without requiring
   a second key.
+- **`hostname`** mirrors `NameRecord.hostname`: a human-meaningful
+  host name captured by the emitting coordinator, advisory only,
+  never compared for ownership. Stamped on every event so an audit
+  trail attributes each transition to a host name in addition to
+  the opaque `coordinator_id`. Read once from `gethostname()` at
+  coordinator startup and cached; absent if the syscall failed or
+  returned non-UTF-8 bytes. Included in the canonical signing
+  payload — a bucket-rewriter cannot substitute a forged hostname
+  under the original signature.
 - **`prev_event_ulid`** is the writer's view of "the previous event
   on this name's log". It is *not* a strict hash chain — concurrent
   writers may both name the same `prev_event_ulid` — but it lets a

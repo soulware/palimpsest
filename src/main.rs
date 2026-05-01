@@ -2171,6 +2171,13 @@ fn print_name_events(reply: &coordinator_client::NameEventsReply) {
         let kind_label = ev.kind.as_str();
         let coord = &ev.coordinator_id;
         let vol = ev.vol_ulid;
+        // `on=<hostname>` only when the event recorded one. Old
+        // events from before this field landed render without it
+        // rather than with `on=<unknown>` clutter.
+        let host = match ev.hostname.as_deref() {
+            Some(h) => format!(" on={h}"),
+            None => String::new(),
+        };
         let extra = match &ev.kind {
             EventKind::Created | EventKind::Claimed => String::new(),
             EventKind::Released { handoff_snapshot } => {
@@ -2197,7 +2204,7 @@ fn print_name_events(reply: &coordinator_client::NameEventsReply) {
                 format!(" from={old_name} inherits={inherits_log_from}")
             }
         };
-        println!("{sigil} {when}  {kind_label:<14} vol={vol}  by={coord}{extra}");
+        println!("{sigil} {when}  {kind_label:<14} vol={vol}  by={coord}{host}{extra}");
     }
 
     // Footer: any non-Valid statuses get explained, so the operator

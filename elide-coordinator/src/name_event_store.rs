@@ -197,6 +197,7 @@ pub async fn emit_event(
     let mut event = NameEvent::new(
         event_ulid,
         identity.coordinator_id_str().to_owned(),
+        identity.hostname().map(str::to_owned),
         vol_ulid,
         prev_event_ulid,
         kind,

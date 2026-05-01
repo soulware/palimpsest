@@ -16,9 +16,7 @@ use object_store::ObjectStore;
 use tracing::warn;
 use ulid::Ulid;
 
-use elide_core::name_record::{
-    Lifecycle, NameRecord, NameState, TransitionCheck, current_hostname,
-};
+use elide_core::name_record::{Lifecycle, NameRecord, NameState, TransitionCheck};
 
 use crate::name_store::{self, NameStoreError};
 use crate::volume_state::STOPPED_FILE;
@@ -53,7 +51,12 @@ fn check_owner(record: &NameRecord, coord_id: &str) -> Result<(), LifecycleError
 /// Backfill owner-identity fields if absent. Phase 1 records arrive
 /// without `coordinator_id`/`claimed_at`/`hostname`; the first lifecycle
 /// verb that has the context populates them in place.
-fn ensure_owner_fields(record: &mut NameRecord, coord_id: &str) {
+///
+/// `hostname` comes from the caller (typically
+/// `CoordinatorIdentity::hostname()`, which captures
+/// `gethostname()` once at startup) so a per-call syscall is
+/// avoided. `None` is acceptable — the field is advisory.
+fn ensure_owner_fields(record: &mut NameRecord, coord_id: &str, hostname: Option<&str>) {
     if record.coordinator_id.is_none() {
         record.coordinator_id = Some(coord_id.to_owned());
     }
@@ -61,7 +64,7 @@ fn ensure_owner_fields(record: &mut NameRecord, coord_id: &str) {
         record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
     }
     if record.hostname.is_none() {
-        record.hostname = current_hostname();
+        record.hostname = hostname.map(str::to_owned);
     }
 }
 
@@ -124,6 +127,7 @@ pub async fn mark_stopped(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     coord_id: &str,
+    hostname: Option<&str>,
 ) -> Result<MarkStoppedOutcome, LifecycleError> {
     let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
         return Ok(MarkStoppedOutcome::Absent);
@@ -143,7 +147,7 @@ pub async fn mark_stopped(
     }
 
     record.state = NameState::Stopped;
-    ensure_owner_fields(&mut record, coord_id);
+    ensure_owner_fields(&mut record, coord_id, hostname);
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkStoppedOutcome::Updated)
@@ -325,6 +329,7 @@ pub async fn mark_live(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     coord_id: &str,
+    hostname: Option<&str>,
 ) -> Result<MarkLiveOutcome, LifecycleError> {
     let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
         return Ok(MarkLiveOutcome::Absent);
@@ -345,7 +350,7 @@ pub async fn mark_live(
     }
 
     record.state = NameState::Live;
-    ensure_owner_fields(&mut record, coord_id);
+    ensure_owner_fields(&mut record, coord_id, hostname);
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkLiveOutcome::Resumed)
@@ -393,6 +398,7 @@ pub async fn mark_reclaimed_local(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     coord_id: &str,
+    hostname: Option<&str>,
     local_vol_ulid: Ulid,
     target_state: NameState,
 ) -> Result<MarkReclaimedLocalOutcome, LifecycleError> {
@@ -422,7 +428,7 @@ pub async fn mark_reclaimed_local(
     record.state = target_state;
     record.coordinator_id = Some(coord_id.to_owned());
     record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
-    record.hostname = current_hostname();
+    record.hostname = hostname.map(str::to_owned);
     record.handoff_snapshot = None;
 
     name_store::update_name_record(store, name, &record, version).await?;
@@ -459,6 +465,7 @@ pub async fn mark_initial(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     coord_id: &str,
+    hostname: Option<&str>,
     vol_ulid: Ulid,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
     // If a record already exists, surface its details so the caller can
@@ -480,7 +487,7 @@ pub async fn mark_initial(
         state: NameState::Live,
         parent: None,
         claimed_at: Some(chrono::Utc::now().to_rfc3339()),
-        hostname: current_hostname(),
+        hostname: hostname.map(str::to_owned),
         handoff_snapshot: None,
     };
 
@@ -601,6 +608,7 @@ pub async fn mark_claimed(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     coord_id: &str,
+    hostname: Option<&str>,
     new_vol_ulid: Ulid,
     target_state: NameState,
 ) -> Result<MarkClaimedOutcome, LifecycleError> {
@@ -630,7 +638,7 @@ pub async fn mark_claimed(
         state: target_state,
         parent: parent_pin,
         claimed_at: Some(chrono::Utc::now().to_rfc3339()),
-        hostname: current_hostname(),
+        hostname: hostname.map(str::to_owned),
         handoff_snapshot: None,
     };
 
@@ -742,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_returns_absent_when_record_missing() {
         let s = store();
-        let r = mark_stopped(&s, "missing", &id_a()).await.unwrap();
+        let r = mark_stopped(&s, "missing", &id_a(), None).await.unwrap();
         assert!(matches!(r, MarkStoppedOutcome::Absent));
     }
 
@@ -752,7 +760,7 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        let outcome = mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        let outcome = mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
         assert!(matches!(outcome, MarkStoppedOutcome::Updated));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -770,8 +778,8 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
-        let outcome = mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
+        let outcome = mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
         assert!(matches!(outcome, MarkStoppedOutcome::AlreadyStopped));
     }
 
@@ -782,10 +790,10 @@ mod tests {
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         // First coordinator A claims via stop.
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
         // Coordinator B tries to flip an A-owned record.
-        let err = mark_stopped(&s, "vol", &id_b())
+        let err = mark_stopped(&s, "vol", &id_b(), None)
             .await
             .expect_err("B must be refused on A-owned record");
         assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
@@ -798,7 +806,7 @@ mod tests {
         rec.state = NameState::Released;
         create_name_record(&s, "vol", &rec).await.unwrap();
 
-        let err = mark_stopped(&s, "vol", &id_a())
+        let err = mark_stopped(&s, "vol", &id_a(), None)
             .await
             .expect_err("released → stopped is not a valid transition");
         assert!(matches!(
@@ -849,7 +857,7 @@ mod tests {
         // Record has full ownership populated (mark_initial-style),
         // verify mark_released wipes all three identity fields.
         let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
 
@@ -880,7 +888,7 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
         let outcome = mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
         assert!(matches!(outcome, MarkReleasedOutcome::Updated { .. }));
@@ -911,7 +919,7 @@ mod tests {
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         // A claims via stop.
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
         // B tries to release A's record.
         let err = mark_released(&s, "vol", &id_b(), snap())
@@ -923,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_returns_absent_when_record_missing() {
         let s = store();
-        let r = mark_live(&s, "missing", &id_a()).await.unwrap();
+        let r = mark_live(&s, "missing", &id_a(), None).await.unwrap();
         assert!(matches!(r, MarkLiveOutcome::Absent));
     }
 
@@ -932,9 +940,9 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
-        let outcome = mark_live(&s, "vol", &id_a()).await.unwrap();
+        let outcome = mark_live(&s, "vol", &id_a(), None).await.unwrap();
         assert!(matches!(outcome, MarkLiveOutcome::Resumed));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -951,10 +959,10 @@ mod tests {
         create_name_record(&s, "vol", &rec).await.unwrap();
         // Phase 1 records start as Live with coordinator_id=None;
         // mark_stopped→mark_live cycles through both states with our id set.
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
-        mark_live(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
+        mark_live(&s, "vol", &id_a(), None).await.unwrap();
 
-        let outcome = mark_live(&s, "vol", &id_a()).await.unwrap();
+        let outcome = mark_live(&s, "vol", &id_a(), None).await.unwrap();
         assert!(matches!(outcome, MarkLiveOutcome::AlreadyLive));
     }
 
@@ -967,7 +975,7 @@ mod tests {
 
         // Even from the original owner, mark_live on a Released record
         // is not local-resume; the claim-from-released path is required.
-        let outcome = mark_live(&s, "vol", &id_a()).await.unwrap();
+        let outcome = mark_live(&s, "vol", &id_a(), None).await.unwrap();
         assert!(matches!(outcome, MarkLiveOutcome::Released));
     }
 
@@ -976,9 +984,9 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
-        let err = mark_live(&s, "vol", &id_b())
+        let err = mark_live(&s, "vol", &id_b(), None)
             .await
             .expect_err("B must be refused on A-owned record");
         assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
@@ -989,7 +997,7 @@ mod tests {
         let s = store();
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let vol_dir = tmp.path().join("vol");
@@ -1007,8 +1015,8 @@ mod tests {
         // Cycle through stop → start so coordinator_id is set on the
         // record (Phase 1 records start as Live with no coordinator_id,
         // and reconcile only acts on records *we* own).
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
-        mark_live(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
+        mark_live(&s, "vol", &id_a(), None).await.unwrap();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let vol_dir = tmp.path().join("vol");
@@ -1025,7 +1033,7 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
         // A claims via stop.
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let vol_dir = tmp.path().join("vol");
@@ -1043,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn mark_claimed_returns_absent_when_record_missing() {
         let s = store();
-        let outcome = mark_claimed(&s, "missing", &id_b(), other_ulid(), NameState::Live)
+        let outcome = mark_claimed(&s, "missing", &id_b(), None, other_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkClaimedOutcome::Absent));
@@ -1055,10 +1063,10 @@ mod tests {
         let rec = NameRecord::live_minimal(sample_ulid());
         create_name_record(&s, "vol", &rec).await.unwrap();
         // A owns + Live.
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
-        mark_live(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
+        mark_live(&s, "vol", &id_a(), None).await.unwrap();
 
-        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid(), NameState::Live)
+        let outcome = mark_claimed(&s, "vol", &id_b(), None, other_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(
@@ -1077,7 +1085,7 @@ mod tests {
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
         // B claims A's released name with a freshly-minted ULID.
-        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid(), NameState::Live)
+        let outcome = mark_claimed(&s, "vol", &id_b(), None, other_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkClaimedOutcome::Claimed));
@@ -1112,8 +1120,8 @@ mod tests {
         let ulid_b = other_ulid();
         let ulid_c = Ulid::from_string("01J3333333333333333333333V").unwrap();
         let (b_outcome, c_outcome) = tokio::join!(
-            mark_claimed(&s, "vol", &id_b, ulid_b, NameState::Live),
-            mark_claimed(&s, "vol", &id_c, ulid_c, NameState::Live),
+            mark_claimed(&s, "vol", &id_b, None, ulid_b, NameState::Live),
+            mark_claimed(&s, "vol", &id_c, None, ulid_c, NameState::Live),
         );
 
         // Exactly one wins via the conditional PUT; the other observes
@@ -1146,7 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn mark_initial_claims_fresh_name_with_full_ownership() {
         let s = store();
-        let outcome = mark_initial(&s, "fresh", &id_a(), sample_ulid())
+        let outcome = mark_initial(&s, "fresh", &id_a(), None, sample_ulid())
             .await
             .unwrap();
         assert!(matches!(outcome, MarkInitialOutcome::Claimed));
@@ -1168,11 +1176,13 @@ mod tests {
     async fn mark_initial_refuses_when_record_already_exists() {
         let s = store();
         // Pre-existing record under a different owner (key_b).
-        mark_initial(&s, "vol", &id_b(), sample_ulid())
+        mark_initial(&s, "vol", &id_b(), None, sample_ulid())
             .await
             .unwrap();
 
-        let outcome = mark_initial(&s, "vol", &id_a(), snap()).await.unwrap();
+        let outcome = mark_initial(&s, "vol", &id_a(), None, snap())
+            .await
+            .unwrap();
         match outcome {
             MarkInitialOutcome::AlreadyExists {
                 existing_vol_ulid,
@@ -1202,8 +1212,8 @@ mod tests {
         let u1 = sample_ulid();
         let u2 = snap();
 
-        let r1 = mark_initial(&s, "alpha", &id_a(), u1).await.unwrap();
-        let r2 = mark_initial(&s, "beta", &id_b(), u2).await.unwrap();
+        let r1 = mark_initial(&s, "alpha", &id_a(), None, u1).await.unwrap();
+        let r2 = mark_initial(&s, "beta", &id_b(), None, u2).await.unwrap();
         assert!(matches!(r1, MarkInitialOutcome::Claimed));
         assert!(matches!(r2, MarkInitialOutcome::Claimed));
 
@@ -1227,15 +1237,16 @@ mod tests {
     async fn mark_reclaimed_local_flips_released_to_live_keeping_vol_ulid() {
         let s = store();
         // Set up: claim via mark_initial, release.
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
         // Reclaim in-place.
-        let outcome = mark_reclaimed_local(&s, "vol", &id_a(), sample_ulid(), NameState::Live)
-            .await
-            .unwrap();
+        let outcome =
+            mark_reclaimed_local(&s, "vol", &id_a(), None, sample_ulid(), NameState::Live)
+                .await
+                .unwrap();
         assert!(matches!(outcome, MarkReclaimedLocalOutcome::Reclaimed));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
@@ -1253,22 +1264,24 @@ mod tests {
     #[tokio::test]
     async fn mark_reclaimed_local_returns_absent_when_record_missing() {
         let s = store();
-        let outcome = mark_reclaimed_local(&s, "missing", &id_a(), sample_ulid(), NameState::Live)
-            .await
-            .unwrap();
+        let outcome =
+            mark_reclaimed_local(&s, "missing", &id_a(), None, sample_ulid(), NameState::Live)
+                .await
+                .unwrap();
         assert!(matches!(outcome, MarkReclaimedLocalOutcome::Absent));
     }
 
     #[tokio::test]
     async fn mark_reclaimed_local_reports_not_released_for_live_record() {
         let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
 
-        let outcome = mark_reclaimed_local(&s, "vol", &id_a(), sample_ulid(), NameState::Live)
-            .await
-            .unwrap();
+        let outcome =
+            mark_reclaimed_local(&s, "vol", &id_a(), None, sample_ulid(), NameState::Live)
+                .await
+                .unwrap();
         match outcome {
             MarkReclaimedLocalOutcome::NotReleased {
                 observed_state,
@@ -1286,15 +1299,16 @@ mod tests {
         // A different vol_ulid than the local fork → caller must use
         // the cross-coordinator claim path, not the in-place reclaim.
         let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
         let other_local_ulid = snap(); // different from sample_ulid()
-        let outcome = mark_reclaimed_local(&s, "vol", &id_b(), other_local_ulid, NameState::Live)
-            .await
-            .unwrap();
+        let outcome =
+            mark_reclaimed_local(&s, "vol", &id_b(), None, other_local_ulid, NameState::Live)
+                .await
+                .unwrap();
         match outcome {
             MarkReclaimedLocalOutcome::ForkMismatch {
                 local_vol_ulid,
@@ -1361,7 +1375,7 @@ mod tests {
         // First a writable claim, then an attempt to import the same
         // name → must be refused.
         let s = store();
-        mark_initial(&s, "name", &id_a(), sample_ulid())
+        mark_initial(&s, "name", &id_a(), None, sample_ulid())
             .await
             .unwrap();
 
@@ -1384,7 +1398,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = mark_stopped(&s, "vol", &id_a())
+        let err = mark_stopped(&s, "vol", &id_a(), None)
             .await
             .expect_err("readonly record cannot be stopped");
         assert!(matches!(
@@ -1422,7 +1436,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = mark_live(&s, "vol", &id_a())
+        let err = mark_live(&s, "vol", &id_a(), None)
             .await
             .expect_err("readonly record cannot transition to live");
         assert!(matches!(
@@ -1444,7 +1458,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = mark_claimed(&s, "vol", &id_a(), snap(), NameState::Live)
+        let outcome = mark_claimed(&s, "vol", &id_a(), None, snap(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(
@@ -1468,7 +1482,7 @@ mod tests {
     async fn mark_released_force_overrides_foreign_owned_live_record() {
         let s = store();
         // A owns Live.
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
 
@@ -1501,10 +1515,10 @@ mod tests {
     #[tokio::test]
     async fn mark_released_force_overrides_foreign_owned_stopped_record() {
         let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
         let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
         assert!(matches!(outcome, ForceReleaseOutcome::Overwritten { .. }));
@@ -1513,7 +1527,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_force_refuses_already_released_record() {
         let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
             .await
             .unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
