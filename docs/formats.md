@@ -127,27 +127,24 @@ The name `redact` reflects the intent: the sole purpose of this step is to ensur
 ```
 wal/<ULID>              — WAL file (active or awaiting promotion)
 pending/<ULID>          — segment file committed locally, S3 upload pending
-segments/<ULID>         — segment file confirmed uploaded to S3 (evictable)
-index/<ULID>.idx        — header + index + inline fetched from S3 (always present first)
-cache/<ULID>.body       — sparse body file; body-relative byte offsets
-cache/<ULID>.present    — presence bitset; one bit per index entry
+index/<ULID>.idx        — header + index + inline; written on S3 confirmation; always retained
+cache/<ULID>.body       — sparse body file; body-relative byte offsets; evictable
+cache/<ULID>.present    — presence bitset; one bit per index entry; evictable with .body
 ```
 
-The first three directories correspond to the write-path lifecycle; `index/` and `cache/` are the fetch-path cache:
+`pending/` is the write-path holding area; `index/` and `cache/` together are the canonical post-upload local form, used by both self-written and demand-fetched segments:
 
 ```
-wal/<ULID>  →  pending/<ULID>  →  segments/<ULID>   (write path)
-
-                     S3
-                      ↓
-     index/<ULID>.idx + cache/<ULID>.*  →  segments/<ULID>   (fetch path, when fully populated)
+wal/<ULID>  →  pending/<ULID>  →  S3 upload  →  index/<ULID>.idx + cache/<ULID>.{body,present}
+                                                                        ↑
+                                                   demand-fetch from S3 ┘
 ```
 
-Both `pending/` and `segments/` hold segment files in the same format (header + index + inline + body). The distinction is upload state, not file format. Locally-stored segment files have `delta_length = 0` in the header; the coordinator appends the delta body when computing deltas at S3 upload time, producing the final S3 object.
+A `pending/<ULID>` file holds the full segment in the same format used in S3 minus the delta body (which the coordinator appends at upload time). Once the coordinator confirms upload, the volume writes `index/<ULID>.idx` plus `cache/<ULID>.body` + `.present` (with all bits set, since the full body is on hand) and then deletes `pending/<ULID>`. Demand-fetched segments arrive in the same shape: `index/<ULID>.idx` written first, body bytes populated incrementally into `cache/<ULID>.body` with corresponding bits in `.present`. There is no separate "uploaded full-file" local state — the cache triplet is the only post-upload form.
 
 `wal/` normally contains one entry — the active WAL — but can contain two during the brief promotion window. On crash recovery all files in `wal/` are treated identically: scan, truncate partial tail, promote.
 
-`pending/` segments are the only local copy of their data; they must not be evicted. `segments/` are S3-backed caches; freely evictable under space pressure. No list files are needed — the filesystem is the index.
+`pending/` segments are the only local copy of their data; they must not be evicted. `cache/<ULID>.body` and `.present` are S3-backed and freely evictable under space pressure; `index/<ULID>.idx` is the S3-confirmation marker and must be retained even after body eviction. No list files are needed — the filesystem is the index.
 
 **Commit ordering:**
 
@@ -180,7 +177,7 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
       DedupRef entries contribute no body bytes (stored_length=0),
       and hash-dead DATA entries have been hole-punched in place by redact_segment.
 7. Upload S3 object
-8. Rename pending/<ULID> → segments/<ULID>
+8. Volume writes index/<ULID>.idx and cache/<ULID>.{body,present} (full body, all bits set); deletes pending/<ULID>
 ```
 
 The local `pending/<ulid>` file and the uploaded S3 object share the **same format-level thin layout**: `body_length` is the sum of DATA and INLINE `stored_length` only; DedupRef entries carry no body bytes anywhere. Dead-DATA body regions are hole-punched by `materialise_segment` on Linux (zero-written on other platforms) before upload. There is no "local optimisation vs S3" asymmetry — the thin layout is the only layout. See § Segment File Format — FLAG_DEDUP_REF for the invariants that make this sound.
@@ -191,13 +188,12 @@ Under the **sparse** strategy the S3 object diverges structurally from the local
 
 The two strategies are not mutually exclusive: sparse can be applied first (skip unchanged blocks), and delta compression applied to the changed blocks that remain. See [architecture.md](architecture.md) for the trade-off comparison.
 
-**On startup:** scan all four directories within the live node. Each maps to one recovery action:
+**On startup:** scan all three directories within the live node. Each maps to one recovery action:
 - `wal/` — replay (truncate partial tail if needed) and promote
 - `pending/` — read header + index section for LBA map rebuild; queue S3 upload
-- `segments/` — read header + index section for LBA map rebuild
-- `index/*.idx` — read header + index section for LBA map rebuild (same as `segments/`, just a different path to the same data)
+- `index/*.idx` — read header + index section for LBA map rebuild
 
-Then scan ancestor nodes' `segments/` and `index/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
+Then scan ancestor nodes' `index/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
 
 ---
 
@@ -249,7 +245,7 @@ delta_offset  = 100 + index_length + inline_length + body_length
 - `0x20` `FLAG_DELTA` — thin delta entry; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry implies `FLAG_HAS_DELTAS` and must have at least one delta option; the content is served by fetching a delta blob from the segment's delta body section and decompressing it against the `source_hash` extent body located via the extent index. See § Segment File Format — FLAG_DELTA below.
 - `0x40` `FLAG_CANONICAL_ONLY` — canonical-body-only entry. Co-exists with DATA (body in body section) or `FLAG_INLINE` (body in inline section); incompatible with `FLAG_DEDUP_REF`, `FLAG_ZERO`, `FLAG_DELTA`. The entry carries body bytes (its hash is canonical in this segment, resolvable via `extent_index.lookup`) but makes **no LBA claim**: `start_lba` and `lba_length` are serialised as zero and the entry is skipped by `lbamap::rebuild_segments`. Emitted by GC when a DATA/INLINE entry's original LBA has been overwritten (LBA-dead) but its hash is still referenced elsewhere via a DedupRef. Preserves the canonical body for dedup resolution without re-asserting the stale LBA→hash binding on rebuild. See § Segment File Format — FLAG_CANONICAL_ONLY below.
 
-**Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
+**Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents. LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
 **Delta bodies** use zstd dictionary compression (`FLAG_HAS_DELTAS` option entries). The source extent is used as the zstd dictionary; the delta blob is much smaller than the full extent for in-place file updates. Delta blobs are computed in-process by `elide-import` after pending segments are written but before `serve_promote` publishes the control socket, and appended to the segment's delta body section. `FLAG_COMPRESSED` continues to apply uniformly to full-body entries (LZ4); the algorithm is implied by context (full-body entry = LZ4, delta option = zstd).
 
@@ -495,21 +491,21 @@ Snapshot indexes are consolidated index-section views written at snapshot time, 
 
 ## Cache Segment Format
 
-Segments fetched from S3 are **inherently partial**: a newly-arrived segment has its header and index available immediately, but body bytes arrive on demand as specific extents are read. The locally-written format cannot represent this state — a file in `pending/` or `segments/` is always complete by construction (written atomically via tmp→rename). Cached segments live in `index/` (for the `.idx` file) and `cache/` (for `.body` and `.present`) and use a three-file representation.
+Segments fetched from S3 are **inherently partial**: a newly-arrived segment has its header and index available immediately, but body bytes arrive on demand as specific extents are read. The locally-written form in `pending/` is always complete by construction (written atomically via tmp→rename). Post-upload — whether self-written or demand-fetched — segments live in `index/` (for the `.idx` file) and `cache/` (for `.body` and `.present`) and use a three-file representation.
 
 ### Format comparison
 
-| Property | Locally-written (`pending/` · `segments/`) | Cached (`index/` + `cache/`) |
+| Property | Pre-upload (`pending/`) | Post-upload (`index/` + `cache/`) |
 |---|---|---|
 | File count | 1 per segment | 3 per segment (`.idx`, `.body`, `.present`) |
-| Completeness | Always complete (atomic tmp→rename) | Partial; body populated incrementally |
+| Completeness | Always complete (atomic tmp→rename) | Self-written: full body; demand-fetched: populated incrementally |
 | Format | Header + index + inline + body (+ delta on S3) | `.idx`: header + index + inline; `.body`: sparse body bytes |
 | Delta section | `delta_length = 0` locally; appended by coordinator at upload | Never stored; materialised into `.body` if a delta path is taken |
 | `body_offset` reference point | File-relative (as written) | Body-relative (0 = first byte of body section) — matches `entry.body_offset` directly |
 | Presence tracking | N/A — always 100% present | `.present` bitset; one bit per index entry |
 | Signature location | `header[32..96]` in the single file | `header[32..96]` in `.idx`; verified before any body fetch |
-| Eviction unit | Full file | Full triplet (`.idx` + `.body` + `.present`) |
-| Promotion | `pending/` → `segments/` (after upload) | `cache/` → `segments/` (when `.present` is fully set) |
+| Eviction unit | Not evictable | `.body` + `.present` (the body files); `.idx` is retained as the S3-confirmation marker |
+| Lifecycle transition | `pending/` → `index/` + `cache/` (after S3 upload; volume writes triplet, deletes pending) | terminal form (no further promotion) |
 
 ### File details
 
@@ -549,27 +545,20 @@ The bitset is written atomically per extent: write the bytes to `.body`, fsync (
 For a read that hits a missing body extent:
 
 ```
-1. Check segments/<ulid>         — complete file; serve directly if present
-2. Check cache/<ulid>.present    — check bit N for this extent
+1. Check cache/<ulid>.present    — check bit N for this extent
    - Set → read from cache/<ulid>.body at entry.body_offset
-   - Unset → proceed to step 3
-3. Verify signature in index/<ulid>.idx (if not already verified this session)
-4. Issue byte-range GET to S3: [body_section_start + entry.body_offset,
+   - Unset → proceed to step 2
+2. Verify signature in index/<ulid>.idx (if not already verified this session)
+3. Issue byte-range GET to S3: [body_section_start + entry.body_offset,
                                 body_section_start + entry.body_offset + entry.body_length)
    - If a delta option is available and its source_hash is in the local extent index:
      fetch delta bytes instead; apply against local source; write materialised result
-5. Write bytes to cache/<ulid>.body at entry.body_offset
-6. Set bit N in cache/<ulid>.present
-7. Serve from cache/<ulid>.body
+4. Write bytes to cache/<ulid>.body at entry.body_offset
+5. Set bit N in cache/<ulid>.present
+6. Serve from cache/<ulid>.body
 ```
 
 Coalescing: before issuing GETs, collect all absent extents required for the current read and merge adjacent or nearby `(body_offset, body_length)` ranges into a minimal set of byte-range requests. This is the same coalescing described in the warm-start retrieval strategy.
-
-### Promotion to `segments/`
-
-When all bits in `.present` are set (accounting for implicitly-present REF and INLINE entries), the three cache files can be collapsed into a single complete segment file and moved to `segments/`. This is a background operation — identical in character to GC — and does not need to block reads. The read path checks `segments/<ulid>` before `cache/<ulid>.*`, so once promotion completes all subsequent reads use the simpler path.
-
-Promotion reconstructs the complete file by concatenating: `.idx` bytes + body bytes read sequentially from `.body`. The resulting file is identical in format to a locally-written segment (body-relative offsets in the index match file-relative offsets once the header and index sections are prepended). After the rename to `segments/<ulid>` succeeds, the three cache files are deleted.
 
 ---
 
@@ -619,7 +608,7 @@ Every segment is signed. There are no unsigned segments.
 
 The first 32 bytes of the header (all fields except the 64-byte signature field) are hashed together with the raw bytes of the index section. The signature field at `header[32..96]` is not included — it holds the output.
 
-Signing at promotion/import rather than upload means every copy of the segment (`pending/`, `segments/`, S3) carries the same signature. The coordinator uploads files unchanged; no re-signing step.
+Signing at promotion/import rather than upload means every copy of the segment (`pending/<ulid>`, the post-upload `index/<ulid>.idx`, and the S3 object) carries the same signature. The coordinator uploads files unchanged; no re-signing step.
 
 Because the private key never leaves the host, **all segment writes for a fork — including GC-compacted and S3-repacked segments — happen on the fork's host**. GC always produces new segments (new ULIDs) rather than modifying existing ones; signed segments are read-only once written.
 
