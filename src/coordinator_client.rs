@@ -3,7 +3,8 @@
 // Connects to control.sock, sends one command, reads one response line.
 // A new connection is made per call — the protocol is request-response-close.
 //
-// Exception: `import_attach_by_name` reads multiple lines until a terminal line.
+// Exception: `import_attach_by_name` reads a sequence of typed
+// `ImportAttachEvent` envelopes until the import terminates.
 
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -14,7 +15,9 @@ use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
-    ClaimReply, IpcErrorKind, RebindNameReply, ReleaseReply, StatusRemoteReply, StatusReply,
+    ClaimReply, CreateReply, ForkCreateReply, ImportAttachEvent, ImportStartReply,
+    ImportStatusReply, IpcErrorKind, PullReadonlyReply, RebindNameReply, ReleaseReply,
+    StatusRemoteReply, StatusReply, UpdateReply,
 };
 pub use elide_coordinator::volume_state::VolumeLifecycle;
 
@@ -305,33 +308,37 @@ pub fn import_start(
     name: &str,
     oci_ref: &str,
     extents_from: &[String],
-) -> io::Result<()> {
-    let line = if extents_from.is_empty() {
-        format!("import {name} {oci_ref}")
-    } else {
-        // Volume names are [a-zA-Z0-9._-] so comma is a safe separator.
-        let joined = extents_from.join(",");
-        format!("import {name} {oci_ref} extents:{joined}")
-    };
-    let resp = call(socket_path, &line)?;
-    match resp.split_once(' ') {
-        Some(("ok", _ulid)) => Ok(()),
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+) -> io::Result<ImportStartReply> {
+    call_typed(
+        socket_path,
+        &Request::ImportStart {
+            volume: name.to_owned(),
+            oci_ref: oci_ref.to_owned(),
+            extents_from: extents_from.to_vec(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
-/// Poll the state of an import job by volume name.
-/// Returns the raw state string (`running`, `done`, or an error).
-pub fn import_status_by_name(socket_path: &Path, name: &str) -> io::Result<String> {
-    call(socket_path, &format!("import status {name}"))
+/// Poll the state of an import job by volume name. `Ok(reply)` carries
+/// the import state; failures (no active import, import failed) come
+/// back as `Err`.
+pub fn import_status_by_name(socket_path: &Path, name: &str) -> io::Result<ImportStatusReply> {
+    call_typed(
+        socket_path,
+        &Request::ImportStatus {
+            volume: name.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Stream import output to `out` until the import completes, identified by volume name.
 ///
-/// Reads lines from the coordinator until a terminal `ok done` or `err ...`
-/// line is received. Each output line is written to `out`. Returns Ok(()) on
-/// success, Err on import failure or I/O error.
+/// Reads typed [`ImportAttachEvent`] envelopes from the coordinator
+/// until a terminal `Done` event or an `Envelope::Err` is received.
+/// Each `Line` event's content is written to `out`. Returns `Ok(())`
+/// on success, `Err` on import failure or I/O error.
 pub fn import_attach_by_name(
     socket_path: &Path,
     name: &str,
@@ -343,28 +350,36 @@ pub fn import_attach_by_name(
             socket_path.display()
         ))
     })?;
-    writeln!(stream, "import attach {name}")?;
+    let request = Request::ImportAttach {
+        volume: name.to_owned(),
+    };
+    let line = serde_json::to_string(&request)
+        .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
+    writeln!(stream, "{line}")?;
     stream.flush()?;
     stream.shutdown(std::net::Shutdown::Write)?;
 
     let mut reader = io::BufReader::new(stream);
-    let mut line = String::new();
+    let mut buf = String::new();
     loop {
-        line.clear();
-        reader.read_line(&mut line)?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            // EOF before terminal — treat as transport failure.
+            return Err(io::Error::other(
+                "import stream closed before terminal event",
+            ));
         }
-        if trimmed == "ok done" {
-            return Ok(());
+        let env: Envelope<ImportAttachEvent> = serde_json::from_str(buf.trim())
+            .map_err(|e| io::Error::other(format!("parse import event: {e}")))?;
+        match env.into_result() {
+            Ok(ImportAttachEvent::Line { content }) => {
+                writeln!(out, "{content}")?;
+            }
+            Ok(ImportAttachEvent::Done) => return Ok(()),
+            Err(e) => return Err(io::Error::other(e)),
         }
-        if let Some(msg) = trimmed.strip_prefix("err ") {
-            return Err(io::Error::other(msg.to_owned()));
-        }
-        writeln!(out, "{trimmed}")?;
     }
-    Ok(())
 }
 
 /// Evict S3-confirmed segment bodies from a volume's cache/ directory.
@@ -629,48 +644,42 @@ pub fn create_volume_remote(
     size_bytes: u64,
     flags: &[String],
 ) -> io::Result<String> {
-    let mut line = format!("create {name} {size_bytes}");
-    for f in flags {
-        line.push(' ');
-        line.push_str(f);
-    }
-    let resp = call(socket_path, &line)?;
-    match resp.split_once(' ') {
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        Some(("ok", ulid)) => Ok(ulid.to_owned()),
-        _ if resp == "ok" => Ok(String::new()),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let reply: CreateReply = call_typed(
+        socket_path,
+        &Request::Create {
+            volume: name.to_owned(),
+            size_bytes,
+            flags: flags.to_vec(),
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.vol_ulid.to_string())
 }
 
-/// Update transport configuration on an existing volume. Returns "restarting"
-/// if the running volume process was signalled to pick up the new config, or
-/// "not-running" if it wasn't running.
-pub fn update_volume(socket_path: &Path, name: &str, flags: &[String]) -> io::Result<String> {
-    let mut line = format!("update {name}");
-    for f in flags {
-        line.push(' ');
-        line.push_str(f);
-    }
-    let resp = call(socket_path, &line)?;
-    match resp.split_once(' ') {
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        Some(("ok", note)) => Ok(note.to_owned()),
-        _ if resp == "ok" => Ok(String::new()),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+/// Update transport configuration on an existing volume. `restarted = true`
+/// means the running volume process was signalled to pick up the new
+/// config; `false` means it wasn't running and the new config takes
+/// effect on next start.
+pub fn update_volume(socket_path: &Path, name: &str, flags: &[String]) -> io::Result<UpdateReply> {
+    call_typed(
+        socket_path,
+        &Request::Update {
+            volume: name.to_owned(),
+            flags: flags.to_vec(),
+        },
+    )?
+    .map_err(io::Error::other)
 }
 
 /// Pull one readonly ancestor from the store via the coordinator.
 /// Returns the parent ULID (for the ancestor walk), or `None` for a root.
 pub fn pull_readonly(socket_path: &Path, vol_ulid: &str) -> io::Result<Option<String>> {
-    let resp = call(socket_path, &format!("pull-readonly {vol_ulid}"))?;
-    match resp.split_once(' ') {
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        Some(("ok", parent)) if !parent.is_empty() => Ok(Some(parent.to_owned())),
-        _ if resp == "ok" => Ok(None),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let parsed = ulid::Ulid::from_string(vol_ulid)
+        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
+    let reply: PullReadonlyReply =
+        call_typed(socket_path, &Request::PullReadonly { vol_ulid: parsed })?
+            .map_err(io::Error::other)?;
+    Ok(reply.parent.map(|u| u.to_string()))
 }
 
 /// Synthesize a "now" snapshot for a readonly source. Returns
@@ -697,30 +706,28 @@ pub fn fork_create(
     flags: &[String],
     for_claim: bool,
 ) -> io::Result<String> {
-    let mut line = format!("fork-create {new_name} {source_ulid}");
-    if let Some(s) = snap {
-        line.push_str(&format!(" snap={s}"));
-    }
-    if let Some(k) = parent_key_hex {
-        line.push_str(&format!(" parent-key={k}"));
-    }
-    if for_claim {
-        // Tell the coordinator to skip the `mark_initial` step: this
-        // fork-create is the materialise step of a claim-from-
-        // released flow. The CLI's subsequent `claim` IPC rebinds the
-        // existing `Released` record to the new fork.
-        line.push_str(" for-claim");
-    }
-    for f in flags {
-        line.push(' ');
-        line.push_str(f);
-    }
-    let resp = call(socket_path, &line)?;
-    match resp.split_once(' ') {
-        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        Some(("ok", ulid)) => Ok(ulid.to_owned()),
-        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
-    }
+    let source_vol_ulid = ulid::Ulid::from_string(source_ulid)
+        .map_err(|e| io::Error::other(format!("invalid source ULID: {e}")))?;
+    let snap = match snap {
+        Some(s) => Some(
+            ulid::Ulid::from_string(s)
+                .map_err(|e| io::Error::other(format!("invalid snap ULID: {e}")))?,
+        ),
+        None => None,
+    };
+    let reply: ForkCreateReply = call_typed(
+        socket_path,
+        &Request::ForkCreate {
+            new_name: new_name.to_owned(),
+            source_vol_ulid,
+            snap,
+            parent_key_hex: parent_key_hex.map(|s| s.to_owned()),
+            for_claim,
+            flags: flags.to_vec(),
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.new_vol_ulid.to_string())
 }
 
 #[cfg(test)]
@@ -863,5 +870,80 @@ mod tests {
         let err = status_remote(&sock, "ghost").expect_err("ghost name should error");
         server.join().unwrap();
         assert!(err.to_string().contains("no S3 record"), "{err}");
+    }
+
+    /// Streaming server: spawn a thread that writes a fixed sequence of
+    /// envelopes (one per line) and closes. Used to drive the
+    /// `import_attach_by_name` reader.
+    fn spawn_streaming_server(
+        path: std::path::PathBuf,
+        replies: Vec<String>,
+    ) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read and discard the request line.
+            let mut reader = io::BufReader::new(&stream);
+            let mut req = String::new();
+            let _ = reader.read_line(&mut req);
+            let mut writer = &stream;
+            for r in &replies {
+                let _ = writeln!(writer, "{r}");
+            }
+            let _ = writer.flush();
+        })
+    }
+
+    /// import attach: server emits two `Line` events then `Done`. The
+    /// client should write each line's content to `out` and return Ok.
+    #[test]
+    fn import_attach_streams_lines_and_terminates_on_done() {
+        let (_guard, sock) = temp_socket();
+        let replies = vec![
+            r#"{"outcome":"ok","data":{"kind":"line","content":"first"}}"#.to_string(),
+            r#"{"outcome":"ok","data":{"kind":"line","content":"second"}}"#.to_string(),
+            r#"{"outcome":"ok","data":{"kind":"done"}}"#.to_string(),
+        ];
+        let server = spawn_streaming_server(sock.clone(), replies);
+        let mut out: Vec<u8> = Vec::new();
+        import_attach_by_name(&sock, "vol", &mut out).expect("attach should succeed");
+        server.join().unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "first\nsecond\n");
+    }
+
+    /// import attach: a terminal `Envelope::Err` translates into an
+    /// `io::Error` carrying the typed message.
+    #[test]
+    fn import_attach_propagates_terminal_error() {
+        let (_guard, sock) = temp_socket();
+        let replies = vec![
+            r#"{"outcome":"ok","data":{"kind":"line","content":"warming up"}}"#.to_string(),
+            r#"{"outcome":"err","error":{"kind":"internal","message":"import failed: boom"}}"#
+                .to_string(),
+        ];
+        let server = spawn_streaming_server(sock.clone(), replies);
+        let mut out: Vec<u8> = Vec::new();
+        let err = import_attach_by_name(&sock, "vol", &mut out)
+            .expect_err("terminal error should propagate");
+        server.join().unwrap();
+        assert!(err.to_string().contains("import failed: boom"), "{err}");
+        // The pre-error line still made it through.
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "warming up\n");
+    }
+
+    /// EOF before any terminal event is treated as a transport failure.
+    #[test]
+    fn import_attach_errors_on_premature_eof() {
+        let (_guard, sock) = temp_socket();
+        let replies =
+            vec![r#"{"outcome":"ok","data":{"kind":"line","content":"only line"}}"#.to_string()];
+        let server = spawn_streaming_server(sock.clone(), replies);
+        let mut out: Vec<u8> = Vec::new();
+        let err =
+            import_attach_by_name(&sock, "vol", &mut out).expect_err("premature EOF should error");
+        server.join().unwrap();
+        assert!(err.to_string().contains("closed before terminal"), "{err}");
     }
 }
