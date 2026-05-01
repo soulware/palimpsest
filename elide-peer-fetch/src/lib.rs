@@ -36,11 +36,15 @@
 
 pub mod ancestry;
 pub mod auth;
+pub mod client;
 pub mod endpoint;
+pub mod hint;
 pub mod server;
 pub mod token;
 
+pub use client::{BuildError, PeerFetchClient, PeerFetchClientBuilder, TokenSigner};
 pub use endpoint::{EndpointParseError, PeerEndpoint};
+pub use hint::PrefetchHint;
 pub use token::{
     DEFAULT_FRESHNESS_WINDOW_SECS, DOMAIN_TAG, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };
