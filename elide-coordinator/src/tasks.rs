@@ -206,8 +206,10 @@ pub async fn run_volume_tasks(
         let did_fetch = match &prefetch_result {
             Ok(r) if r.fetched > 0 => {
                 info!(
-                    "[prefetch {volume_id}{volume_name}] fetched {} index section(s)",
-                    r.fetched
+                    "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store)",
+                    r.fetched,
+                    r.fetched_from_peer,
+                    r.fetched - r.fetched_from_peer,
                 );
                 true
             }

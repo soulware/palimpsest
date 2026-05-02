@@ -29,6 +29,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tokio::net::TcpListener;
+use tracing::info;
 use ulid::Ulid;
 
 use crate::auth::{AuthError, AuthState, parse_bearer};
@@ -109,6 +110,13 @@ impl ResourceKind {
             Self::Prefetch => format!("{ulid}.present"),
         }
     }
+
+    fn wire_suffix(self) -> &'static str {
+        match self {
+            Self::Idx => ".idx",
+            Self::Prefetch => ".prefetch",
+        }
+    }
 }
 
 /// Server context shared across handlers — cheap to clone.
@@ -150,9 +158,43 @@ async fn handle_segment(
     Path((vol_id_str, filename)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, RouteError> {
+    let result = handle_segment_inner(&ctx, &vol_id_str, &filename, &headers).await;
+    match &result {
+        Ok((kind, ulid, bytes)) => {
+            info!(
+                "[peer-fetch] served {} {}/{} ({} bytes)",
+                kind.wire_suffix(),
+                vol_id_str,
+                ulid,
+                bytes.len(),
+            );
+        }
+        Err(e) => {
+            // Log every rejection. Auth failures are the interesting
+            // case for the manual matrix (401/403); the rest are
+            // route-shape errors a typo would produce.
+            info!("[peer-fetch] rejected {}/{}: {}", vol_id_str, filename, e);
+        }
+    }
+    result.map(|(_, _, bytes)| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .header(http::header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+            .expect("response builder accepts well-formed parts")
+    })
+}
+
+async fn handle_segment_inner(
+    ctx: &ServerContext,
+    vol_id_str: &str,
+    filename: &str,
+    headers: &HeaderMap,
+) -> Result<(ResourceKind, Ulid, Vec<u8>), RouteError> {
     // Path parsing is cheap; do it before the auth round-trip so a
     // bad URL doesn't burn S3 lookups.
-    let vol_id = Ulid::from_string(&vol_id_str).map_err(|_| RouteError::BadVolId)?;
+    let vol_id = Ulid::from_string(vol_id_str).map_err(|_| RouteError::BadVolId)?;
     let (ulid_str, kind) = if let Some(s) = filename.strip_suffix(".idx") {
         (s, ResourceKind::Idx)
     } else if let Some(s) = filename.strip_suffix(".prefetch") {
@@ -186,12 +228,7 @@ async fn handle_segment(
         Err(e) => return Err(RouteError::Io(e)),
     };
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/octet-stream")
-        .header(http::header::CONTENT_LENGTH, bytes.len())
-        .body(Body::from(bytes))
-        .expect("response builder accepts well-formed parts"))
+    Ok((kind, ulid, bytes))
 }
 
 #[cfg(test)]
