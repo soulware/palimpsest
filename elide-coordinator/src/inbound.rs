@@ -1460,7 +1460,10 @@ async fn pull_readonly_op(
         )));
     }
 
+    let pull_started = std::time::Instant::now();
+
     // Step 1: fetch manifest.toml.
+    let step1_started = std::time::Instant::now();
     let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
     let manifest_bytes = match store.get(&manifest_key).await {
         Ok(d) => d
@@ -1483,8 +1486,10 @@ async fn pull_readonly_op(
         .get("size")
         .and_then(|v| v.as_integer())
         .ok_or_else(|| IpcError::internal("manifest.toml missing 'size'"))?;
+    let manifest_elapsed = step1_started.elapsed();
 
     // Step 2: fetch volume.pub.
+    let step2_started = std::time::Instant::now();
     let pub_key_bytes = store
         .get(&StorePath::from(format!("by_id/{volume_id}/volume.pub")))
         .await
@@ -1492,8 +1497,10 @@ async fn pull_readonly_op(
         .bytes()
         .await
         .map_err(|e| IpcError::store(format!("reading volume.pub: {e}")))?;
+    let pub_elapsed = step2_started.elapsed();
 
     // Step 3: fetch volume.provenance. NotFound is hard error.
+    let step3_started = std::time::Instant::now();
     let provenance_bytes = match store
         .get(&StorePath::from(format!(
             "by_id/{volume_id}/volume.provenance"
@@ -1515,11 +1522,13 @@ async fn pull_readonly_op(
             )));
         }
     };
+    let provenance_elapsed = step3_started.elapsed();
 
     // Step 4: write the ancestor entry. No name carried over from manifest:
     // a missing volume.name (and missing by_name/ symlink) is the on-disk
     // marker that distinguishes a pulled ancestor from a user-managed volume.
     let _ = manifest;
+    let step4_started = std::time::Instant::now();
     let result: std::io::Result<()> = (|| {
         std::fs::create_dir_all(&vol_dir)?;
         elide_core::config::VolumeConfig {
@@ -1541,8 +1550,10 @@ async fn pull_readonly_op(
         let _ = std::fs::remove_dir_all(&vol_dir);
         return Err(IpcError::internal(format!("writing pulled ancestor: {e}")));
     }
+    let write_elapsed = step4_started.elapsed();
 
     // Step 5: parse and verify provenance to find the parent.
+    let step5_started = std::time::Instant::now();
     let parent = match elide_core::signing::read_lineage_verifying_signature(
         &vol_dir,
         elide_core::signing::VOLUME_PUB_FILE,
@@ -1563,8 +1574,17 @@ async fn pull_readonly_op(
             )));
         }
     };
+    let verify_elapsed = step5_started.elapsed();
 
-    info!("[inbound] pulled ancestor {volume_id}");
+    info!(
+        "[inbound] pulled ancestor {volume_id} in {:.2?} (manifest {:.2?}, pub {:.2?}, provenance {:.2?}, write {:.2?}, verify {:.2?})",
+        pull_started.elapsed(),
+        manifest_elapsed,
+        pub_elapsed,
+        provenance_elapsed,
+        write_elapsed,
+        verify_elapsed,
+    );
     Ok(PullReadonlyReply { parent })
 }
 
@@ -3709,7 +3729,12 @@ async fn stream_fork_by_name(new_name: &str, writer: &mut OwnedWriteHalf, regist
 /// `Claiming` callers subscribe via `claim-attach` to stream progress.
 async fn start_claim(volume: String, ctx: IpcContext) -> Result<ClaimStartReply, IpcError> {
     let store = ctx.stores.coordinator_wide();
+    let bucket_started = std::time::Instant::now();
     let bucket = claim_volume_bucket_op(&volume, &ctx.data_dir, &store, &ctx.identity).await?;
+    info!(
+        "[claim {volume}] bucket-side claim resolved in {:.2?}",
+        bucket_started.elapsed()
+    );
     match bucket {
         ClaimReply::Reclaimed => Ok(ClaimStartReply::Reclaimed),
         ClaimReply::MustClaimFresh {
@@ -3777,6 +3802,8 @@ async fn run_claim_job(
 
     // Step 1: pull the released chain locally if absent. Walks
     // ancestor-by-ancestor exactly as the fork orchestrator does.
+    let chain_started = std::time::Instant::now();
+    let mut chain_pulled = 0usize;
     let mut next: Option<ulid::Ulid> = Some(released_vol_ulid);
     while let Some(vol_ulid) = next.take() {
         let dir = volume::resolve_ancestor_dir(&by_id_dir, &vol_ulid.to_string());
@@ -3786,8 +3813,13 @@ async fn run_claim_job(
         job.append(ClaimAttachEvent::PullingAncestor { vol_ulid });
         let store = ctx.stores.for_volume(&vol_ulid);
         let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
+        chain_pulled += 1;
         next = reply.parent;
     }
+    info!(
+        "[claim {volume}] ancestor chain pulled: {chain_pulled} in {:.2?}",
+        chain_started.elapsed()
+    );
 
     let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &released_vol_ulid.to_string());
     if !source_dir.exists() {
@@ -3799,8 +3831,13 @@ async fn run_claim_job(
     // Step 2: resolve the handoff key. Recovery snapshots are signed
     // by an attestation key the fork's provenance must record so its
     // own signature verifies later.
+    let handoff_started = std::time::Instant::now();
     let store = ctx.stores.for_volume(&released_vol_ulid);
     let key = resolve_handoff_key_op(released_vol_ulid, handoff_snap, &store).await?;
+    info!(
+        "[claim {volume}] handoff key resolved in {:.2?}",
+        handoff_started.elapsed()
+    );
     let parent_key_hex = match &key {
         ResolveHandoffKeyReply::Normal => None,
         ResolveHandoffKeyReply::Recovery {
@@ -3813,6 +3850,7 @@ async fn run_claim_job(
     // tells `fork_create_op` to skip `mark_initial` (the released
     // record already exists) and to detect a resumable orphan at
     // `by_name/<name>`.
+    let fork_create_started = std::time::Instant::now();
     let store_wide = ctx.stores.coordinator_wide();
     // Source's pre-release name == new fork name. Claim rebinds the
     // same `names/<volume>` record; the released volume held that
@@ -3838,13 +3876,22 @@ async fn run_claim_job(
     job.append(ClaimAttachEvent::ForkCreated {
         new_vol_ulid: reply.new_vol_ulid,
     });
+    info!(
+        "[claim {volume}] fork created in {:.2?}",
+        fork_create_started.elapsed()
+    );
 
     // Step 4: surface prefetch warm-up. Same non-fatal semantics as
     // the fork flow: the bucket-side claim and local fork are durable
     // by this point.
+    let prefetch_wait_started = std::time::Instant::now();
     job.append(ClaimAttachEvent::PrefetchStarted);
     let _ = await_prefetch_op(reply.new_vol_ulid, &ctx.prefetch_tracker).await;
     job.append(ClaimAttachEvent::PrefetchDone);
+    info!(
+        "[claim {volume}] prefetch+prewarm awaited in {:.2?}",
+        prefetch_wait_started.elapsed()
+    );
 
     Ok(())
 }
