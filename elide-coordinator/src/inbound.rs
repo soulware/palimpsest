@@ -3801,7 +3801,6 @@ async fn run_claim_job(
         let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
         next = reply.parent;
     }
-    ctx.rescan.notify_one();
 
     let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &released_vol_ulid.to_string());
     if !source_dir.exists() {
