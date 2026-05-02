@@ -218,11 +218,14 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 | Marker files present | State |
 |---|---|
 | `volume.pid` alive | running — volume process is serving I/O |
+| `volume.released` | released — `names/<name>` flipped to `Released`; reclaim before restart (display-only marker, see below) |
 | `volume.stopped` | explicitly stopped — coordinator will not restart |
 | `import.lock` (no `control.sock`) | import write phase or interrupted |
 | `import.lock` + `control.sock` | import serve phase — coordinator may send IPC |
 | `volume.readonly` | readonly — coordinator never supervises |
 | none of the above | idle — coordinator will start the volume process |
+
+`volume.released` is a CLI display marker, not a lifecycle gate. Authoritative claim state lives in `names/<name>` in the bucket; the local marker only exists so `elide volume list` can render `released` without an S3 round-trip. The supervisor, the reconcile path, and the claim/start flows do **not** consult it — they read `names/<name>` directly. The release IPC handlers write the marker (with the handoff snapshot ULID as the body) after a successful flip; the in-place reclaim path clears it.
 
 **Volume ancestry:** a volume's `volume.parent` file names its parent ULID and the branch-point snapshot ULID. `walk_ancestors(vol_dir, by_id_dir)` follows this chain to the root (a volume with no `volume.parent` file), building an oldest-first list of ancestor layers. Segments in each ancestor are included only up to the branch-point ULID — post-branch writes to an ancestor are not visible in derived volumes.
 

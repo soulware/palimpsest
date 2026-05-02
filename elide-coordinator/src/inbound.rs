@@ -43,7 +43,9 @@ use elide_coordinator::ipc::{
     ResolveHandoffKeyReply, ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply,
     StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
-use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
+use elide_coordinator::volume_state::{
+    IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE, clear_released_marker, write_released_marker,
+};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
     subscribe_prefetch,
@@ -2628,6 +2630,19 @@ async fn force_release_volume_op(
                 published.snap_ulid,
             );
 
+            // Best-effort local display marker. force-release is also
+            // used to displace a *foreign* coordinator's record without
+            // any local fork — in that case the by_name symlink doesn't
+            // resolve and we silently skip the marker write.
+            if let Ok(vol_dir) = std::fs::canonicalize(data_dir.join("by_name").join(volume_name))
+                && let Err(e) = write_released_marker(&vol_dir, published.snap_ulid)
+            {
+                warn!(
+                    "[inbound] force-release {volume_name}: writing volume.released \
+                     marker: {e} (display-only; bucket state authoritative)"
+                );
+            }
+
             // Best-effort journal entry recording the override.
             elide_coordinator::volume_event_store::emit_best_effort(
                 store,
@@ -2778,7 +2793,8 @@ async fn release_volume_op(
                 "[release {volume_name}] fast path: reusing snapshot {snap_ulid} \
                  (clean stopped volume, no daemon restart needed)"
             );
-            let result = perform_release_flip(volume_name, store, identity, snap_ulid).await;
+            let result =
+                perform_release_flip(volume_name, &vol_dir, store, identity, snap_ulid).await;
             info!(
                 "[release {volume_name}] complete in {:.2?}",
                 started.elapsed()
@@ -2895,7 +2911,7 @@ async fn release_volume_op(
         }
     }
 
-    let result = perform_release_flip(volume_name, store, identity, snap_ulid).await;
+    let result = perform_release_flip(volume_name, &vol_dir, store, identity, snap_ulid).await;
     info!(
         "[release {volume_name}] complete in {:.2?}",
         started.elapsed()
@@ -2904,8 +2920,13 @@ async fn release_volume_op(
 }
 
 /// Final S3 conditional PUT flipping `names/<name>` to Released.
+///
+/// On success also writes `volume.released` into `vol_dir` as a
+/// best-effort display marker — the bucket record is authoritative,
+/// the local marker only drives `volume list` rendering.
 async fn perform_release_flip(
     volume_name: &str,
+    vol_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     snap_ulid: ulid::Ulid,
@@ -2925,6 +2946,12 @@ async fn perform_release_flip(
                  (flip {:.2?})",
                 flip_started.elapsed()
             );
+            if let Err(e) = write_released_marker(vol_dir, snap_ulid) {
+                warn!(
+                    "[release {volume_name}] writing volume.released marker: {e} \
+                     (display-only; bucket state authoritative)"
+                );
+            }
             elide_coordinator::volume_event_store::emit_best_effort(
                 store,
                 identity.as_ref(),
@@ -2944,6 +2971,15 @@ async fn perform_release_flip(
                 "[release {volume_name}] release flip was idempotent or absent \
                  (no event emitted)"
             );
+            // Idempotent path: the bucket record is already Released. Best-
+            // effort backfill the local display marker so `volume list`
+            // shows the right state on hosts that released earlier.
+            if let Err(e) = write_released_marker(vol_dir, snap_ulid) {
+                warn!(
+                    "[release {volume_name}] writing volume.released marker: {e} \
+                     (display-only; bucket state authoritative)"
+                );
+            }
             Ok(ReleaseReply {
                 handoff_snapshot: snap_ulid,
             })
@@ -3138,6 +3174,16 @@ async fn claim_volume_bucket_op(
                             "[inbound] reclaimed {volume_name} in place (vol_ulid {})",
                             record.vol_ulid
                         );
+                        // Best-effort: drop the display-only marker now
+                        // that the bucket record is no longer Released.
+                        if let Ok(vol_dir) = std::fs::canonicalize(&link)
+                            && let Err(e) = clear_released_marker(&vol_dir)
+                        {
+                            warn!(
+                                "[inbound] reclaim {volume_name}: clearing \
+                                 volume.released marker: {e}"
+                            );
+                        }
                         elide_coordinator::volume_event_store::emit_best_effort(
                             store,
                             identity.as_ref(),
