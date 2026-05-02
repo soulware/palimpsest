@@ -58,6 +58,7 @@ pub struct PeerFetchContext {
     pub volume_name: String,
 }
 
+#[derive(Default)]
 pub struct PrefetchResult {
     pub fetched: usize,
     /// Of `fetched`, how many came from a peer (the rest came from S3).
@@ -66,6 +67,12 @@ pub struct PrefetchResult {
     pub fetched_from_peer: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Snapshot artifacts (markers, manifests, filemaps) downloaded
+    /// during this run. Counted separately from `.idx` so the per-run
+    /// log line keeps the index/snapshot signals distinct.
+    pub snapshots_fetched: usize,
+    /// Of `snapshots_fetched`, how many came from a peer.
+    pub snapshots_from_peer: usize,
 }
 
 // Segment file header constants are re-exported from elide-core/src/segment.rs
@@ -225,12 +232,7 @@ pub async fn prefetch_indexes(
         let store = store.clone();
         let peer = peer_owned.clone();
         async move {
-            let mut local = PrefetchResult {
-                fetched: 0,
-                fetched_from_peer: 0,
-                skipped: 0,
-                failed: 0,
-            };
+            let mut local = PrefetchResult::default();
             prefetch_fork(
                 &store,
                 &task.dir,
@@ -248,17 +250,14 @@ pub async fn prefetch_indexes(
     .try_collect()
     .await?;
 
-    let mut result = PrefetchResult {
-        fetched: 0,
-        fetched_from_peer: 0,
-        skipped: 0,
-        failed: 0,
-    };
+    let mut result = PrefetchResult::default();
     for r in outcomes {
         result.fetched += r.fetched;
         result.fetched_from_peer += r.fetched_from_peer;
         result.skipped += r.skipped;
         result.failed += r.failed;
+        result.snapshots_fetched += r.snapshots_fetched;
+        result.snapshots_from_peer += r.snapshots_from_peer;
     }
     Ok(result)
 }
@@ -386,7 +385,7 @@ async fn prefetch_fork(
     // writable fork (`branch_ulid = None`) we still fetch every snapshot
     // present in the bucket so the read path can replay against any of
     // them.
-    prefetch_snapshots(store, fork_dir, volume_id, branch_ulid).await?;
+    prefetch_snapshots(store, fork_dir, volume_id, branch_ulid, peer, result).await?;
 
     Ok(())
 }
@@ -475,30 +474,60 @@ async fn fetch_idx(
     Ok(())
 }
 
-/// Download snapshot markers and filemaps from S3 into `<fork_dir>/snapshots/`.
+/// Download snapshot markers, manifests, and filemaps from S3 (and/or
+/// the configured peer) into `<fork_dir>/snapshots/`.
 ///
-/// Lists `by_id/<volume_id>/snapshots/` and downloads any files not already
-/// present locally. Snapshot markers are empty files; filemaps are small text
-/// files. Both are written atomically (tmp → rename).
+/// Two paths:
 ///
-/// When `branch_ulid = Some(b)`, restricts to just the artifacts for that
-/// specific snapshot (`<b>`, `<b>.manifest`, `<b>.filemap`). Used by the
-/// ancestor-walk path to avoid pulling every snapshot the ancestor ever
-/// minted — only the branch-point snapshot is on this fork's read path.
+/// 1. **Branch-point fast path** — `branch_ulid = Some(b)` and a peer
+///    context is available. The three artifact names are known
+///    up-front (`<b>`, `<b>.manifest`, `<b>.filemap`); we issue all
+///    three peer GETs in parallel via [`futures::future::join_all`]
+///    and skip the S3 LIST entirely on the happy path. For any
+///    artifact the peer doesn't have, we fall through to a per-name
+///    S3 GET keyed via [`crate::upload::snapshot_key`] /
+///    [`crate::upload::snapshot_manifest_key`] /
+///    [`crate::upload::filemap_key`] — still no LIST.
+///
+/// 2. **Listed path** — `branch_ulid = None` (current writable fork)
+///    or no peer context. Lists `by_id/<volume_id>/snapshots/`,
+///    filters by branch (if set) and skip-if-local, and fetches the
+///    remainder via S3 GETs bounded by `buffer_unordered`.
+///
+/// Both paths write atomically (tmp → rename).
 async fn prefetch_snapshots(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
     volume_id: &str,
     branch_ulid: Option<&str>,
+    peer: Option<&PeerFetchContext>,
+    result: &mut PrefetchResult,
 ) -> Result<()> {
+    let snap_dir = fork_dir.join("snapshots");
+
+    // Fast path: known branch + peer available. The three artifact
+    // names are deterministic, so we can fetch by-name without ever
+    // listing. S3 LIST stays off the critical path entirely when the
+    // peer answers; on a peer miss we fall back to a single S3 GET
+    // per missed artifact (also no LIST).
+    if let (Some(branch), Some(peer_ctx)) = (branch_ulid, peer)
+        && let (Ok(vol_ulid), Ok(snap_ulid)) =
+            (Ulid::from_string(volume_id), Ulid::from_string(branch))
+    {
+        return prefetch_branch_snapshot_artifacts(
+            store, &snap_dir, vol_ulid, snap_ulid, peer_ctx, result,
+        )
+        .await;
+    }
+
+    // Listed path: no branch, or no peer. Either way LIST is the only
+    // way to discover what to fetch.
     let prefix = StorePath::from(format!("by_id/{volume_id}/snapshots/"));
     let objects: Vec<_> = store
         .list(Some(&prefix))
         .try_collect()
         .await
         .with_context(|| format!("listing by_id/{volume_id}/snapshots/"))?;
-
-    let snap_dir = fork_dir.join("snapshots");
 
     // Filter + skip-if-local synchronously, then fetch the remaining
     // artifacts concurrently. Bounded with `buffer_unordered` so a
@@ -528,10 +557,11 @@ async fn prefetch_snapshots(
     }
     std::fs::create_dir_all(&snap_dir).context("creating snapshots dir")?;
 
-    let snap_dir = snap_dir.clone();
+    let snap_dir_owned = snap_dir.clone();
+    let n = to_fetch.len();
     futures::stream::iter(to_fetch.into_iter().map(|(location, filename)| {
         let store = store.clone();
-        let snap_dir = snap_dir.clone();
+        let snap_dir = snap_dir_owned.clone();
         async move {
             let data = store
                 .get(&location)
@@ -541,13 +571,7 @@ async fn prefetch_snapshots(
                 .await
                 .with_context(|| format!("reading {location}"))?;
 
-            let tmp_path = snap_dir.join(format!("{filename}.tmp"));
-            let local_path = snap_dir.join(&filename);
-            std::fs::write(&tmp_path, &data)
-                .with_context(|| format!("writing {}", tmp_path.display()))?;
-            std::fs::rename(&tmp_path, &local_path)
-                .with_context(|| format!("renaming to {}", local_path.display()))?;
-
+            write_snapshot_artifact_atomic(&snap_dir, &filename, &data)?;
             info!("[prefetch] fetched snapshot artifact: {filename}");
             anyhow::Ok(())
         }
@@ -555,6 +579,141 @@ async fn prefetch_snapshots(
     .buffer_unordered(PREFETCH_CONCURRENCY)
     .try_collect::<Vec<()>>()
     .await?;
+
+    result.snapshots_fetched += n;
+
+    Ok(())
+}
+
+/// Write `<snap_dir>/<filename>` atomically (tmp → rename).
+fn write_snapshot_artifact_atomic(snap_dir: &Path, filename: &str, data: &[u8]) -> Result<()> {
+    let tmp_path = snap_dir.join(format!("{filename}.tmp"));
+    let local_path = snap_dir.join(filename);
+    std::fs::write(&tmp_path, data).with_context(|| format!("writing {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &local_path)
+        .with_context(|| format!("renaming to {}", local_path.display()))?;
+    Ok(())
+}
+
+/// Branch-point fast path. Fetch the three known artifact names in
+/// parallel — peer first, S3 by-name on miss, no LIST on either tier.
+async fn prefetch_branch_snapshot_artifacts(
+    store: &Arc<dyn ObjectStore>,
+    snap_dir: &Path,
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+    peer: &PeerFetchContext,
+    result: &mut PrefetchResult,
+) -> Result<()> {
+    let volume_id = vol_ulid.to_string();
+    let snap_ulid_str = snap_ulid.to_string();
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Marker,
+        Manifest,
+        Filemap,
+    }
+
+    let candidates: [(Kind, String); 3] = [
+        (Kind::Marker, snap_ulid_str.to_string()),
+        (Kind::Manifest, format!("{snap_ulid_str}.manifest")),
+        (Kind::Filemap, format!("{snap_ulid_str}.filemap")),
+    ];
+
+    // Skip-if-local up front — same semantics as the listed path.
+    let to_fetch: Vec<(Kind, String)> = candidates
+        .into_iter()
+        .filter(|(_, name)| !snap_dir.join(name).exists())
+        .collect();
+
+    if to_fetch.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(snap_dir).context("creating snapshots dir")?;
+
+    // Phase 1: try the peer for each artifact in parallel. Successful
+    // fetches are written immediately; misses go to the S3 fallback
+    // list. Each peer call already collapses every error mode to
+    // `None`, so this future set never short-circuits on failure.
+    let peer_futs = to_fetch.iter().map(|(kind, _)| {
+        let client = peer.client.clone();
+        let endpoint = peer.endpoint.clone();
+        let volume_name = peer.volume_name.clone();
+        let kind = *kind;
+        async move {
+            match kind {
+                Kind::Marker => {
+                    client
+                        .fetch_snapshot_marker(&endpoint, &volume_name, vol_ulid, snap_ulid)
+                        .await
+                }
+                Kind::Manifest => {
+                    client
+                        .fetch_snapshot_manifest(&endpoint, &volume_name, vol_ulid, snap_ulid)
+                        .await
+                }
+                Kind::Filemap => {
+                    client
+                        .fetch_snapshot_filemap(&endpoint, &volume_name, vol_ulid, snap_ulid)
+                        .await
+                }
+            }
+        }
+    });
+    let peer_outcomes = futures::future::join_all(peer_futs).await;
+
+    let mut s3_fallback: Vec<(Kind, String)> = Vec::new();
+    for ((kind, name), peer_bytes) in to_fetch.into_iter().zip(peer_outcomes) {
+        match peer_bytes {
+            Some(bytes) => {
+                write_snapshot_artifact_atomic(snap_dir, &name, &bytes)?;
+                info!("[prefetch] fetched snapshot artifact from peer: {name}");
+                result.snapshots_fetched += 1;
+                result.snapshots_from_peer += 1;
+            }
+            None => {
+                trace!("[prefetch] peer miss for snapshot artifact {name}; falling through to S3");
+                s3_fallback.push((kind, name));
+            }
+        }
+    }
+
+    // Phase 2: S3 fallback for any peer misses, also in parallel.
+    // Each artifact's S3 key is computable from `(volume_id, snap_ulid_str)`
+    // via the upload helpers; no LIST needed.
+    if s3_fallback.is_empty() {
+        return Ok(());
+    }
+    let n = s3_fallback.len();
+    let snap_dir_owned = snap_dir.to_path_buf();
+    futures::stream::iter(s3_fallback.into_iter().map(|(kind, name)| {
+        let store = store.clone();
+        let snap_dir = snap_dir_owned.clone();
+        let volume_id = volume_id.to_owned();
+        let snap_ulid_str = snap_ulid_str.to_owned();
+        async move {
+            let key = match kind {
+                Kind::Marker => crate::upload::snapshot_key(&volume_id, &snap_ulid_str),
+                Kind::Manifest => crate::upload::snapshot_manifest_key(&volume_id, &snap_ulid_str),
+                Kind::Filemap => crate::upload::filemap_key(&volume_id, &snap_ulid_str),
+            }?;
+            let data = store
+                .get(&key)
+                .await
+                .with_context(|| format!("downloading {key}"))?
+                .bytes()
+                .await
+                .with_context(|| format!("reading {key}"))?;
+            write_snapshot_artifact_atomic(&snap_dir, &name, &data)?;
+            info!("[prefetch] fetched snapshot artifact: {name}");
+            anyhow::Ok(())
+        }
+    }))
+    .buffer_unordered(PREFETCH_CONCURRENCY)
+    .try_collect::<Vec<()>>()
+    .await?;
+
+    result.snapshots_fetched += n;
 
     Ok(())
 }
@@ -1021,5 +1180,122 @@ mod tests {
             result.is_err(),
             "peer_fetch_idx should propagate error so the caller falls through to S3"
         );
+    }
+
+    /// Branch-point fast path: with a peer context but an unreachable
+    /// peer, `prefetch_branch_snapshot_artifacts` must fall through to
+    /// the keyed S3 GETs (no LIST) and still land all three artifacts
+    /// locally. Asserts the artifacts arrive *and* that the
+    /// `snapshots_fetched` accounting reflects S3 (not peer).
+    #[tokio::test]
+    async fn branch_snapshot_fast_path_falls_back_to_s3_when_peer_unreachable() {
+        use elide_peer_fetch::PeerEndpoint;
+        use std::sync::Arc as StdArc;
+
+        #[derive(Debug)]
+        struct StubSigner;
+        impl elide_peer_fetch::TokenSigner for StubSigner {
+            fn coordinator_id(&self) -> &str {
+                "stub-coord"
+            }
+            fn sign(&self, _msg: &[u8]) -> [u8; 64] {
+                [0u8; 64]
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
+
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        let branch = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_ulid.to_owned(),
+                    snapshot_ulid: branch.to_owned(),
+                    pubkey: parent_key.verifying_key().to_bytes(),
+                    manifest_pubkey: None,
+                }),
+                extent_index: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        // Upload the three branch-point artifacts to S3 under the
+        // canonical date-partitioned keys. Use the upload helpers so
+        // the test stays in sync with the production keying.
+        let marker_key = crate::upload::snapshot_key(parent_ulid, branch).unwrap();
+        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, branch).unwrap();
+        let filemap_key = crate::upload::filemap_key(parent_ulid, branch).unwrap();
+        store
+            .put(&marker_key, bytes::Bytes::new().into())
+            .await
+            .unwrap();
+        store
+            .put(
+                &manifest_key,
+                bytes::Bytes::from_static(b"manifest-bytes").into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &filemap_key,
+                bytes::Bytes::from_static(b"# elide-filemap v2\n").into(),
+            )
+            .await
+            .unwrap();
+
+        // Build a peer context pointing at port 1 (ECONNREFUSED).
+        let signer: StdArc<dyn elide_peer_fetch::TokenSigner> = StdArc::new(StubSigner);
+        let client = elide_peer_fetch::PeerFetchClient::builder(signer)
+            .request_timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let peer = PeerFetchContext {
+            client,
+            endpoint: PeerEndpoint::new("127.0.0.1".to_owned(), 1),
+            volume_name: "myvol".to_owned(),
+        };
+
+        let result = prefetch_indexes(&child_dir, &store, Some(&peer))
+            .await
+            .unwrap();
+
+        // All three artifacts present locally under the parent.
+        let snap_dir = parent_dir.join("snapshots");
+        for suffix in ["", ".manifest", ".filemap"] {
+            assert!(
+                snap_dir.join(format!("{branch}{suffix}")).exists(),
+                "branch artifact {branch}{suffix} should land via S3 fallback"
+            );
+        }
+
+        // All snapshots came from S3 (peer was unreachable).
+        assert_eq!(result.snapshots_fetched, 3);
+        assert_eq!(result.snapshots_from_peer, 0);
     }
 }

@@ -204,14 +204,24 @@ pub async fn run_volume_tasks(
         let prefetch_result =
             prefetch::prefetch_indexes(&fork_dir, &store, peer_ctx.as_ref()).await;
         let did_fetch = match &prefetch_result {
-            Ok(r) if r.fetched > 0 => {
-                info!(
-                    "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store)",
-                    r.fetched,
-                    r.fetched_from_peer,
-                    r.fetched - r.fetched_from_peer,
-                );
-                true
+            Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 => {
+                if r.fetched > 0 {
+                    info!(
+                        "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store)",
+                        r.fetched,
+                        r.fetched_from_peer,
+                        r.fetched - r.fetched_from_peer,
+                    );
+                }
+                if r.snapshots_fetched > 0 {
+                    info!(
+                        "[prefetch {volume_id}{volume_name}] fetched {} snapshot artifact(s) ({} from peer, {} from store)",
+                        r.snapshots_fetched,
+                        r.snapshots_from_peer,
+                        r.snapshots_fetched - r.snapshots_from_peer,
+                    );
+                }
+                r.fetched > 0
             }
             Ok(_) => false,
             Err(e) => {

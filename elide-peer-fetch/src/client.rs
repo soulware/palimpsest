@@ -1,15 +1,22 @@
-//! HTTP client for fetching segment data from peer coordinators.
+//! HTTP client for fetching segment and snapshot data from peer coordinators.
 //!
-//! Two operations:
+//! Five operations:
 //! - [`PeerFetchClient::fetch_idx`] — full-file fetch of `.idx`.
 //! - [`PeerFetchClient::fetch_prefetch_hint`] — full-file fetch of the
 //!   advisory `.prefetch` payload (server synthesises from local
 //!   `cache/<ulid>.present`; client receives a typed [`PrefetchHint`]).
+//! - [`PeerFetchClient::fetch_snapshot_marker`] — full-file fetch of
+//!   the bare snapshot marker (empty file under `snapshots/`).
+//! - [`PeerFetchClient::fetch_snapshot_manifest`] — full-file fetch of
+//!   `snapshots/<snap>.manifest` (signed handoff manifest).
+//! - [`PeerFetchClient::fetch_snapshot_filemap`] — full-file fetch of
+//!   `snapshots/<snap>.filemap` (per-file fragment table).
 //!
 //! Failure model: the client treats every non-200 response (404 / 401 /
 //! 403 / network error / timeout) as `Ok(None)`. The caller — the
-//! prefetch loop — falls through to S3 for `.idx` misses and simply
-//! drops the warming hint for `.prefetch` misses. There is intentionally
+//! prefetch loop — falls through to S3 on miss for the artifact
+//! flavours (`.idx`, `.manifest`, `.filemap`, marker) and simply drops
+//! the warming hint for `.prefetch` misses. There is intentionally
 //! no error type leakage from the peer; the peer is opportunistic, and
 //! every failure mode collapses to "ask S3 instead."
 //!
@@ -141,6 +148,52 @@ impl PeerFetchClient {
         self.get_bytes(volume_name, &url)
             .await
             .map(PrefetchHint::from_wire_bytes)
+    }
+
+    /// Fetch the bare snapshot marker (`<snap>` with no on-disk suffix;
+    /// `<snap>.snapshot` on the wire). Returns the response body — an
+    /// empty `Bytes` on success, since the marker file is itself empty.
+    /// Caller writes a 0-byte marker locally on `Some(_)`.
+    pub async fn fetch_snapshot_marker(
+        &self,
+        peer: &PeerEndpoint,
+        volume_name: &str,
+        vol_id: Ulid,
+        snap_ulid: Ulid,
+    ) -> Option<Bytes> {
+        let url = format!("{}/v1/{}/{}.snapshot", peer.url(), vol_id, snap_ulid);
+        self.get_bytes(volume_name, &url).await
+    }
+
+    /// Fetch `snapshots/<snap>.manifest` (the signed handoff manifest).
+    /// The caller is responsible for verifying the signature against
+    /// the appropriate volume key before acting on the contents — this
+    /// client returns raw bytes, matching the existing S3 path semantics.
+    pub async fn fetch_snapshot_manifest(
+        &self,
+        peer: &PeerEndpoint,
+        volume_name: &str,
+        vol_id: Ulid,
+        snap_ulid: Ulid,
+    ) -> Option<Bytes> {
+        let url = format!("{}/v1/{}/{}.manifest", peer.url(), vol_id, snap_ulid);
+        self.get_bytes(volume_name, &url).await
+    }
+
+    /// Fetch `snapshots/<snap>.filemap` (per-file fragment table).
+    /// The filemap itself is unsigned; row-level blake3 hashes are
+    /// content-verified later when actually reading bytes, so a
+    /// tampered filemap can mislead dedup/lookup but cannot let
+    /// corrupted bytes through.
+    pub async fn fetch_snapshot_filemap(
+        &self,
+        peer: &PeerEndpoint,
+        volume_name: &str,
+        vol_id: Ulid,
+        snap_ulid: Ulid,
+    ) -> Option<Bytes> {
+        let url = format!("{}/v1/{}/{}.filemap", peer.url(), vol_id, snap_ulid);
+        self.get_bytes(volume_name, &url).await
     }
 
     async fn get_bytes(&self, volume_name: &str, url: &str) -> Option<Bytes> {
