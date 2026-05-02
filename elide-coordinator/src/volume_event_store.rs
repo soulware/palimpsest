@@ -15,11 +15,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutResult};
 use tracing::{debug, warn};
 use ulid::Ulid;
+
+/// Concurrency cap for parallel event-body fetches inside
+/// `list_events`. Sized to match the per-prefetch cap in
+/// `crate::prefetch::PREFETCH_CONCURRENCY` — the same HTTP/2
+/// multiplexing argument applies (commodity object stores tolerate
+/// 8-way concurrency on a single connection comfortably).
+const EVENT_FETCH_CONCURRENCY: usize = 8;
 
 use elide_core::signing::{self, VerifyingKey};
 use elide_core::volume_event::{EventKind, VolumeEvent};
@@ -242,47 +249,61 @@ pub async fn list_events(
     let prefix = event_prefix(name);
     let objects: Vec<_> = store.list(Some(&prefix)).try_collect().await?;
 
-    let mut events = Vec::with_capacity(objects.len());
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let Some(stem) = filename.strip_suffix(".toml") else {
-            continue;
-        };
-        if Ulid::from_string(stem).is_err() {
-            continue;
-        }
-        let body = match store.get(&obj.location).await {
-            Ok(g) => match g.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("[volume_event_store] read {key}: {e}", key = obj.location);
-                    continue;
+    // Sync filter: drop non-`<ulid>.toml` listings up front. Each
+    // surviving entry's body GET is independent, so fetch them in
+    // parallel under a small concurrency cap. Per-event errors are
+    // warned and skipped (yields `None`) — matching the previous
+    // sequential behaviour.
+    let to_fetch: Vec<object_store::path::Path> = objects
+        .into_iter()
+        .filter_map(|obj| {
+            let filename = obj.location.filename()?;
+            let stem = filename.strip_suffix(".toml")?;
+            if Ulid::from_string(stem).is_err() {
+                return None;
+            }
+            Some(obj.location)
+        })
+        .collect();
+
+    let mut events: Vec<VolumeEvent> =
+        futures::stream::iter(to_fetch.into_iter().map(|location| {
+            let store = store.clone();
+            async move {
+                let body = match store.get(&location).await {
+                    Ok(g) => match g.bytes().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("[volume_event_store] read {location}: {e}");
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("[volume_event_store] get {location}: {e}");
+                        return None;
+                    }
+                };
+                let text = match std::str::from_utf8(&body) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("[volume_event_store] {location}: not UTF-8: {e}");
+                        return None;
+                    }
+                };
+                match VolumeEvent::from_toml(text) {
+                    Ok(event) => Some(event),
+                    Err(e) => {
+                        warn!("[volume_event_store] parse {location}: {e}");
+                        None
+                    }
                 }
-            },
-            Err(e) => {
-                warn!("[volume_event_store] get {key}: {e}", key = obj.location);
-                continue;
             }
-        };
-        let text = match std::str::from_utf8(&body) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    "[volume_event_store] {key}: not UTF-8: {e}",
-                    key = obj.location
-                );
-                continue;
-            }
-        };
-        match VolumeEvent::from_toml(text) {
-            Ok(event) => events.push(event),
-            Err(e) => {
-                warn!("[volume_event_store] parse {key}: {e}", key = obj.location);
-            }
-        }
-    }
+        }))
+        .buffer_unordered(EVENT_FETCH_CONCURRENCY)
+        .filter_map(|opt| async move { opt })
+        .collect()
+        .await;
+
     events.sort_by_key(|e| e.event_ulid);
     Ok(events)
 }
