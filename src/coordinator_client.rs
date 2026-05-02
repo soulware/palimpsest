@@ -16,12 +16,11 @@ use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
-    ClaimAttachEvent, ClaimReply, ClaimStartReply, CreateReply, EvictReply, ForceSnapshotNowReply,
-    ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply, GenerateFilemapReply,
-    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind, LatestSnapshotReply,
-    PullReadonlyReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply, ResolveNameReply,
-    SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
+    ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, ForkAttachEvent, ForkSource,
+    ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
+    IpcErrorKind, RegisterReply, ReleaseReply, ResolveHandoffKeyReply, SignatureStatus,
+    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    VolumeEventEntry, VolumeEventsReply,
 };
 
 /// Public-API aliases for the client side. The underlying types live
@@ -77,29 +76,6 @@ pub fn is_reachable(socket_path: &Path) -> bool {
 /// coordinator's view; the CLI itself never builds an object_store.
 pub fn get_store_config(socket_path: &Path) -> io::Result<StoreConfig> {
     call_typed(socket_path, &Request::GetStoreConfig)?.map_err(io::Error::other)
-}
-
-/// Resolve a volume name to its current `vol_ulid` via the coordinator.
-/// The coordinator performs the bucket-side `names/<name>` lookup; the CLI
-/// holds no S3 credentials.
-pub fn resolve_name(socket_path: &Path, name: &str) -> io::Result<ulid::Ulid> {
-    let reply: ResolveNameReply = call_typed(
-        socket_path,
-        &Request::ResolveName {
-            name: name.to_owned(),
-        },
-    )?
-    .map_err(io::Error::other)?;
-    Ok(reply.vol_ulid)
-}
-
-/// Return the highest snapshot ULID under `by_id/<vol_ulid>/snapshots/`,
-/// or `None` if the volume has no snapshots in the store.
-pub fn latest_snapshot(socket_path: &Path, vol_ulid: ulid::Ulid) -> io::Result<Option<ulid::Ulid>> {
-    let reply: LatestSnapshotReply =
-        call_typed(socket_path, &Request::LatestSnapshot { vol_ulid })?
-            .map_err(io::Error::other)?;
-    Ok(reply.snapshot_ulid)
 }
 
 /// Default budget for [`await_prefetch`]. Longer than `OPEN_RETRY_BUDGET`
@@ -470,57 +446,6 @@ pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
 /// Drives the claim-from-released path's choice of `parent-key` for
 /// the new fork's `volume.provenance`. For `Normal` manifests the
 /// CLI uses the source volume's own `volume.pub`; for `Recovery` it
-/// embeds the recovering coordinator's pubkey so the new fork's
-/// open-time ancestor walk verifies the synthesised handoff snapshot
-/// against the right key.
-#[derive(Debug, Clone)]
-pub enum HandoffKey {
-    /// Manifest is signed by the source volume's own key.
-    Normal,
-    /// Manifest is a synthesised handoff snapshot signed by a
-    /// recovering coordinator. The carried hex string is the
-    /// already-verified Ed25519 pubkey, ready to pass to
-    /// `fork-create` as `parent-key=<hex>`.
-    Recovery { manifest_pubkey_hex: String },
-}
-
-/// Ask the coordinator to resolve which Ed25519 key the snapshot
-/// manifest at `by_id/<vol_ulid>/snapshots/.../<snap_ulid>.manifest`
-/// is signed by. Returns `HandoffKey::Recovery { hex }` for
-/// synthesised handoff snapshots minted by `volume release --force`,
-/// or `HandoffKey::Normal` for ordinary manifests.
-///
-/// The coordinator verifies the manifest signature and the
-/// recovering coordinator's pub binding before returning a
-/// `Recovery` result, so the CLI can use the returned hex as a
-/// trusted `parent-key` for `fork-create`.
-pub fn resolve_handoff_key(
-    socket_path: &Path,
-    vol_ulid: &str,
-    snap_ulid: &str,
-) -> io::Result<HandoffKey> {
-    let vol_ulid = ulid::Ulid::from_string(vol_ulid)
-        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
-    let snap_ulid = ulid::Ulid::from_string(snap_ulid)
-        .map_err(|e| io::Error::other(format!("invalid snap_ulid: {e}")))?;
-    let reply: ResolveHandoffKeyReply = call_typed(
-        socket_path,
-        &Request::ResolveHandoffKey {
-            vol_ulid,
-            snap_ulid,
-        },
-    )?
-    .map_err(io::Error::other)?;
-    Ok(match reply {
-        ResolveHandoffKeyReply::Normal => HandoffKey::Normal,
-        ResolveHandoffKeyReply::Recovery {
-            manifest_pubkey_hex,
-        } => HandoffKey::Recovery {
-            manifest_pubkey_hex,
-        },
-    })
-}
-
 /// Release a volume's name back to the pool so any other coordinator can
 /// `volume claim` it. Drains WAL, publishes a handoff snapshot, halts
 /// the daemon, and flips `names/<name>` to `state=released` with the
@@ -554,53 +479,6 @@ pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<()> {
         },
     )?
     .map_err(io::Error::other)
-}
-
-/// Outcome of a `claim_volume_bucket` call.
-pub enum ClaimOutcome {
-    /// In-place reclaim: the local fork's ULID matched the released
-    /// record's. The bucket flipped from `Released` to `Stopped` with
-    /// the same `vol_ulid`. No CLI orchestration was needed.
-    Reclaimed,
-    /// The released record's `vol_ulid` is foreign content. The CLI
-    /// must pull the source, mint a fresh local fork, and call
-    /// `rebind_name` with the new ULID.
-    NeedsClaim {
-        released_vol_ulid: String,
-        handoff_snapshot: Option<String>,
-    },
-}
-
-/// `volume claim <name>` IPC: bucket-side claim flow.
-///
-/// On success, the volume is left in `Stopped` state — no daemon is
-/// launched. The CLI calls `start_volume` afterwards if a composed
-/// `start --claim` flow was requested.
-///
-/// Always CAS-protected. To override an unreachable owner, the
-/// operator must first run `volume release --force <name>` (the
-/// unconditional override), then call this verb against the now-
-/// `Released` record. Splitting the two steps means concurrent
-/// claimants are arbitrated by the conditional PUT inside
-/// `mark_claimed`, not by an unconditional rewrite.
-pub fn claim_volume_bucket(socket_path: &Path, name: &str) -> io::Result<ClaimOutcome> {
-    let reply: ClaimReply = call_typed(
-        socket_path,
-        &Request::Claim {
-            volume: name.to_owned(),
-        },
-    )?
-    .map_err(io::Error::other)?;
-    Ok(match reply {
-        ClaimReply::Reclaimed => ClaimOutcome::Reclaimed,
-        ClaimReply::MustClaimFresh {
-            released_vol_ulid,
-            handoff_snapshot,
-        } => ClaimOutcome::NeedsClaim {
-            released_vol_ulid: released_vol_ulid.to_string(),
-            handoff_snapshot: handoff_snapshot.map(|s| s.to_string()),
-        },
-    })
 }
 
 /// Register a name-claim job with the coordinator. `Reclaimed` is
@@ -729,28 +607,6 @@ pub fn update_volume(socket_path: &Path, name: &str, flags: &[String]) -> io::Re
     .map_err(io::Error::other)
 }
 
-/// Pull one readonly ancestor from the store via the coordinator.
-/// Returns the parent ULID (for the ancestor walk), or `None` for a root.
-pub fn pull_readonly(socket_path: &Path, vol_ulid: &str) -> io::Result<Option<String>> {
-    let parsed = ulid::Ulid::from_string(vol_ulid)
-        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
-    let reply: PullReadonlyReply =
-        call_typed(socket_path, &Request::PullReadonly { vol_ulid: parsed })?
-            .map_err(io::Error::other)?;
-    Ok(reply.parent.map(|u| u.to_string()))
-}
-
-/// Synthesize a "now" snapshot for a readonly source. Returns
-/// `(snap_ulid, ephemeral_pubkey_hex)`.
-pub fn force_snapshot_now(socket_path: &Path, vol_ulid: &str) -> io::Result<(String, String)> {
-    let parsed = ulid::Ulid::from_string(vol_ulid)
-        .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
-    let reply: ForceSnapshotNowReply =
-        call_typed(socket_path, &Request::ForceSnapshotNow { vol_ulid: parsed })?
-            .map_err(io::Error::other)?;
-    Ok((reply.snap_ulid.to_string(), reply.attestation_pubkey_hex))
-}
-
 /// Register a fork-from-source job with the coordinator. Returns
 /// immediately on success; progress (and the eventual fork ULID) is
 /// observed via [`fork_attach_by_name`]. Mirrors the
@@ -856,40 +712,6 @@ fn render_fork_event(event: &ForkAttachEvent) -> Option<String> {
         ForkAttachEvent::PrefetchDone => Some("ready".to_owned()),
         ForkAttachEvent::Done => None,
     }
-}
-
-/// Fork a new writable volume from a local source. Returns the new volume ULID.
-pub fn fork_create(
-    socket_path: &Path,
-    new_name: &str,
-    source_ulid: &str,
-    snap: Option<&str>,
-    parent_key_hex: Option<&str>,
-    flags: &[String],
-    for_claim: bool,
-) -> io::Result<String> {
-    let source_vol_ulid = ulid::Ulid::from_string(source_ulid)
-        .map_err(|e| io::Error::other(format!("invalid source ULID: {e}")))?;
-    let snap = match snap {
-        Some(s) => Some(
-            ulid::Ulid::from_string(s)
-                .map_err(|e| io::Error::other(format!("invalid snap ULID: {e}")))?,
-        ),
-        None => None,
-    };
-    let reply: ForkCreateReply = call_typed(
-        socket_path,
-        &Request::ForkCreate {
-            new_name: new_name.to_owned(),
-            source_vol_ulid,
-            snap,
-            parent_key_hex: parent_key_hex.map(|s| s.to_owned()),
-            for_claim,
-            flags: flags.to_vec(),
-        },
-    )?
-    .map_err(io::Error::other)?;
-    Ok(reply.new_vol_ulid.to_string())
 }
 
 #[cfg(test)]
@@ -1032,55 +854,6 @@ mod tests {
         assert_eq!(reply.state, NameState::Live);
         assert_eq!(reply.coordinator_id.as_deref(), Some("coord-self"));
         assert_eq!(reply.eligibility, Eligibility::Owned);
-    }
-
-    /// resolve-name: client sends `{"verb":"resolve-name","name":"vol"}`,
-    /// server returns the bound `vol_ulid`. Confirms the typed reply
-    /// round-trips and the helper unwraps the ULID directly.
-    #[test]
-    fn resolve_name_round_trips_typed_envelope() {
-        let (_guard, sock) = temp_socket();
-        let body = r#"{"outcome":"ok","data":{"vol_ulid":"01J0000000000000000000000V"}}"#;
-        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
-        let vol_ulid = resolve_name(&sock, "vol").expect("resolve-name should succeed");
-        server.join().unwrap();
-        assert_eq!(vol_ulid.to_string(), "01J0000000000000000000000V");
-    }
-
-    /// resolve-name: NotFound from the coordinator surfaces as a
-    /// transport-level `Err` whose message preserves the typed reason.
-    #[test]
-    fn resolve_name_propagates_not_found() {
-        let (_guard, sock) = temp_socket();
-        let body = r#"{"outcome":"err","error":{"kind":"not-found","message":"volume 'ghost' not found in store"}}"#;
-        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
-        let err = resolve_name(&sock, "ghost").expect_err("ghost name should error");
-        server.join().unwrap();
-        assert!(err.to_string().contains("not found in store"), "{err}");
-    }
-
-    /// latest-snapshot: with a populated reply, the helper returns
-    /// `Some(ulid)`. The empty-store case (`snapshot_ulid: null`)
-    /// returns `None` so the caller can produce a clean error message.
-    #[test]
-    fn latest_snapshot_round_trips_some_and_none() {
-        let (_guard, sock) = temp_socket();
-        let some_body = r#"{"outcome":"ok","data":{"snapshot_ulid":"01J0000000000000000000000V"}}"#;
-        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, some_body);
-        let vol = ulid::Ulid::from_string("01J9999999999999999999999V").unwrap();
-        let reply = latest_snapshot(&sock, vol).expect("call should succeed");
-        server.join().unwrap();
-        assert_eq!(
-            reply.map(|u| u.to_string()).as_deref(),
-            Some("01J0000000000000000000000V"),
-        );
-
-        let (_guard2, sock2) = temp_socket();
-        let none_body = r#"{"outcome":"ok","data":{}}"#;
-        let server2 = spawn_one_shot_server(sock2.clone(), Duration::ZERO, none_body);
-        let reply = latest_snapshot(&sock2, vol).expect("call should succeed");
-        server2.join().unwrap();
-        assert!(reply.is_none());
     }
 
     /// Typed errors come back as `Err` with the kind preserved.

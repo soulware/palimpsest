@@ -115,9 +115,6 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
-    /// Bucket-side claim flow against a `Released` record. Either
-    /// reclaims in place or signals the CLI to mint a fresh fork.
-    Claim { volume: String },
     /// Local resume of a `Stopped` volume. Empty success reply.
     Start { volume: String },
 
@@ -135,26 +132,6 @@ pub enum Request {
     /// the daemon if it's running.
     Update {
         volume: String,
-        #[serde(default)]
-        flags: Vec<String>,
-    },
-    /// Pull one readonly ancestor (manifest + volume.pub + provenance)
-    /// from the store. Returns the parent ULID parsed from the verified
-    /// provenance, or `None` if the ancestor is a root volume.
-    PullReadonly { vol_ulid: Ulid },
-    /// Mint a fresh writable fork from a local source. `for_claim`
-    /// switches off the bucket-side `mark_initial` step — the
-    /// claim-from-released flow handles the rebind via a subsequent
-    /// `claim` call.
-    ForkCreate {
-        new_name: String,
-        source_vol_ulid: Ulid,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        snap: Option<Ulid>,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        parent_key_hex: Option<String>,
-        #[serde(default)]
-        for_claim: bool,
         #[serde(default)]
         flags: Vec<String>,
     },
@@ -180,11 +157,6 @@ pub enum Request {
     /// WAL → drain pending → sign manifest → upload. Returns the
     /// snapshot ULID.
     Snapshot { volume: String },
-    /// Synthesise a "now" snapshot for a readonly source volume by
-    /// pinning currently-prefetched segments under an ephemeral
-    /// attestation key. Used by force-claim to mint a handoff against
-    /// an unreachable owner.
-    ForceSnapshotNow { vol_ulid: Ulid },
     /// Evict S3-confirmed segment bodies from a volume's `cache/`. With
     /// `segment_ulid = None`, evicts every confirmed body; with `Some`,
     /// evicts only that one segment.
@@ -213,29 +185,11 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
-    /// Resolve which Ed25519 key the snapshot manifest at
-    /// `by_id/<vol_ulid>/snapshots/<snap_ulid>.manifest` is signed by.
-    /// The reply carries either `Normal` (use the source volume's
-    /// `volume.pub`) or `Recovery { hex }` (the recovering
-    /// coordinator's already-verified pubkey, ready to embed in
-    /// `fork-create` as `parent-key=<hex>`).
-    ResolveHandoffKey { vol_ulid: Ulid, snap_ulid: Ulid },
-
     // ── Read-only history ────────────────────────────────────────────
     /// List the per-name event log at `events/<volume>/`,
     /// verifying each entry's signature against the emitting
     /// coordinator's published pubkey.
     VolumeEvents { volume: String },
-
-    // ── Read-only S3 lookups (CLI delegates to coordinator) ──────────
-    /// Resolve a volume name to its current `vol_ulid` via the
-    /// bucket-side `names/<name>` record. Lets the CLI walk the
-    /// `name → ULID` link without holding S3 credentials.
-    ResolveName { name: String },
-    /// Return the latest snapshot ULID for `vol_ulid` by listing
-    /// `by_id/<vol_ulid>/snapshots/` in the store. Empty result is
-    /// `snapshot_ulid: None`.
-    LatestSnapshot { vol_ulid: Ulid },
 
     // ── Creds + cleanup (final iteration) ────────────────────────────
     /// Vend the non-secret `[store]` config (bucket / endpoint /
@@ -254,21 +208,16 @@ pub enum Request {
     /// `CredentialIssuer`.
     Credentials { macaroon: String },
 
-    // ── Iteration 5: consolidated fork / claim flows ─────────────────
+    // ── Consolidated fork / claim flows ──────────────────────────────
     //
     // These verbs collapse the multi-call CLI orchestration of
     // `volume create --from` and `volume claim` into a coordinator-side
     // job, mirroring the `ImportStart` / `ImportAttach` shape:
     //
-    //   * `*Start` returns immediately with the new fork ULID and
-    //     spawns the work as a tracked background task.
+    //   * `*Start` registers the job and (for fork) returns
+    //     immediately, or (for claim) returns synchronously when the
+    //     in-place reclaim path applies.
     //   * `*Attach` streams progress events until terminal.
-    //
-    // The legacy verbs they replace (`PullReadonly`, `ResolveName`,
-    // `LatestSnapshot`, `ForceSnapshotNow`, `ResolveHandoffKey`,
-    // `ForkCreate`, `AwaitPrefetch`) remain wired during migration so
-    // existing callers and tests keep working; they will be removed
-    // once `ForkStart` / `ClaimStart` cover all CLI paths.
     /// Spawn a fork-from-source flow as a background job. The
     /// coordinator does the full orchestration internally: name
     /// resolution, ancestor-chain pull, snapshot decision (latest,
@@ -360,23 +309,15 @@ pub struct ReleaseReply {
     pub handoff_snapshot: Ulid,
 }
 
-/// Reply for [`Request::Claim`]. The bucket-side claim flow is
-/// non-deterministic in shape: an in-place reclaim succeeds with no
-/// further action, but a foreign-content claim returns the routing
-/// info the CLI needs to materialise a fresh fork and call
-/// `rebind-name`.
+/// Internal return type for `claim_volume_bucket_op`, the synchronous
+/// bucket-side step inside [`Request::ClaimStart`]. The two arms map
+/// directly onto [`ClaimStartReply`]'s `Reclaimed` / `Claiming`
+/// branches: `Reclaimed` short-circuits with no job spawned;
+/// `MustClaimFresh` triggers the foreign-content orchestrator.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ClaimReply {
-    /// In-place reclaim. The local fork's ULID matched the released
-    /// record's; the bucket flipped from `Released` to `Stopped` with
-    /// the same `vol_ulid`. No CLI orchestration is needed.
     Reclaimed,
-    /// The released record's `vol_ulid` is foreign content. The CLI
-    /// must pull the source, mint a fresh local fork, and call
-    /// `rebind-name` with the new ULID. `handoff_snapshot` is the
-    /// snapshot the new fork will inherit from; absent when the
-    /// released record has no recorded handoff yet.
     MustClaimFresh {
         released_vol_ulid: Ulid,
         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -384,15 +325,17 @@ pub enum ClaimReply {
     },
 }
 
-/// Reply for [`Request::Create`] and [`Request::ForkCreate`]. The new
-/// volume's ULID is what the caller stamps into local state for any
-/// follow-up IPCs.
+/// Reply for [`Request::Create`]. The new volume's ULID is what the
+/// caller stamps into local state for any follow-up IPCs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateReply {
     pub vol_ulid: Ulid,
 }
 
-/// Reply for [`Request::ForkCreate`].
+/// Internal return type for `fork_create_op`, the fork-mint step
+/// inside the fork and claim orchestrators. The new fork's ULID is
+/// surfaced to subscribers as
+/// [`ForkAttachEvent::ForkCreated`] / [`ClaimAttachEvent::ForkCreated`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkCreateReply {
     pub new_vol_ulid: Ulid,
@@ -407,23 +350,27 @@ pub struct UpdateReply {
     pub restarted: bool,
 }
 
-/// Reply for [`Request::PullReadonly`]. `parent` is `None` for a root
-/// ancestor; otherwise it carries the verified parent ULID parsed from
-/// the just-fetched provenance.
+/// Internal return type for `pull_readonly_op`, the per-ancestor
+/// chain-walk step inside the fork and claim orchestrators. `parent`
+/// is `None` for a root ancestor; otherwise it carries the verified
+/// parent ULID parsed from the just-fetched provenance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PullReadonlyReply {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent: Option<Ulid>,
 }
 
-/// Reply for [`Request::ResolveName`].
+/// Internal return type for `resolve_name_op`, called from the fork
+/// orchestrator's name-source resolution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolveNameReply {
     pub vol_ulid: Ulid,
 }
 
-/// Reply for [`Request::LatestSnapshot`]. `snapshot_ulid` is `None`
-/// when the volume has no snapshots in the store.
+/// Internal return type for `latest_snapshot_op`, used by the fork
+/// orchestrator to pick a snapshot when the source is readonly and
+/// no local snapshot is recorded. `snapshot_ulid` is `None` when the
+/// volume has no snapshots in the store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LatestSnapshotReply {
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -468,9 +415,10 @@ pub struct SnapshotReply {
     pub snap_ulid: Ulid,
 }
 
-/// Reply for [`Request::ForceSnapshotNow`]. The attestation pubkey is
-/// hex-encoded so callers can pass it through to `fork-create` as a
-/// `parent-key=<hex>` token without re-encoding.
+/// Internal return type for `force_snapshot_now_op`, used by the
+/// fork orchestrator's `--force-snapshot` branch. The attestation
+/// pubkey is hex-encoded so it can be propagated into the new fork's
+/// signed provenance without re-encoding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForceSnapshotNowReply {
     pub snap_ulid: Ulid,
@@ -529,12 +477,14 @@ pub struct RegisterReply {
     pub macaroon: String,
 }
 
-/// Reply for [`Request::ResolveHandoffKey`]. `Normal` means the
-/// manifest is signed by the source volume's own key (the source
-/// volume's `volume.pub` is the verifying key); `Recovery` means the
-/// manifest is a synthesised handoff snapshot signed by a recovering
-/// coordinator under an attestation key — the carried hex is the
-/// already-verified Ed25519 pubkey.
+/// Internal return type for `resolve_handoff_key_op`, also embedded
+/// in [`ClaimAttachEvent::HandoffKeyResolved`] so subscribers can
+/// see which key the handoff snapshot is signed under. `Normal`
+/// means the manifest is signed by the source volume's own key (the
+/// source volume's `volume.pub` is the verifying key); `Recovery`
+/// means the manifest is a synthesised handoff snapshot signed by a
+/// recovering coordinator under an attestation key — the carried hex
+/// is the already-verified Ed25519 pubkey.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ResolveHandoffKeyReply {

@@ -222,14 +222,6 @@ async fn dispatch_json(
             let env: Envelope<ReleaseReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Claim { volume } => {
-            // Conditional PUT on names/<volume>: coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
-            let result =
-                claim_volume_bucket_op(&volume, &ctx.data_dir, &store, &ctx.identity).await;
-            let env: Envelope<ClaimReply> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
         Request::Start { volume } => {
             // Conditional PUT on names/<volume>: coordinator-wide.
             let store = ctx.stores.coordinator_wide();
@@ -268,40 +260,6 @@ async fn dispatch_json(
         Request::Update { volume, flags } => {
             let result = update_volume_op(&volume, &flags, &ctx.data_dir).await;
             let env: Envelope<UpdateReply> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
-        Request::PullReadonly { vol_ulid } => {
-            // Reads only under by_id/<vol_ulid>/: per-volume.
-            let store = ctx.stores.for_volume(&vol_ulid);
-            let result = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await;
-            let env: Envelope<PullReadonlyReply> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
-        Request::ForkCreate {
-            new_name,
-            source_vol_ulid,
-            snap,
-            parent_key_hex,
-            for_claim,
-            flags,
-        } => {
-            // Mixed: names/<new_name> mark_initial + per-volume copy.
-            let store = ctx.stores.coordinator_wide();
-            let result = fork_create_op(
-                &new_name,
-                source_vol_ulid,
-                snap,
-                parent_key_hex.as_deref(),
-                for_claim,
-                &flags,
-                &ctx.data_dir,
-                &store,
-                &ctx.identity,
-                &ctx.rescan,
-                &ctx.prefetch_tracker,
-            )
-            .await;
-            let env: Envelope<ForkCreateReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::ImportStart {
@@ -351,16 +309,6 @@ async fn dispatch_json(
             let env: Envelope<SnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::ForceSnapshotNow { vol_ulid } => {
-            // Reads include the ancestor chain (prefetch_indexes), so
-            // the scope is broader than for_volume(vol_ulid). Future
-            // Tigris work refactors prefetch_indexes to take
-            // ScopedStores and fetch each ancestor under its own scope.
-            let store = ctx.stores.coordinator_wide();
-            let result = force_snapshot_now_op(vol_ulid, &ctx.data_dir, &store).await;
-            let env: Envelope<ForceSnapshotNowReply> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
         Request::Evict {
             volume,
             segment_ulid,
@@ -389,17 +337,6 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::ResolveHandoffKey {
-            vol_ulid,
-            snap_ulid,
-        } => {
-            // Reads only by_id/<vol_ulid>/snapshots/<snap>.manifest:
-            // per-volume.
-            let store = ctx.stores.for_volume(&vol_ulid);
-            let result = resolve_handoff_key_op(vol_ulid, snap_ulid, &store).await;
-            let env: Envelope<ResolveHandoffKeyReply> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
         Request::VolumeEvents { volume } => {
             // Reads events/<volume>/: coordinator-wide.
             let store = ctx.stores.coordinator_wide();
@@ -410,18 +347,6 @@ async fn dispatch_json(
         Request::GetStoreConfig => {
             let reply = render_store_config(&ctx.store_config);
             let env: Envelope<StoreConfigReply> = Envelope::ok(reply);
-            let _ = ipc::write_message(writer, &env).await;
-        }
-        Request::ResolveName { name } => {
-            let store = ctx.stores.coordinator_wide();
-            let result = resolve_name_op(&name, &store).await;
-            let env: Envelope<ResolveNameReply> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
-        Request::LatestSnapshot { vol_ulid } => {
-            let store = ctx.stores.for_volume(&vol_ulid);
-            let result = latest_snapshot_op(vol_ulid, &store).await;
-            let env: Envelope<LatestSnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Register { volume_ulid } => {
