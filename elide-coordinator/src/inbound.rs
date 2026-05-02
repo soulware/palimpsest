@@ -34,11 +34,12 @@ use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
-    self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
-    GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    LatestSnapshotReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
-    ResolveHandoffKeyReply, ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply,
-    StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
+    self, ClaimAttachEvent, ClaimReply, ClaimStartReply, CreateReply, Envelope, EvictReply,
+    ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkStartReply, GenerateFilemapReply,
+    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError, LatestSnapshotReply,
+    PullReadonlyReply, RegisterReply, ReleaseReply, Request, ResolveHandoffKeyReply,
+    ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
+    StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -433,6 +434,31 @@ async fn dispatch_json(
                 ctx.issuer.as_ref(),
             );
             let env: Envelope<StoreCredsReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+
+        // ── Iteration 5 stubs: consolidated fork / claim flows ───────
+        // Wire types are landed; coordinator-side orchestration moves
+        // here in a follow-up. Until then these reply with `Internal`
+        // so callers fail fast rather than silently hanging.
+        Request::ForkStart { .. } => {
+            let env: Envelope<ForkStartReply> =
+                Envelope::err(IpcError::internal("fork-start not yet implemented"));
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ForkAttach { .. } => {
+            let env: Envelope<ForkAttachEvent> =
+                Envelope::err(IpcError::internal("fork-attach not yet implemented"));
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ClaimStart { .. } => {
+            let env: Envelope<ClaimStartReply> =
+                Envelope::err(IpcError::internal("claim-start not yet implemented"));
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::ClaimAttach { .. } => {
+            let env: Envelope<ClaimAttachEvent> =
+                Envelope::err(IpcError::internal("claim-attach not yet implemented"));
             let _ = ipc::write_message(writer, &env).await;
         }
     }

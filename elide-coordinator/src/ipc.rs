@@ -253,6 +253,73 @@ pub enum Request {
     /// `pid` caveat, then delegates to the configured
     /// `CredentialIssuer`.
     Credentials { macaroon: String },
+
+    // ── Iteration 5: consolidated fork / claim flows ─────────────────
+    //
+    // These verbs collapse the multi-call CLI orchestration of
+    // `volume create --from` and `volume claim` into a coordinator-side
+    // job, mirroring the `ImportStart` / `ImportAttach` shape:
+    //
+    //   * `*Start` returns immediately with the new fork ULID and
+    //     spawns the work as a tracked background task.
+    //   * `*Attach` streams progress events until terminal.
+    //
+    // The legacy verbs they replace (`PullReadonly`, `ResolveName`,
+    // `LatestSnapshot`, `ForceSnapshotNow`, `ResolveHandoffKey`,
+    // `ForkCreate`, `AwaitPrefetch`) remain wired during migration so
+    // existing callers and tests keep working; they will be removed
+    // once `ForkStart` / `ClaimStart` cover all CLI paths.
+    /// Spawn a fork-from-source flow as a background job. The
+    /// coordinator does the full orchestration internally: name
+    /// resolution, ancestor-chain pull, snapshot decision (latest,
+    /// implicit, or `force_snapshot`-attested), and the fork mint.
+    /// Returns the new fork's ULID immediately; progress is streamed
+    /// via [`Request::ForkAttach`].
+    ForkStart {
+        new_name: String,
+        from: ForkSource,
+        #[serde(default)]
+        force_snapshot: bool,
+        #[serde(default)]
+        flags: Vec<String>,
+    },
+    /// Stream progress for an in-flight fork started via
+    /// [`Request::ForkStart`]. Server replies with a sequence of
+    /// [`Envelope<ForkAttachEvent>`] messages, terminating with
+    /// `ForkAttachEvent::Done` (success) or `Envelope::Err` (failure).
+    ForkAttach { fork_ulid: Ulid },
+    /// Spawn a name-claim flow as a background job. Subsumes the
+    /// existing `Claim` verb's `MustClaimFresh` branch: the coordinator
+    /// runs the bucket-side claim, pulls the ancestor chain, resolves
+    /// the handoff key, mints the fresh fork, and triggers prefetch.
+    /// In-place reclaims return `Reclaimed` immediately with no job
+    /// spawned; foreign-content claims return `Claiming { fork_ulid }`
+    /// and the caller observes via [`Request::ClaimAttach`].
+    ClaimStart { volume: String },
+    /// Stream progress for an in-flight claim started via
+    /// [`Request::ClaimStart`]. Addressed by the bucket-side name so
+    /// the caller doesn't have to remember the freshly-minted fork
+    /// ULID across reconnects.
+    ClaimAttach { volume: String },
+}
+
+/// Source spec for [`Request::ForkStart`]. Mirrors the CLI's
+/// `FromSpec`: a name to resolve, a writable volume by ULID (which
+/// implies an implicit snapshot before forking), or an explicit
+/// `(vol_ulid, snap_ulid)` pin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ForkSource {
+    /// Source addressed by name. Coordinator tries `by_name/<name>`
+    /// locally first, then `names/<name>` in the store.
+    Name { name: String },
+    /// Writable source addressed by ULID. Coordinator takes an
+    /// implicit snapshot of the running daemon before forking.
+    BareUlid { vol_ulid: Ulid },
+    /// Pinned source: a specific `(vol_ulid, snap_ulid)` pair.
+    /// Coordinator pulls the chain if missing and verifies the
+    /// snapshot exists in the store.
+    Pinned { vol_ulid: Ulid, snap_ulid: Ulid },
 }
 
 /// Reply for [`Request::Status`].
@@ -511,6 +578,88 @@ pub struct VolumeEventEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeEventsReply {
     pub events: Vec<VolumeEventEntry>,
+}
+
+/// Reply for [`Request::ForkStart`]. The fork mint is staged
+/// synchronously enough to allocate the new ULID; the rest of the
+/// flow (chain pull, snapshot, prefetch warm-up) runs in the
+/// background and is observed via [`Request::ForkAttach`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkStartReply {
+    pub fork_ulid: Ulid,
+}
+
+/// Streaming event for [`Request::ForkAttach`]. The server writes
+/// one [`Envelope<ForkAttachEvent>`] per message until the fork
+/// flow terminates with `Done` (success) or `Envelope::Err` (failure).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ForkAttachEvent {
+    /// Resolving a `ForkSource::Name` to a vol ULID (local then
+    /// bucket-side `names/<name>`).
+    ResolvingName { name: String },
+    /// Pulling one ancestor's manifest / volume.pub / provenance.
+    /// Emitted once per ancestor as the chain walks back.
+    PullingAncestor { vol_ulid: Ulid },
+    /// Took an implicit snapshot of a writable source before forking.
+    SnapshotTaken { snap_ulid: Ulid },
+    /// Synthesised an attested "now" snapshot under
+    /// `--force-snapshot`. `pubkey_hex` is the ephemeral attestation
+    /// key the fork's provenance is signed under.
+    AttestedSnapshot { snap_ulid: Ulid, pubkey_hex: String },
+    /// Source resolved; about to mint the fork.
+    ForkingFrom {
+        source_vol_ulid: Ulid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        snap_ulid: Option<Ulid>,
+    },
+    /// Fork minted — `new_vol_ulid` is the fresh writable volume ULID.
+    /// Matches the `fork_ulid` returned by `ForkStart`.
+    ForkCreated { new_vol_ulid: Ulid },
+    /// Background prefetch of the ancestor `.idx` chain has started.
+    PrefetchStarted,
+    /// Background prefetch finished (or volume is untracked).
+    PrefetchDone,
+    /// Terminal success — last message in the stream.
+    Done,
+}
+
+/// Reply for [`Request::ClaimStart`]. `Reclaimed` is the
+/// no-op-required happy path; `Claiming` signals the foreign-content
+/// branch — the caller subscribes via [`Request::ClaimAttach`] to
+/// observe the chain pull / fork mint / prefetch warm-up.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ClaimStartReply {
+    /// In-place reclaim. The bucket flipped from `Released` to
+    /// `Stopped` with the same `vol_ulid`; nothing else to do.
+    Reclaimed,
+    /// Foreign-content claim spawned as a background job. The new
+    /// fork's ULID is allocated immediately and a tracked claim
+    /// task drives the rest of the flow.
+    Claiming { fork_ulid: Ulid },
+}
+
+/// Streaming event for [`Request::ClaimAttach`]. Same envelope shape
+/// as [`ForkAttachEvent`]; named separately so the wire format stays
+/// self-documenting and so claim-only events (handoff-key resolution)
+/// don't pollute the fork enum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ClaimAttachEvent {
+    /// Pulling one ancestor in the released volume's chain.
+    PullingAncestor { vol_ulid: Ulid },
+    /// Resolved which key the handoff snapshot is signed under.
+    HandoffKeyResolved { key: ResolveHandoffKeyReply },
+    /// Fresh fork minted from the released volume's handoff snapshot.
+    ForkCreated { new_vol_ulid: Ulid },
+    /// Background prefetch of the ancestor index has started.
+    PrefetchStarted,
+    /// Background prefetch finished (or budget expired — coordinator
+    /// continues in background; the caller may proceed regardless).
+    PrefetchDone,
+    /// Terminal success.
+    Done,
 }
 
 #[cfg(test)]
