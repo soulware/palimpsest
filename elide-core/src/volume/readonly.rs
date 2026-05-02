@@ -134,23 +134,36 @@ pub(super) fn open_read_state(
     fork_dir: &Path,
     by_id_dir: &Path,
 ) -> io::Result<(Vec<AncestorLayer>, lbamap::LbaMap, extentindex::ExtentIndex)> {
+    let total_started = std::time::Instant::now();
+
     // Fail-fast verification: every ancestor in the fork chain must have a
     // signed `.manifest` file whose listed `.idx` files are all present
     // locally. The trust chain is rooted in this volume's own pubkey and
     // walked via the `parent_pubkey` embedded in each child's provenance.
+    let verify_started = std::time::Instant::now();
     verify_ancestor_manifests(fork_dir, by_id_dir)?;
+    let verify_elapsed = verify_started.elapsed();
+
+    let fork_walk_started = std::time::Instant::now();
     let fork_layers = walk_ancestors(fork_dir, by_id_dir)?;
+    let fork_walk_elapsed = fork_walk_started.elapsed();
+    let fork_layers_n = fork_layers.len();
+
     let lba_chain: Vec<(PathBuf, Option<String>)> = fork_layers
         .iter()
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_owned(), None)))
         .collect();
+    let lbamap_started = std::time::Instant::now();
     let lbamap = lbamap::rebuild_segments(&lba_chain)?;
+    let lbamap_elapsed = lbamap_started.elapsed();
 
     // Extent-index sources: recursed across the fork chain by
     // `walk_extent_ancestors`. They contribute canonical hashes to the
     // extent index and must also be searchable for body lookups.
+    let extent_walk_started = std::time::Instant::now();
     let extent_sources = walk_extent_ancestors(fork_dir, by_id_dir)?;
+    let extent_walk_elapsed = extent_walk_started.elapsed();
 
     // Build the hash chain for extent-index rebuild: fork chain + extent
     // sources (deduped by dir). `extent_index.lookup` returns canonical
@@ -161,7 +174,10 @@ pub(super) fn open_read_state(
             hash_chain.push((layer.dir.clone(), layer.branch_ulid.clone()));
         }
     }
+    let hash_chain_len = hash_chain.len();
+    let extent_rebuild_started = std::time::Instant::now();
     let extent_index = extentindex::rebuild(&hash_chain)?;
+    let extent_rebuild_elapsed = extent_rebuild_started.elapsed();
 
     // The returned `ancestor_layers` unifies fork parents and extent
     // sources. Callers use this as the body-lookup search path; the
@@ -172,6 +188,19 @@ pub(super) fn open_read_state(
             ancestor_layers.push(layer);
         }
     }
+
+    log::info!(
+        "[open_read_state] {} in {:.2?} (verify_manifests {:.2?}, walk_ancestors {:.2?}, lbamap::rebuild_segments {:.2?}, walk_extent_ancestors {:.2?}, extentindex::rebuild {:.2?}, fork_layers={}, hash_chain={})",
+        fork_dir.display(),
+        total_started.elapsed(),
+        verify_elapsed,
+        fork_walk_elapsed,
+        lbamap_elapsed,
+        extent_walk_elapsed,
+        extent_rebuild_elapsed,
+        fork_layers_n,
+        hash_chain_len,
+    );
     Ok((ancestor_layers, lbamap, extent_index))
 }
 
