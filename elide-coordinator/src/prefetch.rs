@@ -296,7 +296,14 @@ async fn prefetch_fork(
     }
 
     // Prefetch snapshot markers and filemaps from snapshots/ sub-prefix.
-    prefetch_snapshots(store, fork_dir, volume_id).await?;
+    // For ancestor walks (`branch_ulid = Some(...)`), restrict to just the
+    // branch-point snapshot's artifacts — older snapshots in the ancestor
+    // are not on the read path of this fork, and snapshots newer than the
+    // branch point belong to a parallel timeline. For the current
+    // writable fork (`branch_ulid = None`) we still fetch every snapshot
+    // present in the bucket so the read path can replay against any of
+    // them.
+    prefetch_snapshots(store, fork_dir, volume_id, branch_ulid).await?;
 
     Ok(())
 }
@@ -390,10 +397,16 @@ async fn fetch_idx(
 /// Lists `by_id/<volume_id>/snapshots/` and downloads any files not already
 /// present locally. Snapshot markers are empty files; filemaps are small text
 /// files. Both are written atomically (tmp → rename).
+///
+/// When `branch_ulid = Some(b)`, restricts to just the artifacts for that
+/// specific snapshot (`<b>`, `<b>.manifest`, `<b>.filemap`). Used by the
+/// ancestor-walk path to avoid pulling every snapshot the ancestor ever
+/// minted — only the branch-point snapshot is on this fork's read path.
 async fn prefetch_snapshots(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
     volume_id: &str,
+    branch_ulid: Option<&str>,
 ) -> Result<()> {
     let prefix = StorePath::from(format!("by_id/{volume_id}/snapshots/"));
     let objects: Vec<_> = store
@@ -409,6 +422,17 @@ async fn prefetch_snapshots(
             continue;
         };
         let filename = filename.to_owned();
+
+        // When restricted to a branch-point snapshot, accept only the
+        // three known artifact shapes for that ULID.
+        if let Some(branch) = branch_ulid {
+            let matches = filename == branch
+                || filename == format!("{branch}.manifest")
+                || filename == format!("{branch}.filemap");
+            if !matches {
+                continue;
+            }
+        }
 
         let local_path = snap_dir.join(&filename);
         if local_path.exists() {
@@ -747,6 +771,100 @@ mod tests {
         // Running again should skip (already present).
         prefetch_indexes(&vol_dir, &store, None).await.unwrap();
         // No error, no re-download.
+    }
+
+    /// Ancestor-walk path: when an ancestor has multiple snapshots in
+    /// its bucket prefix, only the snapshot at the branch point (and
+    /// its sibling `.manifest` / `.filemap`) should be downloaded into
+    /// the local fork — older snapshots in the ancestor are not on the
+    /// read path of this fork. Regression for the "every claim pulls
+    /// every ancestor snapshot" pattern observed in production logs.
+    #[tokio::test]
+    async fn ancestor_walk_only_fetches_branch_point_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
+
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        // Three snapshots in the parent's bucket prefix. Only `branch`
+        // is the branch point recorded in the child's provenance; the
+        // other two should NOT be downloaded.
+        let branch = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let earlier = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let later = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_ulid.to_owned(),
+                    snapshot_ulid: branch.to_owned(),
+                    pubkey: parent_key.verifying_key().to_bytes(),
+                    manifest_pubkey: None,
+                }),
+                extent_index: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        // Upload all three snapshots' artifacts into the parent's
+        // bucket prefix. Each gets bare + `.manifest` + `.filemap`.
+        for snap in [earlier, branch, later] {
+            for suffix in ["", ".manifest", ".filemap"] {
+                let key = StorePath::from(format!(
+                    "by_id/{parent_ulid}/snapshots/19700101/{snap}{suffix}"
+                ));
+                store
+                    .put(&key, bytes::Bytes::from_static(b"x").into())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        prefetch_indexes(&child_dir, &store, None).await.unwrap();
+
+        // Only branch-point artifacts should appear locally in the
+        // parent's snapshots/ dir.
+        let parent_snap_dir = parent_dir.join("snapshots");
+        for suffix in ["", ".manifest", ".filemap"] {
+            let p = parent_snap_dir.join(format!("{branch}{suffix}"));
+            assert!(
+                p.exists(),
+                "branch artifact {branch}{suffix} should be local"
+            );
+        }
+        for snap in [earlier, later] {
+            for suffix in ["", ".manifest", ".filemap"] {
+                let p = parent_snap_dir.join(format!("{snap}{suffix}"));
+                assert!(
+                    !p.exists(),
+                    "non-branch ancestor snapshot {snap}{suffix} \
+                     should NOT have been pulled, but exists at {}",
+                    p.display(),
+                );
+            }
+        }
     }
 
     /// `peer_fetch_idx` against an unreachable peer returns an error so
