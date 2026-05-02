@@ -13,10 +13,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use serde::Deserialize;
-
 use elide_core::{
     segment::{self, EntryKind},
+    signing::{self, OciSource},
     volume, writelog,
 };
 
@@ -32,7 +31,7 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
 
     let size_bytes = cfg.size;
     let is_readonly = dir.join("volume.readonly").exists();
-    let meta = read_meta(dir);
+    let oci_source = read_oci_source(dir);
 
     println!("Volume:     {vol_name}");
     match size_bytes {
@@ -43,18 +42,17 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     if is_readonly {
         println!("Type:       readonly");
     }
-    if let Some(VolumeMeta {
-        source: Some(source),
-        digest: Some(digest),
-        arch: Some(arch),
-        ..
-    }) = &meta
+    if let Some(OciSource {
+        image,
+        digest,
+        arch,
+    }) = &oci_source
     {
-        let short_digest = digest.get(7..19).unwrap_or(digest);
-        println!(
-            "Source:     {}  (sha256:{})  {}",
-            source, short_digest, arch
-        );
+        let short_digest = digest
+            .strip_prefix("sha256:")
+            .and_then(|h| h.get(..12))
+            .unwrap_or(digest);
+        println!("Source:     {image}  (sha256:{short_digest})  {arch}");
     }
     if let Some(origin) = read_origin(dir) {
         println!("Origin:     {origin}");
@@ -812,16 +810,19 @@ fn print_cache_section(
 
 // --- helpers ---
 
-#[derive(Deserialize)]
-struct VolumeMeta {
-    source: Option<String>,
-    digest: Option<String>,
-    arch: Option<String>,
-}
-
-fn read_meta(dir: &Path) -> Option<VolumeMeta> {
-    let content = fs::read_to_string(dir.join("meta.toml")).ok()?;
-    toml::from_str(&content).ok()
+/// Read the OCI source label from a volume's signed provenance.
+///
+/// Returns `None` if the volume is not an OCI-imported root, or if the
+/// provenance file is unreadable / fails signature verification — operator
+/// inspection should fall through silently rather than fail the report.
+fn read_oci_source(dir: &Path) -> Option<OciSource> {
+    let lineage = signing::read_lineage_verifying_signature(
+        dir,
+        signing::VOLUME_PUB_FILE,
+        signing::VOLUME_PROVENANCE_FILE,
+    )
+    .ok()?;
+    lineage.oci_source
 }
 
 fn fmt_size(bytes: u64) -> String {

@@ -74,7 +74,7 @@ aws --endpoint-url https://t3.storage.dev s3 ls \
     s3://elide-test/by_id/ --recursive | head
 ```
 
-You should see `by_id/<volume-ulid>/segments/<YYYYMMDD>/<segment-ulid>` objects, plus `manifest.toml`, `volume.pub`, and `names/<name>` entries.
+You should see `by_id/<volume-ulid>/segments/<YYYYMMDD>/<segment-ulid>` objects, plus `volume.pub`, `volume.provenance`, and `names/<name>` entries.
 
 ## Test demand-fetch
 

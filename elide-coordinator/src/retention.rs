@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn rejects_marker_key_wrong_shape() {
         for bad in [
-            "by_id/01J0000000000000000000000V/manifest.toml",
+            "by_id/01J0000000000000000000000V/volume.pub",
             "by_id/01J0000000000000000000000V/segments/20260425/X",
             "names/anything",
         ] {

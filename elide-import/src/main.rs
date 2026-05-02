@@ -18,13 +18,12 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use clap::Parser;
 use elide_core::extentindex::ExtentIndex;
-use elide_core::signing::{VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
+use elide_core::signing::{OciSource, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use oci_spec::image::{Arch, Os};
 use ocirender::{ImageSpec, LayerMeta, StreamingPacker};
-use serde::Serialize;
 use tempfile::TempDir;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -87,10 +86,6 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let vol_dir = Path::new(&args.vol_dir);
-    let lineage = elide_core::signing::ProvenanceLineage {
-        parent: None,
-        extent_index: args.extent_sources,
-    };
     match (args.image, args.from_file) {
         (Some(image), None) => {
             run_oci(
@@ -99,12 +94,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 args.size.as_deref(),
                 args.arch.as_deref(),
                 args.save_flat.as_deref(),
-                &lineage,
+                args.extent_sources,
             )
             .await?;
         }
         (None, Some(ext4_path)) => {
-            run_from_file(&ext4_path, vol_dir, &lineage)?;
+            run_from_file(&ext4_path, vol_dir, args.extent_sources)?;
         }
         _ => {
             bail!("provide --image <ref> or --from-file <path>");
@@ -116,7 +111,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 fn run_from_file(
     ext4_path: &Path,
     vol_dir: &Path,
-    lineage: &elide_core::signing::ProvenanceLineage,
+    extent_sources: Vec<String>,
 ) -> anyhow::Result<()> {
     eprintln!(
         "Importing {} into {}...",
@@ -125,6 +120,13 @@ fn run_from_file(
     );
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
+    // Raw ext4 imports carry no OCI source — that field is only set on
+    // OCI-imported roots.
+    let lineage = elide_core::signing::ProvenanceLineage {
+        parent: None,
+        extent_index: extent_sources,
+        oci_source: None,
+    };
     // Readonly volumes must not have a private key on disk — use an ephemeral
     // keypair that signs segments during import but is never persisted. The
     // extent-source list is signed into volume.provenance at the same time.
@@ -132,7 +134,7 @@ fn run_from_file(
         vol_dir,
         VOLUME_PUB_FILE,
         VOLUME_PROVENANCE_FILE,
-        lineage,
+        &lineage,
     )
     .context("setup volume identity")?;
     let parent_extent_index =
@@ -156,7 +158,6 @@ fn run_from_file(
     )?;
     // The filemap is written by import_image as a side effect of the
     // ext4 scan (see elide_core::import).
-    write_meta(vol_dir, &ext4_path.display().to_string(), "", "")?;
     run_delta_stage(vol_dir, signer.as_ref())?;
     serve_promote(vol_dir).context("serve promote IPC")?;
     eprintln!("Done. Volume ready at {}", vol_dir.display());
@@ -196,7 +197,7 @@ async fn run_oci(
     size: Option<&str>,
     arch: Option<&str>,
     save_flat: Option<&Path>,
-    lineage: &elide_core::signing::ProvenanceLineage,
+    extent_sources: Vec<String>,
 ) -> anyhow::Result<()> {
     let target_arch = arch.map(parse_arch).unwrap_or_else(host_arch);
 
@@ -260,6 +261,19 @@ async fn run_oci(
     eprintln!("Importing into {}...", vol_dir.display());
     std::fs::create_dir_all(vol_dir).context("create volume directory")?;
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
+    // OCI-imported root: bake the source label into signed provenance.
+    // The forked-from chain (parent + parent_pubkey) is empty — imports
+    // are always roots — and `extent_sources` carry hash-pool ancestors
+    // for delta compression, not lineage.
+    let lineage = elide_core::signing::ProvenanceLineage {
+        parent: None,
+        extent_index: extent_sources,
+        oci_source: Some(OciSource {
+            image: image.to_owned(),
+            digest: digest.clone(),
+            arch: target_arch.to_string(),
+        }),
+    };
     // Readonly volumes must not have a private key on disk — use an ephemeral
     // keypair that signs segments during import but is never persisted. The
     // extent-source list is signed into volume.provenance at the same time.
@@ -267,7 +281,7 @@ async fn run_oci(
         vol_dir,
         VOLUME_PUB_FILE,
         VOLUME_PROVENANCE_FILE,
-        lineage,
+        &lineage,
     )
     .context("setup volume identity")?;
     let parent_extent_index =
@@ -302,15 +316,12 @@ async fn run_oci(
         );
     }
 
-    // 9. Write volume metadata
-    write_meta(vol_dir, image, &digest, &target_arch.to_string())?;
-
-    // 9b. File-aware delta compression against extent_index sources.
+    // 10. File-aware delta compression against extent_index sources.
     // Runs with the ephemeral signer still in memory so no key material
     // leaves this process.
     run_delta_stage(vol_dir, signer.as_ref())?;
 
-    // 10. Serve promote IPC until coordinator drains all pending/ segments.
+    // 11. Serve promote IPC until coordinator drains all pending/ segments.
     serve_promote(vol_dir).context("serve promote IPC")?;
 
     eprintln!("Done. Volume ready at {}", vol_dir.display());
@@ -745,28 +756,6 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
         .parse()
         .with_context(|| format!("invalid size value: {num}"))?;
     Ok(n << shift)
-}
-
-// ── Volume metadata ───────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct VolumeMeta<'a> {
-    readonly: bool,
-    source: &'a str,
-    digest: &'a str,
-    arch: &'a str,
-}
-
-/// Write `meta.toml` to the volume root with OCI image provenance information.
-fn write_meta(vol_dir: &Path, source: &str, digest: &str, arch: &str) -> anyhow::Result<()> {
-    let meta = VolumeMeta {
-        readonly: true,
-        source,
-        digest,
-        arch,
-    };
-    let content = toml::to_string(&meta).context("serialize meta.toml")?;
-    std::fs::write(vol_dir.join("meta.toml"), content).context("write meta.toml")
 }
 
 // ── Architecture helpers ──────────────────────────────────────────────────────

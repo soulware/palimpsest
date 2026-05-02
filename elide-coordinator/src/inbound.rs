@@ -5338,6 +5338,7 @@ mod tests {
                         manifest_pubkey: None,
                     }),
                     extent_index: vec![],
+                    oci_source: None,
                 },
             };
 
@@ -5518,6 +5519,7 @@ mod tests {
                     manifest_pubkey: Some(override_pubkey_bytes),
                 }),
                 extent_index: vec![],
+                oci_source: None,
             };
             let f1_signer =
                 setup_readonly_identity(&f1_dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
@@ -5588,6 +5590,7 @@ mod tests {
                     manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
+                oci_source: None,
             };
             elide_core::signing::write_provenance(
                 dir,

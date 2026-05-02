@@ -194,6 +194,7 @@ mod tests {
         let lineage = ProvenanceLineage {
             parent,
             extent_index: Vec::new(),
+            oci_source: None,
         };
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 

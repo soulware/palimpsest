@@ -63,7 +63,7 @@ Segments accumulate in `pending/` after WAL promotion. The coordinator's per-for
 4. **Upload** — PUT each `pending/` file, send `promote <ulid>` IPC on success; the volume writes `index/<ulid>.idx` + `cache/<ulid>.body` + `cache/<ulid>.present` and removes `pending/<ulid>`.
 5. **GC** — rate-limited to `gc_interval` (default 10s); see below.
 
-All store access uses the `object_store` crate (uniform local / S3 / GCS / Azure). On first drain the coordinator also uploads `manifest.toml`, `volume.pub`, and `names/<name>`. The volume's promote handler writes `index/` before the body files, and body files before removing `pending/` — a mid-promote crash leaves idempotent retry state.
+All store access uses the `object_store` crate (uniform local / S3 / GCS / Azure). On first drain the coordinator also uploads `volume.pub` and `volume.provenance`; `names/<name>` is published earlier by the lifecycle verbs (`mark_initial`). The volume's promote handler writes `index/` before the body files, and body files before removing `pending/` — a mid-promote crash leaves idempotent retry state.
 
 Steps 1–3 and 5 require `control.sock` (volume running). If absent, those steps are skipped and upload proceeds alone. The drain loop skips a fork entirely when `import.lock` is present and `control.sock` is absent — the import process is still writing segments.
 

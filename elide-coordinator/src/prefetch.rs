@@ -798,6 +798,7 @@ mod tests {
                     manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
+                oci_source: None,
             },
         )
         .unwrap();
@@ -889,6 +890,7 @@ mod tests {
                     manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
+                oci_source: None,
             },
         )
         .unwrap();
@@ -1077,6 +1079,7 @@ mod tests {
                     manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
+                oci_source: None,
             },
         )
         .unwrap();
@@ -1236,6 +1239,7 @@ mod tests {
                     manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
+                oci_source: None,
             },
         )
         .unwrap();
