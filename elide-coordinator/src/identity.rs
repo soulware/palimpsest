@@ -18,6 +18,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use elide_core::signing::{decode_hex, encode_hex};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use rand_core::OsRng;
@@ -34,11 +35,39 @@ const PUB_FILE: &str = "coordinator.pub";
 const ID_FILE: &str = "coordinator.id";
 
 const PRIV_LEN: usize = 32;
-// Used by `fetch_coordinator_pub` (Phase 3 — claimant-side verification
-// of synthesised handoff snapshots). Kept here so the wire-length check
-// stays consistent with the publish path.
-#[allow(dead_code)]
 const PUB_LEN: usize = 32;
+
+/// Serialise a 32-byte Ed25519 verifying key as the canonical
+/// hex-with-trailing-newline form used for both `volume.pub` and
+/// `coordinator.pub`. Single source of truth for the on-disk and
+/// on-bucket format.
+fn encode_pub_hex(key: &VerifyingKey) -> Vec<u8> {
+    let mut s = encode_hex(&key.to_bytes());
+    s.push('\n');
+    s.into_bytes()
+}
+
+/// Parse the canonical `coordinator.pub` form back into a `VerifyingKey`.
+/// Tolerates trailing whitespace (including the newline written by
+/// [`encode_pub_hex`]). Length and hex validity are reported in the
+/// returned error so a tampered or wrong-format record surfaces a
+/// clear diagnostic.
+fn parse_pub_hex(body: &[u8]) -> io::Result<VerifyingKey> {
+    let text = std::str::from_utf8(body)
+        .map_err(|e| io::Error::other(format!("coordinator.pub not utf-8: {e}")))?;
+    let bytes = decode_hex(text.trim())
+        .map_err(|_| io::Error::other("coordinator.pub is not valid hex"))?;
+    if bytes.len() != PUB_LEN {
+        return Err(io::Error::other(format!(
+            "coordinator.pub has wrong length (expected {PUB_LEN} bytes, got {})",
+            bytes.len()
+        )));
+    }
+    let mut arr = [0u8; PUB_LEN];
+    arr.copy_from_slice(&bytes);
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| io::Error::other(format!("invalid Ed25519 pubkey: {e}")))
+}
 
 /// Domain-separation context for the macaroon MAC root.
 const MACAROON_ROOT_CONTEXT: &str = "elide macaroon-root v1";
@@ -183,16 +212,20 @@ impl CoordinatorIdentity {
     /// `coordinator_id`, which is essentially impossible for an
     /// honest 32-byte derivation but worth refusing loudly.
     pub async fn publish_pub(&self, store: &dyn ObjectStore) -> io::Result<()> {
-        let pub_bytes = self.verifying_key().to_bytes();
+        let body = encode_pub_hex(&self.verifying_key());
         let key = pub_object_path(&self.coordinator_id_str);
 
         match store.get(&key).await {
             Ok(get_result) => {
-                let body = get_result
+                // Compare by parsed key, not raw bytes, so trailing-
+                // whitespace differences across writers don't trip the
+                // mismatch check.
+                let existing = get_result
                     .bytes()
                     .await
                     .map_err(|e| io::Error::other(format!("read existing coordinator.pub: {e}")))?;
-                if body.as_ref() != pub_bytes.as_slice() {
+                let existing_vk = parse_pub_hex(&existing)?;
+                if existing_vk.to_bytes() != self.verifying_key().to_bytes() {
                     return Err(io::Error::other(format!(
                         "coordinators/{}/coordinator.pub already exists with different bytes",
                         self.coordinator_id_str
@@ -201,7 +234,7 @@ impl CoordinatorIdentity {
                 Ok(())
             }
             Err(object_store::Error::NotFound { .. }) => {
-                portable::put_if_absent(store, &key, Bytes::copy_from_slice(&pub_bytes))
+                portable::put_if_absent(store, &key, Bytes::from(body))
                     .await
                     .map_err(|e| io::Error::other(format!("publish coordinator.pub: {e}")))?;
                 info!(
@@ -237,24 +270,17 @@ pub async fn fetch_coordinator_pub(
         .await
         .map_err(|e| io::Error::other(format!("read coordinator.pub for {coord_id_str}: {e}")))?;
 
-    if body.len() != PUB_LEN {
-        return Err(io::Error::other(format!(
-            "coordinator.pub for {coord_id_str} has wrong length (expected {PUB_LEN}, got {})",
-            body.len()
-        )));
-    }
-    let mut pub_bytes = [0u8; PUB_LEN];
-    pub_bytes.copy_from_slice(&body);
+    let vk = parse_pub_hex(&body)
+        .map_err(|e| io::Error::other(format!("coordinator.pub for {coord_id_str}: {e}")))?;
 
-    let derived = portable::format_coordinator_id(&portable::coordinator_id(&pub_bytes));
+    let derived = portable::format_coordinator_id(&portable::coordinator_id(&vk.to_bytes()));
     if derived != coord_id_str {
         return Err(io::Error::other(format!(
             "coordinator.pub at coordinators/{coord_id_str}/coordinator.pub does not derive to that id (got {derived})"
         )));
     }
 
-    VerifyingKey::from_bytes(&pub_bytes)
-        .map_err(|e| io::Error::other(format!("invalid Ed25519 pubkey for {coord_id_str}: {e}")))
+    Ok(vk)
 }
 
 fn pub_object_path(coord_id_str: &str) -> StorePath {
@@ -288,11 +314,21 @@ fn load_or_generate_signing_key(data_dir: &Path) -> io::Result<SigningKey> {
 
 fn load_or_write_pub(data_dir: &Path, verifying_key: &VerifyingKey) -> io::Result<()> {
     let path = data_dir.join(PUB_FILE);
-    let pub_bytes = verifying_key.to_bytes();
+    let body = encode_pub_hex(verifying_key);
 
     match std::fs::read(&path) {
         Ok(existing) => {
-            if existing.as_slice() != pub_bytes.as_slice() {
+            // Parse rather than compare bytes: tolerates trailing-
+            // whitespace drift if the file was written by an older
+            // build, and surfaces a clear error if the file is in a
+            // legacy raw-bytes format.
+            let existing_vk = parse_pub_hex(&existing).map_err(|e| {
+                io::Error::other(format!(
+                    "{} unparseable (delete and let it regenerate from coordinator.key): {e}",
+                    path.display()
+                ))
+            })?;
+            if existing_vk.to_bytes() != verifying_key.to_bytes() {
                 return Err(io::Error::other(format!(
                     "{} does not match the loaded private key — keypair files are inconsistent",
                     path.display()
@@ -301,7 +337,7 @@ fn load_or_write_pub(data_dir: &Path, verifying_key: &VerifyingKey) -> io::Resul
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            atomic_write(&path, &pub_bytes, 0o644)?;
+            atomic_write(&path, &body, 0o644)?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -405,9 +441,10 @@ mod tests {
         // Seed a private key.
         let seed = [0xABu8; 32];
         std::fs::write(tmp.path().join(KEY_FILE), seed).unwrap();
-        // Write a public key that doesn't match.
-        let bogus_pub = [0xCDu8; 32];
-        std::fs::write(tmp.path().join(PUB_FILE), bogus_pub).unwrap();
+        // Write a public key (hex format) that doesn't match the
+        // private key's derived pubkey.
+        let bogus = SigningKey::generate(&mut OsRng).verifying_key();
+        std::fs::write(tmp.path().join(PUB_FILE), encode_pub_hex(&bogus)).unwrap();
 
         let err = CoordinatorIdentity::load_or_generate(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("does not match"));
@@ -444,11 +481,12 @@ mod tests {
         let id = CoordinatorIdentity::load_or_generate(tmp.path()).unwrap();
         let store = InMemory::new();
 
-        // Pre-seed the bucket path with a *different* pubkey.
-        let bogus = [0u8; 32];
+        // Pre-seed the bucket path with a *different* but valid pubkey
+        // in the same hex+newline form `publish_pub` writes.
+        let bogus = SigningKey::generate(&mut OsRng).verifying_key();
         let key = pub_object_path(id.coordinator_id_str());
         store
-            .put(&key, Bytes::copy_from_slice(&bogus).into())
+            .put(&key, Bytes::from(encode_pub_hex(&bogus)).into())
             .await
             .expect("seed bogus pub");
 
@@ -464,10 +502,10 @@ mod tests {
 
         // Place a valid Ed25519 pubkey at the path, but the path's id
         // doesn't derive from it. Simulates a tampered or misfiled pub.
-        let other = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let other = SigningKey::generate(&mut OsRng).verifying_key();
         let key = pub_object_path(id.coordinator_id_str());
         store
-            .put(&key, Bytes::copy_from_slice(&other).into())
+            .put(&key, Bytes::from(encode_pub_hex(&other)).into())
             .await
             .expect("seed mismatched pub");
 
@@ -484,8 +522,12 @@ mod tests {
         let store = InMemory::new();
 
         let key = pub_object_path(id.coordinator_id_str());
+        // Valid hex but wrong length (16 bytes instead of 32).
         store
-            .put(&key, Bytes::from_static(b"too short").into())
+            .put(
+                &key,
+                Bytes::from_static(b"00112233445566778899aabbccddeeff\n").into(),
+            )
             .await
             .expect("seed short pub");
 
