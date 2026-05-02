@@ -3619,6 +3619,33 @@ async fn run_fork_job(
                 .name
                 .ok_or_else(|| IpcError::internal("source volume has no name in volume.toml"))?
         };
+
+        // If the source is stopped, transparently bring its daemon up
+        // in transport-suppressed mode so we can drive the implicit
+        // snapshot. The `DrainingMarkerGuard` re-writes
+        // `volume.stopped` and shuts the daemon down on any failure
+        // path; the success path defuses the guard and halts
+        // explicitly so the volume returns to its pre-fork state.
+        let was_stopped = source_dir.join(STOPPED_FILE).exists();
+        let mut draining_guard: Option<DrainingMarkerGuard> = None;
+        if was_stopped {
+            std::fs::write(source_dir.join("volume.draining"), "")
+                .map_err(|e| IpcError::internal(format!("writing volume.draining: {e}")))?;
+            if let Err(e) = std::fs::remove_file(source_dir.join(STOPPED_FILE)) {
+                let _ = std::fs::remove_file(source_dir.join("volume.draining"));
+                return Err(IpcError::internal(format!(
+                    "clearing volume.stopped for fork drain: {e}"
+                )));
+            }
+            ctx.rescan.notify_one();
+            draining_guard = Some(DrainingMarkerGuard::new(source_dir.clone()));
+            if !wait_for_control_sock(&source_dir, std::time::Duration::from_secs(30)).await {
+                return Err(IpcError::internal(format!(
+                    "timed out waiting for source volume '{name}' to come up for fork drain"
+                )));
+            }
+        }
+
         let store = ctx.stores.coordinator_wide();
         let reply = snapshot_volume(
             &name,
@@ -3631,6 +3658,29 @@ async fn run_fork_job(
         job.append(ForkAttachEvent::SnapshotTaken {
             snap_ulid: reply.snap_ulid,
         });
+
+        // Snapshot succeeded: restore the source to `Stopped` if we
+        // brought it up. Defuse the guard so it doesn't fight the
+        // explicit halt; write the marker before shutdown so the
+        // supervisor won't respawn between exit and our final state.
+        if was_stopped {
+            if let Some(g) = draining_guard.as_mut() {
+                g.defuse();
+            }
+            std::fs::write(source_dir.join(STOPPED_FILE), "").map_err(|e| {
+                IpcError::internal(format!("restoring volume.stopped after fork drain: {e}"))
+            })?;
+            use elide_coordinator::control::ShutdownOutcome;
+            match elide_coordinator::control::shutdown(&source_dir).await {
+                ShutdownOutcome::Acknowledged | ShutdownOutcome::NotRunning => {}
+                ShutdownOutcome::Failed(msg) => {
+                    warn!(
+                        "[fork {name}] post-drain shutdown of source daemon failed: {msg}; \
+                         supervisor will respect volume.stopped marker"
+                    );
+                }
+            }
+        }
         Some(reply.snap_ulid)
     };
 
