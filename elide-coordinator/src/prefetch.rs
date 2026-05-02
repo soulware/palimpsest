@@ -100,12 +100,19 @@ pub async fn prefetch_indexes(
         .unwrap_or(fork_dir);
     let by_id_dir = data_dir.join("by_id");
 
-    let mut result = PrefetchResult {
-        fetched: 0,
-        fetched_from_peer: 0,
-        skipped: 0,
-        failed: 0,
-    };
+    // Two-pass shape:
+    //   Pass 1 (this scope): walk lineage chain + extent ancestors to
+    //   collect a flat list of `prefetch_fork` invocations to run.
+    //   Sequential by necessity — each parent's lineage must be read
+    //   to know the next parent, and pulling a missing skeleton is
+    //   prerequisite for that read. Mostly local-fs-fast.
+    //
+    //   Pass 2 (below): run all `prefetch_fork` calls concurrently
+    //   under `buffer_unordered(PREFETCH_CONCURRENCY)`. The work in
+    //   each call (LIST + parallel GETs) is independent across forks,
+    //   so the across-fork wall time collapses from N × per-fork to
+    //   max(per-fork) (modulo concurrency cap).
+    let mut tasks: Vec<PrefetchTask> = Vec::new();
 
     // Current fork: all its segments are valid (no branch-point cutoff).
     // We always have the current fork's own volume.pub locally — it was
@@ -114,25 +121,20 @@ pub async fn prefetch_indexes(
         .with_context(|| format!("resolving volume id for {}", fork_dir.display()))?;
     let own_vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)
         .with_context(|| format!("loading volume.pub from {}", fork_dir.display()))?;
-    prefetch_fork(
-        store,
-        fork_dir,
-        &current_volume_id,
-        None,
-        &own_vk,
-        peer,
-        &mut result,
-    )
-    .await?;
+    tasks.push(PrefetchTask {
+        dir: fork_dir.to_path_buf(),
+        volume_id: current_volume_id,
+        branch_ulid: None,
+        vk: own_vk,
+    });
 
-    // Walk the fork parent chain using embedded pubkeys committed in each
-    // child's signed provenance — *not* the parent's on-disk `volume.pub`.
-    // This matches the read-path trust model (see `block_reader.rs`): the
-    // child's provenance fixes its parent's key at fork time, so the parent
-    // directory doesn't need a locally-trusted `volume.pub`.
-    //
-    // If an ancestor isn't present locally, pull its skeleton first so
-    // subsequent steps can proceed.
+    // Walk the fork parent chain using embedded pubkeys committed in
+    // each child's signed provenance — *not* the parent's on-disk
+    // `volume.pub`. This matches the read-path trust model (see
+    // `block_reader.rs`): the child's provenance fixes its parent's
+    // key at fork time, so the parent directory doesn't need a
+    // locally-trusted `volume.pub`. Pull missing skeletons here so
+    // we can read each parent's lineage to discover the next.
     let mut trusted_dirs: Vec<PathBuf> = Vec::new();
     let own_lineage =
         signing::read_lineage_with_key(fork_dir, &own_vk, signing::VOLUME_PROVENANCE_FILE)
@@ -157,16 +159,12 @@ pub async fn prefetch_indexes(
                 parent.volume_ulid
             )
         })?;
-        prefetch_fork(
-            store,
-            &parent_dir,
-            &parent.volume_ulid,
-            Some(&parent.snapshot_ulid),
-            &parent_vk,
-            peer,
-            &mut result,
-        )
-        .await?;
+        tasks.push(PrefetchTask {
+            dir: parent_dir.clone(),
+            volume_id: parent.volume_ulid.clone(),
+            branch_ulid: Some(parent.snapshot_ulid.clone()),
+            vk: parent_vk,
+        });
         trusted_dirs.push(parent_dir.clone());
         // Continue walking under the pubkey the child committed to.
         let parent_lineage = signing::read_lineage_with_key(
@@ -178,11 +176,12 @@ pub async fn prefetch_indexes(
         cursor = parent_lineage.parent;
     }
 
-    // Extent-index ancestors have no embedded pubkey — the child just names
-    // them by `<volume_ulid>/<snapshot_ulid>` with no trust anchor. For
-    // these we pull the skeleton if missing and fall back to loading
-    // `volume.pub` from disk (the just-pulled one, which is what the store
-    // itself published). Dedup against the fork chain we already walked.
+    // Extent-index ancestors have no embedded pubkey — the child just
+    // names them by `<volume_ulid>/<snapshot_ulid>` with no trust
+    // anchor. For these we pull the skeleton if missing and fall back
+    // to loading `volume.pub` from disk (the just-pulled one, which is
+    // what the store itself published). Dedup against the fork chain
+    // we already walked.
     let extent_ancestors = walk_extent_ancestors(fork_dir, by_id_dir.as_path())
         .context("walking extent-index ancestor chain")?;
     for ancestor in extent_ancestors {
@@ -211,19 +210,66 @@ pub async fn prefetch_indexes(
             .with_context(|| format!("resolving volume id for {}", ancestor_dir.display()))?;
         let ancestor_vk = signing::load_verifying_key(&ancestor_dir, signing::VOLUME_PUB_FILE)
             .with_context(|| format!("loading volume.pub from {}", ancestor_dir.display()))?;
-        prefetch_fork(
-            store,
-            &ancestor_dir,
-            &volume_id,
-            ancestor.branch_ulid.as_deref(),
-            &ancestor_vk,
-            peer,
-            &mut result,
-        )
-        .await?;
+        tasks.push(PrefetchTask {
+            dir: ancestor_dir,
+            volume_id,
+            branch_ulid: ancestor.branch_ulid,
+            vk: ancestor_vk,
+        });
     }
 
+    // Pass 2: dispatch all `prefetch_fork` calls concurrently. Each
+    // task gets its own `PrefetchResult`; merge after.
+    let peer_owned: Option<PeerFetchContext> = peer.cloned();
+    let outcomes: Vec<PrefetchResult> = futures::stream::iter(tasks.into_iter().map(|task| {
+        let store = store.clone();
+        let peer = peer_owned.clone();
+        async move {
+            let mut local = PrefetchResult {
+                fetched: 0,
+                fetched_from_peer: 0,
+                skipped: 0,
+                failed: 0,
+            };
+            prefetch_fork(
+                &store,
+                &task.dir,
+                &task.volume_id,
+                task.branch_ulid.as_deref(),
+                &task.vk,
+                peer.as_ref(),
+                &mut local,
+            )
+            .await?;
+            anyhow::Ok(local)
+        }
+    }))
+    .buffer_unordered(PREFETCH_CONCURRENCY)
+    .try_collect()
+    .await?;
+
+    let mut result = PrefetchResult {
+        fetched: 0,
+        fetched_from_peer: 0,
+        skipped: 0,
+        failed: 0,
+    };
+    for r in outcomes {
+        result.fetched += r.fetched;
+        result.fetched_from_peer += r.fetched_from_peer;
+        result.skipped += r.skipped;
+        result.failed += r.failed;
+    }
     Ok(result)
+}
+
+/// One unit of prefetch work collected during the lineage walk and
+/// dispatched concurrently in Pass 2.
+struct PrefetchTask {
+    dir: PathBuf,
+    volume_id: String,
+    branch_ulid: Option<String>,
+    vk: VerifyingKey,
 }
 
 async fn prefetch_fork(
