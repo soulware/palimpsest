@@ -7,7 +7,7 @@
 ## The shape
 
 - `size: u64` is a required field on `NameRecord` (the TOML at `names/<name>`); schema bumped to `version = 2`.
-- `manifest.toml` no longer carries `size`. Pulled-ancestor skeletons fetch `volume.pub + volume.provenance` only — no `manifest.toml` GET, no `volume.toml`.
+- `manifest.toml` no longer carries `size` (and is now gone entirely — see [design-manifest-toml-removal.md](design-manifest-toml-removal.md)). Pulled-ancestor skeletons fetch `volume.pub + volume.provenance` only — no `volume.toml`.
 - The single owner of `names/<name>` — the coordinator currently holding the claim — is the sole writer of `size`. Updates are CAS-mutations on the same record that already serialises ownership, state, and handoff snapshot.
 - Local `volume.toml.size` is a *cache* of the authoritative `names/<name>.size`, hydrated at create / fork / claim / orphan-resume time, the same way `name` is already cached locally.
 
@@ -48,7 +48,7 @@ Once `size` moves out, the remaining fields are all derivable or non-load-bearin
 - `source` (OCI digest/arch) — bookkeeping only, never consumed by code.
 - `readonly` — implied by `volume.readonly` marker presence and `volume.key` absence.
 
-`manifest.toml` could be dropped entirely as a follow-up. That's a separate, smaller cleanup; the size relocation stands alone.
+Dropped entirely — see [design-manifest-toml-removal.md](design-manifest-toml-removal.md). OCI source migrates to a signed `oci_source` block on `volume.provenance`; the other three fields go away with no replacement.
 
 ## Migration
 

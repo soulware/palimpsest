@@ -114,8 +114,7 @@ elide_data/                           — single root (default --data-dir)
       volume.readonly                 — present = permanently readonly (imported/frozen)
       volume.size                     — volume size in bytes (plain text)
       volume.pub                      — Ed25519 public key (uploaded to S3)
-      volume.provenance               — signed lineage (parent + extent_index); uploaded to S3
-      manifest.toml                   — name, OCI source metadata (size lives on names/<name>)
+      volume.provenance               — signed lineage (parent + extent_index + oci_source); uploaded to S3
       pending/                        — segments awaiting S3 upload (volume-written)
       index/                          — volume-written LBA index files (01JQXXXXX.idx)
       cache/                          — volume-owned body cache (.body, .present); evictable
@@ -158,7 +157,7 @@ elide_data/                           — single root (default --data-dir)
 `by_id/<ulid>/` holds three roles, distinguishable by file shape:
 
 1. **Writable volume** — has `volume.key`, `volume.name`, `wal/`, `by_name/` symlink.
-2. **Imported readonly base** — has `volume.readonly`, `volume.name`, `manifest.toml`, `by_name/` symlink.
+2. **Imported readonly base** — has `volume.readonly`, `volume.name`, `by_name/` symlink. OCI source label (`image`, `digest`, `arch`) lives inside the signed `volume.provenance` as an `oci_source` block.
 3. **Ancestor pulled from S3** — has `volume.readonly`, *no* `volume.name`, *no* `by_name/` symlink. `index/` is populated incrementally by prefetch; `cache/` is populated incrementally by demand-fetches issued by children that read through this ancestor.
 
 Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` / `volume.extent_index` files. Provenance is a single signed document recording both lineage relationships under one Ed25519 signature. Tampering with lineage is detectable with the volume's own public key, and the file format is extensible — adding new lineage fields in the future means extending the signed payload rather than dropping more unsigned files into the directory. `volume.provenance` is uploaded to S3 alongside `volume.pub` so that `remote pull` can materialise a signed, verifiable skeleton on another host.
@@ -182,7 +181,7 @@ The `extent_index` list is **flat because it is computed at import time, not res
 
 Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the signature of each volume's provenance before reading its lineage fields, using the volume's own `volume.pub`. The Ed25519 signature anchors lineage integrity against tampering.
 
-**S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/manifest.toml`, `by_id/<volume-ulid>/volume.pub`, and `by_id/<volume-ulid>/volume.provenance`. Volume names are indexed at `names/<name>` (plain text ULID), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
+**S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/volume.pub` and `by_id/<volume-ulid>/volume.provenance`. Volume names are indexed at `names/<name>` (the signed `NameRecord`, including `vol_ulid`, `state`, owner, and `size`), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
 
 **Name resolution:** the CLI accepts human-readable names in all commands. `by_name/<name>` is a symlink → O(1) resolution via `readlink`. Names must be unique within a `data_dir` — the CLI refuses to create a volume whose name would duplicate an existing `by_name/` entry. The uniqueness constraint is local only; different hosts sharing the same S3 bucket may assign different names to the same ULID.
 
@@ -200,7 +199,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 - `parent` field set → volume is a fork; value is `<parent-ulid>/<snapshot-ulid>`; parent is merged into both the LBA map and the extent index
 - `extent_index` field non-empty → volume lists a flat union of source snapshots; one `<source-ulid>/<snapshot-ulid>` per entry; each source is merged into the extent index only, **never** into the LBA map (no read-path fall-through, no data leak); bounded at `MAX_EXTENT_INDEX_SOURCES` entries
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
-- `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
+- `volume.provenance` carries an `oci_source` block on OCI-imported roots (and only on roots — forks of an imported volume don't inherit it)
 - `import.lock` present while an import is in progress (write phase) or in serve phase (handling promote IPC) or was interrupted
 - **`index/<ulid>.idx` present** means the volume has flushed segment `<ulid>` to `pending/` (or applied a GC handoff producing it). The volume writes `index/<ulid>.idx` at two points: (1) when flushing the WAL to `pending/<ulid>`; (2) when applying a GC handoff — writing `index/<new>.idx` from `gc/<new>` and deleting `index/<old>.idx` for each consumed input. `index/` is never written by the coordinator. `index/<ulid>.idx` files are never evicted — they are the permanent LBA index for all segments the volume has ever created or compacted.
 - **`pending/<ulid>` absent ↔ segment `<ulid>` is confirmed in S3.** The volume deletes `pending/<ulid>` as part of responding to the coordinator's `promote` IPC, which the coordinator issues only after a confirmed S3 upload. If `pending/<ulid>` exists, the segment has not yet been confirmed in S3. `cache/<ulid>.body` and `cache/<ulid>.present` are volume-owned: written by the volume on `promote` response and on demand-fetch; may be evicted by the volume at any time; their absence means body bytes must be fetched from S3.
@@ -724,7 +723,7 @@ OCI import is a potentially long-running operation. The coordinator supervises i
 - After the coordinator drains: `index/` + `cache/` hold the segment index and body cache; `pending/` is empty
 - No `wal/` — the volume is frozen after import completes
 - `snapshots/<import-ulid>` marks the branch point for derived volumes
-- `manifest.toml` records source metadata (OCI digest, arch)
+- `volume.provenance` carries the OCI source label (`image`, `digest`, `arch`) under the volume's signature
 
 To get a writable copy, the user runs `elide volume create <new-name> --from <import-name>` after import completes. This is an explicit step, not automatic.
 
@@ -1214,11 +1213,11 @@ Import is handled by `elide volume import <name> <oci-ref>`, which asks the coor
 
 **Snapshot procedure:** snapshot is a coordinator-orchestrated sequence, not an in-process volume call. The CLI (`elide volume snapshot`) sends `snapshot <name>` to the coordinator, which acquires the per-volume snapshot lock (mutual exclusion against drain/GC/eviction on that volume's tick) and runs: (1) `flush` IPC to the volume — WAL becomes a segment in `pending/`; (2) inline drain — upload each `pending/` segment to S3 and `promote` it so the volume writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}`; (3) pick `snap_ulid` as the max ULID in `index/`; (4) `sign_snapshot_manifest` IPC to the volume — the volume enumerates its own `index/`, writes a signed `snapshots/<snap_ulid>.manifest` listing every segment ULID, then writes the `snapshots/<snap_ulid>` marker; (4b) regenerate `snapshots/<snap_ulid>.filemap` by walking ext4 metadata at the sealed snapshot via `BlockReader::open_snapshot` (no body reads — hashes come from the LBA map), non-ext4 volumes and parse failures skip cleanly; (5) upload manifest, marker, and filemap to S3; release the lock. The marker is written last by the volume, so a partial sequence leaves no visible snapshot. Keys never leave the volume process — signing stays inside the actor. If no new segments have been committed since the latest snapshot, the operation is idempotent and returns the existing ULID.
 
-**Import procedure:** the import path writes data directly into `<vol-dir>/pending/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. `volume.toml` (size, name) and `manifest.toml` (OCI source metadata) are written into the volume directory; the bucket-side `names/<name>` claim is then issued with the now-known size.
+**Import procedure:** the import path writes data directly into `<vol-dir>/pending/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. `volume.toml` (size, name) is written into the volume directory and the OCI source label (`image`, `digest`, `arch`) is signed into `volume.provenance` as an `oci_source` block; the bucket-side `names/<name>` claim is then issued with the now-known size.
 
 The import process then enters its serve phase: it binds `control.sock` and handles `promote <ulid>` IPC from the coordinator. Each promote call causes the import to write `index/<ulid>.idx` and `cache/<ulid>.{body,present}`, then remove `pending/<ulid>`. This keeps the same ownership boundary as writable volumes: the process that controls the directory performs the `pending/ → index/ + cache/` transition in response to coordinator IPC. The import exits when `pending/` is empty.
 
-**S3 upload for volume metadata:** at import, fork, and create time, two objects are written to the store eagerly: `names/<name>` (the signed `NameRecord`, including `vol_ulid`, `state`, owner, and `size`) and `by_id/<ulid>/manifest.toml` (name, origin, OCI source metadata — no size; that lives on the name record). Snapshot markers are uploaded as empty objects at `by_id/<ulid>/snapshots/YYYYMMDD/<snapshot-ulid>` after each `volume snapshot` and at the end of import. Together these allow any host to reconstruct the full volume ancestry skeleton with O(depth) GETs before segment index prefetch begins. See *S3 object layout* in `docs/formats.md` for the full key structure.
+**S3 upload for volume metadata:** at import, fork, and create time, three objects are written to the store eagerly: `names/<name>` (the signed `NameRecord`, including `vol_ulid`, `state`, owner, and `size`), `by_id/<ulid>/volume.pub` (the volume's Ed25519 verifying key), and `by_id/<ulid>/volume.provenance` (signed lineage: `parent`, `extent_index`, and `oci_source` for OCI-imported roots). Snapshot markers are uploaded as empty objects at `by_id/<ulid>/snapshots/YYYYMMDD/<snapshot-ulid>` after each `volume snapshot` and at the end of import. Together these allow any host to reconstruct the full volume ancestry skeleton with O(depth) GETs before segment index prefetch begins. See *S3 object layout* in `docs/formats.md` for the full key structure.
 
 **Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source volume. If a snapshot already exists at the tip, `fork-volume` uses the latest existing snapshot marker rather than creating a duplicate.
 

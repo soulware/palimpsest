@@ -135,6 +135,7 @@ fn fork_volume_at_inner(
             manifest_pubkey: manifest_pubkey.map(|k| k.to_bytes()),
         }),
         extent_index: Vec::new(),
+        oci_source: None,
     };
     crate::signing::write_provenance(
         new_fork_dir,

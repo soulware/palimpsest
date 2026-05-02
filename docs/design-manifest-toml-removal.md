@@ -1,8 +1,8 @@
 # Drop `manifest.toml` entirely
 
-**Status:** Proposed.
+**Status:** Implemented.
 
-Follow-up to [design-volume-size-ownership.md](design-volume-size-ownership.md). With `size` relocated to `NameRecord`, every remaining field on `manifest.toml` is either redundant with an existing surface or migrates onto a signed one, so the file goes away.
+Follow-up to [design-volume-size-ownership.md](design-volume-size-ownership.md). With `size` relocated to `NameRecord`, every remaining field on `manifest.toml` was either redundant with an existing surface or migrated onto a signed one, so the file is gone.
 
 ## What's left on `manifest.toml`
 

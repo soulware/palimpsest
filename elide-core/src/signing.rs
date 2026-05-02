@@ -213,15 +213,34 @@ impl ParentRef {
     }
 }
 
+/// OCI source recorded on the import root of a volume.
+///
+/// Present iff the volume was created via `elide volume import` from an
+/// OCI image. Forks of an imported volume do not inherit it — the field
+/// describes how a *root* was built, not how a child branched. Tools
+/// that want the OCI label on a fork walk up the parent chain to the
+/// import root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OciSource {
+    /// e.g. `docker.io/library/ubuntu:24.04`.
+    pub image: String,
+    /// `sha256:…` of the resolved platform manifest.
+    pub digest: String,
+    /// `amd64` / `arm64` / …
+    pub arch: String,
+}
+
 /// Lineage fields embedded in `volume.provenance` under the signature.
 ///
 /// `parent` is the fork ancestor (writable CoW relationship — merged into
 /// the child's LBA map at open time). `extent_index` is a flat list of
 /// hash-source snapshots whose extents seed the child's extent index for
 /// dedup and delta compression, but are never merged into the LBA map.
-/// Both fields are optional: fresh writable volumes carry neither,
-/// forks carry only `parent`, imports-with-`--extents-from` carry only
-/// `extent_index`, and in principle a future flow could carry both.
+/// `oci_source` records how an import root was built and is present
+/// only on OCI-imported roots. All three are optional: fresh writable
+/// volumes carry none, forks carry only `parent`, imports carry
+/// `oci_source` (and optionally `extent_index`), and in principle a
+/// future flow could carry several.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ProvenanceLineage {
     /// Parent snapshot reference with embedded parent pubkey, or `None`
@@ -230,6 +249,8 @@ pub struct ProvenanceLineage {
     /// Flat list of `<volume-ulid>/<snapshot-ulid>` entries naming
     /// hash-source snapshots.
     pub extent_index: Vec<String>,
+    /// Present iff this volume is an OCI-imported root.
+    pub oci_source: Option<OciSource>,
 }
 
 /// Set up a readonly volume's identity and return a signer for segment writing.
@@ -337,13 +358,16 @@ fn sign_provenance(key: &SigningKey, lineage: &ProvenanceLineage) -> [u8; 64] {
 /// Signing input (NUL-separated, fixed field order):
 ///   parent_or_empty || NUL || parent_pubkey_hex_or_empty || NUL ||
 ///   entry_1 || NUL || entry_2 || NUL || … || entry_N
-///   [ || NUL || manifest_pubkey_hex ]  (only when Some)
+///   [ || NUL || manifest_pubkey_hex ]                          (only when Some)
+///   [ || NUL || oci_image || NUL || oci_digest || NUL || oci_arch ]
+///                                                              (only when Some)
 ///
 /// Empty `extent_index` contributes zero trailing entries. The optional
-/// `manifest_pubkey` suffix is only included when a parent is present and
-/// its `manifest_pubkey` field is `Some` — when absent, the signing input
-/// is byte-identical to the original single-key format, so existing
-/// provenance signatures continue to verify under the same input.
+/// `manifest_pubkey` and `oci_source` suffixes are only included when
+/// their respective fields are `Some` — when both are absent, the
+/// signing input is byte-identical to the original single-key format,
+/// so existing single-key provenance signatures continue to verify
+/// under the same input.
 fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
@@ -364,6 +388,9 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     if let Some(ref hex) = manifest_pubkey_hex {
         total += 1 + hex.len();
     }
+    if let Some(src) = &lineage.oci_source {
+        total += 3 + src.image.len() + src.digest.len() + src.arch.len();
+    }
     let mut msg = Vec::with_capacity(total);
     msg.extend_from_slice(parent_str.as_bytes());
     msg.push(0u8);
@@ -375,6 +402,14 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     if let Some(hex) = manifest_pubkey_hex {
         msg.push(0u8);
         msg.extend_from_slice(hex.as_bytes());
+    }
+    if let Some(src) = &lineage.oci_source {
+        msg.push(0u8);
+        msg.extend_from_slice(src.image.as_bytes());
+        msg.push(0u8);
+        msg.extend_from_slice(src.digest.as_bytes());
+        msg.push(0u8);
+        msg.extend_from_slice(src.arch.as_bytes());
     }
     msg
 }
@@ -412,6 +447,19 @@ fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
         content.push_str(entry);
         content.push('\n');
     }
+    // Only emit when set — same convention as parent_manifest_pubkey, so
+    // non-OCI roots serialise byte-identically to the pre-oci_source format.
+    if let Some(src) = &lineage.oci_source {
+        content.push_str("oci_image: ");
+        content.push_str(&src.image);
+        content.push('\n');
+        content.push_str("oci_digest: ");
+        content.push_str(&src.digest);
+        content.push('\n');
+        content.push_str("oci_arch: ");
+        content.push_str(&src.arch);
+        content.push('\n');
+    }
     content.push_str("sig: ");
     content.push_str(&encode_hex(sig));
     content.push('\n');
@@ -431,11 +479,20 @@ fn parse_provenance(
     let mut parent_pubkey_str: Option<Option<String>> = None;
     let mut manifest_pubkey_str: Option<String> = None;
     let mut extent_index: Option<Vec<String>> = None;
+    let mut oci_image: Option<String> = None;
+    let mut oci_digest: Option<String> = None;
+    let mut oci_arch: Option<String> = None;
     let mut sig: Option<Vec<u8>> = None;
 
     let mut lines = content.lines().peekable();
     while let Some(line) = lines.next() {
-        if let Some(v) = line.strip_prefix("parent_manifest_pubkey: ") {
+        if let Some(v) = line.strip_prefix("oci_image: ") {
+            oci_image = Some(v.to_owned());
+        } else if let Some(v) = line.strip_prefix("oci_digest: ") {
+            oci_digest = Some(v.to_owned());
+        } else if let Some(v) = line.strip_prefix("oci_arch: ") {
+            oci_arch = Some(v.to_owned());
+        } else if let Some(v) = line.strip_prefix("parent_manifest_pubkey: ") {
             if !v.is_empty() {
                 manifest_pubkey_str = Some(v.to_owned());
             }
@@ -550,10 +607,25 @@ fn parse_provenance(
         }
     };
 
+    let oci_source = match (oci_image, oci_digest, oci_arch) {
+        (None, None, None) => None,
+        (Some(image), Some(digest), Some(arch)) => Some(OciSource {
+            image,
+            digest,
+            arch,
+        }),
+        _ => {
+            return Err(io::Error::other(format!(
+                "{provenance_file} has partial oci_source (need all of oci_image, oci_digest, oci_arch or none)"
+            )));
+        }
+    };
+
     Ok((
         ProvenanceLineage {
             parent,
             extent_index,
+            oci_source,
         },
         sig,
     ))
@@ -1027,6 +1099,81 @@ mod tests {
 
     fn signer_from(key: SigningKey) -> Ed25519Signer {
         Ed25519Signer { key }
+    }
+
+    /// OCI-imported root: `oci_source` survives a write/read round-trip
+    /// via the signed `volume.provenance` file and verifies under the
+    /// volume's pubkey.
+    #[test]
+    fn provenance_round_trips_oci_source() {
+        let tmp = TempDir::new().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
+        crate::segment::write_file_atomic(&tmp.path().join(VOLUME_PUB_FILE), pub_hex.as_bytes())
+            .unwrap();
+
+        let lineage = ProvenanceLineage {
+            parent: None,
+            extent_index: vec![],
+            oci_source: Some(OciSource {
+                image: "docker.io/library/ubuntu:24.04".to_owned(),
+                digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                arch: "amd64".to_owned(),
+            }),
+        };
+        write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
+
+        let got =
+            read_lineage_verifying_signature(tmp.path(), VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
+                .unwrap();
+        assert_eq!(got, lineage);
+    }
+
+    /// `oci_source = None` produces a signing input byte-identical to a
+    /// pre-`oci_source` provenance, so non-OCI roots' signatures stay
+    /// stable across the schema extension.
+    #[test]
+    fn provenance_signing_input_unchanged_when_oci_source_absent() {
+        let lineage = ProvenanceLineage {
+            parent: None,
+            extent_index: vec!["01ABC/01DEF".to_owned()],
+            oci_source: None,
+        };
+        let with_oci_none = provenance_signing_input(&lineage);
+
+        // Reference: same content, manually built without the trailing
+        // `oci_source` block. Encoding rule from `provenance_signing_input`.
+        let mut expected = Vec::new();
+        expected.push(0u8); // empty parent
+        // empty parent_pubkey_hex
+        expected.push(0u8);
+        expected.extend_from_slice(b"01ABC/01DEF");
+        assert_eq!(with_oci_none, expected);
+    }
+
+    /// Partial `oci_*` lines (e.g. only `oci_image:` without `oci_digest:`)
+    /// must be rejected at parse time — not silently accepted as a no-op.
+    #[test]
+    fn provenance_rejects_partial_oci_source() {
+        let tmp = TempDir::new().unwrap();
+        // Build a hand-crafted provenance with only oci_image set. We
+        // can sign it with any key (the partial-oci check happens before
+        // signature verification).
+        let key = SigningKey::generate(&mut OsRng);
+        let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
+        crate::segment::write_file_atomic(&tmp.path().join(VOLUME_PUB_FILE), pub_hex.as_bytes())
+            .unwrap();
+        let body = "parent: \nparent_pubkey: \nextent_index:\noci_image: foo:bar\nsig: deadbeef\n";
+        crate::segment::write_file_atomic(
+            &tmp.path().join(VOLUME_PROVENANCE_FILE),
+            body.as_bytes(),
+        )
+        .unwrap();
+
+        let err =
+            read_lineage_verifying_signature(tmp.path(), VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
+                .unwrap_err();
+        assert!(err.to_string().contains("partial oci_source"), "{err}");
     }
 
     #[test]

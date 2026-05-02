@@ -406,26 +406,21 @@ by_id/<volume-ulid>/volume.pub
 
 Uploaded once at first drain. Enables segment signature verification on any host (trust-on-first-use).
 
-**Volume manifest:**
+**Volume provenance:**
 ```
-by_id/<volume-ulid>/manifest.toml
+by_id/<volume-ulid>/volume.provenance
 ```
 
-Written at import, fork, and create time. Contains everything a new host needs to reconstruct the local directory skeleton before prefetching segment indexes:
+Written at import, fork, and create time and uploaded with `volume.pub` so any host can verify lineage and segment signatures locally. The file is a custom line-oriented format (not TOML), Ed25519-signed by the volume's own key. Fields:
 
-```toml
-name = "ubuntu-22.04"
-size = 2361393152
-readonly = true
+- `parent: <parent-ulid>/<snapshot-ulid>` — present on forks only.
+- `parent_pubkey: <hex>` — embedded parent verifying key, paired with `parent`.
+- `parent_manifest_pubkey: <hex>` — optional override for `.manifest` verification (force-snapshot path).
+- `extent_index:` — flat list of `<source-ulid>/<snapshot-ulid>` entries for hash-pool ancestors (delta compression).
+- `oci_image:` / `oci_digest:` / `oci_arch:` — present together iff this volume is an OCI-imported root. Forks of an imported volume don't inherit them.
+- `sig:` — 64-byte Ed25519 signature over the canonical signing input.
 
-# present on forks only
-origin = "<parent-ulid>/snapshots/<snapshot-ulid>"
-
-# present on OCI-imported volumes only
-[source]
-digest = "sha256:..."
-arch = "amd64"
-```
+`size` is **not** here — it lives on the `names/<name>` claim record (see [design-volume-size-ownership.md](design-volume-size-ownership.md)). `name` is **not** here either — `names/<name>` is the canonical name→ulid index.
 
 **Snapshot markers:**
 ```

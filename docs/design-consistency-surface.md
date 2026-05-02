@@ -41,8 +41,7 @@ remain correct.
 | `by_id/<vol>/YYYYMMDD/<segment>` | Write-once PUT, ULID-named. Coordinator-only DELETE during GC, after the volume's signed handoff. Idempotent re-PUT. | Volume that owns the prefix (own host); replicas/forkers (any host) on demand-fetch | **Eventual-tolerant.** Cross-region readers may see 404 briefly after upload; the demand-fetch retry path absorbs this. ULID naming makes PUT a no-CAS operation — uniqueness is by name, not by check-then-write. |
 | `by_id/<vol>/snapshots/<snap_ulid>` (marker) | Write-once empty object | Forkers, replicas | **Eventual-tolerant.** A reader that sees a marker before its `.manifest` / `.filemap` retries; a reader that sees the marker before the underlying segments retries on demand-fetch. |
 | `by_id/<vol>/snapshots/<snap_ulid>.manifest` / `.filemap` | Write-once, signed | Forkers, replicas | **Eventual-tolerant.** Same as the marker — ordered as marker-last, but readers tolerate any visibility order via retry. |
-| `by_id/<vol>/manifest.toml` | Write-once at create/import; immutable thereafter | `remote pull`, `remote list` | **Eventual-tolerant.** Stable content, cacheable. |
-| `by_id/<vol>/volume.pub`, `volume.provenance` | Write-once at create/import; immutable | Replicas (signature verification) | **Eventual-tolerant.** Stable; only published once. |
+| `by_id/<vol>/volume.pub`, `volume.provenance` | Write-once at create/import; immutable | Replicas (signature verification, OCI-source inspection on imported roots) | **Eventual-tolerant.** Stable; only published once. |
 | `coordinators/<coord_id>/coordinator.pub` | Write-once at first coordinator startup; immutable | Other coordinators verifying segment signatures | **Eventual-tolerant.** |
 | **`names/<name>`** | **Conditional PUT** — `If-None-Match: *` for create-if-absent on claim, `If-Match: <etag>` for ownership transfer / release | All coordinators that may host the name | **Globally linearizable single-key CAS.** Cannot tolerate eventual consistency without breaking the name-uniqueness invariant. |
 | `_capabilities/conditional-put-probe-<ulid>` | Single conditional PUT (capability detection) | Same coordinator | Strong on the bucket where it lives — same regime as `names/`. |
@@ -87,14 +86,14 @@ Every other S3 access pattern in Elide:
   load-bearing only within a single region; cross-region replicas
   already have to wait for replication and already retry.
 
-- **Volume metadata (`manifest.toml`, `volume.pub`, provenance)** is
+- **Volume metadata (`volume.pub`, `volume.provenance`)** is
   effectively immutable. Eventually-consistent reads are fine.
 
 - **Coordinator public keys** are the same: write-once, immutable.
 
-The `manifest.toml` and `volume.pub` claims here assume we keep them
-immutable. Renames or key rotation would change this; both would also
-need to be designed against a CAS primitive, at which point they join
+The `volume.pub` and `volume.provenance` claims here assume we keep
+them immutable. Key rotation would change this; it would also need to
+be designed against a CAS primitive, at which point it joins
 `names/<name>` in the strong-consistency tier.
 
 ## Two-bucket split
@@ -113,7 +112,7 @@ are typically more expensive than Global, a deployment can split:
 - **Data bucket** — large, configured for the cheapest acceptable
   tier (Tigris Global is now in scope). Holds everything else:
   - `by_id/<vol>/...` (segments, snapshot markers/manifests/filemaps,
-    `manifest.toml`, `volume.pub`, `volume.provenance`)
+    `volume.pub`, `volume.provenance`)
 
 The coordination bucket carries kilobytes per name; the data bucket
 carries the entire working set. The cost ratio is what makes the
@@ -330,11 +329,11 @@ completeness; none of them corrupt anything.
   refreshes the index and retries against the new GC output. Window:
   replication lag.
 
-- **Manifest read drift.** Volume metadata
-  (`manifest.toml`, `volume.pub`, `provenance`) is effectively
-  immutable, so most reads tolerate eventual consistency trivially.
-  A `remote pull` immediately after `volume create` may briefly 404
-  on `manifest.toml` and retry.
+- **Provenance read drift.** Volume metadata (`volume.pub`,
+  `volume.provenance`) is effectively immutable, so most reads
+  tolerate eventual consistency trivially. A `remote pull`
+  immediately after `volume create` may briefly 404 on
+  `volume.provenance` and retry.
 
 These are the failures the existing design already accepts. Putting
 the data bucket on Tigris Global doesn't change them.

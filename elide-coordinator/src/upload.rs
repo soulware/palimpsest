@@ -40,13 +40,10 @@ use object_store::path::Path as StorePath;
 use object_store::{
     Attribute, AttributeValue, Attributes, ObjectStore, PutOptions, WriteMultipart,
 };
-use serde::Serialize;
 use ulid::Ulid;
 
 /// `Content-Type` for plain UTF-8 text files (volume.pub, provenance, filemap, etc.).
 const MIME_TEXT: &str = "text/plain; charset=utf-8";
-/// `Content-Type` for TOML manifests.
-const MIME_TOML: &str = "application/toml; charset=utf-8";
 
 /// Default multipart part size for tests and non-configurable callers.
 /// Operational code paths read the value from `StoreSection::multipart_part_size_bytes()`.
@@ -190,32 +187,6 @@ pub fn snapshot_manifest_key(volume_id: &str, ulid_str: &str) -> Result<StorePat
     )))
 }
 
-/// Volume manifest written to `by_id/<ulid>/manifest.toml` in the store.
-///
-/// Holds bookkeeping fields for operator inspection. The authoritative
-/// per-volume size lives on `names/<name>` (see
-/// `docs/design-volume-size-ownership.md`); this manifest carries none
-/// of it. Ancestors don't carry size on disk at all.
-#[derive(Serialize)]
-struct Manifest<'a> {
-    name: &'a str,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    readonly: bool,
-    /// Present on forks only. Format: `<parent-ulid>/snapshots/<snapshot-ulid>`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    origin: Option<&'a str>,
-    /// Present on OCI-imported volumes only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<ManifestSource<'a>>,
-}
-
-#[derive(Serialize)]
-struct ManifestSource<'a> {
-    image: &'a str,
-    digest: &'a str,
-    arch: &'a str,
-}
-
 /// Upload all committed segments from `pending/` to the object store, then
 /// promote each segment to the local cache.
 ///
@@ -293,17 +264,17 @@ pub async fn drain_pending(
     Ok(DrainResult { uploaded, failed })
 }
 
-/// Upload volume metadata: public key, signed provenance, manifest.toml,
-/// names/<name> entry, snapshot markers, and filemaps.
+/// Upload volume metadata: public key, signed provenance, snapshot
+/// markers, and filemaps.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
 /// Each artifact is gated on an `uploaded/<name>` file whose bytes must
 /// equal the value we are about to upload; a mismatch (or missing file)
-/// triggers upload. For small metadata (volume.pub, provenance, manifest.toml,
-/// names_<name>) the `uploaded/` entry holds a verbatim copy of the uploaded
-/// bytes, so the directory is inspectable with standard tools. The snapshot
-/// triple (marker + filemap + .manifest) is covered by a single empty
-/// sentinel at `uploaded/snapshots/<ulid>`.
+/// triggers upload. For small metadata (volume.pub, provenance) the
+/// `uploaded/` entry holds a verbatim copy of the uploaded bytes, so the
+/// directory is inspectable with standard tools. The snapshot triple
+/// (marker + filemap + .manifest) is covered by a single empty sentinel
+/// at `uploaded/snapshots/<ulid>`.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
@@ -349,10 +320,6 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!("failed to read provenance: {e:#}"),
-    }
-
-    if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
-        warn!("manifest upload failed: {e:#}");
     }
 
     if let Err(e) = upload_snapshots_and_filemaps(vol_dir, volume_id, store).await {
@@ -442,87 +409,6 @@ async fn upload_small_bytes(
         .await
         .with_context(|| format!("uploading {remote_name} to {key}"))?;
     info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
-    Ok(())
-}
-
-/// Build and upload `by_id/<volume_id>/manifest.toml` from local metadata files.
-async fn upload_manifest(
-    vol_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<()> {
-    let cfg = elide_core::config::VolumeConfig::read(vol_dir).context("reading volume.toml")?;
-    let name = cfg
-        .name
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("volume.toml missing name"))?
-        .trim()
-        .to_owned();
-    let name = name.as_str();
-
-    let readonly = vol_dir.join("volume.readonly").exists();
-
-    let origin_raw = std::fs::read_to_string(vol_dir.join("volume.parent")).ok();
-    let origin = origin_raw.as_deref().map(str::trim);
-
-    // Read OCI source metadata from local meta.toml if present.
-    let meta_raw = std::fs::read_to_string(vol_dir.join("meta.toml")).ok();
-    let meta_table: Option<toml::Table> = meta_raw.as_deref().and_then(|s| toml::from_str(s).ok());
-    let source = meta_table.as_ref().and_then(|t| {
-        let image = t.get("source")?.as_str()?;
-        let digest = t.get("digest")?.as_str()?;
-        let arch = t.get("arch")?.as_str()?;
-        Some(ManifestSource {
-            image,
-            digest,
-            arch,
-        })
-    });
-
-    let manifest = Manifest {
-        name,
-        readonly,
-        origin,
-        source,
-    };
-
-    // Render manifest.toml up front so we can compare against the cached
-    // copy at `uploaded/manifest.toml`. Content-equal gating means re-saving
-    // volume.toml without changing a manifest-visible field does not trigger
-    // a re-upload.
-    let content_bytes = toml::to_string(&manifest)
-        .context("serializing manifest.toml")?
-        .into_bytes();
-    let manifest_sentinel = upload_sentinel(vol_dir, "manifest.toml");
-    if !is_already_uploaded(&manifest_sentinel, &content_bytes) {
-        let manifest_len = content_bytes.len();
-        let key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
-        let started = Instant::now();
-        put_with_content_type(
-            store,
-            &key,
-            Bytes::copy_from_slice(&content_bytes),
-            MIME_TOML,
-        )
-        .await
-        .with_context(|| format!("uploading manifest.toml to {key}"))?;
-        info!(
-            "[upload] {key} ({manifest_len} bytes in {:.2?})",
-            started.elapsed()
-        );
-        if let Err(e) = mark_uploaded(&manifest_sentinel, &content_bytes) {
-            warn!("failed to mark manifest.toml sentinel: {e}");
-        }
-    }
-
-    // The `names/<name>` record is owned by the lifecycle verbs in
-    // `crate::lifecycle`: `mark_initial` claims it at create / fork /
-    // import time, and `mark_stopped` / `mark_released` / `mark_live`
-    // / `mark_claimed` mutate it on state transitions. Drain has no
-    // business writing it — an unconditional PUT here would clobber
-    // the populated record (overwriting `coordinator_id`,
-    // `claimed_at`, `hostname`).
-
     Ok(())
 }
 
@@ -923,8 +809,13 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), fake_pub);
     }
 
+    /// `names/<name>` is owned by the lifecycle verbs (`mark_initial` /
+    /// `mark_stopped` / `mark_released` / etc.). The drain path uploads
+    /// `volume.pub`, `volume.provenance`, snapshot markers, and segments —
+    /// it must not write the name record or it would clobber the populated
+    /// claim (overwriting `coordinator_id`, `claimed_at`, `hostname`).
     #[tokio::test]
-    async fn drain_pending_uploads_manifest_and_does_not_touch_name_record() {
+    async fn drain_pending_does_not_touch_name_record() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
@@ -946,45 +837,20 @@ mod tests {
             .await
             .unwrap();
 
-        // manifest.toml should be present and parseable.
-        let manifest_key = StorePath::from(format!("by_id/{VOL_ULID}/manifest.toml"));
-        let got = store
-            .get(&manifest_key)
-            .await
-            .expect("manifest.toml not in store");
-        let content = String::from_utf8(got.bytes().await.unwrap().to_vec()).unwrap();
-        let table: toml::Table = toml::from_str(&content).unwrap();
-        assert_eq!(table["name"].as_str(), Some("my-vol"));
-        assert_eq!(table["readonly"].as_bool(), Some(true));
-        assert!(
-            !table.contains_key("size"),
-            "size has moved to names/<name>; manifest.toml must not carry it"
-        );
-
-        // names/<name> is owned by the lifecycle verbs, not drain. The
-        // drain path must not touch it — assert no record was created.
         let name_key = StorePath::from("names/my-vol");
         assert!(
             store.head(&name_key).await.is_err(),
             "drain_pending must not write names/<name>; that is owned by mark_initial / lifecycle verbs"
         );
-
-        // uploaded/ holds verbatim copies of the uploaded bytes — diff-able
-        // with standard tools against the store objects.
-        let uploaded = vol_dir.join("uploaded");
-        assert_eq!(
-            std::fs::read_to_string(uploaded.join("manifest.toml")).unwrap(),
-            content
-        );
         // No `uploaded/names_<name>` sentinel either — drain doesn't write
         // the record, so it has no sentinel to compare against.
-        assert!(!uploaded.join("names_my-vol").exists());
+        assert!(!vol_dir.join("uploaded").join("names_my-vol").exists());
     }
 
-    /// Volume-metadata upload is skipped on re-drain when the rendered bytes
+    /// Volume-metadata upload is skipped on re-drain when the file bytes
     /// match the existing `uploaded/<f>` entry. Regression guard for the
-    /// mtime→content-equal gating switch: touching `volume.toml` (or any
-    /// source) without changing the rendered manifest must not re-upload.
+    /// mtime→content-equal gating switch: re-running drain without changing
+    /// any source file must not re-upload.
     #[tokio::test]
     async fn drain_skips_reupload_when_metadata_unchanged() {
         let tmp = TempDir::new().unwrap();
@@ -1007,20 +873,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete the store objects behind the coordinator's back. If gating
-        // works, re-drain sees matching `uploaded/` and skips — the objects
-        // remain absent. If gating is broken (e.g. reverted to mtime), the
-        // objects reappear.
-        let manifest_key = StorePath::from(format!("by_id/{VOL_ULID}/manifest.toml"));
+        // Delete the store object behind the coordinator's back. If gating
+        // works, re-drain sees a matching `uploaded/volume.pub` and skips —
+        // the object remains absent. If gating is broken (e.g. reverted to
+        // mtime), the object reappears.
         let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
-        store.delete(&manifest_key).await.unwrap();
         store.delete(&pub_key).await.unwrap();
 
         drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
             .await
             .unwrap();
 
-        assert!(store.head(&manifest_key).await.is_err());
         assert!(store.head(&pub_key).await.is_err());
 
         // Now change volume.pub content — re-drain must upload.
