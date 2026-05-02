@@ -120,9 +120,6 @@ pub enum Request {
     Claim { volume: String },
     /// Local resume of a `Stopped` volume. Empty success reply.
     Start { volume: String },
-    /// Atomically rebind a `Released` name to a freshly-minted local
-    /// fork. Internal helper called by the CLI's claim orchestration.
-    RebindName { volume: String, new_vol_ulid: Ulid },
 
     // ── Iteration 3: creation + readonly ─────────────────────────────
     /// Mint a fresh writable volume. `flags` is the same transport-flag
@@ -289,14 +286,6 @@ pub struct StatusRemoteReply {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseReply {
     pub handoff_snapshot: Ulid,
-}
-
-/// Reply for [`Request::RebindName`]. Echoes the new fork's ULID for
-/// confirmation; the coordinator atomically rebound `names/<volume>`
-/// to it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RebindNameReply {
-    pub new_vol_ulid: Ulid,
 }
 
 /// Reply for [`Request::Claim`]. The bucket-side claim flow is

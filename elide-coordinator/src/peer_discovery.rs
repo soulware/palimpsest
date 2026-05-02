@@ -68,32 +68,43 @@ pub async fn discover_peer_for_claim(
         }
     };
 
-    // Latest event by ULID order — `list_and_verify_events` returns
-    // entries sorted ascending, so the back of the list is the most
-    // recent.
-    let latest = entries.last()?;
-
-    if latest.signature_status != SignatureStatus::Valid {
-        debug!(
-            "[peer-discovery {volume_name}] latest event signature is {:?}; skip peer",
-            latest.signature_status
-        );
-        return None;
-    }
-
-    let coord_id = match &latest.event.kind {
-        EventKind::Released { .. } => latest.event.coordinator_id.clone(),
-        // `ForceReleased` carries the recovering coordinator's id, not
-        // the previous owner's — and the whole point of force-release
-        // is "the previous owner is gone." S3 is the only sensible
-        // fallback. All other kinds (Created, Claimed, ForkedFrom,
-        // RenamedTo, RenamedFrom) imply no prior cleanly-released
-        // owner to peer-fetch from.
-        other => {
+    // Walk the log back-to-front. The expected handoff prefix on the
+    // tail is `… Released, Claimed`: the previous owner released, we
+    // (the new claimer) immediately emitted Claimed inside the same
+    // claim flow. Skip Claimed entries — they tell us nothing about
+    // who held the cache warm — and use the first Released we find.
+    // Stop on any other terminal kind (Created, ForkedFrom,
+    // ForceReleased, RenamedTo, RenamedFrom): those mean either no
+    // prior cleanly-released owner or that the previous owner is
+    // gone, so direct S3 is the only sensible source.
+    let mut coord_id: Option<String> = None;
+    for entry in entries.iter().rev() {
+        if entry.signature_status != SignatureStatus::Valid {
             debug!(
-                "[peer-discovery {volume_name}] latest event is {}; skip peer",
-                other.as_str()
+                "[peer-discovery {volume_name}] event signature is {:?}; skip peer",
+                entry.signature_status
             );
+            return None;
+        }
+        match &entry.event.kind {
+            EventKind::Claimed => continue, // skip past Claimed events
+            EventKind::Released { .. } => {
+                coord_id = Some(entry.event.coordinator_id.clone());
+                break;
+            }
+            other => {
+                debug!(
+                    "[peer-discovery {volume_name}] hit {} before Released; skip peer",
+                    other.as_str()
+                );
+                return None;
+            }
+        }
+    }
+    let coord_id = match coord_id {
+        Some(id) => id,
+        None => {
+            debug!("[peer-discovery {volume_name}] no Released event in log; skip peer");
             return None;
         }
     };
@@ -208,6 +219,52 @@ mod tests {
 
         let result = discover_peer_for_claim(&store, "vol").await;
         assert!(result.is_none());
+    }
+
+    /// Regression: when the foreign-claim flow emits its own `Claimed`
+    /// event before discovery runs (as happens now that the rebind is
+    /// folded into `fork_create_op`), the log tail looks like
+    /// `[…, Released-by-A, Claimed-by-B]`. Discovery must walk back
+    /// past the Claimed and resolve A as the releaser.
+    #[tokio::test]
+    async fn finds_releaser_when_claimed_already_emitted() {
+        let store = store().await;
+        let (a, _tmp_a) = make_coord(&store).await;
+        let (b, _tmp_b) = make_coord(&store).await;
+        let a_id = a.coordinator_id_str().to_owned();
+
+        let vol_ulid = Ulid::new();
+        emit_event(&store, &a, "vol", EventKind::Created, vol_ulid)
+            .await
+            .unwrap();
+        emit_event(
+            &store,
+            &a,
+            "vol",
+            EventKind::Released {
+                handoff_snapshot: Ulid::new(),
+            },
+            vol_ulid,
+        )
+        .await
+        .unwrap();
+        // B has already emitted its Claimed event by the time
+        // discovery runs (this is the new ordering after the
+        // rebind-into-fork-create refactor).
+        emit_event(&store, &b, "vol", EventKind::Claimed, vol_ulid)
+            .await
+            .unwrap();
+
+        // A advertises a peer-fetch endpoint.
+        PeerEndpoint::new("10.0.0.42".to_owned(), 8443)
+            .publish(store.as_ref(), &a_id)
+            .await
+            .unwrap();
+
+        let discovered = discover_peer_for_claim(&store, "vol")
+            .await
+            .expect("discovery walks past B's Claimed and finds A's Release");
+        assert_eq!(discovered.coordinator_id, a_id);
     }
 
     #[tokio::test]

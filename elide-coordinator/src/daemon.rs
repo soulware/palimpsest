@@ -97,35 +97,49 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // can find us during handoff discovery. Sibling write to
     // `coordinator.pub`. Absence of `peer_fetch.port` keeps the whole
     // mechanism off — no server, no advertisement, no peer tier.
-    let peer_fetch_handle: Option<elide_coordinator::tasks::PeerFetchHandle> =
-        if let Some(port) = config.peer_fetch.port {
-            let host = config.peer_fetch.advertised_host(identity.hostname());
-            let endpoint = elide_peer_fetch::PeerEndpoint::new(host, port);
-            if let Err(e) = endpoint
-                .publish(coord_wide.as_ref(), identity.coordinator_id_str())
-                .await
-            {
-                return Err(anyhow::anyhow!("publish peer-endpoint.toml: {e}"));
+    let mut peer_fetch_handle: Option<elide_coordinator::tasks::PeerFetchHandle> = None;
+    let mut peer_fetch_server: Option<(
+        std::net::SocketAddr,
+        elide_peer_fetch::server::ServerContext,
+    )> = None;
+    if let Some(port) = config.peer_fetch.port {
+        let host = config.peer_fetch.advertised_host(identity.hostname());
+        let endpoint = elide_peer_fetch::PeerEndpoint::new(host, port);
+        if let Err(e) = endpoint
+            .publish(coord_wide.as_ref(), identity.coordinator_id_str())
+            .await
+        {
+            return Err(anyhow::anyhow!("publish peer-endpoint.toml: {e}"));
+        }
+        info!(
+            "[coordinator] peer-fetch endpoint advertised: {} (bind {})",
+            endpoint.url(),
+            config.peer_fetch.bind_addr(),
+        );
+        // Build a single peer-fetch client to share across all
+        // per-volume tasks. The client pools HTTP/2 connections
+        // internally and signs tokens on demand via the
+        // `TokenSigner` impl on `CoordinatorIdentity`.
+        let signer: std::sync::Arc<dyn elide_peer_fetch::TokenSigner> = identity.clone();
+        match elide_peer_fetch::PeerFetchClient::new(signer) {
+            Ok(client) => {
+                peer_fetch_handle = Some(elide_coordinator::tasks::PeerFetchHandle { client });
             }
-            info!(
-                "[coordinator] peer-fetch endpoint advertised: {} (bind {})",
-                endpoint.url(),
-                config.peer_fetch.bind_addr(),
-            );
-            // Build a single peer-fetch client to share across all
-            // per-volume tasks. The client pools HTTP/2 connections
-            // internally and signs tokens on demand via the
-            // `TokenSigner` impl on `CoordinatorIdentity`.
-            let signer: std::sync::Arc<dyn elide_peer_fetch::TokenSigner> = identity.clone();
-            match elide_peer_fetch::PeerFetchClient::new(signer) {
-                Ok(client) => Some(elide_coordinator::tasks::PeerFetchHandle { client }),
-                Err(e) => {
-                    return Err(anyhow::anyhow!("build peer-fetch client: {e}"));
-                }
-            }
-        } else {
-            None
-        };
+            Err(e) => return Err(anyhow::anyhow!("build peer-fetch client: {e}")),
+        }
+        // Server context for the inbound HTTP listener. The auth state
+        // shares the same coord-wide store handle the rest of the
+        // daemon uses (reads `coordinators/<id>/coordinator.pub`,
+        // `names/<name>`, `by_id/<vol>/volume.{pub,provenance}`); the
+        // route handler resolves files under `data_dir/by_id/...`.
+        let bind_addr_str = format!("{}:{}", config.peer_fetch.bind_addr(), port);
+        let addr: std::net::SocketAddr = bind_addr_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parsing peer-fetch bind {bind_addr_str:?}: {e}"))?;
+        let auth = elide_peer_fetch::auth::AuthState::new(coord_wide.clone());
+        let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
+        peer_fetch_server = Some((addr, ctx));
+    }
     let coord_id_str: String = identity.coordinator_id_str().to_owned();
     let macaroon_root: [u8; 32] = *identity.macaroon_root();
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
@@ -202,6 +216,17 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         };
         tasks.spawn(async move {
             inbound::serve(&socket_path, ctx).await;
+        });
+    }
+
+    // Peer-fetch HTTP server: bound only when `[peer_fetch].port` is
+    // set in coordinator.toml. Shares the same `JoinSet` so Ctrl-C
+    // aborts and drains it alongside the rest.
+    if let Some((addr, ctx)) = peer_fetch_server.take() {
+        tasks.spawn(async move {
+            if let Err(e) = elide_peer_fetch::server::serve(addr, ctx).await {
+                warn!("[coordinator] peer-fetch server exited: {e}");
+            }
         });
     }
 

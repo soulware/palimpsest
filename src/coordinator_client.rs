@@ -18,10 +18,9 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
-    LatestSnapshotReply, PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply,
-    ResolveHandoffKeyReply, ResolveNameReply, SignatureStatus, SnapshotReply, StatusRemoteReply,
-    StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventEntry,
-    VolumeEventsReply,
+    LatestSnapshotReply, PullReadonlyReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply,
+    ResolveNameReply, SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply,
+    StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
 };
 
 /// Public-API aliases for the client side. The underlying types live
@@ -601,24 +600,6 @@ pub fn claim_volume_bucket(socket_path: &Path, name: &str) -> io::Result<ClaimOu
             handoff_snapshot: handoff_snapshot.map(|s| s.to_string()),
         },
     })
-}
-
-/// Atomically rebind a `Released` name to a freshly-minted local fork,
-/// leaving the bucket state in `Stopped`. The CLI must have already
-/// materialised `by_id/<new_vol_ulid>/` before calling this. Returns
-/// the new ULID on success.
-pub fn rebind_name(socket_path: &Path, name: &str, new_vol_ulid: &str) -> io::Result<String> {
-    let parsed = ulid::Ulid::from_string(new_vol_ulid)
-        .map_err(|e| io::Error::other(format!("invalid new_vol_ulid: {e}")))?;
-    let reply: RebindNameReply = call_typed(
-        socket_path,
-        &Request::RebindName {
-            volume: name.to_owned(),
-            new_vol_ulid: parsed,
-        },
-    )?
-    .map_err(io::Error::other)?;
-    Ok(reply.new_vol_ulid.to_string())
 }
 
 /// Create a fresh writable volume. Returns the new volume's ULID. Routes

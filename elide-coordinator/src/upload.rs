@@ -386,6 +386,47 @@ pub async fn upload_volume_pub_initial(
     Ok(())
 }
 
+/// Upload `<vol_dir>/volume.provenance` to
+/// `by_id/<volume_id>/volume.provenance` and write the local upload
+/// sentinel.
+///
+/// Sibling to [`upload_volume_pub_initial`]: extends the same
+/// "`names/<name>` only ever points at a `vol_ulid` whose immutable
+/// trust artefacts are already in the bucket" invariant from
+/// `volume.pub` to `volume.provenance`. Provenance is needed by the
+/// peer-fetch auth pipeline's lineage walk (which fetches
+/// `by_id/<vol_ulid>/volume.provenance` to reconstruct ancestry) and
+/// by `pull_readonly` for ancestor materialisation. Without this
+/// eager publish, the window between `mark_claimed` and the daemon's
+/// later metadata-drain pass is one in which every peer-fetch
+/// request 401s on a 404 from S3.
+///
+/// Crash-safety story matches the `volume.pub` case: if the
+/// coordinator dies after this call but before `mark_initial` /
+/// `mark_claimed`, the orphan `by_id/<vol_ulid>/volume.provenance`
+/// has no `names/<name>` referrer and is reclaimed by future GC.
+pub async fn upload_volume_provenance_initial(
+    vol_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<()> {
+    let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
+    let bytes = std::fs::read(&provenance_path)
+        .with_context(|| format!("reading {}", provenance_path.display()))?;
+    upload_small_bytes(
+        &bytes,
+        volume_id,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        MIME_TEXT,
+        store,
+    )
+    .await?;
+    let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
+    mark_uploaded(&sentinel, &bytes)
+        .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
+    Ok(())
+}
+
 async fn upload_small_bytes(
     data: &[u8],
     volume_id: &str,

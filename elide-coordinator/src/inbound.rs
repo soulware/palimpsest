@@ -36,7 +36,7 @@ use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    LatestSnapshotReply, PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, Request,
+    LatestSnapshotReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
     ResolveHandoffKeyReply, ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply,
     StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
@@ -238,25 +238,6 @@ async fn dispatch_json(
             )
             .await;
             let env: Envelope<()> = result.into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
-        Request::RebindName {
-            volume,
-            new_vol_ulid,
-        } => {
-            // Conditional PUT on names/<volume>: coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
-            let result = rebind_name_op(
-                &volume,
-                new_vol_ulid,
-                &ctx.data_dir,
-                &store,
-                &ctx.identity,
-                &ctx.rescan,
-                &ctx.prefetch_tracker,
-            )
-            .await;
-            let env: Envelope<RebindNameReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Create {
@@ -1275,42 +1256,59 @@ async fn create_volume_op(
     let vol_ulid_str = vol_ulid.to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid_str);
 
-    // Phase 1: create the local volume directory and signing key. We need
-    // `volume.pub` on disk before we can upload it, and we want the
-    // upload to land in S3 *before* `names/<name>` so the invariant
-    // "every named vol_ulid has volume.pub in the bucket" holds across
-    // crashes. A SIGINT before the upload leaves only local-disk state,
-    // which `cleanup_local` rolls back.
+    // Phase 1: create the local volume directory, signing key, and
+    // signed empty-lineage `volume.provenance`. Both immutable trust
+    // artefacts must exist on disk before Phase 2 uploads them, and
+    // both must land in S3 *before* `names/<name>` so the invariant
+    // "every named vol_ulid has volume.pub *and* volume.provenance in
+    // the bucket" holds across crashes. A SIGINT before the upload
+    // leaves only local-disk state, which `cleanup_local` rolls back.
     let cleanup_local = || {
         let _ = std::fs::remove_file(by_name_dir.join(name));
         let _ = std::fs::remove_dir_all(&vol_dir);
     };
-    let signing_key = match (|| {
+    if let Err(e) = (|| {
         std::fs::create_dir_all(&vol_dir)?;
         std::fs::create_dir_all(vol_dir.join("pending"))?;
         std::fs::create_dir_all(vol_dir.join("index"))?;
         std::fs::create_dir_all(vol_dir.join("cache"))?;
-        elide_core::signing::generate_keypair(
+        let key = elide_core::signing::generate_keypair(
             &vol_dir,
             elide_core::signing::VOLUME_KEY_FILE,
             elide_core::signing::VOLUME_PUB_FILE,
-        )
+        )?;
+        elide_core::signing::write_provenance(
+            &vol_dir,
+            &key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &elide_core::signing::ProvenanceLineage::default(),
+        )?;
+        Ok::<_, std::io::Error>(())
     })() {
-        Ok(k) => k,
-        Err(e) => {
-            cleanup_local();
-            return Err(IpcError::internal(format!("create failed: {e}")));
-        }
-    };
+        cleanup_local();
+        return Err(IpcError::internal(format!("create failed: {e}")));
+    }
 
-    // Phase 2: publish volume.pub to S3. A SIGINT here at worst leaves an
-    // orphan `by_id/<vol_ulid>/volume.pub` (no names/<name> references it,
-    // so it's harmless and GC-reclaimable).
+    // Phase 2: publish volume.pub *and* volume.provenance to S3
+    // *before* claiming the name. Both files are immutable. A SIGINT
+    // here at worst leaves orphan
+    // `by_id/<vol_ulid>/{volume.pub, volume.provenance}` (no
+    // names/<name> references them, so they're harmless and
+    // GC-reclaimable).
     if let Err(e) =
         elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, store).await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
+    }
+    if let Err(e) =
+        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &vol_ulid_str, store)
+            .await
+    {
+        cleanup_local();
+        return Err(IpcError::store(format!(
+            "uploading volume.provenance: {e:#}"
+        )));
     }
 
     // Phase 3: claim the name in S3. After this point the names/<name>
@@ -1362,14 +1360,10 @@ async fn create_volume_op(
         }
     }
 
-    // Phase 4: finish local state (provenance, config, by_name symlink).
+    // Phase 4: finish local state (config + by_name symlink).
+    // Provenance was already written in Phase 1 so it could be
+    // uploaded in Phase 2 ahead of the names/<name> claim.
     let result: std::io::Result<()> = (|| {
-        elide_core::signing::write_provenance(
-            &vol_dir,
-            &signing_key,
-            elide_core::signing::VOLUME_PROVENANCE_FILE,
-            &elide_core::signing::ProvenanceLineage::default(),
-        )?;
         elide_core::config::VolumeConfig {
             name: Some(name.to_owned()),
             size: Some(size_bytes),
@@ -1825,6 +1819,58 @@ async fn force_snapshot_now_op(
 /// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
 /// recorded in the new fork's provenance for force-snapshot pins.
 #[allow(clippy::too_many_arguments)]
+/// Classify a pre-existing `by_name/<name>` symlink seen during a
+/// `for_claim` fork-create.
+///
+/// Returns:
+///
+///   - `Some(ulid)` when the symlink target's `by_id/<ulid>/`
+///     directory holds a verified `volume.provenance` whose parent
+///     matches `expected_parent` and `expected_snap` — i.e. it's
+///     exactly what a fresh `fork_create` would mint, the residue
+///     of an aborted prior attempt. The caller reuses it (resume
+///     mode): no new fork minted, no orphan accumulation.
+///
+///   - `None` otherwise: symlink absent, target dir missing,
+///     provenance unverifiable, or lineage doesn't match. The
+///     caller's `for_claim` branch removes the stale link and
+///     mints a fresh fork.
+///
+/// Read-only — never mutates filesystem.
+fn classify_resumable_orphan(
+    symlink: &std::path::Path,
+    by_id_dir: &std::path::Path,
+    expected_parent: ulid::Ulid,
+    expected_snap: Option<ulid::Ulid>,
+) -> Option<ulid::Ulid> {
+    let target = std::fs::read_link(symlink).ok()?;
+    let prev_ulid_str = target.file_name().and_then(|n| n.to_str())?;
+    let prev_ulid = ulid::Ulid::from_string(prev_ulid_str).ok()?;
+    let prev_dir = by_id_dir.join(prev_ulid_str);
+    if !prev_dir.is_dir() {
+        return None;
+    }
+    let lineage = elide_core::signing::read_lineage_verifying_signature(
+        &prev_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    )
+    .ok()?;
+    let parent = lineage.parent?;
+    let expected_snap = expected_snap?;
+    if parent.volume_ulid == expected_parent.to_string()
+        && parent.snapshot_ulid == expected_snap.to_string()
+    {
+        Some(prev_ulid)
+    } else {
+        None
+    }
+}
+
+// IPC handler: arguments mirror the dispatcher's per-call context.
+// Packing them into a struct would create a one-shot type with no
+// other callers.
+#[allow(clippy::too_many_arguments)]
 async fn fork_create_op(
     new_name: &str,
     source_vol_ulid: ulid::Ulid,
@@ -1885,12 +1931,6 @@ async fn fork_create_op(
 
     let by_name_dir = data_dir.join("by_name");
     let symlink_path = by_name_dir.join(new_name);
-    if symlink_path.exists() {
-        return Err(IpcError::conflict(format!(
-            "volume already exists: {new_name}"
-        )));
-    }
-
     let by_id_dir = data_dir.join("by_id");
     let source_dir = elide_core::volume::resolve_ancestor_dir(&by_id_dir, &source_ulid_str);
     if !source_dir.exists() {
@@ -1899,7 +1939,39 @@ async fn fork_create_op(
         )));
     }
 
-    let new_vol_ulid_value = ulid::Ulid::new();
+    // For_claim mode: a pre-existing `by_name/<name>` symlink may be
+    // the residue of an aborted prior attempt. If its signed
+    // provenance matches the parent + snap we'd be forking from,
+    // resume against it — no new fork minted, no orphan accumulation.
+    // Otherwise, remove the stale link and fall through to the
+    // fresh-fork path. (For `!for_claim`, an existing symlink is
+    // always a hard conflict — that's `volume create --from`'s
+    // contract.)
+    let resume_existing: Option<ulid::Ulid> = if for_claim {
+        classify_resumable_orphan(&symlink_path, &by_id_dir, source_vol_ulid, snap)
+    } else {
+        None
+    };
+    if let Some(prev) = resume_existing {
+        info!("[inbound] fork-create {new_name}: resuming aborted prior attempt at {prev}");
+    } else if symlink_path.exists() {
+        if for_claim {
+            std::fs::remove_file(&symlink_path).map_err(|e| {
+                IpcError::internal(format!("removing stale by_name/{new_name}: {e}"))
+            })?;
+            info!("[inbound] removed stale by_name/{new_name}");
+        } else {
+            return Err(IpcError::conflict(format!(
+                "volume already exists: {new_name}"
+            )));
+        }
+    }
+
+    // `Ulid::default()` is the nil ULID; we need a freshly minted one
+    // when resume isn't in play, so suppress clippy's unwrap_or_default
+    // suggestion explicitly.
+    #[allow(clippy::unwrap_or_default)]
+    let new_vol_ulid_value = resume_existing.unwrap_or_else(ulid::Ulid::new);
     let new_vol_ulid = new_vol_ulid_value.to_string();
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
 
@@ -1925,75 +1997,142 @@ async fn fork_create_op(
         }
     };
 
-    // Phase 1: materialise the fork locally. This generates the new
-    // fork's keypair on disk so we can upload `volume.pub` before
-    // touching `names/<name>`.
-    let fork_result: std::io::Result<()> = match (snap, parent_key) {
-        (Some(snap), Some(vk)) => elide_core::volume::fork_volume_at_with_manifest_key(
-            &new_fork_dir,
-            &source_dir,
-            snap,
-            vk,
-        ),
-        (Some(snap), None) => elide_core::volume::fork_volume_at(&new_fork_dir, &source_dir, snap),
-        (None, _) => elide_core::volume::fork_volume(&new_fork_dir, &source_dir),
-    };
-    if let Err(e) = fork_result {
-        cleanup(&new_fork_dir, &symlink_path);
-        return Err(IpcError::internal(format!("fork failed: {e}")));
-    }
-
-    // Phase 2: publish volume.pub to S3 *before* claiming the name.
-    // A SIGINT here at worst leaves an orphan
-    // `by_id/<new_vol_ulid>/volume.pub` (no names/<name> references it,
-    // so it's harmless). Without this ordering, a crash between
-    // mark_initial and the daemon's first metadata-drain leaves
-    // `names/<name>` pointing at a vol_ulid whose volume.pub is
-    // missing — which makes both the normal claim path and
-    // `release --force` recovery impossible.
-    if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vol_ulid, store)
-            .await
-    {
-        cleanup(&new_fork_dir, &symlink_path);
-        return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
-    }
-
-    // Read source volume config: `src_cfg.name` feeds the
-    // `ForkedFrom` journal entry below, and `src_cfg.size` is
-    // inherited into the new fork's `volume.toml` further down. Done
-    // before the bucket claim so a malformed source fails cleanly
-    // without leaving a half-claimed name.
-    let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
-        Ok(c) => c,
-        Err(e) => {
+    // Phases 1 + 2 + 4 are skipped when resuming an aborted prior
+    // attempt: the orphan fork's signed provenance was already
+    // verified by `classify_resumable_orphan`, the volume.pub +
+    // volume.provenance uploads were completed before the orphan
+    // attempt's symlink was created, and `volume.toml` + the
+    // by_name symlink are exactly what they would be on a fresh
+    // mint. The remaining work — bucket-side `mark_claimed`,
+    // `volume.stopped` marker, journal event — runs unconditionally
+    // for the `for_claim` path further down.
+    let (resolved_snap, src_name) = if resume_existing.is_none() {
+        // Phase 1: materialise the fork locally. This generates the new
+        // fork's keypair on disk so we can upload `volume.pub` before
+        // touching `names/<name>`.
+        let fork_result: std::io::Result<()> = match (snap, parent_key) {
+            (Some(snap), Some(vk)) => elide_core::volume::fork_volume_at_with_manifest_key(
+                &new_fork_dir,
+                &source_dir,
+                snap,
+                vk,
+            ),
+            (Some(snap), None) => {
+                elide_core::volume::fork_volume_at(&new_fork_dir, &source_dir, snap)
+            }
+            (None, _) => elide_core::volume::fork_volume(&new_fork_dir, &source_dir),
+        };
+        if let Err(e) = fork_result {
             cleanup(&new_fork_dir, &symlink_path);
-            return Err(IpcError::internal(format!(
-                "reading source volume config: {e}"
+            return Err(IpcError::internal(format!("fork failed: {e}")));
+        }
+
+        // Phase 2: publish volume.pub *and* volume.provenance to S3
+        // *before* claiming the name. Both files are immutable from
+        // fork creation onward and self-signed by the new fork's
+        // keypair. A SIGINT here at worst leaves orphan
+        // `by_id/<new_vol_ulid>/{volume.pub, volume.provenance}` (no
+        // names/<name> references them, so they're harmless and
+        // reclaimable by future GC). Without this ordering, a crash
+        // between mark_initial and the daemon's first metadata-drain
+        // leaves `names/<name>` pointing at a vol_ulid whose
+        // immutable trust artefacts are missing — which breaks both
+        // the normal claim path and the peer-fetch auth pipeline
+        // (lineage walk 404s on volume.provenance).
+        if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(
+            &new_fork_dir,
+            &new_vol_ulid,
+            store,
+        )
+        .await
+        {
+            cleanup(&new_fork_dir, &symlink_path);
+            return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
+        }
+        if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
+            &new_fork_dir,
+            &new_vol_ulid,
+            store,
+        )
+        .await
+        {
+            cleanup(&new_fork_dir, &symlink_path);
+            return Err(IpcError::store(format!(
+                "uploading volume.provenance: {e:#}"
             )));
         }
-    };
-    let size = match src_cfg.size {
-        Some(s) => s,
-        None => {
-            cleanup(&new_fork_dir, &symlink_path);
-            return Err(IpcError::conflict(
-                "source volume has no size (import may not have completed)",
-            ));
-        }
-    };
 
-    // Snap actually used for the fork. `snap.is_some()` matches the
-    // explicit-pin call sites; otherwise `fork_volume` above
-    // resolved `latest_snapshot(&source_dir)` internally and we
-    // recompute it here so the journal records the same value.
-    // Resolution failure here only suppresses the `ForkedFrom`
-    // event; the lifecycle proceeds with `Created` as a fallback.
-    let resolved_snap = snap.or_else(|| {
-        elide_core::volume::latest_snapshot(&source_dir)
+        // Read source volume config: `src_cfg.name` feeds the
+        // `ForkedFrom` journal entry below, and `src_cfg.size` is
+        // inherited into the new fork's `volume.toml` further down.
+        // Done before the bucket claim so a malformed source fails
+        // cleanly without leaving a half-claimed name.
+        let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return Err(IpcError::internal(format!(
+                    "reading source volume config: {e}"
+                )));
+            }
+        };
+        let size = match src_cfg.size {
+            Some(s) => s,
+            None => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return Err(IpcError::conflict(
+                    "source volume has no size (import may not have completed)",
+                ));
+            }
+        };
+
+        // Snap actually used for the fork. `snap.is_some()` matches
+        // the explicit-pin call sites; otherwise `fork_volume` above
+        // resolved `latest_snapshot(&source_dir)` internally and we
+        // recompute it here so the journal records the same value.
+        // Resolution failure here only suppresses the `ForkedFrom`
+        // event; the lifecycle proceeds with `Created` as a fallback.
+        let resolved_snap = snap.or_else(|| {
+            elide_core::volume::latest_snapshot(&source_dir)
+                .ok()
+                .flatten()
+        });
+
+        // Phase 4 prep: stash the local-config write alongside the
+        // symlink creation below. Doing it here keeps the cleanup
+        // semantics symmetric with the upload failures above.
+        if let Err(e) = (elide_core::config::VolumeConfig {
+            name: Some(new_name.to_owned()),
+            size: Some(size),
+            nbd: nbd_cfg,
+            ublk: ublk_cfg,
+        }
+        .write(&new_fork_dir))
+        {
+            cleanup(&new_fork_dir, &symlink_path);
+            return Err(IpcError::internal(format!("writing volume config: {e}")));
+        }
+
+        (resolved_snap, src_cfg.name)
+    } else {
+        // Resume mode: orphan fork is fully materialised on disk,
+        // volume.pub + volume.provenance are already on S3, and
+        // volume.toml + by_name symlink already exist. We just need
+        // the `resolved_snap` value so the journal event below can
+        // emit a meaningful record. We don't read `volume.toml`
+        // because the fresh-fork path read source's, not the new
+        // fork's; mirroring "use snap if pinned, else latest" is
+        // enough for the event.
+        let resolved_snap = snap.or_else(|| {
+            elide_core::volume::latest_snapshot(&source_dir)
+                .ok()
+                .flatten()
+        });
+        let src_name = elide_core::config::VolumeConfig::read(&source_dir)
             .ok()
-            .flatten()
-    });
+            .and_then(|c| c.name);
+        (resolved_snap, src_name)
+    };
 
     // Phase 3: for brand-new names, claim in S3. For the
     // claim-from-released path (`for-claim` flag), the bucket record
@@ -2022,7 +2161,7 @@ async fn fork_create_op(
                 // source name and snap have to be present; a
                 // partial `ForkedFrom` would publish a less useful
                 // record than just stating "this name appeared".
-                let kind = match (resolved_snap, src_cfg.name.clone()) {
+                let kind = match (resolved_snap, src_name.clone()) {
                     (Some(source_snap_ulid), Some(source_name)) => {
                         elide_core::volume_event::EventKind::ForkedFrom {
                             source_name,
@@ -2080,27 +2219,88 @@ async fn fork_create_op(
         }
     }
 
-    if let Err(e) = (elide_core::config::VolumeConfig {
-        name: Some(new_name.to_owned()),
-        size: Some(size),
-        nbd: nbd_cfg,
-        ublk: ublk_cfg,
+    // Phase 4: by_name/<name> symlink (volume.toml was written
+    // earlier as part of the fresh-fork phases, before mark_initial,
+    // so a Phase-3 failure didn't leave a half-written config).
+    // Resume mode skips this — the orphan attempt's symlink already
+    // points at the same ULID.
+    if resume_existing.is_none() {
+        if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
+            cleanup(&new_fork_dir, &symlink_path);
+            rollback_claim(name_claimed_in_bucket).await;
+            return Err(IpcError::internal(format!("creating by_name dir: {e}")));
+        }
+        if let Err(e) =
+            std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path)
+        {
+            cleanup(&new_fork_dir, &symlink_path);
+            rollback_claim(name_claimed_in_bucket).await;
+            return Err(IpcError::internal(format!("creating by_name symlink: {e}")));
+        }
     }
-    .write(&new_fork_dir))
-    {
-        cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim(name_claimed_in_bucket).await;
-        return Err(IpcError::internal(format!("writing volume config: {e}")));
-    }
-    if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
-        cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim(name_claimed_in_bucket).await;
-        return Err(IpcError::internal(format!("creating by_name dir: {e}")));
-    }
-    if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
-        cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim(name_claimed_in_bucket).await;
-        return Err(IpcError::internal(format!("creating by_name symlink: {e}")));
+
+    // For-claim post-work: write `volume.stopped` and atomically
+    // rebind `names/<name>` to the new (or resumed) fork via
+    // `mark_claimed`. Subsumes the previous `RebindName` IPC: the
+    // claim flow is now one round-trip from the CLI, and the
+    // CLI no longer touches root-owned filesystem state.
+    if for_claim {
+        // Idempotent on resume — file may already exist from an
+        // earlier successful rebind that the CLI never observed.
+        if let Err(e) = std::fs::write(new_fork_dir.join(STOPPED_FILE), "") {
+            return Err(IpcError::internal(format!(
+                "writing volume.stopped on new fork: {e}"
+            )));
+        }
+
+        use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
+        use elide_core::name_record::NameState;
+        match mark_claimed(
+            store,
+            new_name,
+            coord_id,
+            identity.hostname(),
+            new_vol_ulid_value,
+            NameState::Stopped,
+        )
+        .await
+        {
+            Ok(MarkClaimedOutcome::Claimed) => {
+                info!("[inbound] rebound name {new_name} to new fork {new_vol_ulid} (stopped)");
+                elide_coordinator::volume_event_store::emit_best_effort(
+                    store,
+                    identity.as_ref(),
+                    new_name,
+                    elide_core::volume_event::EventKind::Claimed,
+                    new_vol_ulid_value,
+                )
+                .await;
+            }
+            Ok(MarkClaimedOutcome::Absent) => {
+                return Err(IpcError::not_found(format!(
+                    "names/{new_name} does not exist; nothing to claim"
+                )));
+            }
+            Ok(MarkClaimedOutcome::NotReleased { observed }) => {
+                return Err(IpcError::conflict(format!(
+                    "names/{new_name} is in state {observed:?}, not Released; cannot claim"
+                )));
+            }
+            Err(LifecycleError::Store(e)) => {
+                return Err(IpcError::store(format!("claim failed: {e}")));
+            }
+            Err(LifecycleError::OwnershipConflict { held_by }) => {
+                return Err(IpcError::precondition_failed(format!(
+                    "name '{new_name}' raced with another claim ({held_by} won); \
+                     your local fork at {new_vol_ulid} can be re-purposed manually"
+                )));
+            }
+            Err(LifecycleError::InvalidTransition { from, .. }) => {
+                return Err(IpcError::conflict(format!(
+                    "names/{new_name} is in state {from:?}; cannot claim"
+                )));
+            }
+        }
     }
 
     // Pre-register the prefetch tracker entry before notifying the daemon's
@@ -2898,120 +3098,6 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
         }
     }
     Ok(latest)
-}
-
-/// Internal helper: atomically rebind a `Released` name to a
-/// freshly-minted local fork, leaving the bucket state in `Stopped`.
-/// The CLI orchestrates fork creation before calling.
-///
-/// Pre-conditions enforced here:
-/// - `by_id/<new_vol_ulid>/` must exist locally (the CLI created it).
-/// - `by_name/<name>` must point at it (or be absent — created if so).
-/// - `names/<name>` must be in `Released` state and the conditional
-///   PUT must succeed.
-///
-/// The volume is left `Stopped`; the CLI calls `start` if a follow-up
-/// daemon launch was requested.
-async fn rebind_name_op(
-    volume_name: &str,
-    new_vol_ulid: ulid::Ulid,
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    rescan: &Notify,
-    prefetch_tracker: &PrefetchTracker,
-) -> Result<RebindNameReply, IpcError> {
-    let coord_id = identity.coordinator_id_str();
-    // Pre-register the prefetch tracker entry, mirroring `fork_create_op`.
-    // For the regular foreign-claim flow this is redundant (the
-    // preceding `fork_create_op` already pre-registered), but on the
-    // claim-resume path the CLI skips `fork_create_op` and the orphan
-    // fork's tracker entry may be missing — e.g. coordinator restarted
-    // between the original aborted attempt and this resume, and
-    // discovery hasn't completed yet. `register_prefetch_or_get` is
-    // idempotent so the redundant case is a no-op.
-    let _ = register_prefetch_or_get(prefetch_tracker, new_vol_ulid);
-
-    let new_dir = data_dir.join("by_id").join(new_vol_ulid.to_string());
-    if !new_dir.exists() {
-        return Err(IpcError::not_found(format!(
-            "new fork directory not found at {} — \
-             the CLI must materialise the fork before calling rebind-name",
-            new_dir.display()
-        )));
-    }
-
-    // Ensure volume.stopped is present so the supervisor doesn't
-    // launch the daemon when notified — claim leaves the volume
-    // halted; start brings it up.
-    std::fs::write(new_dir.join(STOPPED_FILE), "")
-        .map_err(|e| IpcError::internal(format!("writing volume.stopped on new fork: {e}")))?;
-
-    let symlink_path = data_dir.join("by_name").join(volume_name);
-    let target = std::path::PathBuf::from(format!("../by_id/{new_vol_ulid}"));
-    match std::fs::read_link(&symlink_path) {
-        Ok(existing) if existing == target => {}
-        Ok(other) => {
-            return Err(IpcError::conflict(format!(
-                "by_name/{volume_name} already points at {} (expected ../by_id/{new_vol_ulid})",
-                other.display()
-            )));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &symlink_path).map_err(|e| {
-                IpcError::internal(format!("creating by_name/{volume_name} symlink: {e}"))
-            })?;
-        }
-        Err(e) => {
-            return Err(IpcError::internal(format!(
-                "reading by_name/{volume_name}: {e}"
-            )));
-        }
-    }
-
-    use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
-    use elide_core::name_record::NameState;
-    match mark_claimed(
-        store,
-        volume_name,
-        coord_id,
-        identity.hostname(),
-        new_vol_ulid,
-        NameState::Stopped,
-    )
-    .await
-    {
-        Ok(MarkClaimedOutcome::Claimed) => {
-            rescan.notify_one();
-            info!("[inbound] rebound name {volume_name} to new fork {new_vol_ulid} (stopped)");
-            elide_coordinator::volume_event_store::emit_best_effort(
-                store,
-                identity.as_ref(),
-                volume_name,
-                elide_core::volume_event::EventKind::Claimed,
-                new_vol_ulid,
-            )
-            .await;
-            Ok(RebindNameReply { new_vol_ulid })
-        }
-        Ok(MarkClaimedOutcome::Absent) => Err(IpcError::not_found(format!(
-            "names/{volume_name} does not exist; nothing to claim"
-        ))),
-        Ok(MarkClaimedOutcome::NotReleased { observed }) => Err(IpcError::conflict(format!(
-            "names/{volume_name} is in state {observed:?}, not Released; cannot claim"
-        ))),
-        Err(LifecycleError::Store(e)) => Err(IpcError::store(format!("claim failed: {e}"))),
-        Err(LifecycleError::OwnershipConflict { held_by }) => {
-            Err(IpcError::precondition_failed(format!(
-                "name '{volume_name}' raced with another claim ({held_by} won); \
-                 your local fork at {new_vol_ulid} can be re-purposed manually"
-            )))
-        }
-        Err(LifecycleError::InvalidTransition { from, .. }) => Err(IpcError::conflict(format!(
-            "names/{volume_name} is in state {from:?}; cannot claim"
-        ))),
-    }
 }
 
 /// `volume claim <name>` IPC handler.
@@ -4469,5 +4555,148 @@ mod tests {
             err.message.contains("not found locally") && err.message.contains(&bogus.to_string()),
             "{err}"
         );
+    }
+
+    /// Tests for [`classify_resumable_orphan`] — exercises the
+    /// `for_claim` resume-detection logic now living coordinator-side
+    /// (was previously a CLI-side classifier + provenance check).
+    mod classify_resumable_orphan_tests {
+        use super::super::classify_resumable_orphan;
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let tmp = TempDir::new().unwrap();
+            let by_id = tmp.path().join("by_id");
+            let by_name = tmp.path().join("by_name");
+            std::fs::create_dir_all(&by_id).unwrap();
+            std::fs::create_dir_all(&by_name).unwrap();
+            (tmp, by_id, by_name)
+        }
+
+        /// Write a fork directory whose signed `volume.provenance`
+        /// records `(parent_ulid, snap_ulid)` as the parent ref.
+        /// Mirrors the on-disk shape `fork_volume_at` produces.
+        fn write_orphan_fork(
+            dir: &std::path::Path,
+            parent_ulid: ulid::Ulid,
+            snap_ulid: ulid::Ulid,
+        ) {
+            std::fs::create_dir_all(dir).unwrap();
+            let key = elide_core::signing::generate_keypair(
+                dir,
+                elide_core::signing::VOLUME_KEY_FILE,
+                elide_core::signing::VOLUME_PUB_FILE,
+            )
+            .unwrap();
+            let lineage = elide_core::signing::ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_ulid.to_string(),
+                    snapshot_ulid: snap_ulid.to_string(),
+                    pubkey: [0u8; 32],
+                    manifest_pubkey: None,
+                }),
+                extent_index: Vec::new(),
+            };
+            elide_core::signing::write_provenance(
+                dir,
+                &key,
+                elide_core::signing::VOLUME_PROVENANCE_FILE,
+                &lineage,
+            )
+            .unwrap();
+        }
+
+        fn ulids() -> (ulid::Ulid, ulid::Ulid, ulid::Ulid, ulid::Ulid) {
+            // Distinct, deterministic — order doesn't matter, only equality.
+            let mut mint = elide_core::ulid_mint::UlidMint::new(ulid::Ulid::nil());
+            (mint.next(), mint.next(), mint.next(), mint.next())
+        }
+
+        #[test]
+        fn returns_none_when_symlink_absent() {
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, _, _) = ulids();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
+                None
+            );
+        }
+
+        #[test]
+        fn returns_some_when_provenance_records_expected_parent_and_snap() {
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, orphan, _) = ulids();
+            write_orphan_fork(&by_id.join(orphan.to_string()), released, snap);
+            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
+                Some(orphan)
+            );
+        }
+
+        #[test]
+        fn returns_none_when_parent_ulid_differs() {
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, orphan, other) = ulids();
+            write_orphan_fork(&by_id.join(orphan.to_string()), other, snap);
+            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
+                None
+            );
+        }
+
+        #[test]
+        fn returns_none_when_snap_differs() {
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, orphan, other_snap) = ulids();
+            write_orphan_fork(&by_id.join(orphan.to_string()), released, other_snap);
+            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
+                None
+            );
+        }
+
+        #[test]
+        fn returns_none_when_target_dir_missing() {
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, orphan, _) = ulids();
+            // Symlink points at by_id/<orphan>/ but no fork was written.
+            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
+                None
+            );
+        }
+
+        #[test]
+        fn returns_none_when_provenance_corrupted() {
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, orphan, _) = ulids();
+            let dir = by_id.join(orphan.to_string());
+            write_orphan_fork(&dir, released, snap);
+            // Truncate provenance to invalidate the signature.
+            std::fs::write(dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE), "").unwrap();
+            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
+                None
+            );
+        }
+
+        #[test]
+        fn returns_none_when_no_snap_supplied() {
+            // No snap ⇒ can't match any provenance, regardless of state.
+            let (_t, by_id, by_name) = setup();
+            let (released, snap, orphan, _) = ulids();
+            write_orphan_fork(&by_id.join(orphan.to_string()), released, snap);
+            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
+            assert_eq!(
+                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, None),
+                None
+            );
+        }
     }
 }
