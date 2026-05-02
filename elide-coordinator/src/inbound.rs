@@ -29,17 +29,18 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::credential::CredentialIssuer;
+use crate::fork::{ForkJob, ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimReply, ClaimStartReply, CreateReply, Envelope, EvictReply,
-    ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkStartReply, GenerateFilemapReply,
-    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError, LatestSnapshotReply,
-    PullReadonlyReply, RegisterReply, ReleaseReply, Request, ResolveHandoffKeyReply,
-    ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply, VolumeEventsReply,
+    ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply,
+    GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
+    LatestSnapshotReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
+    ResolveHandoffKeyReply, ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply,
+    StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -57,6 +58,7 @@ pub struct IpcContext {
     pub data_dir: Arc<PathBuf>,
     pub rescan: Arc<Notify>,
     pub registry: ImportRegistry,
+    pub fork_registry: ForkRegistry,
     pub elide_import_bin: Arc<PathBuf>,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
@@ -437,20 +439,22 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
 
-        // ── Iteration 5 stubs: consolidated fork / claim flows ───────
-        // Wire types are landed; coordinator-side orchestration moves
-        // here in a follow-up. Until then these reply with `Internal`
-        // so callers fail fast rather than silently hanging.
-        Request::ForkStart { .. } => {
-            let env: Envelope<ForkStartReply> =
-                Envelope::err(IpcError::internal("fork-start not yet implemented"));
+        // ── Iteration 5: consolidated fork / claim flows ─────────────
+        Request::ForkStart {
+            new_name,
+            from,
+            force_snapshot,
+            flags,
+        } => {
+            let result = start_fork(new_name, from, force_snapshot, flags, ctx.clone());
+            let env: Envelope<ForkStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::ForkAttach { .. } => {
-            let env: Envelope<ForkAttachEvent> =
-                Envelope::err(IpcError::internal("fork-attach not yet implemented"));
-            let _ = ipc::write_message(writer, &env).await;
+        Request::ForkAttach { new_name } => {
+            stream_fork_by_name(&new_name, writer, &ctx.fork_registry).await;
         }
+        // Claim flow stubs remain — coordinator-side orchestration
+        // lands in a follow-up alongside the same shape.
         Request::ClaimStart { .. } => {
             let env: Envelope<ClaimStartReply> =
                 Envelope::err(IpcError::internal("claim-start not yet implemented"));
@@ -3445,6 +3449,274 @@ fn issue_credentials(
         session_token: creds.session_token,
         expiry_unix: creds.expiry_unix,
     })
+}
+
+// ── Fork orchestrator (consolidated `fork-start` / `fork-attach`) ────────────
+
+/// Register a fork job and spawn the orchestrator task.
+///
+/// Returns immediately once the job is in the registry; the actual
+/// chain pull / snapshot / fork-create / prefetch flow runs in the
+/// background. Errors here are synchronous validation failures
+/// (duplicate name in flight, bad inputs); orchestrator errors are
+/// surfaced via `attach_fork` instead.
+fn start_fork(
+    new_name: String,
+    from: ForkSource,
+    force_snapshot: bool,
+    flags: Vec<String>,
+    ctx: IpcContext,
+) -> Result<ForkStartReply, IpcError> {
+    {
+        let mut reg = ctx.fork_registry.lock().expect("fork registry poisoned");
+        if let Some(job) = reg.get(&new_name)
+            && matches!(job.state(), ForkJobState::Running)
+        {
+            return Err(IpcError::conflict(format!(
+                "fork '{new_name}' is already in progress"
+            )));
+        }
+        reg.insert(new_name.clone(), ForkJob::new());
+    }
+
+    let job = {
+        let reg = ctx.fork_registry.lock().expect("fork registry poisoned");
+        reg.get(&new_name).cloned().expect("just inserted")
+    };
+
+    tokio::spawn(async move {
+        let outcome = run_fork_job(job.clone(), new_name, from, force_snapshot, flags, ctx).await;
+        match outcome {
+            Ok(()) => {
+                job.append(ForkAttachEvent::Done);
+                job.finish(ForkJobState::Done);
+            }
+            Err(e) => job.finish(ForkJobState::Failed(e)),
+        }
+    });
+
+    Ok(ForkStartReply::default())
+}
+
+/// Drive one fork-job to completion. Pushes per-stage events into
+/// `job` so an attached subscriber sees progress in real time.
+async fn run_fork_job(
+    job: Arc<ForkJob>,
+    new_name: String,
+    from: ForkSource,
+    force_snapshot: bool,
+    flags: Vec<String>,
+    ctx: IpcContext,
+) -> Result<(), IpcError> {
+    use elide_core::volume;
+
+    let by_id_dir = ctx.data_dir.join("by_id");
+
+    // Step 1: resolve `from` to (source_vol_ulid, optional source_name,
+    // optional pre-pinned snap). Pulls the chain when the source isn't
+    // already local.
+    let (source_vol_ulid, source_name, snap_hint): (
+        ulid::Ulid,
+        Option<String>,
+        Option<ulid::Ulid>,
+    ) = match &from {
+        ForkSource::Pinned {
+            vol_ulid,
+            snap_ulid,
+        } => (*vol_ulid, None, Some(*snap_ulid)),
+        ForkSource::BareUlid { vol_ulid } => (*vol_ulid, None, None),
+        ForkSource::Name { name } => {
+            let local = ctx.data_dir.join("by_name").join(name);
+            if local.exists() {
+                let canon = std::fs::canonicalize(&local)
+                    .map_err(|e| IpcError::internal(format!("canonicalize by_name/{name}: {e}")))?;
+                let ulid_str = canon
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| IpcError::internal("by_name link has non-utf8 target"))?;
+                let vol_ulid = ulid::Ulid::from_string(ulid_str).map_err(|e| {
+                    IpcError::internal(format!(
+                        "by_name/{name} target {ulid_str:?} not a ULID: {e}"
+                    ))
+                })?;
+                (vol_ulid, Some(name.clone()), None)
+            } else {
+                job.append(ForkAttachEvent::ResolvingName { name: name.clone() });
+                let store = ctx.stores.coordinator_wide();
+                let reply = resolve_name_op(name, &store).await?;
+                (reply.vol_ulid, Some(name.clone()), None)
+            }
+        }
+    };
+
+    // Step 2: walk the ancestor chain, pulling each missing entry.
+    let mut next: Option<ulid::Ulid> = Some(source_vol_ulid);
+    while let Some(vol_ulid) = next.take() {
+        let dir = volume::resolve_ancestor_dir(&by_id_dir, &vol_ulid.to_string());
+        if dir.exists() {
+            break;
+        }
+        job.append(ForkAttachEvent::PullingAncestor { vol_ulid });
+        let store = ctx.stores.for_volume(&vol_ulid);
+        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
+        next = reply.parent;
+    }
+    // Wake the supervisor so any pulled ancestors get prefetch_indexes
+    // kicked off.
+    ctx.rescan.notify_one();
+
+    let source_ulid_str = source_vol_ulid.to_string();
+    let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &source_ulid_str);
+    if !source_dir.exists() {
+        return Err(IpcError::not_found(format!(
+            "source volume {source_ulid_str} not found in remote store"
+        )));
+    }
+    if source_dir.join(IMPORT_LOCK_FILE).exists() {
+        return Err(IpcError::conflict(format!(
+            "source '{source_ulid_str}' is still importing; wait for import to complete"
+        )));
+    }
+
+    // Step 3: decide which snapshot the fork pins to.
+    let mut parent_key_hex: Option<String> = None;
+    let snap_ulid: Option<ulid::Ulid> = if let Some(snap) = snap_hint {
+        // Pinned source already names the snapshot.
+        Some(snap)
+    } else if source_dir.join("volume.readonly").exists() {
+        if force_snapshot {
+            let store = ctx.stores.coordinator_wide();
+            let reply = force_snapshot_now_op(source_vol_ulid, &ctx.data_dir, &store).await?;
+            parent_key_hex = Some(reply.attestation_pubkey_hex.clone());
+            job.append(ForkAttachEvent::AttestedSnapshot {
+                snap_ulid: reply.snap_ulid,
+                pubkey_hex: reply.attestation_pubkey_hex,
+            });
+            Some(reply.snap_ulid)
+        } else if let Some(snap) = volume::latest_snapshot(&source_dir)
+            .map_err(|e| IpcError::internal(format!("reading local snapshots: {e}")))?
+        {
+            Some(snap)
+        } else {
+            let store = ctx.stores.for_volume(&source_vol_ulid);
+            match latest_snapshot_op(source_vol_ulid, &store)
+                .await?
+                .snapshot_ulid
+            {
+                Some(snap) => Some(snap),
+                None => {
+                    return Err(IpcError::not_found(format!(
+                        "source volume {source_ulid_str} has no snapshots; pass \
+                         force_snapshot=true to upload a new 'now' marker"
+                    )));
+                }
+            }
+        }
+    } else {
+        // Writable source: take an implicit snapshot. Need the
+        // source's name to drive `snapshot_volume`; for `BareUlid` we
+        // read it out of `volume.toml`.
+        let name = if let Some(n) = source_name {
+            n
+        } else {
+            elide_core::config::VolumeConfig::read(&source_dir)
+                .map_err(|e| IpcError::internal(format!("read volume.toml: {e}")))?
+                .name
+                .ok_or_else(|| IpcError::internal("source volume has no name in volume.toml"))?
+        };
+        let store = ctx.stores.coordinator_wide();
+        let reply = snapshot_volume(
+            &name,
+            &ctx.data_dir,
+            &ctx.snapshot_locks,
+            &store,
+            ctx.part_size_bytes,
+        )
+        .await?;
+        job.append(ForkAttachEvent::SnapshotTaken {
+            snap_ulid: reply.snap_ulid,
+        });
+        Some(reply.snap_ulid)
+    };
+
+    // Step 4: mint the fork.
+    job.append(ForkAttachEvent::ForkingFrom {
+        source_vol_ulid,
+        snap_ulid,
+    });
+    let store = ctx.stores.coordinator_wide();
+    let reply = fork_create_op(
+        &new_name,
+        source_vol_ulid,
+        snap_ulid,
+        parent_key_hex.as_deref(),
+        false,
+        &flags,
+        &ctx.data_dir,
+        &store,
+        &ctx.identity,
+        &ctx.rescan,
+        &ctx.prefetch_tracker,
+    )
+    .await?;
+    job.append(ForkAttachEvent::ForkCreated {
+        new_vol_ulid: reply.new_vol_ulid,
+    });
+
+    // Step 5: surface the coordinator's background prefetch. The fork
+    // is already durable above; prefetch failure here is non-fatal —
+    // the volume opens regardless and `volume start` re-awaits.
+    job.append(ForkAttachEvent::PrefetchStarted);
+    let _ = await_prefetch_op(reply.new_vol_ulid, &ctx.prefetch_tracker).await;
+    job.append(ForkAttachEvent::PrefetchDone);
+
+    Ok(())
+}
+
+/// Stream buffered and live fork events to `writer` as a sequence of
+/// [`Envelope<ForkAttachEvent>`] messages, terminating with either
+/// `ForkAttachEvent::Done` (success) or `Envelope::Err` (failure).
+async fn stream_fork_by_name(new_name: &str, writer: &mut OwnedWriteHalf, registry: &ForkRegistry) {
+    async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
+        let env: Envelope<ForkAttachEvent> = Envelope::err(error);
+        let _ = ipc::write_message(writer, &env).await;
+    }
+
+    let job = {
+        let reg = registry.lock().expect("fork registry poisoned");
+        reg.get(new_name).cloned()
+    };
+    let Some(job) = job else {
+        write_err(
+            writer,
+            IpcError::not_found(format!("no active fork for: {new_name}")),
+        )
+        .await;
+        return;
+    };
+
+    let mut offset = 0;
+    loop {
+        let events = job.read_from(offset);
+        for event in &events {
+            let env: Envelope<ForkAttachEvent> = Envelope::ok(event.clone());
+            if ipc::write_message(writer, &env).await.is_err() {
+                return;
+            }
+        }
+        offset += events.len();
+
+        match job.state() {
+            ForkJobState::Done => return,
+            ForkJobState::Failed(err) => {
+                write_err(writer, err).await;
+                return;
+            }
+            ForkJobState::Running => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

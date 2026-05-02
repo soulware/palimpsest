@@ -16,11 +16,12 @@ use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
-    ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
-    GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
-    LatestSnapshotReply, PullReadonlyReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply,
-    ResolveNameReply, SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply,
-    StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
+    ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply,
+    ForkSource, ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply,
+    ImportStatusReply, IpcErrorKind, LatestSnapshotReply, PullReadonlyReply, RegisterReply,
+    ReleaseReply, ResolveHandoffKeyReply, ResolveNameReply, SignatureStatus, SnapshotReply,
+    StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    VolumeEventEntry, VolumeEventsReply,
 };
 
 /// Public-API aliases for the client side. The underlying types live
@@ -658,6 +659,113 @@ pub fn force_snapshot_now(socket_path: &Path, vol_ulid: &str) -> io::Result<(Str
         call_typed(socket_path, &Request::ForceSnapshotNow { vol_ulid: parsed })?
             .map_err(io::Error::other)?;
     Ok((reply.snap_ulid.to_string(), reply.attestation_pubkey_hex))
+}
+
+/// Register a fork-from-source job with the coordinator. Returns
+/// immediately on success; progress (and the eventual fork ULID) is
+/// observed via [`fork_attach_by_name`]. Mirrors the
+/// `import_start` + `import_attach_by_name` pattern.
+pub fn fork_start(
+    socket_path: &Path,
+    new_name: &str,
+    from: ForkSource,
+    force_snapshot: bool,
+    flags: &[String],
+) -> io::Result<ForkStartReply> {
+    call_typed(
+        socket_path,
+        &Request::ForkStart {
+            new_name: new_name.to_owned(),
+            from,
+            force_snapshot,
+            flags: flags.to_vec(),
+        },
+    )?
+    .map_err(io::Error::other)
+}
+
+/// Stream fork progress for `new_name` to `out` until the fork
+/// completes. Returns the freshly-minted fork's ULID, parsed from the
+/// terminal `ForkCreated` event in the stream.
+pub fn fork_attach_by_name(
+    socket_path: &Path,
+    new_name: &str,
+    out: &mut dyn Write,
+) -> io::Result<ulid::Ulid> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        io::Error::other(format!(
+            "coordinator not running ({}): {e}",
+            socket_path.display()
+        ))
+    })?;
+    let request = Request::ForkAttach {
+        new_name: new_name.to_owned(),
+    };
+    let line = serde_json::to_string(&request)
+        .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
+    writeln!(stream, "{line}")?;
+    stream.flush()?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+
+    let mut reader = io::BufReader::new(stream);
+    let mut buf = String::new();
+    let mut new_vol_ulid: Option<ulid::Ulid> = None;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::other("fork stream closed before terminal event"));
+        }
+        let env: Envelope<ForkAttachEvent> = serde_json::from_str(buf.trim())
+            .map_err(|e| io::Error::other(format!("parse fork event: {e}")))?;
+        match env.into_result() {
+            Ok(event) => {
+                if let Some(line) = render_fork_event(&event) {
+                    writeln!(out, "{line}")?;
+                }
+                if let ForkAttachEvent::ForkCreated { new_vol_ulid: u } = event {
+                    new_vol_ulid = Some(u);
+                }
+                if matches!(event, ForkAttachEvent::Done) {
+                    return new_vol_ulid.ok_or_else(|| {
+                        io::Error::other("fork completed without ForkCreated event")
+                    });
+                }
+            }
+            Err(e) => return Err(io::Error::other(e)),
+        }
+    }
+}
+
+/// Render a coordinator-side fork event as one user-visible line.
+/// Returns `None` for events that don't warrant a print (the terminal
+/// `Done`, which the caller handles structurally).
+fn render_fork_event(event: &ForkAttachEvent) -> Option<String> {
+    match event {
+        ForkAttachEvent::ResolvingName { name } => {
+            Some(format!("resolving '{name}' in remote store"))
+        }
+        ForkAttachEvent::PullingAncestor { vol_ulid } => Some(format!("pulled {vol_ulid}")),
+        ForkAttachEvent::SnapshotTaken { snap_ulid } => {
+            Some(format!("took implicit snapshot {snap_ulid}"))
+        }
+        ForkAttachEvent::AttestedSnapshot { snap_ulid, .. } => {
+            Some(format!("attested now-snapshot {snap_ulid}"))
+        }
+        ForkAttachEvent::ForkingFrom {
+            source_vol_ulid,
+            snap_ulid,
+        } => Some(match snap_ulid {
+            Some(s) => format!("forking from {source_vol_ulid}/{s}"),
+            None => format!("forking from {source_vol_ulid}"),
+        }),
+        ForkAttachEvent::ForkCreated { new_vol_ulid } => {
+            Some(format!("fork created at {new_vol_ulid}"))
+        }
+        ForkAttachEvent::PrefetchStarted => Some("prefetching ancestor index...".to_owned()),
+        ForkAttachEvent::PrefetchDone => Some("ready".to_owned()),
+        ForkAttachEvent::Done => None,
+    }
 }
 
 /// Fork a new writable volume from a local source. Returns the new volume ULID.

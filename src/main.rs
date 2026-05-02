@@ -1128,7 +1128,7 @@ enum ListFilter {
     All,
 }
 
-use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, VolumeLifecycle, VolumeMode};
+use elide_coordinator::volume_state::{VolumeLifecycle, VolumeMode};
 
 /// Cell value for the STATE column in `elide volume list`. Wraps the
 /// coordinator-derived `VolumeLifecycle` with two CLI-only sentinels:
@@ -1452,163 +1452,39 @@ fn create_fork(
         )));
     }
 
-    // Parse `from` into one of three forms.
-    enum FromSpec {
-        ExplicitPin(ulid::Ulid, ulid::Ulid),
-        BareUlid(ulid::Ulid),
-        Name,
-    }
-
-    let spec = if let Some((vol, snap)) = from.split_once('/') {
-        let vol = ulid::Ulid::from_string(vol)
+    // Parse `from` into one of three forms. Maps directly to the
+    // `ForkSource` enum the coordinator's `fork-start` IPC takes.
+    let source = if let Some((vol, snap)) = from.split_once('/') {
+        let vol_ulid = ulid::Ulid::from_string(vol)
             .map_err(|e| std::io::Error::other(format!("invalid volume ULID in --from: {e}")))?;
-        let snap = ulid::Ulid::from_string(snap)
+        let snap_ulid = ulid::Ulid::from_string(snap)
             .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
-        FromSpec::ExplicitPin(vol, snap)
-    } else if let Ok(vol) = ulid::Ulid::from_string(from) {
-        FromSpec::BareUlid(vol)
+        if force_snapshot {
+            return Err(std::io::Error::other(
+                "--force-snapshot conflicts with an explicit snapshot pin in --from <vol>/<snap>",
+            ));
+        }
+        coordinator_client::ForkSource::Pinned {
+            vol_ulid,
+            snap_ulid,
+        }
+    } else if let Ok(vol_ulid) = ulid::Ulid::from_string(from) {
+        coordinator_client::ForkSource::BareUlid { vol_ulid }
     } else {
-        FromSpec::Name
-    };
-
-    if force_snapshot && matches!(spec, FromSpec::ExplicitPin(..)) {
-        return Err(std::io::Error::other(
-            "--force-snapshot conflicts with an explicit snapshot pin in --from <vol>/<snap>",
-        ));
-    }
-
-    // Resolve the source directory. Try local first; for ULID-based forms
-    // fall back to auto-pulling from the remote store. For names, try local
-    // `by_name/` first, then resolve the name in the remote store.
-    //
-    // `pulled_vol_ulid` is set when we auto-pulled from the store so we can
-    // discover the latest remote snapshot later.
-    let mut pulled_vol_ulid: Option<String> = None;
-
-    let source_fork_dir = match &spec {
-        FromSpec::ExplicitPin(vol_ulid, _) | FromSpec::BareUlid(vol_ulid) => {
-            let ulid_str = vol_ulid.to_string();
-            let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
-            if dir.exists() {
-                dir
-            } else {
-                eprintln!("pulling {ulid_str} from remote store...");
-                remote_pull(from, data_dir, socket_path)?;
-                let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
-                if !dir.exists() {
-                    return Err(std::io::Error::other(format!(
-                        "source volume {ulid_str} not found in remote store"
-                    )));
-                }
-                pulled_vol_ulid = Some(ulid_str);
-                dir
-            }
-        }
-        FromSpec::Name => {
-            let local = resolve_volume_dir(data_dir, from);
-            if local.exists() {
-                local
-            } else {
-                // Name not found locally — ask the coordinator to resolve
-                // it and pull the chain.
-                eprintln!("pulling '{from}' from remote store...");
-                remote_pull(from, data_dir, socket_path)?;
-                let ulid_str = coordinator_client::resolve_name(socket_path, from)?.to_string();
-                let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
-                if !dir.exists() {
-                    return Err(std::io::Error::other(format!(
-                        "volume '{from}' not found in remote store"
-                    )));
-                }
-                pulled_vol_ulid = Some(ulid_str);
-                dir
-            }
+        coordinator_client::ForkSource::Name {
+            name: from.to_owned(),
         }
     };
 
-    if source_fork_dir.join(IMPORT_LOCK_FILE).exists() {
-        return Err(std::io::Error::other(format!(
-            "volume '{from}' is still importing; wait for import to complete before forking"
-        )));
-    }
+    coordinator_client::fork_start(socket_path, fork_name, source, force_snapshot, flags)?;
 
-    // Resolve source ULID for the fork-create IPC. For ULID forms it's
-    // already in `spec`; for Name it comes from the canonicalized symlink
-    // target (or the auto-pull's ULID if we just pulled it).
-    let source_ulid_str: String = match &spec {
-        FromSpec::ExplicitPin(vol, _) | FromSpec::BareUlid(vol) => vol.to_string(),
-        FromSpec::Name => {
-            if let Some(p) = &pulled_vol_ulid {
-                p.clone()
-            } else {
-                std::fs::canonicalize(&source_fork_dir)?
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or_else(|| std::io::Error::other("source dir has no ULID file name"))?
-                    .to_owned()
-            }
-        }
-    };
-
-    // Determine the snapshot ULID + (for force-snapshot) the ephemeral
-    // pubkey we'll record in the fork's provenance.
-    let mut parent_key_hex: Option<String> = None;
-    let snap_ulid: Option<ulid::Ulid> = match &spec {
-        FromSpec::ExplicitPin(_, snap) => Some(*snap),
-        _ if source_fork_dir.join("volume.readonly").exists() => {
-            if force_snapshot {
-                // Coordinator synthesizes the "now" snapshot (uploads marker,
-                // verifies pinned segments, writes signed manifest under an
-                // ephemeral key). Returns the snap ULID + ephemeral pubkey hex.
-                let (snap_str, pubkey_hex) =
-                    coordinator_client::force_snapshot_now(socket_path, &source_ulid_str)?;
-                eprintln!("attested now-snapshot {snap_str} for {source_ulid_str}");
-                parent_key_hex = Some(pubkey_hex);
-                Some(ulid::Ulid::from_string(&snap_str).map_err(|e| {
-                    std::io::Error::other(format!("coordinator returned invalid snap ULID: {e}"))
-                })?)
-            } else if let Some(snap) = volume::latest_snapshot(&source_fork_dir)? {
-                Some(snap)
-            } else {
-                let vol_ulid = ulid::Ulid::from_string(&source_ulid_str).map_err(|e| {
-                    std::io::Error::other(format!("invalid source ULID {source_ulid_str}: {e}"))
-                })?;
-                match coordinator_client::latest_snapshot(socket_path, vol_ulid)? {
-                    Some(snap) => Some(snap),
-                    None => {
-                        return Err(std::io::Error::other(format!(
-                            "source volume {source_ulid_str} has no snapshots; pass \
-                             --force-snapshot to upload a new 'now' marker"
-                        )));
-                    }
-                }
-            }
-        }
-        FromSpec::BareUlid(_) => {
-            // Writable volume addressed by ULID: take an implicit snapshot.
-            let name = elide_core::config::VolumeConfig::read(&source_fork_dir)?
-                .name
-                .ok_or_else(|| std::io::Error::other("source volume has no name in volume.toml"))?;
-            snapshot_volume(data_dir, &name)?;
-            None
-        }
-        FromSpec::Name => {
-            snapshot_volume(data_dir, from)?;
-            None
-        }
-    };
-
-    let snap_str = snap_ulid.map(|s| s.to_string());
-    let new_vol_ulid = coordinator_client::fork_create(
-        socket_path,
-        fork_name,
-        &source_ulid_str,
-        snap_str.as_deref(),
-        parent_key_hex.as_deref(),
-        flags,
-        false, // brand-new name → mark_initial claims it
-    )?;
-    let new_fork_dir = by_id_dir.join(&new_vol_ulid);
+    // Stream coordinator-side progress to stderr (chain pull, snapshot
+    // decision, fork mint, prefetch warm-up). The terminal `Done`
+    // event hands back the new fork's ULID.
+    let mut stderr = std::io::stderr();
+    let new_vol_ulid =
+        coordinator_client::fork_attach_by_name(socket_path, fork_name, &mut stderr)?;
+    let new_fork_dir = by_id_dir.join(new_vol_ulid.to_string());
     println!("{}", new_fork_dir.display());
     Ok(())
 }

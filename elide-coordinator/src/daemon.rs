@@ -172,6 +172,12 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // Import job registry: tracks running and recently-completed import jobs.
     let import_registry = import::new_registry();
 
+    // Fork job registry: in-memory tracking of in-flight `fork-start`
+    // orchestrations. Empty after a coordinator restart — partial
+    // forks that didn't reach `fork-create` rely on `fork_create_op`'s
+    // stale-symlink cleanup on retry.
+    let fork_registry = crate::fork::new_registry();
+
     // Per-fork eviction channel registry.
     let evict_registry: EvictRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -202,6 +208,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             data_dir: data_dir.clone(),
             rescan: rescan_notify.clone(),
             registry: import_registry.clone(),
+            fork_registry: fork_registry.clone(),
             elide_import_bin: elide_import_bin.clone(),
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),

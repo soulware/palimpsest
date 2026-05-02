@@ -273,8 +273,9 @@ pub enum Request {
     /// coordinator does the full orchestration internally: name
     /// resolution, ancestor-chain pull, snapshot decision (latest,
     /// implicit, or `force_snapshot`-attested), and the fork mint.
-    /// Returns the new fork's ULID immediately; progress is streamed
-    /// via [`Request::ForkAttach`].
+    /// Returns immediately on registration; progress is streamed via
+    /// [`Request::ForkAttach`]. The new fork's ULID arrives in the
+    /// stream as [`ForkAttachEvent::ForkCreated`].
     ForkStart {
         new_name: String,
         from: ForkSource,
@@ -284,10 +285,13 @@ pub enum Request {
         flags: Vec<String>,
     },
     /// Stream progress for an in-flight fork started via
-    /// [`Request::ForkStart`]. Server replies with a sequence of
+    /// [`Request::ForkStart`]. Addressed by the new fork's name (the
+    /// `new_name` from `ForkStart`) so the caller doesn't have to
+    /// remember a ULID across reconnects, matching the `ImportAttach`
+    /// shape. Server replies with a sequence of
     /// [`Envelope<ForkAttachEvent>`] messages, terminating with
     /// `ForkAttachEvent::Done` (success) or `Envelope::Err` (failure).
-    ForkAttach { fork_ulid: Ulid },
+    ForkAttach { new_name: String },
     /// Spawn a name-claim flow as a background job. Subsumes the
     /// existing `Claim` verb's `MustClaimFresh` branch: the coordinator
     /// runs the bucket-side claim, pulls the ancestor chain, resolves
@@ -580,14 +584,13 @@ pub struct VolumeEventsReply {
     pub events: Vec<VolumeEventEntry>,
 }
 
-/// Reply for [`Request::ForkStart`]. The fork mint is staged
-/// synchronously enough to allocate the new ULID; the rest of the
-/// flow (chain pull, snapshot, prefetch warm-up) runs in the
-/// background and is observed via [`Request::ForkAttach`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ForkStartReply {
-    pub fork_ulid: Ulid,
-}
+/// Reply for [`Request::ForkStart`]. Empty success envelope: the
+/// background job has been registered against the requested
+/// `new_name` and the caller should now subscribe via
+/// [`Request::ForkAttach`] to observe progress. The eventual fork
+/// ULID is delivered as a [`ForkAttachEvent::ForkCreated`] event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkStartReply {}
 
 /// Streaming event for [`Request::ForkAttach`]. The server writes
 /// one [`Envelope<ForkAttachEvent>`] per message until the fork
@@ -726,6 +729,74 @@ mod tests {
         let mut reader = BufReader::new(b_read);
         let parsed: Envelope<u32> = read_message(&mut reader).await.unwrap().unwrap();
         assert_eq!(parsed.into_result().unwrap(), 42);
+    }
+
+    #[test]
+    fn fork_source_wire_shape() {
+        let pinned = ForkSource::Pinned {
+            vol_ulid: Ulid::nil(),
+            snap_ulid: Ulid::nil(),
+        };
+        let s = serde_json::to_string(&pinned).unwrap();
+        assert_eq!(
+            s,
+            r#"{"kind":"pinned","vol_ulid":"00000000000000000000000000","snap_ulid":"00000000000000000000000000"}"#
+        );
+
+        let by_name = ForkSource::Name {
+            name: "demo".to_owned(),
+        };
+        let s = serde_json::to_string(&by_name).unwrap();
+        assert_eq!(s, r#"{"kind":"name","name":"demo"}"#);
+    }
+
+    #[test]
+    fn fork_attach_event_round_trip() {
+        let events = [
+            ForkAttachEvent::ResolvingName {
+                name: "demo".to_owned(),
+            },
+            ForkAttachEvent::PullingAncestor {
+                vol_ulid: Ulid::nil(),
+            },
+            ForkAttachEvent::SnapshotTaken {
+                snap_ulid: Ulid::nil(),
+            },
+            ForkAttachEvent::AttestedSnapshot {
+                snap_ulid: Ulid::nil(),
+                pubkey_hex: "deadbeef".to_owned(),
+            },
+            ForkAttachEvent::ForkingFrom {
+                source_vol_ulid: Ulid::nil(),
+                snap_ulid: Some(Ulid::nil()),
+            },
+            ForkAttachEvent::ForkCreated {
+                new_vol_ulid: Ulid::nil(),
+            },
+            ForkAttachEvent::PrefetchStarted,
+            ForkAttachEvent::PrefetchDone,
+            ForkAttachEvent::Done,
+        ];
+        for event in &events {
+            let s = serde_json::to_string(event).unwrap();
+            let parsed: ForkAttachEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(&parsed, event);
+        }
+    }
+
+    #[test]
+    fn fork_start_request_wire_shape() {
+        let req = Request::ForkStart {
+            new_name: "child".to_owned(),
+            from: ForkSource::Name {
+                name: "parent".to_owned(),
+            },
+            force_snapshot: true,
+            flags: vec!["nbd-port=10809".to_owned()],
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, req);
     }
 
     #[tokio::test]

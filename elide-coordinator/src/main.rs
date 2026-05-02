@@ -11,6 +11,7 @@
 // Binary-only modules (process supervision, IPC, import jobs).
 mod credential;
 mod daemon;
+mod fork;
 mod import;
 mod inbound;
 mod macaroon;
