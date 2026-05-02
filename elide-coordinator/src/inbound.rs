@@ -3561,9 +3561,6 @@ async fn run_fork_job(
         let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
         next = reply.parent;
     }
-    // Wake the supervisor so any pulled ancestors get prefetch_indexes
-    // kicked off.
-    ctx.rescan.notify_one();
 
     let source_ulid_str = source_vol_ulid.to_string();
     let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &source_ulid_str);
