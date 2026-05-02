@@ -297,8 +297,9 @@ pub enum Request {
     /// runs the bucket-side claim, pulls the ancestor chain, resolves
     /// the handoff key, mints the fresh fork, and triggers prefetch.
     /// In-place reclaims return `Reclaimed` immediately with no job
-    /// spawned; foreign-content claims return `Claiming { fork_ulid }`
-    /// and the caller observes via [`Request::ClaimAttach`].
+    /// spawned; foreign-content claims return
+    /// `Claiming { released_vol_ulid }` and the caller observes via
+    /// [`Request::ClaimAttach`].
     ClaimStart { volume: String },
     /// Stream progress for an in-flight claim started via
     /// [`Request::ClaimStart`]. Addressed by the bucket-side name so
@@ -637,10 +638,11 @@ pub enum ClaimStartReply {
     /// In-place reclaim. The bucket flipped from `Released` to
     /// `Stopped` with the same `vol_ulid`; nothing else to do.
     Reclaimed,
-    /// Foreign-content claim spawned as a background job. The new
-    /// fork's ULID is allocated immediately and a tracked claim
-    /// task drives the rest of the flow.
-    Claiming { fork_ulid: Ulid },
+    /// Foreign-content claim spawned as a background job. Echoes the
+    /// released record's `vol_ulid` for diagnostic logging; the new
+    /// fork's ULID is delivered later as a
+    /// [`ClaimAttachEvent::ForkCreated`] event in the attach stream.
+    Claiming { released_vol_ulid: Ulid },
 }
 
 /// Streaming event for [`Request::ClaimAttach`]. Same envelope shape
@@ -780,6 +782,50 @@ mod tests {
         for event in &events {
             let s = serde_json::to_string(event).unwrap();
             let parsed: ForkAttachEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(&parsed, event);
+        }
+    }
+
+    #[test]
+    fn claim_start_reply_wire_shape() {
+        let reclaimed = ClaimStartReply::Reclaimed;
+        let s = serde_json::to_string(&reclaimed).unwrap();
+        assert_eq!(s, r#"{"kind":"reclaimed"}"#);
+
+        let claiming = ClaimStartReply::Claiming {
+            released_vol_ulid: Ulid::nil(),
+        };
+        let s = serde_json::to_string(&claiming).unwrap();
+        assert_eq!(
+            s,
+            r#"{"kind":"claiming","released_vol_ulid":"00000000000000000000000000"}"#
+        );
+    }
+
+    #[test]
+    fn claim_attach_event_round_trip() {
+        let events = [
+            ClaimAttachEvent::PullingAncestor {
+                vol_ulid: Ulid::nil(),
+            },
+            ClaimAttachEvent::HandoffKeyResolved {
+                key: ResolveHandoffKeyReply::Normal,
+            },
+            ClaimAttachEvent::HandoffKeyResolved {
+                key: ResolveHandoffKeyReply::Recovery {
+                    manifest_pubkey_hex: "deadbeef".to_owned(),
+                },
+            },
+            ClaimAttachEvent::ForkCreated {
+                new_vol_ulid: Ulid::nil(),
+            },
+            ClaimAttachEvent::PrefetchStarted,
+            ClaimAttachEvent::PrefetchDone,
+            ClaimAttachEvent::Done,
+        ];
+        for event in &events {
+            let s = serde_json::to_string(event).unwrap();
+            let parsed: ClaimAttachEvent = serde_json::from_str(&s).unwrap();
             assert_eq!(&parsed, event);
         }
     }

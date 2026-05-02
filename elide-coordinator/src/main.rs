@@ -9,6 +9,7 @@
 //     Write a default coordinator.toml (commented template) to the given path.
 
 // Binary-only modules (process supervision, IPC, import jobs).
+mod claim;
 mod credential;
 mod daemon;
 mod fork;

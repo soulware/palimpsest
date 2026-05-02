@@ -28,6 +28,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
+use crate::claim::{ClaimJob, ClaimJobState, ClaimRegistry};
 use crate::credential::CredentialIssuer;
 use crate::fork::{ForkJob, ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
@@ -59,6 +60,7 @@ pub struct IpcContext {
     pub rescan: Arc<Notify>,
     pub registry: ImportRegistry,
     pub fork_registry: ForkRegistry,
+    pub claim_registry: ClaimRegistry,
     pub elide_import_bin: Arc<PathBuf>,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
@@ -453,17 +455,13 @@ async fn dispatch_json(
         Request::ForkAttach { new_name } => {
             stream_fork_by_name(&new_name, writer, &ctx.fork_registry).await;
         }
-        // Claim flow stubs remain — coordinator-side orchestration
-        // lands in a follow-up alongside the same shape.
-        Request::ClaimStart { .. } => {
-            let env: Envelope<ClaimStartReply> =
-                Envelope::err(IpcError::internal("claim-start not yet implemented"));
+        Request::ClaimStart { volume } => {
+            let result = start_claim(volume, ctx.clone()).await;
+            let env: Envelope<ClaimStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::ClaimAttach { .. } => {
-            let env: Envelope<ClaimAttachEvent> =
-                Envelope::err(IpcError::internal("claim-attach not yet implemented"));
-            let _ = ipc::write_message(writer, &env).await;
+        Request::ClaimAttach { volume } => {
+            stream_claim_by_name(&volume, writer, &ctx.claim_registry).await;
         }
     }
 }
@@ -3710,6 +3708,192 @@ async fn stream_fork_by_name(new_name: &str, writer: &mut OwnedWriteHalf, regist
                 return;
             }
             ForkJobState::Running => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+// ── Claim orchestrator (consolidated `claim-start` / `claim-attach`) ────────
+
+/// Run the bucket-side claim synchronously and either return
+/// `Reclaimed` (no further work) or register a job and spawn the
+/// foreign-claim orchestrator. Returns immediately in both branches —
+/// `Claiming` callers subscribe via `claim-attach` to stream progress.
+async fn start_claim(volume: String, ctx: IpcContext) -> Result<ClaimStartReply, IpcError> {
+    let store = ctx.stores.coordinator_wide();
+    let bucket = claim_volume_bucket_op(&volume, &ctx.data_dir, &store, &ctx.identity).await?;
+    match bucket {
+        ClaimReply::Reclaimed => Ok(ClaimStartReply::Reclaimed),
+        ClaimReply::MustClaimFresh {
+            released_vol_ulid,
+            handoff_snapshot,
+        } => {
+            let snap = handoff_snapshot.ok_or_else(|| {
+                IpcError::not_found(format!(
+                    "name '{volume}' is Released but has no handoff snapshot — \
+                     manual recovery required (see docs/operations.md)"
+                ))
+            })?;
+
+            {
+                let mut reg = ctx.claim_registry.lock().expect("claim registry poisoned");
+                if let Some(job) = reg.get(&volume)
+                    && matches!(job.state(), ClaimJobState::Running)
+                {
+                    return Err(IpcError::conflict(format!(
+                        "claim for '{volume}' is already in progress"
+                    )));
+                }
+                reg.insert(volume.clone(), ClaimJob::new());
+            }
+            let job = ctx
+                .claim_registry
+                .lock()
+                .expect("claim registry poisoned")
+                .get(&volume)
+                .cloned()
+                .expect("just inserted");
+
+            tokio::spawn(async move {
+                let outcome =
+                    run_claim_job(job.clone(), volume, released_vol_ulid, snap, ctx).await;
+                match outcome {
+                    Ok(()) => {
+                        job.append(ClaimAttachEvent::Done);
+                        job.finish(ClaimJobState::Done);
+                    }
+                    Err(e) => job.finish(ClaimJobState::Failed(e)),
+                }
+            });
+
+            Ok(ClaimStartReply::Claiming { released_vol_ulid })
+        }
+    }
+}
+
+/// Drive one claim-job to completion. Pulls the released volume's
+/// chain if needed, resolves the handoff key, mints the fresh fork
+/// (with `for_claim = true` so it skips `mark_initial` and lets
+/// `mark_claimed` do the bucket rebind), and surfaces the
+/// coordinator's background prefetch.
+async fn run_claim_job(
+    job: Arc<ClaimJob>,
+    volume: String,
+    released_vol_ulid: ulid::Ulid,
+    handoff_snap: ulid::Ulid,
+    ctx: IpcContext,
+) -> Result<(), IpcError> {
+    use elide_core::volume;
+
+    let by_id_dir = ctx.data_dir.join("by_id");
+
+    // Step 1: pull the released chain locally if absent. Walks
+    // ancestor-by-ancestor exactly as the fork orchestrator does.
+    let mut next: Option<ulid::Ulid> = Some(released_vol_ulid);
+    while let Some(vol_ulid) = next.take() {
+        let dir = volume::resolve_ancestor_dir(&by_id_dir, &vol_ulid.to_string());
+        if dir.exists() {
+            break;
+        }
+        job.append(ClaimAttachEvent::PullingAncestor { vol_ulid });
+        let store = ctx.stores.for_volume(&vol_ulid);
+        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
+        next = reply.parent;
+    }
+
+    let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &released_vol_ulid.to_string());
+    if !source_dir.exists() {
+        return Err(IpcError::not_found(format!(
+            "source volume {released_vol_ulid} not found in remote store"
+        )));
+    }
+
+    // Step 2: resolve the handoff key. Recovery snapshots are signed
+    // by an attestation key the fork's provenance must record so its
+    // own signature verifies later.
+    let store = ctx.stores.for_volume(&released_vol_ulid);
+    let key = resolve_handoff_key_op(released_vol_ulid, handoff_snap, &store).await?;
+    let parent_key_hex = match &key {
+        ResolveHandoffKeyReply::Normal => None,
+        ResolveHandoffKeyReply::Recovery {
+            manifest_pubkey_hex,
+        } => Some(manifest_pubkey_hex.clone()),
+    };
+    job.append(ClaimAttachEvent::HandoffKeyResolved { key });
+
+    // Step 3: mint (or resume) the local fork. `for_claim = true`
+    // tells `fork_create_op` to skip `mark_initial` (the released
+    // record already exists) and to detect a resumable orphan at
+    // `by_name/<name>`.
+    let store_wide = ctx.stores.coordinator_wide();
+    let reply = fork_create_op(
+        &volume,
+        released_vol_ulid,
+        Some(handoff_snap),
+        parent_key_hex.as_deref(),
+        true,
+        &[],
+        &ctx.data_dir,
+        &store_wide,
+        &ctx.identity,
+        &ctx.rescan,
+        &ctx.prefetch_tracker,
+    )
+    .await?;
+    job.append(ClaimAttachEvent::ForkCreated {
+        new_vol_ulid: reply.new_vol_ulid,
+    });
+
+    // Step 4: surface prefetch warm-up. Same non-fatal semantics as
+    // the fork flow: the bucket-side claim and local fork are durable
+    // by this point.
+    job.append(ClaimAttachEvent::PrefetchStarted);
+    let _ = await_prefetch_op(reply.new_vol_ulid, &ctx.prefetch_tracker).await;
+    job.append(ClaimAttachEvent::PrefetchDone);
+
+    Ok(())
+}
+
+/// Stream buffered + live claim events to `writer`, terminating with
+/// `Done` (success) or `Envelope::Err` (failure).
+async fn stream_claim_by_name(volume: &str, writer: &mut OwnedWriteHalf, registry: &ClaimRegistry) {
+    async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
+        let env: Envelope<ClaimAttachEvent> = Envelope::err(error);
+        let _ = ipc::write_message(writer, &env).await;
+    }
+
+    let job = {
+        let reg = registry.lock().expect("claim registry poisoned");
+        reg.get(volume).cloned()
+    };
+    let Some(job) = job else {
+        write_err(
+            writer,
+            IpcError::not_found(format!("no active claim for: {volume}")),
+        )
+        .await;
+        return;
+    };
+
+    let mut offset = 0;
+    loop {
+        let events = job.read_from(offset);
+        for event in &events {
+            let env: Envelope<ClaimAttachEvent> = Envelope::ok(event.clone());
+            if ipc::write_message(writer, &env).await.is_err() {
+                return;
+            }
+        }
+        offset += events.len();
+
+        match job.state() {
+            ClaimJobState::Done => return,
+            ClaimJobState::Failed(err) => {
+                write_err(writer, err).await;
+                return;
+            }
+            ClaimJobState::Running => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }

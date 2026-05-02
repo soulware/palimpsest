@@ -178,6 +178,10 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // stale-symlink cleanup on retry.
     let fork_registry = crate::fork::new_registry();
 
+    // Claim job registry: same shape as `fork_registry` but for the
+    // `claim-start` flow's foreign-content branch.
+    let claim_registry = crate::claim::new_registry();
+
     // Per-fork eviction channel registry.
     let evict_registry: EvictRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -209,6 +213,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             rescan: rescan_notify.clone(),
             registry: import_registry.clone(),
             fork_registry: fork_registry.clone(),
+            claim_registry: claim_registry.clone(),
             elide_import_bin: elide_import_bin.clone(),
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),

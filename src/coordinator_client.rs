@@ -16,12 +16,12 @@ use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
-    ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply,
-    ForkSource, ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply,
-    ImportStatusReply, IpcErrorKind, LatestSnapshotReply, PullReadonlyReply, RegisterReply,
-    ReleaseReply, ResolveHandoffKeyReply, ResolveNameReply, SignatureStatus, SnapshotReply,
-    StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
-    VolumeEventEntry, VolumeEventsReply,
+    ClaimAttachEvent, ClaimReply, ClaimStartReply, CreateReply, EvictReply, ForceSnapshotNowReply,
+    ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply, GenerateFilemapReply,
+    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind, LatestSnapshotReply,
+    PullReadonlyReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply, ResolveNameReply,
+    SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
+    StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
 };
 
 /// Public-API aliases for the client side. The underlying types live
@@ -601,6 +601,96 @@ pub fn claim_volume_bucket(socket_path: &Path, name: &str) -> io::Result<ClaimOu
             handoff_snapshot: handoff_snapshot.map(|s| s.to_string()),
         },
     })
+}
+
+/// Register a name-claim job with the coordinator. `Reclaimed` is
+/// the no-op happy path; `Claiming { released_vol_ulid }` indicates
+/// a foreign-content claim is now running in the background — the
+/// caller subscribes via [`claim_attach_by_name`] to stream
+/// progress and learn the freshly-minted fork ULID.
+pub fn claim_start(socket_path: &Path, volume: &str) -> io::Result<ClaimStartReply> {
+    call_typed(
+        socket_path,
+        &Request::ClaimStart {
+            volume: volume.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)
+}
+
+/// Stream claim progress for `volume` to `out`. Returns the new
+/// fork's ULID parsed from the terminal `ForkCreated` event.
+pub fn claim_attach_by_name(
+    socket_path: &Path,
+    volume: &str,
+    out: &mut dyn Write,
+) -> io::Result<ulid::Ulid> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        io::Error::other(format!(
+            "coordinator not running ({}): {e}",
+            socket_path.display()
+        ))
+    })?;
+    let request = Request::ClaimAttach {
+        volume: volume.to_owned(),
+    };
+    let line = serde_json::to_string(&request)
+        .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
+    writeln!(stream, "{line}")?;
+    stream.flush()?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+
+    let mut reader = io::BufReader::new(stream);
+    let mut buf = String::new();
+    let mut new_vol_ulid: Option<ulid::Ulid> = None;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::other(
+                "claim stream closed before terminal event",
+            ));
+        }
+        let env: Envelope<ClaimAttachEvent> = serde_json::from_str(buf.trim())
+            .map_err(|e| io::Error::other(format!("parse claim event: {e}")))?;
+        match env.into_result() {
+            Ok(event) => {
+                if let Some(line) = render_claim_event(&event) {
+                    writeln!(out, "{line}")?;
+                }
+                if let ClaimAttachEvent::ForkCreated { new_vol_ulid: u } = event {
+                    new_vol_ulid = Some(u);
+                }
+                if matches!(event, ClaimAttachEvent::Done) {
+                    return new_vol_ulid.ok_or_else(|| {
+                        io::Error::other("claim completed without ForkCreated event")
+                    });
+                }
+            }
+            Err(e) => return Err(io::Error::other(e)),
+        }
+    }
+}
+
+fn render_claim_event(event: &ClaimAttachEvent) -> Option<String> {
+    match event {
+        ClaimAttachEvent::PullingAncestor { vol_ulid } => {
+            Some(format!("[claim] pulled {vol_ulid}"))
+        }
+        ClaimAttachEvent::HandoffKeyResolved { key } => match key {
+            ResolveHandoffKeyReply::Normal => None,
+            ResolveHandoffKeyReply::Recovery { .. } => Some(
+                "[claim] handoff snapshot is synthesised — verifying under recovering coordinator's key"
+                    .to_owned(),
+            ),
+        },
+        ClaimAttachEvent::ForkCreated { new_vol_ulid } => {
+            Some(format!("[claim] fork created at {new_vol_ulid}"))
+        }
+        ClaimAttachEvent::PrefetchStarted => Some("[claim] prefetching ancestor index...".to_owned()),
+        ClaimAttachEvent::PrefetchDone => Some("[claim] ready".to_owned()),
+        ClaimAttachEvent::Done => None,
+    }
 }
 
 /// Create a fresh writable volume. Returns the new volume's ULID. Routes

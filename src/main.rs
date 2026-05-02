@@ -863,7 +863,7 @@ fn main() {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
                     // already; no second await needed here.
-                    if let Err(e) = run_claim(&args.data_dir, &name, &socket_path, &by_id_dir) {
+                    if let Err(e) = run_claim(&name, &socket_path) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -904,7 +904,7 @@ fn main() {
             }
 
             VolumeCommand::Claim { name } => {
-                if let Err(e) = run_claim(&args.data_dir, &name, &socket_path, &by_id_dir) {
+                if let Err(e) = run_claim(&name, &socket_path) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1499,124 +1499,30 @@ fn create_fork(
 ///     conditional PUT inside `rebind-name` resolves races; the local
 ///     fork is left in place as a usable orphan if another
 ///     coordinator wins.
-fn run_claim(
-    data_dir: &Path,
-    name: &str,
-    socket_path: &Path,
-    by_id_dir: &Path,
-) -> std::io::Result<()> {
-    use coordinator_client::ClaimOutcome;
-    match coordinator_client::claim_volume_bucket(socket_path, name)? {
-        ClaimOutcome::Reclaimed => Ok(()),
-        ClaimOutcome::NeedsClaim {
-            released_vol_ulid,
-            handoff_snapshot,
-        } => orchestrate_foreign_claim(
-            data_dir,
-            name,
-            &released_vol_ulid,
-            handoff_snapshot.as_deref(),
-            socket_path,
-            by_id_dir,
-        ),
-    }
-}
-
-fn orchestrate_foreign_claim(
-    data_dir: &Path,
-    name: &str,
-    released_vol_ulid: &str,
-    handoff_snapshot: Option<&str>,
-    socket_path: &Path,
-    by_id_dir: &Path,
-) -> std::io::Result<()> {
-    let snap = handoff_snapshot.ok_or_else(|| {
-        std::io::Error::other(format!(
-            "name '{name}' is Released but has no handoff snapshot recorded — \
-             the releasing coordinator did not publish one (older release?). \
-             Manual recovery required: see docs/operations.md"
-        ))
-    })?;
-    let from = format!("{released_vol_ulid}/{snap}");
-
-    // Pull the source volume + ancestor chain locally if we don't
-    // already have it. Subsequent fork_create needs source-on-disk.
-    let source_dir = volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid);
-    if !source_dir.exists() {
-        eprintln!("pulling {released_vol_ulid} from remote store...");
-        remote_pull(&from, data_dir, socket_path)?;
-        if !volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid).exists() {
-            return Err(std::io::Error::other(format!(
-                "source volume {released_vol_ulid} not found in remote store"
-            )));
+fn run_claim(name: &str, socket_path: &Path) -> std::io::Result<()> {
+    use coordinator_client::ClaimStartReply;
+    match coordinator_client::claim_start(socket_path, name)? {
+        ClaimStartReply::Reclaimed => Ok(()),
+        ClaimStartReply::Claiming { released_vol_ulid } => {
+            eprintln!("[claim] claiming '{name}' from {released_vol_ulid}");
+            install_prefetch_ctrlc_handler(name, "[claim]");
+            let mut stderr = std::io::stderr();
+            // Don't fail the claim if the attach stream errors out at
+            // the prefetch step — the bucket-side claim and local fork
+            // are durable by the time we get here, mirroring the prior
+            // CLI behaviour. Pre-prefetch errors do still surface.
+            match coordinator_client::claim_attach_by_name(socket_path, name, &mut stderr) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "[claim] attach stream ended with error ({e}); \
+                         coordinator continues in background"
+                    );
+                    Ok(())
+                }
+            }
         }
     }
-
-    // Resolve the handoff key (recovery vs normal) so fork_create can
-    // verify the handoff snapshot's signature under the right key.
-    let parent_key_hex = match coordinator_client::resolve_handoff_key(
-        socket_path,
-        released_vol_ulid,
-        snap,
-    )? {
-        coordinator_client::HandoffKey::Normal => None,
-        coordinator_client::HandoffKey::Recovery {
-            manifest_pubkey_hex,
-        } => {
-            eprintln!(
-                "[claim] handoff snapshot {snap} is synthesised — verifying under recovering coordinator's key"
-            );
-            Some(manifest_pubkey_hex)
-        }
-    };
-
-    // Single IPC for the rest of the foreign-claim flow. The
-    // coordinator detects a resumable orphan at `by_name/<name>`
-    // (matching signed provenance), removes a stale one, mints the
-    // fresh fork when needed, uploads volume.pub + volume.provenance,
-    // writes volume.stopped, and atomically rebinds names/<name> via
-    // `mark_claimed`. Returns the (possibly-resumed) fork ULID.
-    let new_vol_ulid = coordinator_client::fork_create(
-        socket_path,
-        name,
-        released_vol_ulid,
-        Some(snap),
-        parent_key_hex.as_deref(),
-        &[],
-        true,
-    )?;
-
-    // Surface the coordinator's background prefetch to the user. The
-    // bucket-side claim and local fork are already durable above; the
-    // prefetch task on the coordinator pulls the ancestor `.idx` files
-    // (and runs boot-prewarm) so a subsequent `volume start` is offline-
-    // ready. The CLI is just a subscriber to the existing
-    // `await-prefetch` IPC; Ctrl-C kills only the subscriber, never the
-    // coordinator's prefetch work.
-    install_prefetch_ctrlc_handler(name, "[claim]");
-    eprintln!("[claim] prefetching ancestor index...");
-    match coordinator_client::await_prefetch(
-        socket_path,
-        &new_vol_ulid,
-        coordinator_client::PREFETCH_AWAIT_BUDGET,
-    ) {
-        Ok(()) => eprintln!("[claim] ready"),
-        Err(e) => {
-            // Don't fail the claim — the bucket-side claim succeeded and
-            // the local fork is committed. The error here is most
-            // commonly the 60s subscriber-side budget expiring while the
-            // coordinator's prefetch task is still running (deep ancestor
-            // chain, slow network); it can also be a real prefetch
-            // failure. In both cases the coordinator continues on its
-            // own and `volume start` will await prefetch again before
-            // opening the volume.
-            eprintln!(
-                "[claim] prefetch did not finish in time ({e}); \
-                 coordinator continues in background"
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Install a process-wide Ctrl-C handler for prefetch waits.
@@ -1832,99 +1738,6 @@ fn print_remote_status(name: &str, rs: &coordinator_client::StatusRemoteReply) {
         println!("  handoff_snap    {snap}");
     }
     println!("  eligibility     {}", rs.eligibility.wire_str());
-}
-
-/// Pull a volume (and its full ancestor chain) from the remote store as
-/// readonly fork sources.
-///
-/// `spec` is one of:
-///   - a volume name (resolved via `names/<name>` → ULID in the store)
-///   - `<vol_ulid>` (address directly by ULID)
-///   - `<vol_ulid>/<snap_ulid>` (address a specific snapshot; the ULID part
-///     is what gets pulled — the snapshot ULID is retained for the caller
-///     that wants to pin provenance, e.g. `volume create --from`)
-///
-/// Each pulled volume lands under `data_dir/by_id/<vol_ulid>/` with
-/// `volume.readonly`, `volume.pub`, `volume.provenance`, an empty `index/`
-/// dir, and a `volume.toml` with no name (the absent name and absent
-/// `by_name/` symlink mark this as a pulled ancestor). The coordinator's
-/// next rescan then runs `prefetch_indexes` which downloads the signed
-/// `.idx` files into each volume's own `index/` directory (signature
-/// verification uses that volume's own `volume.pub`).
-///
-/// The ancestor chain is walked via the downloaded `volume.provenance`:
-/// for every parent ULID not already present in `by_id/`, its ancestor
-/// entry is pulled too. Encountering a mid-chain ancestor that is already
-/// local terminates the walk — the local copy is authoritative.
-fn remote_pull(spec: &str, data_dir: &Path, socket_path: &Path) -> std::io::Result<()> {
-    // Step 1: resolve `spec` to the root ULID to pull. Names are resolved
-    // by the coordinator over `ResolveName` IPC; ULID forms are parsed
-    // locally. The CLI never talks to S3.
-    let root_ulid = resolve_pull_spec(socket_path, spec)?;
-
-    // Step 2: walk the ancestor chain, pulling each ancestor that isn't
-    // already local. The actual fetch + write is delegated to the
-    // coordinator's `pull-readonly` IPC: the coordinator does the S3 GET,
-    // verifies the provenance, writes the root-owned `by_id/<ulid>/`
-    // tree, and returns the parent ULID parsed from the verified
-    // provenance.
-    let mut pulled: Vec<String> = Vec::new();
-    let mut next: Option<String> = Some(root_ulid);
-    while let Some(ulid_str) = next.take() {
-        if ancestor_exists_locally(data_dir, &ulid_str) {
-            // Local copy is authoritative; stop walking up from here.
-            break;
-        }
-        let parent_ulid = coordinator_client::pull_readonly(socket_path, &ulid_str)?;
-        pulled.push(ulid_str);
-        next = parent_ulid;
-    }
-
-    if pulled.is_empty() {
-        println!("pull: volume already present locally");
-    } else {
-        for id in &pulled {
-            println!("pulled {id}");
-        }
-    }
-
-    // Step 3: signal coordinator to rescan (best-effort) so it picks up the
-    // new ancestor entries and kicks off prefetch_indexes on each.
-    if coordinator_client::rescan(socket_path).is_err() {
-        eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
-    }
-
-    Ok(())
-}
-
-/// Parse a pull spec and resolve it to a volume ULID to fetch.
-///
-/// Accepts `<name>`, `<vol_ulid>`, or `<vol_ulid>/<snap_ulid>`. For ULID
-/// forms the snapshot portion is validated but discarded — this function
-/// only decides *which volume* to pull; the snapshot ULID is a pinning
-/// concern for the caller (`volume create --from`), not for pull itself.
-/// Name resolution is delegated to the coordinator over `ResolveName`
-/// IPC so the CLI never builds an S3 client of its own.
-fn resolve_pull_spec(socket_path: &Path, spec: &str) -> std::io::Result<String> {
-    if let Some((vol, snap)) = spec.split_once('/') {
-        let vol = ulid::Ulid::from_string(vol)
-            .map_err(|e| std::io::Error::other(format!("invalid volume ULID in spec: {e}")))?;
-        ulid::Ulid::from_string(snap)
-            .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in spec: {e}")))?;
-        return Ok(vol.to_string());
-    }
-    if let Ok(vol) = ulid::Ulid::from_string(spec) {
-        return Ok(vol.to_string());
-    }
-
-    validate_volume_name(spec)?;
-    let vol_ulid = coordinator_client::resolve_name(socket_path, spec)?;
-    Ok(vol_ulid.to_string())
-}
-
-/// Return `true` if a local copy of `<ulid>` exists.
-fn ancestor_exists_locally(data_dir: &Path, ulid_str: &str) -> bool {
-    data_dir.join("by_id").join(ulid_str).exists()
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
