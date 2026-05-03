@@ -4971,8 +4971,14 @@ mod tests {
         for sub in ["wal", "pending", "gc", "index", "snapshots"] {
             std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
         }
-        // Snapshot marker (bare-ULID file).
-        std::fs::write(tmp.path().join("snapshots").join(snap_ulid.to_string()), "").unwrap();
+        // Signed snapshot manifest (the snapshot's identity).
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap_ulid}.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
         // Upload sentinel: volume/<id>/uploaded/snapshots/<ulid>.
         std::fs::create_dir_all(tmp.path().join("uploaded").join("snapshots")).unwrap();
         std::fs::write(
@@ -5093,10 +5099,12 @@ mod tests {
         let older_snap = mint.next();
         let newer_snap = mint.next();
         let tmp = fast_path_clean_volume(newer_snap);
-        // Older marker + sentinel (the volume kept history).
+        // Older manifest + sentinel (the volume kept history).
         std::fs::write(
-            tmp.path().join("snapshots").join(older_snap.to_string()),
-            "",
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{older_snap}.manifest")),
+            "fake-signed",
         )
         .unwrap();
         std::fs::write(
@@ -5114,23 +5122,18 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_ignores_filemap_and_manifest_siblings() {
+    fn fast_path_ignores_non_manifest_siblings() {
         let snap = ulid::Ulid::new();
         let tmp = fast_path_clean_volume(snap);
-        // The snapshots dir has marker plus .filemap and .manifest
-        // siblings; only the bare-ULID marker should be considered.
+        // The snapshots dir has the manifest plus a `.filemap`
+        // sibling and a stale bare-ULID marker (pre-#215 layout);
+        // neither should be mistaken for an additional snapshot.
         std::fs::write(
             tmp.path().join("snapshots").join(format!("{snap}.filemap")),
             "fm",
         )
         .unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("snapshots")
-                .join(format!("{snap}.manifest")),
-            "mf",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("snapshots").join(snap.to_string()), "").unwrap();
         assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), Some(snap));
     }
 
