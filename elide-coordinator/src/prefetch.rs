@@ -74,9 +74,9 @@ pub struct PrefetchResult {
     /// fetch would be redundant.
     pub superseded: usize,
     pub failed: usize,
-    /// Snapshot artifacts (markers, manifests, filemaps) downloaded
-    /// during this run. Counted separately from `.idx` so the per-run
-    /// log line keeps the index/snapshot signals distinct.
+    /// Snapshot artifacts (markers, manifests) downloaded during this
+    /// run. Counted separately from `.idx` so the per-run log line
+    /// keeps the index/snapshot signals distinct.
     pub snapshots_fetched: usize,
     /// Of `snapshots_fetched`, how many came from a peer.
     pub snapshots_from_peer: usize,
@@ -428,7 +428,7 @@ async fn prefetch_fork(
         }
     }
 
-    // Prefetch snapshot markers and filemaps from snapshots/ sub-prefix.
+    // Prefetch snapshot markers and manifests from snapshots/ sub-prefix.
     // For ancestor walks (`branch_ulid = Some(...)`), restrict to just the
     // branch-point snapshot's artifacts — older snapshots in the ancestor
     // are not on the read path of this fork, and snapshots newer than the
@@ -586,20 +586,18 @@ async fn fetch_idx(
     Ok(())
 }
 
-/// Download snapshot markers, manifests, and filemaps from S3 (and/or
-/// the configured peer) into `<fork_dir>/snapshots/`.
+/// Download snapshot markers and manifests from S3 (and/or the
+/// configured peer) into `<fork_dir>/snapshots/`.
 ///
 /// Two paths:
 ///
 /// 1. **Branch-point fast path** — `branch_ulid = Some(b)` and a peer
-///    context is available. The three artifact names are known
-///    up-front (`<b>`, `<b>.manifest`, `<b>.filemap`); we issue all
-///    three peer GETs in parallel via [`futures::future::join_all`]
-///    and skip the S3 LIST entirely on the happy path. For any
-///    artifact the peer doesn't have, we fall through to a per-name
-///    S3 GET keyed via [`crate::upload::snapshot_key`] /
-///    [`crate::upload::snapshot_manifest_key`] /
-///    [`crate::upload::filemap_key`] — still no LIST.
+///    context is available. Both artifact names are known up-front
+///    (`<b>`, `<b>.manifest`); we issue both peer GETs in parallel via
+///    [`futures::future::join_all`] and skip the S3 LIST entirely on
+///    the happy path. For any artifact the peer doesn't have, we fall
+///    through to a per-name S3 GET keyed via [`crate::upload::snapshot_key`]
+///    / [`crate::upload::snapshot_manifest_key`] — still no LIST.
 ///
 /// 2. **Listed path** — `branch_ulid = None` (current writable fork)
 ///    or no peer context. Lists `by_id/<volume_id>/snapshots/`,
@@ -645,21 +643,13 @@ async fn prefetch_snapshots(
     // artifacts concurrently. Bounded with `buffer_unordered` so a
     // very wide snapshot dir doesn't blast the store with hundreds
     // of in-flight GETs.
-    // Filemaps are deliberately excluded from prefetch: they're consumed
-    // only by `elide volume import --extents-from` (and the related
-    // `generate-filemap` flow), never by claim/start/mount/read. Pulling
-    // them eagerly during prefetch wasted bandwidth on every claim and
-    // surfaced a fatal 404 on handoff snapshots (which intentionally
-    // have no filemap — `release` skips filemap generation by design;
-    // see `inbound.rs` § "Phase 4 used to run here"). When an import
-    // path actually wants a source filemap, it reads it from disk if
-    // present and gracefully skips the source if not (see
-    // `elide-core/src/delta_compute.rs`); operators wanting cross-volume
-    // dedup run `generate-filemap` first.
     let to_fetch: Vec<(object_store::path::Path, String)> = objects
         .into_iter()
         .filter_map(|obj| {
             let filename = obj.location.filename()?.to_owned();
+            // Pre-#212 buckets may still contain `.filemap` objects;
+            // skip them so a transitioning bucket doesn't pull dead
+            // weight onto the new host.
             if filename.ends_with(".filemap") {
                 return None;
             }
@@ -721,10 +711,6 @@ fn write_snapshot_artifact_atomic(snap_dir: &Path, filename: &str, data: &[u8]) 
 
 /// Branch-point fast path. Fetch the marker + manifest in parallel —
 /// peer first, S3 by-name on miss, no LIST on either tier.
-///
-/// Filemaps are deliberately excluded; see the listed-path comment in
-/// [`prefetch_snapshots`] for the rationale. Operators wanting cross-volume
-/// dedup at import time run `elide volume generate-filemap <source>` first.
 async fn prefetch_branch_snapshot_artifacts(
     store: &Arc<dyn ObjectStore>,
     snap_dir: &Path,
@@ -1283,52 +1269,39 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        // Upload a snapshot marker and filemap to the store.
+        // Snapshot marker + a stale `.filemap` (representing a
+        // pre-#212 bucket): prefetch must skip the filemap.
         let snap_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let snap_key = StorePath::from(format!("by_id/{vol_ulid}/snapshots/19700101/{snap_ulid}"));
         store
             .put(&snap_key, bytes::Bytes::new().into())
             .await
             .unwrap();
-
-        let filemap_content = b"# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n";
         let fm_key = StorePath::from(format!(
             "by_id/{vol_ulid}/snapshots/19700101/{snap_ulid}.filemap"
         ));
         store
-            .put(&fm_key, bytes::Bytes::from_static(filemap_content).into())
+            .put(
+                &fm_key,
+                bytes::Bytes::from_static(b"# elide-filemap v1\n").into(),
+            )
             .await
             .unwrap();
 
-        // Run prefetch — should download the snapshot marker but
-        // deliberately skip the filemap (filemaps are import-only
-        // artifacts; prefetch never pulls them).
         let result = prefetch_indexes(&vol_dir, &store, None).await.unwrap();
         assert_eq!(result.failed, 0);
 
         let snap_dir = vol_dir.join("snapshots");
-        assert!(
-            snap_dir.join(snap_ulid).exists(),
-            "snapshot marker should exist locally"
-        );
-        let local_filemap = snap_dir.join(format!("{snap_ulid}.filemap"));
-        assert!(
-            !local_filemap.exists(),
-            "filemap must NOT be prefetched — it is consumed only by import",
-        );
+        assert!(snap_dir.join(snap_ulid).exists());
+        assert!(!snap_dir.join(format!("{snap_ulid}.filemap")).exists());
 
-        // The uploaded filemap_content sits in S3 untouched; just
-        // sanity-check the test fixture isn't lying about itself.
-        let _ = filemap_content;
-
-        // Running again should skip (already present).
+        // Idempotent: re-running doesn't re-download.
         prefetch_indexes(&vol_dir, &store, None).await.unwrap();
-        // No error, no re-download.
     }
 
     /// Ancestor-walk path: when an ancestor has multiple snapshots in
     /// its bucket prefix, only the snapshot at the branch point (and
-    /// its sibling `.manifest` / `.filemap`) should be downloaded into
+    /// its sibling `.manifest`) should be downloaded into
     /// the local fork — older snapshots in the ancestor are not on the
     /// read path of this fork. Regression for the "every claim pulls
     /// every ancestor snapshot" pattern observed in production logs.
@@ -1383,7 +1356,8 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
         // Upload all three snapshots' artifacts into the parent's
-        // bucket prefix. Each gets bare + `.manifest` + `.filemap`.
+        // bucket prefix — including stale `.filemap` entries that a
+        // pre-#212 bucket would still carry.
         for snap in [earlier, branch, later] {
             for suffix in ["", ".manifest", ".filemap"] {
                 let key = StorePath::from(format!(
@@ -1398,30 +1372,16 @@ mod tests {
 
         prefetch_indexes(&child_dir, &store, None).await.unwrap();
 
-        // Only the branch-point's marker + manifest should appear
-        // locally in the parent's snapshots/ dir. Filemaps are never
-        // prefetched; non-branch ancestor snapshots are never pulled.
         let parent_snap_dir = parent_dir.join("snapshots");
         for suffix in ["", ".manifest"] {
             let p = parent_snap_dir.join(format!("{branch}{suffix}"));
-            assert!(
-                p.exists(),
-                "branch artifact {branch}{suffix} should be local"
-            );
+            assert!(p.exists(), "branch artifact {branch}{suffix} missing");
         }
-        assert!(
-            !parent_snap_dir.join(format!("{branch}.filemap")).exists(),
-            "filemap must NOT be prefetched — it is consumed only by import",
-        );
+        assert!(!parent_snap_dir.join(format!("{branch}.filemap")).exists());
         for snap in [earlier, later] {
             for suffix in ["", ".manifest", ".filemap"] {
                 let p = parent_snap_dir.join(format!("{snap}{suffix}"));
-                assert!(
-                    !p.exists(),
-                    "non-branch ancestor snapshot {snap}{suffix} \
-                     should NOT have been pulled, but exists at {}",
-                    p.display(),
-                );
+                assert!(!p.exists(), "{snap}{suffix} should not exist locally");
             }
         }
     }
@@ -1549,12 +1509,9 @@ mod tests {
 
         // Upload the marker + manifest under the canonical
         // date-partitioned keys (the upload helpers keep the test in
-        // sync with production keying). A filemap is also uploaded
-        // to verify prefetch deliberately does NOT fetch it even when
-        // present in S3.
+        // sync with production keying).
         let marker_key = crate::upload::snapshot_key(parent_ulid, branch).unwrap();
         let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, branch).unwrap();
-        let filemap_key = crate::upload::filemap_key(parent_ulid, branch).unwrap();
         store
             .put(&marker_key, bytes::Bytes::new().into())
             .await
@@ -1563,13 +1520,6 @@ mod tests {
             .put(
                 &manifest_key,
                 bytes::Bytes::from_static(b"manifest-bytes").into(),
-            )
-            .await
-            .unwrap();
-        store
-            .put(
-                &filemap_key,
-                bytes::Bytes::from_static(b"# elide-filemap v2\n").into(),
             )
             .await
             .unwrap();

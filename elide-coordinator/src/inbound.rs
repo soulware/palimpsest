@@ -698,7 +698,7 @@ async fn evict_volume(
 ///   5. `snapshot_manifest <snap_ulid>` IPC → volume writes the signed
 ///      `snapshots/<snap_ulid>.manifest` file and marker.
 ///   6. Upload the just-written snapshot files to S3 via
-///      `upload::upload_snapshots_and_filemaps`.
+///      `upload::upload_snapshot_metadata`.
 ///
 /// Lock is released when this function returns (via the `Drop` guard on
 /// the returned `MutexGuard`).
@@ -800,7 +800,7 @@ async fn snapshot_volume(
     // because the importer already has ext4 layout in hand.
 
     // 5. Upload the new snapshot marker and manifest.
-    elide_coordinator::upload::upload_snapshots_and_filemaps(&fork_dir, &volume_id, store)
+    elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, &volume_id, store)
         .await
         .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
 
@@ -3057,9 +3057,9 @@ fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<ulid::Uli
         return Ok(None);
     };
 
-    // The snapshot triple (marker + filemap + .manifest) is uploaded
-    // atomically; the sentinel is written only after all three succeed.
-    // Its presence is the canonical "this snapshot is on S3" check.
+    // The snapshot pair (marker + .manifest) is uploaded atomically;
+    // the sentinel is written only after both succeed. Its presence
+    // is the canonical "this snapshot is on S3" check.
     let sentinel = vol_dir
         .join("uploaded")
         .join("snapshots")
