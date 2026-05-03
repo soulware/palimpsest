@@ -1690,17 +1690,12 @@ async fn force_snapshot_now_op(
     let snap = max_seg.unwrap_or_else(ulid::Ulid::new);
     let snap_str = snap.to_string();
 
-    // Step 3 + 4: upload marker, verify pinned segments still present.
-    let marker_key = elide_coordinator::upload::snapshot_key(&volume_id, &snap_str)
-        .map_err(|e| IpcError::internal(format!("snapshot_key: {e}")))?;
+    // Step 3: verify pinned segments still present in S3 before
+    // committing to a manifest. We list rather than HEAD-each because
+    // a single LIST is cheaper than N HEADs once there's more than a
+    // handful of pins.
     let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
     let pinned: std::collections::HashSet<ulid::Ulid> = segments.iter().copied().collect();
-
-    store
-        .put(&marker_key, PutPayload::from_static(b""))
-        .await
-        .map_err(|e| IpcError::store(format!("uploading snapshot marker: {e}")))?;
-
     let objects = store
         .list(Some(&seg_prefix))
         .try_collect::<Vec<_>>()
@@ -1714,9 +1709,6 @@ async fn force_snapshot_now_op(
     let mut missing: Vec<ulid::Ulid> = pinned.difference(&present).copied().collect();
     if !missing.is_empty() {
         missing.sort();
-        if let Err(e) = store.delete(&marker_key).await {
-            warn!("[inbound] failed to delete stale snapshot marker {snap_str}: {e}");
-        }
         let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();
         let extra = missing.len().saturating_sub(preview.len());
         let suffix = if extra > 0 {
@@ -1734,7 +1726,7 @@ async fn force_snapshot_now_op(
         )));
     }
 
-    // Step 5: load-or-create the per-source attestation key.
+    // Step 4: load-or-create the per-source attestation key.
     let (signer, vk) = elide_core::signing::load_or_create_keypair(
         &ancestor_dir,
         elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
@@ -1742,14 +1734,23 @@ async fn force_snapshot_now_op(
     )
     .map_err(|e| IpcError::internal(format!("attestation keypair: {e}")))?;
 
-    // Step 6: signed manifest + local marker.
+    // Step 5: sign + write manifest locally.
     elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments, None)
         .map_err(|e| IpcError::internal(format!("writing snapshot manifest: {e}")))?;
-    let snap_dir = ancestor_dir.join("snapshots");
-    std::fs::create_dir_all(&snap_dir)
-        .map_err(|e| IpcError::internal(format!("creating snapshots dir: {e}")))?;
-    std::fs::write(snap_dir.join(&snap_str), b"")
-        .map_err(|e| IpcError::internal(format!("writing local marker: {e}")))?;
+
+    // Step 6: upload the manifest to S3. The manifest's S3 presence
+    // is the snapshot's S3 visibility — no separate marker.
+    let manifest_path = ancestor_dir
+        .join("snapshots")
+        .join(format!("{snap_str}.manifest"));
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .map_err(|e| IpcError::internal(format!("reading just-written manifest: {e}")))?;
+    let manifest_key = elide_coordinator::upload::snapshot_manifest_key(&volume_id, &snap_str)
+        .map_err(|e| IpcError::internal(format!("snapshot_manifest_key: {e}")))?;
+    store
+        .put(&manifest_key, PutPayload::from(manifest_bytes))
+        .await
+        .map_err(|e| IpcError::store(format!("uploading snapshot manifest: {e}")))?;
 
     info!(
         "[inbound] attested now-snapshot {snap_str} for {volume_id} ({} segments)",
@@ -3085,8 +3086,9 @@ fn dir_is_empty_or_absent(p: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Return the highest ULID among `snapshots/<ulid>` markers (skipping
-/// `<ulid>.manifest` / `<ulid>.filemap` siblings).
+/// Return the highest snapshot ULID found under `snap_dir`. Snapshots
+/// are recorded as `<ulid>.manifest` files; any other entry (including
+/// `<ulid>.filemap` siblings) is ignored.
 fn latest_snapshot_marker(snap_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
     let entries = match std::fs::read_dir(snap_dir) {
         Ok(e) => e,
@@ -3097,12 +3099,10 @@ fn latest_snapshot_marker(snap_dir: &Path) -> std::io::Result<Option<ulid::Ulid>
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(s) = name.to_str() else { continue };
-        // Skip filemap/manifest siblings: `<ulid>.filemap`,
-        // `<ulid>.manifest`. Plain marker is the bare ULID.
-        if s.contains('.') {
+        let Some(stem) = s.strip_suffix(".manifest") else {
             continue;
-        }
-        if let Ok(u) = ulid::Ulid::from_string(s)
+        };
+        if let Ok(u) = ulid::Ulid::from_string(stem)
             && latest.is_none_or(|cur| u > cur)
         {
             latest = Some(u);
@@ -4971,8 +4971,14 @@ mod tests {
         for sub in ["wal", "pending", "gc", "index", "snapshots"] {
             std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
         }
-        // Snapshot marker (bare-ULID file).
-        std::fs::write(tmp.path().join("snapshots").join(snap_ulid.to_string()), "").unwrap();
+        // Signed snapshot manifest (the snapshot's identity).
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap_ulid}.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
         // Upload sentinel: volume/<id>/uploaded/snapshots/<ulid>.
         std::fs::create_dir_all(tmp.path().join("uploaded").join("snapshots")).unwrap();
         std::fs::write(
@@ -5093,10 +5099,12 @@ mod tests {
         let older_snap = mint.next();
         let newer_snap = mint.next();
         let tmp = fast_path_clean_volume(newer_snap);
-        // Older marker + sentinel (the volume kept history).
+        // Older manifest + sentinel (the volume kept history).
         std::fs::write(
-            tmp.path().join("snapshots").join(older_snap.to_string()),
-            "",
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{older_snap}.manifest")),
+            "fake-signed",
         )
         .unwrap();
         std::fs::write(
@@ -5114,23 +5122,18 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_ignores_filemap_and_manifest_siblings() {
+    fn fast_path_ignores_non_manifest_siblings() {
         let snap = ulid::Ulid::new();
         let tmp = fast_path_clean_volume(snap);
-        // The snapshots dir has marker plus .filemap and .manifest
-        // siblings; only the bare-ULID marker should be considered.
+        // The snapshots dir has the manifest plus a `.filemap`
+        // sibling and a stale bare-ULID marker (pre-#215 layout);
+        // neither should be mistaken for an additional snapshot.
         std::fs::write(
             tmp.path().join("snapshots").join(format!("{snap}.filemap")),
             "fm",
         )
         .unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("snapshots")
-                .join(format!("{snap}.manifest")),
-            "mf",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("snapshots").join(snap.to_string()), "").unwrap();
         assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), Some(snap));
     }
 

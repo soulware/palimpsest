@@ -1844,6 +1844,9 @@ impl Volume {
                 }
             }
         }
+        // The manifest's existence under `snapshots/` is the
+        // snapshot's existence; `write_snapshot_manifest` writes
+        // atomically, so a partial sequence leaves no snapshot visible.
         crate::signing::write_snapshot_manifest(
             &self.base_dir,
             self.signer.as_ref(),
@@ -1851,10 +1854,6 @@ impl Volume {
             &index_ulids,
             None,
         )?;
-
-        // Marker is written last — a partial sequence leaves no snapshot
-        // visible under `snapshots/`.
-        fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
         self.has_new_segments = false;
 
         // The WAL was closed by `flush_wal_to_pending` above. The next write

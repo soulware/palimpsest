@@ -118,7 +118,14 @@ fn delta_entry_end_to_end_decompression() {
     .unwrap();
 
     // Write a snapshot marker so the volume has a floor.
-    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+        None,
+    )
+    .unwrap();
 
     // --- Open the volume and read the Delta LBA. ---
     let vol = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
@@ -224,7 +231,14 @@ fn delta_entry_roundtrip_from_drained_cache() {
     );
 
     // Snapshot marker on the post-drain volume.
-    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+        None,
+    )
+    .unwrap();
 
     // ── Read the Delta LBA. Extent-index rebuild must register the
     // Delta entry from the cached path, and the reader must resolve
@@ -318,7 +332,14 @@ fn delta_entry_demand_fetch_from_pull_host() {
     let staged_delta_bytes = fs::read(&delta_file).unwrap();
     fs::remove_file(&delta_file).unwrap();
 
-    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+        None,
+    )
+    .unwrap();
 
     // --- Fake fetcher: only fetch_delta_body is exercised. Writes the
     // staged bytes atomically (tmp+rename) into body_dir/<id>.delta
@@ -452,7 +473,14 @@ fn block_reader_read_block_dispatches_to_delta() {
     )
     .unwrap();
 
-    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+        None,
+    )
+    .unwrap();
 
     let reader = BlockReader::open_live(&vol_dir, Box::new(|_| None)).unwrap();
 

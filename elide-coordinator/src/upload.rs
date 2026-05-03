@@ -145,20 +145,6 @@ pub fn segment_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     )))
 }
 
-/// Build the object store key for a snapshot marker.
-///
-/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>`
-pub fn snapshot_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
-    let ulid: Ulid = ulid_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
-    let dt: DateTime<Utc> = ulid.datetime().into();
-    let date = dt.format("%Y%m%d").to_string();
-    Ok(StorePath::from(format!(
-        "by_id/{volume_id}/snapshots/{date}/{ulid_str}"
-    )))
-}
-
 /// Build the object store key for a signed snapshot manifest.
 ///
 /// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.manifest`
@@ -398,32 +384,12 @@ async fn upload_small_bytes(
     Ok(())
 }
 
-/// Upload a snapshot marker as an empty object at
-/// `by_id/<volume_id>/snapshots/YYYYMMDD/<snapshot_ulid>`.
-pub async fn upload_snapshot(
-    volume_id: &str,
-    snapshot_ulid: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<()> {
-    let key = snapshot_key(volume_id, snapshot_ulid)?;
-    let started = Instant::now();
-    store
-        .put(&key, Bytes::new().into())
-        .await
-        .with_context(|| format!("uploading snapshot marker to {key}"))?;
-    info!(
-        "[upload] {key} (0 bytes, snapshot marker in {:.2?})",
-        started.elapsed()
-    );
-    Ok(())
-}
-
-/// Upload all snapshot markers and signed segments manifests from
-/// `vol_dir/snapshots/` to S3.
+/// Upload signed snapshot manifests from `vol_dir/snapshots/` to S3.
 ///
-/// For each snapshot ULID found locally, uploads:
-/// - The empty snapshot marker at `snapshots/YYYYMMDD/<ulid>`
-/// - The signed snapshot manifest at `snapshots/YYYYMMDD/<ulid>.manifest` (if present)
+/// Snapshots are recorded as `<ulid>.manifest`; the manifest's
+/// existence is the snapshot's existence. Each manifest's upload is
+/// gated on a sentinel at `uploaded/snapshots/<ulid>` so re-runs don't
+/// re-PUT.
 pub async fn upload_snapshot_metadata(
     vol_dir: &Path,
     volume_id: &str,
@@ -442,54 +408,32 @@ pub async fn upload_snapshot_metadata(
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        // Skip the .manifest sibling — uploaded explicitly below.
-        if name.contains('.') {
+        let Some(snap_str) = name.strip_suffix(".manifest") else {
             continue;
-        }
-        // Validate as ULID.
-        if ulid::Ulid::from_string(name).is_err() {
+        };
+        if ulid::Ulid::from_string(snap_str).is_err() {
             continue;
         }
 
-        // Per-snapshot triple (marker + filemap + .manifest) is immutable
-        // for a given ULID, so one empty sentinel covers all three. Bytes
-        // aren't useful here — the S3 marker is empty, and the filemap /
-        // .manifest pair is already inspectable under `snapshots/<ulid>.*`.
-        let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{name}"));
+        let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{snap_str}"));
         if is_already_uploaded(&sentinel, &[]) {
             continue;
         }
 
-        let mut all_ok = true;
-
-        // Upload snapshot marker.
-        if let Err(e) = upload_snapshot(volume_id, name, store).await {
-            warn!("snapshot marker upload failed for {name}: {e:#}");
-            all_ok = false;
-        }
-
-        // Upload signed segments manifest if present.
-        let manifest_path = snap_dir.join(format!("{name}.manifest"));
-        if manifest_path.exists() {
-            let key = snapshot_manifest_key(volume_id, name)?;
-            let data = std::fs::read(&manifest_path).with_context(|| {
-                format!("reading snapshot manifest: {}", manifest_path.display())
-            })?;
-            let len = data.len();
-            let started = Instant::now();
-            match put_with_content_type(store, &key, Bytes::from(data), MIME_TEXT).await {
-                Ok(()) => {
-                    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
-                }
-                Err(e) => {
-                    warn!("snapshot manifest upload failed for {key}: {e:#}");
-                    all_ok = false;
+        let manifest_path = snap_dir.join(name);
+        let key = snapshot_manifest_key(volume_id, snap_str)?;
+        let data = std::fs::read(&manifest_path)
+            .with_context(|| format!("reading snapshot manifest: {}", manifest_path.display()))?;
+        let len = data.len();
+        let started = Instant::now();
+        match put_with_content_type(store, &key, Bytes::from(data), MIME_TEXT).await {
+            Ok(()) => {
+                info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
+                if let Err(e) = mark_uploaded(&sentinel, &[]) {
+                    warn!("failed to mark snapshot {snap_str} sentinel: {e}");
                 }
             }
-        }
-
-        if all_ok && let Err(e) = mark_uploaded(&sentinel, &[]) {
-            warn!("failed to mark snapshot {name} sentinel: {e}");
+            Err(e) => warn!("snapshot manifest upload failed for {key}: {e:#}"),
         }
     }
 
@@ -635,21 +579,6 @@ mod tests {
         assert_eq!(
             key.as_ref(),
             format!("by_id/{VOL_ULID}/segments/{expected_date}/{ulid_str}")
-        );
-    }
-
-    #[test]
-    fn snapshot_key_format() {
-        let ulid = Ulid::from_parts(1743120000000, 42);
-        let ulid_str = ulid.to_string();
-
-        let dt: DateTime<Utc> = ulid.datetime().into();
-        let expected_date = dt.format("%Y%m%d").to_string();
-
-        let key = snapshot_key(VOL_ULID, &ulid_str).unwrap();
-        assert_eq!(
-            key.as_ref(),
-            format!("by_id/{VOL_ULID}/snapshots/{expected_date}/{ulid_str}")
         );
     }
 
@@ -862,21 +791,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_snapshot_writes_empty_object() {
-        let store_tmp = TempDir::new().unwrap();
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+    async fn drain_uploads_signed_manifest_and_skips_local_filemap() {
+        use elide_core::signing::generate_ephemeral_signer;
 
-        let snap_ulid = Ulid::from_parts(1743120000000, 99).to_string();
-        upload_snapshot(VOL_ULID, &snap_ulid, &store).await.unwrap();
-
-        let key = snapshot_key(VOL_ULID, &snap_ulid).unwrap();
-        let meta = store.head(&key).await.expect("snapshot not in store");
-        assert_eq!(meta.size, 0);
-    }
-
-    #[tokio::test]
-    async fn drain_uploads_snapshot_marker_and_skips_local_filemap() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
@@ -891,12 +808,21 @@ mod tests {
         .write(&vol_dir)
         .unwrap();
 
-        // Snapshot marker plus a local filemap. The marker uploads;
-        // the filemap stays local-only.
-        let snap_ulid = Ulid::from_parts(1743120000000, 77).to_string();
-        std::fs::write(snap_dir.join(&snap_ulid), "").unwrap();
+        // Sign a real manifest plus a local filemap. The manifest
+        // uploads; the filemap stays local-only.
+        let snap_ulid = Ulid::from_parts(1743120000000, 77);
+        let snap_str = snap_ulid.to_string();
+        let (signer, _vk) = generate_ephemeral_signer();
+        elide_core::signing::write_snapshot_manifest(
+            &vol_dir,
+            signer.as_ref(),
+            &snap_ulid,
+            &[],
+            None,
+        )
+        .unwrap();
         std::fs::write(
-            snap_dir.join(format!("{snap_ulid}.filemap")),
+            snap_dir.join(format!("{snap_str}.filemap")),
             "# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n",
         )
         .unwrap();
@@ -909,19 +835,26 @@ mod tests {
             .await
             .unwrap();
 
-        // Snapshot marker is in store.
-        let snap_key = snapshot_key(VOL_ULID, &snap_ulid).unwrap();
+        // Manifest is in store.
+        let manifest_key = snapshot_manifest_key(VOL_ULID, &snap_str).unwrap();
         let meta = store
-            .head(&snap_key)
+            .head(&manifest_key)
             .await
-            .expect("snapshot marker not in store");
-        assert_eq!(meta.size, 0);
+            .expect("snapshot manifest not in store");
+        assert!(meta.size > 0);
+
+        // No bare-ULID marker in store.
+        let dt: DateTime<Utc> = snap_ulid.datetime().into();
+        let date = dt.format("%Y%m%d").to_string();
+        let bare_key = StorePath::from(format!("by_id/{VOL_ULID}/snapshots/{date}/{snap_str}"));
+        assert!(
+            store.head(&bare_key).await.is_err(),
+            "bare-ULID snapshot marker must not be uploaded to S3",
+        );
 
         // Filemap is NOT in store — it stays local.
-        let dt: DateTime<Utc> = Ulid::from_string(&snap_ulid).unwrap().datetime().into();
-        let date = dt.format("%Y%m%d").to_string();
         let fm_key = StorePath::from(format!(
-            "by_id/{VOL_ULID}/snapshots/{date}/{snap_ulid}.filemap"
+            "by_id/{VOL_ULID}/snapshots/{date}/{snap_str}.filemap"
         ));
         assert!(
             store.head(&fm_key).await.is_err(),

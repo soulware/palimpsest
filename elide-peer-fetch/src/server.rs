@@ -4,7 +4,6 @@
 //!
 //! - `GET /v1/<vol_id>/<ulid>.idx`         → serves `<data_dir>/by_id/<vol_id>/index/<ulid>.idx`
 //! - `GET /v1/<vol_id>/<ulid>.prefetch`    → serves `<data_dir>/by_id/<vol_id>/cache/<ulid>.present`
-//! - `GET /v1/<vol_id>/<ulid>.snapshot`    → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>` (empty marker)
 //! - `GET /v1/<vol_id>/<ulid>.manifest`    → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.manifest`
 //! - `GET /v1/<vol_id>/volume.pub`         → serves `<data_dir>/by_id/<vol_id>/volume.pub`
 //! - `GET /v1/<vol_id>/volume.provenance`  → serves `<data_dir>/by_id/<vol_id>/volume.provenance`
@@ -17,12 +16,10 @@
 //! The wire `.prefetch` resource is deliberately a different name from
 //! the on-disk `.present` file: the bytes are returned verbatim in v1
 //! but clients consume the response as advisory state, never as
-//! authoritative cache state. The wire `.snapshot` follows the same
-//! decoupling for the bare-marker file (no on-disk suffix) so the URL
-//! always carries an explicit suffix. See `docs/design-peer-segment-fetch.md`
+//! authoritative cache state. See `docs/design-peer-segment-fetch.md`
 //! § "What's served" for the rationale.
 //!
-//! For the snapshot routes the second URL component is a *snapshot*
+//! For the `.manifest` route the second URL component is a *snapshot*
 //! ULID, not a segment ULID. Auth steps 1–4 don't distinguish — the
 //! lineage check (step 4) only requires `<vol_id>` to be in the
 //! requesting volume's ancestry. Step 5 falls out as 404 if the
@@ -128,7 +125,6 @@ impl std::fmt::Display for ResourceTarget {
 enum ResourceKind {
     Idx,
     Prefetch,
-    SnapshotMarker,
     SnapshotManifest,
     /// Per-fork `volume.pub` — fetched by ancestor-skeleton pull.
     VolumePub,
@@ -143,7 +139,7 @@ impl ResourceKind {
         match self {
             Self::Idx => Some("index"),
             Self::Prefetch => Some("cache"),
-            Self::SnapshotMarker | Self::SnapshotManifest => Some("snapshots"),
+            Self::SnapshotManifest => Some("snapshots"),
             Self::VolumePub | Self::VolumeProvenance => None,
         }
     }
@@ -155,9 +151,6 @@ impl ResourceKind {
             // The on-disk file is `.present`; the wire calls it
             // `.prefetch` (see docs/design-peer-segment-fetch.md).
             (Self::Prefetch, ResourceTarget::Ulid(u)) => format!("{u}.present"),
-            // The on-disk snapshot marker has no suffix; wire decouples
-            // it as `.snapshot` so the URL always carries one.
-            (Self::SnapshotMarker, ResourceTarget::Ulid(u)) => u.to_string(),
             (Self::SnapshotManifest, ResourceTarget::Ulid(u)) => format!("{u}.manifest"),
             (Self::VolumePub, ResourceTarget::Skeleton) => "volume.pub".to_owned(),
             (Self::VolumeProvenance, ResourceTarget::Skeleton) => "volume.provenance".to_owned(),
@@ -171,7 +164,6 @@ impl ResourceKind {
         match self {
             Self::Idx => ".idx",
             Self::Prefetch => ".prefetch",
-            Self::SnapshotMarker => ".snapshot",
             Self::SnapshotManifest => ".manifest",
             Self::VolumePub => "volume.pub",
             Self::VolumeProvenance => "volume.provenance",
@@ -268,8 +260,6 @@ async fn handle_segment_inner(
                 (s, ResourceKind::Prefetch)
             } else if let Some(s) = filename.strip_suffix(".manifest") {
                 (s, ResourceKind::SnapshotManifest)
-            } else if let Some(s) = filename.strip_suffix(".snapshot") {
-                (s, ResourceKind::SnapshotMarker)
             } else {
                 return Err(RouteError::UnknownFilename);
             };
@@ -622,37 +612,6 @@ mod tests {
         let (status, returned) = run(&f.router, req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(returned, body);
-    }
-
-    #[tokio::test]
-    async fn snapshot_marker_happy_path_serves_empty_file() {
-        let f = fixture().await;
-        let snap_ulid = Ulid::new();
-        // Marker is an empty file on disk; URL uses the `.snapshot`
-        // wire suffix because the URL must carry one.
-        write_local_file(
-            f.data_dir.path(),
-            f.vol_ulid,
-            "snapshots",
-            &snap_ulid.to_string(),
-            b"",
-        );
-
-        let token = sign_token(
-            &f.vol_name,
-            &f.coord_id,
-            PeerFetchToken::now_unix_seconds(),
-            &f.coord_key,
-        );
-        let req = Request::builder()
-            .uri(format!("/v1/{}/{}.snapshot", f.vol_ulid, snap_ulid))
-            .header(http::header::AUTHORIZATION, bearer_header(&token))
-            .body(Body::empty())
-            .unwrap();
-
-        let (status, returned) = run(&f.router, req).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(returned.is_empty());
     }
 
     /// Write a per-fork file directly under `by_id/<vol_id>/`

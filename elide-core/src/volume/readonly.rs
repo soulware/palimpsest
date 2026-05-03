@@ -436,8 +436,10 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
     Ok(layers)
 }
 
-/// Return the latest snapshot ULID string for a fork, or `None` if no
-/// snapshots exist. Snapshots live as plain files under `fork_dir/snapshots/`.
+/// Return the latest snapshot ULID for a fork, or `None` if no
+/// snapshots exist. Snapshots are recorded as `<ulid>.manifest` files
+/// under `fork_dir/snapshots/`; the manifest's presence is the
+/// snapshot's existence.
 pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
     let snapshots_dir = fork_dir.join("snapshots");
     let iter = match fs::read_dir(&snapshots_dir) {
@@ -447,7 +449,12 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
     };
     let latest = iter
         .filter_map(|e| e.ok())
-        .filter_map(|e| Ulid::from_string(e.file_name().to_str()?).ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_str()?;
+            let stem = s.strip_suffix(".manifest")?;
+            Ulid::from_string(stem).ok()
+        })
         .max();
     Ok(latest)
 }

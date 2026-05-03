@@ -5,8 +5,6 @@
 //! - [`PeerFetchClient::fetch_prefetch_hint`] — full-file fetch of the
 //!   advisory `.prefetch` payload (server synthesises from local
 //!   `cache/<ulid>.present`; client receives a typed [`PrefetchHint`]).
-//! - [`PeerFetchClient::fetch_snapshot_marker`] — full-file fetch of
-//!   the bare snapshot marker (empty file under `snapshots/`).
 //! - [`PeerFetchClient::fetch_snapshot_manifest`] — full-file fetch of
 //!   `snapshots/<snap>.manifest` (signed handoff manifest).
 //! - [`PeerFetchClient::fetch_volume_pub`] — full-file fetch of
@@ -150,21 +148,6 @@ impl PeerFetchClient {
         self.get_bytes(volume_name, &url)
             .await
             .map(PrefetchHint::from_wire_bytes)
-    }
-
-    /// Fetch the bare snapshot marker (`<snap>` with no on-disk suffix;
-    /// `<snap>.snapshot` on the wire). Returns the response body — an
-    /// empty `Bytes` on success, since the marker file is itself empty.
-    /// Caller writes a 0-byte marker locally on `Some(_)`.
-    pub async fn fetch_snapshot_marker(
-        &self,
-        peer: &PeerEndpoint,
-        volume_name: &str,
-        vol_id: Ulid,
-        snap_ulid: Ulid,
-    ) -> Option<Bytes> {
-        let url = format!("{}/v1/{}/{}.snapshot", peer.url(), vol_id, snap_ulid);
-        self.get_bytes(volume_name, &url).await
     }
 
     /// Fetch `snapshots/<snap>.manifest` (the signed handoff manifest).

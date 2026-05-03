@@ -121,9 +121,16 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     )
     .unwrap();
 
-    // Snapshot marker so the rebuild sees a floor (not strictly
-    // required for reclaim, but matches production shape).
-    fs::write(vol_dir.join(format!("snapshots/{delta_ulid}")), "").unwrap();
+    // Signed snapshot manifest so the rebuild sees a floor (not
+    // strictly required for reclaim, but matches production shape).
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_ulid,
+        &[delta_ulid],
+        None,
+    )
+    .unwrap();
 
     // --- Open a mutable Volume and split the Delta with a middle overwrite. ---
     let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
@@ -347,7 +354,14 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         signer.as_ref(),
     )
     .unwrap();
-    fs::write(vol_dir.join(format!("snapshots/{delta50_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta50_ulid,
+        &[delta50_ulid],
+        None,
+    )
+    .unwrap();
 
     // --- Open, split H via middle overwrite, reclaim. ---
     let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
@@ -477,8 +491,15 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
     )];
     write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
 
-    // Snapshot marker AT parent_ulid — H's segment is now snapshot-pinned.
-    fs::write(vol_dir.join(format!("snapshots/{parent_ulid}")), "").unwrap();
+    // Snapshot manifest AT parent_ulid — H's segment is now snapshot-pinned.
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &parent_ulid,
+        &[parent_ulid],
+        None,
+    )
+    .unwrap();
 
     // No Delta entry referencing H. `delta_source_refcount(H)` stays 0.
 
@@ -594,7 +615,14 @@ fn scanner_surfaces_bloated_delta_hash() {
         signer.as_ref(),
     )
     .unwrap();
-    fs::write(vol_dir.join(format!("snapshots/{delta_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_ulid,
+        &[delta_ulid],
+        None,
+    )
+    .unwrap();
 
     let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
 

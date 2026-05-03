@@ -245,13 +245,12 @@ pub fn import_image(
     let snap_ulid = Ulid::from_string(&snap_ulid_str)
         .map_err(|e| io::Error::other(format!("invalid snapshot ULID: {e}")))?;
 
-    // Write the signed snapshot manifest before the marker — partial
-    // sequences leave no snapshot visible (the marker is written last).
+    // Signed snapshot manifest at `snapshots/<snap_ulid>.manifest`. The
+    // manifest's existence is the snapshot's existence — there's no
+    // separate marker file.
     crate::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &all_segment_ulids, None)?;
 
-    fs::write(snapshots_dir.join(&snap_ulid_str), "")?;
-
-    // Write the filemap alongside the snapshot marker.
+    // Write the filemap alongside the manifest.
     filemap::write(&snapshots_dir, &snap_ulid_str, &filemap_rows)?;
 
     // Write size into volume.toml (read-modify-write to preserve name if already set).

@@ -113,13 +113,16 @@ fn parse_filemap(path: &Path) -> Vec<(String, u64, String, u64)> {
     out
 }
 
-/// Find the snapshot ULID inside `vol_dir/snapshots`, skipping `.filemap` files.
+/// Find the snapshot ULID inside `vol_dir/snapshots` by looking for
+/// the `<ulid>.manifest` file that records the snapshot.
 fn find_snapshot_ulid(snap_dir: &Path) -> String {
     for entry in fs::read_dir(snap_dir).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
-        if !name.contains('.') && ulid::Ulid::from_string(&name).is_ok() {
-            return name;
+        if let Some(stem) = name.strip_suffix(".manifest")
+            && ulid::Ulid::from_string(stem).is_ok()
+        {
+            return stem.to_owned();
         }
     }
     panic!("no snapshot ULID found in {}", snap_dir.display());

@@ -275,7 +275,14 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     )
     .unwrap();
 
-    fs::write(vol_dir.join(format!("snapshots/{delta_ulid}")), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_ulid,
+        &[delta_ulid],
+        None,
+    )
+    .unwrap();
 
     let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
 

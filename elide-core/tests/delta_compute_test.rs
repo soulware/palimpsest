@@ -72,13 +72,14 @@ fn write_single_entry_segment(
 
 fn write_snapshot_and_filemap(
     vol_dir: &Path,
+    signer: &dyn elide_core::segment::SegmentSigner,
     snap_ulid: Ulid,
     path: &str,
     hash: blake3::Hash,
     byte_count: u64,
 ) {
     let snap_str = snap_ulid.to_string();
-    fs::write(vol_dir.join("snapshots").join(&snap_str), "").unwrap();
+    elide_core::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &[], None).unwrap();
     let rows = vec![FilemapRow {
         path: path.to_owned(),
         file_offset: 0,
@@ -109,6 +110,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
     );
     write_snapshot_and_filemap(
         &source_dir,
+        source_signer.as_ref(),
         source_seg_ulid,
         "/shared.bin",
         parent_hash,
@@ -139,6 +141,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
     );
     write_snapshot_and_filemap(
         &child_dir,
+        child_signer.as_ref(),
         child_seg_ulid,
         "/shared.bin",
         child_hash,
@@ -232,6 +235,7 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
     .unwrap();
     write_snapshot_and_filemap(
         &source_dir,
+        source_signer.as_ref(),
         source_seg_ulid,
         "/blob",
         parent_hash,
@@ -263,6 +267,7 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
     );
     write_snapshot_and_filemap(
         &child_dir,
+        child_signer.as_ref(),
         child_seg_ulid,
         "/blob",
         child_hash,
@@ -324,6 +329,7 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
     .unwrap();
     write_snapshot_and_filemap(
         &source_dir,
+        source_signer.as_ref(),
         source_seg_ulid,
         "/blob",
         parent_hash,
@@ -363,6 +369,7 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
     );
     write_snapshot_and_filemap(
         &child_dir,
+        child_signer.as_ref(),
         child_seg_ulid,
         "/blob",
         child_hash,
@@ -423,6 +430,7 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     .unwrap();
     write_snapshot_and_filemap(
         &source_dir,
+        source_signer.as_ref(),
         source_seg_ulid,
         "/config",
         parent_hash,
@@ -453,6 +461,7 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     );
     write_snapshot_and_filemap(
         &child_dir,
+        child_signer.as_ref(),
         child_seg_ulid,
         "/config",
         child_hash,
@@ -494,6 +503,7 @@ fn rewrite_pending_with_deltas_skips_unchanged_hashes() {
     );
     write_snapshot_and_filemap(
         &source_dir,
+        source_signer.as_ref(),
         source_seg_ulid,
         "/same.bin",
         hash,
@@ -510,6 +520,7 @@ fn rewrite_pending_with_deltas_skips_unchanged_hashes() {
         write_single_entry_segment(&child_dir, child_signer.as_ref(), hash, 0, 1, bytes.clone());
     write_snapshot_and_filemap(
         &child_dir,
+        child_signer.as_ref(),
         child_seg_ulid,
         "/same.bin",
         hash,

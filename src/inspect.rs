@@ -224,7 +224,8 @@ fn count_snapshots(fork_dir: &Path) -> usize {
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .and_then(|n| ulid::Ulid::from_string(n).ok())
+                        .and_then(|n| n.strip_suffix(".manifest"))
+                        .and_then(|stem| ulid::Ulid::from_string(stem).ok())
                         .is_some()
                 })
                 .count()

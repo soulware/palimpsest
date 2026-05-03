@@ -2659,6 +2659,8 @@ pub(crate) fn execute_sign_snapshot_manifest(
     let snapshots_dir = base_dir.join("snapshots");
     std::fs::create_dir_all(&snapshots_dir)?;
 
+    // The manifest's existence under `snapshots/` is the snapshot's
+    // existence; `write_snapshot_manifest` writes atomically.
     crate::signing::write_snapshot_manifest(
         &base_dir,
         signer.as_ref(),
@@ -2666,9 +2668,6 @@ pub(crate) fn execute_sign_snapshot_manifest(
         &seg_ulids,
         None,
     )?;
-
-    // Marker last — partial sequences leave no snapshot visible.
-    std::fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
 
     Ok(SignSnapshotManifestResult { snap_ulid })
 }

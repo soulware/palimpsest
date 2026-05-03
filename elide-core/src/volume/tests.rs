@@ -1710,7 +1710,7 @@ fn double_open_same_fork_fails() {
 // --- snapshot() tests ---
 
 #[test]
-fn snapshot_writes_marker_and_stays_live() {
+fn snapshot_writes_manifest_and_stays_live() {
     let fork_dir = keyed_temp_dir();
     let data = vec![0xAAu8; 4096];
 
@@ -1720,11 +1720,11 @@ fn snapshot_writes_marker_and_stays_live() {
 
     // Fork still has wal/ (still live).
     assert!(fork_dir.join("wal").is_dir());
-    // Snapshot marker file exists.
+    // Signed manifest is the snapshot record.
     assert!(
         fork_dir
             .join("snapshots")
-            .join(snap_ulid.to_string())
+            .join(format!("{snap_ulid}.manifest"))
             .exists()
     );
 
@@ -1782,14 +1782,17 @@ fn snapshot_idempotent_when_no_new_data() {
     let ulid2 = vol.snapshot().unwrap();
     assert_eq!(ulid1, ulid2);
 
-    // Still only one snapshot marker on disk (filter out the
-    // `<ulid>.manifest` file that sits next to each marker).
-    let marker_count = fs::read_dir(fork_dir.join("snapshots"))
+    // Still only one signed manifest on disk.
+    let manifest_count = fs::read_dir(fork_dir.join("snapshots"))
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name().to_str().is_some_and(|s| !s.contains('.')))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|s| s.ends_with(".manifest"))
+        })
         .count();
-    assert_eq!(marker_count, 1);
+    assert_eq!(manifest_count, 1);
 
     fs::remove_dir_all(fork_dir).unwrap();
 }
@@ -1807,12 +1810,16 @@ fn snapshot_not_idempotent_after_new_write() {
     let ulid2 = vol.snapshot().unwrap();
     assert_ne!(ulid1, ulid2);
 
-    let marker_count = fs::read_dir(fork_dir.join("snapshots"))
+    let manifest_count = fs::read_dir(fork_dir.join("snapshots"))
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name().to_str().is_some_and(|s| !s.contains('.')))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|s| s.ends_with(".manifest"))
+        })
         .count();
-    assert_eq!(marker_count, 2);
+    assert_eq!(manifest_count, 2);
 
     fs::remove_dir_all(fork_dir).unwrap();
 }
