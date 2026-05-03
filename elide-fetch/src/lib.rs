@@ -30,7 +30,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use elide_core::signing::VerifyingKey;
@@ -253,6 +253,126 @@ impl RangeFetcher for S3RangeFetcher {
     }
 }
 
+// --- in-flight coalescing ---
+
+/// Cross-thread coalescing for in-flight `fetch_one_extent` calls.
+///
+/// Two callers whose batches overlap on the same segment must not
+/// race: each batch ends with a write to `cache/<sid>.body` and a
+/// rewrite of `cache/<sid>.present`, and the wasted S3 egress on
+/// duplicate range-GETs is exactly what we want to avoid. This
+/// coordinator gives the first arrival a [`BatchLease`]; subsequent
+/// callers whose `[start, end]` entry-range overlaps a live lease
+/// block on its `done` condvar, then re-loop in
+/// [`fetch_one_extent`] to recompute their batch against the fresh
+/// `.present` bytes (their target may now be present, or covered
+/// only partially).
+///
+/// Disjoint batches on the same segment do **not** block each other:
+/// the overlap test is per-batch, not per-segment, so two readers
+/// fetching from far ends of one segment proceed in parallel.
+///
+/// On lease drop (RAII), the entry is removed and waiters are
+/// notified — covers success, error, and panic uniformly.
+#[derive(Clone, Default)]
+pub(crate) struct FetchCoalescer {
+    state: Arc<Mutex<Vec<InFlight>>>,
+}
+
+struct InFlight {
+    segment: Ulid,
+    /// Inclusive entry-index range this lease claims.
+    start: u32,
+    end: u32,
+    /// `(completed, condvar)` — set + notified on lease drop.
+    done: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl FetchCoalescer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Try to acquire a lease for `[start, end]` on `segment`. Returns
+    /// `Some(BatchLease)` if no in-flight lease overlaps; otherwise
+    /// blocks until the conflicting lease releases and returns `None`
+    /// (caller must recompute their batch and retry).
+    fn claim_or_wait(&self, segment: Ulid, start: u32, end: u32) -> Option<BatchLease> {
+        // Find an overlapping in-flight, or insert our own — under the
+        // state lock so the decision is atomic.
+        let conflict = {
+            let mut s = self.state.lock().expect("coalescer state lock poisoned");
+            if let Some(found) = s
+                .iter()
+                .find(|f| f.segment == segment && f.start <= end && start <= f.end)
+            {
+                Some(found.done.clone())
+            } else {
+                let done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+                s.push(InFlight {
+                    segment,
+                    start,
+                    end,
+                    done: done.clone(),
+                });
+                return Some(BatchLease {
+                    state: self.state.clone(),
+                    segment,
+                    start,
+                    end,
+                });
+            }
+        };
+        // Wait outside the state lock — the leader needs the state lock
+        // to remove its entry on completion.
+        if let Some(handle) = conflict {
+            let (m, cv) = &*handle;
+            let mut g = m.lock().expect("lease done lock poisoned");
+            while !*g {
+                g = cv.wait(g).expect("lease done wait poisoned");
+            }
+        }
+        None
+    }
+}
+
+/// RAII handle held by the lease holder. On drop: remove the matching
+/// entry from the coalescer state and notify any waiters.
+struct BatchLease {
+    state: Arc<Mutex<Vec<InFlight>>>,
+    segment: Ulid,
+    start: u32,
+    end: u32,
+}
+
+impl Drop for BatchLease {
+    fn drop(&mut self) {
+        let mut s = match self.state.lock() {
+            Ok(s) => s,
+            // Don't panic in Drop — a poisoned mutex during drop would
+            // double-panic. Best-effort: leak the entry; a stale entry
+            // means future waiters see a phantom overlap and serialise
+            // through an in-process barrier, which is suboptimal but
+            // correct.
+            Err(_) => return,
+        };
+        if let Some(pos) = s
+            .iter()
+            .position(|f| f.segment == self.segment && f.start == self.start && f.end == self.end)
+        {
+            let removed = s.remove(pos);
+            // Drop state lock before signalling so woken waiters can
+            // immediately reacquire it on the next claim attempt.
+            drop(s);
+            let (m, cv) = &*removed.done;
+            if let Ok(mut g) = m.lock() {
+                *g = true;
+                cv.notify_all();
+            }
+        }
+    }
+}
+
 // --- fetcher ---
 
 /// Demand-fetcher implementing `SegmentFetcher` on top of a sync
@@ -266,6 +386,12 @@ pub struct RemoteFetcher {
     chain: Vec<(String, VerifyingKey)>,
     /// Maximum bytes per coalesced range-GET batch.
     max_batch_bytes: u64,
+    /// Cross-thread in-flight coalescing for `fetch_extent`. Two callers
+    /// whose batches overlap on the same segment share one fetch: the
+    /// second caller waits, then re-reads `.present` and finds its bytes
+    /// already cached. Disjoint batches on the same segment proceed in
+    /// parallel. See [`FetchCoalescer`] for the algorithm.
+    coalescer: FetchCoalescer,
 }
 
 impl RemoteFetcher {
@@ -299,6 +425,7 @@ impl RemoteFetcher {
             store,
             chain,
             max_batch_bytes,
+            coalescer: FetchCoalescer::new(),
         })
     }
 }
@@ -314,7 +441,7 @@ impl SegmentFetcher for RemoteFetcher {
         fetch_one_extent(
             &*self.store,
             &self.chain,
-            &segment_id.to_string(),
+            segment_id,
             index_dir,
             body_dir,
             &ExtentFetchParams {
@@ -322,6 +449,7 @@ impl SegmentFetcher for RemoteFetcher {
                 entry_idx: extent.entry_idx,
                 max_batch_bytes: self.max_batch_bytes,
             },
+            &self.coalescer,
         )
     }
 
@@ -367,15 +495,19 @@ struct ExtentFetchParams {
 fn fetch_one_extent(
     store: &dyn RangeFetcher,
     chain: &[(String, VerifyingKey)],
-    segment_id: &str,
+    segment_ulid: Ulid,
     index_dir: &Path,
     body_dir: &Path,
     extent: &ExtentFetchParams,
+    coalescer: &FetchCoalescer,
 ) -> io::Result<()> {
+    let segment_id = segment_ulid.to_string();
     let idx_path = index_dir.join(format!("{segment_id}.idx"));
     let present_path = body_dir.join(format!("{segment_id}.present"));
 
     // Read the full index so we can scan ahead for adjacent absent entries.
+    // The .idx is invariant for the segment's lifetime, so we read it once
+    // and reuse across the retry loop below.
     let (_, entries, _) = segment::read_segment_index(&idx_path)?;
     let start = extent.entry_idx as usize;
     if start >= entries.len() {
@@ -399,50 +531,133 @@ fn fetch_one_extent(
         )));
     }
 
-    // Read present bits once up front.
-    let present_bytes = match std::fs::read(&present_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
-        Err(e) => return Err(e),
-    };
-    let is_present = |idx: usize| -> bool {
-        let byte_idx = idx / 8;
-        present_bytes
-            .get(byte_idx)
-            .is_some_and(|b| b & (1 << (idx % 8)) != 0)
-    };
+    // Coalescing retry loop: re-read present bits, recompute the batch
+    // against the freshest state, and try to claim a non-overlapping
+    // lease. If an overlapping lease is in flight,
+    // [`FetchCoalescer::claim_or_wait`] blocks until it releases and
+    // returns `None`; we then loop and re-read so we see whatever the
+    // leader populated. Termination: each iteration either claims a
+    // lease, returns Ok (target is now present), or returns the
+    // not-found-in-ancestors error. The loop can run at most one extra
+    // iteration per concurrent overlapping caller, which is bounded by
+    // the small number of in-flight readers.
+    loop {
+        // Read present bits at the top of every iteration so a
+        // re-tried call observes whatever the previous leader wrote.
+        let present_bytes = match std::fs::read(&present_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e),
+        };
+        let is_present = |idx: usize| -> bool {
+            let byte_idx = idx / 8;
+            present_bytes
+                .get(byte_idx)
+                .is_some_and(|b| b & (1 << (idx % 8)) != 0)
+        };
 
-    // Scan forward from `start` to find the longest contiguous run of
-    // body-adjacent, not-yet-present entries.  Stop at the first gap,
-    // already-present entry, or non-data entry (dedup-ref / inline).
-    let mut batch_last = start;
-    let mut next_expected_offset =
-        entries[start].stored_offset + entries[start].stored_length as u64;
-    for i in (start + 1)..entries.len() {
-        let e = &entries[i];
-        // Only Data / CanonicalData entries carry body bytes addressable
-        // via stored_offset into the body section. DedupRef is thin;
-        // Inline / CanonicalInline live in the inline section.
-        if !e.kind.is_data() {
-            break;
+        // Fast exit: target entry was filled in by a prior leader's
+        // batch while we were waiting (or even before we entered).
+        if is_present(start) {
+            return Ok(());
         }
-        if e.stored_offset != next_expected_offset {
-            break; // gap in body layout
+
+        // Scan forward from `start` to find the longest contiguous run of
+        // body-adjacent, not-yet-present entries.  Stop at the first gap,
+        // already-present entry, or non-data entry (dedup-ref / inline).
+        let mut batch_last = start;
+        let mut next_expected_offset =
+            entries[start].stored_offset + entries[start].stored_length as u64;
+        for i in (start + 1)..entries.len() {
+            let e = &entries[i];
+            // Only Data / CanonicalData entries carry body bytes addressable
+            // via stored_offset into the body section. DedupRef is thin;
+            // Inline / CanonicalInline live in the inline section.
+            if !e.kind.is_data() {
+                break;
+            }
+            if e.stored_offset != next_expected_offset {
+                break; // gap in body layout
+            }
+            if is_present(i) {
+                break; // already cached — no need to re-fetch
+            }
+            // Stop if adding this entry would exceed the batch byte cap.
+            // The first entry is always included regardless of its size.
+            let new_batch_bytes =
+                next_expected_offset + e.stored_length as u64 - entries[start].stored_offset;
+            if new_batch_bytes > extent.max_batch_bytes {
+                break;
+            }
+            batch_last = i;
+            next_expected_offset = e.stored_offset + e.stored_length as u64;
         }
-        if is_present(i) {
-            break; // already cached — no need to re-fetch
-        }
-        // Stop if adding this entry would exceed the batch byte cap.
-        // The first entry is always included regardless of its size.
-        let new_batch_bytes =
-            next_expected_offset + e.stored_length as u64 - entries[start].stored_offset;
-        if new_batch_bytes > extent.max_batch_bytes {
-            break;
-        }
-        batch_last = i;
-        next_expected_offset = e.stored_offset + e.stored_length as u64;
+
+        // Try to claim the lease for `[start, batch_last]`. On overlap
+        // with an in-flight lease the call blocks then returns `None`;
+        // we loop and re-derive the batch against fresh `.present`.
+        let lease = match coalescer.claim_or_wait(segment_ulid, start as u32, batch_last as u32) {
+            Some(lease) => lease,
+            None => continue,
+        };
+
+        return fetch_batch(
+            BatchContext {
+                store,
+                chain,
+                segment_id: &segment_id,
+                body_dir,
+                present_path: &present_path,
+                entries: &entries,
+                extent,
+                present_bytes: &present_bytes,
+                start,
+                batch_last,
+                next_expected_offset,
+            },
+            lease,
+        );
     }
+}
 
+/// Context for a single batch fetch held under a [`BatchLease`].
+/// Bundles the read-only state that fell out of [`fetch_one_extent`]'s
+/// retry loop (index entries, the present bitmap snapshot the loop
+/// observed, and the batch range it computed) so the actual fetch
+/// helper can stay a flat function without a long argument list.
+struct BatchContext<'a> {
+    store: &'a dyn RangeFetcher,
+    chain: &'a [(String, VerifyingKey)],
+    segment_id: &'a str,
+    body_dir: &'a Path,
+    present_path: &'a Path,
+    entries: &'a [segment::SegmentEntry],
+    extent: &'a ExtentFetchParams,
+    /// Snapshot of the on-disk `.present` bytes from the loop iteration
+    /// that won the lease. Used as the base for the merged write below.
+    present_bytes: &'a [u8],
+    /// Inclusive entry-index range of this batch.
+    start: usize,
+    batch_last: usize,
+    /// Body-section offset of the byte just past the last entry —
+    /// the exclusive end of the body slice we'll range-GET.
+    next_expected_offset: u64,
+}
+
+fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
+    let BatchContext {
+        store,
+        chain,
+        segment_id,
+        body_dir,
+        present_path,
+        entries,
+        extent,
+        present_bytes,
+        start,
+        batch_last,
+        next_expected_offset,
+    } = ctx;
     let batch_body_start = entries[start].stored_offset;
     let batch_body_end = next_expected_offset; // = entries[batch_last].stored_offset + len
     let range_start = extent.body_section_start + batch_body_start;
@@ -516,17 +731,14 @@ fn fetch_one_extent(
                 // Bulk-update .present for all entries in the batch (one read + one write).
                 let entry_count = entries.len() as u32;
                 let bitset_len = (entry_count as usize).div_ceil(8);
-                let mut new_present = if present_bytes.len() >= bitset_len {
-                    present_bytes.clone()
-                } else {
-                    let mut v = present_bytes.clone();
-                    v.resize(bitset_len, 0);
-                    v
-                };
+                let mut new_present = present_bytes.to_vec();
+                if new_present.len() < bitset_len {
+                    new_present.resize(bitset_len, 0);
+                }
                 for i in start..=batch_last {
                     new_present[i / 8] |= 1 << (i % 8);
                 }
-                segment::write_file_atomic(&present_path, &new_present)
+                segment::write_file_atomic(present_path, &new_present)
                     .map_err(|e| io::Error::other(format!("write .present: {e}")))?;
 
                 tracing::debug!(
@@ -1267,5 +1479,254 @@ mod tests {
         let f = LocalRangeFetcher::new(tmp.path().to_path_buf());
         let bytes = f.get_range("a/b/c", 2, 6).unwrap();
         assert_eq!(&bytes, b"2345");
+    }
+
+    // --- coalescer unit tests ---
+
+    /// Basic happy path: a fresh coalescer hands out a lease and the
+    /// lease drops cleanly with no waiters.
+    #[test]
+    fn coalescer_grants_lease_when_no_conflict() {
+        let c = FetchCoalescer::new();
+        let seg = ulid::Ulid::new();
+        let lease = c.claim_or_wait(seg, 0, 5);
+        assert!(lease.is_some(), "first claim should succeed");
+        drop(lease);
+        // After release, a follow-up claim on the same range succeeds again.
+        assert!(c.claim_or_wait(seg, 0, 5).is_some());
+    }
+
+    /// Disjoint ranges on the same segment must NOT block each other.
+    /// The whole point of using `[start, end]` overlap rather than
+    /// per-segment locking is that two readers fetching far apart
+    /// within the same segment proceed in parallel.
+    #[test]
+    fn coalescer_disjoint_ranges_do_not_conflict() {
+        let c = FetchCoalescer::new();
+        let seg = ulid::Ulid::new();
+        let lease_a = c.claim_or_wait(seg, 0, 4);
+        assert!(lease_a.is_some(), "first claim succeeds");
+        // Range [10, 15] doesn't overlap [0, 4] → second claim succeeds
+        // without blocking. If overlap detection were segment-level,
+        // this would block waiting for the first lease to release.
+        let lease_b = c.claim_or_wait(seg, 10, 15);
+        assert!(
+            lease_b.is_some(),
+            "disjoint range on same segment must not conflict",
+        );
+    }
+
+    /// Ranges on different segments are always disjoint by definition.
+    #[test]
+    fn coalescer_different_segments_do_not_conflict() {
+        let c = FetchCoalescer::new();
+        let seg_a = ulid::Ulid::new();
+        let seg_b = ulid::Ulid::new();
+        let _la = c.claim_or_wait(seg_a, 0, 100).unwrap();
+        let lb = c.claim_or_wait(seg_b, 0, 100);
+        assert!(
+            lb.is_some(),
+            "different segment, same range, must not block"
+        );
+    }
+
+    /// Overlap-and-block: a second claimer whose range overlaps a live
+    /// lease must block until the lease drops, then return `None` so
+    /// the caller knows to recompute its batch and retry. Drives the
+    /// blocking semantics through real threads + a brief sleep so the
+    /// wakeup path is exercised.
+    #[test]
+    fn coalescer_overlapping_range_blocks_until_release() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let c = StdArc::new(FetchCoalescer::new());
+        let seg = ulid::Ulid::new();
+
+        // Hold a lease covering [0, 10] on the main thread.
+        let lease = c.claim_or_wait(seg, 0, 10).expect("primary claim");
+
+        // Spawn a thread that tries to claim [5, 7] (overlapping). It
+        // should block until we drop the primary lease below.
+        let waiter_started = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let waiter_returned = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let c_w = c.clone();
+        let started_w = waiter_started.clone();
+        let returned_w = waiter_returned.clone();
+        let waiter = thread::spawn(move || {
+            *started_w.lock().unwrap() = Some(Instant::now());
+            let result = c_w.claim_or_wait(seg, 5, 7);
+            *returned_w.lock().unwrap() = Some(Instant::now());
+            // Returns None — we're a waiter, not a leaseholder.
+            assert!(result.is_none());
+        });
+
+        // Give the waiter time to enter the wait.
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            waiter_returned.lock().unwrap().is_none(),
+            "waiter must still be blocked"
+        );
+
+        // Drop the primary lease — this notifies the waiter.
+        let drop_at = Instant::now();
+        drop(lease);
+        waiter.join().unwrap();
+
+        let returned = waiter_returned.lock().unwrap().expect("waiter returned");
+        assert!(
+            returned >= drop_at,
+            "waiter must have unblocked after the primary lease was dropped",
+        );
+    }
+
+    /// Cross-thread concurrent demand-fetches on the same segment
+    /// must all succeed AND fire only one underlying range-GET per
+    /// distinct batch. Models the ublk-fanout race directly: spawn
+    /// N threads all targeting entry 0, count how many times the
+    /// inner range-fetcher is invoked.
+    #[test]
+    fn fetch_extent_coalesces_concurrent_demand_fetches_for_same_segment() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        // A wrapping range-fetcher that counts calls and sleeps long
+        // enough that overlapping callers definitely arrive before
+        // the leader returns.
+        struct CountingFetcher {
+            inner: LocalRangeFetcher,
+            calls: AtomicUsize,
+            delay: Duration,
+        }
+        impl RangeFetcher for CountingFetcher {
+            fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                self.inner.get_range(key, start, end_exclusive)
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Three contiguous entries — same shape as the existing
+        // coalescing test. The whole batch is what the leader will
+        // fetch; followers' targets all fall inside it.
+        let data: Vec<Vec<u8>> = (0..3).map(|i| vec![0x10 + i as u8; 4096]).collect();
+        let hashes: Vec<_> = data.iter().map(|d| blake3::hash(d)).collect();
+        let mut entries: Vec<SegmentEntry> = data
+            .iter()
+            .zip(hashes.iter())
+            .enumerate()
+            .map(|(i, (d, h))| {
+                SegmentEntry::new_data(*h, i as u64, 1, SegmentFlags::empty(), d.clone())
+            })
+            .collect();
+        let seg_path = tmp.path().join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+
+        // .idx in place; .body / .present absent so every thread
+        // demand-fetches.
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
+
+        // Fork dir holding volume.pub.
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        let counting = Arc::new(CountingFetcher {
+            inner: LocalRangeFetcher::new(store_dir.path().to_path_buf()),
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(50),
+        });
+        let fetcher = Arc::new(
+            RemoteFetcher::from_store(counting.clone(), &[vol_dir], DEFAULT_FETCH_BATCH_BYTES)
+                .unwrap(),
+        );
+
+        // Spawn N threads, all racing on entry 0 of the same segment.
+        // Without coalescing, every thread fires its own range-GET; with
+        // coalescing, only the first thread fetches and the others wait
+        // then find their bytes already present.
+        // Capture entry-0's offset/length as Copy primitives so the
+        // closures don't need to share `entries` itself.
+        let entry0_offset = entries[0].stored_offset;
+        let entry0_length = entries[0].stored_length;
+        let n_threads = 8;
+        let errors: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let fetcher = fetcher.clone();
+                let index_dir = index_dir.clone();
+                let cache_dir = cache_dir.clone();
+                let errs = errors.clone();
+                thread::spawn(move || {
+                    let result = fetcher.fetch_extent(
+                        seg_ulid,
+                        &index_dir,
+                        &cache_dir,
+                        &segment::ExtentFetch {
+                            body_section_start: bss,
+                            body_offset: entry0_offset,
+                            body_length: entry0_length,
+                            entry_idx: 0,
+                        },
+                    );
+                    if let Err(e) = result {
+                        errs.lock().unwrap().push(format!("{e:#}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let errs = errors.lock().unwrap();
+        assert!(errs.is_empty(), "all fetches must succeed: {errs:?}");
+
+        // Exactly one range-GET fired even though N threads all called
+        // fetch_extent. The leader's batch covered every follower's
+        // target entry; followers re-read present_bytes after waiting,
+        // saw their entry was set, and fast-exited.
+        let calls = counting.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            calls, 1,
+            "concurrent demand-fetches on the same segment must coalesce to one range-GET"
+        );
+
+        // All present bits set, body file populated.
+        let body_bytes = std::fs::read(cache_dir.join(format!("{seg_id}.body"))).unwrap();
+        for (i, d) in data.iter().enumerate() {
+            let off = entries[i].stored_offset as usize;
+            assert_eq!(&body_bytes[off..off + d.len()], d.as_slice());
+        }
     }
 }
