@@ -156,7 +156,7 @@ pub async fn prefetch_indexes(
                 "[prefetch] pulling ancestor skeleton: {}",
                 parent.volume_ulid
             );
-            pull_volume_skeleton(store, data_dir, &parent.volume_ulid)
+            pull_volume_skeleton(store, data_dir, &parent.volume_ulid, peer)
                 .await
                 .with_context(|| format!("pulling ancestor {}", parent.volume_ulid))?
         };
@@ -209,7 +209,7 @@ pub async fn prefetch_indexes(
                     )
                 })?;
             info!("[prefetch] pulling extent-source skeleton: {ulid_str}");
-            pull_volume_skeleton(store, data_dir, ulid_str)
+            pull_volume_skeleton(store, data_dir, ulid_str, peer)
                 .await
                 .with_context(|| format!("pulling extent-source {ulid_str}"))?
         };

@@ -1,6 +1,6 @@
 //! HTTP client for fetching segment and snapshot data from peer coordinators.
 //!
-//! Five operations:
+//! Operations:
 //! - [`PeerFetchClient::fetch_idx`] — full-file fetch of `.idx`.
 //! - [`PeerFetchClient::fetch_prefetch_hint`] — full-file fetch of the
 //!   advisory `.prefetch` payload (server synthesises from local
@@ -11,6 +11,10 @@
 //!   `snapshots/<snap>.manifest` (signed handoff manifest).
 //! - [`PeerFetchClient::fetch_snapshot_filemap`] — full-file fetch of
 //!   `snapshots/<snap>.filemap` (per-file fragment table).
+//! - [`PeerFetchClient::fetch_volume_pub`] — full-file fetch of
+//!   `volume.pub` for an ancestor fork (skeleton pull).
+//! - [`PeerFetchClient::fetch_volume_provenance`] — full-file fetch of
+//!   `volume.provenance` for an ancestor fork (skeleton pull).
 //!
 //! Failure model: the client treats every non-200 response (404 / 401 /
 //! 403 / network error / timeout) as `Ok(None)`. The caller — the
@@ -193,6 +197,37 @@ impl PeerFetchClient {
         snap_ulid: Ulid,
     ) -> Option<Bytes> {
         let url = format!("{}/v1/{}/{}.filemap", peer.url(), vol_id, snap_ulid);
+        self.get_bytes(volume_name, &url).await
+    }
+
+    /// Fetch the per-fork `volume.pub` (Ed25519 verifying key) for an
+    /// ancestor fork. Used by the skeleton pull during the lineage walk
+    /// — the caller is the requester's coordinator and `vol_id` is an
+    /// ancestor in its signed lineage. Caller writes the bytes verbatim
+    /// to `<data_dir>/by_id/<vol_id>/volume.pub`.
+    pub async fn fetch_volume_pub(
+        &self,
+        peer: &PeerEndpoint,
+        volume_name: &str,
+        vol_id: Ulid,
+    ) -> Option<Bytes> {
+        let url = format!("{}/v1/{}/volume.pub", peer.url(), vol_id);
+        self.get_bytes(volume_name, &url).await
+    }
+
+    /// Fetch the per-fork `volume.provenance` (signed lineage) for an
+    /// ancestor fork. Counterpart to [`Self::fetch_volume_pub`]; caller
+    /// is responsible for verifying the signature against the pubkey it
+    /// trusts (typically the embedded `pubkey` in the child's
+    /// `ParentRef` for fork-chain ancestors, or the just-written
+    /// `volume.pub` for extent-index ancestors).
+    pub async fn fetch_volume_provenance(
+        &self,
+        peer: &PeerEndpoint,
+        volume_name: &str,
+        vol_id: Ulid,
+    ) -> Option<Bytes> {
+        let url = format!("{}/v1/{}/volume.provenance", peer.url(), vol_id);
         self.get_bytes(volume_name, &url).await
     }
 
@@ -559,6 +594,38 @@ mod tests {
             .await;
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_volume_pub_returns_local_bytes() {
+        let f = start_server().await;
+        let body = b"abcdef0123456789\n";
+        // Skeleton files sit directly under by_id/<vol_id>/, with no
+        // subdirectory — verify the route resolves the right path.
+        let dir = f.data_dir.path().join("by_id").join(f.vol_ulid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("volume.pub"), body).unwrap();
+
+        let client = PeerFetchClient::new(f.coord_key.clone()).unwrap();
+        let result = client
+            .fetch_volume_pub(&f.peer, &f.vol_name, f.vol_ulid)
+            .await;
+        assert_eq!(result.as_deref(), Some(body.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn fetch_volume_provenance_returns_local_bytes() {
+        let f = start_server().await;
+        let body = b"toml-ish provenance bytes";
+        let dir = f.data_dir.path().join("by_id").join(f.vol_ulid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("volume.provenance"), body).unwrap();
+
+        let client = PeerFetchClient::new(f.coord_key.clone()).unwrap();
+        let result = client
+            .fetch_volume_provenance(&f.peer, &f.vol_name, f.vol_ulid)
+            .await;
+        assert_eq!(result.as_deref(), Some(body.as_ref()));
     }
 
     #[tokio::test]

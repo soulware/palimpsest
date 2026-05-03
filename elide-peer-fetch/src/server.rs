@@ -1,12 +1,19 @@
 //! Peer-fetch HTTP server.
 //!
-//! Five routes, all full-file GETs (no Range support in v1):
+//! Routes, all full-file GETs (no Range support in v1):
 //!
-//! - `GET /v1/<vol_id>/<ulid>.idx`       → serves `<data_dir>/by_id/<vol_id>/index/<ulid>.idx`
-//! - `GET /v1/<vol_id>/<ulid>.prefetch`  → serves `<data_dir>/by_id/<vol_id>/cache/<ulid>.present`
-//! - `GET /v1/<vol_id>/<ulid>.snapshot`  → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>` (empty marker)
-//! - `GET /v1/<vol_id>/<ulid>.manifest`  → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.manifest`
-//! - `GET /v1/<vol_id>/<ulid>.filemap`   → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.filemap`
+//! - `GET /v1/<vol_id>/<ulid>.idx`         → serves `<data_dir>/by_id/<vol_id>/index/<ulid>.idx`
+//! - `GET /v1/<vol_id>/<ulid>.prefetch`    → serves `<data_dir>/by_id/<vol_id>/cache/<ulid>.present`
+//! - `GET /v1/<vol_id>/<ulid>.snapshot`    → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>` (empty marker)
+//! - `GET /v1/<vol_id>/<ulid>.manifest`    → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.manifest`
+//! - `GET /v1/<vol_id>/<ulid>.filemap`     → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.filemap`
+//! - `GET /v1/<vol_id>/volume.pub`         → serves `<data_dir>/by_id/<vol_id>/volume.pub`
+//! - `GET /v1/<vol_id>/volume.provenance`  → serves `<data_dir>/by_id/<vol_id>/volume.provenance`
+//!
+//! The last two are the per-fork skeleton files an ancestor walk needs
+//! before any of the segment/snapshot routes can be issued for that
+//! ancestor; serving them peer-first lets `pull_volume_skeleton` close
+//! out the last category of S3 traffic on the claim path.
 //!
 //! The wire `.prefetch` resource is deliberately a different name from
 //! the on-disk `.present` file: the bytes are returned verbatim in v1
@@ -98,6 +105,26 @@ impl std::fmt::Display for RouteError {
     }
 }
 
+/// Identifier carried in the second URL component.
+///
+/// Per-segment / per-snapshot routes embed a ULID; the per-fork
+/// skeleton routes embed a literal filename (`volume.pub`,
+/// `volume.provenance`) and have no ULID.
+#[derive(Clone, Copy)]
+enum ResourceTarget {
+    Ulid(Ulid),
+    Skeleton,
+}
+
+impl std::fmt::Display for ResourceTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ulid(u) => u.fmt(f),
+            Self::Skeleton => f.write_str("-"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ResourceKind {
     Idx,
@@ -105,29 +132,43 @@ enum ResourceKind {
     SnapshotMarker,
     SnapshotManifest,
     SnapshotFilemap,
+    /// Per-fork `volume.pub` — fetched by ancestor-skeleton pull.
+    VolumePub,
+    /// Per-fork `volume.provenance` — fetched by ancestor-skeleton pull.
+    VolumeProvenance,
 }
 
 impl ResourceKind {
-    fn local_subdir(self) -> &'static str {
+    /// Subdirectory under `by_id/<vol_id>/` where the file lives, or
+    /// `None` for files that sit directly in the fork directory.
+    fn local_subdir(self) -> Option<&'static str> {
         match self {
-            Self::Idx => "index",
-            Self::Prefetch => "cache",
-            Self::SnapshotMarker | Self::SnapshotManifest | Self::SnapshotFilemap => "snapshots",
+            Self::Idx => Some("index"),
+            Self::Prefetch => Some("cache"),
+            Self::SnapshotMarker | Self::SnapshotManifest | Self::SnapshotFilemap => {
+                Some("snapshots")
+            }
+            Self::VolumePub | Self::VolumeProvenance => None,
         }
     }
 
-    fn local_filename(self, ulid: Ulid) -> String {
-        match self {
+    fn local_filename(self, target: ResourceTarget) -> String {
+        match (self, target) {
             // The on-disk `.idx` filename matches the wire suffix.
-            Self::Idx => format!("{ulid}.idx"),
+            (Self::Idx, ResourceTarget::Ulid(u)) => format!("{u}.idx"),
             // The on-disk file is `.present`; the wire calls it
             // `.prefetch` (see docs/design-peer-segment-fetch.md).
-            Self::Prefetch => format!("{ulid}.present"),
+            (Self::Prefetch, ResourceTarget::Ulid(u)) => format!("{u}.present"),
             // The on-disk snapshot marker has no suffix; wire decouples
             // it as `.snapshot` so the URL always carries one.
-            Self::SnapshotMarker => ulid.to_string(),
-            Self::SnapshotManifest => format!("{ulid}.manifest"),
-            Self::SnapshotFilemap => format!("{ulid}.filemap"),
+            (Self::SnapshotMarker, ResourceTarget::Ulid(u)) => u.to_string(),
+            (Self::SnapshotManifest, ResourceTarget::Ulid(u)) => format!("{u}.manifest"),
+            (Self::SnapshotFilemap, ResourceTarget::Ulid(u)) => format!("{u}.filemap"),
+            (Self::VolumePub, ResourceTarget::Skeleton) => "volume.pub".to_owned(),
+            (Self::VolumeProvenance, ResourceTarget::Skeleton) => "volume.provenance".to_owned(),
+            // Other combinations are rejected at parse time before
+            // ever reaching the resolver.
+            (kind, _) => kind.wire_suffix().to_owned(),
         }
     }
 
@@ -138,6 +179,8 @@ impl ResourceKind {
             Self::SnapshotMarker => ".snapshot",
             Self::SnapshotManifest => ".manifest",
             Self::SnapshotFilemap => ".filemap",
+            Self::VolumePub => "volume.pub",
+            Self::VolumeProvenance => "volume.provenance",
         }
     }
 }
@@ -183,12 +226,12 @@ async fn handle_segment(
 ) -> Result<Response, RouteError> {
     let result = handle_segment_inner(&ctx, &vol_id_str, &filename, &headers).await;
     match &result {
-        Ok((kind, ulid, bytes)) => {
+        Ok((kind, target, bytes)) => {
             info!(
                 "[peer-fetch] served {} {}/{} ({} bytes)",
                 kind.wire_suffix(),
                 vol_id_str,
-                ulid,
+                target,
                 bytes.len(),
             );
         }
@@ -214,24 +257,34 @@ async fn handle_segment_inner(
     vol_id_str: &str,
     filename: &str,
     headers: &HeaderMap,
-) -> Result<(ResourceKind, Ulid, Vec<u8>), RouteError> {
+) -> Result<(ResourceKind, ResourceTarget, Vec<u8>), RouteError> {
     // Path parsing is cheap; do it before the auth round-trip so a
     // bad URL doesn't burn S3 lookups.
     let vol_id = Ulid::from_string(vol_id_str).map_err(|_| RouteError::BadVolId)?;
-    let (ulid_str, kind) = if let Some(s) = filename.strip_suffix(".idx") {
-        (s, ResourceKind::Idx)
-    } else if let Some(s) = filename.strip_suffix(".prefetch") {
-        (s, ResourceKind::Prefetch)
-    } else if let Some(s) = filename.strip_suffix(".manifest") {
-        (s, ResourceKind::SnapshotManifest)
-    } else if let Some(s) = filename.strip_suffix(".filemap") {
-        (s, ResourceKind::SnapshotFilemap)
-    } else if let Some(s) = filename.strip_suffix(".snapshot") {
-        (s, ResourceKind::SnapshotMarker)
-    } else {
-        return Err(RouteError::UnknownFilename);
+
+    // Per-fork skeleton routes have no ULID component — match by
+    // literal filename first.
+    let (kind, target) = match filename {
+        "volume.pub" => (ResourceKind::VolumePub, ResourceTarget::Skeleton),
+        "volume.provenance" => (ResourceKind::VolumeProvenance, ResourceTarget::Skeleton),
+        _ => {
+            let (ulid_str, kind) = if let Some(s) = filename.strip_suffix(".idx") {
+                (s, ResourceKind::Idx)
+            } else if let Some(s) = filename.strip_suffix(".prefetch") {
+                (s, ResourceKind::Prefetch)
+            } else if let Some(s) = filename.strip_suffix(".manifest") {
+                (s, ResourceKind::SnapshotManifest)
+            } else if let Some(s) = filename.strip_suffix(".filemap") {
+                (s, ResourceKind::SnapshotFilemap)
+            } else if let Some(s) = filename.strip_suffix(".snapshot") {
+                (s, ResourceKind::SnapshotMarker)
+            } else {
+                return Err(RouteError::UnknownFilename);
+            };
+            let ulid = Ulid::from_string(ulid_str).map_err(|_| RouteError::BadUlid)?;
+            (kind, ResourceTarget::Ulid(ulid))
+        }
     };
-    let ulid = Ulid::from_string(ulid_str).map_err(|_| RouteError::BadUlid)?;
 
     // Auth pipeline (steps 1–4).
     let bearer_header = headers
@@ -243,13 +296,14 @@ async fn handle_segment_inner(
         .await
         .map_err(RouteError::Auth)?;
 
-    // Step 5: segment-membership — local stat of the route's file.
-    let path = ctx
-        .data_dir
-        .join("by_id")
-        .join(vol_id.to_string())
-        .join(kind.local_subdir())
-        .join(kind.local_filename(ulid));
+    // Step 5: local stat of the route's file. Skeleton files sit
+    // directly under `by_id/<vol_id>/`; segment/snapshot files sit
+    // under a per-kind subdirectory.
+    let mut path = ctx.data_dir.join("by_id").join(vol_id.to_string());
+    if let Some(subdir) = kind.local_subdir() {
+        path.push(subdir);
+    }
+    path.push(kind.local_filename(target));
 
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
@@ -257,7 +311,7 @@ async fn handle_segment_inner(
         Err(e) => return Err(RouteError::Io(e)),
     };
 
-    Ok((kind, ulid, bytes))
+    Ok((kind, target, bytes))
 }
 
 #[cfg(test)]
@@ -637,6 +691,110 @@ mod tests {
         let (status, returned) = run(&f.router, req).await;
         assert_eq!(status, StatusCode::OK);
         assert!(returned.is_empty());
+    }
+
+    /// Write a per-fork file directly under `by_id/<vol_id>/`
+    /// (no subdirectory). For `volume.pub` / `volume.provenance`.
+    fn write_local_fork_file(
+        data_dir: &std::path::Path,
+        vol_ulid: Ulid,
+        filename: &str,
+        body: &[u8],
+    ) {
+        let dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(filename), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn volume_pub_happy_path_returns_local_bytes() {
+        let f = fixture().await;
+        let body = b"abcdef0123456789\n";
+        write_local_fork_file(f.data_dir.path(), f.vol_ulid, "volume.pub", body);
+
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
+        let req = Request::builder()
+            .uri(format!("/v1/{}/volume.pub", f.vol_ulid))
+            .header(http::header::AUTHORIZATION, bearer_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, returned) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(returned, body);
+    }
+
+    #[tokio::test]
+    async fn volume_provenance_happy_path_returns_local_bytes() {
+        let f = fixture().await;
+        let body = b"toml-ish provenance bytes";
+        write_local_fork_file(f.data_dir.path(), f.vol_ulid, "volume.provenance", body);
+
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
+        let req = Request::builder()
+            .uri(format!("/v1/{}/volume.provenance", f.vol_ulid))
+            .header(http::header::AUTHORIZATION, bearer_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, returned) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(returned, body);
+    }
+
+    #[tokio::test]
+    async fn volume_pub_missing_local_file_returns_404() {
+        let f = fixture().await;
+        // Deliberately do not write the local file. The S3 fixture has
+        // it published, but the route serves from the local `data_dir`
+        // — and the peer is opportunistic, so a local miss is a 404.
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
+        let req = Request::builder()
+            .uri(format!("/v1/{}/volume.pub", f.vol_ulid))
+            .header(http::header::AUTHORIZATION, bearer_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn volume_pub_outside_lineage_is_403() {
+        // Skeleton routes go through the same auth pipeline, so a
+        // `vol_id` not in the requesting volume's signed lineage is
+        // rejected with 403 — same as the segment routes.
+        let f = fixture().await;
+        let unrelated_ulid = Ulid::new();
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
+        let req = Request::builder()
+            .uri(format!("/v1/{}/volume.pub", unrelated_ulid))
+            .header(http::header::AUTHORIZATION, bearer_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

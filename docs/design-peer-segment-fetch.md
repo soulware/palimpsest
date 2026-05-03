@@ -40,7 +40,11 @@ v1 wire resources:
 - `<snap>.snapshot` — empty marker file from `snapshots/<snap>` (wire suffix decouples the URL from the bare on-disk filename, same pattern as `.prefetch`/`.present`)
 - `<snap>.manifest` — signed handoff manifest from `snapshots/<snap>.manifest` (caller verifies signature using the volume's `volume.pub`, same as on the S3 path)
 - `<snap>.filemap` — per-file fragment table from `snapshots/<snap>.filemap` (unsigned; row-level blake3 hashes are content-verified at read time, so a tampered filemap can mislead lookup but cannot let corrupted bytes through)
+- `volume.pub` — per-fork Ed25519 verifying key from `by_id/<vol_id>/volume.pub`; pulled by the requester's ancestor-skeleton walk before any segment fetch can verify a signature for that fork
+- `volume.provenance` — per-fork signed lineage from `by_id/<vol_id>/volume.provenance`; the requester verifies the signature against the pubkey it trusts (embedded in the child's `ParentRef` for fork-chain ancestors, or the just-pulled `volume.pub` for extent-index ancestors)
 - `.body` — deferred; not in v1
+
+The skeleton routes (`volume.pub`, `volume.provenance`) close out the last category of S3 traffic on the claim path. With `manifest.toml` removed, the per-fork S3 footprint is exactly these two files plus `segments/` and `snapshots/` — all of which are now peer-eligible.
 
 The wire-level `.prefetch` name is deliberate: it tells the client "this is advice about what to warm," not "this is authoritative cache state." The new host's own `cache/<ulid>.present` is built from its own fetches, not copied from the peer.
 
@@ -58,10 +62,12 @@ GET /v1/<vol_id>/<ulid>.prefetch
 GET /v1/<vol_id>/<snap>.snapshot
 GET /v1/<vol_id>/<snap>.manifest
 GET /v1/<vol_id>/<snap>.filemap
+GET /v1/<vol_id>/volume.pub
+GET /v1/<vol_id>/volume.provenance
 Authorization: Bearer <token>
 ```
 
-`vol_id` is the fork that owns the segment or snapshot (the *home* volume, which may be an ancestor of the volume the requesting coordinator currently claims). The second URL component is a *segment* ULID for `.idx` / `.prefetch` and a *snapshot* ULID for `.snapshot` / `.manifest` / `.filemap`; the auth pipeline doesn't distinguish — the lineage check only requires `vol_id` to be in the requesting volume's ancestry, and segment-vs-snapshot membership falls out of step 5 (local file exists). The `/v1/` prefix reserves room for protocol evolution.
+`vol_id` is the fork that owns the segment, snapshot, or skeleton file (the *home* volume, which may be an ancestor of the volume the requesting coordinator currently claims). The second URL component is a *segment* ULID for `.idx` / `.prefetch`, a *snapshot* ULID for `.snapshot` / `.manifest` / `.filemap`, and a literal filename for `volume.pub` / `volume.provenance`; the auth pipeline doesn't distinguish — the lineage check only requires `vol_id` to be in the requesting volume's ancestry, and which-flavour membership falls out of step 5 (local file exists). The `/v1/` prefix reserves room for protocol evolution.
 
 For the snapshot routes, the coordinator's claim-time prefetch can also skip the S3 LIST entirely. The three artifact names are deterministic from the branch-point snapshot ULID, so a known-branch prefetch fans out three peer GETs in parallel and falls back to keyed S3 GETs (using the canonical `by_id/<vol>/snapshots/<YYYYMMDD>/<snap>{,.manifest,.filemap}` paths) only on per-artifact peer miss. The S3 LIST stays in the listed-path branch (no known branch, e.g. when prefetching a fork's own accumulated snapshots) and as a fallback for any peer-less callers.
 
