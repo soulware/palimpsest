@@ -225,6 +225,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             macaroon_root,
             identity: identity.clone(),
             issuer: issuer.clone(),
+            peer_fetch: peer_fetch_handle.clone(),
         };
         tasks.spawn(async move {
             inbound::serve(&socket_path, ctx).await;
