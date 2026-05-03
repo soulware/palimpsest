@@ -2102,11 +2102,15 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
         let (live_part, dead_part): (Vec<_>, Vec<_>) =
             entries.drain(..).partition(|e| match e.kind {
                 segment::EntryKind::DedupRef => {
-                    // A dedup ref is only live if the LBA still maps to
-                    // this hash. If the LBA was overwritten with different
-                    // data, carrying the stale ref would reintroduce the
-                    // old mapping after crash + rebuild.
-                    job.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                    // A dedup ref is live if any LBA in its claimed range
+                    // still maps to this hash. Checking only the head
+                    // misclassifies the entry as dead when the head has
+                    // been overwritten but a tail (or interior) still
+                    // references the hash — dropping it loses the
+                    // surviving LBAs on rebuild.
+                    let start = e.start_lba;
+                    let end = start + e.lba_length as u64;
+                    (start..end).any(|lba| job.lbamap.hash_at(lba) == Some(e.hash))
                 }
                 _ => live.contains(&e.hash),
             });
