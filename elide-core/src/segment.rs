@@ -1617,35 +1617,54 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `content` to `path` atomically via a `.tmp` sibling file.
+/// Write `content` to `path` atomically via a per-call sibling tmp file.
 ///
-/// Sequence: write to `<path>.tmp` → `sync_data()` → rename to `path` →
-/// `fsync` parent directory.  This ensures that either the complete file is
-/// visible after a crash or no file is visible — never a partial write.
-/// Used for small metadata files (`origin`, `size`, key material) that are
-/// not large enough to warrant the full segment write path but still need
-/// atomic, durable creation.
+/// Sequence: write to `<path>.tmp.<pid>.<counter>` → `sync_data()` →
+/// rename to `path` → `fsync` parent directory.  This ensures that
+/// either the complete file is visible after a crash or no file is
+/// visible — never a partial write.
+///
+/// The tmp filename is unique per call (process pid + monotonic
+/// in-process counter) so concurrent callers writing to the same
+/// `path` don't collide on the tmp inode. Without that, two threads
+/// both racing to write `cache/<sid>.present` from `fetch_extent`
+/// would share `<sid>.present.tmp`: thread A's `rename` removes the
+/// tmp link, then thread B's `rename` fails with `ENOENT`. Last-writer
+/// still wins on the final path; both calls just succeed.
 pub fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = {
         let mut name = path
             .file_name()
             .ok_or_else(|| io::Error::other("path has no filename"))?
             .to_owned();
-        name.push(".tmp");
+        name.push(format!(".tmp.{pid}.{n}"));
         path.with_file_name(name)
     };
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(content)?;
-        f.sync_data()?;
+    let result: io::Result<()> = (|| {
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(content)?;
+            f.sync_data()?;
+        }
+        fs::rename(&tmp, path)?;
+        fsync_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // Best-effort cleanup so a failed write doesn't leave the
+        // unique tmp file behind. NotFound (the rename already moved
+        // it away) is benign; any other error is swallowed because
+        // the original failure is what the caller needs to see.
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    fsync_dir(path)?;
-    Ok(())
+    result
 }
 
 /// Collect all committed segment files in `dir` (files with valid ULID names,
@@ -2830,6 +2849,66 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 2);
         assert_eq!(bytes[1] & 0x01, 0x01);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Concurrent `write_file_atomic` calls on the same target path must
+    /// all return `Ok` and leave the final file with one of the writers'
+    /// payloads. Regression for the ublk demand-fetch race where two
+    /// worker threads both call `write_file_atomic(<sid>.present, ...)`
+    /// for the same segment: with a fixed `<file>.tmp` name, thread A's
+    /// rename removed the link before thread B's rename could find it,
+    /// failing with `ENOENT`. Per-call unique tmp suffix fixes it.
+    #[test]
+    fn write_file_atomic_concurrent_writers_dont_collide() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("racy.present");
+
+        // 16 threads × 100 iterations each, all racing on the same path.
+        // Each iteration writes a distinct payload so we can sanity-check
+        // the result is one of the actual values written.
+        let n_threads = 16;
+        let n_iter = 100;
+        let path_arc = std::sync::Arc::new(path.clone());
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|t| {
+                let p = path_arc.clone();
+                std::thread::spawn(move || {
+                    for i in 0..n_iter {
+                        let payload = format!("thread-{t}-iter-{i}").into_bytes();
+                        write_file_atomic(&p, &payload).expect("concurrent write must not race");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final file is one of the writers' payloads — not corrupted,
+        // not partially written, not missing.
+        let final_bytes = fs::read(&path).unwrap();
+        let s = std::str::from_utf8(&final_bytes).expect("payload is utf-8");
+        assert!(
+            s.starts_with("thread-") && s.contains("-iter-"),
+            "unexpected final payload: {s:?}",
+        );
+
+        // No leftover .tmp.* sidecars — every concurrent call cleaned
+        // up after itself (or its rename succeeded).
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tmp sidecars left behind: {leftovers:?}",
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }
