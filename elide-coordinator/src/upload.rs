@@ -42,7 +42,7 @@ use object_store::{
 };
 use ulid::Ulid;
 
-/// `Content-Type` for plain UTF-8 text files (volume.pub, provenance, filemap, etc.).
+/// `Content-Type` for plain UTF-8 text files (volume.pub, provenance, manifest, etc.).
 const MIME_TEXT: &str = "text/plain; charset=utf-8";
 
 /// Default multipart part size for tests and non-configurable callers.
@@ -86,9 +86,9 @@ async fn put_with_content_type(
 /// file per S3 object we've confirmed uploaded. For small metadata the file
 /// holds a verbatim copy of the uploaded bytes, so `diff uploaded/<f>
 /// <source>` works with standard tools and re-upload decisions are taken by
-/// exact content comparison rather than mtime. The snapshot triple uses a
-/// plain empty sentinel since the S3 marker is empty and filemap/.manifest
-/// are already inspectable under `snapshots/`.
+/// exact content comparison rather than mtime. The snapshot pair uses a
+/// plain empty sentinel since the S3 marker is empty and the .manifest is
+/// inspectable under `snapshots/`.
 const UPLOADED_DIR: &str = "uploaded";
 
 fn upload_sentinel(vol_dir: &Path, relative: &str) -> PathBuf {
@@ -156,20 +156,6 @@ pub fn snapshot_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let date = dt.format("%Y%m%d").to_string();
     Ok(StorePath::from(format!(
         "by_id/{volume_id}/snapshots/{date}/{ulid_str}"
-    )))
-}
-
-/// Build the object store key for a snapshot filemap.
-///
-/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.filemap`
-pub fn filemap_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
-    let ulid: Ulid = ulid_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
-    let dt: DateTime<Utc> = ulid.datetime().into();
-    let date = dt.format("%Y%m%d").to_string();
-    Ok(StorePath::from(format!(
-        "by_id/{volume_id}/snapshots/{date}/{ulid_str}.filemap"
     )))
 }
 
@@ -265,16 +251,16 @@ pub async fn drain_pending(
 }
 
 /// Upload volume metadata: public key, signed provenance, snapshot
-/// markers, and filemaps.
+/// markers, and signed snapshot manifests.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
 /// Each artifact is gated on an `uploaded/<name>` file whose bytes must
 /// equal the value we are about to upload; a mismatch (or missing file)
 /// triggers upload. For small metadata (volume.pub, provenance) the
 /// `uploaded/` entry holds a verbatim copy of the uploaded bytes, so the
-/// directory is inspectable with standard tools. The snapshot triple
-/// (marker + filemap + .manifest) is covered by a single empty sentinel
-/// at `uploaded/snapshots/<ulid>`.
+/// directory is inspectable with standard tools. The snapshot pair
+/// (marker + .manifest) is covered by a single empty sentinel at
+/// `uploaded/snapshots/<ulid>`.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
@@ -322,8 +308,8 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
         Err(e) => warn!("failed to read provenance: {e:#}"),
     }
 
-    if let Err(e) = upload_snapshots_and_filemaps(vol_dir, volume_id, store).await {
-        warn!("snapshot/filemap upload failed: {e:#}");
+    if let Err(e) = upload_snapshot_metadata(vol_dir, volume_id, store).await {
+        warn!("snapshot upload failed: {e:#}");
     }
 }
 
@@ -432,14 +418,13 @@ pub async fn upload_snapshot(
     Ok(())
 }
 
-/// Upload all snapshot markers, filemaps, and signed segments manifests from
+/// Upload all snapshot markers and signed segments manifests from
 /// `vol_dir/snapshots/` to S3.
 ///
 /// For each snapshot ULID found locally, uploads:
 /// - The empty snapshot marker at `snapshots/YYYYMMDD/<ulid>`
-/// - The filemap at `snapshots/YYYYMMDD/<ulid>.filemap` (if present)
 /// - The signed snapshot manifest at `snapshots/YYYYMMDD/<ulid>.manifest` (if present)
-pub async fn upload_snapshots_and_filemaps(
+pub async fn upload_snapshot_metadata(
     vol_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
@@ -457,7 +442,7 @@ pub async fn upload_snapshots_and_filemaps(
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        // Skip filemap files — they are uploaded alongside their snapshot marker.
+        // Skip the .manifest sibling — uploaded explicitly below.
         if name.contains('.') {
             continue;
         }
@@ -481,25 +466,6 @@ pub async fn upload_snapshots_and_filemaps(
         if let Err(e) = upload_snapshot(volume_id, name, store).await {
             warn!("snapshot marker upload failed for {name}: {e:#}");
             all_ok = false;
-        }
-
-        // Upload filemap if present.
-        let filemap_path = snap_dir.join(format!("{name}.filemap"));
-        if filemap_path.exists() {
-            let key = filemap_key(volume_id, name)?;
-            let data = std::fs::read(&filemap_path)
-                .with_context(|| format!("reading filemap: {}", filemap_path.display()))?;
-            let len = data.len();
-            let started = Instant::now();
-            match put_with_content_type(store, &key, Bytes::from(data), MIME_TEXT).await {
-                Ok(()) => {
-                    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
-                }
-                Err(e) => {
-                    warn!("filemap upload failed for {key}: {e:#}");
-                    all_ok = false;
-                }
-            }
         }
 
         // Upload signed segments manifest if present.
@@ -909,23 +875,8 @@ mod tests {
         assert_eq!(meta.size, 0);
     }
 
-    #[test]
-    fn filemap_key_format() {
-        let ulid = Ulid::from_parts(1743120000000, 42);
-        let ulid_str = ulid.to_string();
-
-        let dt: DateTime<Utc> = ulid.datetime().into();
-        let expected_date = dt.format("%Y%m%d").to_string();
-
-        let key = filemap_key(VOL_ULID, &ulid_str).unwrap();
-        assert_eq!(
-            key.as_ref(),
-            format!("by_id/{VOL_ULID}/snapshots/{expected_date}/{ulid_str}.filemap")
-        );
-    }
-
     #[tokio::test]
-    async fn drain_uploads_snapshot_and_filemap() {
+    async fn drain_uploads_snapshot_marker_and_skips_local_filemap() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
         let pending_dir = vol_dir.join("pending");
@@ -940,13 +891,13 @@ mod tests {
         .write(&vol_dir)
         .unwrap();
 
-        // Create a snapshot marker and filemap.
+        // Snapshot marker plus a local filemap. The marker uploads;
+        // the filemap stays local-only.
         let snap_ulid = Ulid::from_parts(1743120000000, 77).to_string();
         std::fs::write(snap_dir.join(&snap_ulid), "").unwrap();
-        let filemap_content = "# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n";
         std::fs::write(
             snap_dir.join(format!("{snap_ulid}.filemap")),
-            filemap_content,
+            "# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n",
         )
         .unwrap();
 
@@ -958,7 +909,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Snapshot marker should be in store.
+        // Snapshot marker is in store.
         let snap_key = snapshot_key(VOL_ULID, &snap_ulid).unwrap();
         let meta = store
             .head(&snap_key)
@@ -966,10 +917,15 @@ mod tests {
             .expect("snapshot marker not in store");
         assert_eq!(meta.size, 0);
 
-        // Filemap should be in store with correct content.
-        let fm_key = filemap_key(VOL_ULID, &snap_ulid).unwrap();
-        let got = store.get(&fm_key).await.expect("filemap not in store");
-        let bytes = got.bytes().await.unwrap();
-        assert_eq!(std::str::from_utf8(&bytes).unwrap(), filemap_content);
+        // Filemap is NOT in store — it stays local.
+        let dt: DateTime<Utc> = Ulid::from_string(&snap_ulid).unwrap().datetime().into();
+        let date = dt.format("%Y%m%d").to_string();
+        let fm_key = StorePath::from(format!(
+            "by_id/{VOL_ULID}/snapshots/{date}/{snap_ulid}.filemap"
+        ));
+        assert!(
+            store.head(&fm_key).await.is_err(),
+            "filemap must not be uploaded to S3",
+        );
     }
 }
