@@ -40,6 +40,7 @@ pub mod body_token;
 pub mod client;
 pub mod endpoint;
 pub mod hint;
+pub mod range_fetcher;
 pub mod server;
 pub mod token;
 
@@ -50,6 +51,7 @@ pub use client::{
 };
 pub use endpoint::{EndpointParseError, PeerEndpoint};
 pub use hint::PrefetchHint;
+pub use range_fetcher::PeerRangeFetcher;
 pub use token::{
     DEFAULT_FRESHNESS_WINDOW_SECS, DOMAIN_TAG, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };

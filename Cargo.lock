@@ -1247,6 +1247,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "elide-core",
+ "elide-fetch",
  "http",
  "object_store",
  "rand_core 0.6.4",
