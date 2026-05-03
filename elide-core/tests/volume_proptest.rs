@@ -1211,3 +1211,91 @@ fn reclaim_crash_recovery_seed_a978281b_regression() {
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
     assert_oracle(&mut vol, &oracle, "Crash");
 }
+
+/// Deterministic regression for proptest seed
+/// `b0f166f0ea2c438cf612a27e217282a545141bd0faed6fe815b42177333fa71b`,
+/// shrunk by `reclaim_crash_recovery` to the 7-op sequence below.
+///
+/// Two `WriteLargeMulti` writes at overlapping LBA ranges (LBAs 24..32
+/// then 26..34, both with `seed = 102`), bracketed by
+/// `reclaim_alias_merge(24, 1)` calls and a final `WriteLargeMulti` at
+/// LBA 24..32 with `seed = 0`. After `sweep_pending` + crash, LBA 32
+/// reads back something other than the bytes the third
+/// `WriteLargeMulti` wrote — its content is not preserved across the
+/// crash boundary the way the oracle expects.
+///
+/// Materialised here per `feedback_proptest_deterministic_repro` so a
+/// fix attempt has a stable repro outside the proptest harness.
+#[test]
+fn reclaim_crash_recovery_seed_b0f166f0_regression() {
+    use elide_core::volume::Volume;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    // Mirrors `ReclaimOp::WriteLargeMulti` in the proptest body.
+    let write_large_multi = |vol: &mut Volume,
+                             oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+                             lba: u8,
+                             seed: u8| {
+        let mut payload = Vec::with_capacity(8 * 4096);
+        for i in 0..8 {
+            payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i as u8)));
+        }
+        let start = 24 + lba as u64;
+        if vol.write(start, &payload).is_ok() {
+            for i in 0..8 {
+                let mut block = [0u8; 4096];
+                block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                oracle.insert(start + i as u64, block);
+            }
+        }
+    };
+
+    let assert_oracle =
+        |vol: &mut Volume, oracle: &std::collections::HashMap<u64, [u8; 4096]>, step: &str| {
+            for (&lba, expected) in oracle {
+                let actual = vol.read(lba, 1).unwrap();
+                assert_eq!(
+                    actual.as_slice(),
+                    expected.as_slice(),
+                    "lba {lba} wrong after {step}"
+                );
+            }
+        };
+
+    write_large_multi(&mut vol, &mut oracle, 0, 102);
+    assert_oracle(&mut vol, &oracle, "WriteLargeMulti(lba=0,seed=102)");
+
+    write_large_multi(&mut vol, &mut oracle, 2, 102);
+    assert_oracle(&mut vol, &oracle, "WriteLargeMulti(lba=2,seed=102)");
+
+    let outcome = vol.reclaim_alias_merge(24, 1).unwrap();
+    assert!(!outcome.discarded, "single-threaded driver: never discards");
+    assert_oracle(
+        &mut vol,
+        &oracle,
+        "ReclaimRange(start_lba=24,lba_count=1)#1",
+    );
+
+    write_large_multi(&mut vol, &mut oracle, 0, 0);
+    assert_oracle(&mut vol, &oracle, "WriteLargeMulti(lba=0,seed=0)");
+
+    let outcome = vol.reclaim_alias_merge(24, 1).unwrap();
+    assert!(!outcome.discarded, "single-threaded driver: never discards");
+    assert_oracle(
+        &mut vol,
+        &oracle,
+        "ReclaimRange(start_lba=24,lba_count=1)#2",
+    );
+
+    let _ = vol.sweep_pending();
+    assert_oracle(&mut vol, &oracle, "SweepPending");
+
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_oracle(&mut vol, &oracle, "Crash");
+}
