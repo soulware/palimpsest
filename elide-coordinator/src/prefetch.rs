@@ -684,36 +684,60 @@ async fn prefetch_branch_snapshot_artifacts(
     if s3_fallback.is_empty() {
         return Ok(());
     }
-    let n = s3_fallback.len();
     let snap_dir_owned = snap_dir.to_path_buf();
-    futures::stream::iter(s3_fallback.into_iter().map(|(kind, name)| {
-        let store = store.clone();
-        let snap_dir = snap_dir_owned.clone();
-        let volume_id = volume_id.to_owned();
-        let snap_ulid_str = snap_ulid_str.to_owned();
-        async move {
-            let key = match kind {
-                Kind::Marker => crate::upload::snapshot_key(&volume_id, &snap_ulid_str),
-                Kind::Manifest => crate::upload::snapshot_manifest_key(&volume_id, &snap_ulid_str),
-                Kind::Filemap => crate::upload::filemap_key(&volume_id, &snap_ulid_str),
-            }?;
-            let data = store
-                .get(&key)
-                .await
-                .with_context(|| format!("downloading {key}"))?
-                .bytes()
-                .await
-                .with_context(|| format!("reading {key}"))?;
-            write_snapshot_artifact_atomic(&snap_dir, &name, &data)?;
-            info!("[prefetch] fetched snapshot artifact: {name}");
-            anyhow::Ok(())
-        }
-    }))
-    .buffer_unordered(PREFETCH_CONCURRENCY)
-    .try_collect::<Vec<()>>()
-    .await?;
+    let outcomes: Vec<bool> =
+        futures::stream::iter(s3_fallback.into_iter().map(|(kind, name)| {
+            let store = store.clone();
+            let snap_dir = snap_dir_owned.clone();
+            let volume_id = volume_id.to_owned();
+            let snap_ulid_str = snap_ulid_str.to_owned();
+            async move {
+                let key = match kind {
+                    Kind::Marker => crate::upload::snapshot_key(&volume_id, &snap_ulid_str),
+                    Kind::Manifest => {
+                        crate::upload::snapshot_manifest_key(&volume_id, &snap_ulid_str)
+                    }
+                    Kind::Filemap => crate::upload::filemap_key(&volume_id, &snap_ulid_str),
+                }?;
+                match store.get(&key).await {
+                    Ok(resp) => {
+                        let data = resp
+                            .bytes()
+                            .await
+                            .with_context(|| format!("reading {key}"))?;
+                        write_snapshot_artifact_atomic(&snap_dir, &name, &data)?;
+                        info!("[prefetch] fetched snapshot artifact: {name}");
+                        anyhow::Ok(true)
+                    }
+                    // Filemaps are advisory and intentionally absent for
+                    // any snapshot whose generator didn't have an ext4
+                    // layout to derive one from — `release` builds a
+                    // handoff snapshot but skips filemap generation
+                    // (see `inbound.rs` § "Phase 4 used to run here").
+                    // A 404 here is the steady state, not a failure;
+                    // log debug and continue so prefetch stays a single
+                    // happy path. Markers and manifests stay required:
+                    // the manifest is signed and load-bearing for the
+                    // claim verification, and a missing marker would
+                    // mean the snapshot itself doesn't exist.
+                    Err(object_store::Error::NotFound { .. }) if matches!(kind, Kind::Filemap) => {
+                        trace!(
+                            "[prefetch] filemap absent for {snap_ulid_str} (handoff snapshots have no filemap); skipping"
+                        );
+                        anyhow::Ok(false)
+                    }
+                    Err(e) => Err(anyhow::Error::new(e))
+                        .with_context(|| format!("downloading {key}")),
+                }
+            }
+        }))
+        .buffer_unordered(PREFETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
 
-    result.snapshots_fetched += n;
+    // Count only artifacts we actually fetched. Filemap-absent doesn't
+    // increment the success counter — it's a no-op.
+    result.snapshots_fetched += outcomes.iter().filter(|fetched| **fetched).count();
 
     Ok(())
 }
@@ -1301,5 +1325,122 @@ mod tests {
         // All snapshots came from S3 (peer was unreachable).
         assert_eq!(result.snapshots_fetched, 3);
         assert_eq!(result.snapshots_from_peer, 0);
+    }
+
+    /// Branch-point fast path: when the filemap is genuinely absent on
+    /// S3 (the steady state for handoff snapshots — `release` skips
+    /// filemap generation by design, see `inbound.rs` § "Phase 4 used
+    /// to run here"), prefetch must NOT propagate the 404 as a fatal
+    /// error. The marker and manifest are still fetched normally; the
+    /// filemap is silently skipped. Without this tolerance, every
+    /// `volume start` after a release/claim cycle fails its
+    /// await-prefetch step with `Object … .filemap not found`.
+    #[tokio::test]
+    async fn branch_snapshot_fast_path_tolerates_missing_filemap() {
+        use elide_peer_fetch::PeerEndpoint;
+        use std::sync::Arc as StdArc;
+
+        #[derive(Debug)]
+        struct StubSigner;
+        impl elide_peer_fetch::TokenSigner for StubSigner {
+            fn coordinator_id(&self) -> &str {
+                "stub-coord"
+            }
+            fn sign(&self, _msg: &[u8]) -> [u8; 64] {
+                [0u8; 64]
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
+
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        let branch = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_ulid.to_owned(),
+                    snapshot_ulid: branch.to_owned(),
+                    pubkey: parent_key.verifying_key().to_bytes(),
+                    manifest_pubkey: None,
+                }),
+                extent_index: Vec::new(),
+                oci_source: None,
+            },
+        )
+        .unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        // Upload only the marker and manifest — NO filemap. This is
+        // the steady state for handoff snapshots.
+        let marker_key = crate::upload::snapshot_key(parent_ulid, branch).unwrap();
+        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, branch).unwrap();
+        store
+            .put(&marker_key, bytes::Bytes::new().into())
+            .await
+            .unwrap();
+        store
+            .put(
+                &manifest_key,
+                bytes::Bytes::from_static(b"manifest-bytes").into(),
+            )
+            .await
+            .unwrap();
+
+        let signer: StdArc<dyn elide_peer_fetch::TokenSigner> = StdArc::new(StubSigner);
+        let client = elide_peer_fetch::PeerFetchClient::builder(signer)
+            .request_timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let peer = PeerFetchContext {
+            client,
+            endpoint: PeerEndpoint::new("127.0.0.1".to_owned(), 1),
+            volume_name: "myvol".to_owned(),
+        };
+
+        // Must NOT propagate the filemap 404. Marker + manifest land
+        // locally; filemap is silently absent.
+        let result = prefetch_indexes(&child_dir, &store, Some(&peer))
+            .await
+            .expect("missing filemap must not fail prefetch");
+
+        let snap_dir = parent_dir.join("snapshots");
+        assert!(snap_dir.join(branch).exists(), "marker should land");
+        assert!(
+            snap_dir.join(format!("{branch}.manifest")).exists(),
+            "manifest should land",
+        );
+        assert!(
+            !snap_dir.join(format!("{branch}.filemap")).exists(),
+            "filemap was never uploaded, so it must not be present locally",
+        );
+
+        // Counter reflects 2 fetched (marker + manifest), not 3.
+        assert_eq!(
+            result.snapshots_fetched, 2,
+            "filemap-absent must not increment the success counter",
+        );
     }
 }
