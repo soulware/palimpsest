@@ -82,6 +82,11 @@ pub struct IpcContext {
     /// stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
     pub issuer: Arc<dyn CredentialIssuer>,
+    /// Peer-fetch client handle. `Some` when `[peer_fetch].port` is
+    /// configured. Used by the claim orchestrator after it rebinds
+    /// `names/<name>` (so peer auth accepts our coord_id) to warm the
+    /// ancestor chain over peer-fetch instead of S3.
+    pub peer_fetch: Option<elide_coordinator::tasks::PeerFetchHandle>,
 }
 
 pub async fn serve(socket_path: &Path, ctx: IpcContext) {
@@ -1521,19 +1526,19 @@ impl Drop for PulledAncestorsGuard {
 /// `docs/design-volume-size-ownership.md`, size lives only on the live
 /// `names/<name>` record.
 ///
-/// No peer-fetch tier here. The claim orchestrator and fork orchestrator
-/// both call this *before* `mark_claimed` rebinds `names/<name>` to us;
-/// the peer's auth check (`elide_peer_fetch::auth`) requires
-/// `coordinator_id` in the bucket's name record to match the requester's
-/// token, which it can't until the rebind. Adding peer-fetch here would
-/// guarantee a 401 round-trip per request before falling through to S3.
-/// The follow-up to enable peer-fetch on this path is to split the fork
-/// creation so `mark_claimed` happens before the chain walk; that work
-/// is tracked separately.
+/// `peer` is best-effort: when `Some` and the peer's auth pipeline
+/// accepts the request (i.e. `names/<volume>` already points at our
+/// coordinator id), each of the two GETs is tried at the peer first
+/// and falls through to S3 on miss. Provenance signatures are still
+/// checked against the just-downloaded `volume.pub`, but that check
+/// is self-consistent — a peer that forges both files passes here.
+/// The caller is responsible for downstream verification against an
+/// S3-rooted artifact (see [`PulledAncestorsGuard`]).
 async fn pull_readonly_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
+    peer: Option<&elide_coordinator::prefetch::PeerFetchContext>,
 ) -> Result<PullReadonlyReply, IpcError> {
     let volume_id = vol_ulid.to_string();
     let vol_dir = data_dir.join("by_id").join(&volume_id);
@@ -1548,8 +1553,8 @@ async fn pull_readonly_op(
     // Steps 1-3: fetch volume.pub + volume.provenance and write the
     // ancestor skeleton via `pull_volume_skeleton`. The two GETs run
     // in parallel so per-ancestor latency is bounded by the slowest
-    // leg rather than the sum.
-    elide_coordinator::pull::pull_volume_skeleton(store, data_dir, &volume_id, None)
+    // leg rather than the sum; peer-first when a context is supplied.
+    elide_coordinator::pull::pull_volume_skeleton(store, data_dir, &volume_id, peer)
         .await
         .map_err(|e| IpcError::store(format!("pulling skeleton for {volume_id}: {e}")))?;
     let fetch_elapsed = pull_started.elapsed();
@@ -3612,7 +3617,10 @@ async fn run_fork_job(
         }
         job.append(ForkAttachEvent::PullingAncestor { vol_ulid });
         let store = ctx.stores.for_volume(&vol_ulid);
-        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
+        // Fork orchestrator is the `volume create --from` path — there's
+        // no released ancestor to claim, so peer-fetch can't authenticate
+        // (no `names/<volume>` rebind to anchor against). S3-only here.
+        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store, None).await?;
         next = reply.parent;
     }
 
@@ -3922,6 +3930,7 @@ async fn skip_empty_intermediates(
     initial_parent_key_hex: Option<String>,
     data_dir: &Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+    peer: Option<&elide_coordinator::prefetch::PeerFetchContext>,
     guard: &mut PulledAncestorsGuard,
 ) -> Result<(ulid::Ulid, ulid::Ulid, Option<String>), IpcError> {
     use elide_core::signing::{
@@ -3999,7 +4008,7 @@ async fn skip_empty_intermediates(
             });
             let parent_store = stores.for_volume(&parent_vol_ulid);
             guard.record(parent_vol_ulid);
-            let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store).await?;
+            let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store, peer).await?;
         }
 
         info!(
@@ -4015,11 +4024,220 @@ async fn skip_empty_intermediates(
     Ok((effective_vol, effective_snap, effective_parent_key_hex))
 }
 
-/// Drive one claim-job to completion. Pulls the released volume's
-/// chain if needed, resolves the handoff key, mints the fresh fork
-/// (with `for_claim = true` so it skips `mark_initial` and lets
-/// `mark_claimed` do the bucket rebind), and surfaces the
-/// coordinator's background prefetch.
+/// Stage 1 of the claim flow: mint a fresh fork ULID + keypair, upload
+/// `volume.pub` to S3, and `mark_claimed` to rebind `names/<volume>`
+/// to this coordinator. After this returns the bucket says we own the
+/// name, peer-fetch auth accepts our coord_id for the chain walk that
+/// follows, and the local fork dir holds `volume.{key,pub}` only —
+/// crucially **no `wal/`, no `pending/`, no `index/`**, so the daemon's
+/// discovery loop won't pick the partial fork up and try to open it
+/// before [`finalize_claim_fork`] writes the provenance.
+///
+/// Crash semantics. If the coordinator dies between this returning and
+/// `finalize_claim_fork`'s `volume.provenance` upload, the bucket
+/// points at a fork that has a pubkey but no provenance. The fork is
+/// unmountable but recoverable: `volume release --force` treats a
+/// missing provenance as a crashed-during-create empty fork (its
+/// `recovery::list_and_verify_segments` finds zero segments and
+/// publishes an empty synthesised handoff manifest). After force-
+/// release, a fresh `claim` mints a new vol_ulid and proceeds.
+async fn early_rebind_for_claim(
+    volume: &str,
+    ctx: &IpcContext,
+) -> Result<(ulid::Ulid, std::path::PathBuf, ed25519_dalek::SigningKey), IpcError> {
+    use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
+    use elide_core::name_record::NameState;
+    use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PUB_FILE, generate_keypair};
+
+    let new_vol_ulid = ulid::Ulid::new();
+    let new_vol_ulid_str = new_vol_ulid.to_string();
+    let new_fork_dir = ctx.data_dir.join("by_id").join(&new_vol_ulid_str);
+
+    // Bare dir + keypair only. No wal/, no pending/, no index/ — daemon
+    // discovery requires one of those to consider a dir a volume, so
+    // this skeleton stays invisible to the supervisor until
+    // `finalize_claim_fork` adds them.
+    std::fs::create_dir_all(&new_fork_dir)
+        .map_err(|e| IpcError::internal(format!("creating fork dir: {e}")))?;
+    let signing_key = generate_keypair(&new_fork_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
+        .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
+
+    // Upload volume.pub to S3 so peer-fetch ancestry walks (which read
+    // `by_id/<id>/volume.pub` to verify our parent provenance) and
+    // future claimants doing release --force on a stuck fork have the
+    // file they expect.
+    let store = ctx.stores.for_volume(&new_vol_ulid);
+    elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vol_ulid_str, &store)
+        .await
+        .map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
+
+    // Bucket rebind. Peer-fetch auth accepts our coord_id from this
+    // point onward.
+    let store_wide = ctx.stores.coordinator_wide();
+    match mark_claimed(
+        &store_wide,
+        volume,
+        &ctx.coord_id,
+        ctx.identity.hostname(),
+        new_vol_ulid,
+        NameState::Stopped,
+    )
+    .await
+    {
+        Ok(MarkClaimedOutcome::Claimed) => {
+            info!(
+                "[claim {volume}] early-rebind: bucket → {new_vol_ulid_str} \
+                 (provenance pending)"
+            );
+            elide_coordinator::volume_event_store::emit_best_effort(
+                &store_wide,
+                ctx.identity.as_ref(),
+                volume,
+                elide_core::volume_event::EventKind::Claimed,
+                new_vol_ulid,
+            )
+            .await;
+            Ok((new_vol_ulid, new_fork_dir, signing_key))
+        }
+        Ok(MarkClaimedOutcome::Absent) => Err(IpcError::not_found(format!(
+            "names/{volume} disappeared between bucket-side claim and rebind"
+        ))),
+        Ok(MarkClaimedOutcome::NotReleased { observed }) => Err(IpcError::conflict(format!(
+            "names/{volume} changed underneath us; now in state {observed:?}"
+        ))),
+        Err(LifecycleError::Store(e)) => Err(IpcError::store(format!("rebind failed: {e}"))),
+        Err(LifecycleError::OwnershipConflict { held_by }) => Err(IpcError::precondition_failed(
+            format!("name '{volume}' raced with another claim ({held_by} won)"),
+        )),
+        Err(LifecycleError::InvalidTransition { from, .. }) => Err(IpcError::conflict(format!(
+            "names/{volume} is in unexpected state {from:?}"
+        ))),
+    }
+}
+
+/// Stage 2 of the claim flow: now that ancestor verification has
+/// passed and `effective_vol` / `effective_snap` are known, sign and
+/// upload `volume.provenance`, write the local config + `wal/` +
+/// `pending/`, link `by_name/<volume>`, drop the `volume.stopped`
+/// marker, and emit the journal event. Once this returns the fork is
+/// fully materialised and the daemon's next discovery tick will find
+/// and supervise it.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_claim_fork(
+    volume: &str,
+    new_vol_ulid: ulid::Ulid,
+    new_fork_dir: &std::path::Path,
+    signing_key: &ed25519_dalek::SigningKey,
+    effective_vol: ulid::Ulid,
+    effective_snap: ulid::Ulid,
+    effective_parent_key_hex: Option<&str>,
+    ctx: &IpcContext,
+) -> Result<(), IpcError> {
+    use elide_core::signing::{
+        ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, load_verifying_key,
+        write_provenance,
+    };
+    use elide_core::volume::resolve_ancestor_dir;
+
+    let new_vol_ulid_str = new_vol_ulid.to_string();
+    let by_id_dir = ctx.data_dir.join("by_id");
+
+    // Ancestor's identity pubkey for the embedded `ParentRef.pubkey`
+    // trust anchor. Loaded from the just-pulled (and verified)
+    // ancestor skeleton.
+    let parent_dir = resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
+    let parent_pubkey = load_verifying_key(&parent_dir, VOLUME_PUB_FILE)
+        .map_err(|e| IpcError::internal(format!("loading parent volume.pub: {e}")))?;
+
+    let manifest_pubkey = match effective_parent_key_hex {
+        Some(hex) => {
+            let arr = decode_hex32(hex)
+                .map_err(|e| IpcError::internal(format!("bad parent-key: {e}")))?;
+            Some(arr)
+        }
+        None => None,
+    };
+
+    let lineage = ProvenanceLineage {
+        parent: Some(ParentRef {
+            volume_ulid: effective_vol.to_string(),
+            snapshot_ulid: effective_snap.to_string(),
+            pubkey: parent_pubkey.to_bytes(),
+            manifest_pubkey,
+        }),
+        extent_index: Vec::new(),
+        oci_source: None,
+    };
+    write_provenance(new_fork_dir, signing_key, VOLUME_PROVENANCE_FILE, &lineage)
+        .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
+
+    let store = ctx.stores.for_volume(&new_vol_ulid);
+    elide_coordinator::upload::upload_volume_provenance_initial(
+        new_fork_dir,
+        &new_vol_ulid_str,
+        &store,
+    )
+    .await
+    .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
+
+    // wal/ and pending/ now — daemon discovery becomes interested only
+    // after these exist, by which point the provenance is on S3 and
+    // the volume is fully openable.
+    std::fs::create_dir_all(new_fork_dir.join("wal"))
+        .map_err(|e| IpcError::internal(format!("creating wal/: {e}")))?;
+    std::fs::create_dir_all(new_fork_dir.join("pending"))
+        .map_err(|e| IpcError::internal(format!("creating pending/: {e}")))?;
+
+    // Local volume.toml: size from the released NameRecord (claim is
+    // a continuation of the same logical volume identity, not a
+    // resize).
+    let store_wide = ctx.stores.coordinator_wide();
+    let size = match elide_coordinator::name_store::read_name_record(&store_wide, volume).await {
+        Ok(Some((rec, _))) => rec.size,
+        Ok(None) => {
+            return Err(IpcError::not_found(format!(
+                "names/{volume} disappeared during finalize"
+            )));
+        }
+        Err(e) => return Err(IpcError::store(format!("reading names/{volume}: {e}"))),
+    };
+    elide_core::config::VolumeConfig {
+        name: Some(volume.to_owned()),
+        size: Some(size),
+        nbd: None,
+        ublk: None,
+    }
+    .write(new_fork_dir)
+    .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
+
+    // by_name symlink + volume.stopped marker.
+    let by_name_dir = ctx.data_dir.join("by_name");
+    let symlink_path = by_name_dir.join(volume);
+    std::fs::create_dir_all(&by_name_dir)
+        .map_err(|e| IpcError::internal(format!("creating by_name dir: {e}")))?;
+    if symlink_path.exists() || symlink_path.is_symlink() {
+        std::fs::remove_file(&symlink_path)
+            .map_err(|e| IpcError::internal(format!("removing stale by_name link: {e}")))?;
+    }
+    std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid_str}"), &symlink_path)
+        .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
+    std::fs::write(new_fork_dir.join(STOPPED_FILE), "")
+        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
+
+    register_prefetch_or_get(&ctx.prefetch_tracker, new_vol_ulid);
+    ctx.rescan.notify_one();
+    info!(
+        "[claim {volume}] finalized fork {new_vol_ulid_str} (parent {effective_vol}/{effective_snap})"
+    );
+    Ok(())
+}
+
+/// Drive one claim-job to completion. Mints the fresh fork and
+/// rebinds `names/<volume>` early so peer-fetch auth accepts the
+/// chain-walk requests that follow; pulls the released volume's
+/// chain (peer-first); resolves the handoff key; finalises the local
+/// fork by signing and uploading provenance once the verified parent
+/// is known; surfaces the coordinator's background prefetch.
 async fn run_claim_job(
     job: Arc<ClaimJob>,
     volume: String,
@@ -4031,16 +4249,53 @@ async fn run_claim_job(
 
     let by_id_dir = ctx.data_dir.join("by_id");
 
+    // Step 1: early rebind. Mint our fork ULID + keypair, upload
+    // `volume.pub`, and `mark_claimed` so the bucket points at us.
+    // Peer-fetch auth gates on `names/<volume>.coordinator_id` matching
+    // our token's coord id, so this has to land before the chain walk
+    // for any peer request to authenticate.
+    let early_started = std::time::Instant::now();
+    let (new_vol_ulid, new_fork_dir, signing_key) = early_rebind_for_claim(&volume, &ctx).await?;
+    info!(
+        "[claim {volume}] early-rebind completed in {:.2?}",
+        early_started.elapsed()
+    );
+
+    // Step 2: discover the previous claimer. Best-effort — peer is
+    // `Some` only when `[peer_fetch].port` is configured, the event
+    // log yields a clean Released, and the previous claimer published
+    // a peer endpoint. The peer auth pipeline now accepts our
+    // coord_id (we `mark_claimed` above), so peer requests will
+    // succeed.
+    let peer_ctx: Option<elide_coordinator::prefetch::PeerFetchContext> =
+        match ctx.peer_fetch.as_ref() {
+            Some(handle) => {
+                let store_wide = ctx.stores.coordinator_wide();
+                elide_coordinator::peer_discovery::discover_peer_for_claim(&store_wide, &volume)
+                    .await
+                    .map(|discovered| elide_coordinator::prefetch::PeerFetchContext {
+                        client: handle.client.clone(),
+                        endpoint: discovered.endpoint,
+                        volume_name: volume.clone(),
+                    })
+            }
+            None => None,
+        };
+
     // Verification-failure cleanup guard. Records every ancestor
     // skeleton we write during this attempt; on drop without commit,
     // each is `remove_dir_all`'d so a retry refetches cleanly. Commit
     // happens once all signature checks against S3-rooted artifacts
-    // have passed — see the `commit()` site below.
+    // have passed — see the `commit()` site below. The partial fork
+    // we just minted is a separate concern: its on-disk state is
+    // bare (no `wal/` / `pending/` / `index/` yet) so daemon
+    // discovery ignores it; recovery via `volume release --force`
+    // sees the orphan `volume.pub` and treats it as a
+    // crashed-during-create empty fork.
     let mut pulled_guard = PulledAncestorsGuard::new(by_id_dir.clone());
 
-    // Step 1: pull the released chain locally if absent. Walks
-    // ancestor-by-ancestor exactly as the fork orchestrator does.
-    // No peer-fetch tier here — see `pull_readonly_op` for why.
+    // Step 3: pull the released chain locally if absent. Peer-first
+    // when a context is available — auth now accepts our coord_id.
     let chain_started = std::time::Instant::now();
     let mut chain_pulled = 0usize;
     let mut next: Option<ulid::Ulid> = Some(released_vol_ulid);
@@ -4052,7 +4307,7 @@ async fn run_claim_job(
         job.append(ClaimAttachEvent::PullingAncestor { vol_ulid });
         let store = ctx.stores.for_volume(&vol_ulid);
         pulled_guard.record(vol_ulid);
-        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
+        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store, peer_ctx.as_ref()).await?;
         chain_pulled += 1;
         next = reply.parent;
     }
@@ -4068,7 +4323,7 @@ async fn run_claim_job(
         )));
     }
 
-    // Step 2: resolve the handoff key. Recovery snapshots are signed
+    // Step 4: resolve the handoff key. Recovery snapshots are signed
     // by an attestation key the fork's provenance must record so its
     // own signature verifies later. **This is the first step that
     // verifies a peer-served pubkey against an S3-rooted artifact**:
@@ -4076,7 +4331,9 @@ async fn run_claim_job(
     // bucket and is checked against the just-pulled `volume.pub`. A
     // tampering peer is detected here; on `?` propagation
     // `pulled_guard` tears down the bogus skeletons before the error
-    // returns to the caller.
+    // returns. (The partial fork we minted in step 1 is left for
+    // `volume release --force` to clean up; see early_rebind_for_claim
+    // for the recovery story.)
     let handoff_started = std::time::Instant::now();
     let store = ctx.stores.for_volume(&released_vol_ulid);
     let key = resolve_handoff_key_op(released_vol_ulid, handoff_snap, &store).await?;
@@ -4092,19 +4349,13 @@ async fn run_claim_job(
     };
     job.append(ClaimAttachEvent::HandoffKeyResolved { key });
 
-    // Step 2b: skip empty intermediates. A fork that produced no
+    // Step 4b: skip empty intermediates. A fork that produced no
     // writes between claim and release leaves a handoff snapshot
     // whose segment list is identical to its parent's — every
     // segment was inherited, none minted under this fork. Forking
     // from such a no-op intermediate just bloats the chain by one
-    // link per cycle. Detect it and rewrite the source we hand to
-    // `fork_create_op` to point at the deepest non-empty ancestor.
-    //
-    // Predicate: max(segment_ulids in handoff manifest) <
-    // parent.snapshot_ulid. Sound by ULID monotonicity — any segment
-    // a child wrote was minted after its parent's snapshot was
-    // taken, so a child-written segment has a ULID strictly greater
-    // than the parent snapshot's ULID.
+    // link per cycle. Detect it and rewrite `effective_vol` /
+    // `effective_snap` to point at the deepest non-empty ancestor.
     let (effective_vol, effective_snap, effective_parent_key_hex) = skip_empty_intermediates(
         &job,
         &volume,
@@ -4113,6 +4364,7 @@ async fn run_claim_job(
         parent_key_hex,
         ctx.data_dir.as_path(),
         &ctx.stores,
+        peer_ctx.as_ref(),
         &mut pulled_guard,
     )
     .await?;
@@ -4121,47 +4373,33 @@ async fn run_claim_job(
     // Commit so the pulled skeletons survive the rest of this job.
     pulled_guard.commit();
 
-    // Step 3: mint (or resume) the local fork. `for_claim = true`
-    // tells `fork_create_op` to skip `mark_initial` (the released
-    // record already exists) and to detect a resumable orphan at
-    // `by_name/<name>`.
+    // Step 5: finalize the local fork. Sign + upload provenance with
+    // the verified parent, write `volume.toml`, link `by_name`, drop
+    // the `volume.stopped` marker, and emit `ForkedFrom`.
     let fork_create_started = std::time::Instant::now();
-    let store_wide = ctx.stores.coordinator_wide();
-    // Source's pre-release name == new fork name. Claim rebinds the
-    // same `names/<volume>` record; the released volume held that
-    // name before, so the journal's `ForkedFrom { source_name, ... }`
-    // is the volume name itself. The released source's
-    // `volume.toml` was written by the prior owner and is rarely
-    // local to this host, so the hint is what makes this work.
-    let reply = fork_create_op(
+    finalize_claim_fork(
         &volume,
+        new_vol_ulid,
+        &new_fork_dir,
+        &signing_key,
         effective_vol,
-        Some(effective_snap),
+        effective_snap,
         effective_parent_key_hex.as_deref(),
-        true,
-        &[],
-        Some(&volume),
-        &ctx.data_dir,
-        &store_wide,
-        &ctx.identity,
-        &ctx.rescan,
-        &ctx.prefetch_tracker,
+        &ctx,
     )
     .await?;
-    job.append(ClaimAttachEvent::ForkCreated {
-        new_vol_ulid: reply.new_vol_ulid,
-    });
+    job.append(ClaimAttachEvent::ForkCreated { new_vol_ulid });
     info!(
-        "[claim {volume}] fork created in {:.2?}",
+        "[claim {volume}] fork finalized in {:.2?}",
         fork_create_started.elapsed()
     );
 
-    // Step 4: surface prefetch warm-up. Same non-fatal semantics as
+    // Step 6: surface prefetch warm-up. Same non-fatal semantics as
     // the fork flow: the bucket-side claim and local fork are durable
     // by this point.
     let prefetch_wait_started = std::time::Instant::now();
     job.append(ClaimAttachEvent::PrefetchStarted);
-    let _ = await_prefetch_op(reply.new_vol_ulid, &ctx.prefetch_tracker).await;
+    let _ = await_prefetch_op(new_vol_ulid, &ctx.prefetch_tracker).await;
     job.append(ClaimAttachEvent::PrefetchDone);
     info!(
         "[claim {volume}] prefetch+prewarm awaited in {:.2?}",
@@ -5472,6 +5710,7 @@ mod tests {
                 None,
                 data_dir,
                 &stores,
+                None,
                 &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
             )
             .await
@@ -5512,6 +5751,7 @@ mod tests {
                 None,
                 data_dir,
                 &stores,
+                None,
                 &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
             )
             .await
@@ -5549,6 +5789,7 @@ mod tests {
                 None,
                 data_dir,
                 &stores,
+                None,
                 &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
             )
             .await
@@ -5581,6 +5822,7 @@ mod tests {
                 None,
                 data_dir,
                 &stores,
+                None,
                 &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
             )
             .await
@@ -5644,6 +5886,7 @@ mod tests {
                 None,
                 data_dir,
                 &stores,
+                None,
                 &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
             )
             .await

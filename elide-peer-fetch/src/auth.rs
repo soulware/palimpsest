@@ -8,14 +8,17 @@
 //! |------|---------------------------------|-----------|
 //! | 1    | Token decode + freshness        | 401        |
 //! | 2    | Ed25519 signature               | 401        |
+//! | 2.5  | Rate limiter ([`RateLimiter`])  | 429        |
 //! | 3    | Volume claimed by this coord    | 401        |
 //! | 4    | URL `vol_id` is in ancestry     | 403        |
 //! | 5    | Local file exists (route-level) | 404        |
 //!
-//! Step 5 is the route handler's responsibility — it's a stat that
-//! falls out as 404 if the file isn't present locally. The auth
-//! pipeline returns successfully once steps 1–4 pass; the handler
-//! then reads the file or returns 404.
+//! Step 4 only runs under [`RouteAuthMode::LineageGated`]. Skeleton
+//! routes (`volume.pub`, `volume.provenance`) request
+//! [`RouteAuthMode::SkeletonsOnly`] and skip step 4 — see that
+//! enum's documentation for the security analysis. Step 5 is the
+//! route handler's responsibility — it's a stat that falls out as
+//! 404 if the file isn't present locally.
 //!
 //! ### Caching profile
 //!
@@ -88,6 +91,9 @@ pub enum AuthError {
     /// URL's `vol_id` is not in the requesting volume's signed
     /// fork-parent ancestry.
     OutsideLineage,
+    /// Rate limiter rejected the request. Carries a static reason
+    /// string from the limiter for log/operator surface.
+    RateLimited(&'static str),
     /// Wrapper for any underlying S3 / parsing error encountered while
     /// resolving the auth pipeline.
     Backend(io::Error),
@@ -102,6 +108,7 @@ impl AuthError {
             Self::BadCredentials(_) => 401,
             Self::NotCurrentClaimer => 401,
             Self::OutsideLineage => 403,
+            Self::RateLimited(_) => 429,
             Self::Backend(_) => 502,
         }
     }
@@ -117,6 +124,7 @@ impl std::fmt::Display for AuthError {
             Self::OutsideLineage => {
                 f.write_str("requested vol_id is outside claimed volume's lineage")
             }
+            Self::RateLimited(reason) => write!(f, "rate limited: {reason}"),
             Self::Backend(e) => write!(f, "auth backend error: {e}"),
         }
     }
@@ -155,16 +163,87 @@ struct AuthStateInner {
     /// cached result never outlives the token's own freshness.
     verified_tokens: RwLock<HashMap<VerifiedKey, VerifiedEntry>>,
     freshness_window_secs: u64,
+    rate_limiter: Arc<dyn RateLimiter>,
 }
 
-/// Cache key for the resolved-Authorized cache. Bound to both the
-/// bearer (token bytes) and the URL `vol_id`, since the same token
-/// can validly authorise different `vol_id`s in the volume's
-/// ancestry, and each must be lineage-checked once.
+/// Hook for per-token rate limiting on peer-fetch routes. Currently
+/// a placeholder — the no-op default impl in [`NoRateLimit`] always
+/// permits — so the surface lands now and an actual limiter can plug
+/// in later without touching call sites. The skeleton routes are the
+/// most likely to need rate limiting in practice (any authenticated
+/// coordinator can hit them post-relaxation, see [`RouteAuthMode`]),
+/// so the hook is consulted before the lineage walk, after token
+/// signature verification.
+///
+/// Implementations should be cheap to clone; `AuthState` stores them
+/// in an `Arc<dyn>`.
+pub trait RateLimiter: Send + Sync {
+    /// Return `Ok(())` to permit the request, `Err(reason)` to reject
+    /// with a 429-ish error wrapped in [`AuthError::RateLimited`].
+    /// `volume_name` is the token-claim (the requester's own volume),
+    /// `mode` allows policy to differ between skeleton and payload
+    /// surfaces. The `vol_id` of the URL is intentionally not passed
+    /// — limiters that need it can be added later if a use case
+    /// emerges.
+    fn check(
+        &self,
+        coordinator_id: &str,
+        volume_name: &str,
+        mode: RouteAuthMode,
+    ) -> Result<(), &'static str>;
+}
+
+/// No-op rate limiter; always permits. Used as the default until a
+/// real limiter is plumbed in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoRateLimit;
+
+impl RateLimiter for NoRateLimit {
+    fn check(
+        &self,
+        _coordinator_id: &str,
+        _volume_name: &str,
+        _mode: RouteAuthMode,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+/// Auth mode declared by the route registration. Skeleton routes
+/// (`volume.pub`, `volume.provenance`) skip the lineage walk so a
+/// claim-time chain pull can authenticate before the requesting
+/// fork's own provenance is published. Payload routes (`.idx`,
+/// `.manifest`) keep the full pipeline.
+///
+/// The check that the lineage gate enforces is *intent scoping* —
+/// "this requester actually has business with the URL's vol_id" —
+/// not confidentiality. Within a bucket every authenticated
+/// coordinator already has S3 read access to every key. Skeleton
+/// metadata (a 32-byte verifying key + a signed lineage record) is
+/// already broadly readable from S3; relaxing the peer-side gate
+/// for those routes mirrors that reality and lets peer-fetch warm
+/// chain walks during the early-rebind phase of `volume claim`,
+/// when the requester's own `volume.provenance` hasn't been signed
+/// yet (parent isn't known until handoff verification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteAuthMode {
+    /// Steps 1-3 only: token integrity + freshness + signature +
+    /// `names/<volume>` ownership. No lineage walk.
+    SkeletonsOnly,
+    /// Full pipeline (steps 1-4): adds the ancestry walk.
+    LineageGated,
+}
+
+/// Cache key for the resolved-Authorized cache. Bound to bearer +
+/// vol_id + mode: the same token validating against the same vol_id
+/// resolves *differently* across modes (skeleton mode skips the
+/// lineage walk), so we mustn't serve a cached `SkeletonsOnly` hit
+/// to a `LineageGated` request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VerifiedKey {
     bearer: String,
     vol_id: Ulid,
+    mode: RouteAuthMode,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +258,18 @@ impl AuthState {
     }
 
     pub fn with_freshness_window(store: Arc<dyn ObjectStore>, freshness_window_secs: u64) -> Self {
+        Self::with_freshness_window_and_limiter(store, freshness_window_secs, Arc::new(NoRateLimit))
+    }
+
+    /// Construct an `AuthState` with a custom rate limiter. The
+    /// no-arg [`AuthState::new`] uses [`NoRateLimit`]; this hook
+    /// exists so the daemon can plug in a real limiter later
+    /// without touching call sites.
+    pub fn with_freshness_window_and_limiter(
+        store: Arc<dyn ObjectStore>,
+        freshness_window_secs: u64,
+        rate_limiter: Arc<dyn RateLimiter>,
+    ) -> Self {
         Self {
             inner: Arc::new(AuthStateInner {
                 store,
@@ -187,24 +278,35 @@ impl AuthState {
                 name_records: RwLock::new(HashMap::new()),
                 verified_tokens: RwLock::new(HashMap::new()),
                 freshness_window_secs,
+                rate_limiter,
             }),
         }
     }
 
-    /// Run the full five-step pipeline (steps 1–4 — step 5 is the
-    /// route handler's local stat). Returns the resolved
-    /// [`Authorized`] context on success.
+    /// Run the auth pipeline for a request. Mode selects whether
+    /// step 4 (lineage walk) runs:
     ///
-    /// On a fresh request, runs all four steps. On a repeat request
-    /// within the token's freshness window (same bearer, same
-    /// `vol_id`), the resolved [`Authorized`] is returned from
-    /// cache after only the cheap checks (decode, freshness,
-    /// signature) — the S3 round-trip for `names/<name>` and the
-    /// ancestry walk are skipped.
+    /// - [`RouteAuthMode::LineageGated`]: full pipeline, the URL's
+    ///   `vol_id` must be in the token-volume's signed fork ancestry.
+    /// - [`RouteAuthMode::SkeletonsOnly`]: skip step 4. Used for
+    ///   `volume.pub` and `volume.provenance` so that a claim-time
+    ///   chain walk authenticates before the requester's own
+    ///   provenance is published. See [`RouteAuthMode`] for the
+    ///   security analysis.
+    ///
+    /// Always-runs step 5 (local stat) is the route handler's
+    /// concern; this method returns the resolved [`Authorized`].
+    ///
+    /// Cache: keyed on `(bearer, vol_id, mode)`. Expiry tracks the
+    /// token's residual freshness so a cached entry can never
+    /// authorise past the moment the token itself becomes stale. The
+    /// mode is part of the key so a `SkeletonsOnly` hit cannot serve
+    /// a `LineageGated` request.
     pub async fn verify(
         &self,
         bearer_value: &str,
         url_vol_id: Ulid,
+        mode: RouteAuthMode,
     ) -> Result<Authorized, AuthError> {
         // Step 1: decode + freshness. Always runs — these are cheap
         // and the freshness check is what bounds the cache lifetime.
@@ -223,13 +325,18 @@ impl AuthState {
             .verify_signature(&vk)
             .map_err(AuthError::BadCredentials)?;
 
-        // Cached resolution: `Authorized` keyed on this exact bearer +
-        // vol_id. Expiry is the token's residual freshness, so a
-        // cached entry can never authorise past the moment the token
-        // itself becomes stale.
+        // Rate-limit hook (no-op default; see `RateLimiter`). Runs
+        // before the cache so that even repeat requests within the
+        // freshness window remain subject to the policy.
+        self.inner
+            .rate_limiter
+            .check(&token.coordinator_id, &token.volume_name, mode)
+            .map_err(AuthError::RateLimited)?;
+
         let cache_key = VerifiedKey {
             bearer: bearer_value.to_owned(),
             vol_id: url_vol_id,
+            mode,
         };
         if let Some(entry) = self.lookup_cached(&cache_key).await {
             return Ok(entry.authorized);
@@ -248,11 +355,12 @@ impl AuthState {
             _ => return Err(AuthError::NotCurrentClaimer),
         }
 
-        // Step 4: lineage — URL's `vol_id` must be in the volume's
-        // signed fork-parent ancestry.
-        let ancestry = self.ancestry(name_record.vol_ulid).await?;
-        if !ancestry.contains(&url_vol_id) {
-            return Err(AuthError::OutsideLineage);
+        // Step 4: lineage — `LineageGated` only. Skeletons skip this.
+        if matches!(mode, RouteAuthMode::LineageGated) {
+            let ancestry = self.ancestry(name_record.vol_ulid).await?;
+            if !ancestry.contains(&url_vol_id) {
+                return Err(AuthError::OutsideLineage);
+            }
         }
 
         let authorized = Authorized {
@@ -581,7 +689,10 @@ mod tests {
             &coord_key,
         );
         let bearer = token.encode();
-        let result = auth.verify(&bearer, vol_ulid).await.unwrap();
+        let result = auth
+            .verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
         assert_eq!(result.coordinator_id, coord_id);
         assert_eq!(result.volume_name, vol_name);
         assert_eq!(result.vol_id, vol_ulid);
@@ -624,7 +735,10 @@ mod tests {
         let bearer = token.encode();
 
         // Asking for a segment of the root (in leaf's ancestry) should pass.
-        let result = auth.verify(&bearer, root_ulid).await.unwrap();
+        let result = auth
+            .verify(&bearer, root_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
         assert_eq!(result.vol_id, root_ulid);
     }
 
@@ -632,7 +746,11 @@ mod tests {
     async fn rejects_missing_bearer() {
         let (_, auth) = make_state();
         let err = auth
-            .verify("garbage-not-base64", Ulid::new())
+            .verify(
+                "garbage-not-base64",
+                Ulid::new(),
+                RouteAuthMode::LineageGated,
+            )
             .await
             .expect_err("decode");
         assert_eq!(err.status_code(), 401);
@@ -651,7 +769,10 @@ mod tests {
         let token = sign_token("myvol", coord_id, stale_at, &coord_key);
         let bearer = token.encode();
 
-        let err = auth.verify(&bearer, Ulid::new()).await.expect_err("stale");
+        let err = auth
+            .verify(&bearer, Ulid::new(), RouteAuthMode::LineageGated)
+            .await
+            .expect_err("stale");
         assert!(matches!(
             err,
             AuthError::BadCredentials(TokenVerifyError::Stale { .. })
@@ -676,7 +797,7 @@ mod tests {
         let bearer = token.encode();
 
         let err = auth
-            .verify(&bearer, Ulid::new())
+            .verify(&bearer, Ulid::new(), RouteAuthMode::LineageGated)
             .await
             .expect_err("bad sig");
         assert!(matches!(
@@ -709,7 +830,7 @@ mod tests {
         let bearer = token.encode();
 
         let err = auth
-            .verify(&bearer, vol_ulid)
+            .verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
             .await
             .expect_err("wrong claimer");
         assert!(matches!(err, AuthError::NotCurrentClaimer));
@@ -749,7 +870,10 @@ mod tests {
         );
         let bearer = token.encode();
 
-        let err = auth.verify(&bearer, vol_ulid).await.expect_err("released");
+        let err = auth
+            .verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("released");
         assert!(matches!(err, AuthError::NotCurrentClaimer));
     }
 
@@ -776,7 +900,7 @@ mod tests {
         let bearer = token.encode();
 
         let err = auth
-            .verify(&bearer, unrelated_ulid)
+            .verify(&bearer, unrelated_ulid, RouteAuthMode::LineageGated)
             .await
             .expect_err("not in lineage");
         assert!(matches!(err, AuthError::OutsideLineage));
@@ -801,7 +925,7 @@ mod tests {
         let bearer = token.encode();
 
         let err = auth
-            .verify(&bearer, Ulid::new())
+            .verify(&bearer, Ulid::new(), RouteAuthMode::LineageGated)
             .await
             .expect_err("no name");
         assert!(matches!(err, AuthError::NotCurrentClaimer));
@@ -854,7 +978,9 @@ mod tests {
         let bearer = token.encode();
 
         // First verify: cache miss → full pipeline → success, cached.
-        auth.verify(&bearer, vol_ulid).await.unwrap();
+        auth.verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
 
         // Flip the names record to disauthorise this coordinator.
         publish_live_name(store.as_ref(), vol_name, vol_ulid, other_coord).await;
@@ -864,7 +990,10 @@ mod tests {
         // expected behaviour — the cache lifetime is the token's
         // freshness window, after which a fresh pipeline run picks up
         // the change.
-        let result = auth.verify(&bearer, vol_ulid).await.unwrap();
+        let result = auth
+            .verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
         assert_eq!(result.coordinator_id, coord_id);
     }
 
@@ -908,18 +1037,26 @@ mod tests {
         let bearer = token.encode();
 
         // Both ancestor + leaf authorise.
-        auth.verify(&bearer, leaf_ulid).await.unwrap();
-        auth.verify(&bearer, root_ulid).await.unwrap();
+        auth.verify(&bearer, leaf_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+        auth.verify(&bearer, root_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
 
         // Repeats hit cache.
-        auth.verify(&bearer, leaf_ulid).await.unwrap();
-        auth.verify(&bearer, root_ulid).await.unwrap();
+        auth.verify(&bearer, leaf_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+        auth.verify(&bearer, root_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
 
         // An unrelated vol_id is a cache miss → pipeline runs →
         // ancestry rejection.
         let unrelated = Ulid::new();
         let err = auth
-            .verify(&bearer, unrelated)
+            .verify(&bearer, unrelated, RouteAuthMode::LineageGated)
             .await
             .expect_err("not in lineage");
         assert!(matches!(err, AuthError::OutsideLineage));
@@ -948,7 +1085,9 @@ mod tests {
         // First verify warms the names ETag cache.
         let now = PeerFetchToken::now_unix_seconds();
         let token1 = sign_token(vol_name, coord_id, now, &coord_key);
-        auth.verify(&token1.encode(), vol_ulid).await.unwrap();
+        auth.verify(&token1.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
 
         // Flip names to other_coord. ETag changes → next conditional
         // GET returns 200 with the new value.
@@ -958,7 +1097,7 @@ mod tests {
         // (different `issued_at` ⇒ different bearer bytes).
         let token2 = sign_token(vol_name, coord_id, now + 1, &coord_key);
         let err = auth
-            .verify(&token2.encode(), vol_ulid)
+            .verify(&token2.encode(), vol_ulid, RouteAuthMode::LineageGated)
             .await
             .expect_err("names flipped");
         assert!(matches!(err, AuthError::NotCurrentClaimer));
@@ -991,7 +1130,10 @@ mod tests {
         );
         let bearer = token.encode();
 
-        let result = auth.verify(&bearer, vol_ulid).await.unwrap();
+        let result = auth
+            .verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
         assert_eq!(result.coordinator_id, coord_id);
 
         // The verified-tokens map should not contain this entry —
@@ -1001,5 +1143,132 @@ mod tests {
             cache_size, 0,
             "boundary token should not enter the resolved cache"
         );
+    }
+
+    /// `SkeletonsOnly` mode skips the lineage walk: a request for a
+    /// `vol_id` *not* in the requesting volume's signed ancestry
+    /// passes auth, where `LineageGated` would reject it as
+    /// `OutsideLineage`. Models the early-rebind claim path —
+    /// requesting volume's provenance hasn't been signed yet, so
+    /// even our own ancestry is unwalkable.
+    #[tokio::test]
+    async fn skeletons_only_skips_lineage_walk() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+        let unrelated_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // LineageGated rejects: unrelated_ulid is not in vol_ulid's
+        // (singleton) ancestry.
+        let err = auth
+            .verify(&bearer, unrelated_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("lineage gate must reject");
+        assert!(matches!(err, AuthError::OutsideLineage));
+
+        // SkeletonsOnly accepts the same request — no ancestry walk.
+        let result = auth
+            .verify(&bearer, unrelated_ulid, RouteAuthMode::SkeletonsOnly)
+            .await
+            .unwrap();
+        assert_eq!(result.coordinator_id, coord_id);
+        assert_eq!(result.vol_id, unrelated_ulid);
+    }
+
+    /// Cache is keyed on mode: a `SkeletonsOnly` hit for a
+    /// non-ancestor `vol_id` must not satisfy a subsequent
+    /// `LineageGated` request for the same `(bearer, vol_id)`.
+    #[tokio::test]
+    async fn cache_does_not_cross_modes() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+        let unrelated_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // SkeletonsOnly succeeds and caches.
+        auth.verify(&bearer, unrelated_ulid, RouteAuthMode::SkeletonsOnly)
+            .await
+            .unwrap();
+
+        // LineageGated for the same bearer + vol_id must NOT be served
+        // from the SkeletonsOnly cache entry — it must run the lineage
+        // walk and reject.
+        let err = auth
+            .verify(&bearer, unrelated_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("must not serve cached SkeletonsOnly hit to LineageGated");
+        assert!(matches!(err, AuthError::OutsideLineage));
+    }
+
+    /// The rate-limiter hook runs after signature verification. A
+    /// limiter that always rejects produces `AuthError::RateLimited`.
+    #[tokio::test]
+    async fn rate_limiter_can_reject_authenticated_requests() {
+        struct AlwaysReject;
+        impl RateLimiter for AlwaysReject {
+            fn check(&self, _: &str, _: &str, _: RouteAuthMode) -> Result<(), &'static str> {
+                Err("test-policy")
+            }
+        }
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let auth = AuthState::with_freshness_window_and_limiter(
+            store.clone(),
+            DEFAULT_FRESHNESS_WINDOW_SECS,
+            Arc::new(AlwaysReject),
+        );
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        let err = auth
+            .verify(&bearer, vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("limiter rejected");
+        assert!(matches!(err, AuthError::RateLimited("test-policy")));
     }
 }

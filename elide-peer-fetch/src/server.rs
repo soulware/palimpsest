@@ -169,6 +169,25 @@ impl ResourceKind {
             Self::VolumeProvenance => "volume.provenance",
         }
     }
+
+    /// Auth mode this route requests from the pipeline.
+    ///
+    /// Skeleton routes (`volume.pub`, `volume.provenance`) carry
+    /// metadata already broadly readable from S3 within the bucket
+    /// trust boundary, and need to authenticate during the
+    /// claim-time chain walk *before* the requesting fork's own
+    /// `volume.provenance` is published. `SkeletonsOnly` skips the
+    /// lineage walk for those routes; payload routes (`.idx`,
+    /// `.manifest`, `.prefetch`) keep the full pipeline. See
+    /// `crate::auth::RouteAuthMode` for the security analysis.
+    fn auth_mode(self) -> crate::auth::RouteAuthMode {
+        match self {
+            Self::VolumePub | Self::VolumeProvenance => crate::auth::RouteAuthMode::SkeletonsOnly,
+            Self::Idx | Self::Prefetch | Self::SnapshotManifest => {
+                crate::auth::RouteAuthMode::LineageGated
+            }
+        }
+    }
 }
 
 /// Server context shared across handlers — cheap to clone.
@@ -268,15 +287,32 @@ async fn handle_segment_inner(
         }
     };
 
-    // Auth pipeline (steps 1–4).
+    // Auth pipeline. Mode is route-specific: skeleton routes skip
+    // the lineage walk so the claim-time chain pull authenticates
+    // before the requester's own provenance is published; payload
+    // routes keep the full check.
+    let mode = kind.auth_mode();
     let bearer_header = headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let bearer = parse_bearer(bearer_header).map_err(RouteError::Auth)?;
-    ctx.auth
-        .verify(bearer, vol_id)
+    let authorized = ctx
+        .auth
+        .verify(bearer, vol_id, mode)
         .await
         .map_err(RouteError::Auth)?;
+
+    // Audit log: every authenticated request, with mode visible.
+    // Operator surface for spotting anomalies (e.g. one coord
+    // hitting many unrelated `vol_id`s on skeleton routes — the
+    // route relaxation's predicted abuse shape).
+    info!(
+        "[peer-fetch] authorized: requester {coord_id} for volume {volume_name} → {url_vol_id}/{filename} ({mode:?})",
+        coord_id = authorized.coordinator_id,
+        volume_name = authorized.volume_name,
+        url_vol_id = vol_id,
+        filename = kind.wire_suffix(),
+    );
 
     // Step 5: local stat of the route's file. Skeleton files sit
     // directly under `by_id/<vol_id>/`; segment/snapshot files sit
@@ -696,10 +732,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn volume_pub_outside_lineage_is_403() {
-        // Skeleton routes go through the same auth pipeline, so a
-        // `vol_id` not in the requesting volume's signed lineage is
-        // rejected with 403 — same as the segment routes.
+    async fn volume_pub_outside_lineage_is_404_not_403() {
+        // Skeleton routes (`volume.pub`, `volume.provenance`) run
+        // under `RouteAuthMode::SkeletonsOnly` — the lineage walk
+        // is intentionally skipped so a claim-time chain pull can
+        // authenticate before the requester's own provenance is
+        // published. A request for an unrelated `vol_id` therefore
+        // passes auth and reaches the local-stat step, which 404s
+        // when the file isn't on disk.
+        //
+        // The lineage gate still applies to payload routes — see
+        // `vol_id_outside_lineage_is_403` for the `.idx` case.
         let f = fixture().await;
         let unrelated_ulid = Ulid::new();
         let token = sign_token(
@@ -715,7 +758,28 @@ mod tests {
             .unwrap();
 
         let (status, _) = run(&f.router, req).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn volume_provenance_outside_lineage_is_404_not_403() {
+        // Sibling test: same relaxation applies to volume.provenance.
+        let f = fixture().await;
+        let unrelated_ulid = Ulid::new();
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
+        let req = Request::builder()
+            .uri(format!("/v1/{}/volume.provenance", unrelated_ulid))
+            .header(http::header::AUTHORIZATION, bearer_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
