@@ -468,15 +468,22 @@ pub async fn resolve_handoff_verifier(
     })
 }
 
-/// Fetch a handoff snapshot manifest from S3, verify it under the
-/// right key, and return the parsed manifest alongside the
-/// [`HandoffVerifier`] that identified the key.
+/// Fetch a handoff snapshot manifest, verify it under the right key,
+/// and return the parsed manifest alongside the [`HandoffVerifier`]
+/// that identified the key.
 ///
 /// `fallback_pubkey` is the volume's own identity key, used when the
 /// manifest is a normal (non-recovery) handoff. For recovery
 /// manifests the recovering coordinator's pub is fetched and
 /// verified under the same path-binding rules as
 /// [`resolve_handoff_verifier`].
+///
+/// When `peer` is `Some`, the manifest bytes are tried over peer-
+/// fetch first and only fall through to S3 on a peer miss / network
+/// error. The signature is verified the same way regardless of which
+/// tier served the bytes; a tampering peer is detected here and
+/// surfaces as `ResolveHandoffError::SignatureInvalid` rather than a
+/// silent acceptance.
 ///
 /// Used by the claim path to inspect the released fork's segment
 /// list and decide whether to skip an empty intermediate fork.
@@ -485,25 +492,33 @@ pub async fn fetch_verified_handoff_manifest(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
     fallback_pubkey: &VerifyingKey,
+    peer: Option<&crate::prefetch::PeerFetchContext>,
 ) -> Result<(SnapshotManifest, HandoffVerifier), ResolveHandoffError> {
-    let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string())
-        .map_err(|e| ResolveHandoffError::ManifestRead(e.context("computing manifest key")))?;
-    let bytes = store
-        .get(&key)
-        .await
-        .map_err(|e| {
-            ResolveHandoffError::ManifestRead(
-                anyhow::Error::new(e).context(format!("fetching snapshot manifest at {key}")),
+    let bytes = if let Some(peer_ctx) = peer {
+        if let Some(b) = peer_ctx
+            .client
+            .fetch_snapshot_manifest(
+                &peer_ctx.endpoint,
+                &peer_ctx.volume_name,
+                vol_ulid,
+                snap_ulid,
             )
-        })?
-        .bytes()
-        .await
-        .map_err(|e| {
-            ResolveHandoffError::ManifestRead(
-                anyhow::Error::new(e)
-                    .context(format!("reading snapshot manifest bytes from {key}")),
-            )
-        })?;
+            .await
+        {
+            tracing::trace!(
+                "[handoff-fetch] peer-served manifest {vol_ulid}/{snap_ulid} ({} bytes)",
+                b.len()
+            );
+            b
+        } else {
+            tracing::trace!(
+                "[handoff-fetch] peer miss for manifest {vol_ulid}/{snap_ulid}; falling through to S3"
+            );
+            fetch_manifest_from_store(store, vol_ulid, snap_ulid).await?
+        }
+    } else {
+        fetch_manifest_from_store(store, vol_ulid, snap_ulid).await?
+    };
 
     let recovery =
         peek_snapshot_manifest_recovery(&bytes).map_err(ResolveHandoffError::ManifestParse)?;
@@ -533,6 +548,31 @@ pub async fn fetch_verified_handoff_manifest(
             ))
         }
     }
+}
+
+async fn fetch_manifest_from_store(
+    store: &Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+) -> Result<Bytes, ResolveHandoffError> {
+    let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string())
+        .map_err(|e| ResolveHandoffError::ManifestRead(e.context("computing manifest key")))?;
+    store
+        .get(&key)
+        .await
+        .map_err(|e| {
+            ResolveHandoffError::ManifestRead(
+                anyhow::Error::new(e).context(format!("fetching snapshot manifest at {key}")),
+            )
+        })?
+        .bytes()
+        .await
+        .map_err(|e| {
+            ResolveHandoffError::ManifestRead(
+                anyhow::Error::new(e)
+                    .context(format!("reading snapshot manifest bytes from {key}")),
+            )
+        })
 }
 
 #[cfg(test)]

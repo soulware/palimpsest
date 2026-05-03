@@ -20,10 +20,12 @@
 //! § "What's served" for the rationale.
 //!
 //! For the `.manifest` route the second URL component is a *snapshot*
-//! ULID, not a segment ULID. Auth steps 1–4 don't distinguish — the
-//! lineage check (step 4) only requires `<vol_id>` to be in the
-//! requesting volume's ancestry. Step 5 falls out as 404 if the
-//! specific artifact isn't present locally.
+//! ULID, not a segment ULID. The route runs under
+//! [`crate::auth::RouteAuthMode::SkeletonsOnly`] alongside
+//! `volume.pub` / `volume.provenance` — manifests are signed and the
+//! caller verifies before trusting bytes, and `skip_empty_intermediates`
+//! has to read each ancestor's manifest to discover its parent before
+//! the requester's own `volume.provenance` is published.
 //!
 //! Each request runs the [`crate::auth`] five-step verify pipeline
 //! before the local file is touched. A successful auth doesn't imply
@@ -172,20 +174,20 @@ impl ResourceKind {
 
     /// Auth mode this route requests from the pipeline.
     ///
-    /// Skeleton routes (`volume.pub`, `volume.provenance`) carry
-    /// metadata already broadly readable from S3 within the bucket
-    /// trust boundary, and need to authenticate during the
-    /// claim-time chain walk *before* the requesting fork's own
-    /// `volume.provenance` is published. `SkeletonsOnly` skips the
-    /// lineage walk for those routes; payload routes (`.idx`,
-    /// `.manifest`, `.prefetch`) keep the full pipeline. See
+    /// Skeleton-class routes (`volume.pub`, `volume.provenance`,
+    /// `.manifest`) carry signed metadata already broadly readable
+    /// from S3 within the bucket trust boundary, and need to
+    /// authenticate during the claim-time chain walk *before* the
+    /// requesting fork's own `volume.provenance` is published — so
+    /// the lineage walk is skipped. Payload routes (`.idx`,
+    /// `.prefetch`) keep the full pipeline. See
     /// `crate::auth::RouteAuthMode` for the security analysis.
     fn auth_mode(self) -> crate::auth::RouteAuthMode {
         match self {
-            Self::VolumePub | Self::VolumeProvenance => crate::auth::RouteAuthMode::SkeletonsOnly,
-            Self::Idx | Self::Prefetch | Self::SnapshotManifest => {
-                crate::auth::RouteAuthMode::LineageGated
+            Self::VolumePub | Self::VolumeProvenance | Self::SnapshotManifest => {
+                crate::auth::RouteAuthMode::SkeletonsOnly
             }
+            Self::Idx | Self::Prefetch => crate::auth::RouteAuthMode::LineageGated,
         }
     }
 }
@@ -774,6 +776,35 @@ mod tests {
         );
         let req = Request::builder()
             .uri(format!("/v1/{}/volume.provenance", unrelated_ulid))
+            .header(http::header::AUTHORIZATION, bearer_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, _) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn snapshot_manifest_outside_lineage_is_404_not_403() {
+        // `.manifest` runs under `RouteAuthMode::SkeletonsOnly` so that
+        // `skip_empty_intermediates` (and any other claim-time chain
+        // walker) can read each ancestor's signed manifest before the
+        // requester's own `volume.provenance` has been published — the
+        // requester's parent isn't even known until those manifests
+        // have been read. Manifests are signed and the caller verifies
+        // before trusting bytes, mirroring the `volume.pub` /
+        // `volume.provenance` relaxation.
+        let f = fixture().await;
+        let unrelated_ulid = Ulid::new();
+        let snap_ulid = Ulid::new();
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
+        let req = Request::builder()
+            .uri(format!("/v1/{}/{}.manifest", unrelated_ulid, snap_ulid))
             .header(http::header::AUTHORIZATION, bearer_header(&token))
             .body(Body::empty())
             .unwrap();

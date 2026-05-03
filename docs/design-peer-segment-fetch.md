@@ -43,7 +43,7 @@ Filemaps (`snapshots/<snap>.filemap`) are deliberately **not** part of the peer-
 - `volume.provenance` — per-fork signed lineage from `by_id/<vol_id>/volume.provenance`; the requester verifies the signature against the pubkey it trusts (embedded in the child's `ParentRef` for fork-chain ancestors, or the just-pulled `volume.pub` for extent-index ancestors)
 - `.body` — deferred; not in v1
 
-The skeleton routes (`volume.pub`, `volume.provenance`) close out the last category of S3 traffic on the claim path. With `manifest.toml` removed, the per-fork S3 footprint is exactly these two files plus `segments/` and `snapshots/` — all of which are now peer-eligible.
+The skeleton-class routes (`volume.pub`, `volume.provenance`, `<snap>.manifest`) close out the last category of S3 traffic on the claim path. With `manifest.toml` removed, the per-fork S3 footprint is exactly these three artifact families plus `segments/` — all of which are now peer-eligible. All three skeleton-class routes share an auth-mode relaxation that lets a claim-time chain walk authenticate before the requester's own `volume.provenance` is published; see "Route auth modes" below.
 
 The wire-level `.prefetch` name is deliberate: it tells the client "this is advice about what to warm," not "this is authoritative cache state." The new host's own `cache/<ulid>.present` is built from its own fetches, not copied from the peer.
 
@@ -64,7 +64,7 @@ GET /v1/<vol_id>/volume.provenance
 Authorization: Bearer <token>
 ```
 
-`vol_id` is the fork that owns the segment, snapshot, or skeleton file (the *home* volume, which may be an ancestor of the volume the requesting coordinator currently claims). The second URL component is a *segment* ULID for `.idx` / `.prefetch`, a *snapshot* ULID for `.manifest`, and a literal filename for `volume.pub` / `volume.provenance`; the auth pipeline doesn't distinguish — the lineage check only requires `vol_id` to be in the requesting volume's ancestry, and which-flavour membership falls out of step 5 (local file exists). The `/v1/` prefix reserves room for protocol evolution.
+`vol_id` is the fork that owns the segment, snapshot, or skeleton file (the *home* volume, which may be an ancestor of the volume the requesting coordinator currently claims). The second URL component is a *segment* ULID for `.idx` / `.prefetch`, a *snapshot* ULID for `.manifest`, and a literal filename for `volume.pub` / `volume.provenance`. The lineage check (step 4 in the verify pipeline below) only runs for payload routes (`.idx` / `.prefetch`); skeleton-class routes skip it — see "Route auth modes" — and which-flavour membership falls out of step 5 (local file exists). The `/v1/` prefix reserves room for protocol evolution.
 
 For the snapshot route, the coordinator's claim-time prefetch can also skip the S3 LIST entirely. The manifest name is deterministic from the branch-point snapshot ULID, so a known-branch prefetch issues a single peer GET and falls back to a keyed S3 GET (using the canonical `by_id/<vol>/snapshots/<YYYYMMDD>/<snap>.manifest` path) on a peer miss. The S3 LIST stays in the listed-path branch (no known branch, e.g. when prefetching a fork's own accumulated snapshots) and as a fallback for any peer-less callers.
 
@@ -180,6 +180,16 @@ The peer's verify pipeline is five checks, each tied to a property the auth mode
 | 5 | `index/<ulid>.idx` (or `cache/<ulid>.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
 
 Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves).
+
+#### Route auth modes
+
+Step 4 (lineage walk) only runs for **payload routes**: `.idx`, `.prefetch`. The **skeleton-class routes** — `volume.pub`, `volume.provenance`, `<snap>.manifest` — declare `RouteAuthMode::SkeletonsOnly` and skip step 4. They still run steps 1–3 (token integrity + freshness + signature + `names/<volume>` ownership) and step 5 (local file exists).
+
+The reason is that step 4 is *intent scoping* — "this requester actually has business with the URL's `vol_id`" — not confidentiality. Within the bucket trust boundary every authenticated coordinator already has S3 read access to every key, so the lineage gate isn't keeping anything secret; it's filtering against accidental over-fetch. The skeleton-class artifacts are signed bytes the caller verifies before trusting (Ed25519 verifying key, signed lineage record, signed snapshot manifest), so peer tampering is detected even without the gate.
+
+Relaxing those routes is what makes claim-time chain walks work end-to-end. The new fork's `volume.provenance` isn't published until `finalize_claim_fork` — and that finalisation needs the verified parent, which needs `skip_empty_intermediates` to read each ancestor's signed manifest, which under `LineageGated` would itself need the new fork's provenance. Without `SkeletonsOnly` the loop would never start; the chain walk would 401 every request and silently fall through to S3 on the very path peer-fetch was added to accelerate.
+
+DoS pressure on the now-broader skeleton surface is the responsibility of the [`RateLimiter`] hook, which is consulted before the cache regardless of mode.
 
 The coordinator-key model has two operational benefits over per-volume signing:
 

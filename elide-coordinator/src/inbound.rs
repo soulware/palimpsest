@@ -3981,6 +3981,7 @@ async fn skip_empty_intermediates(
             effective_vol,
             effective_snap,
             &fallback_pubkey,
+            peer,
         )
         .await
         .map_err(|e| {

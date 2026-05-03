@@ -13,10 +13,10 @@
 //! | 4    | URL `vol_id` is in ancestry     | 403        |
 //! | 5    | Local file exists (route-level) | 404        |
 //!
-//! Step 4 only runs under [`RouteAuthMode::LineageGated`]. Skeleton
-//! routes (`volume.pub`, `volume.provenance`) request
-//! [`RouteAuthMode::SkeletonsOnly`] and skip step 4 — see that
-//! enum's documentation for the security analysis. Step 5 is the
+//! Step 4 only runs under [`RouteAuthMode::LineageGated`]. Skeleton-
+//! class routes (`volume.pub`, `volume.provenance`, `.manifest`)
+//! request [`RouteAuthMode::SkeletonsOnly`] and skip step 4 — see
+//! that enum's documentation for the security analysis. Step 5 is the
 //! route handler's responsibility — it's a stat that falls out as
 //! 404 if the file isn't present locally.
 //!
@@ -209,22 +209,25 @@ impl RateLimiter for NoRateLimit {
     }
 }
 
-/// Auth mode declared by the route registration. Skeleton routes
-/// (`volume.pub`, `volume.provenance`) skip the lineage walk so a
-/// claim-time chain pull can authenticate before the requesting
-/// fork's own provenance is published. Payload routes (`.idx`,
-/// `.manifest`) keep the full pipeline.
+/// Auth mode declared by the route registration. Skeleton-class
+/// routes (`volume.pub`, `volume.provenance`, `.manifest`) skip the
+/// lineage walk so a claim-time chain pull can authenticate before
+/// the requesting fork's own provenance is published. Payload
+/// routes (`.idx`, `.prefetch`) keep the full pipeline.
 ///
 /// The check that the lineage gate enforces is *intent scoping* —
 /// "this requester actually has business with the URL's vol_id" —
 /// not confidentiality. Within a bucket every authenticated
-/// coordinator already has S3 read access to every key. Skeleton
-/// metadata (a 32-byte verifying key + a signed lineage record) is
-/// already broadly readable from S3; relaxing the peer-side gate
-/// for those routes mirrors that reality and lets peer-fetch warm
-/// chain walks during the early-rebind phase of `volume claim`,
-/// when the requester's own `volume.provenance` hasn't been signed
-/// yet (parent isn't known until handoff verification).
+/// coordinator already has S3 read access to every key. The
+/// skeleton-class artifacts (a 32-byte verifying key, a signed
+/// lineage record, a signed snapshot manifest) are already broadly
+/// readable from S3 and the caller verifies signatures before
+/// trusting bytes; relaxing the peer-side gate for those routes
+/// mirrors that reality. It lets peer-fetch warm chain walks during
+/// the early-rebind phase of `volume claim`, when the requester's
+/// own `volume.provenance` hasn't been signed yet (parent isn't
+/// known until handoff verification, and `skip_empty_intermediates`
+/// has to read each ancestor's manifest to find that parent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RouteAuthMode {
     /// Steps 1-3 only: token integrity + freshness + signature +
