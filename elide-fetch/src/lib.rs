@@ -488,7 +488,7 @@ impl SegmentFetcher for RemoteFetcher {
         body_dir: &Path,
         body_section_start: u64,
         populated_entries: &[u32],
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         warm_segment_impl(
             &*self.store,
             owner_vol_id,
@@ -1025,8 +1025,8 @@ fn warm_segment_impl(
     body_dir: &Path,
     body_section_start: u64,
     populated_entries: &[u32],
-) -> io::Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+) -> io::Result<u64> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     let segment_id = segment_ulid.to_string();
     let idx_path = index_dir.join(format!("{segment_id}.idx"));
@@ -1048,7 +1048,7 @@ fn warm_segment_impl(
 
     let batches = plan_warm_batches(&entries, populated_entries, &is_present, max_batch_bytes);
     if batches.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     std::fs::create_dir_all(body_dir)?;
@@ -1064,6 +1064,7 @@ fn warm_segment_impl(
     // a shared cursor, runs the GET + verify + pwrite, and records the
     // entry indices it warmed for the final `.present` OR.
     let cursor = AtomicUsize::new(0);
+    let bytes_fetched = AtomicU64::new(0);
     let warmed: Mutex<Vec<u32>> = Mutex::new(Vec::with_capacity(populated_entries.len()));
     let first_err: Mutex<Option<io::Error>> = Mutex::new(None);
 
@@ -1071,6 +1072,7 @@ fn warm_segment_impl(
         let workers = WARM_INTRA_SEGMENT_PARALLELISM.min(batches.len());
         for _ in 0..workers {
             let cursor = &cursor;
+            let bytes_fetched = &bytes_fetched;
             let batches = &batches;
             let warmed = &warmed;
             let first_err = &first_err;
@@ -1100,7 +1102,8 @@ fn warm_segment_impl(
                         body_section_start,
                         batch,
                     ) {
-                        Ok(()) => {
+                        Ok(n) => {
+                            bytes_fetched.fetch_add(n, Ordering::Relaxed);
                             let mut g = warmed.lock().expect("warmed mutex poisoned");
                             for idx in batch.start_entry..=batch.end_entry_inclusive {
                                 g.push(idx as u32);
@@ -1123,7 +1126,7 @@ fn warm_segment_impl(
     }
     let mut warmed = warmed.into_inner().expect("warmed mutex poisoned");
     if warmed.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     // Single fsync of .body covers every parallel pwrite above.
@@ -1161,13 +1164,15 @@ fn warm_segment_impl(
     segment::write_file_atomic(&present_path, &new_present)
         .map_err(|e| io::Error::other(format!("write .present for warm: {e}")))?;
 
+    let bytes_fetched = bytes_fetched.load(Ordering::Relaxed);
     tracing::debug!(
         segment_id,
         batches = batches.len(),
         entries_warmed = warmed.len(),
+        bytes_fetched,
         "warm_segment complete"
     );
-    Ok(())
+    Ok(bytes_fetched)
 }
 
 /// Fetch one warming batch directly from the segment's owning volume
@@ -1184,7 +1189,7 @@ fn warm_one_batch(
     body_file: &std::fs::File,
     body_section_start: u64,
     batch: &WarmBatch,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     use std::os::unix::fs::FileExt;
 
     let range_start = body_section_start + batch.body_start;
@@ -1236,7 +1241,7 @@ fn warm_one_batch(
     body_file
         .write_all_at(&bytes, batch.body_start)
         .map_err(|e| io::Error::other(format!("pwrite .body for warm: {e}")))?;
-    Ok(())
+    Ok(bytes.len() as u64)
 }
 
 /// Build the S3 object key for a segment.
