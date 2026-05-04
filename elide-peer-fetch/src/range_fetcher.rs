@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use elide_fetch::RangeFetcher;
@@ -35,6 +36,58 @@ use ulid::Ulid;
 
 use crate::client::BodyFetchClient;
 use crate::endpoint::PeerEndpoint;
+
+/// Snapshot of body-byte counters split by source. Returned by
+/// [`PeerRangeFetcher::counters`].
+///
+/// `peer` counts only bytes the peer actually returned (full hit and
+/// the prefix in a partial-coverage 206). `store` counts only bytes
+/// the decorator pulled from the inner fetcher *as part of a body
+/// range request* — full miss (peer 404 / network error / token
+/// failure) and the remainder of a partial-coverage splice. Inner
+/// calls for non-body ranges (header / index / inline reads, or any
+/// non-segment key) are not counted here — those bypass the peer
+/// path entirely and there's no peer-vs-store decision to attribute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerFetchCounters {
+    pub body_bytes_from_peer: u64,
+    pub body_bytes_from_store: u64,
+}
+
+/// Atomic counters shared across `PeerRangeFetcher` clones. Cheap to
+/// clone — internally an `Arc`.
+#[derive(Debug, Clone, Default)]
+pub struct PeerFetchCountersHandle {
+    inner: Arc<PeerFetchCountersInner>,
+}
+
+#[derive(Debug, Default)]
+struct PeerFetchCountersInner {
+    body_bytes_from_peer: AtomicU64,
+    body_bytes_from_store: AtomicU64,
+}
+
+impl PeerFetchCountersHandle {
+    fn add_peer(&self, n: u64) {
+        self.inner
+            .body_bytes_from_peer
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn add_store(&self, n: u64) {
+        self.inner
+            .body_bytes_from_store
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Take an atomic snapshot. Counters keep advancing afterward.
+    pub fn snapshot(&self) -> PeerFetchCounters {
+        PeerFetchCounters {
+            body_bytes_from_peer: self.inner.body_bytes_from_peer.load(Ordering::Relaxed),
+            body_bytes_from_store: self.inner.body_bytes_from_store.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Decorator that tries a peer-fetch server for body byte ranges
 /// before falling through to `inner`.
@@ -50,6 +103,7 @@ pub struct PeerRangeFetcher {
     data_dir: PathBuf,
     body_section_start_cache: Arc<Mutex<HashMap<Ulid, u64>>>,
     runtime: tokio::runtime::Handle,
+    counters: PeerFetchCountersHandle,
 }
 
 impl PeerRangeFetcher {
@@ -73,7 +127,15 @@ impl PeerRangeFetcher {
             data_dir,
             body_section_start_cache: Arc::new(Mutex::new(HashMap::new())),
             runtime,
+            counters: PeerFetchCountersHandle::default(),
         }
+    }
+
+    /// Handle for reading the per-decorator body-byte counters. Cheap
+    /// to clone; readers see live values without coordinating with
+    /// the decorator.
+    pub fn counters(&self) -> PeerFetchCountersHandle {
+        self.counters.clone()
     }
 
     /// Resolve the body-section start offset for `seg_ulid`, reading
@@ -128,6 +190,7 @@ impl RangeFetcher for PeerRangeFetcher {
                 if let Some(bytes) = bytes {
                     let got = bytes.len() as u64;
                     if got == body_len {
+                        self.counters.add_peer(got);
                         tracing::trace!(
                             target = "peer-fetch::range",
                             %vol_id,
@@ -150,6 +213,8 @@ impl RangeFetcher for PeerRangeFetcher {
                         let remainder_start = start + got;
                         let remainder =
                             self.inner.get_range(key, remainder_start, end_exclusive)?;
+                        self.counters.add_peer(got);
+                        self.counters.add_store(remainder.len() as u64);
                         let mut combined = Vec::with_capacity(body_len as usize);
                         combined.extend_from_slice(&bytes);
                         combined.extend_from_slice(&remainder);
@@ -166,9 +231,19 @@ impl RangeFetcher for PeerRangeFetcher {
                     }
                     // got == 0: nothing useful from peer; fall through.
                 }
+                // Body-range fall-through (peer miss / partial covers
+                // nothing / no token / network error). Attribute the
+                // whole inner result to "store" so totals add up to
+                // exactly the body bytes the caller requested.
+                let bytes = self.inner.get_range(key, start, end_exclusive)?;
+                self.counters.add_store(bytes.len() as u64);
+                return Ok(bytes);
             }
         }
 
+        // Non-body-range request (header / index / inline / non-segment
+        // key). Not attributable to the peer-vs-store split; bypass
+        // counters.
         self.inner.get_range(key, start, end_exclusive)
     }
 }
@@ -448,12 +523,14 @@ mod tests {
             f.data_dir.path().to_owned(),
             tokio::runtime::Handle::current(),
         );
+        let counters = fetcher.counters();
 
         // Ask for the full body range expressed in absolute segment
         // offsets — what fetch_batch passes today.
         let key = segment_key(f.vol_ulid, f.seg_ulid);
         let absolute_start = f.body_section_start;
         let absolute_end = f.body_section_start + f.body_payload.len() as u64;
+        let body_len = f.body_payload.len() as u64;
         let bytes = tokio::task::spawn_blocking(move || {
             fetcher.get_range(&key, absolute_start, absolute_end)
         })
@@ -467,6 +544,10 @@ mod tests {
             "inner fetcher must not be called on peer hit; got {:?}",
             inner.calls()
         );
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.body_bytes_from_peer, body_len);
+        assert_eq!(snap.body_bytes_from_store, 0);
     }
 
     #[tokio::test]
@@ -495,6 +576,7 @@ mod tests {
             f.data_dir.path().to_owned(),
             tokio::runtime::Handle::current(),
         );
+        let counters = fetcher.counters();
 
         let key = segment_key(f.vol_ulid, f.seg_ulid);
         let absolute_start = f.body_section_start;
@@ -511,6 +593,12 @@ mod tests {
         assert_eq!(calls.len(), 1, "inner must be called exactly once");
         assert_eq!(calls[0].1, absolute_start);
         assert_eq!(calls[0].2, absolute_end);
+
+        // Whole body range came from the inner store; counters
+        // attribute it to `body_bytes_from_store`.
+        let snap = counters.snapshot();
+        assert_eq!(snap.body_bytes_from_peer, 0);
+        assert_eq!(snap.body_bytes_from_store, 16);
     }
 
     /// Two Data entries; first is present on the peer, second is
@@ -538,6 +626,7 @@ mod tests {
             f.data_dir.path().to_owned(),
             tokio::runtime::Handle::current(),
         );
+        let counters = fetcher.counters();
 
         let key = segment_key(f.vol_ulid, f.seg_ulid);
         let absolute_start = f.body_section_start;
@@ -565,6 +654,51 @@ mod tests {
             "remainder starts after the peer-covered prefix"
         );
         assert_eq!(calls[0].2, absolute_end);
+
+        // Splice path attributes the prefix to peer and remainder to
+        // store; the two should sum to the body request length.
+        let snap = counters.snapshot();
+        assert_eq!(snap.body_bytes_from_peer, 4096);
+        assert_eq!(snap.body_bytes_from_store, 4096);
+    }
+
+    /// Header / non-segment-key reads bypass the peer-vs-store split
+    /// and must not register on the body-byte counters.
+    #[tokio::test]
+    async fn counters_skip_non_body_ranges() {
+        let f = live_fixture().await;
+        let signer = Arc::new(TestBodySigner {
+            vol_ulid: f.vol_ulid,
+            key: f.vol_key.clone(),
+        });
+        let client = BodyFetchClient::new(signer).unwrap();
+        let inner = Arc::new(RecordingInner::new(vec![0xAAu8]));
+        let fetcher = PeerRangeFetcher::new(
+            inner.clone(),
+            client,
+            f.peer.clone(),
+            f.data_dir.path().to_owned(),
+            tokio::runtime::Handle::current(),
+        );
+        let counters = fetcher.counters();
+
+        // Header range (entirely below body_section_start).
+        let key = segment_key(f.vol_ulid, f.seg_ulid);
+        tokio::task::spawn_blocking({
+            let key = key.clone();
+            let f = fetcher;
+            move || f.get_range(&key, 0, 32)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.body_bytes_from_peer, 0);
+        assert_eq!(
+            snap.body_bytes_from_store, 0,
+            "header reads bypass body counters"
+        );
     }
 
     /// Ranges that aren't entirely inside the body section (e.g.

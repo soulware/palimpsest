@@ -360,7 +360,10 @@ mod imp {
     ///
     /// A second signal short-circuits to `process::exit(130)` so an
     /// impatient operator is never trapped.
-    fn spawn_ublk_signal_watcher(client: VolumeClient) -> io::Result<std::thread::JoinHandle<()>> {
+    fn spawn_ublk_signal_watcher(
+        client: VolumeClient,
+        peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle>,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
         let sfd = nix::sys::signalfd::SignalFd::new(&shutdown_sigset())
             .map_err(|e| io::Error::other(format!("signalfd: {e}")))?;
         std::thread::Builder::new()
@@ -407,6 +410,7 @@ mod imp {
                 if let Err(e) = client.flush() {
                     tracing::warn!("ublk shutdown flush: {e}");
                 }
+                crate::log_peer_fetch_counters_at_shutdown(peer_counters.as_ref());
                 std::process::exit(0);
             })
             .map_err(io::Error::other)
@@ -436,9 +440,10 @@ mod imp {
         // anything else propagates. NBD uses the same helper.
         let mut volume = crate::volume_open::open_volume_with_retry(dir, by_id_dir)?;
 
-        if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)?
-        {
-            volume.set_fetcher(Arc::new(fetcher));
+        let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
+        if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+            volume.set_fetcher(Arc::new(build.fetcher));
+            peer_counters = build.peer_counters;
             println!("[demand-fetch enabled]");
         }
 
@@ -460,7 +465,7 @@ mod imp {
         // so the kernel's daemon-exit detection parks the device in
         // QUIESCED for the next serve to recover. See
         // `docs/design-ublk-shutdown-park.md`.
-        let _sig_watcher = spawn_ublk_signal_watcher(client.clone())?;
+        let _sig_watcher = spawn_ublk_signal_watcher(client.clone(), peer_counters)?;
 
         let persisted_id = read_ublk_id(dir)?;
         let (target_id, recovering) = match plan_route(persisted_id, dev_id, ublk_device_exists) {

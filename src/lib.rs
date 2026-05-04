@@ -18,7 +18,9 @@ use std::sync::{Arc, OnceLock};
 
 use elide_core::signing::VOLUME_KEY_FILE;
 use elide_fetch::{FetchConfig, RangeFetcher, RemoteFetcher};
-use elide_peer_fetch::{BodyFetchClient, PeerEndpoint, PeerRangeFetcher, VolumeBodySigner};
+use elide_peer_fetch::{
+    BodyFetchClient, PeerEndpoint, PeerFetchCountersHandle, PeerRangeFetcher, VolumeBodySigner,
+};
 use object_store::ObjectStore;
 
 /// Bundle of inputs the volume daemon needs to construct its remote
@@ -55,6 +57,32 @@ fn peer_fetch_runtime_handle() -> io::Result<tokio::runtime::Handle> {
     Ok(rt.handle().clone())
 }
 
+/// Output of [`build_volume_fetcher`]. Always returns the
+/// `RemoteFetcher`; the optional `peer_counters` handle is present iff
+/// the peer-fetch decorator was actually stacked (peer endpoint
+/// available and `volume.key` on disk).
+pub struct VolumeFetcherBuild {
+    pub fetcher: RemoteFetcher,
+    pub peer_counters: Option<PeerFetchCountersHandle>,
+}
+
+/// Emit a single tracing event with the final peer-fetch counter
+/// snapshot. Called from the volume daemon's signal-watcher thread
+/// just before `process::exit`. No-op when peer-fetch was not enabled
+/// for this run.
+pub fn log_peer_fetch_counters_at_shutdown(counters: Option<&PeerFetchCountersHandle>) {
+    let Some(counters) = counters else {
+        return;
+    };
+    let snap = counters.snapshot();
+    tracing::info!(
+        target = "peer-fetch::counters",
+        body_bytes_from_peer = snap.body_bytes_from_peer,
+        body_bytes_from_store = snap.body_bytes_from_store,
+        "peer-fetch shutdown counters"
+    );
+}
+
 /// Build the `RemoteFetcher` the volume daemon uses for demand-fetch.
 ///
 /// When `inputs.peer_endpoint` is `Some` and the fork has a local
@@ -70,12 +98,12 @@ pub fn build_volume_fetcher(
     fork_dir: &Path,
     fork_dirs: &[PathBuf],
     inputs: VolumeFetchInputs,
-) -> io::Result<Option<RemoteFetcher>> {
+) -> io::Result<Option<VolumeFetcherBuild>> {
     let Some(config) = inputs.fetch_config else {
         return Ok(None);
     };
     let store: Arc<dyn RangeFetcher> = config.build_fetcher()?;
-    let store = match inputs.peer_endpoint {
+    let (store, peer_counters) = match inputs.peer_endpoint {
         Some(endpoint) if fork_dir.join(VOLUME_KEY_FILE).exists() => {
             let vol_ulid_str = elide_fetch::derive_volume_id(fork_dir)?;
             let vol_ulid = ulid::Ulid::from_string(&vol_ulid_str)
@@ -89,15 +117,11 @@ pub fn build_volume_fetcher(
                 .and_then(Path::parent)
                 .unwrap_or(fork_dir)
                 .to_path_buf();
-            Arc::new(PeerRangeFetcher::new(
-                store,
-                body_client,
-                endpoint,
-                data_dir,
-                runtime,
-            )) as Arc<dyn RangeFetcher>
+            let peer = PeerRangeFetcher::new(store, body_client, endpoint, data_dir, runtime);
+            let counters = peer.counters();
+            (Arc::new(peer) as Arc<dyn RangeFetcher>, Some(counters))
         }
-        _ => store,
+        _ => (store, None),
     };
     let fetcher = RemoteFetcher::from_store(
         store,
@@ -106,7 +130,10 @@ pub fn build_volume_fetcher(
             .fetch_batch_bytes
             .unwrap_or(elide_fetch::DEFAULT_FETCH_BATCH_BYTES),
     )?;
-    Ok(Some(fetcher))
+    Ok(Some(VolumeFetcherBuild {
+        fetcher,
+        peer_counters,
+    }))
 }
 
 /// Build an `object_store` client from a [`FetchConfig`].
