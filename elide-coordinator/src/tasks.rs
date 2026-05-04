@@ -204,7 +204,7 @@ pub async fn run_volume_tasks(
         let prefetch_result =
             prefetch::prefetch_indexes(&fork_dir, &store, peer_ctx.as_ref()).await;
         match &prefetch_result {
-            Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 => {
+            Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 || r.hints_fetched > 0 => {
                 if r.fetched > 0 {
                     info!(
                         "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store, {} superseded by GC)",
@@ -220,6 +220,12 @@ pub async fn run_volume_tasks(
                         r.snapshots_fetched,
                         r.snapshots_from_peer,
                         r.snapshots_fetched - r.snapshots_from_peer,
+                    );
+                }
+                if r.hints_fetched > 0 {
+                    info!(
+                        "[prefetch {volume_id}{volume_name}] persisted {} prefetch hint(s) for body warming",
+                        r.hints_fetched,
                     );
                 }
             }

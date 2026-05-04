@@ -923,7 +923,11 @@ fn serve_readonly_volume_listener(
     let mut volume = open_readonly_volume_with_retry(dir, by_id_dir)?;
 
     if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
-        volume.set_fetcher(std::sync::Arc::new(build.fetcher));
+        let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
+            std::sync::Arc::new(build.fetcher);
+        let fork_dirs = volume.fork_dirs();
+        volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
+        crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
         println!("[demand-fetch enabled]");
     }
 
@@ -964,7 +968,11 @@ fn run_volume_ipc_only(
 
     let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
     if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
-        volume.set_fetcher(std::sync::Arc::new(build.fetcher));
+        let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
+            std::sync::Arc::new(build.fetcher);
+        let fork_dirs = volume.fork_dirs();
+        volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
+        crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
         peer_counters = build.peer_counters;
     }
 
@@ -1003,7 +1011,11 @@ fn serve_volume_listener(
 
     let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
     if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
-        volume.set_fetcher(std::sync::Arc::new(build.fetcher));
+        let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
+            std::sync::Arc::new(build.fetcher);
+        let fork_dirs = volume.fork_dirs();
+        volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
+        crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
         peer_counters = build.peer_counters;
         println!("[demand-fetch enabled]");
     }

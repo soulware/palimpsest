@@ -90,7 +90,7 @@ It's not a perfect signal:
 - Body-cache eviction can clear bits even though the guest accessed them earlier.
 - Speculative prefetch can mark bits the guest never read.
 
-But it is workload-shaped, free (already exists in a usable form on the peer), and a strict superset of "guest accesses that survived in cache" — i.e. it captures the warm working set. v1 uses it solely to drive **background byte-range prefetch from S3** after `volume claim`: parse the hint, issue Range-GETs to S3 for the indicated bytes, populate the new host's `cache/<ulid>.body`. The new host's `cache/<ulid>.present` is then built from the bits it actually fetched — never from the wire response.
+But it is workload-shaped, free (already exists in a usable form on the peer), and a strict superset of "guest accesses that survived in cache" — i.e. it captures the warm working set. v1 uses it solely to drive **background byte-range prefetch from S3** after `volume claim`: parse the hint, issue Range-GETs to S3 for the indicated bytes, populate the new host's `cache/<ulid>.body`. The new host's `cache/<ulid>.present` is then built from the bits it actually fetched — never from the wire response. (Once peer body fetch lands, those Range GETs flow through the same `PeerRangeFetcher` the demand path uses, so warming runs peer-first and falls through to S3 — see "Body prefetch on claim" below.)
 
 If the peer has evicted body cache (so its `.present` is all-zeros or absent), the `.prefetch` response is empty or 404; the hint degrades to "demand-fetch only" — same as no peer at all. That's a graceful floor, not a failure.
 
@@ -179,6 +179,104 @@ No multi-range responses. A peer with gaps in the middle of the requested range 
 Signature verification on body bytes is per-extent against the signed `.idx`, same as on the S3 path.
 
 The body-fetch path is genuinely more complex than `.idx` (range arithmetic, partial-coverage semantics, larger transfers, more failure modes during streaming). Validating `.idx` first ensures we only pay that complexity if v1 has demonstrated peer fetch is actually paying off.
+
+### Body prefetch on claim (proposed, v1.2)
+
+> **Proposed:** kick off background body warming as soon as a fork has
+> been claimed and a peer has been discovered, using the `.prefetch`
+> hint to drive Range GETs through the same `PeerRangeFetcher` the
+> demand-fetch path already uses. Goal: by the time the guest issues
+> its first IO, the working set the previous host had warm is already
+> on the new host's `cache/<ulid>.body`, and the peer can subsequently
+> be lost (host down, body cache evicted) without any of those bytes
+> falling back to S3.
+>
+> The shape is "copy the peer's warm working set across" — for a fork
+> the peer was actively running, the hint marks ~the boot working set
+> (`findings.md`: ~130 MB out of a ~2 GB image), so the wire volume is
+> small and the win is correspondingly local.
+>
+> #### Ownership split follows the signer boundary
+>
+> The hint is an index-class artifact (signed under `coordinator.key`);
+> the coordinator's `prefetch_fork` already does a per-segment peer
+> walk for `.idx` on the per-fork task, and fetches the `.prefetch`
+> alongside in the same loop, on the same HTTP/2 connection, with the
+> same token. The response is persisted as `cache/<ulid>.prefetch-hint`
+> — visible alongside the cache files it is about to populate.
+>
+> Body bytes are signed under `volume.key`, held by the volume daemon
+> process. So the body prefetch task lives in the volume daemon, not
+> in the coordinator. At `volume up` it scans `cache/*.prefetch-hint`,
+> reads each segment's local `.idx` to translate populated entry
+> indices into body-relative byte ranges, coalesces adjacent populated
+> entries into runs, and dispatches the runs through
+> `PeerRangeFetcher.get_range`. Demand-fetch and prefetch share one
+> fetcher, so a guest read that races with prefetch is absorbed by the
+> inner cache layer rather than double-fetched. Cache writes and
+> `.present` updates land through the existing path.
+>
+> #### Hint location: `cache/<ulid>.prefetch-hint`
+>
+> Sits alongside `.body` and `.present` for the same segment.
+> Inspectable by `ls cache/`. Written by the coordinator at hint-fetch
+> time; deleted by the volume daemon once every populated entry has
+> been attempted (peer hit, peer-then-S3 fallback, or peer 404 +
+> deliberate skip — the file's job is done as soon as no further
+> outstanding work remains). A daemon restart re-derives the residual
+> work set by intersecting the on-disk hint with the on-disk
+> `.present` (entries set in the hint but not in `.present` are still
+> outstanding) and resumes — no separate progress journal is needed.
+>
+> An empty or missing `.prefetch` response (peer evicted body cache,
+> or fork has no `.present`) leaves no hint file on disk. Nothing to
+> warm; demand-fetch handles that segment.
+>
+> #### Concurrency
+>
+> Bounded prefetch parallelism — a small handful of in-flight ranges
+> per fork, well below the demand-fetch headroom. The HTTP/2
+> connection pool is shared with demand reads, so a guest IO spike
+> wins by burst rather than by an explicit scheduler. Sized by
+> measurement once the path is exercised; v1.2 starts with a fixed
+> low constant and revisits if findings warrant.
+>
+> #### Ordering
+>
+> Writable head's segments first, then ancestors in lineage order.
+> Most-likely-touched bytes warm earliest, so the demand-fetch path
+> is least likely to find a cold extent before prefetch reaches it.
+> Within a segment, runs are issued in offset order — smallest body
+> offset first — to keep the on-disk `.body` writes sequential.
+>
+> #### Coalescing
+>
+> Adjacent populated entries → one Range GET. The hint is typically
+> dense (`.present` reflects whole-extent reads, not byte-granular
+> access), so per-entry GETs would balloon the request count for no
+> latency win. Maximum coalesced run size is capped to the same
+> `fetch_batch_bytes` the demand path uses — keeps individual GET
+> sizes bounded and naturally rate-limits any one segment's
+> contribution to outstanding work.
+>
+> #### Failure modes
+>
+> Peer 404 / partial coverage / unreachable falls through to S3 by
+> exactly the same path as demand reads — body prefetch invents no
+> new failure handling. A peer that evicted its body cache between
+> hint emission and range fetch produces 404s; the warming shrinks
+> to "demand-fetch only" for those segments, identical to having no
+> peer at all. A peer that goes away mid-prefetch fails the in-flight
+> ranges to S3 fallback, then subsequent ranges go straight to S3.
+>
+> #### What this surfaces
+>
+> Same shape as the v1 success-signal counters: per-fork totals for
+> ranges-fetched / bytes-fetched / peer-hit-rate / S3-fallback
+> reasons. The handoff use case is what makes the hint dense and the
+> peer-hit-rate meaningful; image-pull-at-scale (no warm peer) leaves
+> hints empty and is a no-op for body prefetch — falls through cleanly,
+> as today.
 
 ## Auth: claim-derived bearer tokens, verified against S3
 
