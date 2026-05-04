@@ -47,8 +47,7 @@ fn remote_fetcher_factory(search_dirs: &[PathBuf]) -> Option<Box<dyn SegmentFetc
     let by_id_dir = dir0.parent()?;
     let data_dir = by_id_dir.parent().unwrap_or(by_id_dir);
     let cfg = FetchConfig::load(data_dir).ok().flatten()?;
-    let fork_dirs: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
-    RemoteFetcher::new(&cfg, &fork_dirs)
+    RemoteFetcher::new(&cfg)
         .ok()
         .map(|f| Box::new(f) as Box<dyn SegmentFetcher>)
 }

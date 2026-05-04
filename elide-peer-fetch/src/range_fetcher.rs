@@ -175,69 +175,107 @@ impl RangeFetcher for PeerRangeFetcher {
             // Resolve body_section_start. A failure here (idx missing,
             // bad magic) is non-fatal for peer-fetch purposes — fall
             // through to the inner fetcher.
-            if let Ok(body_section_start) = self.body_section_start(vol_id, seg_ulid)
-                && start >= body_section_start
-            {
-                let body_start = start - body_section_start;
-                let body_len = end_exclusive - start;
-                let client = self.client.clone();
-                let endpoint = self.endpoint.clone();
-                let bytes = self.runtime.block_on(async move {
-                    client
-                        .fetch_body_range(&endpoint, vol_id, seg_ulid, body_start, body_len)
-                        .await
-                });
-                if let Some(bytes) = bytes {
-                    let got = bytes.len() as u64;
-                    if got == body_len {
-                        self.counters.add_peer(got);
-                        tracing::trace!(
-                            target = "peer-fetch::range",
-                            %vol_id,
-                            %seg_ulid,
-                            body_start,
-                            body_len,
-                            "peer body range served"
-                        );
-                        return Ok(bytes.to_vec());
+            match self.body_section_start(vol_id, seg_ulid) {
+                Ok(body_section_start) if start >= body_section_start => {
+                    let body_start = start - body_section_start;
+                    let body_len = end_exclusive - start;
+                    let client = self.client.clone();
+                    let endpoint = self.endpoint.clone();
+                    let bytes = self.runtime.block_on(async move {
+                        client
+                            .fetch_body_range(&endpoint, vol_id, seg_ulid, body_start, body_len)
+                            .await
+                    });
+                    if let Some(bytes) = bytes {
+                        let got = bytes.len() as u64;
+                        if got == body_len {
+                            self.counters.add_peer(got);
+                            tracing::info!(
+                                target = "peer-fetch::range",
+                                %vol_id,
+                                %seg_ulid,
+                                body_start,
+                                body_len,
+                                "body range served from peer"
+                            );
+                            return Ok(bytes.to_vec());
+                        }
+                        if got > 0 && got < body_len {
+                            // Partial coverage. The peer covered
+                            // `[start, start + got)`; ask the inner
+                            // fetcher for the remainder and splice. A
+                            // failure on the remainder collapses the
+                            // whole request to inner — we don't strand
+                            // the caller with a partial result and we
+                            // don't double-count peer bytes when the
+                            // inner fetch fails.
+                            let remainder_start = start + got;
+                            let remainder =
+                                self.inner.get_range(key, remainder_start, end_exclusive)?;
+                            self.counters.add_peer(got);
+                            self.counters.add_store(remainder.len() as u64);
+                            let mut combined = Vec::with_capacity(body_len as usize);
+                            combined.extend_from_slice(&bytes);
+                            combined.extend_from_slice(&remainder);
+                            tracing::info!(
+                                target = "peer-fetch::range",
+                                %vol_id,
+                                %seg_ulid,
+                                body_start,
+                                peer_len = got,
+                                store_len = body_len - got,
+                                "body range served partial peer + store remainder"
+                            );
+                            return Ok(combined);
+                        }
+                        // got == 0: nothing useful from peer; fall through.
                     }
-                    if got > 0 && got < body_len {
-                        // Partial coverage. The peer covered
-                        // `[start, start + got)`; ask the inner
-                        // fetcher for the remainder and splice. A
-                        // failure on the remainder collapses the
-                        // whole request to inner — we don't strand
-                        // the caller with a partial result and we
-                        // don't double-count peer bytes when the
-                        // inner fetch fails.
-                        let remainder_start = start + got;
-                        let remainder =
-                            self.inner.get_range(key, remainder_start, end_exclusive)?;
-                        self.counters.add_peer(got);
-                        self.counters.add_store(remainder.len() as u64);
-                        let mut combined = Vec::with_capacity(body_len as usize);
-                        combined.extend_from_slice(&bytes);
-                        combined.extend_from_slice(&remainder);
-                        tracing::trace!(
-                            target = "peer-fetch::range",
-                            %vol_id,
-                            %seg_ulid,
-                            body_start,
-                            peer_len = got,
-                            remainder_len = body_len - got,
-                            "peer body range partial; spliced with inner remainder"
-                        );
-                        return Ok(combined);
-                    }
-                    // got == 0: nothing useful from peer; fall through.
+                    // Body-range fall-through (peer miss / partial
+                    // covers nothing / no token / network error).
+                    // Attribute the whole inner result to "store" so
+                    // totals add up to exactly the body bytes the
+                    // caller requested.
+                    let bytes = self.inner.get_range(key, start, end_exclusive)?;
+                    self.counters.add_store(bytes.len() as u64);
+                    tracing::info!(
+                        target = "peer-fetch::range",
+                        %vol_id,
+                        %seg_ulid,
+                        body_start,
+                        body_len,
+                        reason = "peer_miss",
+                        "body range served from store"
+                    );
+                    return Ok(bytes);
                 }
-                // Body-range fall-through (peer miss / partial covers
-                // nothing / no token / network error). Attribute the
-                // whole inner result to "store" so totals add up to
-                // exactly the body bytes the caller requested.
-                let bytes = self.inner.get_range(key, start, end_exclusive)?;
-                self.counters.add_store(bytes.len() as u64);
-                return Ok(bytes);
+                Ok(_) => {
+                    // Range doesn't fall in the body section (header /
+                    // index / inline read). Not a peer route; bypass
+                    // counters.
+                }
+                Err(_) => {
+                    // No local `.idx` for `(vol_id, seg_ulid)` — happens
+                    // during a multi-ancestor chain walk when this
+                    // vol_id doesn't own the segment. The peer route
+                    // can't tell us "wrong volume" any cheaper than
+                    // the store, so we go straight to the store. Log
+                    // it: during prewarm a chain walk fans these out
+                    // ahead of every successful warm hit and they
+                    // show up as full-cost round-trips against the
+                    // store.
+                    let bytes = self.inner.get_range(key, start, end_exclusive)?;
+                    self.counters.add_store(bytes.len() as u64);
+                    tracing::info!(
+                        target = "peer-fetch::range",
+                        %vol_id,
+                        %seg_ulid,
+                        body_offset = start,
+                        body_len = end_exclusive - start,
+                        reason = "no_local_idx",
+                        "body range served from store"
+                    );
+                    return Ok(bytes);
+                }
             }
         }
 

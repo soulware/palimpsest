@@ -63,7 +63,10 @@ fn build_ext4_image(rootfs: &Path, out: &Path, size_bytes: u64) {
 /// Create a new volume directory with an ephemeral signer and return
 /// the signer along with the dir path.
 fn setup_volume_dir(tmp: &TempDir) -> (PathBuf, std::sync::Arc<dyn segment::SegmentSigner>) {
-    let vol_dir = tmp.path().join("vol");
+    // ULID-named to match production layout (`<data_dir>/by_id/<ulid>/`);
+    // the demand-fetch path now derives the owning vol_id from the
+    // fork dir's basename.
+    let vol_dir = tmp.path().join(ulid::Ulid::new().to_string());
     fs::create_dir_all(&vol_dir).unwrap();
     // generate_keypair writes volume.key + volume.pub; import_image
     // only needs volume.pub for signing-identity bootstrap, but the

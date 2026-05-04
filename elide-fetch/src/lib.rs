@@ -34,7 +34,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use elide_core::signing::VerifyingKey;
 use s3::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
@@ -42,7 +41,6 @@ use serde::Deserialize;
 use ulid::Ulid;
 
 use elide_core::segment::{self, SegmentFetcher};
-use elide_core::signing;
 
 // --- config ---
 
@@ -401,14 +399,12 @@ impl Drop for BatchLease {
 // --- fetcher ---
 
 /// Demand-fetcher implementing `SegmentFetcher` on top of a sync
-/// [`RangeFetcher`]. Holds the ancestry chain (oldest-first) and the per-batch
-/// coalescing budget.
+/// [`RangeFetcher`]. Stateless w.r.t. the fork chain — every per-extent
+/// call carries its own `owner_vol_id`, since the read path that
+/// triggered the demand-fetch already iterated the local layout to
+/// resolve the segment's owner.
 pub struct RemoteFetcher {
     store: Arc<dyn RangeFetcher>,
-    /// Volume ancestry chain oldest-first: (volume_ulid, verifying_key).
-    /// Searched newest-first on a cache miss; verifying key used to verify
-    /// fetched segment bytes before writing to the local cache.
-    chain: Vec<(String, VerifyingKey)>,
     /// Maximum bytes per coalesced range-GET batch.
     max_batch_bytes: u64,
     /// Cross-thread in-flight coalescing for `fetch_extent`. Two callers
@@ -420,38 +416,27 @@ pub struct RemoteFetcher {
 }
 
 impl RemoteFetcher {
-    /// Build a fetcher from a [`FetchConfig`] and the fork directories in the
-    /// ancestry chain (oldest-first, current fork last).
-    ///
-    /// Each fork directory must contain a `volume.pub` file. The volume ULID
-    /// is derived from the directory name.
-    pub fn new(config: &FetchConfig, fork_dirs: &[PathBuf]) -> io::Result<Self> {
+    /// Build a fetcher from a [`FetchConfig`].
+    pub fn new(config: &FetchConfig) -> io::Result<Self> {
         let store = config.build_fetcher()?;
-        Self::from_store(
+        Ok(Self::from_store(
             store,
-            fork_dirs,
             config
                 .fetch_batch_bytes
                 .unwrap_or(DEFAULT_FETCH_BATCH_BYTES),
-        )
+        ))
     }
 
     /// Build a fetcher from an already-constructed `RangeFetcher`.
     ///
     /// Used by callers (e.g. the coordinator) that manage the store directly
     /// rather than going through [`FetchConfig`].
-    pub fn from_store(
-        store: Arc<dyn RangeFetcher>,
-        fork_dirs: &[PathBuf],
-        max_batch_bytes: u64,
-    ) -> io::Result<Self> {
-        let chain = load_chain(fork_dirs)?;
-        Ok(Self {
+    pub fn from_store(store: Arc<dyn RangeFetcher>, max_batch_bytes: u64) -> Self {
+        Self {
             store,
-            chain,
             max_batch_bytes,
             coalescer: FetchCoalescer::new(),
-        })
+        }
     }
 }
 
@@ -459,13 +444,14 @@ impl SegmentFetcher for RemoteFetcher {
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         extent: &segment::ExtentFetch,
     ) -> io::Result<()> {
         fetch_one_extent(
             &*self.store,
-            &self.chain,
+            owner_vol_id,
             segment_id,
             index_dir,
             body_dir,
@@ -481,33 +467,40 @@ impl SegmentFetcher for RemoteFetcher {
     fn fetch_delta_body(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
     ) -> io::Result<()> {
         fetch_one_delta_body(
             &*self.store,
-            &self.chain,
+            owner_vol_id,
             &segment_id.to_string(),
             index_dir,
             body_dir,
         )
     }
-}
 
-/// Load the ancestry chain from fork directories.
-///
-/// Each directory must be named with a valid ULID and contain a `volume.pub`
-/// file. Returns `(volume_ulid, verifying_key)` pairs in the same order as
-/// `fork_dirs` (oldest-first).
-fn load_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<(String, VerifyingKey)>> {
-    fork_dirs
-        .iter()
-        .map(|dir| {
-            let id = derive_volume_id(dir)?;
-            let vk = signing::load_verifying_key(dir, signing::VOLUME_PUB_FILE)?;
-            Ok((id, vk))
-        })
-        .collect()
+    fn warm_segment(
+        &self,
+        segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
+        index_dir: &Path,
+        body_dir: &Path,
+        body_section_start: u64,
+        populated_entries: &[u32],
+    ) -> io::Result<()> {
+        warm_segment_impl(
+            &*self.store,
+            owner_vol_id,
+            &self.coalescer,
+            self.max_batch_bytes,
+            segment_id,
+            index_dir,
+            body_dir,
+            body_section_start,
+            populated_entries,
+        )
+    }
 }
 
 /// Parameters for fetching a single extent from storage.
@@ -517,9 +510,10 @@ struct ExtentFetchParams {
     max_batch_bytes: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_one_extent(
     store: &dyn RangeFetcher,
-    chain: &[(String, VerifyingKey)],
+    owner_vol_id: ulid::Ulid,
     segment_ulid: Ulid,
     index_dir: &Path,
     body_dir: &Path,
@@ -629,7 +623,7 @@ fn fetch_one_extent(
         return fetch_batch(
             BatchContext {
                 store,
-                chain,
+                owner_vol_id,
                 segment_ulid,
                 segment_id: &segment_id,
                 body_dir,
@@ -653,7 +647,11 @@ fn fetch_one_extent(
 /// helper can stay a flat function without a long argument list.
 struct BatchContext<'a> {
     store: &'a dyn RangeFetcher,
-    chain: &'a [(String, VerifyingKey)],
+    /// Volume ULID that authored this segment. Resolved by the read
+    /// path before demand-fetch is invoked (see
+    /// `volume/read.rs::find_segment_in_dirs`); we GET against this
+    /// one volume only, no chain walk.
+    owner_vol_id: ulid::Ulid,
     /// Segment ULID — used to look up the per-segment `.present`
     /// write lock from `coalescer`.
     segment_ulid: Ulid,
@@ -678,7 +676,7 @@ struct BatchContext<'a> {
 fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
     let BatchContext {
         store,
-        chain,
+        owner_vol_id,
         segment_ulid,
         segment_id,
         body_dir,
@@ -696,132 +694,125 @@ fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
     let range_end = extent.body_section_start + batch_body_end;
     let batch_count = batch_last - start + 1;
 
-    for (volume_id, _) in chain.iter().rev() {
-        let key = segment_key(volume_id, segment_id)?;
-        match store.get_range(&key, range_start, range_end) {
-            Ok(bytes) => {
-                // Hash-verify every entry in the batch before touching disk.
-                // The .idx is signed and authentic, so each entry's declared
-                // hash is trusted; the bytes we just pulled from the store
-                // are not. A mismatch here means either the remote object is
-                // tampered/corrupt or the range slice is wrong — in either
-                // case the batch is rejected and we try the next ancestor.
-                if bytes.len() as u64 != range_end - range_start {
-                    return Err(io::Error::other(format!(
-                        "short range-GET for {segment_id}: expected {} bytes, got {}",
-                        range_end - range_start,
-                        bytes.len(),
-                    )));
-                }
-                for (i, e) in entries.iter().enumerate().take(batch_last + 1).skip(start) {
-                    let rel = (e.stored_offset - batch_body_start) as usize;
-                    let len = e.stored_length as usize;
-                    let slice = bytes.get(rel..rel + len).ok_or_else(|| {
-                        io::Error::other(format!(
-                            "entry {i} out of batch bounds while verifying {segment_id}"
-                        ))
-                    })?;
-                    segment::verify_body_hash(e, slice).map_err(|err| {
-                        io::Error::new(err.kind(), format!("demand-fetch {segment_id}[{i}]: {err}"))
-                    })?;
-                }
+    let owner_str = owner_vol_id.to_string();
+    let key = segment_key(&owner_str, segment_id)?;
+    let bytes = store.get_range(&key, range_start, range_end).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "fetching extent {segment_id}[{}] from {owner_str}: {e}",
+                extent.entry_idx
+            ),
+        )
+    })?;
 
-                std::fs::create_dir_all(body_dir)?;
-
-                // Durability ordering: write .body bytes and fsync them before
-                // publishing the present bit.  The invariant is "a set present
-                // bit implies the body bytes are durable" — the opposite
-                // reordering (bit durable, bytes still in page cache) would
-                // surface as a silent read of zeros after a crash.  .present is
-                // then written via write_file_atomic (tmp + rename + dir fsync)
-                // so a torn write can't leave a partially updated bitset.
-                let body_path = body_dir.join(format!("{segment_id}.body"));
-                let body_is_new = !body_path.exists();
-                {
-                    let mut f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&body_path)
-                        .map_err(|e| io::Error::other(format!("open .body: {e}")))?;
-                    f.seek(SeekFrom::Start(batch_body_start))
-                        .map_err(|e| io::Error::other(format!("seek .body: {e}")))?;
-                    f.write_all(&bytes)
-                        .map_err(|e| io::Error::other(format!("write .body: {e}")))?;
-                    f.sync_data()
-                        .map_err(|e| io::Error::other(format!("fsync .body: {e}")))?;
-                }
-                // If this call created the .body file, fsync the parent dir so
-                // the new directory entry is durable before the present bit
-                // that references it.
-                if body_is_new {
-                    std::fs::File::open(body_dir)
-                        .and_then(|d| d.sync_all())
-                        .map_err(|e| io::Error::other(format!("fsync body dir: {e}")))?;
-                }
-
-                // Bulk-update .present for all entries in the batch.
-                //
-                // Disjoint coalescer leases on the same segment write
-                // disjoint bits, but `.present` is one file per
-                // segment — a stale-snapshot RMW would clobber the
-                // sibling leader's bits and leave the next reader
-                // re-fetching already-cached body bytes. The
-                // per-segment lock + re-read inside the lock is what
-                // makes the merge converge across concurrent leaders.
-                let present_lock = coalescer.present_lock_for(segment_ulid);
-                let _present_guard = present_lock
-                    .lock()
-                    .expect("per-segment .present lock poisoned");
-                let entry_count = entries.len() as u32;
-                let bitset_len = (entry_count as usize).div_ceil(8);
-                let mut new_present = match std::fs::read(present_path) {
-                    Ok(b) => b,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-                    Err(e) => return Err(e),
-                };
-                if new_present.len() < bitset_len {
-                    new_present.resize(bitset_len, 0);
-                }
-                for i in start..=batch_last {
-                    new_present[i / 8] |= 1 << (i % 8);
-                }
-                segment::write_file_atomic(present_path, &new_present)
-                    .map_err(|e| io::Error::other(format!("write .present: {e}")))?;
-
-                tracing::debug!(
-                    segment_id,
-                    entry_idx = extent.entry_idx,
-                    batch_count,
-                    total_bytes = bytes.len(),
-                    "fetched extent batch"
-                );
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fetching extent {segment_id}[{}] from {volume_id}: {e}",
-                    extent.entry_idx
-                )));
-            }
-        }
+    // Hash-verify every entry in the batch before touching disk. The
+    // .idx is signed and authentic, so each entry's declared hash is
+    // trusted; the bytes we just pulled from the store are not. A
+    // mismatch here means either the remote object is tampered/corrupt
+    // or the range slice is wrong — reject the batch.
+    if bytes.len() as u64 != range_end - range_start {
+        return Err(io::Error::other(format!(
+            "short range-GET for {segment_id}: expected {} bytes, got {}",
+            range_end - range_start,
+            bytes.len(),
+        )));
     }
-    Err(io::Error::other(format!(
-        "extent {segment_id}[{}] not found in any ancestor",
-        extent.entry_idx
-    )))
+    for (i, e) in entries.iter().enumerate().take(batch_last + 1).skip(start) {
+        let rel = (e.stored_offset - batch_body_start) as usize;
+        let len = e.stored_length as usize;
+        let slice = bytes.get(rel..rel + len).ok_or_else(|| {
+            io::Error::other(format!(
+                "entry {i} out of batch bounds while verifying {segment_id}"
+            ))
+        })?;
+        segment::verify_body_hash(e, slice).map_err(|err| {
+            io::Error::new(err.kind(), format!("demand-fetch {segment_id}[{i}]: {err}"))
+        })?;
+    }
+
+    std::fs::create_dir_all(body_dir)?;
+
+    // Durability ordering: write .body bytes and fsync them before
+    // publishing the present bit.  The invariant is "a set present
+    // bit implies the body bytes are durable" — the opposite
+    // reordering (bit durable, bytes still in page cache) would
+    // surface as a silent read of zeros after a crash.  .present is
+    // then written via write_file_atomic (tmp + rename + dir fsync)
+    // so a torn write can't leave a partially updated bitset.
+    let body_path = body_dir.join(format!("{segment_id}.body"));
+    let body_is_new = !body_path.exists();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&body_path)
+            .map_err(|e| io::Error::other(format!("open .body: {e}")))?;
+        f.seek(SeekFrom::Start(batch_body_start))
+            .map_err(|e| io::Error::other(format!("seek .body: {e}")))?;
+        f.write_all(&bytes)
+            .map_err(|e| io::Error::other(format!("write .body: {e}")))?;
+        f.sync_data()
+            .map_err(|e| io::Error::other(format!("fsync .body: {e}")))?;
+    }
+    // If this call created the .body file, fsync the parent dir so the
+    // new directory entry is durable before the present bit that
+    // references it.
+    if body_is_new {
+        std::fs::File::open(body_dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io::Error::other(format!("fsync body dir: {e}")))?;
+    }
+
+    // Bulk-update .present for all entries in the batch.
+    //
+    // Disjoint coalescer leases on the same segment write disjoint
+    // bits, but `.present` is one file per segment — a stale-snapshot
+    // RMW would clobber the sibling leader's bits and leave the next
+    // reader re-fetching already-cached body bytes. The per-segment
+    // lock + re-read inside the lock is what makes the merge converge
+    // across concurrent leaders.
+    let present_lock = coalescer.present_lock_for(segment_ulid);
+    let _present_guard = present_lock
+        .lock()
+        .expect("per-segment .present lock poisoned");
+    let entry_count = entries.len() as u32;
+    let bitset_len = (entry_count as usize).div_ceil(8);
+    let mut new_present = match std::fs::read(present_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    if new_present.len() < bitset_len {
+        new_present.resize(bitset_len, 0);
+    }
+    for i in start..=batch_last {
+        new_present[i / 8] |= 1 << (i % 8);
+    }
+    segment::write_file_atomic(present_path, &new_present)
+        .map_err(|e| io::Error::other(format!("write .present: {e}")))?;
+
+    tracing::debug!(
+        segment_id,
+        entry_idx = extent.entry_idx,
+        batch_count,
+        total_bytes = bytes.len(),
+        "fetched extent batch"
+    );
+    Ok(())
 }
 
 /// Fetch a segment's delta body section and write it to `body_dir/<id>.delta`.
 ///
 /// Reads layout from the local `.idx` (header carries `body_length` and
 /// `delta_length`), issues one range-GET for exactly the delta region,
-/// and writes the result atomically (tmp+rename). Searches the ancestry
-/// chain newest-first on NotFound, mirroring `fetch_one_extent`.
+/// and writes the result atomically (tmp+rename). Targets the
+/// segment's owning volume directly; the read path resolves
+/// `owner_vol_id` from `<owner>/index/<seg>.idx` before invoking us.
 fn fetch_one_delta_body(
     store: &dyn RangeFetcher,
-    chain: &[(String, VerifyingKey)],
+    owner_vol_id: ulid::Ulid,
     segment_id: &str,
     index_dir: &Path,
     body_dir: &Path,
@@ -846,73 +837,398 @@ fn fetch_one_delta_body(
     // is available for verifying the bytes we pull from the remote store.
     let (_, entries, _) = segment::read_segment_index(&idx_path)?;
 
-    for (volume_id, _) in chain.iter().rev() {
-        let key = segment_key(volume_id, segment_id)?;
-        match store.get_range(&key, range_start, range_end) {
-            Ok(bytes) => {
-                if bytes.len() as u64 != range_end - range_start {
-                    return Err(io::Error::other(format!(
-                        "short range-GET for delta body {segment_id}: expected {} bytes, got {}",
-                        range_end - range_start,
-                        bytes.len(),
-                    )));
-                }
-                // Verify every delta option's blob against its signed
-                // `delta_hash`. The delta body section is outside the
-                // segment signature, so the hash in each option is the
-                // only authentication. A mismatch means tamper or
-                // corruption in the remote object — refuse the batch.
-                for (i, e) in entries.iter().enumerate() {
-                    for (j, opt) in e.delta_options.iter().enumerate() {
-                        let start = opt.delta_offset as usize;
-                        let end = start + opt.delta_length as usize;
-                        let slice = bytes.get(start..end).ok_or_else(|| {
-                            io::Error::other(format!(
-                                "delta option {segment_id}[{i}][{j}] out of bounds \
-                                 (offset {start}, length {}) for delta body of {} bytes",
-                                opt.delta_length,
-                                bytes.len(),
-                            ))
-                        })?;
-                        segment::verify_delta_blob_hash(opt, slice).map_err(|err| {
-                            io::Error::new(
-                                err.kind(),
-                                format!("demand-fetch delta {segment_id}[{i}][{j}]: {err}"),
-                            )
-                        })?;
-                    }
-                }
+    let owner_str = owner_vol_id.to_string();
+    let key = segment_key(&owner_str, segment_id)?;
+    let bytes = store.get_range(&key, range_start, range_end).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("fetching delta body {segment_id} from {owner_str}: {e}"),
+        )
+    })?;
+    if bytes.len() as u64 != range_end - range_start {
+        return Err(io::Error::other(format!(
+            "short range-GET for delta body {segment_id}: expected {} bytes, got {}",
+            range_end - range_start,
+            bytes.len(),
+        )));
+    }
+    // Verify every delta option's blob against its signed `delta_hash`.
+    // The delta body section is outside the segment signature, so the
+    // hash in each option is the only authentication. A mismatch means
+    // tamper or corruption in the remote object — refuse the batch.
+    for (i, e) in entries.iter().enumerate() {
+        for (j, opt) in e.delta_options.iter().enumerate() {
+            let start = opt.delta_offset as usize;
+            let end = start + opt.delta_length as usize;
+            let slice = bytes.get(start..end).ok_or_else(|| {
+                io::Error::other(format!(
+                    "delta option {segment_id}[{i}][{j}] out of bounds \
+                     (offset {start}, length {}) for delta body of {} bytes",
+                    opt.delta_length,
+                    bytes.len(),
+                ))
+            })?;
+            segment::verify_delta_blob_hash(opt, slice).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("demand-fetch delta {segment_id}[{i}][{j}]: {err}"),
+                )
+            })?;
+        }
+    }
 
-                std::fs::create_dir_all(body_dir)?;
-                let tmp_path = body_dir.join(format!("{segment_id}.delta.tmp"));
-                {
-                    let mut f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&tmp_path)
-                        .map_err(|e| io::Error::other(format!("open .delta.tmp: {e}")))?;
-                    f.write_all(&bytes)
-                        .map_err(|e| io::Error::other(format!("write .delta.tmp: {e}")))?;
-                    f.sync_data()
-                        .map_err(|e| io::Error::other(format!("fsync .delta.tmp: {e}")))?;
-                }
-                std::fs::rename(&tmp_path, &delta_path)
-                    .map_err(|e| io::Error::other(format!("rename .delta: {e}")))?;
-                tracing::debug!(segment_id, bytes = bytes.len(), "fetched delta body");
-                return Ok(());
+    std::fs::create_dir_all(body_dir)?;
+    let tmp_path = body_dir.join(format!("{segment_id}.delta.tmp"));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| io::Error::other(format!("open .delta.tmp: {e}")))?;
+        f.write_all(&bytes)
+            .map_err(|e| io::Error::other(format!("write .delta.tmp: {e}")))?;
+        f.sync_data()
+            .map_err(|e| io::Error::other(format!("fsync .delta.tmp: {e}")))?;
+    }
+    std::fs::rename(&tmp_path, &delta_path)
+        .map_err(|e| io::Error::other(format!("rename .delta: {e}")))?;
+    tracing::debug!(segment_id, bytes = bytes.len(), "fetched delta body");
+    Ok(())
+}
+
+/// Maximum concurrent in-flight Range GETs per warming segment.
+///
+/// Each in-flight request holds up to `max_batch_bytes` of buffer. With
+/// the default 256 KiB batch and 4 inner threads per segment, peak
+/// per-segment buffer is ~1 MiB; with 16 outer prewarm workers running
+/// independent segments, total prewarm memory is bounded at a few tens
+/// of MiB even for a fully-fan-out claim.
+const WARM_INTRA_SEGMENT_PARALLELISM: usize = 4;
+
+/// One coalesced batch in a segment-wide warming pass: a contiguous run
+/// of body-adjacent entry indices we'll cover with one Range GET.
+struct WarmBatch {
+    /// Inclusive entry-index range in `entries`. Used for hash-verify
+    /// after the GET and for the `.present`-bit OR at end of segment.
+    start_entry: usize,
+    end_entry_inclusive: usize,
+    /// Body-section-relative range covered by this batch.
+    body_start: u64,
+    body_end: u64,
+}
+
+/// Plan a segment-wide warming pass: walk `populated_entries` in order
+/// and group body-adjacent, not-yet-present entries into batches up to
+/// `max_batch_bytes`. The first entry in a batch is always included
+/// regardless of size (matches `fetch_one_extent`'s same-entry-always-
+/// first rule). Already-present entries are skipped.
+fn plan_warm_batches(
+    entries: &[segment::SegmentEntry],
+    populated_entries: &[u32],
+    is_present: &dyn Fn(usize) -> bool,
+    max_batch_bytes: u64,
+) -> Vec<WarmBatch> {
+    let mut batches = Vec::new();
+    let mut current: Option<WarmBatch> = None;
+
+    for &idx in populated_entries {
+        let i = idx as usize;
+        let Some(entry) = entries.get(i) else {
+            continue;
+        };
+        if !entry.kind.is_data() || entry.stored_length == 0 {
+            continue;
+        }
+        if is_present(i) {
+            // Already cached: close the current batch (its run is
+            // body-adjacent on stored offsets, and a present-and-skipped
+            // entry breaks the run), and continue past.
+            if let Some(b) = current.take() {
+                batches.push(b);
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fetching delta body {segment_id} from {volume_id}: {e}"
-                )));
+            continue;
+        }
+        let entry_start = entry.stored_offset;
+        let entry_end = entry_start + entry.stored_length as u64;
+
+        match current.as_mut() {
+            Some(b) if b.body_end == entry_start => {
+                // Body-adjacent extension. Honour `max_batch_bytes`,
+                // but always include the first entry of a batch.
+                if entry_end - b.body_start > max_batch_bytes {
+                    batches.push(current.take().expect("just matched Some"));
+                    current = Some(WarmBatch {
+                        start_entry: i,
+                        end_entry_inclusive: i,
+                        body_start: entry_start,
+                        body_end: entry_end,
+                    });
+                } else {
+                    b.end_entry_inclusive = i;
+                    b.body_end = entry_end;
+                }
+            }
+            _ => {
+                // No current batch, or a body-layout gap broke the run.
+                if let Some(b) = current.take() {
+                    batches.push(b);
+                }
+                current = Some(WarmBatch {
+                    start_entry: i,
+                    end_entry_inclusive: i,
+                    body_start: entry_start,
+                    body_end: entry_end,
+                });
             }
         }
     }
-    Err(io::Error::other(format!(
-        "delta body {segment_id} not found in any ancestor"
-    )))
+    if let Some(b) = current.take() {
+        batches.push(b);
+    }
+    batches
+}
+
+/// Optimised whole-segment warming for `RemoteFetcher::warm_segment`.
+///
+/// Differs from the per-extent demand-fetch path in three ways:
+///
+/// 1. Multiple batches are issued concurrently (`std::thread::scope`,
+///    capped by `WARM_INTRA_SEGMENT_PARALLELISM`); body bytes are
+///    `pwrite`-ed at disjoint offsets so the writers don't contend.
+/// 2. fsync of `.body` and `body_dir` runs **once** after every batch
+///    has landed, instead of per batch — the bulk of the per-batch
+///    latency in the demand path is the fsync chain, and warming
+///    semantics don't need per-batch durability (a crash before the
+///    final fsync just leaves the relevant `.present` bits clear, so
+///    demand-fetch will re-fetch).
+/// 3. The `.present` RMW happens once at end-of-segment under the
+///    coalescer's per-segment lock, OR-ing every successfully-warmed
+///    bit in one atomic write. Concurrent demand-fetch on the same
+///    segment is unaffected: it still acquires the same lock, and the
+///    re-read inside the lock means neither side clobbers the other's
+///    bits.
+///
+/// Unlike demand-fetch's per-extent path, warming targets the segment's
+/// **owning volume directly** — body-prefetch knows the owner from the
+/// hint file's location, so there's no need to fan out a chain walk
+/// that would issue N−1 NotFound store round-trips ahead of every
+/// successful warm hit.
+#[allow(clippy::too_many_arguments)]
+fn warm_segment_impl(
+    store: &dyn RangeFetcher,
+    owner_vol_id: ulid::Ulid,
+    coalescer: &FetchCoalescer,
+    max_batch_bytes: u64,
+    segment_ulid: Ulid,
+    index_dir: &Path,
+    body_dir: &Path,
+    body_section_start: u64,
+    populated_entries: &[u32],
+) -> io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let segment_id = segment_ulid.to_string();
+    let idx_path = index_dir.join(format!("{segment_id}.idx"));
+    let present_path = body_dir.join(format!("{segment_id}.present"));
+    let body_path = body_dir.join(format!("{segment_id}.body"));
+
+    let (_, entries, _) = segment::read_segment_index(&idx_path)?;
+
+    let present_at_start = match std::fs::read(&present_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let is_present = |idx: usize| -> bool {
+        present_at_start
+            .get(idx / 8)
+            .is_some_and(|b| b & (1 << (idx % 8)) != 0)
+    };
+
+    let batches = plan_warm_batches(&entries, populated_entries, &is_present, max_batch_bytes);
+    if batches.is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(body_dir)?;
+    let body_was_new = !body_path.try_exists()?;
+    let body_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&body_path)
+        .map_err(|e| io::Error::other(format!("open .body for warm: {e}")))?;
+
+    // Issue batches in parallel. Each thread picks the next batch from
+    // a shared cursor, runs the GET + verify + pwrite, and records the
+    // entry indices it warmed for the final `.present` OR.
+    let cursor = AtomicUsize::new(0);
+    let warmed: Mutex<Vec<u32>> = Mutex::new(Vec::with_capacity(populated_entries.len()));
+    let first_err: Mutex<Option<io::Error>> = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        let workers = WARM_INTRA_SEGMENT_PARALLELISM.min(batches.len());
+        for _ in 0..workers {
+            let cursor = &cursor;
+            let batches = &batches;
+            let warmed = &warmed;
+            let first_err = &first_err;
+            let entries = &entries;
+            let body_file = &body_file;
+            let segment_id = segment_id.as_str();
+            scope.spawn(move || {
+                loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= batches.len() {
+                        return;
+                    }
+                    if first_err
+                        .lock()
+                        .expect("first_err mutex poisoned")
+                        .is_some()
+                    {
+                        return;
+                    }
+                    let batch = &batches[i];
+                    match warm_one_batch(
+                        store,
+                        owner_vol_id,
+                        segment_id,
+                        entries,
+                        body_file,
+                        body_section_start,
+                        batch,
+                    ) {
+                        Ok(()) => {
+                            let mut g = warmed.lock().expect("warmed mutex poisoned");
+                            for idx in batch.start_entry..=batch.end_entry_inclusive {
+                                g.push(idx as u32);
+                            }
+                        }
+                        Err(e) => {
+                            let mut g = first_err.lock().expect("first_err mutex poisoned");
+                            if g.is_none() {
+                                *g = Some(e);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(e) = first_err.into_inner().expect("first_err mutex poisoned") {
+        return Err(e);
+    }
+    let mut warmed = warmed.into_inner().expect("warmed mutex poisoned");
+    if warmed.is_empty() {
+        return Ok(());
+    }
+
+    // Single fsync of .body covers every parallel pwrite above.
+    body_file
+        .sync_data()
+        .map_err(|e| io::Error::other(format!("fsync .body for warm: {e}")))?;
+    drop(body_file);
+    if body_was_new {
+        std::fs::File::open(body_dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io::Error::other(format!("fsync body dir for warm: {e}")))?;
+    }
+
+    // Single .present update under the per-segment write lock. Re-read
+    // inside the lock so a concurrent demand-fetch's bits are merged
+    // rather than clobbered (same convergence rule as `fetch_batch`).
+    let lock = coalescer.present_lock_for(segment_ulid);
+    let _present_guard = lock.lock().expect("per-segment .present lock poisoned");
+    let entry_count = entries.len();
+    let bitset_len = entry_count.div_ceil(8);
+    let mut new_present = match std::fs::read(&present_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    if new_present.len() < bitset_len {
+        new_present.resize(bitset_len, 0);
+    }
+    warmed.sort_unstable();
+    warmed.dedup();
+    for idx in &warmed {
+        let i = *idx as usize;
+        new_present[i / 8] |= 1 << (i % 8);
+    }
+    segment::write_file_atomic(&present_path, &new_present)
+        .map_err(|e| io::Error::other(format!("write .present for warm: {e}")))?;
+
+    tracing::debug!(
+        segment_id,
+        batches = batches.len(),
+        entries_warmed = warmed.len(),
+        "warm_segment complete"
+    );
+    Ok(())
+}
+
+/// Fetch one warming batch directly from the segment's owning volume
+/// (no chain walk), verify each entry against its hash from the local
+/// `.idx`, and `pwrite` the bytes into `body_file` at body-relative
+/// offset `batch.body_start`. No fsync — the caller does one
+/// segment-wide fsync after every batch lands.
+#[allow(clippy::too_many_arguments)]
+fn warm_one_batch(
+    store: &dyn RangeFetcher,
+    owner_vol_id: ulid::Ulid,
+    segment_id: &str,
+    entries: &[segment::SegmentEntry],
+    body_file: &std::fs::File,
+    body_section_start: u64,
+    batch: &WarmBatch,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let range_start = body_section_start + batch.body_start;
+    let range_end = body_section_start + batch.body_end;
+    let owner_str = owner_vol_id.to_string();
+    let key = segment_key(&owner_str, segment_id)?;
+    let bytes = store.get_range(&key, range_start, range_end).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "warm fetch {segment_id} batch [{}..={}] from {owner_str}: {e}",
+                batch.start_entry, batch.end_entry_inclusive
+            ),
+        )
+    })?;
+    if bytes.len() as u64 != range_end - range_start {
+        return Err(io::Error::other(format!(
+            "short range-GET for warm {segment_id}: expected {} bytes, got {}",
+            range_end - range_start,
+            bytes.len(),
+        )));
+    }
+    for (i, e) in entries
+        .iter()
+        .enumerate()
+        .take(batch.end_entry_inclusive + 1)
+        .skip(batch.start_entry)
+    {
+        let rel = (e.stored_offset - batch.body_start) as usize;
+        let len = e.stored_length as usize;
+        let slice = bytes.get(rel..rel + len).ok_or_else(|| {
+            io::Error::other(format!(
+                "warm entry {i} out of batch bounds for {segment_id}"
+            ))
+        })?;
+        segment::verify_body_hash(e, slice)
+            .map_err(|err| io::Error::new(err.kind(), format!("warm {segment_id}[{i}]: {err}")))?;
+    }
+    // .body is body-section-relative: offset 0 in the file corresponds
+    // to body_section_start in the remote object.
+    body_file
+        .write_all_at(&bytes, batch.body_start)
+        .map_err(|e| io::Error::other(format!("pwrite .body for warm: {e}")))?;
+    Ok(())
 }
 
 /// Build the S3 object key for a segment.
@@ -971,6 +1287,7 @@ mod tests {
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
 
         // Build a segment with 3 uncompressed entries (all body-adjacent).
         let data0 = vec![0x11u8; 4096];
@@ -1020,12 +1337,13 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
 
         // Fetch entry 0 — should coalesce entries 0, 1, 2 into one range-GET.
         fetcher
             .fetch_extent(
                 seg_ulid,
+                owner_vol_id,
                 &index_dir,
                 &cache_dir,
                 &segment::ExtentFetch {
@@ -1068,6 +1386,7 @@ mod tests {
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
 
         // Two entries that will NOT be body-adjacent because entry 1 is
         // written into a segment that already has entry 0 present — we
@@ -1121,11 +1440,12 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
 
         fetcher
             .fetch_extent(
                 seg_ulid,
+                owner_vol_id,
                 &index_dir,
                 &cache_dir,
                 &segment::ExtentFetch {
@@ -1166,6 +1486,7 @@ mod tests {
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
 
         let data0 = vec![0x55u8; 4096];
         let h0 = blake3::hash(&data0);
@@ -1214,11 +1535,12 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
 
         let err = fetcher
             .fetch_extent(
                 seg_ulid,
+                owner_vol_id,
                 &index_dir,
                 &cache_dir,
                 &segment::ExtentFetch {
@@ -1264,6 +1586,7 @@ mod tests {
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
 
         // One Delta entry with one option. The delta blob is 256 bytes; we
         // record its hash in the option, build the segment, then tamper the
@@ -1322,10 +1645,10 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
 
         let err = fetcher
-            .fetch_delta_body(seg_ulid, &index_dir, &cache_dir)
+            .fetch_delta_body(seg_ulid, owner_vol_id, &index_dir, &cache_dir)
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
@@ -1610,6 +1933,7 @@ mod tests {
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
 
         // Three contiguous entries — same shape as the existing
         // coalescing test. The whole batch is what the leader will
@@ -1657,10 +1981,10 @@ mod tests {
             calls: AtomicUsize::new(0),
             delay: Duration::from_millis(50),
         });
-        let fetcher = Arc::new(
-            RemoteFetcher::from_store(counting.clone(), &[vol_dir], DEFAULT_FETCH_BATCH_BYTES)
-                .unwrap(),
-        );
+        let fetcher = Arc::new(RemoteFetcher::from_store(
+            counting.clone(),
+            DEFAULT_FETCH_BATCH_BYTES,
+        ));
 
         // Spawn N threads, all racing on entry 0 of the same segment.
         // Without coalescing, every thread fires its own range-GET; with
@@ -1681,6 +2005,7 @@ mod tests {
                 thread::spawn(move || {
                     let result = fetcher.fetch_extent(
                         seg_ulid,
+                        owner_vol_id,
                         &index_dir,
                         &cache_dir,
                         &segment::ExtentFetch {
@@ -1784,6 +2109,7 @@ mod tests {
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
 
         let data: Vec<Vec<u8>> = (0..N).map(|i| vec![0xA0u8 + i as u8; 4096]).collect();
         let hashes: Vec<_> = data.iter().map(|d| blake3::hash(d)).collect();
@@ -1829,9 +2155,10 @@ mod tests {
             barrier: Arc::new(Barrier::new(N)),
             counter: std::sync::atomic::AtomicU32::new(0),
         });
-        let fetcher = Arc::new(
-            RemoteFetcher::from_store(barrier_fetcher.clone(), &[vol_dir], small_batch).unwrap(),
-        );
+        let fetcher = Arc::new(RemoteFetcher::from_store(
+            barrier_fetcher.clone(),
+            small_batch,
+        ));
 
         let stored_offsets: Vec<u64> = entries.iter().map(|e| e.stored_offset).collect();
         let stored_lengths: Vec<u32> = entries.iter().map(|e| e.stored_length).collect();
@@ -1848,6 +2175,7 @@ mod tests {
                 thread::spawn(move || {
                     let result = fetcher.fetch_extent(
                         seg_ulid,
+                        owner_vol_id,
                         &index_dir,
                         &cache_dir,
                         &segment::ExtentFetch {
@@ -1879,6 +2207,259 @@ mod tests {
                 byte & (1 << (i % 8)) != 0,
                 "bit {i} unset after disjoint concurrent fetch — RMW race lost it. \
                  present bytes: {present:?}",
+            );
+        }
+    }
+
+    // --- warm_segment tests ---
+
+    /// Helper: build a segment with `n` body-adjacent uncompressed
+    /// entries, write its `.idx` to `index_dir`, upload the full file to
+    /// `store_root` keyed under `vol_id`, and return everything the
+    /// `warm_segment` tests need: the segment ULID, body-section start,
+    /// the entries' raw payloads, and the constructed `RemoteFetcher`.
+    #[allow(clippy::type_complexity)]
+    fn build_warm_fixture(
+        tmp: &Path,
+        store_root: &Path,
+        n: usize,
+        entry_size: usize,
+    ) -> (
+        RemoteFetcher,
+        ulid::Ulid,
+        ulid::Ulid,
+        u64,
+        Vec<Vec<u8>>,
+        PathBuf,
+        PathBuf,
+    ) {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+
+        let index_dir = tmp.join("index");
+        let cache_dir = tmp.join("cache");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id_str).unwrap();
+
+        let payloads: Vec<Vec<u8>> = (0..n)
+            .map(|i| vec![(i as u8).wrapping_add(0x10); entry_size])
+            .collect();
+        let mut entries: Vec<SegmentEntry> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, data)| {
+                SegmentEntry::new_data(
+                    blake3::hash(data),
+                    i as u64,
+                    1,
+                    SegmentFlags::empty(),
+                    data.clone(),
+                )
+            })
+            .collect();
+        let seg_path = tmp.join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        let key = segment_key(vol_id_str, &seg_id).unwrap();
+        put_local(store_root, &key, &full_bytes);
+
+        let vol_dir = tmp.join(vol_id_str);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store_root.to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
+        };
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        (
+            fetcher,
+            seg_ulid,
+            owner_vol_id,
+            bss,
+            payloads,
+            index_dir,
+            cache_dir,
+        )
+    }
+
+    /// `warm_segment` warms every populated entry: bytes land in
+    /// `.body` and the matching `.present` bit is set.
+    #[test]
+    fn warm_segment_warms_populated_entries() {
+        use elide_core::segment::check_present_bit;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        let (fetcher, seg_ulid, owner_vol_id, bss, payloads, index_dir, cache_dir) =
+            build_warm_fixture(tmp.path(), store.path(), 4, 4096);
+
+        fetcher
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &[0, 1, 2, 3],
+            )
+            .unwrap();
+
+        let body = std::fs::read(cache_dir.join(format!("{seg_ulid}.body"))).unwrap();
+        for (i, want) in payloads.iter().enumerate() {
+            let off = i * 4096;
+            assert_eq!(
+                &body[off..off + 4096],
+                want.as_slice(),
+                "entry {i} bytes mismatch"
+            );
+        }
+        let present_path = cache_dir.join(format!("{seg_ulid}.present"));
+        for i in 0..4 {
+            assert!(
+                check_present_bit(&present_path, i as u32).unwrap(),
+                "bit {i} not set"
+            );
+        }
+    }
+
+    /// `warm_segment` does not re-fetch entries already marked present;
+    /// it only fills in the missing ones and merges with the existing
+    /// `.present` bitmap.
+    #[test]
+    fn warm_segment_skips_already_present_entries() {
+        use elide_core::segment::check_present_bit;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        let (fetcher, seg_ulid, owner_vol_id, bss, _payloads, index_dir, cache_dir) =
+            build_warm_fixture(tmp.path(), store.path(), 4, 4096);
+
+        // Pre-seed: entry 1 is already "present" (bit set, body file
+        // empty). warm_segment must leave bit 1 alone, fill bits 0, 2, 3.
+        let present_path = cache_dir.join(format!("{seg_ulid}.present"));
+        std::fs::write(&present_path, [0b0000_0010u8]).unwrap();
+
+        fetcher
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &[0, 1, 2, 3],
+            )
+            .unwrap();
+
+        for i in 0..4 {
+            assert!(
+                check_present_bit(&present_path, i as u32).unwrap(),
+                "bit {i} not set after warm"
+            );
+        }
+        // The pre-seeded bit (1) was preserved through the merge.
+        let final_present = std::fs::read(&present_path).unwrap();
+        assert_eq!(final_present[0] & 0b0000_1111, 0b0000_1111);
+    }
+
+    /// `warm_segment` is a no-op when `populated_entries` is empty —
+    /// no `.body` file gets created and no `.present` write happens.
+    #[test]
+    fn warm_segment_empty_populated_is_noop() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        let (fetcher, seg_ulid, owner_vol_id, bss, _payloads, index_dir, cache_dir) =
+            build_warm_fixture(tmp.path(), store.path(), 4, 4096);
+
+        fetcher
+            .warm_segment(seg_ulid, owner_vol_id, &index_dir, &cache_dir, bss, &[])
+            .unwrap();
+
+        assert!(!cache_dir.join(format!("{seg_ulid}.body")).exists());
+        assert!(!cache_dir.join(format!("{seg_ulid}.present")).exists());
+    }
+
+    /// Many adjacent entries → multiple batches under a small
+    /// `max_batch_bytes`. All entries must still warm correctly with
+    /// the parallel batch path.
+    #[test]
+    fn warm_segment_splits_into_multiple_batches() {
+        use elide_core::segment::check_present_bit;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        // 12 entries × 4 KiB = 48 KiB total; with a 16 KiB batch cap we
+        // expect ~3 batches, exercising the parallel scope path.
+        let n = 12;
+        let entry_size = 4096;
+        let (_default_fetcher, seg_ulid, owner_vol_id, bss, payloads, index_dir, cache_dir) =
+            build_warm_fixture(tmp.path(), store.path(), n, entry_size);
+
+        // Rebuild the fetcher with a small batch cap; the helper above
+        // uses the default. Same store, just different config —
+        // RemoteFetcher::new no longer takes fork_dirs after the
+        // owner-vol-id threading.
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: Some(16 * 1024),
+        };
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+
+        let populated: Vec<u32> = (0..n as u32).collect();
+        fetcher
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &populated,
+            )
+            .unwrap();
+
+        let body = std::fs::read(cache_dir.join(format!("{seg_ulid}.body"))).unwrap();
+        for (i, want) in payloads.iter().enumerate() {
+            let off = i * entry_size;
+            assert_eq!(
+                &body[off..off + entry_size],
+                want.as_slice(),
+                "entry {i} bytes mismatch after multi-batch warm"
+            );
+        }
+        let present_path = cache_dir.join(format!("{seg_ulid}.present"));
+        for i in 0..n {
+            assert!(
+                check_present_bit(&present_path, i as u32).unwrap(),
+                "bit {i} not set after multi-batch warm"
             );
         }
     }

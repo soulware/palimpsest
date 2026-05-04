@@ -133,9 +133,20 @@ pub trait SegmentSigner: Send + Sync {
 pub trait SegmentFetcher: Send + Sync {
     /// Fetch a single extent and write body bytes into `body_dir/<segment_id>.body`
     /// at `extent.body_offset`, then set bit `extent.entry_idx` in `.present`.
+    ///
+    /// `owner_vol_id` is the volume ULID that authored this segment.
+    /// Callers always know it: the segment's `.idx` lives in
+    /// `<owner>/index/<segment_id>.idx`, so the read path that decided
+    /// to demand-fetch already iterated `search_dirs`/`ancestor_layers`
+    /// to find which fork dir contains the `.idx` (otherwise the call
+    /// wouldn't know which directory to write the body into).
+    /// Implementations should issue exactly one GET against the owner
+    /// rather than fanning out a chain walk that 404s on every
+    /// non-owner ancestor.
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         extent: &ExtentFetch,
@@ -152,13 +163,76 @@ pub trait SegmentFetcher: Send + Sync {
     /// (no leading body section), matching `promote_to_cache`'s output
     /// shape so `try_read_delta_extent` can open it uniformly.
     ///
+    /// `owner_vol_id` carries the same meaning as in
+    /// [`Self::fetch_extent`].
+    ///
     /// Written via tmp+rename for crash safety.
     fn fetch_delta_body(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
     ) -> io::Result<()>;
+
+    /// Warm a set of body entries for `segment_id` in `body_dir`.
+    ///
+    /// Conceptually equivalent to calling [`Self::fetch_extent`] for each
+    /// `entry_idx` in `populated_entries`, but implementations are free
+    /// to issue parallel range-GETs and amortise fsync across the whole
+    /// segment. Used by background body-warming on volume start, where
+    /// per-batch durability isn't required (a crash mid-warm just
+    /// re-fetches on next start, gated by `.present`).
+    ///
+    /// `body_section_start` is the segment's `body_section_start`
+    /// (parsed from the local `.idx`); callers already have it cached
+    /// from the layout read.
+    ///
+    /// `owner_vol_id` is the volume ULID that authored this segment
+    /// (always known at the warming call site, where the hint file
+    /// lives alongside the segment's `.idx`). Implementations should
+    /// fetch directly under that vol_id rather than walking the fork
+    /// ancestry the way `fetch_extent` does — chain-walks during
+    /// prewarm fan out N−1 NotFound round-trips against the inner
+    /// store ahead of every successful peer hit.
+    ///
+    /// Default impl loops `fetch_extent` (which walks the chain) for
+    /// compatibility with mock implementations in tests; production
+    /// fetchers (e.g. `RemoteFetcher`) override with the optimised
+    /// owner-targeted path.
+    fn warm_segment(
+        &self,
+        segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
+        index_dir: &Path,
+        body_dir: &Path,
+        body_section_start: u64,
+        populated_entries: &[u32],
+    ) -> io::Result<()> {
+        let idx_path = index_dir.join(format!("{segment_id}.idx"));
+        let (_, entries, _) = read_segment_index(&idx_path)?;
+        for &idx in populated_entries {
+            let Some(entry) = entries.get(idx as usize) else {
+                continue;
+            };
+            if !entry.kind.is_data() || entry.stored_length == 0 {
+                continue;
+            }
+            self.fetch_extent(
+                segment_id,
+                owner_vol_id,
+                index_dir,
+                body_dir,
+                &ExtentFetch {
+                    body_section_start,
+                    body_offset: entry.stored_offset,
+                    body_length: entry.stored_length,
+                    entry_idx: idx,
+                },
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Parameters for fetching a single extent from an object store.

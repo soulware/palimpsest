@@ -762,6 +762,7 @@ mod tests {
             fn fetch_extent(
                 &self,
                 segment_id: Ulid,
+                _owner_vol_id: Ulid,
                 index_dir: &Path,
                 body_dir: &Path,
                 _extent: &crate::segment::ExtentFetch,
@@ -777,6 +778,7 @@ mod tests {
             fn fetch_delta_body(
                 &self,
                 _segment_id: Ulid,
+                _owner_vol_id: Ulid,
                 _index_dir: &Path,
                 _body_dir: &Path,
             ) -> io::Result<()> {
@@ -785,8 +787,11 @@ mod tests {
         }
 
         let tmp = temp_dir();
-        let child_dir = tmp.join("child");
-        let ancestor_dir = tmp.join("ancestor");
+        // Owner-volume threading requires fork directory names to be
+        // valid ULIDs (the volume process always lays them out as
+        // `by_id/<ulid>/`); use distinct ULIDs for child and ancestor.
+        let child_dir = tmp.join(Ulid::new().to_string());
+        let ancestor_dir = tmp.join(Ulid::new().to_string());
         std::fs::create_dir_all(child_dir.join("index")).unwrap();
         std::fs::create_dir_all(ancestor_dir.join("index")).unwrap();
 
@@ -859,6 +864,7 @@ mod tests {
             fn fetch_extent(
                 &self,
                 segment_id: Ulid,
+                _owner_vol_id: Ulid,
                 index_dir: &Path,
                 body_dir: &Path,
                 _extent: &crate::segment::ExtentFetch,
@@ -868,14 +874,16 @@ mod tests {
                 std::fs::write(body_dir.join(format!("{segment_id}.body")), b"")?;
                 Ok(())
             }
-            fn fetch_delta_body(&self, _: Ulid, _: &Path, _: &Path) -> io::Result<()> {
+            fn fetch_delta_body(&self, _: Ulid, _: Ulid, _: &Path, _: &Path) -> io::Result<()> {
                 Err(io::Error::other("unused"))
             }
         }
 
         let tmp = temp_dir();
-        let child_dir = tmp.join("child");
-        let ancestor_dir = tmp.join("ancestor");
+        // ULID-named dirs because owner-volume threading parses the
+        // fork dir name as the owning volume's ULID.
+        let child_dir = tmp.join(Ulid::new().to_string());
+        let ancestor_dir = tmp.join(Ulid::new().to_string());
         std::fs::create_dir_all(child_dir.join("index")).unwrap();
         std::fs::create_dir_all(ancestor_dir.join("index")).unwrap();
 

@@ -441,7 +441,7 @@ mod imp {
         let mut volume = crate::volume_open::open_volume_with_retry(dir, by_id_dir)?;
 
         let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
-        if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+        if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
             let arc_fetcher: Arc<dyn elide_core::segment::SegmentFetcher> = Arc::new(build.fetcher);
             let fork_dirs = volume.fork_dirs();
             volume.set_fetcher(Arc::clone(&arc_fetcher));

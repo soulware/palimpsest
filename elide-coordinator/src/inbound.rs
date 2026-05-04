@@ -946,17 +946,12 @@ async fn generate_snapshot_filemap(
     tokio::task::spawn_blocking(move || {
         let range_fetcher_for_factory = range_fetcher.clone();
         let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
-            Box::new(move |search_dirs: &[PathBuf]| {
-                // RemoteFetcher wants oldest-first; BlockReader hands us
-                // newest-first (fork → ancestors).
-                let oldest_first: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
-                elide_fetch::RemoteFetcher::from_store(
+            Box::new(move |_search_dirs: &[PathBuf]| {
+                let f = elide_fetch::RemoteFetcher::from_store(
                     range_fetcher_for_factory,
-                    &oldest_first,
                     elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
-                )
-                .ok()
-                .map(|f| Box::new(f) as Box<dyn elide_core::segment::SegmentFetcher>)
+                );
+                Some(Box::new(f) as Box<dyn elide_core::segment::SegmentFetcher>)
             });
         let _wrote =
             elide_core::filemap::generate_from_snapshot(&fork_dir, &snap_ulid, mk_fetcher)?;
