@@ -97,6 +97,12 @@ pub struct PrefetchResult {
     pub snapshots_fetched: usize,
     /// Of `snapshots_fetched`, how many came from a peer.
     pub snapshots_from_peer: usize,
+    /// Per-segment `.prefetch` hints persisted to
+    /// `cache/<ulid>.prefetch-hint` for the volume daemon's body
+    /// prefetch task to consume at `volume up`. Only populated when a
+    /// peer context is present; segments with empty hints (peer has no
+    /// body cache for that segment) are not counted.
+    pub hints_fetched: usize,
 }
 
 // Segment file header constants are re-exported from elide-core/src/segment.rs
@@ -310,6 +316,7 @@ pub async fn prefetch_indexes(
         result.failed += r.failed;
         result.snapshots_fetched += r.snapshots_fetched;
         result.snapshots_from_peer += r.snapshots_from_peer;
+        result.hints_fetched += r.hints_fetched;
     }
     Ok(result)
 }
@@ -494,6 +501,19 @@ pub async fn pull_indexes_via_list(
 /// first when a context is available, falls through to S3 on any
 /// failure (including signature mismatch — see
 /// [`peer_fetch_idx`]). Aggregates outcomes into `result`.
+///
+/// When a peer context is present *and* the peer served the `.idx`
+/// successfully, the same task also fetches the `.prefetch` hint and
+/// persists it as `cache/<ulid>.prefetch-hint`. The volume daemon
+/// consumes those files on `volume up` to drive background body
+/// warming. Hint fetch is best-effort: any failure (404, network,
+/// empty payload) is non-fatal and just means no warming advice for
+/// that segment.
+///
+/// Hints are paired with peer-served `.idx` deliberately: a peer that
+/// 404'd `.idx` has no body cache for the segment either, so a
+/// follow-up hint GET would also 404. Skipping the round-trip in that
+/// case keeps the fan-out tight without losing any signal.
 async fn fetch_idx_set(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
@@ -509,12 +529,18 @@ async fn fetch_idx_set(
         Failed,
     }
 
-    let outcomes: Vec<IdxOutcome> =
+    struct SegOutcome {
+        idx: IdxOutcome,
+        hint_persisted: bool,
+    }
+
+    let outcomes: Vec<SegOutcome> =
         futures::stream::iter(to_fetch.into_iter().map(|(location, ulid_str, ulid)| {
             let store = store.clone();
             let fork_dir = fork_dir.to_path_buf();
             let verifying_key = *verifying_key;
             async move {
+                let mut hint_persisted = false;
                 if let (Some(peer_ctx), Some(vol_ulid)) = (peer, vol_ulid) {
                     match peer_fetch_idx(
                         peer_ctx,
@@ -528,7 +554,28 @@ async fn fetch_idx_set(
                     {
                         Ok(()) => {
                             info!("[prefetch] fetched index from peer: {ulid_str}");
-                            return IdxOutcome::FromPeer;
+                            // Pair the hint fetch with peer-served idx.
+                            // Best-effort: a hint failure does not
+                            // demote the idx outcome.
+                            match peer_fetch_hint_persist(peer_ctx, vol_ulid, ulid, &fork_dir).await
+                            {
+                                Ok(persisted) => {
+                                    hint_persisted = persisted;
+                                    if persisted {
+                                        trace!("[prefetch] persisted prefetch-hint: {ulid_str}");
+                                    }
+                                }
+                                Err(e) => {
+                                    trace!(
+                                        "[prefetch] peer hint miss for {ulid_str}: {e:#}; \
+                                         body prefetch will demand-fetch"
+                                    );
+                                }
+                            }
+                            return SegOutcome {
+                                idx: IdxOutcome::FromPeer,
+                                hint_persisted,
+                            };
                         }
                         Err(e) => {
                             trace!(
@@ -538,7 +585,9 @@ async fn fetch_idx_set(
                     }
                 }
 
-                match fetch_idx(&store, &location, &fork_dir, &ulid_str, &verifying_key).await {
+                let idx = match fetch_idx(&store, &location, &fork_dir, &ulid_str, &verifying_key)
+                    .await
+                {
                     Ok(()) => {
                         info!("[prefetch] fetched index: {ulid_str}");
                         IdxOutcome::FromStore
@@ -547,6 +596,10 @@ async fn fetch_idx_set(
                         warn!("[prefetch] failed to fetch index {ulid_str}: {e:#}");
                         IdxOutcome::Failed
                     }
+                };
+                SegOutcome {
+                    idx,
+                    hint_persisted,
                 }
             }
         }))
@@ -555,13 +608,16 @@ async fn fetch_idx_set(
         .await;
 
     for outcome in outcomes {
-        match outcome {
+        match outcome.idx {
             IdxOutcome::FromPeer => {
                 result.fetched += 1;
                 result.fetched_from_peer += 1;
             }
             IdxOutcome::FromStore => result.fetched += 1,
             IdxOutcome::Failed => result.failed += 1,
+        }
+        if outcome.hint_persisted {
+            result.hints_fetched += 1;
         }
     }
 }
@@ -673,6 +729,46 @@ fn manifest_driven_fetch_set(
         out.push((key, ulid_str, ulid));
     }
     Ok(out)
+}
+
+/// Try to fetch a segment's `.prefetch` hint from the peer and persist
+/// it to `<fork_dir>/cache/<ulid>.prefetch-hint` for the volume
+/// daemon's body prefetch task to consume at `volume up`.
+///
+/// Returns `Ok(true)` if a non-empty hint was persisted, `Ok(false)`
+/// if the peer returned 404 / network error / empty payload (any of
+/// which means "no warming advice for this segment"). All failure
+/// modes are non-fatal: hints are advisory and prefetch falls through
+/// to demand-fetch when absent.
+///
+/// Atomic write via `tmp + rename` so a daemon crash mid-write
+/// can't leave a half-written hint that would confuse the volume
+/// daemon's parser.
+async fn peer_fetch_hint_persist(
+    peer: &PeerFetchContext,
+    vol_ulid: Ulid,
+    seg_ulid: Ulid,
+    fork_dir: &Path,
+) -> Result<bool> {
+    let hint = match peer
+        .client
+        .fetch_prefetch_hint(&peer.endpoint, &peer.volume_name, vol_ulid, seg_ulid)
+        .await
+    {
+        Some(h) => h,
+        None => return Ok(false),
+    };
+    if hint.payload_len() == 0 {
+        return Ok(false);
+    }
+
+    let cache_dir = fork_dir.join("cache");
+    std::fs::create_dir_all(&cache_dir).context("creating cache dir for hint")?;
+    let final_path = cache_dir.join(format!("{seg_ulid}.prefetch-hint"));
+    let tmp_path = cache_dir.join(format!("{seg_ulid}.prefetch-hint.tmp"));
+    std::fs::write(&tmp_path, hint.wire_bytes()).context("writing prefetch-hint tmp")?;
+    std::fs::rename(&tmp_path, &final_path).context("renaming prefetch-hint tmp")?;
+    Ok(true)
 }
 
 /// Try to fetch a segment's `.idx` from the peer, verify its signature,

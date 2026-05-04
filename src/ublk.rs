@@ -438,7 +438,10 @@ mod imp {
 
         if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)?
         {
-            volume.set_fetcher(Arc::new(fetcher));
+            let arc_fetcher: Arc<dyn elide_core::segment::SegmentFetcher> = Arc::new(fetcher);
+            let fork_dirs = volume.fork_dirs();
+            volume.set_fetcher(Arc::clone(&arc_fetcher));
+            crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
             println!("[demand-fetch enabled]");
         }
 

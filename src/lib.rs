@@ -1,6 +1,7 @@
 // Elide library: module declarations and utilities shared across the binary
 // and its tests.
 
+pub mod body_prefetch;
 pub mod control;
 pub mod coordinator_client;
 pub mod extents;

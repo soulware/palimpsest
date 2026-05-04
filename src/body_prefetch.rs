@@ -1,0 +1,399 @@
+//! Background body warming on volume start.
+//!
+//! Consumes `cache/<ulid>.prefetch-hint` files persisted by the
+//! coordinator's prefetch loop on a fresh claim — each one carries the
+//! peer's per-segment `.present` bitmap, identifying body byte ranges
+//! the previous claimer had warm. We translate each populated entry
+//! into a body offset via the local `.idx` and dispatch through the
+//! volume's `SegmentFetcher`. Demand-fetch and prefetch share the same
+//! fetcher, so the per-segment coalescer absorbs runs and a guest read
+//! that races with prefetch is naturally deduplicated rather than
+//! double-fetched.
+//!
+//! Each call to `fetch_extent` is a starting point; the coalescer
+//! extends the batch forward across body-adjacent entries that aren't
+//! yet present, so a dense hint produces a few large Range GETs
+//! rather than many small ones. Subsequent per-entry calls inside the
+//! batched run early-return via the present-bit fast path.
+//!
+//! Failure modes match demand-fetch: peer 404 / partial coverage /
+//! unreachable falls through to S3 inside `PeerRangeFetcher`, so the
+//! prefetch loop just keeps iterating. The hint file is deleted once
+//! every populated entry has been *attempted*; a daemon restart
+//! re-derives any residual work by intersecting the on-disk hint with
+//! the on-disk `.present` (entries set in the hint but absent from
+//! `.present` are still outstanding).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
+use elide_core::segment::{self, BoxFetcher, ExtentFetch};
+use elide_peer_fetch::PrefetchHint;
+use tracing::{trace, warn};
+use ulid::Ulid;
+
+/// Worker count for the body-prefetch pool. Sized well below
+/// demand-fetch headroom (NBD per-connection read pool is 4 workers,
+/// ublk runs comparable concurrency); two background workers leaves
+/// the connection pool — and any outbound bandwidth budget — to live
+/// guest IO during the warming window.
+const PREFETCH_WORKERS: usize = 2;
+
+/// Spawn a detached worker pool that warms body cache from any
+/// `cache/*.prefetch-hint` files in the chain.
+///
+/// Non-blocking: returns immediately. The pool exits when every hint
+/// has been attempted or when no hints are present (immediate
+/// return). All errors are non-fatal; the demand-fetch path handles
+/// any segment whose prefetch is incomplete.
+///
+/// `fork_dirs` is the volume's ancestry chain (oldest-first, current
+/// fork last) — the same list demand-fetch searches on a cache miss.
+/// Each fork's `cache/` is scanned independently because segments are
+/// owned by the fork that minted them and their `.idx` / `.body` /
+/// `.prefetch-hint` files all live alongside in that fork's
+/// directory.
+pub fn spawn(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
+    let _ = thread::Builder::new()
+        .name("body-prefetch".into())
+        .spawn(move || run(fork_dirs, fetcher));
+}
+
+fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
+    let hints = collect_hints(&fork_dirs);
+    if hints.is_empty() {
+        return;
+    }
+    let total = hints.len();
+    trace!("[body-prefetch] {total} hint(s) discovered across chain");
+
+    let hints = Arc::new(hints);
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..PREFETCH_WORKERS.min(total) {
+        let cursor = Arc::clone(&cursor);
+        let hints = Arc::clone(&hints);
+        let fetcher = Arc::clone(&fetcher);
+        if let Ok(h) = thread::Builder::new()
+            .name(format!("body-prefetch-{w}"))
+            .spawn(move || worker(cursor, hints, fetcher))
+        {
+            handles.push(h);
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    trace!("[body-prefetch] pool done: {total} hint(s) attempted");
+}
+
+/// Walk the chain head-first and collect every `cache/*.prefetch-hint`
+/// alongside its owning fork directory and parsed segment ULID.
+///
+/// Head-first ordering puts the writable fork's segments at the front
+/// of the work queue: most-likely-touched bytes warm earliest, so the
+/// demand-fetch path is least likely to find a cold extent before
+/// prefetch reaches it.
+fn collect_hints(fork_dirs: &[PathBuf]) -> Vec<HintEntry> {
+    let mut out = Vec::new();
+    // `fork_dirs` is oldest-first; iterate in reverse so the writable
+    // head fork's segments queue ahead of ancestors.
+    for dir in fork_dirs.iter().rev() {
+        let cache = dir.join("cache");
+        let entries = match std::fs::read_dir(&cache) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".prefetch-hint") else {
+                continue;
+            };
+            let Ok(ulid) = Ulid::from_string(stem) else {
+                continue;
+            };
+            out.push(HintEntry {
+                owner_dir: dir.clone(),
+                seg_ulid: ulid,
+                hint_path: path,
+            });
+        }
+    }
+    out
+}
+
+struct HintEntry {
+    owner_dir: PathBuf,
+    seg_ulid: Ulid,
+    hint_path: PathBuf,
+}
+
+fn worker(cursor: Arc<AtomicUsize>, hints: Arc<Vec<HintEntry>>, fetcher: BoxFetcher) {
+    loop {
+        let i = cursor.fetch_add(1, Ordering::Relaxed);
+        if i >= hints.len() {
+            return;
+        }
+        let h = &hints[i];
+        if let Err(e) = process_hint(&h.owner_dir, h.seg_ulid, &h.hint_path, &*fetcher) {
+            trace!("[body-prefetch {}] non-fatal error: {e:#}", h.seg_ulid);
+        }
+    }
+}
+
+/// Process one segment's hint: translate populated entries to byte
+/// ranges via the local `.idx`, dispatch each range through the
+/// fetcher, and remove the hint when every populated entry has been
+/// attempted.
+fn process_hint(
+    owner_dir: &Path,
+    seg_ulid: Ulid,
+    hint_path: &Path,
+    fetcher: &dyn segment::SegmentFetcher,
+) -> std::io::Result<()> {
+    let hint_bytes = std::fs::read(hint_path)?;
+    let hint = PrefetchHint::from_vec(hint_bytes);
+
+    let index_dir = owner_dir.join("index");
+    let cache_dir = owner_dir.join("cache");
+    let idx_path = index_dir.join(format!("{seg_ulid}.idx"));
+
+    let layout = match segment::read_segment_layout(&idx_path) {
+        Ok(l) => l,
+        Err(e) => {
+            // The coordinator persists `.idx` and `.prefetch-hint` in
+            // the same per-segment task, so a hint without an idx is
+            // unusual. Leave the hint on disk for a subsequent run
+            // rather than deleting work we can't yet do.
+            warn!("[body-prefetch {seg_ulid}] missing idx, leaving hint on disk: {e}");
+            return Ok(());
+        }
+    };
+    let (_, entries, _) = segment::read_segment_index(&idx_path)?;
+    let entry_count = entries.len() as u32;
+
+    let mut dispatched = 0usize;
+    for entry_idx in hint.iter_populated_entries(entry_count) {
+        let entry = match entries.get(entry_idx as usize) {
+            Some(e) => e,
+            None => continue,
+        };
+        // Only Data / CanonicalData entries with stored body bytes are
+        // body-prefetchable. DedupRef rows resolve via the extent
+        // index without a body GET; Inline lives in the .idx (already
+        // on disk); Zero contributes no body. Skipping these here
+        // matches the same kind-check `fetch_one_extent` does
+        // internally — no point invoking it just to bail.
+        if !entry.kind.is_data() || entry.stored_length == 0 {
+            continue;
+        }
+        if let Err(err) = fetcher.fetch_extent(
+            seg_ulid,
+            &index_dir,
+            &cache_dir,
+            &ExtentFetch {
+                body_section_start: layout.body_section_start,
+                body_offset: entry.stored_offset,
+                body_length: entry.stored_length,
+                entry_idx,
+            },
+        ) {
+            // Best-effort: peer 404 / S3 transient / etc.  Log and move
+            // on; the demand-fetch path will retry if the guest reads
+            // this entry. Hint file still gets cleaned up below — the
+            // entry was attempted, and the present bit reflects the
+            // truth either way.
+            trace!("[body-prefetch {seg_ulid}] fetch_extent(entry={entry_idx}): {err:#}");
+        }
+        dispatched += 1;
+    }
+
+    // Remove the hint now that every populated entry has been
+    // attempted. A restart will not re-attempt them — but the
+    // present-bit fast-path inside `fetch_extent` already makes
+    // re-attempts cheap, so the hint deletion is operator hygiene
+    // rather than a correctness requirement.
+    if let Err(e) = std::fs::remove_file(hint_path) {
+        trace!(
+            "[body-prefetch {seg_ulid}] failed to remove consumed hint {}: {e}",
+            hint_path.display()
+        );
+    }
+    trace!("[body-prefetch {seg_ulid}] dispatched {dispatched} extent(s); hint consumed");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+
+    use elide_core::segment::{ExtentFetch, SegmentFetcher};
+
+    /// Counts `fetch_extent` calls per segment. Records every entry
+    /// idx requested so tests can assert against the exact set the
+    /// hint should have driven.
+    struct RecordingFetcher {
+        calls: Mutex<Vec<(Ulid, u32)>>,
+    }
+
+    impl RecordingFetcher {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SegmentFetcher for RecordingFetcher {
+        fn fetch_extent(
+            &self,
+            segment_id: Ulid,
+            _index_dir: &Path,
+            _body_dir: &Path,
+            extent: &ExtentFetch,
+        ) -> std::io::Result<()> {
+            self.calls
+                .lock()
+                .expect("recording fetcher mutex")
+                .push((segment_id, extent.entry_idx));
+            Ok(())
+        }
+
+        fn fetch_delta_body(
+            &self,
+            _segment_id: Ulid,
+            _index_dir: &Path,
+            _body_dir: &Path,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a minimal segment with `entry_count` Data entries (each
+    /// 1 KiB so they don't fall under the inline threshold), write a
+    /// full segment file, then strip the body section to land an
+    /// `.idx` in `<owner_dir>/index/`. Returns the segment ULID.
+    /// `<owner_dir>/cache/` is also created so the test can drop a
+    /// `.prefetch-hint` next to where `.body` would land.
+    fn write_test_segment(owner_dir: &Path, entry_count: u32) -> std::io::Result<Ulid> {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+
+        let index_dir = owner_dir.join("index");
+        std::fs::create_dir_all(&index_dir)?;
+        std::fs::create_dir_all(owner_dir.join("cache"))?;
+
+        let seg_ulid = Ulid::new();
+        let body_size: usize = 1024;
+        let mut entries: Vec<SegmentEntry> = (0..entry_count)
+            .map(|i| {
+                let data = vec![i as u8; body_size];
+                SegmentEntry::new_data(
+                    blake3::hash(&data),
+                    (i as u64) * 8,
+                    8,
+                    SegmentFlags::empty(),
+                    data,
+                )
+            })
+            .collect();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let seg_path = owner_dir.join(format!("{seg_ulid}.tmp-full"));
+        write_segment(&seg_path, &mut entries, signer.as_ref())?;
+
+        // Strip the body section to leave just header + index + inline.
+        let layout = elide_core::segment::read_segment_layout(&seg_path)?;
+        let raw = std::fs::read(&seg_path)?;
+        let idx_bytes = &raw[..layout.body_section_start as usize];
+        std::fs::write(index_dir.join(format!("{seg_ulid}.idx")), idx_bytes)?;
+        std::fs::remove_file(&seg_path)?;
+        Ok(seg_ulid)
+    }
+
+    #[test]
+    fn process_hint_dispatches_populated_entries_and_removes_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = tmp.path().to_path_buf();
+        let seg = write_test_segment(&owner, 16).unwrap();
+
+        // Hint: entries 0, 3, 7, 12 populated.
+        let mut bits = vec![0u8; 2];
+        for idx in [0u32, 3, 7, 12] {
+            bits[(idx / 8) as usize] |= 1 << (idx % 8);
+        }
+        let cache = owner.join("cache");
+        std::fs::write(cache.join(format!("{seg}.prefetch-hint")), &bits).unwrap();
+
+        let fetcher = Arc::new(RecordingFetcher::new());
+        process_hint(
+            &owner,
+            seg,
+            &cache.join(format!("{seg}.prefetch-hint")),
+            &*fetcher,
+        )
+        .unwrap();
+
+        let calls = fetcher.calls.lock().unwrap().clone();
+        let entry_idxs: Vec<u32> = calls.iter().map(|(_, idx)| *idx).collect();
+        assert_eq!(entry_idxs, vec![0, 3, 7, 12]);
+
+        // Hint file is deleted post-attempt.
+        assert!(!cache.join(format!("{seg}.prefetch-hint")).exists());
+    }
+
+    #[test]
+    fn process_hint_with_missing_idx_leaves_hint_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = tmp.path().to_path_buf();
+        std::fs::create_dir_all(owner.join("cache")).unwrap();
+        std::fs::create_dir_all(owner.join("index")).unwrap();
+
+        // Hint references a segment with no .idx on disk.
+        let seg = Ulid::new();
+        let cache = owner.join("cache");
+        let hint_path = cache.join(format!("{seg}.prefetch-hint"));
+        std::fs::write(&hint_path, [0xffu8; 4]).unwrap();
+
+        let fetcher = Arc::new(RecordingFetcher::new());
+        process_hint(&owner, seg, &hint_path, &*fetcher).unwrap();
+
+        // Untouched: a future run (after idx prefetch lands) can retry.
+        assert!(hint_path.exists());
+        assert!(fetcher.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn collect_hints_walks_chain_head_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let head = tmp.path().join("head");
+        std::fs::create_dir_all(parent.join("cache")).unwrap();
+        std::fs::create_dir_all(head.join("cache")).unwrap();
+
+        let p_seg = Ulid::new();
+        let h_seg = Ulid::new();
+        std::fs::write(
+            parent.join("cache").join(format!("{p_seg}.prefetch-hint")),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(
+            head.join("cache").join(format!("{h_seg}.prefetch-hint")),
+            b"x",
+        )
+        .unwrap();
+
+        // Oldest-first chain: parent then head.
+        let chain = vec![parent.clone(), head.clone()];
+        let collected = collect_hints(&chain);
+        let order: Vec<Ulid> = collected.iter().map(|h| h.seg_ulid).collect();
+        // Head first in work queue.
+        assert_eq!(order, vec![h_seg, p_seg]);
+    }
+}

@@ -32,10 +32,29 @@ impl PrefetchHint {
         Self { bytes }
     }
 
+    /// Wrap an owned byte vector. Used by callers that read the hint
+    /// from disk (e.g. the volume daemon's body-prefetch task reading
+    /// a `cache/<ulid>.prefetch-hint` file) and don't otherwise pull
+    /// in the `bytes` crate directly.
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Bytes::from(bytes),
+        }
+    }
+
     /// Number of bytes in the hint payload. Useful for logging /
     /// counters.
     pub fn payload_len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Raw wire bytes. Exposed so the coordinator's prefetch loop can
+    /// persist the hint to disk for later consumption by the volume
+    /// daemon's body-prefetch task. Most callers should use
+    /// [`Self::iter_populated_entries`] instead — the wire encoding is
+    /// not part of the public contract.
+    pub fn wire_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Iterate the entry indices the hint marks as worth warming.
@@ -110,5 +129,17 @@ mod tests {
         // treated as zero bit.
         let entries: Vec<_> = hint.iter_populated_entries(16).collect();
         assert_eq!(entries, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn from_vec_round_trips_through_wire_bytes() {
+        // Round-trip property: the volume daemon reads bytes from the
+        // on-disk hint file, wraps via `from_vec`, and `wire_bytes`
+        // should reflect exactly what the coordinator persisted.
+        let payload = vec![0b1010_0101u8, 0b0000_1111];
+        let hint = PrefetchHint::from_vec(payload.clone());
+        assert_eq!(hint.wire_bytes(), payload.as_slice());
+        let entries: Vec<_> = hint.iter_populated_entries(16).collect();
+        assert_eq!(entries, vec![0, 2, 5, 7, 8, 9, 10, 11]);
     }
 }
