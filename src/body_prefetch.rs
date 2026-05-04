@@ -48,10 +48,40 @@ const PREFETCH_WORKERS: usize = 16;
 ///
 /// `fork_dirs` is the volume's ancestry chain (oldest-first), the same
 /// list demand-fetch searches on a cache miss.
-pub fn spawn(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) -> Option<thread::JoinHandle<()>> {
+///
+/// `on_drain` fires from the outer thread once every hint has been
+/// attempted (or immediately when there are no hints, including the
+/// panic-during-collect path via the drop guard). Used by the volume
+/// daemon to swap the demand-fetcher's inner store from peer-then-S3
+/// to S3-only — peer-fetch is a one-shot LAN warmup, and any later
+/// cache miss (e.g. an evicted segment re-fetched days afterwards)
+/// must skip the peer entirely.
+pub fn spawn<F>(
+    fork_dirs: Vec<PathBuf>,
+    fetcher: BoxFetcher,
+    on_drain: F,
+) -> Option<thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
     thread::Builder::new()
         .name("body-prefetch".into())
-        .spawn(move || run(fork_dirs, fetcher))
+        .spawn(move || {
+            // Drop guard: fires `on_drain` exactly once, on every exit
+            // path of the outer thread (clean return *or* panic).
+            // Without it, a panic in `collect_hints` would strand the
+            // demand-fetcher with the peer wrapper still in place.
+            struct DrainGuard<F: FnOnce()>(Option<F>);
+            impl<F: FnOnce()> Drop for DrainGuard<F> {
+                fn drop(&mut self) {
+                    if let Some(f) = self.0.take() {
+                        f();
+                    }
+                }
+            }
+            let _guard = DrainGuard(Some(on_drain));
+            run(fork_dirs, fetcher);
+        })
         .ok()
 }
 

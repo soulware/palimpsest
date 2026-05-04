@@ -59,13 +59,14 @@ fn peer_fetch_runtime_handle() -> io::Result<tokio::runtime::Handle> {
     Ok(rt.handle().clone())
 }
 
-/// Output of [`build_volume_fetcher`]. `fetcher` is peer-then-S3 (or
-/// S3-only when no peer is configured). `s3_store` is the raw layer
-/// without the peer wrapper, used by `full_warm` to bypass the peer.
+/// Output of [`build_volume_fetcher`]. `fetcher` starts as
+/// peer-then-S3 (or S3-only when no peer is configured); the volume
+/// daemon swaps its inner store to `s3_store` after the hint-driven
+/// warm pass via [`RemoteFetcher::set_store`] so later cache misses
+/// skip the peer entirely.
 pub struct VolumeFetcherBuild {
-    pub fetcher: RemoteFetcher,
+    pub fetcher: Arc<RemoteFetcher>,
     pub s3_store: Arc<dyn RangeFetcher>,
-    pub fetch_batch_bytes: u64,
     pub peer_counters: Option<PeerFetchCountersHandle>,
 }
 
@@ -134,11 +135,10 @@ pub fn build_volume_fetcher(
     let fetch_batch_bytes = config
         .fetch_batch_bytes
         .unwrap_or(elide_fetch::DEFAULT_FETCH_BATCH_BYTES);
-    let fetcher = RemoteFetcher::from_store(demand_store, fetch_batch_bytes);
+    let fetcher = Arc::new(RemoteFetcher::from_store(demand_store, fetch_batch_bytes));
     Ok(Some(VolumeFetcherBuild {
         fetcher,
         s3_store,
-        fetch_batch_bytes,
         peer_counters,
     }))
 }
