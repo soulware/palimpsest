@@ -150,6 +150,108 @@ fn install_sigusr1_handler() {
     }
 }
 
+/// Bound on volume-actor flush latency at shutdown. Matches ublk so
+/// operators see the same cap across transports.
+#[cfg(target_os = "linux")]
+const NBD_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Set of process-termination signals the volume daemon services
+/// gracefully (matches ublk: SIGINT for Ctrl-C, SIGTERM for orderly
+/// stop, SIGHUP for terminal-loss).
+#[cfg(target_os = "linux")]
+fn nbd_shutdown_sigset() -> nix::sys::signal::SigSet {
+    let mut s = nix::sys::signal::SigSet::empty();
+    s.add(nix::sys::signal::Signal::SIGINT);
+    s.add(nix::sys::signal::Signal::SIGTERM);
+    s.add(nix::sys::signal::Signal::SIGHUP);
+    s
+}
+
+/// Block the shutdown signals on the calling thread before any other
+/// thread is spawned. The block is inherited by every subsequent
+/// thread (volume-actor, control-server, NBD reader/writer workers),
+/// so only the dedicated `nbd-signal` watcher reads them via
+/// signalfd. Mirrors the ublk transport.
+///
+/// signalfd is Linux-only; on other Unix targets this is a no-op and
+/// the daemon retains the prior "OS kills us, hope the actor flushed
+/// in time" semantics.
+fn block_shutdown_signals() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        nbd_shutdown_sigset()
+            .thread_block()
+            .map_err(|e| io::Error::other(format!("block shutdown signals: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Spawn the NBD shutdown-signal watcher thread.
+///
+/// On signal:
+///   1. Spawn a watchdog that force-exits after
+///      `NBD_SHUTDOWN_FLUSH_TIMEOUT` so a wedged actor cannot trap
+///      the process.
+///   2. Best-effort `client.flush()` to fsync the WAL — anything the
+///      actor accepted before this call is durable.
+///   3. Log the final peer-fetch counter snapshot (no-op when
+///      peer-fetch was disabled for this run).
+///   4. `process::exit(0)`.
+///
+/// signalfd is Linux-only; on other Unix targets this is a no-op
+/// (returns an empty join handle).
+fn spawn_nbd_signal_watcher(
+    client: elide_core::actor::VolumeClient,
+    peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle>,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(target_os = "linux")]
+    {
+        let sfd = nix::sys::signalfd::SignalFd::new(&nbd_shutdown_sigset())
+            .map_err(|e| io::Error::other(format!("signalfd: {e}")))?;
+        std::thread::Builder::new()
+            .name("nbd-signal".into())
+            .spawn(move || {
+                match sfd.read_signal() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        error!("nbd-signal: signalfd read returned None on a blocking fd");
+                        std::process::exit(130);
+                    }
+                    Err(e) => {
+                        error!("nbd-signal: signalfd read failed: {e}");
+                        std::process::exit(130);
+                    }
+                }
+
+                let _watchdog = std::thread::Builder::new()
+                    .name("nbd-shutdown-watchdog".into())
+                    .spawn(|| {
+                        std::thread::sleep(NBD_SHUTDOWN_FLUSH_TIMEOUT);
+                        warn!(
+                            "nbd shutdown flush did not complete within {:?}; exiting anyway",
+                            NBD_SHUTDOWN_FLUSH_TIMEOUT
+                        );
+                        std::process::exit(0);
+                    });
+
+                if let Err(e) = client.flush() {
+                    warn!("nbd shutdown flush: {e}");
+                }
+                crate::log_peer_fetch_counters_at_shutdown(peer_counters.as_ref());
+                std::process::exit(0);
+            })
+            .map_err(io::Error::other)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (client, peer_counters);
+        std::thread::Builder::new()
+            .name("nbd-signal-stub".into())
+            .spawn(|| {})
+            .map_err(io::Error::other)
+    }
+}
+
 fn report_path() -> String {
     format!("/tmp/elide-{}.report", std::process::id())
 }
@@ -820,9 +922,9 @@ fn serve_readonly_volume_listener(
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_readonly_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+    if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(fetcher);
+            std::sync::Arc::new(build.fetcher);
         let fork_dirs = volume.fork_dirs();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
         crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
@@ -852,17 +954,26 @@ fn run_volume_ipc_only(
     _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
+    // Block shutdown signals on this thread before spawning anything
+    // else, so every subsequent thread inherits the block and only the
+    // dedicated `nbd-signal` watcher reads them via signalfd. Same
+    // shape as ublk's daemon: a wedged thread can never accidentally
+    // service the signal, and the signal disposition stays
+    // deterministic.
+    block_shutdown_signals()?;
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+    let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
+    if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(fetcher);
+            std::sync::Arc::new(build.fetcher);
         let fork_dirs = volume.fork_dirs();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
         crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
+        peer_counters = build.peer_counters;
     }
 
     let (_actor, handle) = elide_core::actor::spawn(volume);
@@ -871,7 +982,9 @@ fn run_volume_ipc_only(
         .spawn(move || _actor.run())
         .map_err(io::Error::other)?;
     let nbd_connected = Arc::new(AtomicBool::new(false));
-    crate::control::start(dir, handle, nbd_connected)?;
+    crate::control::start(dir, handle.clone(), nbd_connected)?;
+
+    let _sig_watcher = spawn_nbd_signal_watcher(handle, peer_counters)?;
 
     // Block until SIGTERM terminates the process.
     loop {
@@ -890,17 +1003,20 @@ fn serve_volume_listener(
     _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
+    block_shutdown_signals()?;
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+    let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
+    if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(fetcher);
+            std::sync::Arc::new(build.fetcher);
         let fork_dirs = volume.fork_dirs();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
         crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
+        peer_counters = build.peer_counters;
         println!("[demand-fetch enabled]");
     }
 
@@ -911,6 +1027,8 @@ fn serve_volume_listener(
         .map_err(io::Error::other)?;
     let nbd_connected = Arc::new(AtomicBool::new(false));
     crate::control::start(dir, handle.clone(), Arc::clone(&nbd_connected))?;
+
+    let _sig_watcher = spawn_nbd_signal_watcher(handle.clone(), peer_counters)?;
 
     loop {
         let (stream, peer) = listener.accept()?;
