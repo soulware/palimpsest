@@ -28,6 +28,11 @@ pub struct VolumeConfig {
     pub nbd: Option<NbdConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ublk: Option<UblkConfig>,
+    /// Opt out of background full-volume warming on writable start.
+    /// `Some(true)` keeps the volume on demand-fetch only; default (None /
+    /// false) eagerly warms every live extent from S3 in the background.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lazy: Option<bool>,
 }
 
 /// NBD server configuration within `volume.toml`.

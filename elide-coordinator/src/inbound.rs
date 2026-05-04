@@ -1344,6 +1344,7 @@ async fn create_volume_op(
             size: Some(size_bytes),
             nbd: nbd_cfg,
             ublk: ublk_cfg,
+            lazy: None,
         }
         .write(&vol_dir)?;
         std::fs::create_dir_all(&by_name_dir)?;
@@ -2140,6 +2141,7 @@ async fn fork_create_op(
             size: Some(size),
             nbd: nbd_cfg,
             ublk: ublk_cfg,
+            lazy: None,
         }
         .write(&new_fork_dir))
         {
@@ -4242,6 +4244,7 @@ async fn finalize_claim_fork(
         size: Some(size),
         nbd: None,
         ublk: None,
+        lazy: None,
     }
     .write(new_fork_dir)
     .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;

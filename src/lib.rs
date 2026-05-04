@@ -5,6 +5,7 @@ pub mod body_prefetch;
 pub mod control;
 pub mod coordinator_client;
 pub mod extents;
+pub mod full_warm;
 pub mod inspect;
 pub mod inspect_files;
 pub mod ls;
@@ -58,12 +59,13 @@ fn peer_fetch_runtime_handle() -> io::Result<tokio::runtime::Handle> {
     Ok(rt.handle().clone())
 }
 
-/// Output of [`build_volume_fetcher`]. Always returns the
-/// `RemoteFetcher`; the optional `peer_counters` handle is present iff
-/// the peer-fetch decorator was actually stacked (peer endpoint
-/// available and `volume.key` on disk).
+/// Output of [`build_volume_fetcher`]. `fetcher` is peer-then-S3 (or
+/// S3-only when no peer is configured). `s3_store` is the raw layer
+/// without the peer wrapper, used by `full_warm` to bypass the peer.
 pub struct VolumeFetcherBuild {
     pub fetcher: RemoteFetcher,
+    pub s3_store: Arc<dyn RangeFetcher>,
+    pub fetch_batch_bytes: u64,
     pub peer_counters: Option<PeerFetchCountersHandle>,
 }
 
@@ -102,8 +104,8 @@ pub fn build_volume_fetcher(
     let Some(config) = inputs.fetch_config else {
         return Ok(None);
     };
-    let store: Arc<dyn RangeFetcher> = config.build_fetcher()?;
-    let (store, peer_counters) = match inputs.peer_endpoint {
+    let s3_store: Arc<dyn RangeFetcher> = config.build_fetcher()?;
+    let (demand_store, peer_counters) = match inputs.peer_endpoint {
         Some(endpoint) if fork_dir.join(VOLUME_KEY_FILE).exists() => {
             let vol_ulid_str = elide_fetch::derive_volume_id(fork_dir)?;
             let vol_ulid = ulid::Ulid::from_string(&vol_ulid_str)
@@ -117,20 +119,26 @@ pub fn build_volume_fetcher(
                 .and_then(Path::parent)
                 .unwrap_or(fork_dir)
                 .to_path_buf();
-            let peer = PeerRangeFetcher::new(store, body_client, endpoint, data_dir, runtime);
+            let peer = PeerRangeFetcher::new(
+                Arc::clone(&s3_store),
+                body_client,
+                endpoint,
+                data_dir,
+                runtime,
+            );
             let counters = peer.counters();
             (Arc::new(peer) as Arc<dyn RangeFetcher>, Some(counters))
         }
-        _ => (store, None),
+        _ => (Arc::clone(&s3_store), None),
     };
-    let fetcher = RemoteFetcher::from_store(
-        store,
-        config
-            .fetch_batch_bytes
-            .unwrap_or(elide_fetch::DEFAULT_FETCH_BATCH_BYTES),
-    );
+    let fetch_batch_bytes = config
+        .fetch_batch_bytes
+        .unwrap_or(elide_fetch::DEFAULT_FETCH_BATCH_BYTES);
+    let fetcher = RemoteFetcher::from_store(demand_store, fetch_batch_bytes);
     Ok(Some(VolumeFetcherBuild {
         fetcher,
+        s3_store,
+        fetch_batch_bytes,
         peer_counters,
     }))
 }
