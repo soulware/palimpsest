@@ -157,6 +157,10 @@ pub async fn prefetch_indexes(
         volume_id: current_volume_id,
         branch_ulid: None,
         vk: own_vk,
+        // Head fork has no branch_ulid → no manifest is read for it
+        // here. If `latest_snapshot(fork_dir)` later resolves to one
+        // it was authored by *this* fork (own_vk).
+        manifest_vk: own_vk,
     });
 
     // Walk the fork parent chain using embedded pubkeys committed in
@@ -190,11 +194,27 @@ pub async fn prefetch_indexes(
                 parent.volume_ulid
             )
         })?;
+        // Synthesised handoff snapshots (force-released parents) are
+        // signed under the recovering coordinator's attestation key,
+        // not the parent's volume.pub. The child's signed provenance
+        // records that override in `ParentRef::manifest_pubkey`;
+        // honour it here so the manifest verify under
+        // `read_snapshot_manifest` uses the right key.
+        let parent_manifest_vk = match parent.manifest_pubkey {
+            Some(bytes) => VerifyingKey::from_bytes(&bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid parent manifest_pubkey in provenance for {}: {e}",
+                    parent.volume_ulid
+                )
+            })?,
+            None => parent_vk,
+        };
         tasks.push(PrefetchTask {
             dir: parent_dir.clone(),
             volume_id: parent.volume_ulid.clone(),
             branch_ulid: Some(parent.snapshot_ulid.clone()),
             vk: parent_vk,
+            manifest_vk: parent_manifest_vk,
         });
         trusted_dirs.push(parent_dir.clone());
         // Continue walking under the pubkey the child committed to.
@@ -241,11 +261,17 @@ pub async fn prefetch_indexes(
             .with_context(|| format!("resolving volume id for {}", ancestor_dir.display()))?;
         let ancestor_vk = signing::load_verifying_key(&ancestor_dir, signing::VOLUME_PUB_FILE)
             .with_context(|| format!("loading volume.pub from {}", ancestor_dir.display()))?;
+        // Extent-index ancestors don't reach the synthesised-handoff
+        // path (their branch ULID is recorded in extent index, not in
+        // the requesting child's provenance, so no
+        // `manifest_pubkey` override applies). Manifest verify and
+        // segment verify both use the ancestor's own volume.pub.
         tasks.push(PrefetchTask {
             dir: ancestor_dir,
             volume_id,
             branch_ulid: ancestor.branch_ulid,
             vk: ancestor_vk,
+            manifest_vk: ancestor_vk,
         });
     }
 
@@ -263,6 +289,7 @@ pub async fn prefetch_indexes(
                 &task.volume_id,
                 task.branch_ulid.as_deref(),
                 &task.vk,
+                &task.manifest_vk,
                 peer.as_ref(),
                 &mut local,
             )
@@ -289,19 +316,33 @@ pub async fn prefetch_indexes(
 
 /// One unit of prefetch work collected during the lineage walk and
 /// dispatched concurrently in Pass 2.
+///
+/// `vk` verifies per-segment signatures on `.idx` bytes — those are
+/// always signed by the volume's own `volume.key` regardless of who
+/// authored the snapshot manifest.
+///
+/// `manifest_vk` verifies the snapshot manifest at `branch_ulid`. For
+/// normal handoffs this equals `vk`. For force-released volumes the
+/// manifest is *synthesised* by the recovering coordinator and signed
+/// under its attestation key — the requesting child records that
+/// override key in its own provenance via `ParentRef::manifest_pubkey`,
+/// and we propagate it here so the manifest verify uses the right key.
 struct PrefetchTask {
     dir: PathBuf,
     volume_id: String,
     branch_ulid: Option<String>,
     vk: VerifyingKey,
+    manifest_vk: VerifyingKey,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prefetch_fork(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
     volume_id: &str,
     branch_ulid: Option<&str>,
     verifying_key: &VerifyingKey,
+    manifest_verifying_key: &VerifyingKey,
     peer: Option<&PeerFetchContext>,
     result: &mut PrefetchResult,
 ) -> Result<()> {
@@ -330,7 +371,9 @@ async fn prefetch_fork(
     };
 
     let to_fetch: Vec<(StorePath, String, Ulid)> = match anchor.as_deref() {
-        Some(snap) => manifest_driven_fetch_set(fork_dir, volume_id, snap, verifying_key, result)?,
+        Some(snap) => {
+            manifest_driven_fetch_set(fork_dir, volume_id, snap, manifest_verifying_key, result)?
+        }
         None => Vec::new(),
     };
 
@@ -589,25 +632,30 @@ async fn list_supersessions(store: &Arc<dyn ObjectStore>, volume_id: &str) -> Ha
 ///
 /// `prefetch_snapshots` is expected to have already landed
 /// `<fork_dir>/snapshots/<branch_ulid>.manifest` on disk; this helper
-/// reads + verifies it under `verifying_key` (the parent pubkey
-/// committed in the requesting child's `volume.provenance`, or the
-/// ancestor's own `volume.pub` for extent-index ancestors), then drops
-/// any segments already present in `index/`. Each remaining ULID is
+/// reads + verifies it under `manifest_verifying_key` and drops any
+/// segments already present in `index/`. Each remaining ULID is
 /// paired with its computed S3 key via [`crate::upload::segment_key`]
 /// — no bucket LIST is involved.
+///
+/// `manifest_verifying_key` may differ from the ancestor's own
+/// `volume.pub`: synthesised handoff manifests (force-released
+/// parents) are signed under the recovering coordinator's
+/// attestation key, recorded in the requesting child's provenance
+/// via `ParentRef::manifest_pubkey`.
 fn manifest_driven_fetch_set(
     fork_dir: &Path,
     volume_id: &str,
     branch_ulid: &str,
-    verifying_key: &VerifyingKey,
+    manifest_verifying_key: &VerifyingKey,
     result: &mut PrefetchResult,
 ) -> Result<Vec<(StorePath, String, Ulid)>> {
     let snap_ulid = Ulid::from_string(branch_ulid)
         .map_err(|e| anyhow::anyhow!("invalid branch ULID '{branch_ulid}': {e}"))?;
-    let manifest = elide_core::signing::read_snapshot_manifest(fork_dir, verifying_key, &snap_ulid)
-        .with_context(|| {
+    let manifest =
+        elide_core::signing::read_snapshot_manifest(fork_dir, manifest_verifying_key, &snap_ulid)
+            .with_context(|| {
             format!(
-                "reading snapshot manifest {branch_ulid} for {} (verifying under parent pubkey)",
+                "reading snapshot manifest {branch_ulid} for {} (verifying under manifest pubkey)",
                 fork_dir.display()
             )
         })?;
@@ -1103,6 +1151,132 @@ mod tests {
                 .exists(),
             "child must not inherit parent's .idx"
         );
+    }
+
+    /// Synthesised handoff manifest: a force-released parent's
+    /// snapshot is signed under the recovering coordinator's
+    /// attestation key, **not** the parent's `volume.pub`. The
+    /// requesting child's provenance records the override via
+    /// `ParentRef::manifest_pubkey`. Prefetch must verify the parent's
+    /// manifest under that override pubkey, while still verifying the
+    /// segment `.idx` bytes under the parent's own volume key (those
+    /// were signed when the parent was alive).
+    ///
+    /// Regression: prior to this fix `prefetch` used a single
+    /// `verifying_key` for both manifest verify and segment verify,
+    /// so any claim from a force-release immediately failed
+    /// startup with `manifest signature invalid` and the volume
+    /// supervisor entered a respawn loop. Reproduced live by
+    /// `volume release --force` followed by `volume claim` + `start`.
+    #[tokio::test]
+    async fn prefetch_indexes_verifies_synthesised_handoff_manifest_under_override_key() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let by_id = data_dir.join("by_id");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+
+        std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
+        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
+
+        // Parent's own volume key signs its segments. Child has its
+        // own key. The "recovering coordinator" key is what signed
+        // the synthesised handoff manifest after the force-release.
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let recovering_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        let data = vec![0xC1u8; 4096];
+        let hash = blake3::hash(&data);
+        let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        // Segment is signed by the parent's own key (it was minted
+        // when the parent was still alive).
+        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
+        let staging = tmp.path().join(seg_ulid);
+        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
+
+        let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
+
+        // Child's signed provenance overrides the manifest pubkey to
+        // the recovering coordinator's attestation key. The parent's
+        // own pubkey still authoritatively verifies its segments.
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_ulid.to_owned(),
+                    snapshot_ulid: snap_ulid.to_owned(),
+                    pubkey: parent_key.verifying_key().to_bytes(),
+                    manifest_pubkey: Some(recovering_key.verifying_key().to_bytes()),
+                }),
+                extent_index: Vec::new(),
+                oci_source: None,
+            },
+        )
+        .unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+        let seg_bytes = std::fs::read(&staging).unwrap();
+        let seg_key = crate::upload::segment_key(parent_ulid, seg_ulid).unwrap();
+        store.put(&seg_key, seg_bytes.into()).await.unwrap();
+
+        // Synthesised manifest signed under the *recovering coord*
+        // key, not the parent's. Without the override the verify
+        // step fails with `manifest signature invalid`.
+        struct AttestationSigner(ed25519_dalek::SigningKey);
+        impl elide_core::segment::SegmentSigner for AttestationSigner {
+            fn sign(&self, msg: &[u8]) -> [u8; 64] {
+                use ed25519_dalek::Signer;
+                self.0.sign(msg).to_bytes()
+            }
+        }
+        let attestation_signer = AttestationSigner(recovering_key.clone());
+        let manifest_bytes = build_snapshot_manifest_bytes(
+            &attestation_signer,
+            &[Ulid::from_string(seg_ulid).unwrap()],
+            None,
+        );
+        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid).unwrap();
+        store
+            .put(&manifest_key, manifest_bytes.into())
+            .await
+            .unwrap();
+
+        // Run prefetch on the child. Should succeed: manifest verifies
+        // under the override key, the .idx itself verifies under the
+        // parent's volume.pub.
+        let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
+        assert_eq!(
+            result.fetched, 1,
+            "synthesised handoff manifest must verify under override key"
+        );
+        assert_eq!(result.failed, 0);
+
+        let idx_path = parent_dir.join("index").join(format!("{seg_ulid}.idx"));
+        assert!(idx_path.exists(), ".idx fetched and written");
     }
 
     /// Root volume with a published manifest: warm-start `prefetch_indexes`
