@@ -2376,18 +2376,23 @@ async fn fork_create_op(
 
 // ── Volume stop / start ───────────────────────────────────────────────────────
 
-/// True if `<data_dir>/by_name/<name>` exists and the resolved fork
-/// has no `volume.stopped` marker — i.e. this host is actively
-/// serving (or supposed to be serving) `<name>`.
+/// True if `<data_dir>/by_name/<name>` resolves to a fork with a live
+/// volume daemon — i.e. this host is actively serving `<name>`.
 ///
 /// Used by recovery verbs (`release --force`, `claim`) to refuse when
 /// the operator has typo'd a verb at their own running volume: those
 /// verbs are designed for unreachable peers and would otherwise leave
-/// on-disk state diverging from the bucket record.
+/// on-disk state diverging from the bucket record. A `Released` or
+/// `StoppedManual` fork is parked (no daemon, supervisor refuses to
+/// relaunch) so it is not "running" for these checks.
 fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
+    use elide_coordinator::volume_state::VolumeLifecycle;
     let link = data_dir.join("by_name").join(volume_name);
     match std::fs::canonicalize(&link) {
-        Ok(vol_dir) => !vol_dir.join(STOPPED_FILE).exists(),
+        Ok(vol_dir) => matches!(
+            VolumeLifecycle::from_dir(&vol_dir),
+            VolumeLifecycle::Running { .. }
+        ),
         Err(_) => false,
     }
 }
@@ -5163,6 +5168,79 @@ mod tests {
     //      (e.g. because of bug 1) was unstoppable. Fix: warn-and-skip
     //      the bucket update on InvalidTransition, halt locally
     //      regardless.
+
+    /// Build a `by_name/<vol>` symlink pointing at a `by_id/<ulid>/`
+    /// directory in a chosen lifecycle. `pid` controls whether a live
+    /// pidfile is written (use `Some(std::process::id())` for a
+    /// genuinely-running classification under `VolumeLifecycle::from_dir`).
+    fn make_volume_with_marker(
+        data_dir: &Path,
+        marker: Option<&str>,
+        pid: Option<u32>,
+    ) -> ulid::Ulid {
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("by_name")).unwrap();
+        let link = data_dir.join("by_name").join("vol");
+        let target = std::path::PathBuf::from(format!("../by_id/{vol_ulid}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if let Some(name) = marker {
+            std::fs::write(vol_dir.join(name), "").unwrap();
+        }
+        if let Some(pid) = pid {
+            std::fs::write(vol_dir.join(PID_FILE), pid.to_string()).unwrap();
+        }
+        vol_ulid
+    }
+
+    #[test]
+    fn local_daemon_running_treats_released_marker_as_not_running() {
+        // Regression: previously the predicate checked only for the
+        // absence of `volume.stopped`, so a parked-Released fork was
+        // misclassified as running and `claim` / `release --force`
+        // wrongly refused. The supervisor parks on `volume.released`
+        // too — these forks have no daemon.
+        use elide_coordinator::volume_state::RELEASED_FILE;
+        let data_dir = TempDir::new().unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(data_dir.path().join("by_name")).unwrap();
+        let link = data_dir.path().join("by_name").join("vol");
+        let target = std::path::PathBuf::from(format!("../by_id/{vol_ulid}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::write(vol_dir.join(RELEASED_FILE), vol_ulid.to_string()).unwrap();
+
+        assert!(!local_daemon_running(data_dir.path(), "vol"));
+    }
+
+    #[test]
+    fn local_daemon_running_true_for_live_pid() {
+        let data_dir = TempDir::new().unwrap();
+        make_volume_with_marker(data_dir.path(), None, Some(std::process::id()));
+        assert!(local_daemon_running(data_dir.path(), "vol"));
+    }
+
+    #[test]
+    fn local_daemon_running_false_for_stopped_marker() {
+        let data_dir = TempDir::new().unwrap();
+        // Both a live pid AND volume.stopped: parked wins.
+        make_volume_with_marker(
+            data_dir.path(),
+            Some(STOPPED_FILE),
+            Some(std::process::id()),
+        );
+        assert!(!local_daemon_running(data_dir.path(), "vol"));
+    }
+
+    #[test]
+    fn local_daemon_running_false_for_missing_volume() {
+        let data_dir = TempDir::new().unwrap();
+        assert!(!local_daemon_running(data_dir.path(), "ghost"));
+    }
 
     /// Build a `by_name/<vol>` symlink pointing at a fresh
     /// `by_id/<ulid>/` directory without a `volume.stopped` marker —
