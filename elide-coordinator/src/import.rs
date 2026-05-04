@@ -3,10 +3,10 @@
 // The coordinator spawns `elide-import` as a short-lived child process for OCI
 // volume imports. Two marker files are written to the fork directory:
 //
-//   import.lock — ULID of the running import (one line); present while running or interrupted
+//   volume.importing — ULID of the running import (one line); present while running or interrupted
 //   import.pid  — PID of the running import process (one line)
 //
-// The coordinator creates import.lock before spawning and removes both files
+// The coordinator creates volume.importing before spawning and removes both files
 // when the process exits (success or failure). On coordinator startup,
 // cleanup_stale_locks() kills any surviving import processes and removes stale
 // lock files so forks are in a clean, resumable state.
@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use elide_coordinator::lifecycle::{MarkInitialOutcome, mark_initial_readonly};
-use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE};
+use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
 
 /// Hard cap on entries in the new volume's `extent_index` provenance field.
 ///
@@ -269,7 +269,7 @@ pub struct ImportRequest<'a> {
 /// Spawn an import process for `req.vol_name` using OCI image `req.oci_ref`.
 ///
 /// Generates a ULID for the new volume, creates `<data_dir>/by_id/<ulid>/`,
-/// writes `volume.name`, `volume.readonly`, and `import.lock`, then spawns
+/// writes `volume.name`, `volume.readonly`, and `volume.importing`, then spawns
 /// `elide-import`. On success, creates the `<data_dir>/by_name/<vol_name>`
 /// symlink. Returns the import job ULID.
 pub async fn spawn_import(
@@ -340,7 +340,7 @@ pub async fn spawn_import(
 
         // Write the import lock.
         let import_ulid = Ulid::new().to_string();
-        std::fs::write(vol_dir.join(IMPORT_LOCK_FILE), &import_ulid)?;
+        std::fs::write(vol_dir.join(IMPORTING_FILE), &import_ulid)?;
 
         // Create the by_name symlink immediately so `import status/attach` can
         // resolve the volume before the import completes. Removed on failure.
@@ -417,7 +417,7 @@ pub async fn spawn_import(
     // waiting up to supervisor.scan_interval.
     {
         let watch_dir = vol_dir.clone();
-        let watch_lock = vol_dir.join(IMPORT_LOCK_FILE);
+        let watch_lock = vol_dir.join(IMPORTING_FILE);
         tokio::spawn(async move {
             loop {
                 if watch_dir.join("control.sock").exists() {
@@ -534,7 +534,7 @@ pub async fn spawn_import(
         }
 
         job.finish(final_state);
-        let _ = std::fs::remove_file(async_vol_dir.join(IMPORT_LOCK_FILE));
+        let _ = std::fs::remove_file(async_vol_dir.join(IMPORTING_FILE));
         let _ = std::fs::remove_file(async_vol_dir.join(IMPORT_PID_FILE));
     });
 
@@ -542,7 +542,7 @@ pub async fn spawn_import(
     Ok(import_ulid)
 }
 
-/// On coordinator startup, remove stale `import.lock` files.
+/// On coordinator startup, remove stale `volume.importing` files.
 ///
 /// A lock is stale if no live process matches `import.pid`. If a process is
 /// found alive, it is sent SIGTERM so the volume is in a clean state for retry.
@@ -560,7 +560,7 @@ pub fn cleanup_stale_locks(data_dir: &Path) {
 }
 
 fn cleanup_stale_lock_in(dir: &Path) {
-    let lock_path = dir.join(IMPORT_LOCK_FILE);
+    let lock_path = dir.join(IMPORTING_FILE);
     if !lock_path.exists() {
         return;
     }
@@ -595,7 +595,7 @@ fn cleanup_stale_lock_in(dir: &Path) {
     }
 
     warn!(
-        "[import] removing stale import.lock in {} (ulid={ulid})",
+        "[import] removing stale volume.importing in {} (ulid={ulid})",
         dir.display()
     );
     let _ = std::fs::remove_file(&lock_path);

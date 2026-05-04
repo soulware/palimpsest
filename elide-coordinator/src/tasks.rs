@@ -27,7 +27,7 @@ use crate::control;
 use crate::gc;
 use crate::prefetch;
 use crate::upload;
-use crate::volume_state::IMPORT_LOCK_FILE;
+use crate::volume_state::IMPORTING_FILE;
 use crate::{PrefetchTracker, SnapshotLockRegistry, snapshot_lock_for, unregister_prefetch};
 
 /// Request type for the per-fork evict channel.
@@ -269,11 +269,11 @@ pub async fn run_volume_tasks(
             break;
         }
 
-        // Skip drain/GC while an import is in its write phase (import.lock
+        // Skip drain/GC while an import is in its write phase (volume.importing
         // present but no control.sock yet).  When both are present the import
         // is in its serve phase and is ready to handle promote IPC — fall
         // through to the normal drain path.
-        if fork_dir.join(IMPORT_LOCK_FILE).exists() && !fork_dir.join("control.sock").exists() {
+        if fork_dir.join(IMPORTING_FILE).exists() && !fork_dir.join("control.sock").exists() {
             continue;
         }
 
