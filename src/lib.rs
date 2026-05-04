@@ -49,7 +49,7 @@ fn peer_fetch_runtime_handle() -> io::Result<tokio::runtime::Handle> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("elide-peer-fetch")
-                .worker_threads(1)
+                .worker_threads(4)
                 .build()
                 .map_err(|e| io::Error::other(format!("peer-fetch runtime: {e}")))?;
             PEER_FETCH_RUNTIME.get_or_init(|| rt)

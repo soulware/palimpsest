@@ -34,12 +34,12 @@ use elide_peer_fetch::PrefetchHint;
 use tracing::{trace, warn};
 use ulid::Ulid;
 
-/// Worker count for the body-prefetch pool. Sized well below
-/// demand-fetch headroom (NBD per-connection read pool is 4 workers,
-/// ublk runs comparable concurrency); two background workers leaves
-/// the connection pool — and any outbound bandwidth budget — to live
-/// guest IO during the warming window.
-const PREFETCH_WORKERS: usize = 2;
+/// Worker count for the body-prefetch pool. The warming window runs
+/// on fresh claim before any guest IO can race, so we run wide enough
+/// to keep the peer's connection pool busy and the link saturated;
+/// the per-segment coalescer + present-bit fast path absorb any
+/// duplicated work if a guest read does arrive mid-warm.
+const PREFETCH_WORKERS: usize = 16;
 
 /// Spawn a detached worker pool that warms body cache from any
 /// `cache/*.prefetch-hint` files in the chain.
