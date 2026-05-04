@@ -159,6 +159,53 @@ pub trait SegmentFetcher: Send + Sync {
         index_dir: &Path,
         body_dir: &Path,
     ) -> io::Result<()>;
+
+    /// Warm a set of body entries for `segment_id` in `body_dir`.
+    ///
+    /// Conceptually equivalent to calling [`Self::fetch_extent`] for each
+    /// `entry_idx` in `populated_entries`, but implementations are free
+    /// to issue parallel range-GETs and amortise fsync across the whole
+    /// segment. Used by background body-warming on volume start, where
+    /// per-batch durability isn't required (a crash mid-warm just
+    /// re-fetches on next start, gated by `.present`).
+    ///
+    /// `body_section_start` is the segment's `body_section_start`
+    /// (parsed from the local `.idx`); callers already have it cached
+    /// from the layout read.
+    ///
+    /// Default impl loops `fetch_extent`; implementations with
+    /// batching/durability latitude (e.g. `RemoteFetcher`) override.
+    fn warm_segment(
+        &self,
+        segment_id: ulid::Ulid,
+        index_dir: &Path,
+        body_dir: &Path,
+        body_section_start: u64,
+        populated_entries: &[u32],
+    ) -> io::Result<()> {
+        let idx_path = index_dir.join(format!("{segment_id}.idx"));
+        let (_, entries, _) = read_segment_index(&idx_path)?;
+        for &idx in populated_entries {
+            let Some(entry) = entries.get(idx as usize) else {
+                continue;
+            };
+            if !entry.kind.is_data() || entry.stored_length == 0 {
+                continue;
+            }
+            self.fetch_extent(
+                segment_id,
+                index_dir,
+                body_dir,
+                &ExtentFetch {
+                    body_section_start,
+                    body_offset: entry.stored_offset,
+                    body_length: entry.stored_length,
+                    entry_idx: idx,
+                },
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Parameters for fetching a single extent from an object store.

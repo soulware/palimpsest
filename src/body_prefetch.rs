@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use elide_core::segment::{self, BoxFetcher, ExtentFetch};
+use elide_core::segment::{self, BoxFetcher};
 use elide_peer_fetch::PrefetchHint;
 use tracing::{trace, warn};
 use ulid::Ulid;
@@ -177,54 +177,48 @@ fn process_hint(
     let (_, entries, _) = segment::read_segment_index(&idx_path)?;
     let entry_count = entries.len() as u32;
 
-    let mut dispatched = 0usize;
-    for entry_idx in hint.iter_populated_entries(entry_count) {
-        let entry = match entries.get(entry_idx as usize) {
-            Some(e) => e,
-            None => continue,
-        };
-        // Only Data / CanonicalData entries with stored body bytes are
-        // body-prefetchable. DedupRef rows resolve via the extent
-        // index without a body GET; Inline lives in the .idx (already
-        // on disk); Zero contributes no body. Skipping these here
-        // matches the same kind-check `fetch_one_extent` does
-        // internally — no point invoking it just to bail.
-        if !entry.kind.is_data() || entry.stored_length == 0 {
-            continue;
+    let populated: Vec<u32> = hint.iter_populated_entries(entry_count).collect();
+    if populated.is_empty() {
+        // Nothing to warm; remove the hint so we don't reread it next
+        // start.
+        if let Err(e) = std::fs::remove_file(hint_path) {
+            trace!(
+                "[body-prefetch {seg_ulid}] failed to remove empty hint {}: {e}",
+                hint_path.display()
+            );
         }
-        if let Err(err) = fetcher.fetch_extent(
-            seg_ulid,
-            &index_dir,
-            &cache_dir,
-            &ExtentFetch {
-                body_section_start: layout.body_section_start,
-                body_offset: entry.stored_offset,
-                body_length: entry.stored_length,
-                entry_idx,
-            },
-        ) {
-            // Best-effort: peer 404 / S3 transient / etc.  Log and move
-            // on; the demand-fetch path will retry if the guest reads
-            // this entry. Hint file still gets cleaned up below — the
-            // entry was attempted, and the present bit reflects the
-            // truth either way.
-            trace!("[body-prefetch {seg_ulid}] fetch_extent(entry={entry_idx}): {err:#}");
-        }
-        dispatched += 1;
+        return Ok(());
+    }
+
+    if let Err(err) = fetcher.warm_segment(
+        seg_ulid,
+        &index_dir,
+        &cache_dir,
+        layout.body_section_start,
+        &populated,
+    ) {
+        // Best-effort: peer 404 / S3 transient / etc. Log and move on;
+        // demand-fetch will retry any unwarmed entry on first guest
+        // read. Drop the hint anyway — the present-bit fast path makes
+        // re-attempts cheap, and leaving it on disk would re-warm
+        // already-cached bytes on every restart.
+        trace!("[body-prefetch {seg_ulid}] warm_segment: {err:#}");
     }
 
     // Remove the hint now that every populated entry has been
-    // attempted. A restart will not re-attempt them — but the
-    // present-bit fast-path inside `fetch_extent` already makes
-    // re-attempts cheap, so the hint deletion is operator hygiene
-    // rather than a correctness requirement.
+    // attempted. Restart-safe via the present-bit fast path: any
+    // entries that didn't make it into `.present` will be picked up by
+    // demand-fetch, and entries that did won't be re-fetched.
     if let Err(e) = std::fs::remove_file(hint_path) {
         trace!(
             "[body-prefetch {seg_ulid}] failed to remove consumed hint {}: {e}",
             hint_path.display()
         );
     }
-    trace!("[body-prefetch {seg_ulid}] dispatched {dispatched} extent(s); hint consumed");
+    trace!(
+        "[body-prefetch {seg_ulid}] warmed {} entr(ies); hint consumed",
+        populated.len()
+    );
     Ok(())
 }
 
