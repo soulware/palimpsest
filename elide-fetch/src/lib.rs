@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use s3::Bucket;
@@ -404,7 +404,13 @@ impl Drop for BatchLease {
 /// triggered the demand-fetch already iterated the local layout to
 /// resolve the segment's owner.
 pub struct RemoteFetcher {
-    store: Arc<dyn RangeFetcher>,
+    /// Live-swappable inner store. Read once per demand-fetch call;
+    /// the volume daemon swaps this from a peer-then-S3 wrapper to an
+    /// S3-only store after the hint-driven warm pass completes, so
+    /// later cache misses (e.g. an evicted segment re-fetched days
+    /// later) skip the peer entirely. The lock is uncontended in
+    /// practice (one swap at startup, reads everywhere else).
+    store: RwLock<Arc<dyn RangeFetcher>>,
     /// Maximum bytes per coalesced range-GET batch.
     max_batch_bytes: u64,
     /// Cross-thread in-flight coalescing for `fetch_extent`. Two callers
@@ -433,10 +439,30 @@ impl RemoteFetcher {
     /// rather than going through [`FetchConfig`].
     pub fn from_store(store: Arc<dyn RangeFetcher>, max_batch_bytes: u64) -> Self {
         Self {
-            store,
+            store: RwLock::new(store),
             max_batch_bytes,
             coalescer: FetchCoalescer::new(),
         }
+    }
+
+    /// Replace the inner store. Used by the volume daemon to drop its
+    /// peer-fetch wrapper after the hint-driven warm pass finishes:
+    /// once the LAN warmup is done, every subsequent cache miss must
+    /// go straight to S3 without re-probing the peer.
+    pub fn set_store(&self, store: Arc<dyn RangeFetcher>) {
+        *self
+            .store
+            .write()
+            .expect("RemoteFetcher store lock poisoned") = store;
+    }
+
+    fn store_snapshot(&self) -> Arc<dyn RangeFetcher> {
+        Arc::clone(
+            &self
+                .store
+                .read()
+                .expect("RemoteFetcher store lock poisoned"),
+        )
     }
 }
 
@@ -449,8 +475,9 @@ impl SegmentFetcher for RemoteFetcher {
         body_dir: &Path,
         extent: &segment::ExtentFetch,
     ) -> io::Result<()> {
+        let store = self.store_snapshot();
         fetch_one_extent(
-            &*self.store,
+            &*store,
             owner_vol_id,
             segment_id,
             index_dir,
@@ -471,8 +498,9 @@ impl SegmentFetcher for RemoteFetcher {
         index_dir: &Path,
         body_dir: &Path,
     ) -> io::Result<()> {
+        let store = self.store_snapshot();
         fetch_one_delta_body(
-            &*self.store,
+            &*store,
             owner_vol_id,
             &segment_id.to_string(),
             index_dir,
@@ -489,8 +517,9 @@ impl SegmentFetcher for RemoteFetcher {
         body_section_start: u64,
         populated_entries: &[u32],
     ) -> io::Result<u64> {
+        let store = self.store_snapshot();
         warm_segment_impl(
-            &*self.store,
+            &*store,
             owner_vol_id,
             &self.coalescer,
             self.max_batch_bytes,

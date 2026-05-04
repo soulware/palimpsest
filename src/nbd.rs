@@ -923,11 +923,16 @@ fn serve_readonly_volume_listener(
     let mut volume = open_readonly_volume_with_retry(dir, by_id_dir)?;
 
     if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
+        let fetcher = build.fetcher;
+        let s3_store = build.s3_store;
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(build.fetcher);
+            std::sync::Arc::clone(&fetcher) as _;
         let fork_dirs = volume.fork_dirs();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
-        crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
+        let fetcher_for_swap = std::sync::Arc::clone(&fetcher);
+        crate::body_prefetch::spawn(fork_dirs, arc_fetcher, move || {
+            fetcher_for_swap.set_store(s3_store);
+        });
         println!("[demand-fetch enabled]");
     }
 
@@ -968,23 +973,25 @@ fn run_volume_ipc_only(
 
     let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
     if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
+        let fetcher = build.fetcher;
+        let s3_store = build.s3_store;
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(build.fetcher);
-        let s3_only_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(elide_fetch::RemoteFetcher::from_store(
-                build.s3_store,
-                build.fetch_batch_bytes,
-            ));
+            std::sync::Arc::clone(&fetcher) as _;
         let fork_dirs = volume.fork_dirs();
         let (lba_map, extent_index) = volume.snapshot_maps();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
-        let body_prefetch_done = crate::body_prefetch::spawn(fork_dirs.clone(), arc_fetcher);
+        let fetcher_for_swap = std::sync::Arc::clone(&fetcher);
+        let body_prefetch_done = crate::body_prefetch::spawn(
+            fork_dirs.clone(),
+            std::sync::Arc::clone(&arc_fetcher),
+            move || fetcher_for_swap.set_store(s3_store),
+        );
         crate::full_warm::spawn(
             dir.to_path_buf(),
             fork_dirs,
             lba_map,
             extent_index,
-            s3_only_fetcher,
+            arc_fetcher,
             body_prefetch_done,
         );
         peer_counters = build.peer_counters;
@@ -1025,23 +1032,25 @@ fn serve_volume_listener(
 
     let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
     if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
+        let fetcher = build.fetcher;
+        let s3_store = build.s3_store;
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(build.fetcher);
-        let s3_only_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
-            std::sync::Arc::new(elide_fetch::RemoteFetcher::from_store(
-                build.s3_store,
-                build.fetch_batch_bytes,
-            ));
+            std::sync::Arc::clone(&fetcher) as _;
         let fork_dirs = volume.fork_dirs();
         let (lba_map, extent_index) = volume.snapshot_maps();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
-        let body_prefetch_done = crate::body_prefetch::spawn(fork_dirs.clone(), arc_fetcher);
+        let fetcher_for_swap = std::sync::Arc::clone(&fetcher);
+        let body_prefetch_done = crate::body_prefetch::spawn(
+            fork_dirs.clone(),
+            std::sync::Arc::clone(&arc_fetcher),
+            move || fetcher_for_swap.set_store(s3_store),
+        );
         crate::full_warm::spawn(
             dir.to_path_buf(),
             fork_dirs,
             lba_map,
             extent_index,
-            s3_only_fetcher,
+            arc_fetcher,
             body_prefetch_done,
         );
         peer_counters = build.peer_counters;
