@@ -200,6 +200,11 @@ pub trait SegmentFetcher: Send + Sync {
     /// compatibility with mock implementations in tests; production
     /// fetchers (e.g. `RemoteFetcher`) override with the optimised
     /// owner-targeted path.
+    ///
+    /// Returns the number of body bytes actually fetched from the
+    /// remote/peer tier — already-`.present` entries contribute zero,
+    /// so callers can distinguish "warmed N bytes" from "everything
+    /// already on disk".
     fn warm_segment(
         &self,
         segment_id: ulid::Ulid,
@@ -208,9 +213,10 @@ pub trait SegmentFetcher: Send + Sync {
         body_dir: &Path,
         body_section_start: u64,
         populated_entries: &[u32],
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         let idx_path = index_dir.join(format!("{segment_id}.idx"));
         let (_, entries, _) = read_segment_index(&idx_path)?;
+        let mut bytes_fetched: u64 = 0;
         for &idx in populated_entries {
             let Some(entry) = entries.get(idx as usize) else {
                 continue;
@@ -230,8 +236,9 @@ pub trait SegmentFetcher: Send + Sync {
                     entry_idx: idx,
                 },
             )?;
+            bytes_fetched = bytes_fetched.saturating_add(entry.stored_length as u64);
         }
-        Ok(())
+        Ok(bytes_fetched)
     }
 }
 
