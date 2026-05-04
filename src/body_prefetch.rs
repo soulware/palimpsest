@@ -163,6 +163,27 @@ fn process_hint(
     let cache_dir = owner_dir.join("cache");
     let idx_path = index_dir.join(format!("{seg_ulid}.idx"));
 
+    // The hint file's owner directory IS the segment's owning volume —
+    // the coordinator's prefetch loop persists `.idx` and
+    // `.prefetch-hint` together under the fork that authored the
+    // segment. Pass the vol_ulid down so the warming path GETs
+    // directly from the owner instead of fanning out a chain walk
+    // through the inner store.
+    let owner_vol_id = match owner_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| Ulid::from_string(s).ok())
+    {
+        Some(u) => u,
+        None => {
+            warn!(
+                "[body-prefetch {seg_ulid}] owner_dir name is not a valid ULID: {}",
+                owner_dir.display()
+            );
+            return Ok(());
+        }
+    };
+
     let layout = match segment::read_segment_layout(&idx_path) {
         Ok(l) => l,
         Err(e) => {
@@ -192,6 +213,7 @@ fn process_hint(
 
     if let Err(err) = fetcher.warm_segment(
         seg_ulid,
+        owner_vol_id,
         &index_dir,
         &cache_dir,
         layout.body_section_start,
@@ -313,7 +335,11 @@ mod tests {
     #[test]
     fn process_hint_dispatches_populated_entries_and_removes_hint() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner = tmp.path().to_path_buf();
+        // owner_dir's basename must be a valid ULID — process_hint
+        // parses it as the segment's owning volume and skips warming
+        // if it isn't one.
+        let owner = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&owner).unwrap();
         let seg = write_test_segment(&owner, 16).unwrap();
 
         // Hint: entries 0, 3, 7, 12 populated.
@@ -344,7 +370,8 @@ mod tests {
     #[test]
     fn process_hint_with_missing_idx_leaves_hint_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner = tmp.path().to_path_buf();
+        let owner = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&owner).unwrap();
         std::fs::create_dir_all(owner.join("cache")).unwrap();
         std::fs::create_dir_all(owner.join("index")).unwrap();
 

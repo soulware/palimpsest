@@ -173,11 +173,22 @@ pub trait SegmentFetcher: Send + Sync {
     /// (parsed from the local `.idx`); callers already have it cached
     /// from the layout read.
     ///
-    /// Default impl loops `fetch_extent`; implementations with
-    /// batching/durability latitude (e.g. `RemoteFetcher`) override.
+    /// `owner_vol_id` is the volume ULID that authored this segment
+    /// (always known at the warming call site, where the hint file
+    /// lives alongside the segment's `.idx`). Implementations should
+    /// fetch directly under that vol_id rather than walking the fork
+    /// ancestry the way `fetch_extent` does — chain-walks during
+    /// prewarm fan out N−1 NotFound round-trips against the inner
+    /// store ahead of every successful peer hit.
+    ///
+    /// Default impl loops `fetch_extent` (which walks the chain) for
+    /// compatibility with mock implementations in tests; production
+    /// fetchers (e.g. `RemoteFetcher`) override with the optimised
+    /// owner-targeted path.
     fn warm_segment(
         &self,
         segment_id: ulid::Ulid,
+        _owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         body_section_start: u64,

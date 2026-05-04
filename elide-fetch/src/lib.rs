@@ -496,6 +496,7 @@ impl SegmentFetcher for RemoteFetcher {
     fn warm_segment(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         body_section_start: u64,
@@ -503,7 +504,7 @@ impl SegmentFetcher for RemoteFetcher {
     ) -> io::Result<()> {
         warm_segment_impl(
             &*self.store,
-            &self.chain,
+            owner_vol_id,
             &self.coalescer,
             self.max_batch_bytes,
             segment_id,
@@ -1047,10 +1048,16 @@ fn plan_warm_batches(
 ///    segment is unaffected: it still acquires the same lock, and the
 ///    re-read inside the lock means neither side clobbers the other's
 ///    bits.
+///
+/// Unlike demand-fetch's per-extent path, warming targets the segment's
+/// **owning volume directly** — body-prefetch knows the owner from the
+/// hint file's location, so there's no need to fan out a chain walk
+/// that would issue N−1 NotFound store round-trips ahead of every
+/// successful warm hit.
 #[allow(clippy::too_many_arguments)]
 fn warm_segment_impl(
     store: &dyn RangeFetcher,
-    chain: &[(String, VerifyingKey)],
+    owner_vol_id: ulid::Ulid,
     coalescer: &FetchCoalescer,
     max_batch_bytes: u64,
     segment_ulid: Ulid,
@@ -1126,7 +1133,7 @@ fn warm_segment_impl(
                     let batch = &batches[i];
                     match warm_one_batch(
                         store,
-                        chain,
+                        owner_vol_id,
                         segment_id,
                         entries,
                         body_file,
@@ -1203,13 +1210,15 @@ fn warm_segment_impl(
     Ok(())
 }
 
-/// Fetch one warming batch from the ancestry chain, verify each entry
-/// against its signed hash, and `pwrite` the bytes into `body_file` at
-/// `body_section_start + batch.body_start`. No fsync — the caller does
-/// one segment-wide fsync after every batch lands.
+/// Fetch one warming batch directly from the segment's owning volume
+/// (no chain walk), verify each entry against its hash from the local
+/// `.idx`, and `pwrite` the bytes into `body_file` at body-relative
+/// offset `batch.body_start`. No fsync — the caller does one
+/// segment-wide fsync after every batch lands.
+#[allow(clippy::too_many_arguments)]
 fn warm_one_batch(
     store: &dyn RangeFetcher,
-    chain: &[(String, VerifyingKey)],
+    owner_vol_id: ulid::Ulid,
     segment_id: &str,
     entries: &[segment::SegmentEntry],
     body_file: &std::fs::File,
@@ -1220,55 +1229,46 @@ fn warm_one_batch(
 
     let range_start = body_section_start + batch.body_start;
     let range_end = body_section_start + batch.body_end;
-
-    for (volume_id, _) in chain.iter().rev() {
-        let key = segment_key(volume_id, segment_id)?;
-        match store.get_range(&key, range_start, range_end) {
-            Ok(bytes) => {
-                if bytes.len() as u64 != range_end - range_start {
-                    return Err(io::Error::other(format!(
-                        "short range-GET for warm {segment_id}: expected {} bytes, got {}",
-                        range_end - range_start,
-                        bytes.len(),
-                    )));
-                }
-                for (i, e) in entries
-                    .iter()
-                    .enumerate()
-                    .take(batch.end_entry_inclusive + 1)
-                    .skip(batch.start_entry)
-                {
-                    let rel = (e.stored_offset - batch.body_start) as usize;
-                    let len = e.stored_length as usize;
-                    let slice = bytes.get(rel..rel + len).ok_or_else(|| {
-                        io::Error::other(format!(
-                            "warm entry {i} out of batch bounds for {segment_id}"
-                        ))
-                    })?;
-                    segment::verify_body_hash(e, slice).map_err(|err| {
-                        io::Error::new(err.kind(), format!("warm {segment_id}[{i}]: {err}"))
-                    })?;
-                }
-                // .body is body-section-relative: offset 0 in the file
-                // corresponds to body_section_start in the remote object.
-                body_file
-                    .write_all_at(&bytes, batch.body_start)
-                    .map_err(|e| io::Error::other(format!("pwrite .body for warm: {e}")))?;
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "warm fetch {segment_id} batch [{}..={}] from {volume_id}: {e}",
-                    batch.start_entry, batch.end_entry_inclusive
-                )));
-            }
-        }
+    let owner_str = owner_vol_id.to_string();
+    let key = segment_key(&owner_str, segment_id)?;
+    let bytes = store.get_range(&key, range_start, range_end).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "warm fetch {segment_id} batch [{}..={}] from {owner_str}: {e}",
+                batch.start_entry, batch.end_entry_inclusive
+            ),
+        )
+    })?;
+    if bytes.len() as u64 != range_end - range_start {
+        return Err(io::Error::other(format!(
+            "short range-GET for warm {segment_id}: expected {} bytes, got {}",
+            range_end - range_start,
+            bytes.len(),
+        )));
     }
-    Err(io::Error::other(format!(
-        "warm batch {segment_id} [{}..={}] not found in any ancestor",
-        batch.start_entry, batch.end_entry_inclusive
-    )))
+    for (i, e) in entries
+        .iter()
+        .enumerate()
+        .take(batch.end_entry_inclusive + 1)
+        .skip(batch.start_entry)
+    {
+        let rel = (e.stored_offset - batch.body_start) as usize;
+        let len = e.stored_length as usize;
+        let slice = bytes.get(rel..rel + len).ok_or_else(|| {
+            io::Error::other(format!(
+                "warm entry {i} out of batch bounds for {segment_id}"
+            ))
+        })?;
+        segment::verify_body_hash(e, slice)
+            .map_err(|err| io::Error::new(err.kind(), format!("warm {segment_id}[{i}]: {err}")))?;
+    }
+    // .body is body-section-relative: offset 0 in the file corresponds
+    // to body_section_start in the remote object.
+    body_file
+        .write_all_at(&bytes, batch.body_start)
+        .map_err(|e| io::Error::other(format!("pwrite .body for warm: {e}")))?;
+    Ok(())
 }
 
 /// Build the S3 object key for a segment.
@@ -2255,6 +2255,7 @@ mod tests {
     ) -> (
         RemoteFetcher,
         ulid::Ulid,
+        ulid::Ulid,
         u64,
         Vec<Vec<u8>>,
         PathBuf,
@@ -2269,7 +2270,8 @@ mod tests {
 
         let seg_ulid = ulid::Ulid::new();
         let seg_id = seg_ulid.to_string();
-        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let vol_id_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id_str).unwrap();
 
         let payloads: Vec<Vec<u8>> = (0..n)
             .map(|i| vec![(i as u8).wrapping_add(0x10); entry_size])
@@ -2298,10 +2300,10 @@ mod tests {
         )
         .unwrap();
 
-        let key = segment_key(vol_id, &seg_id).unwrap();
+        let key = segment_key(vol_id_str, &seg_id).unwrap();
         put_local(store_root, &key, &full_bytes);
 
-        let vol_dir = tmp.join(vol_id);
+        let vol_dir = tmp.join(vol_id_str);
         std::fs::create_dir_all(&vol_dir).unwrap();
         let pub_hex = vk
             .to_bytes()
@@ -2319,7 +2321,15 @@ mod tests {
             fetch_batch_bytes: None,
         };
         let fetcher = RemoteFetcher::new(&cfg, &[vol_dir]).unwrap();
-        (fetcher, seg_ulid, bss, payloads, index_dir, cache_dir)
+        (
+            fetcher,
+            seg_ulid,
+            owner_vol_id,
+            bss,
+            payloads,
+            index_dir,
+            cache_dir,
+        )
     }
 
     /// `warm_segment` warms every populated entry: bytes land in
@@ -2331,11 +2341,18 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = TempDir::new().unwrap();
-        let (fetcher, seg_ulid, bss, payloads, index_dir, cache_dir) =
+        let (fetcher, seg_ulid, owner_vol_id, bss, payloads, index_dir, cache_dir) =
             build_warm_fixture(tmp.path(), store.path(), 4, 4096);
 
         fetcher
-            .warm_segment(seg_ulid, &index_dir, &cache_dir, bss, &[0, 1, 2, 3])
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &[0, 1, 2, 3],
+            )
             .unwrap();
 
         let body = std::fs::read(cache_dir.join(format!("{seg_ulid}.body"))).unwrap();
@@ -2366,7 +2383,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = TempDir::new().unwrap();
-        let (fetcher, seg_ulid, bss, _payloads, index_dir, cache_dir) =
+        let (fetcher, seg_ulid, owner_vol_id, bss, _payloads, index_dir, cache_dir) =
             build_warm_fixture(tmp.path(), store.path(), 4, 4096);
 
         // Pre-seed: entry 1 is already "present" (bit set, body file
@@ -2375,7 +2392,14 @@ mod tests {
         std::fs::write(&present_path, [0b0000_0010u8]).unwrap();
 
         fetcher
-            .warm_segment(seg_ulid, &index_dir, &cache_dir, bss, &[0, 1, 2, 3])
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &[0, 1, 2, 3],
+            )
             .unwrap();
 
         for i in 0..4 {
@@ -2397,11 +2421,11 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = TempDir::new().unwrap();
-        let (fetcher, seg_ulid, bss, _payloads, index_dir, cache_dir) =
+        let (fetcher, seg_ulid, owner_vol_id, bss, _payloads, index_dir, cache_dir) =
             build_warm_fixture(tmp.path(), store.path(), 4, 4096);
 
         fetcher
-            .warm_segment(seg_ulid, &index_dir, &cache_dir, bss, &[])
+            .warm_segment(seg_ulid, owner_vol_id, &index_dir, &cache_dir, bss, &[])
             .unwrap();
 
         assert!(!cache_dir.join(format!("{seg_ulid}.body")).exists());
@@ -2422,7 +2446,7 @@ mod tests {
         // expect ~3 batches, exercising the parallel scope path.
         let n = 12;
         let entry_size = 4096;
-        let (_default_fetcher, seg_ulid, bss, payloads, index_dir, cache_dir) =
+        let (_default_fetcher, seg_ulid, owner_vol_id, bss, payloads, index_dir, cache_dir) =
             build_warm_fixture(tmp.path(), store.path(), n, entry_size);
 
         // Rebuild the fetcher with a small batch cap; the helper above
@@ -2439,7 +2463,14 @@ mod tests {
 
         let populated: Vec<u32> = (0..n as u32).collect();
         fetcher
-            .warm_segment(seg_ulid, &index_dir, &cache_dir, bss, &populated)
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &populated,
+            )
             .unwrap();
 
         let body = std::fs::read(cache_dir.join(format!("{seg_ulid}.body"))).unwrap();
