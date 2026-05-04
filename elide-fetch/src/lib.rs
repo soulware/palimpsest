@@ -28,6 +28,7 @@
 // runs tokio for its own reasons, adapts its `object_store` to the
 // `RangeFetcher` trait when it needs to construct a fetcher.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -274,9 +275,18 @@ impl RangeFetcher for S3RangeFetcher {
 ///
 /// On lease drop (RAII), the entry is removed and waiters are
 /// notified — covers success, error, and panic uniformly.
+///
+/// `present_locks` is a separate per-segment serializer for the
+/// `.present` read-modify-write phase of [`fetch_batch`]. Disjoint
+/// leases write disjoint bits, but the on-disk `.present` is one
+/// file per segment — without this lock the RMW from a stale
+/// in-memory snapshot would silently overwrite a concurrent leader's
+/// bits and force the next reader to re-fetch already-cached body
+/// bytes.
 #[derive(Clone, Default)]
 pub(crate) struct FetchCoalescer {
     state: Arc<Mutex<Vec<InFlight>>>,
+    present_locks: Arc<Mutex<HashMap<Ulid, Arc<Mutex<()>>>>>,
 }
 
 struct InFlight {
@@ -291,6 +301,21 @@ struct InFlight {
 impl FetchCoalescer {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Return the per-segment write lock for `.present`. Lazily created
+    /// on first use. Held by [`fetch_batch`] across the read-modify-write
+    /// of `.present` so concurrent disjoint leases on the same segment
+    /// merge their bits against the freshest on-disk state instead of
+    /// each other's stale snapshots.
+    fn present_lock_for(&self, segment: Ulid) -> Arc<Mutex<()>> {
+        let mut map = self
+            .present_locks
+            .lock()
+            .expect("present_locks map mutex poisoned");
+        map.entry(segment)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Try to acquire a lease for `[start, end]` on `segment`. Returns
@@ -605,15 +630,16 @@ fn fetch_one_extent(
             BatchContext {
                 store,
                 chain,
+                segment_ulid,
                 segment_id: &segment_id,
                 body_dir,
                 present_path: &present_path,
                 entries: &entries,
                 extent,
-                present_bytes: &present_bytes,
                 start,
                 batch_last,
                 next_expected_offset,
+                coalescer,
             },
             lease,
         );
@@ -628,35 +654,41 @@ fn fetch_one_extent(
 struct BatchContext<'a> {
     store: &'a dyn RangeFetcher,
     chain: &'a [(String, VerifyingKey)],
+    /// Segment ULID — used to look up the per-segment `.present`
+    /// write lock from `coalescer`.
+    segment_ulid: Ulid,
     segment_id: &'a str,
     body_dir: &'a Path,
     present_path: &'a Path,
     entries: &'a [segment::SegmentEntry],
     extent: &'a ExtentFetchParams,
-    /// Snapshot of the on-disk `.present` bytes from the loop iteration
-    /// that won the lease. Used as the base for the merged write below.
-    present_bytes: &'a [u8],
     /// Inclusive entry-index range of this batch.
     start: usize,
     batch_last: usize,
     /// Body-section offset of the byte just past the last entry —
     /// the exclusive end of the body slice we'll range-GET.
     next_expected_offset: u64,
+    /// Source of the per-segment `.present` write lock. The merged
+    /// write at the end of [`fetch_batch`] re-reads `.present` under
+    /// this lock so disjoint leases on the same segment don't
+    /// clobber each other's bits via a stale-snapshot RMW.
+    coalescer: &'a FetchCoalescer,
 }
 
 fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
     let BatchContext {
         store,
         chain,
+        segment_ulid,
         segment_id,
         body_dir,
         present_path,
         entries,
         extent,
-        present_bytes,
         start,
         batch_last,
         next_expected_offset,
+        coalescer,
     } = ctx;
     let batch_body_start = entries[start].stored_offset;
     let batch_body_end = next_expected_offset; // = entries[batch_last].stored_offset + len
@@ -728,10 +760,26 @@ fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
                         .map_err(|e| io::Error::other(format!("fsync body dir: {e}")))?;
                 }
 
-                // Bulk-update .present for all entries in the batch (one read + one write).
+                // Bulk-update .present for all entries in the batch.
+                //
+                // Disjoint coalescer leases on the same segment write
+                // disjoint bits, but `.present` is one file per
+                // segment — a stale-snapshot RMW would clobber the
+                // sibling leader's bits and leave the next reader
+                // re-fetching already-cached body bytes. The
+                // per-segment lock + re-read inside the lock is what
+                // makes the merge converge across concurrent leaders.
+                let present_lock = coalescer.present_lock_for(segment_ulid);
+                let _present_guard = present_lock
+                    .lock()
+                    .expect("per-segment .present lock poisoned");
                 let entry_count = entries.len() as u32;
                 let bitset_len = (entry_count as usize).div_ceil(8);
-                let mut new_present = present_bytes.to_vec();
+                let mut new_present = match std::fs::read(present_path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+                    Err(e) => return Err(e),
+                };
                 if new_present.len() < bitset_len {
                     new_present.resize(bitset_len, 0);
                 }
@@ -1727,6 +1775,168 @@ mod tests {
         for (i, d) in data.iter().enumerate() {
             let off = entries[i].stored_offset as usize;
             assert_eq!(&body_bytes[off..off + d.len()], d.as_slice());
+        }
+    }
+
+    /// Two `fetch_extent` calls with **disjoint** entry ranges run
+    /// concurrently. Each leader takes its own coalescer lease (the
+    /// ranges don't overlap), reads the on-disk `.present` bitmap,
+    /// fetches its body slice, then writes the merged `.present` back.
+    ///
+    /// The bug: each leader uses the snapshot it read *before* the
+    /// fetch as the merge base — so a sibling leader's writes that
+    /// landed in between are silently overwritten by the next
+    /// `write_file_atomic`. Disjoint lease ranges write disjoint bits,
+    /// but the on-disk `.present` is one file per segment; the RMW
+    /// from a stale snapshot loses the other writer's bits.
+    ///
+    /// This test forces the race with a barrier inside the inner
+    /// range-fetcher, so all leaders are past the `.present` read and
+    /// inside their range-GET at the same instant. With the bug, at
+    /// least one leader's bits are missing after both threads return.
+    /// With the fix (re-read `.present` immediately before
+    /// `write_file_atomic` under a per-segment write lock), every bit
+    /// the run set is durable.
+    #[test]
+    fn fetch_extent_disjoint_concurrent_batches_preserve_present_bits() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use std::sync::Barrier;
+        use std::sync::Mutex as StdMutex;
+        use std::thread;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        // Range-fetcher that pauses every caller at a barrier *inside*
+        // get_range, then sleeps a thread-specific extra delay before
+        // returning. The barrier synchronises N readers past the
+        // top-of-loop `.present` read; the staggered post-barrier sleep
+        // makes their writes interleave at the on-disk-rename layer.
+        struct BarrierFetcher {
+            inner: LocalRangeFetcher,
+            barrier: Arc<Barrier>,
+            counter: std::sync::atomic::AtomicU32,
+        }
+        impl RangeFetcher for BarrierFetcher {
+            fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+                self.barrier.wait();
+                let n = self
+                    .counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis((n as u64) * 5));
+                self.inner.get_range(key, start, end_exclusive)
+            }
+        }
+
+        const N: usize = 4;
+
+        // Build a segment with N Data entries, each 4 KiB. With
+        // `max_batch_bytes = 4096` every fetch_extent call is forced
+        // to a single-entry batch, so calls on different starts get
+        // **disjoint** coalescer leases and proceed in parallel.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+
+        let data: Vec<Vec<u8>> = (0..N).map(|i| vec![0xA0u8 + i as u8; 4096]).collect();
+        let hashes: Vec<_> = data.iter().map(|d| blake3::hash(d)).collect();
+        let mut entries: Vec<SegmentEntry> = data
+            .iter()
+            .zip(hashes.iter())
+            .enumerate()
+            .map(|(i, (d, h))| {
+                SegmentEntry::new_data(*h, i as u64, 1, SegmentFlags::empty(), d.clone())
+            })
+            .collect();
+        let seg_path = tmp.path().join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
+
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        // Cap the batch at one entry so disjoint starts → disjoint
+        // leases. With the default 256 KiB cap and 4 KiB entries the
+        // first call would batch all four, masking the bug.
+        let small_batch = entries[0].stored_length as u64;
+        let inner = LocalRangeFetcher::new(store_dir.path().to_path_buf());
+        let barrier_fetcher = Arc::new(BarrierFetcher {
+            inner,
+            barrier: Arc::new(Barrier::new(N)),
+            counter: std::sync::atomic::AtomicU32::new(0),
+        });
+        let fetcher = Arc::new(
+            RemoteFetcher::from_store(barrier_fetcher.clone(), &[vol_dir], small_batch).unwrap(),
+        );
+
+        let stored_offsets: Vec<u64> = entries.iter().map(|e| e.stored_offset).collect();
+        let stored_lengths: Vec<u32> = entries.iter().map(|e| e.stored_length).collect();
+        let errors: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let fetcher = fetcher.clone();
+                let index_dir = index_dir.clone();
+                let cache_dir = cache_dir.clone();
+                let body_offset = stored_offsets[i];
+                let body_length = stored_lengths[i];
+                let errs = errors.clone();
+                thread::spawn(move || {
+                    let result = fetcher.fetch_extent(
+                        seg_ulid,
+                        &index_dir,
+                        &cache_dir,
+                        &segment::ExtentFetch {
+                            body_section_start: bss,
+                            body_offset,
+                            body_length,
+                            entry_idx: i as u32,
+                        },
+                    );
+                    if let Err(e) = result {
+                        errs.lock().unwrap().push(format!("entry {i}: {e:#}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let errs = errors.lock().unwrap();
+        assert!(errs.is_empty(), "all fetches must succeed: {errs:?}");
+
+        // Every entry's bit must be set in `.present` after the race.
+        let present_path = cache_dir.join(format!("{seg_id}.present"));
+        let present = std::fs::read(&present_path).expect("present file written");
+        for i in 0..N {
+            let byte = present.get(i / 8).copied().unwrap_or(0);
+            assert!(
+                byte & (1 << (i % 8)) != 0,
+                "bit {i} unset after disjoint concurrent fetch — RMW race lost it. \
+                 present bytes: {present:?}",
+            );
         }
     }
 }
