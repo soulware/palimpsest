@@ -31,7 +31,7 @@ use std::thread;
 
 use elide_core::segment::{self, BoxFetcher};
 use elide_peer_fetch::PrefetchHint;
-use tracing::{trace, warn};
+use tracing::{info, warn};
 use ulid::Ulid;
 
 /// Worker count for the body-prefetch pool. The warming window runs
@@ -91,7 +91,7 @@ fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
         return;
     }
     let total = hints.len();
-    trace!("[body-prefetch] {total} hint(s) discovered across chain");
+    info!("[body-prefetch] {total} hint(s) discovered across chain");
 
     let hints = Arc::new(hints);
     let cursor = Arc::new(AtomicUsize::new(0));
@@ -110,7 +110,7 @@ fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
     for h in handles {
         let _ = h.join();
     }
-    trace!("[body-prefetch] pool done: {total} hint(s) attempted");
+    info!("[body-prefetch] pool done: {total} hint(s) attempted");
 }
 
 /// Walk the chain head-first and collect every `cache/*.prefetch-hint`
@@ -165,7 +165,7 @@ fn worker(cursor: Arc<AtomicUsize>, hints: Arc<Vec<HintEntry>>, fetcher: BoxFetc
         }
         let h = &hints[i];
         if let Err(e) = process_hint(&h.owner_dir, h.seg_ulid, &h.hint_path, &*fetcher) {
-            trace!("[body-prefetch {}] non-fatal error: {e:#}", h.seg_ulid);
+            info!("[body-prefetch {}] non-fatal error: {e:#}", h.seg_ulid);
         }
     }
 }
@@ -227,7 +227,7 @@ fn process_hint(
         // Nothing to warm; remove the hint so we don't reread it next
         // start.
         if let Err(e) = std::fs::remove_file(hint_path) {
-            trace!(
+            info!(
                 "[body-prefetch {seg_ulid}] failed to remove empty hint {}: {e}",
                 hint_path.display()
             );
@@ -248,7 +248,7 @@ fn process_hint(
         // read. Drop the hint anyway — the present-bit fast path makes
         // re-attempts cheap, and leaving it on disk would re-warm
         // already-cached bytes on every restart.
-        trace!("[body-prefetch {seg_ulid}] warm_segment: {err:#}");
+        info!("[body-prefetch {seg_ulid}] warm_segment: {err:#}");
     }
 
     // Remove the hint now that every populated entry has been
@@ -256,12 +256,12 @@ fn process_hint(
     // entries that didn't make it into `.present` will be picked up by
     // demand-fetch, and entries that did won't be re-fetched.
     if let Err(e) = std::fs::remove_file(hint_path) {
-        trace!(
+        info!(
             "[body-prefetch {seg_ulid}] failed to remove consumed hint {}: {e}",
             hint_path.display()
         );
     }
-    trace!(
+    info!(
         "[body-prefetch {seg_ulid}] warmed {} entr(ies); hint consumed",
         populated.len()
     );

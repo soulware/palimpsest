@@ -14,14 +14,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 use elide_core::config::VolumeConfig;
 use elide_core::extentindex::{BodySource, ExtentIndex};
 use elide_core::lbamap::LbaMap;
 use elide_core::segment::{self, BoxFetcher};
-use tracing::{trace, warn};
+use tracing::{info, warn};
 use ulid::Ulid;
 
 const FULL_WARM_WORKERS: usize = 4;
@@ -40,7 +40,7 @@ pub fn spawn(
 ) {
     match VolumeConfig::read(&head_dir) {
         Ok(cfg) if cfg.lazy == Some(true) => {
-            trace!("[full-warm] volume opted into lazy mode; skipping");
+            info!("[full-warm] volume opted into lazy mode; skipping");
             return;
         }
         Ok(_) => {}
@@ -56,7 +56,7 @@ pub fn spawn(
                 if let Err(e) = handle.join() {
                     warn!("[full-warm] body-prefetch pool panicked: {e:?}");
                 }
-                trace!("[full-warm] body-prefetch drained; starting S3 warm");
+                info!("[full-warm] body-prefetch drained; starting S3 warm");
             }
             run(fork_dirs, lba_map, extent_index, fetcher)
         });
@@ -75,22 +75,27 @@ fn run(
             return;
         }
     };
-    if plan.is_empty() {
+    let total = plan.len();
+    if total == 0 {
+        info!("[full-warm] plan empty — nothing to warm");
         return;
     }
-    let total = plan.len();
-    trace!("[full-warm] {total} segment(s) to warm");
+    info!("[full-warm] {total} segment(s) to warm");
 
     let work: Arc<Vec<SegmentWork>> = Arc::new(plan.into_values().collect());
     let cursor = Arc::new(AtomicUsize::new(0));
+    let bytes_fetched = Arc::new(AtomicU64::new(0));
+    let segments_with_fetch = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for w in 0..FULL_WARM_WORKERS.min(work.len()) {
         let cursor = Arc::clone(&cursor);
         let work = Arc::clone(&work);
         let fetcher = Arc::clone(&fetcher);
+        let bytes_fetched = Arc::clone(&bytes_fetched);
+        let segments_with_fetch = Arc::clone(&segments_with_fetch);
         if let Ok(h) = thread::Builder::new()
             .name(format!("full-warm-{w}"))
-            .spawn(move || worker(cursor, work, fetcher))
+            .spawn(move || worker(cursor, work, fetcher, bytes_fetched, segments_with_fetch))
         {
             handles.push(h);
         }
@@ -98,7 +103,11 @@ fn run(
     for h in handles {
         let _ = h.join();
     }
-    trace!("[full-warm] pool done: {total} segment(s) attempted");
+    let bytes = bytes_fetched.load(Ordering::Relaxed);
+    let nonempty = segments_with_fetch.load(Ordering::Relaxed);
+    info!(
+        "[full-warm] pool done: {total} segment(s) attempted; {nonempty} fetched from S3, {bytes} bytes"
+    );
 }
 
 struct SegmentWork {
@@ -176,20 +185,37 @@ fn plan_segments(
     Ok(by_segment)
 }
 
-fn worker(cursor: Arc<AtomicUsize>, work: Arc<Vec<SegmentWork>>, fetcher: BoxFetcher) {
+fn worker(
+    cursor: Arc<AtomicUsize>,
+    work: Arc<Vec<SegmentWork>>,
+    fetcher: BoxFetcher,
+    bytes_fetched: Arc<AtomicU64>,
+    segments_with_fetch: Arc<AtomicUsize>,
+) {
     loop {
         let i = cursor.fetch_add(1, Ordering::Relaxed);
         if i >= work.len() {
             return;
         }
         let w = &work[i];
-        if let Err(e) = warm_one_segment(w, &*fetcher) {
-            trace!("[full-warm {}] non-fatal: {e:#}", w.seg_ulid);
+        match warm_one_segment(w, &*fetcher) {
+            Ok(n) => {
+                if n > 0 {
+                    bytes_fetched.fetch_add(n, Ordering::Relaxed);
+                    segments_with_fetch.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                info!("[full-warm {}] non-fatal: {e:#}", w.seg_ulid);
+            }
         }
     }
 }
 
-fn warm_one_segment(w: &SegmentWork, fetcher: &dyn segment::SegmentFetcher) -> std::io::Result<()> {
+fn warm_one_segment(
+    w: &SegmentWork,
+    fetcher: &dyn segment::SegmentFetcher,
+) -> std::io::Result<u64> {
     let index_dir = w.owner_dir.join("index");
     let cache_dir = w.owner_dir.join("cache");
     let idx_path = index_dir.join(format!("{}.idx", w.seg_ulid));
@@ -197,8 +223,8 @@ fn warm_one_segment(w: &SegmentWork, fetcher: &dyn segment::SegmentFetcher) -> s
     let layout = match segment::read_segment_layout(&idx_path) {
         Ok(l) => l,
         Err(e) => {
-            trace!("[full-warm {}] missing idx: {e}", w.seg_ulid);
-            return Ok(());
+            info!("[full-warm {}] missing idx: {e}", w.seg_ulid);
+            return Ok(0);
         }
     };
 
