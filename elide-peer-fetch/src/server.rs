@@ -49,7 +49,7 @@ use tracing::info;
 use ulid::Ulid;
 
 use crate::auth::{AuthError, AuthState, parse_bearer};
-use elide_core::segment::{EntryKind as SegEntryKind, check_present_bit, read_segment_index};
+use elide_core::segment::{EntryKind as SegEntryKind, read_segment_index};
 
 /// Errors the route handler emits before reaching the auth pipeline
 /// or the local file. Map to status codes for the response.
@@ -354,11 +354,16 @@ async fn handle_segment_inner(
 /// `by_id/<token.vol_ulid>/volume.pub` plus a lineage check that
 /// `<vol_id>` is in the signing volume's signed ancestry.
 ///
-/// Coverage: every Data entry in the segment whose body region
-/// overlaps the requested byte range must have its `.present` bit
-/// set. Partial coverage is treated as a miss (404) in this
-/// iteration; partial-coverage 206 with `Content-Range` is a
-/// follow-up surface.
+/// Coverage:
+/// - Every overlapping Data entry present → `200 OK`, full body
+///   bytes for the requested range.
+/// - First overlapping Data entry missing → `404 Not Found`; the
+///   client falls through to S3.
+/// - Some overlapping Data entries present, then a missing one →
+///   `206 Partial Content` with `Content-Range: bytes
+///   <start>-<start+prefix-1>/*` and the maximal contiguous
+///   prefix bytes. The client splices the prefix with an S3 range
+///   GET for the remainder.
 ///
 /// Range header: required, single-range only, `bytes=<start>-<end>`
 /// inclusive. Anything else returns 416.
@@ -414,33 +419,46 @@ async fn handle_body(
     let body_path_owned = body_path.clone();
     let idx_path_owned = idx_path.clone();
     let present_path_owned = present_path.clone();
-    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, RouteError> {
-        if !body_range_covered(&idx_path_owned, &present_path_owned, range_start, range_len)
-            .map_err(RouteError::Io)?
-        {
-            return Err(RouteError::NotFound);
-        }
-        read_body_range(&body_path_owned, range_start, range_len).map_err(RouteError::Io)
-    })
-    .await
-    .map_err(|e| RouteError::Io(std::io::Error::other(format!("blocking task: {e}"))))??;
+    let (bytes, covered) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u64), RouteError> {
+            let covered =
+                body_covered_prefix(&idx_path_owned, &present_path_owned, range_start, range_len)
+                    .map_err(RouteError::Io)?;
+            if covered == 0 {
+                return Err(RouteError::NotFound);
+            }
+            let bytes =
+                read_body_range(&body_path_owned, range_start, covered).map_err(RouteError::Io)?;
+            Ok((bytes, covered))
+        })
+        .await
+        .map_err(|e| RouteError::Io(std::io::Error::other(format!("blocking task: {e}"))))??;
 
+    let status = if covered == range_len {
+        StatusCode::OK
+    } else {
+        StatusCode::PARTIAL_CONTENT
+    };
+    let served_end_inclusive = range_start + covered - 1;
     info!(
-        "[peer-fetch] served .body {}/{} ({} bytes, range bytes={}-{})",
+        "[peer-fetch] served .body {}/{} ({} bytes, status {}, requested bytes={}-{}, served bytes={}-{})",
         vol_id_str,
         seg_ulid,
         bytes.len(),
+        status.as_u16(),
         range_start,
         range_end_inclusive,
+        range_start,
+        served_end_inclusive,
     );
 
     Ok(Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(http::header::CONTENT_TYPE, "application/octet-stream")
         .header(http::header::CONTENT_LENGTH, bytes.len())
         .header(
             http::header::CONTENT_RANGE,
-            format!("bytes {}-{}/*", range_start, range_end_inclusive),
+            format!("bytes {}-{}/*", range_start, served_end_inclusive),
         )
         .body(Body::from(bytes))
         .expect("response builder accepts well-formed parts"))
@@ -461,40 +479,75 @@ fn parse_single_byte_range(header: &str) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-/// Read every Data entry from `idx_path`; for each entry whose body
-/// region overlaps `[range_start, range_start + range_len)`, check
-/// the corresponding `.present` bit. Returns `true` if every
-/// overlapping Data entry's bit is set.
+/// Compute the maximal contiguous covered prefix of
+/// `[range_start, range_start + range_len)` for which every overlapping
+/// Data entry has its `.present` bit set.
+///
+/// Returns the prefix length in bytes:
+/// - `range_len` when every overlapping Data entry is present (full
+///   coverage; the route serves 200).
+/// - A smaller positive value when an overlapping Data entry is
+///   missing — the prefix runs up to the start of that missing entry,
+///   clamped to `range_start` (the route serves 206 with
+///   `Content-Range: bytes <start>-<start+prefix-1>/*`).
+/// - `0` when the first overlapping Data entry is already missing —
+///   the route serves 404 and the client falls through to S3.
 ///
 /// DedupRef, Inline, and Zero entries are skipped — they don't
 /// contribute body bytes. A range falling on a body region not
-/// covered by any Data entry currently returns `true` (the underlying
-/// pread will read sparse-hole zeros), but in practice the body
-/// layout is contiguous Data entries, so this case doesn't arise on
-/// well-formed requests.
-fn body_range_covered(
+/// covered by any Data entry returns the full `range_len` (the
+/// underlying pread reads sparse-hole zeros), but in practice the
+/// body layout is contiguous Data entries so this case doesn't arise
+/// on well-formed requests.
+///
+/// `.present` is read once into memory rather than reopened per
+/// entry; the file is one byte per eight entries, so a kilobyte
+/// covers a segment with 8000 extents.
+fn body_covered_prefix(
     idx_path: &std::path::Path,
     present_path: &std::path::Path,
     range_start: u64,
     range_len: u64,
-) -> std::io::Result<bool> {
+) -> std::io::Result<u64> {
     let (_body_section_start, entries, _inputs) = read_segment_index(idx_path)?;
+    let present = read_present_bitmap(present_path)?;
     let request_end = range_start + range_len;
+
     for (idx, entry) in entries.iter().enumerate() {
         if entry.kind != SegEntryKind::Data {
             continue;
         }
         let entry_start = entry.stored_offset;
         let entry_end = entry_start + entry.stored_length as u64;
-        // Skip entries that don't overlap the requested range.
         if entry_end <= range_start || entry_start >= request_end {
             continue;
         }
-        if !check_present_bit(present_path, idx as u32)? {
-            return Ok(false);
+        if !present_bit_in_buf(&present, idx as u32) {
+            // Maximal prefix runs up to the start of the missing
+            // entry, clamped to range_start so a missing entry that
+            // begins before the request still yields a 0-length
+            // prefix rather than underflowing.
+            let prefix_end = entry_start.max(range_start);
+            return Ok(prefix_end - range_start);
         }
     }
-    Ok(true)
+    Ok(range_len)
+}
+
+/// Read the `.present` bitmap into a `Vec<u8>`. Missing file is
+/// treated as an all-zero bitmap (every entry not present).
+fn read_present_bitmap(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn present_bit_in_buf(buf: &[u8], entry_idx: u32) -> bool {
+    let byte_idx = (entry_idx / 8) as usize;
+    let bit = entry_idx % 8;
+    buf.get(byte_idx).is_some_and(|b| b & (1 << bit) != 0)
 }
 
 fn read_body_range(
@@ -656,10 +709,22 @@ mod tests {
     }
 
     async fn run(router: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let (status, _, body) = run_full(router, req).await;
+        (status, body)
+    }
+
+    /// Like [`run`] but also returns the response headers. Used by the
+    /// `.body` route tests that need to inspect `Content-Range` to
+    /// distinguish 206 partial-coverage from 200 full-coverage.
+    async fn run_full(
+        router: &Router,
+        req: Request<Body>,
+    ) -> (StatusCode, http::HeaderMap, Vec<u8>) {
         let response = router.clone().oneshot(req).await.unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let body_bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        (status, body_bytes.to_vec())
+        (status, headers, body_bytes.to_vec())
     }
 
     #[tokio::test]
@@ -1328,6 +1393,94 @@ mod tests {
             .unwrap();
         let (status, _) = run(&f.router, req).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// Two Data entries, second entry's `.present` bit cleared.
+    /// Requesting the full body range produces a 206 with the maximal
+    /// covered prefix (the first entry's bytes); `Content-Range`
+    /// reports `bytes 0-(prefix-1)/*`. The client splices the prefix
+    /// with an S3 fetch for the remainder.
+    #[tokio::test]
+    async fn body_partial_coverage_returns_206_with_content_range() {
+        let f = body_fixture().await;
+        let seg_ulid = Ulid::new();
+        let first = vec![0xAAu8; 4096];
+        let second = vec![0xBBu8; 4096];
+        let entries = vec![
+            SegmentEntry::new_data(
+                blake3::hash(&first),
+                0,
+                1,
+                SegmentFlags::empty(),
+                first.clone(),
+            ),
+            SegmentEntry::new_data(blake3::hash(&second), 1, 1, SegmentFlags::empty(), second),
+        ];
+        write_segment_files(f.data_dir.path(), f.vol_ulid, seg_ulid, entries, &f.vol_key);
+        // Clear bit 1 (the second Data entry) while keeping bit 0
+        // (the first) set. With two entries the bitmap is one byte.
+        let present_path = f
+            .data_dir
+            .path()
+            .join("by_id")
+            .join(f.vol_ulid.to_string())
+            .join("cache")
+            .join(format!("{seg_ulid}.present"));
+        std::fs::write(&present_path, [0b0000_0001u8]).unwrap();
+
+        let token = sign_body_token(f.vol_ulid, &f.vol_key);
+        let req = Request::builder()
+            .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
+            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::RANGE, "bytes=0-8191")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = run_full(&f.router, req).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body.len(), 4096, "should serve only the first entry");
+        assert_eq!(body, first);
+        assert_eq!(
+            headers.get(http::header::CONTENT_RANGE).unwrap(),
+            "bytes 0-4095/*"
+        );
+    }
+
+    /// First overlapping Data entry's `.present` bit is cleared → 404,
+    /// because the maximal contiguous prefix is empty and there's
+    /// nothing useful for the client to splice. The route must NOT
+    /// emit a 206 with zero bytes.
+    #[tokio::test]
+    async fn body_first_entry_missing_returns_404_not_empty_206() {
+        let f = body_fixture().await;
+        let seg_ulid = Ulid::new();
+        let first = vec![0xAAu8; 4096];
+        let second = vec![0xBBu8; 4096];
+        let entries = vec![
+            SegmentEntry::new_data(blake3::hash(&first), 0, 1, SegmentFlags::empty(), first),
+            SegmentEntry::new_data(blake3::hash(&second), 1, 1, SegmentFlags::empty(), second),
+        ];
+        write_segment_files(f.data_dir.path(), f.vol_ulid, seg_ulid, entries, &f.vol_key);
+        // Clear bit 0 (first entry); keep bit 1 (second entry) set.
+        // The client can't use a 206 starting after a hole — fall
+        // through to S3 cleanly.
+        let present_path = f
+            .data_dir
+            .path()
+            .join("by_id")
+            .join(f.vol_ulid.to_string())
+            .join("cache")
+            .join(format!("{seg_ulid}.present"));
+        std::fs::write(&present_path, [0b0000_0010u8]).unwrap();
+
+        let token = sign_body_token(f.vol_ulid, &f.vol_key);
+        let req = Request::builder()
+            .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
+            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::RANGE, "bytes=0-8191")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = run(&f.router, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// A coordinator-flavour token sent at the `.body` route fails

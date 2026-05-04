@@ -125,18 +125,46 @@ impl RangeFetcher for PeerRangeFetcher {
                         .fetch_body_range(&endpoint, vol_id, seg_ulid, body_start, body_len)
                         .await
                 });
-                if let Some(bytes) = bytes
-                    && bytes.len() as u64 == body_len
-                {
-                    tracing::trace!(
-                        target = "peer-fetch::range",
-                        %vol_id,
-                        %seg_ulid,
-                        body_start,
-                        body_len,
-                        "peer body range served"
-                    );
-                    return Ok(bytes.to_vec());
+                if let Some(bytes) = bytes {
+                    let got = bytes.len() as u64;
+                    if got == body_len {
+                        tracing::trace!(
+                            target = "peer-fetch::range",
+                            %vol_id,
+                            %seg_ulid,
+                            body_start,
+                            body_len,
+                            "peer body range served"
+                        );
+                        return Ok(bytes.to_vec());
+                    }
+                    if got > 0 && got < body_len {
+                        // Partial coverage. The peer covered
+                        // `[start, start + got)`; ask the inner
+                        // fetcher for the remainder and splice. A
+                        // failure on the remainder collapses the
+                        // whole request to inner — we don't strand
+                        // the caller with a partial result and we
+                        // don't double-count peer bytes when the
+                        // inner fetch fails.
+                        let remainder_start = start + got;
+                        let remainder =
+                            self.inner.get_range(key, remainder_start, end_exclusive)?;
+                        let mut combined = Vec::with_capacity(body_len as usize);
+                        combined.extend_from_slice(&bytes);
+                        combined.extend_from_slice(&remainder);
+                        tracing::trace!(
+                            target = "peer-fetch::range",
+                            %vol_id,
+                            %seg_ulid,
+                            body_start,
+                            peer_len = got,
+                            remainder_len = body_len - got,
+                            "peer body range partial; spliced with inner remainder"
+                        );
+                        return Ok(combined);
+                    }
+                    // got == 0: nothing useful from peer; fall through.
                 }
             }
         }
@@ -176,8 +204,7 @@ mod tests {
     use bytes::Bytes;
     use ed25519_dalek::{Signer, SigningKey};
     use elide_core::segment::{
-        EntryKind as SegEntryKind, SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache,
-        set_present_bit, write_segment,
+        SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, write_segment,
     };
     use elide_core::signing::{ProvenanceLineage, write_provenance};
     use object_store::ObjectStore;
@@ -273,6 +300,26 @@ mod tests {
     }
 
     async fn live_fixture() -> LiveFixture {
+        let body_payload = vec![0xABu8; 4096];
+        let f = live_fixture_with(vec![(body_payload.clone(), true)]).await;
+        LiveFixture {
+            peer: f.peer,
+            vol_key: f.vol_key,
+            vol_ulid: f.vol_ulid,
+            seg_ulid: f.seg_ulid,
+            body_payload,
+            body_section_start: f.body_section_start,
+            data_dir: f.data_dir,
+            _server: f._server,
+        }
+    }
+
+    /// Build a live fixture from a custom list of `(payload, present)`
+    /// Data entries. Each payload becomes one Data entry; the
+    /// `present` flag controls whether that entry's `.present` bit is
+    /// set on disk. Used by the partial-coverage test below to set up
+    /// "first entry present, second entry missing" scenarios.
+    async fn live_fixture_with(entries_spec: Vec<(Vec<u8>, bool)>) -> LiveFixture {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let auth = AuthState::new(store.clone());
         let data_dir = TempDir::new().unwrap();
@@ -307,17 +354,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Build the segment locally. One Data entry, > INLINE_THRESHOLD
-        // so it lands in the body section.
-        let body_payload = vec![0xABu8; 4096];
-        let hash = blake3::hash(&body_payload);
-        let mut entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            body_payload.clone(),
-        )];
+        // Build a multi-Data-entry segment per the spec. Each payload
+        // is > INLINE_THRESHOLD so it lands in the body section.
+        let mut entries: Vec<SegmentEntry> = entries_spec
+            .iter()
+            .enumerate()
+            .map(|(i, (payload, _))| {
+                let hash = blake3::hash(payload);
+                SegmentEntry::new_data(hash, i as u64, 1, SegmentFlags::empty(), payload.clone())
+            })
+            .collect();
         let staging = data_dir.path().join("staging");
         let signer = TestSegSigner(vol_key.clone());
         write_segment(&staging, &mut entries, &signer).unwrap();
@@ -331,11 +377,18 @@ mod tests {
         let body_path = cache.join(format!("{seg_ulid}.body"));
         let present_path = cache.join(format!("{seg_ulid}.present"));
         promote_to_cache(&staging, &body_path, &present_path).unwrap();
-        for (idx, entry) in entries.iter().enumerate() {
-            if entry.kind == SegEntryKind::Data {
-                set_present_bit(&present_path, idx as u32, entries.len() as u32).unwrap();
+        // promote_to_cache marks every Data entry as present. Rewrite
+        // the bitmap from scratch to honour the per-entry `present`
+        // flags in `entries_spec` so partial-coverage cases can be
+        // exercised.
+        let bitset_len = entries_spec.len().div_ceil(8);
+        let mut bitmap = vec![0u8; bitset_len];
+        for (idx, (_, present)) in entries_spec.iter().enumerate() {
+            if *present {
+                bitmap[idx / 8] |= 1 << (idx % 8);
             }
         }
+        std::fs::write(&present_path, &bitmap).unwrap();
         // Slice the staged segment file into <seg>.idx.
         let seg_bytes = std::fs::read(&staging).unwrap();
         let index_length =
@@ -361,7 +414,10 @@ mod tests {
             vol_key,
             vol_ulid,
             seg_ulid,
-            body_payload,
+            body_payload: entries_spec
+                .first()
+                .map(|(p, _)| p.clone())
+                .unwrap_or_default(),
             body_section_start,
             data_dir,
             _server: server,
@@ -454,6 +510,60 @@ mod tests {
         let calls = inner.calls();
         assert_eq!(calls.len(), 1, "inner must be called exactly once");
         assert_eq!(calls[0].1, absolute_start);
+        assert_eq!(calls[0].2, absolute_end);
+    }
+
+    /// Two Data entries; first is present on the peer, second is
+    /// missing. Asking for the full body range gets a 206 partial
+    /// covering the first entry; the decorator splices that prefix
+    /// with one inner call for the remainder.
+    #[tokio::test]
+    async fn peer_partial_coverage_splices_with_inner() {
+        let first = vec![0xAAu8; 4096];
+        let second = vec![0xBBu8; 4096];
+        let f = live_fixture_with(vec![(first.clone(), true), (second.clone(), false)]).await;
+
+        let signer = Arc::new(TestBodySigner {
+            vol_ulid: f.vol_ulid,
+            key: f.vol_key.clone(),
+        });
+        let client = BodyFetchClient::new(signer).unwrap();
+        // Inner returns 0xEE so we can distinguish its bytes from the
+        // peer's bytes in the spliced result.
+        let inner = Arc::new(RecordingInner::new(vec![0xEEu8]));
+        let fetcher = PeerRangeFetcher::new(
+            inner.clone(),
+            client,
+            f.peer.clone(),
+            f.data_dir.path().to_owned(),
+            tokio::runtime::Handle::current(),
+        );
+
+        let key = segment_key(f.vol_ulid, f.seg_ulid);
+        let absolute_start = f.body_section_start;
+        let absolute_end = f.body_section_start + 8192; // both entries
+        let bytes = tokio::task::spawn_blocking(move || {
+            fetcher.get_range(&key, absolute_start, absolute_end)
+        })
+        .await
+        .unwrap()
+        .expect("partial peer + inner remainder");
+
+        assert_eq!(bytes.len(), 8192, "spliced result spans full request");
+        assert_eq!(&bytes[..4096], first.as_slice(), "first 4 KiB from peer");
+        assert_eq!(
+            &bytes[4096..],
+            vec![0xEEu8; 4096].as_slice(),
+            "trailing 4 KiB from inner"
+        );
+
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 1, "inner called once for the remainder");
+        assert_eq!(
+            calls[0].1,
+            absolute_start + 4096,
+            "remainder starts after the peer-covered prefix"
+        );
         assert_eq!(calls[0].2, absolute_end);
     }
 

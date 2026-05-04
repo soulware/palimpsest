@@ -391,10 +391,21 @@ impl BodyFetchClient {
     /// range_len)`.
     ///
     /// Returns:
-    /// - `Some(bytes)` on 200 (the peer covered the full requested
-    ///   range).
-    /// - `None` on 404 / 401 / 403 / 416 / network error / timeout —
-    ///   caller falls through to S3.
+    /// - `Some(bytes)` with `bytes.len() == range_len` on 200 — the
+    ///   peer covered the full requested range.
+    /// - `Some(bytes)` with `0 < bytes.len() < range_len` on 206 —
+    ///   the peer covered the maximal contiguous prefix of the
+    ///   request, starting at `range_start`. The decorator splices
+    ///   these bytes with an S3 fetch for the remainder.
+    /// - `None` on 404 / 401 / 403 / 416 / network error / timeout
+    ///   / malformed `Content-Range` — caller falls through to S3.
+    ///
+    /// On 206 the returned bytes are validated against the
+    /// `Content-Range` header: the start offset must equal
+    /// `range_start` (the server promises a prefix anchored at the
+    /// requested start), the body length must equal the inclusive
+    /// range width, and the prefix length must be strictly less than
+    /// `range_len`. Any mismatch collapses to `None`.
     pub async fn fetch_body_range(
         &self,
         peer: &PeerEndpoint,
@@ -433,18 +444,57 @@ impl BodyFetchClient {
         };
 
         let status = response.status();
-        if status != StatusCode::OK {
+        if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
             trace!(
                 target = "peer-fetch::client",
                 url,
                 status = status.as_u16(),
-                "body non-200"
+                "body non-2xx"
             );
             return None;
         }
 
+        // For 206, validate Content-Range before reading the body so
+        // a malformed header collapses cleanly to "ask S3 instead".
+        let expected_partial_len = if status == StatusCode::PARTIAL_CONTENT {
+            let header = response
+                .headers()
+                .get(http::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok());
+            match header.and_then(parse_content_range) {
+                Some((cr_start, cr_end_inclusive))
+                    if cr_start == range_start
+                        && cr_end_inclusive >= range_start
+                        && cr_end_inclusive < range_end_inclusive =>
+                {
+                    Some(cr_end_inclusive - cr_start + 1)
+                }
+                _ => {
+                    trace!(
+                        target = "peer-fetch::client",
+                        url, "206 Content-Range invalid or non-prefix; treating as miss"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
         match response.bytes().await {
-            Ok(b) => Some(b),
+            Ok(b) => match expected_partial_len {
+                Some(expected) if b.len() as u64 != expected => {
+                    trace!(
+                        target = "peer-fetch::client",
+                        url,
+                        body_len = b.len(),
+                        expected,
+                        "206 body length disagrees with Content-Range"
+                    );
+                    None
+                }
+                _ => Some(b),
+            },
             Err(e) => {
                 trace!(
                     target = "peer-fetch::client",
@@ -482,6 +532,20 @@ impl BodyFetchClient {
         });
         bearer
     }
+}
+
+/// Parse a `Content-Range: bytes <start>-<end>/<total>` header into
+/// inclusive `(start, end)` bounds. Accepts `*` for the total since
+/// the peer-fetch route doesn't compute a total file length.
+/// Returns `None` for any other shape (suffix range, multipart,
+/// non-numeric bounds, etc).
+fn parse_content_range(header: &str) -> Option<(u64, u64)> {
+    let rest = header.strip_prefix("bytes ")?;
+    let (range, _total) = rest.split_once('/')?;
+    let (start_s, end_s) = range.split_once('-')?;
+    let start = start_s.trim().parse::<u64>().ok()?;
+    let end = end_s.trim().parse::<u64>().ok()?;
+    Some((start, end))
 }
 
 pub struct BodyFetchClientBuilder {
@@ -904,5 +968,50 @@ mod tests {
             .fetch_idx(&unreachable, "vol", Ulid::new(), Ulid::new())
             .await;
         assert!(result.is_none());
+    }
+}
+
+/// Pure-function tests for `parse_content_range`. Live in their own
+/// module so they don't pull in the sandbox-blocked `start_server`
+/// fixtures of the integration tests above and remain runnable under
+/// the local sandbox.
+#[cfg(test)]
+mod content_range_tests {
+    use super::parse_content_range;
+
+    #[test]
+    fn parses_well_formed_range() {
+        assert_eq!(parse_content_range("bytes 0-4095/*"), Some((0, 4095)));
+        assert_eq!(parse_content_range("bytes 100-199/*"), Some((100, 199)));
+    }
+
+    #[test]
+    fn parses_with_explicit_total() {
+        assert_eq!(parse_content_range("bytes 100-199/8192"), Some((100, 199)));
+    }
+
+    #[test]
+    fn rejects_missing_bytes_prefix() {
+        assert!(parse_content_range("0-4095/*").is_none());
+    }
+
+    #[test]
+    fn rejects_missing_total_segment() {
+        // No `/<total>` suffix at all.
+        assert!(parse_content_range("bytes 0-4095").is_none());
+    }
+
+    #[test]
+    fn rejects_non_numeric_bounds() {
+        assert!(parse_content_range("bytes a-b/*").is_none());
+        assert!(parse_content_range("bytes 0-foo/*").is_none());
+    }
+
+    #[test]
+    fn rejects_suffix_range() {
+        // `bytes -500/*` (the trailing-N-bytes form) isn't a prefix
+        // anchored at any specific start — peer-fetch requires a
+        // known start, so reject.
+        assert!(parse_content_range("bytes -500/*").is_none());
     }
 }
