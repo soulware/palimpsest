@@ -2422,8 +2422,9 @@ mod tests {
             build_warm_fixture(tmp.path(), store.path(), n, entry_size);
 
         // Rebuild the fetcher with a small batch cap; the helper above
-        // uses the default. Same vol_dir / store, just different config.
-        let vol_dir = tmp.path().join("01JQAAAAAAAAAAAAAAAAAAAAAA");
+        // uses the default. Same store, just different config —
+        // RemoteFetcher::new no longer takes fork_dirs after the
+        // owner-vol-id threading.
         let cfg = FetchConfig {
             bucket: None,
             endpoint: None,
