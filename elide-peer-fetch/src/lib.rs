@@ -52,7 +52,7 @@ pub use client::{
 };
 pub use endpoint::{EndpointParseError, PeerEndpoint};
 pub use hint::PrefetchHint;
-pub use range_fetcher::PeerRangeFetcher;
+pub use range_fetcher::{PeerFetchCounters, PeerFetchCountersHandle, PeerRangeFetcher};
 pub use token::{
     DEFAULT_FRESHNESS_WINDOW_SECS, DOMAIN_TAG, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };

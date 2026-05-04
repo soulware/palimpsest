@@ -53,7 +53,7 @@ tempfile = "3"
 # you need).
 [features]
 default = ["ublk"]
-ublk = ["dep:libublk", "dep:io-uring", "dep:smol", "dep:nix"]
+ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
 # Workspace aggregate for property-based test suites. Enables `proptest`
 # on every member crate that has one, so CI can run them all via a single
 # `cargo test --workspace --features proptest --tests` invocation.
@@ -70,6 +70,6 @@ io-uring = { version = "0.7", optional = true }
 # libublk depends on smol = "2.0.2" directly — we match that runtime to
 # drive per-queue `LocalExecutor`s for async per-tag I/O dispatch.
 smol     = { version = "2", optional = true }
-# signalfd + pthread_sigmask for the ublk transport's dedicated signal
-# watcher thread. Linux-only: signalfd does not exist on macOS.
-nix      = { version = "0.31", features = ["signal"], optional = true }
+# signalfd + pthread_sigmask for both ublk and nbd transports' dedicated
+# signal watcher threads. Linux-only: signalfd does not exist on macOS.
+nix      = { version = "0.31", features = ["signal"] }
