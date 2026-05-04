@@ -97,7 +97,6 @@ pub fn log_peer_fetch_counters_at_shutdown(counters: Option<&PeerFetchCountersHa
 /// is fully local with no remote tier).
 pub fn build_volume_fetcher(
     fork_dir: &Path,
-    fork_dirs: &[PathBuf],
     inputs: VolumeFetchInputs,
 ) -> io::Result<Option<VolumeFetcherBuild>> {
     let Some(config) = inputs.fetch_config else {
@@ -126,11 +125,10 @@ pub fn build_volume_fetcher(
     };
     let fetcher = RemoteFetcher::from_store(
         store,
-        fork_dirs,
         config
             .fetch_batch_bytes
             .unwrap_or(elide_fetch::DEFAULT_FETCH_BATCH_BYTES),
-    )?;
+    );
     Ok(Some(VolumeFetcherBuild {
         fetcher,
         peer_counters,

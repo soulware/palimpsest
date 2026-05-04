@@ -922,7 +922,7 @@ fn serve_readonly_volume_listener(
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_readonly_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+    if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
             std::sync::Arc::new(build.fetcher);
         let fork_dirs = volume.fork_dirs();
@@ -967,7 +967,7 @@ fn run_volume_ipc_only(
     let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
     let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
-    if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+    if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
             std::sync::Arc::new(build.fetcher);
         let fork_dirs = volume.fork_dirs();
@@ -1010,7 +1010,7 @@ fn serve_volume_listener(
     let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
     let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
-    if let Some(build) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
+    if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
             std::sync::Arc::new(build.fetcher);
         let fork_dirs = volume.fork_dirs();

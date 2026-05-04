@@ -39,10 +39,6 @@ pub struct BlockReader {
     /// Demand-fetcher for evicted segment bodies. `None` for local-only volumes
     /// or when no object store is configured.
     fetcher: Option<Box<dyn SegmentFetcher>>,
-    /// Directory where coordinator-written `.idx` files live (`<fork>/index/`).
-    primary_index_dir: PathBuf,
-    /// Directory where demand-fetched `.body` files are written (`<fork>/cache/`).
-    primary_cache_dir: PathBuf,
 }
 
 impl BlockReader {
@@ -124,8 +120,6 @@ impl BlockReader {
             }
         }
 
-        let primary_index_dir = dir.join("index");
-        let primary_cache_dir = dir.join("cache");
         let fetcher = mk_fetcher(&search_dirs);
 
         Ok(Self {
@@ -133,8 +127,6 @@ impl BlockReader {
             lbamap,
             extent_index,
             fetcher,
-            primary_index_dir,
-            primary_cache_dir,
         })
     }
 
@@ -231,8 +223,6 @@ impl BlockReader {
         let mut search_dirs: Vec<PathBuf> = layers.into_iter().rev().map(|l| l.dir).collect();
         search_dirs.dedup();
 
-        let primary_index_dir = dir.join("index");
-        let primary_cache_dir = dir.join("cache");
         let fetcher = mk_fetcher(&search_dirs);
 
         Ok(Self {
@@ -240,8 +230,6 @@ impl BlockReader {
             lbamap,
             extent_index,
             fetcher,
-            primary_index_dir,
-            primary_cache_dir,
         })
     }
 
@@ -404,7 +392,9 @@ impl BlockReader {
     }
 
     /// Locate `cache/<segment_id>.delta` across the fork's search dirs,
-    /// demand-fetching into the primary cache dir if not present locally.
+    /// demand-fetching into the owner's cache dir if not present
+    /// locally. The owner is the search dir whose `index/` holds this
+    /// segment's `.idx`; the fetched body lands alongside it.
     fn find_delta_body(&self, segment_id: ulid::Ulid) -> io::Result<PathBuf> {
         let sid = segment_id.to_string();
         for dir in &self.search_dirs {
@@ -414,12 +404,16 @@ impl BlockReader {
             }
         }
         if let Some(fetcher) = &self.fetcher {
-            fetcher.fetch_delta_body(
-                segment_id,
-                &self.primary_index_dir,
-                &self.primary_cache_dir,
-            )?;
-            let p = self.primary_cache_dir.join(format!("{sid}.delta"));
+            let (owner_vol_id, index_dir, body_dir) = self
+                .find_owner_dirs_for_segment(segment_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("segment index not found in any search dir: {sid}.idx"),
+                    )
+                })?;
+            fetcher.fetch_delta_body(segment_id, owner_vol_id, &index_dir, &body_dir)?;
+            let p = body_dir.join(format!("{sid}.delta"));
             if p.exists() {
                 return Ok(p);
             }
@@ -436,14 +430,17 @@ impl BlockReader {
         let extentindex::BodySource::Cached(entry_idx) = loc.body_source else {
             return Ok(());
         };
-        let (index_dir, body_dir) =
-            self.find_dirs_for_segment(loc.segment_id)
-                .unwrap_or_else(|| {
-                    (
-                        self.primary_index_dir.clone(),
-                        self.primary_cache_dir.clone(),
-                    )
-                });
+        let (owner_vol_id, index_dir, body_dir) = self
+            .find_owner_dirs_for_segment(loc.segment_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "segment index not found in any search dir: {}.idx",
+                        loc.segment_id
+                    ),
+                )
+            })?;
         let present_path = body_dir.join(format!("{}.present", loc.segment_id));
         if segment::check_present_bit(&present_path, entry_idx)? {
             return Ok(());
@@ -451,6 +448,7 @@ impl BlockReader {
         match &self.fetcher {
             Some(fetcher) => fetcher.fetch_extent(
                 loc.segment_id,
+                owner_vol_id,
                 &index_dir,
                 &body_dir,
                 &segment::ExtentFetch {
@@ -507,12 +505,23 @@ impl BlockReader {
         self.read_extent_body_at(&loc)
     }
 
-    fn find_dirs_for_segment(&self, segment_id: ulid::Ulid) -> Option<(PathBuf, PathBuf)> {
+    /// Find the (owner_vol_id, index_dir, cache_dir) for a segment by
+    /// scanning `search_dirs` for the one whose `index/<seg>.idx`
+    /// exists. Returns `None` if no fork in this layer chain has the
+    /// `.idx` (caller decides whether that's fatal).
+    fn find_owner_dirs_for_segment(
+        &self,
+        segment_id: ulid::Ulid,
+    ) -> Option<(ulid::Ulid, PathBuf, PathBuf)> {
         let sid = segment_id.to_string();
         for dir in &self.search_dirs {
             let idx = dir.join("index").join(format!("{sid}.idx"));
             if idx.exists() {
-                return Some((dir.join("index"), dir.join("cache")));
+                let owner_vol_id = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| ulid::Ulid::from_string(s).ok())?;
+                return Some((owner_vol_id, dir.join("index"), dir.join("cache")));
             }
         }
         None

@@ -520,10 +520,35 @@ pub(crate) fn open_delta_body_in_dirs(
         }
     }
     if let Some(fetcher) = fetcher {
-        let index_dir = base_dir.join("index");
-        let body_dir = base_dir.join("cache");
-        fetcher.fetch_delta_body(segment_id, &index_dir, &body_dir)?;
-        return fs::File::open(&cache_delta);
+        // Find the owner — the only fork dir whose index/ holds this
+        // segment's .idx. Same shape as `find_segment_in_dirs`'s
+        // resolution for body fetch.
+        let idx_filename = format!("{sid}.idx");
+        let owner_dir = std::iter::once(base_dir)
+            .chain(ancestor_layers.iter().map(|l| l.dir.as_path()))
+            .find(|dir| dir.join("index").join(&idx_filename).exists())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "segment index not found in self or ancestors for delta body: {sid}.idx"
+                    ),
+                )
+            })?;
+        let owner_vol_id = owner_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| Ulid::from_string(s).ok())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "owner dir name is not a valid ULID: {}",
+                    owner_dir.display()
+                ))
+            })?;
+        let index_dir = owner_dir.join("index");
+        let body_dir = owner_dir.join("cache");
+        fetcher.fetch_delta_body(segment_id, owner_vol_id, &index_dir, &body_dir)?;
+        return fs::File::open(body_dir.join(format!("{sid}.delta")));
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
@@ -620,10 +645,21 @@ pub(crate) fn find_segment_in_dirs(
                     ),
                 )
             })?;
+        let owner_vol_id = owner_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| Ulid::from_string(s).ok())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "owner dir name is not a valid ULID: {}",
+                    owner_dir.display()
+                ))
+            })?;
         let index_dir = owner_dir.join("index");
         let body_dir = owner_dir.join("cache");
         fetcher.fetch_extent(
             segment_id,
+            owner_vol_id,
             &index_dir,
             &body_dir,
             &segment::ExtentFetch {

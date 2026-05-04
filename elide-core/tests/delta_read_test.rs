@@ -38,7 +38,10 @@ mod common;
 /// Create a new volume directory with a keypair and an empty volume.toml,
 /// returning the dir path and the signer. The volume is not yet opened.
 fn setup_volume_dir(tmp: &TempDir) -> (std::path::PathBuf, Arc<dyn SegmentSigner>) {
-    let vol_dir = tmp.path().join("vol");
+    // ULID-named to match production layout (`<data_dir>/by_id/<ulid>/`);
+    // the demand-fetch path now derives the owning vol_id from the
+    // fork dir's basename.
+    let vol_dir = tmp.path().join(Ulid::new().to_string());
     fs::create_dir_all(&vol_dir).unwrap();
     signing::generate_keypair(&vol_dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE)
         .unwrap();
@@ -353,6 +356,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
         fn fetch_extent(
             &self,
             _segment_id: Ulid,
+            _owner_vol_id: Ulid,
             _index_dir: &Path,
             _body_dir: &Path,
             _extent: &ExtentFetch,
@@ -362,6 +366,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
         fn fetch_delta_body(
             &self,
             segment_id: Ulid,
+            _owner_vol_id: Ulid,
             _index_dir: &Path,
             body_dir: &Path,
         ) -> io::Result<()> {

@@ -133,9 +133,20 @@ pub trait SegmentSigner: Send + Sync {
 pub trait SegmentFetcher: Send + Sync {
     /// Fetch a single extent and write body bytes into `body_dir/<segment_id>.body`
     /// at `extent.body_offset`, then set bit `extent.entry_idx` in `.present`.
+    ///
+    /// `owner_vol_id` is the volume ULID that authored this segment.
+    /// Callers always know it: the segment's `.idx` lives in
+    /// `<owner>/index/<segment_id>.idx`, so the read path that decided
+    /// to demand-fetch already iterated `search_dirs`/`ancestor_layers`
+    /// to find which fork dir contains the `.idx` (otherwise the call
+    /// wouldn't know which directory to write the body into).
+    /// Implementations should issue exactly one GET against the owner
+    /// rather than fanning out a chain walk that 404s on every
+    /// non-owner ancestor.
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         extent: &ExtentFetch,
@@ -152,10 +163,14 @@ pub trait SegmentFetcher: Send + Sync {
     /// (no leading body section), matching `promote_to_cache`'s output
     /// shape so `try_read_delta_extent` can open it uniformly.
     ///
+    /// `owner_vol_id` carries the same meaning as in
+    /// [`Self::fetch_extent`].
+    ///
     /// Written via tmp+rename for crash safety.
     fn fetch_delta_body(
         &self,
         segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
     ) -> io::Result<()>;
@@ -188,7 +203,7 @@ pub trait SegmentFetcher: Send + Sync {
     fn warm_segment(
         &self,
         segment_id: ulid::Ulid,
-        _owner_vol_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         body_section_start: u64,
@@ -205,6 +220,7 @@ pub trait SegmentFetcher: Send + Sync {
             }
             self.fetch_extent(
                 segment_id,
+                owner_vol_id,
                 index_dir,
                 body_dir,
                 &ExtentFetch {

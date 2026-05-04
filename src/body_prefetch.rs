@@ -271,6 +271,7 @@ mod tests {
         fn fetch_extent(
             &self,
             segment_id: Ulid,
+            _owner_vol_id: Ulid,
             _index_dir: &Path,
             _body_dir: &Path,
             extent: &ExtentFetch,
@@ -285,6 +286,7 @@ mod tests {
         fn fetch_delta_body(
             &self,
             _segment_id: Ulid,
+            _owner_vol_id: Ulid,
             _index_dir: &Path,
             _body_dir: &Path,
         ) -> std::io::Result<()> {

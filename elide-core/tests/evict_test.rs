@@ -194,6 +194,7 @@ impl SegmentFetcher for LocalStoreFetcher {
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
+        _owner_vol_id: ulid::Ulid,
         _index_dir: &Path,
         body_dir: &Path,
         extent: &segment::ExtentFetch,
@@ -217,6 +218,7 @@ impl SegmentFetcher for LocalStoreFetcher {
     fn fetch_delta_body(
         &self,
         segment_id: ulid::Ulid,
+        _owner_vol_id: ulid::Ulid,
         _index_dir: &Path,
         _body_dir: &Path,
     ) -> io::Result<()> {
