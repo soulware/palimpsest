@@ -1213,6 +1213,14 @@ fn warm_one_batch(
         .take(batch.end_entry_inclusive + 1)
         .skip(batch.start_entry)
     {
+        // The planner only extends a batch across populated *data* entries,
+        // so any non-data / zero-length entries sitting between them have
+        // body offsets that don't lie inside `[batch.body_start, batch.body_end)`.
+        // Skip them — feeding their bytes to `verify_body_hash` would
+        // either underflow `rel` or hand garbage to the verifier.
+        if !e.kind.is_data() || e.stored_length == 0 {
+            continue;
+        }
         let rel = (e.stored_offset - batch.body_start) as usize;
         let len = e.stored_length as usize;
         let slice = bytes.get(rel..rel + len).ok_or_else(|| {
@@ -2462,5 +2470,119 @@ mod tests {
                 "bit {i} not set after multi-batch warm"
             );
         }
+    }
+
+    /// Regression: a segment that interleaves body-bearing data entries
+    /// with zero-length non-data entries (DedupRef / Zero) leaves the
+    /// data entries body-adjacent. The planner extends a single batch
+    /// over the full data run; the verifier must skip the non-data
+    /// indices instead of trying to read their bytes from the GET.
+    #[test]
+    fn warm_segment_skips_non_data_entries_inside_batch() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id_str).unwrap();
+
+        let entry_size = 4096;
+        let payload_pad = vec![0x11u8; entry_size];
+        let payload_a = vec![0xAAu8; entry_size];
+        let payload_b = vec![0xBBu8; entry_size];
+        let dedup_target_hash = blake3::hash(b"some-already-canonical-extent");
+        // Layout: [Data pad @ 0..4096][Data a @ 4096..8192][DedupRef][Zero]
+        //         [Data b @ 8192..12288]. Populated set excludes `pad`,
+        // so the resulting batch has body_start=4096 — that's what makes
+        // the verify-loop's `rel = (0 - body_start)` underflow on the
+        // non-data entries, triggering the regression.
+        let mut entries = vec![
+            SegmentEntry::new_data(
+                blake3::hash(&payload_pad),
+                0,
+                1,
+                SegmentFlags::empty(),
+                payload_pad.clone(),
+            ),
+            SegmentEntry::new_data(
+                blake3::hash(&payload_a),
+                1,
+                1,
+                SegmentFlags::empty(),
+                payload_a.clone(),
+            ),
+            SegmentEntry::new_dedup_ref(dedup_target_hash, 2, 1),
+            SegmentEntry::new_zero(3, 1),
+            SegmentEntry::new_data(
+                blake3::hash(&payload_b),
+                4,
+                1,
+                SegmentFlags::empty(),
+                payload_b.clone(),
+            ),
+        ];
+        let seg_path = tmp.path().join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        let key = segment_key(vol_id_str, &seg_id).unwrap();
+        put_local(store.path(), &key, &full_bytes);
+
+        let vol_dir = tmp.path().join(vol_id_str);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
+        };
+        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+
+        // Populated set excludes the pad entry so body_start lands at
+        // 4096; includes the non-data entries to mirror what full_warm
+        // hands the planner.
+        let populated: Vec<u32> = vec![1, 2, 3, 4];
+        fetcher
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &populated,
+            )
+            .unwrap();
+
+        let body = std::fs::read(cache_dir.join(format!("{seg_id}.body"))).unwrap();
+        assert_eq!(&body[entry_size..2 * entry_size], payload_a.as_slice());
+        assert_eq!(&body[2 * entry_size..3 * entry_size], payload_b.as_slice());
+
+        let present = cache_dir.join(format!("{seg_id}.present"));
+        assert!(check_present_bit(&present, 1).unwrap());
+        assert!(check_present_bit(&present, 4).unwrap());
     }
 }
