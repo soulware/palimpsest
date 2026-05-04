@@ -203,7 +203,7 @@ pub async fn run_volume_tasks(
         };
         let prefetch_result =
             prefetch::prefetch_indexes(&fork_dir, &store, peer_ctx.as_ref()).await;
-        let did_fetch = match &prefetch_result {
+        match &prefetch_result {
             Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 => {
                 if r.fetched > 0 {
                     info!(
@@ -222,44 +222,20 @@ pub async fn run_volume_tasks(
                         r.snapshots_fetched - r.snapshots_from_peer,
                     );
                 }
-                r.fetched > 0
             }
-            Ok(_) => false,
+            Ok(_) => {}
             Err(e) => {
                 warn!("[prefetch {volume_id}{volume_name}] error: {e:#}");
-                false
             }
-        };
+        }
         // Publish the result so any volume binary blocked on `await-prefetch`
-        // unblocks before we move on to prewarm / drain. Errors propagate to
-        // the caller as the IPC response. `send_replace` stores the value
-        // even when there are no live subscribers, so a late `await-prefetch`
-        // call still sees it.
+        // unblocks before we move on to drain. Errors propagate to the caller
+        // as the IPC response. `send_replace` stores the value even when
+        // there are no live subscribers, so a late `await-prefetch` call
+        // still sees it.
         prefetch_done.send_replace(Some(
             prefetch_result.map(|_| ()).map_err(|e| format!("{e:#}")),
         ));
-
-        if did_fetch {
-            let prewarm_dir = fork_dir.clone();
-            let prewarm_store: std::sync::Arc<dyn elide_fetch::RangeFetcher> = std::sync::Arc::new(
-                crate::range_fetcher::ObjectStoreRangeFetcher::new(store.clone()),
-            );
-            let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
-            match tokio::task::spawn_blocking(move || {
-                elide_fetch::prewarm_volume_start(
-                    &prewarm_dir,
-                    &by_id_dir,
-                    prewarm_store,
-                    elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
-                )
-            })
-            .await
-            {
-                Ok(Ok(())) => info!("[prewarm {volume_id}{volume_name}] volume start pre-warmed"),
-                Ok(Err(e)) => warn!("[prewarm {volume_id}{volume_name}] {e}"),
-                Err(e) => warn!("[prewarm {volume_id}{volume_name}] task error: {e}"),
-            }
-        }
     } else {
         // No prefetch needed: either the fork already has its full local
         // index, or it's a pulled ancestor whose .idx files are populated by

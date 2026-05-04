@@ -1116,6 +1116,7 @@ dependencies = [
  "elide-coordinator",
  "elide-core",
  "elide-fetch",
+ "elide-peer-fetch",
  "ext4-view",
  "futures",
  "io-uring",

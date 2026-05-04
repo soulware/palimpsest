@@ -415,7 +415,7 @@ mod imp {
     pub fn run_volume_ublk(
         dir: &Path,
         size_bytes: u64,
-        fetch_config: Option<elide_fetch::FetchConfig>,
+        fetch_inputs: crate::VolumeFetchInputs,
         dev_id: Option<i32>,
     ) -> Result<(), super::UblkRunError> {
         // Block the shutdown signals on the calling thread BEFORE any
@@ -436,8 +436,8 @@ mod imp {
         // anything else propagates. NBD uses the same helper.
         let mut volume = crate::volume_open::open_volume_with_retry(dir, by_id_dir)?;
 
-        if let Some(config) = fetch_config {
-            let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
+        if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)?
+        {
             volume.set_fetcher(Arc::new(fetcher));
             println!("[demand-fetch enabled]");
         }
@@ -1366,7 +1366,7 @@ mod imp {
     pub fn run_volume_ublk(
         _dir: &Path,
         _size_bytes: u64,
-        _fetch_config: Option<elide_fetch::FetchConfig>,
+        _fetch_inputs: crate::VolumeFetchInputs,
         _dev_id: Option<i32>,
     ) -> Result<(), super::UblkRunError> {
         Err(super::UblkRunError::Config(stub_msg().to_owned()))
@@ -1397,10 +1397,10 @@ mod imp {
 pub fn run_volume_ublk(
     dir: &Path,
     size_bytes: u64,
-    fetch_config: Option<elide_fetch::FetchConfig>,
+    fetch_inputs: crate::VolumeFetchInputs,
     dev_id: Option<i32>,
 ) -> Result<(), UblkRunError> {
-    imp::run_volume_ublk(dir, size_bytes, fetch_config, dev_id)
+    imp::run_volume_ublk(dir, size_bytes, fetch_inputs, dev_id)
 }
 
 /// List ublk devices known to the kernel (reads `/sys/class/ublk-char`).

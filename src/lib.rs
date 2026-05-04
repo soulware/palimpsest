@@ -14,10 +14,100 @@ pub mod volume_open;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use elide_fetch::FetchConfig;
+use elide_core::signing::VOLUME_KEY_FILE;
+use elide_fetch::{FetchConfig, RangeFetcher, RemoteFetcher};
+use elide_peer_fetch::{BodyFetchClient, PeerEndpoint, PeerRangeFetcher, VolumeBodySigner};
 use object_store::ObjectStore;
+
+/// Bundle of inputs the volume daemon needs to construct its remote
+/// fetcher. `fetch_config` drives S3 / local-store access; when
+/// `peer_endpoint` is present the daemon stacks a `PeerRangeFetcher`
+/// in front of S3 to opportunistically serve body byte ranges from
+/// the previous claimer over LAN.
+pub struct VolumeFetchInputs {
+    pub fetch_config: Option<FetchConfig>,
+    pub peer_endpoint: Option<PeerEndpoint>,
+}
+
+/// Process-wide multi-thread tokio runtime used by the volume daemon
+/// for peer-fetch I/O. Initialised lazily on the first call to
+/// [`peer_fetch_runtime_handle`]. The runtime is intentionally leaked
+/// (it lives for the lifetime of the volume process) so the
+/// `tokio::runtime::Handle` captured by [`PeerRangeFetcher`] stays
+/// valid for every later sync `get_range` call.
+static PEER_FETCH_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn peer_fetch_runtime_handle() -> io::Result<tokio::runtime::Handle> {
+    let rt = match PEER_FETCH_RUNTIME.get() {
+        Some(rt) => rt,
+        None => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("elide-peer-fetch")
+                .worker_threads(1)
+                .build()
+                .map_err(|e| io::Error::other(format!("peer-fetch runtime: {e}")))?;
+            PEER_FETCH_RUNTIME.get_or_init(|| rt)
+        }
+    };
+    Ok(rt.handle().clone())
+}
+
+/// Build the `RemoteFetcher` the volume daemon uses for demand-fetch.
+///
+/// When `inputs.peer_endpoint` is `Some` and the fork has a local
+/// `volume.key`, the inner store is wrapped with a [`PeerRangeFetcher`]
+/// so body byte ranges consult the previous claimer's peer-fetch
+/// server before falling through to S3. Missing `volume.key` (e.g.
+/// imported readonly bases) silently runs S3-only — the body-fetch
+/// token requires the running fork's signing key.
+///
+/// Returns `Ok(None)` when no `FetchConfig` is available (the volume
+/// is fully local with no remote tier).
+pub fn build_volume_fetcher(
+    fork_dir: &Path,
+    fork_dirs: &[PathBuf],
+    inputs: VolumeFetchInputs,
+) -> io::Result<Option<RemoteFetcher>> {
+    let Some(config) = inputs.fetch_config else {
+        return Ok(None);
+    };
+    let store: Arc<dyn RangeFetcher> = config.build_fetcher()?;
+    let store = match inputs.peer_endpoint {
+        Some(endpoint) if fork_dir.join(VOLUME_KEY_FILE).exists() => {
+            let vol_ulid_str = elide_fetch::derive_volume_id(fork_dir)?;
+            let vol_ulid = ulid::Ulid::from_string(&vol_ulid_str)
+                .map_err(|e| io::Error::other(format!("invalid volume ulid: {e}")))?;
+            let signer = VolumeBodySigner::load(fork_dir, VOLUME_KEY_FILE, vol_ulid)?;
+            let body_client = BodyFetchClient::new(Arc::new(signer))
+                .map_err(|e| io::Error::other(format!("body fetch client: {e}")))?;
+            let runtime = peer_fetch_runtime_handle()?;
+            let data_dir = fork_dir
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(fork_dir)
+                .to_path_buf();
+            Arc::new(PeerRangeFetcher::new(
+                store,
+                body_client,
+                endpoint,
+                data_dir,
+                runtime,
+            )) as Arc<dyn RangeFetcher>
+        }
+        _ => store,
+    };
+    let fetcher = RemoteFetcher::from_store(
+        store,
+        fork_dirs,
+        config
+            .fetch_batch_bytes
+            .unwrap_or(elide_fetch::DEFAULT_FETCH_BATCH_BYTES),
+    )?;
+    Ok(Some(fetcher))
+}
 
 /// Build an `object_store` client from a [`FetchConfig`].
 ///

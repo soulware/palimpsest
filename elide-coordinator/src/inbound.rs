@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use elide_peer_fetch::PeerEndpoint;
 use object_store::ObjectStore;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
@@ -357,7 +358,17 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Register { volume_ulid } => {
-            let result = register_volume(volume_ulid, &ctx.data_dir, peer_pid, &ctx.macaroon_root);
+            let mut result =
+                register_volume(volume_ulid, &ctx.data_dir, peer_pid, &ctx.macaroon_root);
+            if let Ok(reply) = &mut result {
+                reply.peer_endpoint = resolve_peer_endpoint_for_volume(
+                    volume_ulid,
+                    &ctx.data_dir,
+                    ctx.peer_fetch.is_some(),
+                    &ctx.stores,
+                )
+                .await;
+            }
             let env: Envelope<RegisterReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -3453,7 +3464,31 @@ fn register_volume(
     );
     Ok(RegisterReply {
         macaroon: m.encode(),
+        peer_endpoint: None,
     })
+}
+
+/// Resolve the previous claimer's peer-fetch endpoint for `volume_ulid`.
+///
+/// `Some(endpoint)` only when peer-fetch is locally configured, the
+/// volume name is readable from the fork dir, and discovery resolves
+/// a clean handoff. Every other path collapses to `None` — the volume
+/// runs S3-only.
+async fn resolve_peer_endpoint_for_volume(
+    volume_ulid: ulid::Ulid,
+    data_dir: &Path,
+    peer_fetch_enabled: bool,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+) -> Option<PeerEndpoint> {
+    if !peer_fetch_enabled {
+        return None;
+    }
+    let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
+    let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
+    let store = stores.coordinator_wide();
+    elide_coordinator::peer_discovery::discover_peer_for_claim(&store, &volume_name)
+        .await
+        .map(|d| d.endpoint)
 }
 
 fn issue_credentials(
@@ -4403,7 +4438,7 @@ async fn run_claim_job(
     let _ = await_prefetch_op(new_vol_ulid, &ctx.prefetch_tracker).await;
     job.append(ClaimAttachEvent::PrefetchDone);
     info!(
-        "[claim {volume}] prefetch+prewarm awaited in {:.2?}",
+        "[claim {volume}] prefetch awaited in {:.2?}",
         prefetch_wait_started.elapsed()
     );
 

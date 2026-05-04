@@ -22,6 +22,7 @@ pub use elide_coordinator::ipc::{
     SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
     VolumeEventEntry, VolumeEventsReply,
 };
+pub use elide_peer_fetch::PeerEndpoint;
 
 /// Public-API aliases for the client side. The underlying types live
 /// in `elide_coordinator::ipc` so server and client share the wire
@@ -148,17 +149,21 @@ pub fn await_prefetch(socket_path: &Path, vol_ulid: &str, budget: Duration) -> i
 /// volume's recorded `volume.pid`. There is a brief window after spawn
 /// where the parent has not yet written `volume.pid`; the caller in
 /// `register_and_get_creds` retries on that condition.
-pub fn register_volume(socket_path: &Path, volume_ulid: &str) -> io::Result<String> {
+///
+/// The returned reply also carries the peer-fetch endpoint resolved
+/// for this claim (when peer-fetch is locally configured and a clean
+/// handoff predecessor is reachable). The volume process uses it to
+/// build a body byte-range peer-fetcher in front of S3.
+pub fn register_volume(socket_path: &Path, volume_ulid: &str) -> io::Result<RegisterReply> {
     let parsed = ulid::Ulid::from_string(volume_ulid)
         .map_err(|e| io::Error::other(format!("invalid volume_ulid: {e}")))?;
-    let reply: RegisterReply = call_typed(
+    call_typed(
         socket_path,
         &Request::Register {
             volume_ulid: parsed,
         },
     )?
-    .map_err(io::Error::other)?;
-    Ok(reply.macaroon)
+    .map_err(io::Error::other)
 }
 
 /// Exchange a registered macaroon for short-lived S3 credentials.
@@ -176,19 +181,35 @@ pub fn macaroon_credentials(socket_path: &Path, macaroon: &str) -> io::Result<St
     .map_err(io::Error::other)
 }
 
+/// Result of [`register_and_get_creds`]: the issued credentials, plus
+/// the optional peer-fetch endpoint vended in the registration reply.
+pub struct RegisteredVolume {
+    pub creds: StoreCreds,
+    pub peer_endpoint: Option<PeerEndpoint>,
+}
+
 /// Combined registration + credential fetch with retry.
 ///
 /// The supervisor writes `volume.pid` after `Command::spawn()` returns,
 /// which can race against a fast-starting volume reaching this code path
 /// before the parent has flushed the pid file. We retry a handful of
 /// times with short backoff to absorb that window.
-pub fn register_and_get_creds(socket_path: &Path, volume_ulid: &str) -> io::Result<StoreCreds> {
+pub fn register_and_get_creds(
+    socket_path: &Path,
+    volume_ulid: &str,
+) -> io::Result<RegisteredVolume> {
     const MAX_ATTEMPTS: u32 = 10;
     const BACKOFF_MS: u64 = 50;
     let mut last_err: Option<io::Error> = None;
     for _ in 0..MAX_ATTEMPTS {
         match register_volume(socket_path, volume_ulid) {
-            Ok(m) => return macaroon_credentials(socket_path, &m),
+            Ok(reply) => {
+                let creds = macaroon_credentials(socket_path, &reply.macaroon)?;
+                return Ok(RegisteredVolume {
+                    creds,
+                    peer_endpoint: reply.peer_endpoint,
+                });
+            }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("not registered") || msg.contains("does not match") {

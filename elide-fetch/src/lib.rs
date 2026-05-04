@@ -893,63 +893,6 @@ pub fn derive_volume_id(dir: &Path) -> io::Result<String> {
         .map_err(|e| io::Error::other(format!("fork dir name is not a valid ULID '{name}': {e}")))
 }
 
-// --- volume pre-warm ---
-
-/// Pre-warm the start of a readonly (cached) volume.
-///
-/// Demand-fetches LBAs 0 and 1 (the first 8 KiB of the disk) into the local
-/// cache. These blocks are almost universally accessed on first use
-/// regardless of filesystem type, so pre-fetching them on pull avoids cold
-/// round-trips.
-///
-/// Returns `Ok(())` silently if the volume is not yet indexed.
-pub fn prewarm_volume_start(
-    fork_dir: &Path,
-    by_id_dir: &Path,
-    store: Arc<dyn RangeFetcher>,
-    max_batch_bytes: u64,
-) -> io::Result<()> {
-    use elide_core::volume::{ReadonlyVolume, walk_ancestors};
-
-    let started = std::time::Instant::now();
-
-    // Build fork dir list oldest-first; current fork appended last.
-    let walk_started = std::time::Instant::now();
-    let ancestors = walk_ancestors(fork_dir, by_id_dir)?;
-    let mut fork_dirs: Vec<PathBuf> = ancestors.iter().map(|l| l.dir.clone()).collect();
-    fork_dirs.push(fork_dir.to_path_buf());
-    let walk_elapsed = walk_started.elapsed();
-
-    let fetcher_started = std::time::Instant::now();
-    let fetcher = Arc::new(RemoteFetcher::from_store(
-        store,
-        &fork_dirs,
-        max_batch_bytes,
-    )?);
-    let fetcher_elapsed = fetcher_started.elapsed();
-
-    let open_started = std::time::Instant::now();
-    let mut vol = ReadonlyVolume::open(fork_dir, by_id_dir)?;
-    vol.set_fetcher(fetcher);
-    let open_elapsed = open_started.elapsed();
-
-    let read_started = std::time::Instant::now();
-    vol.read(0, 2)?;
-    let read_elapsed = read_started.elapsed();
-
-    tracing::info!(
-        "[prewarm] volume start pre-warmed: {} in {:.2?} (walk_ancestors {:.2?}, fetcher {:.2?}, ReadonlyVolume::open {:.2?}, read(0,2) {:.2?}, ancestors={})",
-        fork_dir.display(),
-        started.elapsed(),
-        walk_elapsed,
-        fetcher_elapsed,
-        open_elapsed,
-        read_elapsed,
-        ancestors.len(),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,6 +37,7 @@ use std::io;
 
 use elide_core::name_record::NameState;
 use elide_core::volume_event::VolumeEvent;
+use elide_peer_fetch::PeerEndpoint;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ulid::Ulid;
@@ -472,9 +473,20 @@ pub struct StoreCredsReply {
 
 /// Reply for [`Request::Register`]. The macaroon is base64-encoded;
 /// the caller passes it back as-is in [`Request::Credentials`].
+///
+/// `peer_endpoint` is populated when the coordinator has resolved a
+/// previous claimer's peer-fetch endpoint via discovery
+/// (`coordinators/<id>/peer-endpoint.toml`). The volume process uses
+/// it to construct a `PeerRangeFetcher` that consults the peer for
+/// body byte ranges before falling through to S3. `None` means
+/// peer-fetch is unconfigured, the predecessor is unreachable, or the
+/// claim is not a clean handoff — the volume runs S3-only in that
+/// case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterReply {
     pub macaroon: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub peer_endpoint: Option<PeerEndpoint>,
 }
 
 /// Internal return type for `resolve_handoff_key_op`, also embedded
