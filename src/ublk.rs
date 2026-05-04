@@ -443,9 +443,21 @@ mod imp {
         let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
         if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
             let arc_fetcher: Arc<dyn elide_core::segment::SegmentFetcher> = Arc::new(build.fetcher);
+            let s3_only_fetcher: Arc<dyn elide_core::segment::SegmentFetcher> = Arc::new(
+                elide_fetch::RemoteFetcher::from_store(build.s3_store, build.fetch_batch_bytes),
+            );
             let fork_dirs = volume.fork_dirs();
+            let (lba_map, extent_index) = volume.snapshot_maps();
             volume.set_fetcher(Arc::clone(&arc_fetcher));
-            crate::body_prefetch::spawn(fork_dirs, arc_fetcher);
+            let body_prefetch_done = crate::body_prefetch::spawn(fork_dirs.clone(), arc_fetcher);
+            crate::full_warm::spawn(
+                dir.to_path_buf(),
+                fork_dirs,
+                lba_map,
+                extent_index,
+                s3_only_fetcher,
+                body_prefetch_done,
+            );
             peer_counters = build.peer_counters;
             println!("[demand-fetch enabled]");
         }

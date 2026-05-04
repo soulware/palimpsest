@@ -42,23 +42,17 @@ use ulid::Ulid;
 const PREFETCH_WORKERS: usize = 16;
 
 /// Spawn a detached worker pool that warms body cache from any
-/// `cache/*.prefetch-hint` files in the chain.
+/// `cache/*.prefetch-hint` files in the chain. Returns the outer
+/// thread's handle so callers can sequence downstream warming (e.g.
+/// `full_warm`) strictly after the peer pool drains.
 ///
-/// Non-blocking: returns immediately. The pool exits when every hint
-/// has been attempted or when no hints are present (immediate
-/// return). All errors are non-fatal; the demand-fetch path handles
-/// any segment whose prefetch is incomplete.
-///
-/// `fork_dirs` is the volume's ancestry chain (oldest-first, current
-/// fork last) — the same list demand-fetch searches on a cache miss.
-/// Each fork's `cache/` is scanned independently because segments are
-/// owned by the fork that minted them and their `.idx` / `.body` /
-/// `.prefetch-hint` files all live alongside in that fork's
-/// directory.
-pub fn spawn(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
-    let _ = thread::Builder::new()
+/// `fork_dirs` is the volume's ancestry chain (oldest-first), the same
+/// list demand-fetch searches on a cache miss.
+pub fn spawn(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) -> Option<thread::JoinHandle<()>> {
+    thread::Builder::new()
         .name("body-prefetch".into())
-        .spawn(move || run(fork_dirs, fetcher));
+        .spawn(move || run(fork_dirs, fetcher))
+        .ok()
 }
 
 fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
