@@ -21,7 +21,7 @@ use elide_core::config::VolumeConfig;
 use elide_core::extentindex::{BodySource, ExtentIndex};
 use elide_core::lbamap::LbaMap;
 use elide_core::segment::{self, BoxFetcher};
-use tracing::{trace, warn};
+use tracing::{info, warn};
 use ulid::Ulid;
 
 const FULL_WARM_WORKERS: usize = 4;
@@ -40,7 +40,7 @@ pub fn spawn(
 ) {
     match VolumeConfig::read(&head_dir) {
         Ok(cfg) if cfg.lazy == Some(true) => {
-            trace!("[full-warm] volume opted into lazy mode; skipping");
+            info!("[full-warm] volume opted into lazy mode; skipping");
             return;
         }
         Ok(_) => {}
@@ -56,7 +56,7 @@ pub fn spawn(
                 if let Err(e) = handle.join() {
                     warn!("[full-warm] body-prefetch pool panicked: {e:?}");
                 }
-                trace!("[full-warm] body-prefetch drained; starting S3 warm");
+                info!("[full-warm] body-prefetch drained; starting S3 warm");
             }
             run(fork_dirs, lba_map, extent_index, fetcher)
         });
@@ -75,11 +75,12 @@ fn run(
             return;
         }
     };
-    if plan.is_empty() {
+    let total = plan.len();
+    if total == 0 {
+        info!("[full-warm] plan empty — nothing to warm");
         return;
     }
-    let total = plan.len();
-    trace!("[full-warm] {total} segment(s) to warm");
+    info!("[full-warm] {total} segment(s) to warm");
 
     let work: Arc<Vec<SegmentWork>> = Arc::new(plan.into_values().collect());
     let cursor = Arc::new(AtomicUsize::new(0));
@@ -98,7 +99,7 @@ fn run(
     for h in handles {
         let _ = h.join();
     }
-    trace!("[full-warm] pool done: {total} segment(s) attempted");
+    info!("[full-warm] pool done: {total} segment(s) attempted");
 }
 
 struct SegmentWork {
@@ -184,7 +185,7 @@ fn worker(cursor: Arc<AtomicUsize>, work: Arc<Vec<SegmentWork>>, fetcher: BoxFet
         }
         let w = &work[i];
         if let Err(e) = warm_one_segment(w, &*fetcher) {
-            trace!("[full-warm {}] non-fatal: {e:#}", w.seg_ulid);
+            info!("[full-warm {}] non-fatal: {e:#}", w.seg_ulid);
         }
     }
 }
@@ -197,7 +198,7 @@ fn warm_one_segment(w: &SegmentWork, fetcher: &dyn segment::SegmentFetcher) -> s
     let layout = match segment::read_segment_layout(&idx_path) {
         Ok(l) => l,
         Err(e) => {
-            trace!("[full-warm {}] missing idx: {e}", w.seg_ulid);
+            info!("[full-warm {}] missing idx: {e}", w.seg_ulid);
             return Ok(());
         }
     };
