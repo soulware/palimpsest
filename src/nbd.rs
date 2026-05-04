@@ -556,14 +556,26 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, NbdListener::Tcp(listener), None, None)
+    serve_volume_listener(
+        dir,
+        size_bytes,
+        NbdListener::Tcp(listener),
+        None,
+        crate::VolumeFetchInputs {
+            fetch_config: None,
+            peer_endpoint: None,
+        },
+    )
 }
 
 /// Serve a fork over NBD with a signing key attached.
 ///
 /// Segments promoted during this session will be signed with `signer`.
-/// If `fetch_config` is provided, missing segments are fetched from remote
-/// storage on demand and cached in `segments/`.
+/// If `fetch_inputs.fetch_config` is provided, missing segments are
+/// fetched from remote storage on demand and cached in `segments/`.
+/// If `fetch_inputs.peer_endpoint` is also provided, body byte ranges
+/// are routed through the peer-fetch tier first before falling
+/// through to S3.
 /// If `nbd` is `None`, no NBD server is started — the volume runs for
 /// coordinator IPC only (control socket).
 pub fn run_volume_signed(
@@ -571,10 +583,10 @@ pub fn run_volume_signed(
     size_bytes: u64,
     nbd: Option<NbdBind>,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
-    fetch_config: Option<elide_fetch::FetchConfig>,
+    fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
     let Some(nbd) = nbd else {
-        return run_volume_ipc_only(dir, size_bytes, Some(signer), fetch_config);
+        return run_volume_ipc_only(dir, size_bytes, Some(signer), fetch_inputs);
     };
     let listener = match nbd {
         NbdBind::Tcp { bind, port } => {
@@ -610,7 +622,7 @@ pub fn run_volume_signed(
             NbdListener::Unix(l)
         }
     };
-    serve_volume_listener(dir, size_bytes, listener, Some(signer), fetch_config)
+    serve_volume_listener(dir, size_bytes, listener, Some(signer), fetch_inputs)
 }
 
 /// Serve a fork as a read-only NBD device.
@@ -618,15 +630,16 @@ pub fn run_volume_signed(
 /// The fork is opened without acquiring a write lock or creating a WAL. The
 /// NBD device is advertised as read-only; write commands return EPERM.
 /// Requires `--readonly` to be passed explicitly so the intent is unambiguous.
-/// If `fetch_config` is provided, missing segments are fetched on demand.
+/// If `fetch_inputs.fetch_config` is provided, missing segments are fetched
+/// on demand.
 pub fn run_volume_readonly(
     dir: &Path,
     size_bytes: u64,
     nbd: Option<NbdBind>,
-    fetch_config: Option<elide_fetch::FetchConfig>,
+    fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
     let Some(nbd) = nbd else {
-        return run_volume_ipc_only(dir, size_bytes, None, fetch_config);
+        return run_volume_ipc_only(dir, size_bytes, None, fetch_inputs);
     };
     let listener = match nbd {
         NbdBind::Tcp { bind, port } => {
@@ -662,7 +675,7 @@ pub fn run_volume_readonly(
             NbdListener::Unix(l)
         }
     };
-    serve_readonly_volume_listener(dir, size_bytes, listener, fetch_config)
+    serve_readonly_volume_listener(dir, size_bytes, listener, fetch_inputs)
 }
 
 fn handle_readonly_connection(
@@ -801,14 +814,13 @@ fn serve_readonly_volume_listener(
     dir: &Path,
     size_bytes: u64,
     listener: NbdListener,
-    fetch_config: Option<elide_fetch::FetchConfig>,
+    fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
     install_sigusr1_handler();
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_readonly_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(config) = fetch_config {
-        let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
+    if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
         volume.set_fetcher(std::sync::Arc::new(fetcher));
         println!("[demand-fetch enabled]");
     }
@@ -834,15 +846,14 @@ fn run_volume_ipc_only(
     dir: &Path,
     _size_bytes: u64,
     _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
-    fetch_config: Option<elide_fetch::FetchConfig>,
+    fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(config) = fetch_config {
-        let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
+    if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
         volume.set_fetcher(std::sync::Arc::new(fetcher));
     }
 
@@ -869,15 +880,14 @@ fn serve_volume_listener(
     size_bytes: u64,
     listener: NbdListener,
     _signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
-    fetch_config: Option<elide_fetch::FetchConfig>,
+    fetch_inputs: crate::VolumeFetchInputs,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
     let by_id_dir = dir.parent().unwrap_or(dir);
     let mut volume = open_volume_with_retry(dir, by_id_dir)?;
 
-    if let Some(config) = fetch_config {
-        let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
+    if let Some(fetcher) = crate::build_volume_fetcher(dir, &volume.fork_dirs(), fetch_inputs)? {
         volume.set_fetcher(std::sync::Arc::new(fetcher));
         println!("[demand-fetch enabled]");
     }
@@ -1374,7 +1384,17 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, NbdListener::Unix(listener), None, None).ok();
+            serve_volume_listener(
+                &dir,
+                size_bytes,
+                NbdListener::Unix(listener),
+                None,
+                crate::VolumeFetchInputs {
+                    fetch_config: None,
+                    peer_endpoint: None,
+                },
+            )
+            .ok();
         });
         sock
     }
@@ -1558,8 +1578,16 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_readonly_volume_listener(&dir, size_bytes, NbdListener::Unix(listener), None)
-                .ok();
+            serve_readonly_volume_listener(
+                &dir,
+                size_bytes,
+                NbdListener::Unix(listener),
+                crate::VolumeFetchInputs {
+                    fetch_config: None,
+                    peer_endpoint: None,
+                },
+            )
+            .ok();
         });
         sock
     }

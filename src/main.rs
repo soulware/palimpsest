@@ -7,8 +7,8 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size, resolve_volume_dir,
-    resolve_volume_size, ublk, validate_volume_name, verify,
+    VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size,
+    resolve_volume_dir, resolve_volume_size, ublk, validate_volume_name, verify,
 };
 
 /// Elide volume management and analysis tools.
@@ -1565,27 +1565,34 @@ fn resolve_local_volume_ulid(data_dir: &Path, name: &str) -> Option<String> {
 /// ULID is the fork directory's basename. When the env var is unset
 /// (standalone `elide serve-volume` invocation with no coordinator),
 /// fall back to `FetchConfig::load` from the volume directory.
-fn resolve_volume_fetch_config(
-    fork_dir: &Path,
-) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
+fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchInputs> {
     if let Ok(sock) = std::env::var("ELIDE_COORDINATOR_SOCKET") {
         let socket_path = Path::new(&sock);
         let volume_ulid = elide_fetch::derive_volume_id(fork_dir)?;
-        if let Some(cfg) = fetch_config_via_coordinator_macaroon(socket_path, &volume_ulid)? {
-            return Ok(Some(cfg));
+        if let Some(inputs) = fetch_config_via_coordinator_macaroon(socket_path, &volume_ulid)? {
+            return Ok(inputs);
         }
     }
-    elide_fetch::FetchConfig::load(fork_dir)
+    Ok(VolumeFetchInputs {
+        fetch_config: elide_fetch::FetchConfig::load(fork_dir)?,
+        peer_endpoint: None,
+    })
 }
 
 /// Pull store config + macaroon-scoped S3 credentials from the
 /// coordinator over IPC. The CLI itself never holds raw S3 credentials
 /// — only spawned volume subprocesses can authenticate (PID-bound via
 /// SO_PEERCRED) and obtain creds for demand-fetch.
+///
+/// The coordinator's [`coordinator_client::RegisterReply`] also carries
+/// the discovered peer-fetch endpoint for the volume's previous
+/// claimer (when peer-fetch is configured and a clean handoff is in
+/// the event log); it is returned alongside the fetch config so the
+/// daemon can stack a peer body byte-range fetcher in front of S3.
 fn fetch_config_via_coordinator_macaroon(
     socket_path: &Path,
     volume_ulid: &str,
-) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
+) -> std::io::Result<Option<VolumeFetchInputs>> {
     if !socket_path.exists() {
         return Ok(None);
     }
@@ -1602,12 +1609,15 @@ fn fetch_config_via_coordinator_macaroon(
         Err(e) => return Err(e),
     };
     if let Some(path) = config.local_path {
-        return Ok(Some(elide_fetch::FetchConfig {
-            bucket: None,
-            endpoint: None,
-            region: None,
-            local_path: Some(path),
-            fetch_batch_bytes: None,
+        return Ok(Some(VolumeFetchInputs {
+            fetch_config: Some(elide_fetch::FetchConfig {
+                bucket: None,
+                endpoint: None,
+                region: None,
+                local_path: Some(path),
+                fetch_batch_bytes: None,
+            }),
+            peer_endpoint: None,
         }));
     }
     let Some(bucket) = config.bucket else {
@@ -1615,25 +1625,28 @@ fn fetch_config_via_coordinator_macaroon(
             "coordinator returned empty store config",
         ));
     };
-    let creds = coordinator_client::register_and_get_creds(socket_path, volume_ulid)?;
+    let registered = coordinator_client::register_and_get_creds(socket_path, volume_ulid)?;
     // SAFETY: serve-volume startup is single-threaded at this point — no
     // background tasks have been spawned, so there are no concurrent env
     // readers.
     unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-        if let Some(tok) = &creds.session_token {
+        std::env::set_var("AWS_ACCESS_KEY_ID", &registered.creds.access_key_id);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", &registered.creds.secret_access_key);
+        if let Some(tok) = &registered.creds.session_token {
             std::env::set_var("AWS_SESSION_TOKEN", tok);
         } else {
             std::env::remove_var("AWS_SESSION_TOKEN");
         }
     }
-    Ok(Some(elide_fetch::FetchConfig {
-        bucket: Some(bucket),
-        endpoint: config.endpoint,
-        region: config.region,
-        local_path: None,
-        fetch_batch_bytes: None,
+    Ok(Some(VolumeFetchInputs {
+        fetch_config: Some(elide_fetch::FetchConfig {
+            bucket: Some(bucket),
+            endpoint: config.endpoint,
+            region: config.region,
+            local_path: None,
+            fetch_batch_bytes: None,
+        }),
+        peer_endpoint: registered.peer_endpoint,
     }))
 }
 

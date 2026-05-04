@@ -53,14 +53,18 @@ pub struct PeerRangeFetcher {
 }
 
 impl PeerRangeFetcher {
-    /// Build a decorator. Must be called inside a tokio runtime so
-    /// the captured handle can drive the async peer client from the
-    /// sync `get_range` path.
+    /// Build a decorator with an explicit tokio runtime handle.
+    ///
+    /// `runtime` must outlive every `get_range` call: the decorator
+    /// uses it to drive the async peer client from the sync call site.
+    /// Callers in long-running daemons typically leak a multi-thread
+    /// runtime at process startup and pass its `Handle` here.
     pub fn new(
         inner: Arc<dyn RangeFetcher>,
         client: BodyFetchClient,
         endpoint: PeerEndpoint,
         data_dir: PathBuf,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             inner,
@@ -68,7 +72,7 @@ impl PeerRangeFetcher {
             endpoint,
             data_dir,
             body_section_start_cache: Arc::new(Mutex::new(HashMap::new())),
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
         }
     }
 
@@ -386,6 +390,7 @@ mod tests {
             client,
             f.peer.clone(),
             f.data_dir.path().to_owned(),
+            tokio::runtime::Handle::current(),
         );
 
         // Ask for the full body range expressed in absolute segment
@@ -432,6 +437,7 @@ mod tests {
             client,
             f.peer.clone(),
             f.data_dir.path().to_owned(),
+            tokio::runtime::Handle::current(),
         );
 
         let key = segment_key(f.vol_ulid, f.seg_ulid);
@@ -468,6 +474,7 @@ mod tests {
             client,
             f.peer.clone(),
             f.data_dir.path().to_owned(),
+            tokio::runtime::Handle::current(),
         );
 
         let key = segment_key(f.vol_ulid, f.seg_ulid);
@@ -497,6 +504,7 @@ mod tests {
             client,
             f.peer.clone(),
             f.data_dir.path().to_owned(),
+            tokio::runtime::Handle::current(),
         );
 
         let key = "by_id/01ABCDEFGHJKMNPQRSTVWXYZ00/snapshots/01XYZ.manifest";

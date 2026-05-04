@@ -20,6 +20,7 @@ ctrlc          = { version = "3", features = ["termination"] }
 elide-core        = { path = "elide-core" }
 elide-coordinator = { path = "elide-coordinator" }
 elide-fetch       = { path = "elide-fetch" }
+elide-peer-fetch  = { path = "elide-peer-fetch" }
 ext4-view      = { version = "0.9", features = ["std"] }
 libc           = "0.2"
 lz4_flex       = "0.11"
