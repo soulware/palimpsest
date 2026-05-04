@@ -19,7 +19,7 @@ use ulid::Ulid;
 use elide_core::name_record::{Lifecycle, NameRecord, NameState, TransitionCheck};
 
 use crate::name_store::{self, NameStoreError};
-use crate::volume_state::STOPPED_FILE;
+use crate::volume_state::{RELEASED_FILE, STOPPED_FILE};
 
 /// Errors from lifecycle transitions.
 #[derive(Debug)]
@@ -657,22 +657,24 @@ pub async fn mark_claimed(
     Ok(MarkClaimedOutcome::Claimed)
 }
 
-/// Reconcile the local `volume.stopped` marker against
-/// `names/<name>.state`. S3 is authoritative — the local marker is a
-/// host-side cache.
+/// Reconcile the local park markers (`volume.stopped`,
+/// `volume.released`) against `names/<name>.state`. S3 is
+/// authoritative — local markers are a host-side cache used by the
+/// supervisor to decide whether to spawn a daemon.
 ///
-/// Behaviour, scoped to records this coordinator owns:
-/// - `state == Stopped` and marker absent → write the marker so the
-///   supervisor does not relaunch the daemon.
-/// - `state == Live` and marker present → remove the marker so the
-///   supervisor can launch the daemon.
-/// - All other cases (foreign owner, `Released`, no record at all)
-///   are left to the lifecycle verbs to handle. Reconciliation never
-///   acts on records owned by another coordinator.
+/// Behaviour:
+/// - `state == Live`: remove both markers (volume should be supervised).
+/// - `state == Stopped`: ensure `volume.stopped` is present, remove
+///   `volume.released` if present.
+/// - `state == Released`: ensure `volume.released` is present (with the
+///   handoff snapshot from the record), remove `volume.stopped` if
+///   present. Skips the ownership check — Released has no owner.
+/// - `state == Readonly`: no action; readonly volumes are filtered
+///   before reaching the supervisor.
+/// - Foreign owner (any non-Released state): no action.
 ///
-/// Best-effort: errors are logged and the function returns `Ok(())`.
-/// Reconciliation drift is a soft inconsistency — the next operator
-/// `volume start` / `volume stop` resolves it cleanly.
+/// Best-effort: errors are logged and the function returns. Drift is a
+/// soft inconsistency — the next operator verb resolves it cleanly.
 pub async fn reconcile_marker(
     store: &Arc<dyn ObjectStore>,
     vol_dir: &Path,
@@ -688,40 +690,55 @@ pub async fn reconcile_marker(
         }
     };
 
-    // Reconciliation only acts on records this coordinator owns.
     let owned_by_us = record
         .coordinator_id
         .as_deref()
         .is_some_and(|id| id == coord_id);
-    if !owned_by_us {
+    // Released has no owner — every host with a fork dir for this name
+    // should converge its local markers regardless.
+    if record.state != NameState::Released && !owned_by_us {
         return;
     }
 
-    let marker = vol_dir.join(STOPPED_FILE);
-    let marker_present = marker.exists();
+    let stopped = vol_dir.join(STOPPED_FILE);
+    let released = vol_dir.join(RELEASED_FILE);
 
-    match (record.state, marker_present) {
-        (NameState::Stopped, false) => {
-            if let Err(e) = std::fs::write(&marker, "") {
+    let ensure_absent = |path: &Path, label: &str| match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("[reconcile {volume_name}] removing {label}: {e}"),
+    };
+
+    match record.state {
+        NameState::Live => {
+            ensure_absent(&stopped, "volume.stopped");
+            ensure_absent(&released, "volume.released");
+        }
+        NameState::Stopped => {
+            if !stopped.exists()
+                && let Err(e) = std::fs::write(&stopped, "")
+            {
                 warn!("[reconcile {volume_name}] writing volume.stopped: {e}");
-            } else {
-                tracing::info!(
-                    "[reconcile {volume_name}] S3 says Stopped; wrote volume.stopped marker"
-                );
             }
+            ensure_absent(&released, "volume.released");
         }
-        (NameState::Live, true) => {
-            if let Err(e) = std::fs::remove_file(&marker) {
-                warn!("[reconcile {volume_name}] removing volume.stopped: {e}");
-            } else {
-                tracing::info!(
-                    "[reconcile {volume_name}] S3 says Live; removed volume.stopped marker"
-                );
+        NameState::Released => {
+            if !released.exists() {
+                let body = record
+                    .handoff_snapshot
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+                if let Err(e) = std::fs::write(&released, body) {
+                    warn!("[reconcile {volume_name}] writing volume.released: {e}");
+                } else {
+                    tracing::info!(
+                        "[reconcile {volume_name}] S3 says Released; wrote volume.released marker"
+                    );
+                }
             }
+            ensure_absent(&stopped, "volume.stopped");
         }
-        // (Stopped, true) and (Live, false) are aligned — no action.
-        // (Released, _) is left to `volume start --claim` semantics.
-        _ => {}
+        NameState::Readonly => {}
     }
 }
 
@@ -1149,6 +1166,61 @@ mod tests {
             claimed, 1,
             "exactly one claim should win, got: {outcomes:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_writes_released_when_s3_says_released() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+
+        // Released has no owner; reconcile must act regardless of the
+        // caller's coordinator id (simulate a fresh restart on the
+        // host that released).
+        reconcile_marker(&s, &vol_dir, "vol", &id_a()).await;
+        let body = std::fs::read_to_string(vol_dir.join(RELEASED_FILE)).unwrap();
+        assert_eq!(body.trim(), snap().to_string());
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_clears_stopped_when_s3_says_released() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        // Stale stopped marker from before release.
+        std::fs::write(vol_dir.join(STOPPED_FILE), "").unwrap();
+
+        reconcile_marker(&s, &vol_dir, "vol", &id_a()).await;
+        assert!(!vol_dir.join(STOPPED_FILE).exists());
+        assert!(vol_dir.join(RELEASED_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_clears_released_when_s3_says_live() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
+        mark_live(&s, "vol", &id_a(), None).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vol_dir = tmp.path().join("vol");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        // Stale released marker from a prior cycle.
+        std::fs::write(vol_dir.join(RELEASED_FILE), snap().to_string()).unwrap();
+
+        reconcile_marker(&s, &vol_dir, "vol", &id_a()).await;
+        assert!(!vol_dir.join(RELEASED_FILE).exists());
     }
 
     #[tokio::test]

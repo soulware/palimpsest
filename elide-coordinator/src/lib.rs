@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod lifecycle;
 pub mod local_cond_store;
 pub mod name_store;
+pub mod park;
 pub mod peer_discovery;
 pub mod portable;
 pub mod prefetch;

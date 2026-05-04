@@ -32,17 +32,17 @@ pub const STOPPED_FILE: &str = "volume.stopped";
 /// successful `names/<name>` flip to `Released`, cleared by the
 /// in-place reclaim path. Body is the handoff snapshot ULID.
 ///
-/// **Display only.** Authoritative claim state lives in
-/// `names/<name>` in the bucket; this marker exists so `elide
-/// volume list` can render `released` without an S3 round-trip.
-/// The supervisor, reconcile path, and claim logic must not gate on
-/// it.
+/// Acts as a park marker: the supervisor refuses to spawn a daemon
+/// while this is present (see [`crate::park`]). `lifecycle::reconcile_marker`
+/// keeps the file in sync with the bucket's `names/<name>` record so
+/// drift self-heals at the next scan. Authoritative claim state still
+/// lives in S3.
 pub const RELEASED_FILE: &str = "volume.released";
 
-/// Per-volume import lock. Written by `elide-import`'s supervision
-/// protocol while a subprocess is running. The body is the import
-/// ULID.
-pub const IMPORT_LOCK_FILE: &str = "import.lock";
+/// Importing marker. Written by `elide-import`'s supervision protocol
+/// while a subprocess is running. Body is the import ULID. Naming is
+/// aligned with the other `volume.<state>` lifecycle markers.
+pub const IMPORTING_FILE: &str = "volume.importing";
 
 /// Read/write mode for a volume. Readonly is set on imported OCI
 /// volumes; everything else is read/write.
@@ -76,7 +76,7 @@ impl std::fmt::Display for VolumeMode {
 /// Order of precedence in [`VolumeLifecycle::from_dir`]:
 ///   1. `volume.released` exists → `Released { handoff_snapshot }`
 ///   2. `volume.stopped` exists → `StoppedManual`
-///   3. `import.lock` exists → `Importing { import_ulid }`
+///   3. `volume.importing` exists → `Importing { import_ulid }`
 ///   4. `volume.pid` names a live process → `Running { pid }`
 ///   5. otherwise → `Stopped`
 ///
@@ -121,7 +121,7 @@ impl VolumeLifecycle {
         if vol_dir.join(STOPPED_FILE).exists() {
             return Self::StoppedManual;
         }
-        let lock = vol_dir.join(IMPORT_LOCK_FILE);
+        let lock = vol_dir.join(IMPORTING_FILE);
         if lock.exists() {
             let import_ulid = std::fs::read_to_string(&lock)
                 .unwrap_or_default()
@@ -226,7 +226,7 @@ mod tests {
         let d = TempDir::new().unwrap();
         std::fs::write(d.path().join(RELEASED_FILE), "01J9").unwrap();
         std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
-        std::fs::write(d.path().join(IMPORT_LOCK_FILE), "01J7").unwrap();
+        std::fs::write(d.path().join(IMPORTING_FILE), "01J7").unwrap();
         std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
         match VolumeLifecycle::from_dir(d.path()) {
             VolumeLifecycle::Released { handoff_snapshot } => {
@@ -272,11 +272,7 @@ mod tests {
     fn stopped_marker_takes_precedence_over_pid_and_lock() {
         let d = TempDir::new().unwrap();
         std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
-        std::fs::write(
-            d.path().join(IMPORT_LOCK_FILE),
-            "01J0000000000000000000000V",
-        )
-        .unwrap();
+        std::fs::write(d.path().join(IMPORTING_FILE), "01J0000000000000000000000V").unwrap();
         std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
         assert_eq!(
             VolumeLifecycle::from_dir(d.path()),
@@ -288,7 +284,7 @@ mod tests {
     fn import_lock_takes_precedence_over_pid() {
         let d = TempDir::new().unwrap();
         std::fs::write(
-            d.path().join(IMPORT_LOCK_FILE),
+            d.path().join(IMPORTING_FILE),
             "01J0000000000000000000000V\n",
         )
         .unwrap();
@@ -304,7 +300,7 @@ mod tests {
     #[test]
     fn import_lock_with_empty_body_classifies_as_importing_with_empty_ulid() {
         let d = TempDir::new().unwrap();
-        std::fs::write(d.path().join(IMPORT_LOCK_FILE), "").unwrap();
+        std::fs::write(d.path().join(IMPORTING_FILE), "").unwrap();
         match VolumeLifecycle::from_dir(d.path()) {
             VolumeLifecycle::Importing { import_ulid } => {
                 assert_eq!(import_ulid, "");

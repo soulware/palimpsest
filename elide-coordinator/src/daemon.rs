@@ -40,7 +40,7 @@ use crate::import;
 use crate::inbound;
 use crate::supervisor;
 use elide_coordinator::identity::CoordinatorIdentity;
-use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE};
+use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, new_prefetch_tracker,
     new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
@@ -272,10 +272,10 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
         let volumes = discover_volumes(&data_dir);
         for vol_dir in volumes {
-            // Skip volumes in the write phase of an import (import.lock present,
+            // Skip volumes in the write phase of an import (volume.importing present,
             // no control.sock). The serve phase (both present) is handled normally
             // — run_volume_tasks drains pending/ via promote IPC.
-            if vol_dir.join(IMPORT_LOCK_FILE).exists() && !vol_dir.join("control.sock").exists() {
+            if vol_dir.join(IMPORTING_FILE).exists() && !vol_dir.join("control.sock").exists() {
                 continue;
             }
             let vol_ino = vol_dir.metadata().map(|m| m.ino()).unwrap_or(0);

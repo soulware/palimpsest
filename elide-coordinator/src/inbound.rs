@@ -45,7 +45,7 @@ use elide_coordinator::ipc::{
     StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{
-    IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE, clear_released_marker, write_released_marker,
+    IMPORTING_FILE, PID_FILE, STOPPED_FILE, clear_released_marker, write_released_marker,
 };
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
@@ -526,9 +526,9 @@ async fn start_import(
     Ok(ImportStartReply { import_ulid })
 }
 
-/// Resolve a volume name to its import ULID via `import.lock`, if present.
+/// Resolve a volume name to its import ULID via `volume.importing`, if present.
 fn import_ulid_for_volume(name: &str, data_dir: &Path) -> Option<String> {
-    let lock_path = data_dir.join("by_name").join(name).join(IMPORT_LOCK_FILE);
+    let lock_path = data_dir.join("by_name").join(name).join(IMPORTING_FILE);
     std::fs::read_to_string(lock_path)
         .ok()
         .map(|s| s.trim().to_owned())
@@ -556,7 +556,7 @@ async fn import_status_by_name(
         .get(&ulid)
         .cloned();
     match job {
-        // import.lock exists but not in registry (coordinator restarted mid-import)
+        // volume.importing exists but not in registry (coordinator restarted mid-import)
         None => Ok(ImportStatusReply::Running),
         Some(job) => match job.state() {
             ImportState::Running => Ok(ImportStatusReply::Running),
@@ -610,7 +610,7 @@ async fn stream_import_by_name(
         .get(&ulid)
         .cloned();
     let Some(job) = job else {
-        // import.lock exists but not in registry (coordinator restarted mid-import).
+        // volume.importing exists but not in registry (coordinator restarted mid-import).
         // We can't stream output we never buffered.
         write_err(
             writer,
@@ -3666,7 +3666,7 @@ async fn run_fork_job(
             "source volume {source_ulid_str} not found in remote store"
         )));
     }
-    if source_dir.join(IMPORT_LOCK_FILE).exists() {
+    if source_dir.join(IMPORTING_FILE).exists() {
         return Err(IpcError::conflict(format!(
             "source '{source_ulid_str}' is still importing; wait for import to complete"
         )));

@@ -64,8 +64,8 @@ pub async fn supervise(
             break;
         }
 
-        // Volume intentionally stopped — wait for the marker to disappear.
-        if fork_dir.join(STOPPED_FILE).exists() {
+        // Park if any park marker is present (volume.stopped or volume.released).
+        if elide_coordinator::park::is_parked(&fork_dir).is_some() {
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
