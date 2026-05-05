@@ -743,6 +743,7 @@ async fn force_snapshot_now_op(
 /// Without this hint, forks from a pulled source emit a `Created`
 /// journal event instead of the more useful
 /// `ForkedFrom { source_name, ... }`.
+#[allow(clippy::too_many_arguments)]
 async fn fork_create_op(
     new_name: &str,
     source_vol_ulid: Ulid,
