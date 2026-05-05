@@ -299,6 +299,7 @@ mod tests {
             _index_dir: &Path,
             _body_dir: &Path,
             extent: &ExtentFetch,
+            _presence: Option<std::sync::Arc<elide_core::extentindex::SegmentPresence>>,
         ) -> std::io::Result<()> {
             self.calls
                 .lock()

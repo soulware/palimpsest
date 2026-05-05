@@ -25,6 +25,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use log::warn;
 use ulid::Ulid;
@@ -139,6 +141,102 @@ pub struct DeltaLocation {
     pub options: Vec<segment::DeltaOption>,
 }
 
+/// Per-segment bitset of "this entry's body bytes are durable in
+/// `cache/<id>.body`". Mirror of the on-disk `cache/<id>.present`
+/// file held in memory so the hot read path can replace a per-extent
+/// `open + read` syscall with a single atomic load.
+///
+/// Concurrency model: lock-free atomic loads for readers, byte-by-byte
+/// store-Release writes for the fetcher inside its per-segment
+/// `.present` write lock. The fetcher writes the freshest on-disk
+/// bytes back into the bitset under that lock, which makes the
+/// in-memory bitset re-converge to the on-disk state on every fetch
+/// — eviction (which clears the on-disk file) is observed lazily on
+/// the next fetch and stale bits clear themselves.
+///
+/// Reads that find the file missing skip the bitset entirely (the
+/// existence check in `locate_segment_body` runs first), so stale
+/// 1-bits during the eviction window are harmless.
+pub struct SegmentPresence {
+    bits: Vec<AtomicU8>,
+}
+
+impl SegmentPresence {
+    /// Build an all-zero bitset sized for `entry_count` entries.
+    pub fn zeroed(entry_count: u32) -> Self {
+        let len = (entry_count as usize).div_ceil(8);
+        let mut bits = Vec::with_capacity(len);
+        bits.resize_with(len, || AtomicU8::new(0));
+        Self { bits }
+    }
+
+    /// Build a bitset from on-disk bytes (the contents of
+    /// `cache/<id>.present`), padded to `entry_count` bits if shorter.
+    pub fn from_bytes(bytes: &[u8], entry_count: u32) -> Self {
+        let want = (entry_count as usize).div_ceil(8);
+        let mut bits = Vec::with_capacity(want);
+        for &b in bytes.iter().take(want) {
+            bits.push(AtomicU8::new(b));
+        }
+        while bits.len() < want {
+            bits.push(AtomicU8::new(0));
+        }
+        Self { bits }
+    }
+
+    /// Build a bitset with all bits set for the data-bearing entries
+    /// of a freshly-drained segment. Mirrors the on-disk bitmap that
+    /// `promote_to_cache` writes alongside the new `.body`.
+    pub fn from_data_kinds(entries: &[segment::SegmentEntry]) -> Self {
+        let p = Self::zeroed(entries.len() as u32);
+        for (i, e) in entries.iter().enumerate() {
+            if e.kind.is_data() {
+                p.set(i as u32);
+            }
+        }
+        p
+    }
+
+    /// Test bit `idx`. Returns `false` if `idx` is out of range.
+    pub fn test(&self, idx: u32) -> bool {
+        let byte_idx = (idx / 8) as usize;
+        let bit = idx % 8;
+        match self.bits.get(byte_idx) {
+            Some(b) => b.load(Ordering::Acquire) & (1 << bit) != 0,
+            None => false,
+        }
+    }
+
+    /// Set bit `idx`. No-op if `idx` is out of range.
+    pub fn set(&self, idx: u32) {
+        let byte_idx = (idx / 8) as usize;
+        let bit = idx % 8;
+        if let Some(b) = self.bits.get(byte_idx) {
+            b.fetch_or(1 << bit, Ordering::Release);
+        }
+    }
+
+    /// Replace the bitset contents with `bytes`, padded with zeros
+    /// or truncated to the existing size. Used by the fetcher inside
+    /// the per-segment `.present` write lock to re-sync the in-memory
+    /// state to whatever was just written to disk — covers the
+    /// post-eviction case where the on-disk file restarted from zero.
+    pub fn replace_from_bytes(&self, bytes: &[u8]) {
+        for (i, slot) in self.bits.iter().enumerate() {
+            let v = bytes.get(i).copied().unwrap_or(0);
+            slot.store(v, Ordering::Release);
+        }
+    }
+}
+
+impl std::fmt::Debug for SegmentPresence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentPresence")
+            .field("bytes", &self.bits.len())
+            .finish()
+    }
+}
+
 /// In-memory index mapping content hash to segment location.
 #[derive(Clone)]
 pub struct ExtentIndex {
@@ -147,6 +245,12 @@ pub struct ExtentIndex {
     /// hash of the bytes *after* decompression). Separate from
     /// `inner` so the hot-path DATA lookup stays untouched.
     deltas: HashMap<blake3::Hash, DeltaLocation>,
+    /// Per-segment presence bitsets for `BodySource::Cached` entries.
+    /// Shared by `Arc` across snapshot republishes for unchanged
+    /// segments; the fetcher writes through the same `Arc` every
+    /// reader sees, so atomic-bit stores propagate without any
+    /// coordination through the actor.
+    segment_presence: HashMap<Ulid, Arc<SegmentPresence>>,
 }
 
 impl ExtentIndex {
@@ -154,7 +258,23 @@ impl ExtentIndex {
         Self {
             inner: HashMap::new(),
             deltas: HashMap::new(),
+            segment_presence: HashMap::new(),
         }
+    }
+
+    /// Install or replace the presence bitset for `segment_id`.
+    pub fn set_segment_presence(&mut self, segment_id: Ulid, presence: Arc<SegmentPresence>) {
+        self.segment_presence.insert(segment_id, presence);
+    }
+
+    /// Look up the presence bitset for `segment_id`, if any.
+    pub fn segment_presence(&self, segment_id: Ulid) -> Option<&Arc<SegmentPresence>> {
+        self.segment_presence.get(&segment_id)
+    }
+
+    /// Drop the presence bitset for `segment_id`, if present.
+    pub fn remove_segment_presence(&mut self, segment_id: Ulid) {
+        self.segment_presence.remove(&segment_id);
     }
 
     /// Insert or overwrite the location for `hash`.
@@ -433,10 +553,27 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         },
                     )
                 }
-                segment::SegmentTier::Index => (
-                    Box::new(|idx: u32| BodySource::Cached(idx)),
-                    DeltaBodySource::Cached,
-                ),
+                segment::SegmentTier::Index => {
+                    // Read the on-disk `.present` bitmap once and install
+                    // the in-memory mirror so the read path can replace
+                    // a per-extent open+read with an atomic load.
+                    let cache_dir = fork_dir.join("cache");
+                    let present_path = cache_dir.join(format!("{segment_id}.present"));
+                    let present_bytes = match std::fs::read(&present_path) {
+                        Ok(b) => b,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+                        Err(e) => return Err(e),
+                    };
+                    let presence = Arc::new(SegmentPresence::from_bytes(
+                        &present_bytes,
+                        entries.len() as u32,
+                    ));
+                    index.set_segment_presence(segment_id, presence);
+                    (
+                        Box::new(|idx: u32| BodySource::Cached(idx)),
+                        DeltaBodySource::Cached,
+                    )
+                }
             };
 
             for (raw_idx, entry) in entries.iter().enumerate() {

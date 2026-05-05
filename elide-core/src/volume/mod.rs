@@ -1297,6 +1297,17 @@ impl Volume {
             // soon-to-be-deleted pending file.
             self.evict_cached_segment(ulid);
 
+            // Install the in-memory mirror of the all-bits-set
+            // `cache/<ulid>.present` that `promote_to_cache` just
+            // wrote. The hot read path uses this for the per-entry
+            // presence check on `BodyOnly` cache hits — without it
+            // the rebuild-on-startup path would be the only source,
+            // which is too late for live drains.
+            Arc::make_mut(&mut self.extent_index).set_segment_presence(
+                ulid,
+                Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
+            );
+
             for (i, entry) in entries.iter().enumerate() {
                 if !entry.kind.has_body_bytes() {
                     continue;
@@ -1360,6 +1371,17 @@ impl Volume {
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
+
+            // GC carried entries already reference `BodySource::Cached(idx)`
+            // against `ulid` (planted by `apply_gc_handoffs`); now that
+            // `promote_to_cache` has produced `cache/<ulid>.body` +
+            // `cache/<ulid>.present`, install the in-memory presence
+            // mirror so reads against the new cache shape succeed
+            // without consulting `.present` on disk.
+            Arc::make_mut(&mut self.extent_index).set_segment_presence(
+                ulid,
+                Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
+            );
         }
         Ok(())
     }
@@ -1935,6 +1957,7 @@ impl Volume {
             &self.base_dir,
             &self.ancestor_layers,
             self.fetcher.as_ref(),
+            &self.extent_index,
             body_section_start,
             body_source,
         )

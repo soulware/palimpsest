@@ -83,6 +83,7 @@ impl ReadonlyVolume {
             &self.base_dir,
             &self.ancestor_layers,
             self.fetcher.as_ref(),
+            &self.extent_index,
             body_section_start,
             body_source,
         )
@@ -766,6 +767,7 @@ mod tests {
                 index_dir: &Path,
                 body_dir: &Path,
                 _extent: &crate::segment::ExtentFetch,
+                _presence: Option<Arc<crate::extentindex::SegmentPresence>>,
             ) -> io::Result<()> {
                 *self.captured.lock().unwrap() = Some((index_dir.to_owned(), body_dir.to_owned()));
                 // Simulate a successful fetch: write the body file where
@@ -812,11 +814,20 @@ mod tests {
         });
         let fetcher: BoxFetcher = concrete.clone();
 
+        let mut empty_index = crate::extentindex::ExtentIndex::new();
+        // The test segment has at least one entry; install an
+        // all-zero presence so the read path falls through to the
+        // fetcher (the file doesn't exist yet anyway).
+        empty_index.set_segment_presence(
+            seg_ulid,
+            Arc::new(crate::extentindex::SegmentPresence::zeroed(1)),
+        );
         let returned = find_segment_in_dirs(
             seg_ulid,
             &child_dir,
             &layers,
             Some(&fetcher),
+            &empty_index,
             0,
             BodySource::Cached(0),
         )
@@ -868,6 +879,7 @@ mod tests {
                 index_dir: &Path,
                 body_dir: &Path,
                 _extent: &crate::segment::ExtentFetch,
+                _presence: Option<Arc<crate::extentindex::SegmentPresence>>,
             ) -> io::Result<()> {
                 *self.captured.lock().unwrap() = Some(index_dir.to_owned());
                 std::fs::create_dir_all(body_dir)?;
@@ -902,11 +914,17 @@ mod tests {
         });
         let fetcher: BoxFetcher = concrete.clone();
 
+        let mut empty_index = crate::extentindex::ExtentIndex::new();
+        empty_index.set_segment_presence(
+            seg_ulid,
+            Arc::new(crate::extentindex::SegmentPresence::zeroed(1)),
+        );
         let returned = find_segment_in_dirs(
             seg_ulid,
             &child_dir,
             &layers,
             Some(&fetcher),
+            &empty_index,
             0,
             BodySource::Cached(0),
         )

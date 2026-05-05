@@ -360,6 +360,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
             _index_dir: &Path,
             _body_dir: &Path,
             _extent: &ExtentFetch,
+            _presence: Option<std::sync::Arc<elide_core::extentindex::SegmentPresence>>,
         ) -> io::Result<()> {
             Err(io::Error::other("unused in this test"))
         }

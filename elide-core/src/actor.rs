@@ -1684,11 +1684,12 @@ impl VolumeReader {
             self.last_flush_gen.set(snap.flush_gen);
         }
         let config = &self.client.config;
+        let extent_index = &snap.extent_index;
         read_extents(
             lba,
             lba_count,
             &snap.lbamap,
-            &snap.extent_index,
+            extent_index,
             &self.file_cache,
             |id, bss, idx| {
                 find_segment_in_dirs(
@@ -1696,6 +1697,7 @@ impl VolumeReader {
                     &config.base_dir,
                     &config.ancestor_layers,
                     config.fetcher.as_ref(),
+                    extent_index,
                     bss,
                     idx,
                 )
@@ -1789,6 +1791,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         base_dir: &base_dir,
         ancestor_layers: &ancestor_layers,
         fetcher: fetcher.as_ref(),
+        extent_index: &extent_index,
     };
     let inputs = plan.inputs();
     let ctx = match gc_apply::MaterialiseCtx::new(&base_dir, &inputs, &extent_index, &resolver) {
@@ -1890,6 +1893,7 @@ struct WorkerBodyResolver<'a> {
     base_dir: &'a std::path::Path,
     ancestor_layers: &'a [AncestorLayer],
     fetcher: Option<&'a BoxFetcher>,
+    extent_index: &'a crate::extentindex::ExtentIndex,
 }
 
 impl crate::gc_apply::BodyResolver for WorkerBodyResolver<'_> {
@@ -1904,6 +1908,7 @@ impl crate::gc_apply::BodyResolver for WorkerBodyResolver<'_> {
             self.base_dir,
             self.ancestor_layers,
             self.fetcher,
+            self.extent_index,
             body_section_start,
             body_source,
         )?;
