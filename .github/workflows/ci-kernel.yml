@@ -65,10 +65,11 @@ jobs:
           LIB_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "elide" and (.target.kind | index("lib"))) | .executable' build-output.json | head -1)
           CRASH_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "ublk_crash") | .executable' build-output.json | head -1)
           COORD_NBD_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "coordinator_nbd") | .executable' build-output.json | head -1)
+          COORD_UBLK_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "coordinator_ublk") | .executable' build-output.json | head -1)
           ELIDE_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == false and .target.name == "elide" and (.target.kind | index("bin"))) | .executable' build-output.json | head -1)
           ELIDE_COORD_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == false and .target.name == "elide-coordinator" and (.target.kind | index("bin"))) | .executable' build-output.json | head -1)
 
-          for pair in "LIB_BIN=$LIB_BIN" "CRASH_BIN=$CRASH_BIN" "COORD_NBD_BIN=$COORD_NBD_BIN" "ELIDE_BIN=$ELIDE_BIN" "ELIDE_COORD_BIN=$ELIDE_COORD_BIN"; do
+          for pair in "LIB_BIN=$LIB_BIN" "CRASH_BIN=$CRASH_BIN" "COORD_NBD_BIN=$COORD_NBD_BIN" "COORD_UBLK_BIN=$COORD_UBLK_BIN" "ELIDE_BIN=$ELIDE_BIN" "ELIDE_COORD_BIN=$ELIDE_COORD_BIN"; do
             path="${pair#*=}"
             if [ -z "$path" ] || [ ! -x "$path" ]; then
               echo "missing artifact: $pair"
@@ -80,13 +81,15 @@ jobs:
           echo "host lib:         $LIB_BIN"
           echo "host crash:       $CRASH_BIN"
           echo "host coord-nbd:   $COORD_NBD_BIN"
+          echo "host coord-ublk:  $COORD_UBLK_BIN"
           echo "host elide:       $ELIDE_BIN"
           echo "host coordinator: $ELIDE_COORD_BIN"
-          ls -lh "$LIB_BIN" "$CRASH_BIN" "$COORD_NBD_BIN" "$ELIDE_BIN" "$ELIDE_COORD_BIN"
+          ls -lh "$LIB_BIN" "$CRASH_BIN" "$COORD_NBD_BIN" "$COORD_UBLK_BIN" "$ELIDE_BIN" "$ELIDE_COORD_BIN"
 
           echo "lib_bin=$LIB_BIN" >> "$GITHUB_OUTPUT"
           echo "crash_bin=$CRASH_BIN" >> "$GITHUB_OUTPUT"
           echo "coord_nbd_bin=$COORD_NBD_BIN" >> "$GITHUB_OUTPUT"
+          echo "coord_ublk_bin=$COORD_UBLK_BIN" >> "$GITHUB_OUTPUT"
           echo "elide_bin=$ELIDE_BIN" >> "$GITHUB_OUTPUT"
           echo "elide_coord_bin=$ELIDE_COORD_BIN" >> "$GITHUB_OUTPUT"
 
@@ -204,20 +207,23 @@ jobs:
           LIB_HOST="${{ steps.build-tests.outputs.lib_bin }}"
           CRASH_HOST="${{ steps.build-tests.outputs.crash_bin }}"
           COORD_NBD_HOST="${{ steps.build-tests.outputs.coord_nbd_bin }}"
+          COORD_UBLK_HOST="${{ steps.build-tests.outputs.coord_ublk_bin }}"
           ELIDE_HOST="${{ steps.build-tests.outputs.elide_bin }}"
           ELIDE_COORD_HOST="${{ steps.build-tests.outputs.elide_coord_bin }}"
           LIB_GUEST="/repo${LIB_HOST#$WS}"
           CRASH_GUEST="/repo${CRASH_HOST#$WS}"
           COORD_NBD_GUEST="/repo${COORD_NBD_HOST#$WS}"
+          COORD_UBLK_GUEST="/repo${COORD_UBLK_HOST#$WS}"
           ELIDE_GUEST="/repo${ELIDE_HOST#$WS}"
           ELIDE_COORD_GUEST="/repo${ELIDE_COORD_HOST#$WS}"
 
           echo "host lib:         $LIB_HOST         -> $LIB_GUEST"
           echo "host crash:       $CRASH_HOST       -> $CRASH_GUEST"
           echo "host coord-nbd:   $COORD_NBD_HOST   -> $COORD_NBD_GUEST"
+          echo "host coord-ublk:  $COORD_UBLK_HOST  -> $COORD_UBLK_GUEST"
           echo "host elide:       $ELIDE_HOST       -> $ELIDE_GUEST"
           echo "host coordinator: $ELIDE_COORD_HOST -> $ELIDE_COORD_GUEST"
-          for p in "$LIB_GUEST" "$CRASH_GUEST" "$COORD_NBD_GUEST" "$ELIDE_GUEST" "$ELIDE_COORD_GUEST"; do
+          for p in "$LIB_GUEST" "$CRASH_GUEST" "$COORD_NBD_GUEST" "$COORD_UBLK_GUEST" "$ELIDE_GUEST" "$ELIDE_COORD_GUEST"; do
             $SSH "test -x $p" || { echo "binary not accessible in guest: $p"; exit 1; }
           done
 
@@ -238,6 +244,13 @@ jobs:
           # passes the env var through regardless of sudoers env_keep policy.
           echo "::group::ublk crash-injection tests"
           time $SSH "sudo env ELIDE_BIN=$ELIDE_GUEST $CRASH_GUEST --nocapture"
+          echo "::endgroup::"
+          # coordinator_ublk drives a real /dev/ublkbN through the
+          # coordinator's supervisor, so it needs root too. Both the
+          # `elide` and `elide-coordinator` binaries are spawned as
+          # subprocesses.
+          echo "::group::coordinator integration (ublk)"
+          time $SSH "sudo env ELIDE_BIN=$ELIDE_GUEST ELIDE_COORDINATOR_BIN=$ELIDE_COORD_GUEST $COORD_UBLK_GUEST --nocapture"
           echo "::endgroup::"
 
       - name: Artifacts — prepare qemu serial log
