@@ -190,6 +190,11 @@ pub async fn drain_pending(
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
+    let uploader = SegmentUploader {
+        volume_id,
+        store,
+        part_size_bytes,
+    };
 
     for entry in entries {
         let entry = entry.context("reading pending dir entry")?;
@@ -212,7 +217,7 @@ pub async fn drain_pending(
         // DedupRef bodies are never in the file to begin with.
         crate::control::redact_segment(vol_dir, ulid).await;
 
-        match upload_segment_file(&segment_path, name, volume_id, store, part_size_bytes).await {
+        match uploader.upload(&segment_path, name).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
@@ -440,53 +445,58 @@ pub async fn upload_snapshot_metadata(
     Ok(())
 }
 
-/// Upload a segment body file to S3 at its canonical segment key.
-///
-/// Used by both the drain path (pending/<ulid>) and GC compaction (gc body).
-/// The upload goes via multipart: each part is a separate request with its
-/// own timeout and retry, so a stalled part no longer forces a restart of
-/// the whole segment upload. Small segments complete in a single part at
-/// roughly the same cost as a simple PUT.
-///
-/// Concurrency is capped at `MAX_CONCURRENT_PARTS` via `wait_for_capacity`
-/// so parallel parts don't saturate the upload link and trip reqwest's
-/// 30s per-request timeout. Two parts in flight is enough to hide one
-/// request's handshake latency without fanning out.
-pub(crate) async fn upload_segment_file(
-    path: &Path,
-    ulid_str: &str,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
-) -> Result<()> {
-    const MAX_CONCURRENT_PARTS: usize = 2;
+/// Bundles the loop-invariants every segment upload threads through —
+/// destination volume, object store handle, and multipart chunk size — so
+/// callers (drain path, GC handoff cursor) construct one above the loop
+/// rather than passing the same three arguments per file.
+pub(crate) struct SegmentUploader<'a> {
+    pub(crate) volume_id: &'a str,
+    pub(crate) store: &'a Arc<dyn ObjectStore>,
+    pub(crate) part_size_bytes: usize,
+}
 
-    let key = segment_key(volume_id, ulid_str)?;
-    let data = std::fs::read(path).with_context(|| format!("reading segment {ulid_str}"))?;
-    let len = data.len();
-    let mut bytes = Bytes::from(data);
+impl SegmentUploader<'_> {
+    /// Used by both the drain path (pending/<ulid>) and GC compaction (gc
+    /// body). The upload goes via multipart: each part is a separate request
+    /// with its own timeout and retry, so a stalled part no longer forces a
+    /// restart of the whole segment upload. Small segments complete in a
+    /// single part at roughly the same cost as a simple PUT.
+    ///
+    /// Concurrency is capped at `MAX_CONCURRENT_PARTS` via `wait_for_capacity`
+    /// so parallel parts don't saturate the upload link and trip reqwest's
+    /// 30s per-request timeout. Two parts in flight is enough to hide one
+    /// request's handshake latency without fanning out.
+    pub(crate) async fn upload(&self, path: &Path, ulid_str: &str) -> Result<()> {
+        const MAX_CONCURRENT_PARTS: usize = 2;
 
-    let started = Instant::now();
-    let upload = store
-        .put_multipart(&key)
-        .await
-        .with_context(|| format!("initiating multipart upload for {key}"))?;
-    let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size_bytes);
-    while !bytes.is_empty() {
-        let take = bytes.len().min(part_size_bytes);
-        let part = bytes.split_to(take);
-        writer
-            .wait_for_capacity(MAX_CONCURRENT_PARTS)
+        let key = segment_key(self.volume_id, ulid_str)?;
+        let data = std::fs::read(path).with_context(|| format!("reading segment {ulid_str}"))?;
+        let len = data.len();
+        let mut bytes = Bytes::from(data);
+
+        let started = Instant::now();
+        let upload = self
+            .store
+            .put_multipart(&key)
             .await
-            .with_context(|| format!("multipart part upload for {key}"))?;
-        writer.put(part);
+            .with_context(|| format!("initiating multipart upload for {key}"))?;
+        let mut writer = WriteMultipart::new_with_chunk_size(upload, self.part_size_bytes);
+        while !bytes.is_empty() {
+            let take = bytes.len().min(self.part_size_bytes);
+            let part = bytes.split_to(take);
+            writer
+                .wait_for_capacity(MAX_CONCURRENT_PARTS)
+                .await
+                .with_context(|| format!("multipart part upload for {key}"))?;
+            writer.put(part);
+        }
+        writer
+            .finish()
+            .await
+            .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
+        info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
+        Ok(())
     }
-    writer
-        .finish()
-        .await
-        .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
-    info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
-    Ok(())
 }
 
 #[cfg(test)]

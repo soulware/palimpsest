@@ -505,11 +505,13 @@ pub async fn apply_done_handoffs(
     let cursor = HandoffCursor {
         fork_dir,
         cache_dir: fork_dir.join("cache"),
-        volume_id,
         volume_ulid,
-        store,
-        part_size_bytes,
         vk,
+        uploader: crate::upload::SegmentUploader {
+            volume_id,
+            store,
+            part_size_bytes,
+        },
     };
 
     let mut count = 0;
@@ -560,11 +562,9 @@ fn collect_bare_handoffs(gc_dir: &Path) -> Result<Vec<fs::DirEntry>> {
 struct HandoffCursor<'a> {
     fork_dir: &'a Path,
     cache_dir: std::path::PathBuf,
-    volume_id: &'a str,
     volume_ulid: Ulid,
-    store: &'a Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
     vk: elide_core::signing::VerifyingKey,
+    uploader: crate::upload::SegmentUploader<'a>,
 }
 
 impl HandoffCursor<'_> {
@@ -595,15 +595,10 @@ impl HandoffCursor<'_> {
         // Upload + promote are idempotent: if a previous pass already
         // uploaded and promoted, the store PUT is a re-PUT of the same
         // bytes and `promote_segment` short-circuits on cache body presence.
-        crate::upload::upload_segment_file(
-            gc_body,
-            &new_ulid_str,
-            self.volume_id,
-            self.store,
-            self.part_size_bytes,
-        )
-        .await
-        .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
+        self.uploader
+            .upload(gc_body, &new_ulid_str)
+            .await
+            .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
         // Promote IPC: volume writes index/<new>.idx, copies body to cache,
         // deletes stale index/<old>.idx for each input. The gc body stays
@@ -623,7 +618,8 @@ impl HandoffCursor<'_> {
         // this loop after a crash re-PUTs the same key with the same body.
         let body = render_marker(&inputs);
         let key: StorePath = marker_key(self.volume_ulid, new_ulid);
-        self.store
+        self.uploader
+            .store
             .put(&key, Bytes::from(body).into())
             .await
             .with_context(|| format!("writing retention marker {new_ulid_str}"))?;
