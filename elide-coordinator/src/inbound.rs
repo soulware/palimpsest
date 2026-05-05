@@ -29,34 +29,36 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::claim::{ClaimJob, ClaimJobState, ClaimRegistry};
+use crate::claim::{ClaimJobState, ClaimRegistry};
 use crate::credential::CredentialIssuer;
-use crate::fork::{ForkJob, ForkJobState, ForkRegistry};
+use crate::fork::{ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
-    self, ClaimAttachEvent, ClaimReply, ClaimStartReply, CreateReply, Envelope, EvictReply,
-    ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply,
-    GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    LatestSnapshotReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
-    ResolveHandoffKeyReply, ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply,
-    StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
+    self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
+    ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
+    IpcError, PullReadonlyReply, RegisterReply, ReleaseReply, Request, SnapshotReply,
+    StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{
-    IMPORTING_FILE, PID_FILE, STOPPED_FILE, clear_released_marker, write_released_marker,
+    IMPORTING_FILE, PID_FILE, STOPPED_FILE, write_released_marker,
 };
-use elide_coordinator::{
-    EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
-    subscribe_prefetch,
-};
+use elide_coordinator::{EvictRegistry, PrefetchTracker, SnapshotLockRegistry, subscribe_prefetch};
 use elide_core::process::pid_is_alive;
 
 /// Shared coordinator state threaded through every inbound op.
 ///
 /// All fields are cheap to clone (Arc-wrapped or Copy), so per-connection
 /// fan-out in `serve` is a flat clone rather than a long argument list.
+///
+/// The dispatcher legitimately needs all 12 fields (it routes to handlers
+/// touching different subsets); orchestrators and per-domain helpers do
+/// not. They take narrower context structs ([`crate::claim::ClaimContext`],
+/// [`crate::fork::ForkContext`], [`crate::import::ImportContext`]) that
+/// hold the [`CoordinatorCore`] plus the registries they actually use.
 #[derive(Clone)]
 pub struct IpcContext {
     pub data_dir: Arc<PathBuf>,
@@ -64,25 +66,18 @@ pub struct IpcContext {
     pub registry: ImportRegistry,
     pub fork_registry: ForkRegistry,
     pub claim_registry: ClaimRegistry,
-    pub elide_import_bin: Arc<PathBuf>,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
     pub prefetch_tracker: PrefetchTracker,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
-    pub store_config: Arc<StoreSection>,
     pub part_size_bytes: usize,
-    /// Crockford-Base32 ULID-shaped coordinator id, derived once at
-    /// startup from `coordinator.pub`. Cheap to clone (26 bytes).
-    pub coord_id: String,
-    /// 32-byte MAC root for `macaroon::mint` / `macaroon::verify`,
-    /// derived in-memory from `coordinator.key` at startup.
-    pub macaroon_root: [u8; 32],
-    /// The coordinator's identity bundle, used as a `SegmentSigner`
+    /// The coordinator's identity bundle. Used as a `SegmentSigner`
     /// when minting synthesised handoff snapshots during
-    /// `volume release --force`. Arc-shared so per-connection clones
-    /// stay cheap.
+    /// `volume release --force`, and as the source of the coordinator
+    /// id (`identity.coordinator_id_str()`) and the 32-byte macaroon
+    /// MAC root (`identity.macaroon_root()`). Arc-shared so per-
+    /// connection clones stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    pub issuer: Arc<dyn CredentialIssuer>,
     /// Peer-fetch client handle. `Some` when `[peer_fetch].port` is
     /// configured. Used by the claim orchestrator after it rebinds
     /// `names/<name>` (so peer auth accepts our coord_id) to warm the
@@ -90,7 +85,71 @@ pub struct IpcContext {
     pub peer_fetch: Option<elide_coordinator::tasks::PeerFetchHandle>,
 }
 
-pub async fn serve(socket_path: &Path, ctx: IpcContext) {
+/// Universal coordinator state — every IPC handler and every domain
+/// orchestrator needs these four fields. Carried inside the per-domain
+/// context structs so they don't have to embed `IpcContext`'s full bag
+/// when most of it would be unused.
+#[derive(Clone)]
+pub struct CoordinatorCore {
+    pub data_dir: Arc<PathBuf>,
+    pub rescan: Arc<Notify>,
+    pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
+    pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
+}
+
+impl IpcContext {
+    /// Snapshot the universal hot-core fields. Cheap (Arc clones).
+    fn core(&self) -> CoordinatorCore {
+        CoordinatorCore {
+            data_dir: self.data_dir.clone(),
+            rescan: self.rescan.clone(),
+            stores: self.stores.clone(),
+            identity: self.identity.clone(),
+        }
+    }
+
+    /// Construct a [`crate::claim::ClaimContext`] — the hot core plus
+    /// the claim-domain registries (claim_registry, prefetch_tracker,
+    /// peer_fetch).
+    pub(crate) fn for_claim(&self) -> crate::claim::ClaimContext {
+        crate::claim::ClaimContext {
+            core: self.core(),
+            claim_registry: self.claim_registry.clone(),
+            prefetch_tracker: self.prefetch_tracker.clone(),
+            peer_fetch: self.peer_fetch.clone(),
+        }
+    }
+
+    /// Construct a [`crate::fork::ForkContext`] — the hot core plus the
+    /// fork-domain registries (fork_registry, prefetch_tracker,
+    /// snapshot_locks, part_size_bytes).
+    pub(crate) fn for_fork(&self) -> crate::fork::ForkContext {
+        crate::fork::ForkContext {
+            core: self.core(),
+            fork_registry: self.fork_registry.clone(),
+            prefetch_tracker: self.prefetch_tracker.clone(),
+            snapshot_locks: self.snapshot_locks.clone(),
+            part_size_bytes: self.part_size_bytes,
+        }
+    }
+
+    /// Construct a [`crate::import::ImportContext`] — the hot core plus
+    /// the import registry.
+    pub(crate) fn for_import(&self) -> crate::import::ImportContext {
+        crate::import::ImportContext {
+            core: self.core(),
+            registry: self.registry.clone(),
+        }
+    }
+}
+
+pub async fn serve(
+    socket_path: &Path,
+    ctx: IpcContext,
+    elide_import_bin: Arc<PathBuf>,
+    store_config: Arc<StoreSection>,
+    issuer: Arc<dyn CredentialIssuer>,
+) {
     let _ = std::fs::remove_file(socket_path);
 
     let listener = match UnixListener::bind(socket_path) {
@@ -125,14 +184,26 @@ pub async fn serve(socket_path: &Path, ctx: IpcContext) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(handle(stream, ctx.clone()));
+                tokio::spawn(handle(
+                    stream,
+                    ctx.clone(),
+                    elide_import_bin.clone(),
+                    store_config.clone(),
+                    issuer.clone(),
+                ));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
     }
 }
 
-async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
+async fn handle(
+    stream: tokio::net::UnixStream,
+    ctx: IpcContext,
+    elide_import_bin: Arc<PathBuf>,
+    store_config: Arc<StoreSection>,
+    issuer: Arc<dyn CredentialIssuer>,
+) {
     // Capture peer credentials before splitting the stream — needed for
     // SO_PEERCRED on the `register` and `credentials` verbs. Other
     // verbs ignore the peer pid; capturing once here keeps the code
@@ -152,7 +223,16 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     };
     let line = line.trim().to_owned();
 
-    dispatch_json(&line, &ctx, peer_pid, &mut writer).await;
+    dispatch_json(
+        &line,
+        &ctx,
+        peer_pid,
+        &mut writer,
+        &elide_import_bin,
+        &store_config,
+        issuer.as_ref(),
+    )
+    .await;
 }
 
 /// Typed JSON dispatch. Each match arm runs the verb-specific
@@ -162,11 +242,20 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
 /// sequence terminated by either an `Ok(Done)` or `Err`. Unknown
 /// verbs fail at the `serde_json::from_str` step — `serde` rejects
 /// unrecognised variants by default for internally-tagged enums.
+///
+/// `elide_import_bin`, `store_config`, and `issuer` are daemon-owned
+/// resources used by exactly one handler each (`ImportStart`,
+/// `GetStoreConfig`, `Credentials`). Routed alongside the broadly-
+/// shared `ctx` rather than carried inside it.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_json(
     line: &str,
     ctx: &IpcContext,
     peer_pid: Option<i32>,
     writer: &mut OwnedWriteHalf,
+    elide_import_bin: &Path,
+    store_config: &StoreSection,
+    issuer: &dyn CredentialIssuer,
 ) {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -191,7 +280,9 @@ async fn dispatch_json(
         Request::StatusRemote { volume } => {
             // Reads names/<volume>: coordinator-wide.
             let store = ctx.stores.coordinator_wide();
-            let result = volume_status_remote_typed(&volume, &store, &ctx.coord_id).await;
+            let result =
+                volume_status_remote_typed(&volume, &store, ctx.identity.coordinator_id_str())
+                    .await;
             let env: Envelope<StatusRemoteReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -202,7 +293,7 @@ async fn dispatch_json(
                 &volume,
                 &ctx.data_dir,
                 &store,
-                &ctx.coord_id,
+                ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
             )
             .await;
@@ -216,16 +307,7 @@ async fn dispatch_json(
             let result = if force {
                 force_release_volume_op(&volume, &ctx.data_dir, &store, &ctx.identity).await
             } else {
-                release_volume_op(
-                    &volume,
-                    &ctx.data_dir,
-                    &ctx.snapshot_locks,
-                    &store,
-                    ctx.part_size_bytes,
-                    &ctx.identity,
-                    &ctx.rescan,
-                )
-                .await
+                release_volume_op(&volume, &store, ctx).await
             };
             let env: Envelope<ReleaseReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -237,7 +319,7 @@ async fn dispatch_json(
                 &volume,
                 &ctx.data_dir,
                 &store,
-                &ctx.coord_id,
+                ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
                 &ctx.rescan,
             )
@@ -278,16 +360,14 @@ async fn dispatch_json(
             // Mixed: names/<volume> mark_initial; the spawned import
             // subprocess writes locally only.
             let store = ctx.stores.coordinator_wide();
+            let import_ctx = ctx.for_import();
             let result = start_import(
                 &volume,
                 &oci_ref,
                 &extents_from,
-                &ctx.data_dir,
-                &ctx.elide_import_bin,
-                &ctx.registry,
                 &store,
-                &ctx.rescan,
-                &ctx.identity,
+                elide_import_bin,
+                &import_ctx,
             )
             .await;
             let env: Envelope<ImportStartReply> = result.into();
@@ -353,13 +433,17 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::GetStoreConfig => {
-            let reply = render_store_config(&ctx.store_config);
+            let reply = render_store_config(store_config);
             let env: Envelope<StoreConfigReply> = Envelope::ok(reply);
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Register { volume_ulid } => {
-            let mut result =
-                register_volume(volume_ulid, &ctx.data_dir, peer_pid, &ctx.macaroon_root);
+            let mut result = register_volume(
+                volume_ulid,
+                &ctx.data_dir,
+                peer_pid,
+                ctx.identity.macaroon_root(),
+            );
             if let Ok(reply) = &mut result {
                 reply.peer_endpoint = resolve_peer_endpoint_for_volume(
                     volume_ulid,
@@ -377,8 +461,8 @@ async fn dispatch_json(
                 &macaroon,
                 &ctx.data_dir,
                 peer_pid,
-                &ctx.macaroon_root,
-                ctx.issuer.as_ref(),
+                ctx.identity.macaroon_root(),
+                issuer,
             );
             let env: Envelope<StoreCredsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -391,7 +475,8 @@ async fn dispatch_json(
             force_snapshot,
             flags,
         } => {
-            let result = start_fork(new_name, from, force_snapshot, flags, ctx.clone());
+            let result =
+                crate::fork::start_fork(new_name, from, force_snapshot, flags, ctx.for_fork());
             let env: Envelope<ForkStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -399,7 +484,7 @@ async fn dispatch_json(
             stream_fork_by_name(&new_name, writer, &ctx.fork_registry).await;
         }
         Request::ClaimStart { volume } => {
-            let result = start_claim(volume, ctx.clone()).await;
+            let result = crate::claim::start_claim(volume, ctx.for_claim()).await;
             let env: Envelope<ClaimStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -437,90 +522,24 @@ fn render_store_config(store: &StoreSection) -> StoreConfigReply {
     }
 }
 
-/// Resolve `names/<name>` in the bucket and return the bound `vol_ulid`.
-/// Errors NotFound when the name has no S3 record.
-async fn resolve_name_op(
-    name: &str,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<ResolveNameReply, IpcError> {
-    validate_volume_name(name).map_err(IpcError::bad_request)?;
-    match elide_coordinator::name_store::read_name_record(store, name).await {
-        Ok(Some((rec, _))) => Ok(ResolveNameReply {
-            vol_ulid: rec.vol_ulid,
-        }),
-        Ok(None) => Err(IpcError::not_found(format!(
-            "volume '{name}' not found in store"
-        ))),
-        Err(e) => Err(IpcError::store(format!("reading names/{name}: {e}"))),
-    }
-}
-
-/// LIST `by_id/<vol_ulid>/snapshots/` and return the highest snapshot
-/// ULID. Filemap and manifest siblings (filenames containing `.`) are
-/// filtered out so only the bare snapshot markers contribute.
-async fn latest_snapshot_op(
-    vol_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<LatestSnapshotReply, IpcError> {
-    use futures::TryStreamExt;
-    use object_store::path::Path as StorePath;
-
-    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> = store
-        .list(Some(&prefix))
-        .try_collect()
-        .await
-        .map_err(|e| IpcError::store(format!("listing by_id/{vol_ulid}/snapshots/: {e}")))?;
-
-    let mut latest: Option<ulid::Ulid> = None;
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        if filename.contains('.') {
-            continue;
-        }
-        if let Ok(u) = ulid::Ulid::from_string(filename)
-            && latest.is_none_or(|cur| u > cur)
-        {
-            latest = Some(u);
-        }
-    }
-    Ok(LatestSnapshotReply {
-        snapshot_ulid: latest,
-    })
-}
-
 // ── Import operations ─────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn start_import(
     volume: &str,
     oci_ref: &str,
     extents_from: &[String],
-    data_dir: &Path,
-    elide_import_bin: &Path,
-    registry: &ImportRegistry,
     store: &Arc<dyn ObjectStore>,
-    rescan: &Arc<Notify>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    elide_import_bin: &Path,
+    ctx: &crate::import::ImportContext,
 ) -> Result<ImportStartReply, IpcError> {
     let req = import::ImportRequest {
         vol_name: volume,
         oci_ref,
         extents_from,
     };
-    let ulid_str = import::spawn_import(
-        req,
-        data_dir,
-        elide_import_bin,
-        registry,
-        store.clone(),
-        rescan.clone(),
-        identity.clone(),
-    )
-    .await
-    .map_err(|e| IpcError::internal(format!("{e}")))?;
+    let ulid_str = import::spawn_import(req, elide_import_bin, store.clone(), ctx)
+        .await
+        .map_err(|e| IpcError::internal(format!("{e}")))?;
     let import_ulid = ulid::Ulid::from_string(&ulid_str)
         .map_err(|e| IpcError::internal(format!("import ulid {ulid_str:?}: {e}")))?;
     Ok(ImportStartReply { import_ulid })
@@ -718,7 +737,7 @@ async fn evict_volume(
 ///
 /// Lock is released when this function returns (via the `Drop` guard on
 /// the returned `MutexGuard`).
-async fn snapshot_volume(
+pub(crate) async fn snapshot_volume(
     vol_name: &str,
     data_dir: &Path,
     snapshot_locks: &SnapshotLockRegistry,
@@ -1104,21 +1123,21 @@ fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
 /// boolean is an explicit clear. Mutually-exclusive flags are validated by
 /// the consumer (different rules for create vs update).
 #[derive(Default)]
-struct TransportPatch {
-    nbd_port: Option<u16>,
-    nbd_bind: Option<String>,
-    nbd_socket: Option<std::path::PathBuf>,
-    no_nbd: bool,
-    ublk: bool,
-    ublk_id: Option<i32>,
-    no_ublk: bool,
+pub(crate) struct TransportPatch {
+    pub(crate) nbd_port: Option<u16>,
+    pub(crate) nbd_bind: Option<String>,
+    pub(crate) nbd_socket: Option<std::path::PathBuf>,
+    pub(crate) no_nbd: bool,
+    pub(crate) ublk: bool,
+    pub(crate) ublk_id: Option<i32>,
+    pub(crate) no_ublk: bool,
 }
 
 /// Parse a flat space-separated flag list. Recognised tokens:
 ///   nbd-port=<u16>, nbd-bind=<addr>, nbd-socket=<path>, no-nbd,
 ///   ublk, ublk-id=<i32>, no-ublk
 /// Unknown tokens produce an error so silent typos don't get accepted.
-fn parse_transport_flags(args: &str) -> Result<TransportPatch, String> {
+pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String> {
     let mut patch = TransportPatch::default();
     for tok in args.split_whitespace() {
         let (key, val) = match tok.split_once('=') {
@@ -1143,7 +1162,7 @@ fn parse_transport_flags(args: &str) -> Result<TransportPatch, String> {
     Ok(patch)
 }
 
-fn validate_volume_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_volume_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("volume name must not be empty".to_owned());
     }
@@ -1448,7 +1467,7 @@ async fn update_volume_op(
 // ── Volume fork (create --from) plumbing ──────────────────────────────────────
 
 /// Decode a 64-character hex string into a 32-byte array (Ed25519 pubkey).
-fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
+pub(crate) fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
     if s.len() != 64 {
         return Err(format!("expected 64 hex chars, got {}", s.len()));
     }
@@ -1458,70 +1477,6 @@ fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
             .map_err(|_| format!("invalid hex at byte {i}"))?;
     }
     Ok(out)
-}
-
-/// Tracks ancestor skeletons pulled during one claim attempt and
-/// removes them from disk on drop unless [`Self::commit`] was called.
-///
-/// Why: `pull_readonly_op` verifies provenance against the
-/// just-downloaded `volume.pub` — a self-consistent check that does
-/// not catch a peer (or store) supplying matched-but-forged
-/// `volume.pub` + `volume.provenance` bytes. The forgery only fails
-/// later, when `resolve_handoff_key_op` checks the released volume's
-/// signed handoff manifest from S3 against that pubkey. Without this
-/// guard a failed claim leaves the bogus skeleton in
-/// `data_dir/by_id/<id>/`; the next retry sees the directory exists
-/// and reuses the lie. The guard ensures every ancestor pulled in a
-/// failing attempt is torn down before the error propagates.
-///
-/// The directory removal is cheap blocking I/O (`std::fs::remove_dir_all`),
-/// safe to run from `Drop`. Failures are logged but not propagated —
-/// at worst a leftover dir survives, the same outcome as today's
-/// behaviour, but only when the cleanup itself fails.
-struct PulledAncestorsGuard {
-    by_id_dir: PathBuf,
-    pulled: Vec<ulid::Ulid>,
-    committed: bool,
-}
-
-impl PulledAncestorsGuard {
-    fn new(by_id_dir: PathBuf) -> Self {
-        Self {
-            by_id_dir,
-            pulled: Vec::new(),
-            committed: false,
-        }
-    }
-
-    fn record(&mut self, vol_ulid: ulid::Ulid) {
-        self.pulled.push(vol_ulid);
-    }
-
-    /// Mark the pulled set as kept. Call after every downstream
-    /// verification step that could reject a peer-served forgery has
-    /// passed — typically right before `fork_create_op`.
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for PulledAncestorsGuard {
-    fn drop(&mut self) {
-        if self.committed || self.pulled.is_empty() {
-            return;
-        }
-        for vol_ulid in &self.pulled {
-            let dir = self.by_id_dir.join(vol_ulid.to_string());
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                warn!(
-                    "[claim cleanup] failed to remove pulled ancestor {}: {e}",
-                    dir.display()
-                );
-            } else {
-                info!("[claim cleanup] removed unverified ancestor {vol_ulid}");
-            }
-        }
-    }
 }
 
 /// Pull one readonly ancestor from the store.
@@ -1541,7 +1496,7 @@ impl Drop for PulledAncestorsGuard {
 /// is self-consistent — a peer that forges both files passes here.
 /// The caller is responsible for downstream verification against an
 /// S3-rooted artifact (see [`PulledAncestorsGuard`]).
-async fn pull_readonly_op(
+pub(crate) async fn pull_readonly_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
@@ -1606,47 +1561,13 @@ async fn pull_readonly_op(
     Ok(PullReadonlyReply { parent })
 }
 
-/// Synthesize a "now" snapshot for a readonly source volume.
-///
-/// Mirrors the CLI's `create_readonly_snapshot_now`: prefetches indexes,
-/// uploads the snapshot marker, verifies pinned segments are still in S3,
-/// and writes a signed manifest under an ephemeral key in the ancestor's
-/// directory. Returns `<snap_ulid> <ephemeral_pubkey_hex>`.
-/// Implementation of the `resolve-handoff-key` IPC verb. See the
-/// dispatch comment for the wire format.
-async fn resolve_handoff_key_op(
-    vol_ulid: ulid::Ulid,
-    snap_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<ResolveHandoffKeyReply, IpcError> {
-    use elide_coordinator::recovery::{HandoffVerifier, resolve_handoff_verifier};
-
-    match resolve_handoff_verifier(store, vol_ulid, snap_ulid).await {
-        Ok(HandoffVerifier::Normal) => Ok(ResolveHandoffKeyReply::Normal),
-        Ok(HandoffVerifier::Synthesised {
-            manifest_pubkey, ..
-        }) => {
-            let hex: String = manifest_pubkey
-                .as_ref()
-                .to_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            Ok(ResolveHandoffKeyReply::Recovery {
-                manifest_pubkey_hex: hex,
-            })
-        }
-        Err(e) => Err(IpcError::internal(format!("{e}"))),
-    }
-}
-
 /// Wait for the per-fork prefetch result and echo it.
 ///
 /// The IPC has no internal timeout — the volume-side caller bounds it. If
 /// the per-fork task disappears (channel closed without a final value, e.g.
 /// the volume directory was removed) we report that as an error rather than
 /// silently returning ok, so the caller can act on it.
-async fn await_prefetch_op(
+pub(crate) async fn await_prefetch_op(
     vol_ulid: ulid::Ulid,
     tracker: &PrefetchTracker,
 ) -> Result<(), IpcError> {
@@ -1678,704 +1599,6 @@ async fn await_prefetch_op(
     }
 }
 
-async fn force_snapshot_now_op(
-    vol_ulid: ulid::Ulid,
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<ForceSnapshotNowReply, IpcError> {
-    use futures::TryStreamExt;
-    use object_store::PutPayload;
-    use object_store::path::Path as StorePath;
-
-    let volume_id = vol_ulid.to_string();
-    let ancestor_dir = data_dir.join("by_id").join(&volume_id);
-    if !ancestor_dir.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found locally: {volume_id}"
-        )));
-    }
-
-    // Step 1: pull every .idx visible in S3 for this volume into
-    // local index/. We deliberately use the LIST-based path here
-    // rather than `prefetch_indexes` — the whole point of
-    // `force_snapshot_now` is to capture *pre-snapshot* bucket state
-    // (segments published since the last manifest, or where no
-    // manifest exists yet), so anchoring on a manifest would defeat
-    // the operation. The retention/ filter is preserved so we don't
-    // round-trip GC-superseded inputs.
-    //
-    // No peer-fetch tier on the IPC pull-readonly path: this code
-    // runs for ad-hoc readonly hydration (e.g. CLI inspect of a
-    // peer's snapshot), not for the per-volume claim flow that owns
-    // the peer-fetch context.
-    let vk = elide_core::signing::load_verifying_key(
-        &ancestor_dir,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
-    elide_coordinator::prefetch::pull_indexes_via_list(store, &ancestor_dir, &volume_id, &vk, None)
-        .await
-        .map_err(|e| IpcError::store(format!("pulling indexes via list: {e:#}")))?;
-
-    // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
-    let index_dir = ancestor_dir.join("index");
-    let mut segments: Vec<ulid::Ulid> = Vec::new();
-    let mut max_seg: Option<ulid::Ulid> = None;
-    let entries = std::fs::read_dir(&index_dir)
-        .map_err(|e| IpcError::internal(format!("reading index dir: {e}")))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| IpcError::internal(format!("reading index entry: {e}")))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(stem) = name.strip_suffix(".idx") else {
-            continue;
-        };
-        if let Ok(u) = ulid::Ulid::from_string(stem) {
-            segments.push(u);
-            if max_seg.is_none_or(|m| u > m) {
-                max_seg = Some(u);
-            }
-        }
-    }
-    // `Ulid::default()` is the nil ULID, not a fresh one — explicitly mint.
-    #[allow(clippy::unwrap_or_default)]
-    let snap = max_seg.unwrap_or_else(ulid::Ulid::new);
-    let snap_str = snap.to_string();
-
-    // Step 3: verify pinned segments still present in S3 before
-    // committing to a manifest. We list rather than HEAD-each because
-    // a single LIST is cheaper than N HEADs once there's more than a
-    // handful of pins.
-    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
-    let pinned: std::collections::HashSet<ulid::Ulid> = segments.iter().copied().collect();
-    let objects = store
-        .list(Some(&seg_prefix))
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|e| IpcError::store(format!("listing segments for verification: {e}")))?;
-    let present: std::collections::HashSet<ulid::Ulid> = objects
-        .iter()
-        .filter_map(|o| o.location.filename())
-        .filter_map(|name| ulid::Ulid::from_string(name).ok())
-        .collect();
-    let mut missing: Vec<ulid::Ulid> = pinned.difference(&present).copied().collect();
-    if !missing.is_empty() {
-        missing.sort();
-        let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();
-        let extra = missing.len().saturating_sub(preview.len());
-        let suffix = if extra > 0 {
-            format!(" (+{extra} more)")
-        } else {
-            String::new()
-        };
-        return Err(IpcError::conflict(format!(
-            "force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
-             (owner GC raced us); missing: [{}]{}",
-            missing.len(),
-            pinned.len(),
-            preview.join(", "),
-            suffix,
-        )));
-    }
-
-    // Step 4: load-or-create the per-source attestation key.
-    let (signer, vk) = elide_core::signing::load_or_create_keypair(
-        &ancestor_dir,
-        elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
-        elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
-    )
-    .map_err(|e| IpcError::internal(format!("attestation keypair: {e}")))?;
-
-    // Step 5: sign + write manifest locally.
-    elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments, None)
-        .map_err(|e| IpcError::internal(format!("writing snapshot manifest: {e}")))?;
-
-    // Step 6: upload the manifest to S3. The manifest's S3 presence
-    // is the snapshot's S3 visibility — no separate marker.
-    let manifest_path = ancestor_dir
-        .join("snapshots")
-        .join(format!("{snap_str}.manifest"));
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .map_err(|e| IpcError::internal(format!("reading just-written manifest: {e}")))?;
-    let manifest_key = elide_coordinator::upload::snapshot_manifest_key(&volume_id, &snap_str)
-        .map_err(|e| IpcError::internal(format!("snapshot_manifest_key: {e}")))?;
-    store
-        .put(&manifest_key, PutPayload::from(manifest_bytes))
-        .await
-        .map_err(|e| IpcError::store(format!("uploading snapshot manifest: {e}")))?;
-
-    info!(
-        "[inbound] attested now-snapshot {snap_str} for {volume_id} ({} segments)",
-        segments.len()
-    );
-    let pubkey_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    Ok(ForceSnapshotNowReply {
-        snap_ulid: snap,
-        attestation_pubkey_hex: pubkey_hex,
-    })
-}
-
-/// Fork an existing source volume into a new writable volume.
-///
-/// Mirrors the CLI's `fork_volume_at*` + by_name symlink + volume.toml write.
-/// `source_ulid` resolves to any volume in `by_id/<ulid>/` — writable,
-/// imported readonly base, or pulled ancestor. `snap` is optional: if
-/// omitted, falls back to `volume::fork_volume` (latest local snapshot).
-/// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
-/// recorded in the new fork's provenance for force-snapshot pins.
-#[allow(clippy::too_many_arguments)]
-/// Classify a pre-existing `by_name/<name>` symlink seen during a
-/// `for_claim` fork-create.
-///
-/// Returns:
-///
-///   - `Some(ulid)` when the symlink target's `by_id/<ulid>/`
-///     directory holds a verified `volume.provenance` whose parent
-///     matches `expected_parent` and `expected_snap` — i.e. it's
-///     exactly what a fresh `fork_create` would mint, the residue
-///     of an aborted prior attempt. The caller reuses it (resume
-///     mode): no new fork minted, no orphan accumulation.
-///
-///   - `None` otherwise: symlink absent, target dir missing,
-///     provenance unverifiable, or lineage doesn't match. The
-///     caller's `for_claim` branch removes the stale link and
-///     mints a fresh fork.
-///
-/// Read-only — never mutates filesystem.
-fn classify_resumable_orphan(
-    symlink: &std::path::Path,
-    by_id_dir: &std::path::Path,
-    expected_parent: ulid::Ulid,
-    expected_snap: Option<ulid::Ulid>,
-) -> Option<ulid::Ulid> {
-    let target = std::fs::read_link(symlink).ok()?;
-    let prev_ulid_str = target.file_name().and_then(|n| n.to_str())?;
-    let prev_ulid = ulid::Ulid::from_string(prev_ulid_str).ok()?;
-    let prev_dir = by_id_dir.join(prev_ulid_str);
-    if !prev_dir.is_dir() {
-        return None;
-    }
-    let lineage = elide_core::signing::read_lineage_verifying_signature(
-        &prev_dir,
-        elide_core::signing::VOLUME_PUB_FILE,
-        elide_core::signing::VOLUME_PROVENANCE_FILE,
-    )
-    .ok()?;
-    let parent = lineage.parent?;
-    let expected_snap = expected_snap?;
-    if parent.volume_ulid == expected_parent.to_string()
-        && parent.snapshot_ulid == expected_snap.to_string()
-    {
-        Some(prev_ulid)
-    } else {
-        None
-    }
-}
-
-// IPC handler: arguments mirror the dispatcher's per-call context.
-// Packing them into a struct would create a one-shot type with no
-// other callers.
-#[allow(clippy::too_many_arguments)]
-async fn fork_create_op(
-    new_name: &str,
-    source_vol_ulid: ulid::Ulid,
-    snap: Option<ulid::Ulid>,
-    parent_key_hex: Option<&str>,
-    for_claim: bool,
-    flags: &[String],
-    // Orchestrator-supplied source name. Used as a fallback when the
-    // source's on-disk `volume.toml` has no `name` field — typically
-    // because the source was pulled from S3 (`pull.rs` writes
-    // `name: None` for pulled ancestors). Without this hint, forks
-    // from a pulled source emit a `Created` journal event instead of
-    // the more useful `ForkedFrom { source_name, ... }`.
-    source_name_hint: Option<&str>,
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    rescan: &Notify,
-    prefetch_tracker: &PrefetchTracker,
-) -> Result<ForkCreateReply, IpcError> {
-    let coord_id = identity.coordinator_id_str();
-    validate_volume_name(new_name).map_err(IpcError::bad_request)?;
-    let source_ulid_str = source_vol_ulid.to_string();
-
-    let parent_key = match parent_key_hex {
-        Some(hex) => {
-            let arr = decode_hex32(hex)
-                .map_err(|e| IpcError::bad_request(format!("bad parent-key: {e}")))?;
-            Some(
-                elide_core::signing::VerifyingKey::from_bytes(&arr).map_err(|e| {
-                    IpcError::bad_request(format!("parent-key not a valid Ed25519 pubkey: {e}"))
-                })?,
-            )
-        }
-        None => None,
-    };
-
-    let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
-    if patch.no_nbd || patch.no_ublk {
-        return Err(IpcError::bad_request(
-            "no-nbd / no-ublk are not valid on fork-create",
-        ));
-    }
-    let nbd_cfg = if let Some(socket) = patch.nbd_socket {
-        Some(elide_core::config::NbdConfig {
-            socket: Some(socket),
-            ..Default::default()
-        })
-    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
-        Some(elide_core::config::NbdConfig {
-            port: patch.nbd_port,
-            bind: patch.nbd_bind,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
-    let ublk_cfg = if patch.ublk || patch.ublk_id.is_some() {
-        Some(elide_core::config::UblkConfig {
-            dev_id: patch.ublk_id,
-        })
-    } else {
-        None
-    };
-
-    let by_name_dir = data_dir.join("by_name");
-    let symlink_path = by_name_dir.join(new_name);
-    let by_id_dir = data_dir.join("by_id");
-    let source_dir = elide_core::volume::resolve_ancestor_dir(&by_id_dir, &source_ulid_str);
-    if !source_dir.exists() {
-        return Err(IpcError::not_found(format!(
-            "source volume {source_ulid_str} not found locally"
-        )));
-    }
-
-    // For_claim mode: a pre-existing `by_name/<name>` symlink may be
-    // the residue of an aborted prior attempt. If its signed
-    // provenance matches the parent + snap we'd be forking from,
-    // resume against it — no new fork minted, no orphan accumulation.
-    // Otherwise, remove the stale link and fall through to the
-    // fresh-fork path. (For `!for_claim`, an existing symlink is
-    // always a hard conflict — that's `volume create --from`'s
-    // contract.)
-    let resume_existing: Option<ulid::Ulid> = if for_claim {
-        classify_resumable_orphan(&symlink_path, &by_id_dir, source_vol_ulid, snap)
-    } else {
-        None
-    };
-    if let Some(prev) = resume_existing {
-        info!("[inbound] fork-create {new_name}: resuming aborted prior attempt at {prev}");
-    } else if symlink_path.exists() {
-        if for_claim {
-            std::fs::remove_file(&symlink_path).map_err(|e| {
-                IpcError::internal(format!("removing stale by_name/{new_name}: {e}"))
-            })?;
-            info!("[inbound] removed stale by_name/{new_name}");
-        } else {
-            return Err(IpcError::conflict(format!(
-                "volume already exists: {new_name}"
-            )));
-        }
-    }
-
-    // `Ulid::default()` is the nil ULID; we need a freshly minted one
-    // when resume isn't in play, so suppress clippy's unwrap_or_default
-    // suggestion explicitly.
-    #[allow(clippy::unwrap_or_default)]
-    let new_vol_ulid_value = resume_existing.unwrap_or_else(ulid::Ulid::new);
-    let new_vol_ulid = new_vol_ulid_value.to_string();
-    let new_fork_dir = by_id_dir.join(&new_vol_ulid);
-
-    // Local rollback helpers. `rollback_claim` is a no-op until
-    // `mark_initial` succeeds (or in the `for-claim` path, where the
-    // bucket record was created by an earlier release and is owned by
-    // the CLI's subsequent `claim` IPC).
-    let cleanup = |fork_dir: &Path, link: &Path| {
-        let _ = std::fs::remove_file(link);
-        let _ = std::fs::remove_dir_all(fork_dir);
-    };
-    let mut name_claimed_in_bucket = false;
-    let rollback_claim = async |claimed: bool| {
-        if !claimed {
-            return;
-        }
-        let key = object_store::path::Path::from(format!("names/{new_name}"));
-        if let Err(e) = store.delete(&key).await {
-            warn!(
-                "[inbound] fork-create {new_name}: local fork failed and \
-                 rollback of names/<name> also failed: {e}"
-            );
-        }
-    };
-
-    // Phases 1 + 2 + 4 are skipped when resuming an aborted prior
-    // attempt: the orphan fork's signed provenance was already
-    // verified by `classify_resumable_orphan`, the volume.pub +
-    // volume.provenance uploads were completed before the orphan
-    // attempt's symlink was created, and `volume.toml` + the
-    // by_name symlink are exactly what they would be on a fresh
-    // mint. The remaining work — bucket-side `mark_claimed`,
-    // `volume.stopped` marker, journal event — runs unconditionally
-    // for the `for_claim` path further down.
-    let (resolved_snap, src_name, size) = if resume_existing.is_none() {
-        // Phase 1: materialise the fork locally. This generates the new
-        // fork's keypair on disk so we can upload `volume.pub` before
-        // touching `names/<name>`.
-        let fork_result: std::io::Result<()> = match (snap, parent_key) {
-            (Some(snap), Some(vk)) => elide_core::volume::fork_volume_at_with_manifest_key(
-                &new_fork_dir,
-                &source_dir,
-                snap,
-                vk,
-            ),
-            (Some(snap), None) => {
-                elide_core::volume::fork_volume_at(&new_fork_dir, &source_dir, snap)
-            }
-            (None, _) => elide_core::volume::fork_volume(&new_fork_dir, &source_dir),
-        };
-        if let Err(e) = fork_result {
-            cleanup(&new_fork_dir, &symlink_path);
-            return Err(IpcError::internal(format!("fork failed: {e}")));
-        }
-
-        // Phase 2: publish volume.pub *and* volume.provenance to S3
-        // *before* claiming the name. Both files are immutable from
-        // fork creation onward and self-signed by the new fork's
-        // keypair. A SIGINT here at worst leaves orphan
-        // `by_id/<new_vol_ulid>/{volume.pub, volume.provenance}` (no
-        // names/<name> references them, so they're harmless and
-        // reclaimable by future GC). Without this ordering, a crash
-        // between mark_initial and the daemon's first metadata-drain
-        // leaves `names/<name>` pointing at a vol_ulid whose
-        // immutable trust artefacts are missing — which breaks both
-        // the normal claim path and the peer-fetch auth pipeline
-        // (lineage walk 404s on volume.provenance).
-        if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(
-            &new_fork_dir,
-            &new_vol_ulid,
-            store,
-        )
-        .await
-        {
-            cleanup(&new_fork_dir, &symlink_path);
-            return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
-        }
-        if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
-            &new_fork_dir,
-            &new_vol_ulid,
-            store,
-        )
-        .await
-        {
-            cleanup(&new_fork_dir, &symlink_path);
-            return Err(IpcError::store(format!(
-                "uploading volume.provenance: {e:#}"
-            )));
-        }
-
-        // Read source volume config for `src_cfg.name` (feeds the
-        // `ForkedFrom` journal entry). Done before the bucket claim
-        // so a malformed source fails cleanly without leaving a
-        // half-claimed name.
-        let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
-            Ok(c) => c,
-            Err(e) => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::internal(format!(
-                    "reading source volume config: {e}"
-                )));
-            }
-        };
-        // Inherited size for the new fork's local `volume.toml`. For a
-        // cross-coordinator claim (`for_claim`) the source is a
-        // pulled ancestor that carries no local `volume.toml` — size
-        // comes from the released NameRecord. For an in-host fork the
-        // source is the live volume, so its local `volume.toml.size`
-        // cache is authoritative.
-        let size = if for_claim {
-            match elide_coordinator::name_store::read_name_record(store, new_name).await {
-                Ok(Some((rec, _))) => rec.size,
-                Ok(None) => {
-                    cleanup(&new_fork_dir, &symlink_path);
-                    return Err(IpcError::not_found(format!(
-                        "claim target name '{new_name}' has no record in bucket"
-                    )));
-                }
-                Err(e) => {
-                    cleanup(&new_fork_dir, &symlink_path);
-                    return Err(IpcError::store(format!(
-                        "reading names/{new_name} for claim: {e}"
-                    )));
-                }
-            }
-        } else {
-            match src_cfg.size {
-                Some(s) => s,
-                None => {
-                    cleanup(&new_fork_dir, &symlink_path);
-                    return Err(IpcError::conflict(
-                        "source volume has no size (import may not have completed)",
-                    ));
-                }
-            }
-        };
-
-        // Snap actually used for the fork. `snap.is_some()` matches
-        // the explicit-pin call sites; otherwise `fork_volume` above
-        // resolved `latest_snapshot(&source_dir)` internally and we
-        // recompute it here so the journal records the same value.
-        // Resolution failure here only suppresses the `ForkedFrom`
-        // event; the lifecycle proceeds with `Created` as a fallback.
-        let resolved_snap = snap.or_else(|| {
-            elide_core::volume::latest_snapshot(&source_dir)
-                .ok()
-                .flatten()
-        });
-
-        // Phase 4 prep: stash the local-config write alongside the
-        // symlink creation below. Doing it here keeps the cleanup
-        // semantics symmetric with the upload failures above.
-        if let Err(e) = (elide_core::config::VolumeConfig {
-            name: Some(new_name.to_owned()),
-            size: Some(size),
-            nbd: nbd_cfg,
-            ublk: ublk_cfg,
-            lazy: None,
-        }
-        .write(&new_fork_dir))
-        {
-            cleanup(&new_fork_dir, &symlink_path);
-            return Err(IpcError::internal(format!("writing volume config: {e}")));
-        }
-
-        let src_name = src_cfg.name.or_else(|| source_name_hint.map(str::to_owned));
-        (resolved_snap, src_name, size)
-    } else {
-        // Resume mode: orphan fork is fully materialised on disk,
-        // volume.pub + volume.provenance are already on S3, and
-        // volume.toml + by_name symlink already exist. We just need
-        // the `resolved_snap` value so the journal event below can
-        // emit a meaningful record. The orphan's own volume.toml
-        // already carries `size` (written when the orphan was
-        // first minted), so re-read it here to seed `mark_initial`.
-        let resolved_snap = snap.or_else(|| {
-            elide_core::volume::latest_snapshot(&source_dir)
-                .ok()
-                .flatten()
-        });
-        let new_fork_cfg = match elide_core::config::VolumeConfig::read(&new_fork_dir) {
-            Ok(c) => c,
-            Err(e) => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::internal(format!(
-                    "reading orphan fork config: {e}"
-                )));
-            }
-        };
-        let size = match new_fork_cfg.size {
-            Some(s) => s,
-            None => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::internal("orphan fork has no size in volume.toml"));
-            }
-        };
-        let src_name = elide_core::config::VolumeConfig::read(&source_dir)
-            .ok()
-            .and_then(|c| c.name)
-            .or_else(|| source_name_hint.map(str::to_owned));
-        (resolved_snap, src_name, size)
-    };
-
-    // Phase 3: for brand-new names, claim in S3. For the
-    // claim-from-released path (`for-claim` flag), the bucket record
-    // already exists as `Released` and the CLI's subsequent `claim`
-    // IPC handles the rebind via `mark_claimed`; the volume.pub we
-    // just uploaded is what makes that rebind safe.
-    if !for_claim {
-        use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-        match mark_initial(
-            store,
-            new_name,
-            coord_id,
-            identity.hostname(),
-            new_vol_ulid_value,
-            size,
-        )
-        .await
-        {
-            Ok(MarkInitialOutcome::Claimed) => {
-                name_claimed_in_bucket = true;
-                // `volume create --from` mints a fork, so the
-                // opening journal entry on the new name is
-                // `ForkedFrom` (not `Created`). Falls back to
-                // `Created` only when fork context cannot be
-                // reconstructed — typically a ULID-only ancestor
-                // with no `name` in its `volume.toml`. Both the
-                // source name and snap have to be present; a
-                // partial `ForkedFrom` would publish a less useful
-                // record than just stating "this name appeared".
-                let kind = match (resolved_snap, src_name.clone()) {
-                    (Some(source_snap_ulid), Some(source_name)) => {
-                        elide_core::volume_event::EventKind::ForkedFrom {
-                            source_name,
-                            source_vol_ulid,
-                            source_snap_ulid,
-                        }
-                    }
-                    _ => {
-                        warn!(
-                            "[inbound] fork-create {new_name}: source \
-                             {source_ulid_str} missing name or snap; emitting \
-                             Created in lieu of ForkedFrom"
-                        );
-                        elide_core::volume_event::EventKind::Created
-                    }
-                };
-                elide_coordinator::volume_event_store::emit_best_effort(
-                    store,
-                    identity.as_ref(),
-                    new_name,
-                    kind,
-                    new_vol_ulid_value,
-                )
-                .await;
-            }
-            Ok(MarkInitialOutcome::AlreadyExists {
-                existing_vol_ulid,
-                existing_state,
-                existing_owner,
-            }) => {
-                cleanup(&new_fork_dir, &symlink_path);
-                let owner = existing_owner.as_deref().unwrap_or("<unowned>");
-                return Err(IpcError::conflict(format!(
-                    "name '{new_name}' already exists in bucket \
-                     (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
-                     owner={owner})"
-                )));
-            }
-            Err(LifecycleError::Store(e)) => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::store(format!("claiming name in bucket: {e}")));
-            }
-            Err(LifecycleError::OwnershipConflict { held_by }) => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::conflict(format!(
-                    "name held by another coordinator: {held_by}"
-                )));
-            }
-            Err(LifecycleError::InvalidTransition { from, .. }) => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::conflict(format!(
-                    "names/<name> is in unexpected state {from:?}"
-                )));
-            }
-        }
-    }
-
-    // Phase 4: by_name/<name> symlink (volume.toml was written
-    // earlier as part of the fresh-fork phases, before mark_initial,
-    // so a Phase-3 failure didn't leave a half-written config).
-    // Resume mode skips this — the orphan attempt's symlink already
-    // points at the same ULID.
-    if resume_existing.is_none() {
-        if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
-            cleanup(&new_fork_dir, &symlink_path);
-            rollback_claim(name_claimed_in_bucket).await;
-            return Err(IpcError::internal(format!("creating by_name dir: {e}")));
-        }
-        if let Err(e) =
-            std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path)
-        {
-            cleanup(&new_fork_dir, &symlink_path);
-            rollback_claim(name_claimed_in_bucket).await;
-            return Err(IpcError::internal(format!("creating by_name symlink: {e}")));
-        }
-    }
-
-    // For-claim post-work: write `volume.stopped` and atomically
-    // rebind `names/<name>` to the new (or resumed) fork via
-    // `mark_claimed`. Subsumes the previous `RebindName` IPC: the
-    // claim flow is now one round-trip from the CLI, and the
-    // CLI no longer touches root-owned filesystem state.
-    if for_claim {
-        // Idempotent on resume — file may already exist from an
-        // earlier successful rebind that the CLI never observed.
-        if let Err(e) = std::fs::write(new_fork_dir.join(STOPPED_FILE), "") {
-            return Err(IpcError::internal(format!(
-                "writing volume.stopped on new fork: {e}"
-            )));
-        }
-
-        use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
-        use elide_core::name_record::NameState;
-        match mark_claimed(
-            store,
-            new_name,
-            coord_id,
-            identity.hostname(),
-            new_vol_ulid_value,
-            NameState::Stopped,
-        )
-        .await
-        {
-            Ok(MarkClaimedOutcome::Claimed) => {
-                info!("[inbound] rebound name {new_name} to new fork {new_vol_ulid} (stopped)");
-                elide_coordinator::volume_event_store::emit_best_effort(
-                    store,
-                    identity.as_ref(),
-                    new_name,
-                    elide_core::volume_event::EventKind::Claimed,
-                    new_vol_ulid_value,
-                )
-                .await;
-            }
-            Ok(MarkClaimedOutcome::Absent) => {
-                return Err(IpcError::not_found(format!(
-                    "names/{new_name} does not exist; nothing to claim"
-                )));
-            }
-            Ok(MarkClaimedOutcome::NotReleased { observed }) => {
-                return Err(IpcError::conflict(format!(
-                    "names/{new_name} is in state {observed:?}, not Released; cannot claim"
-                )));
-            }
-            Err(LifecycleError::Store(e)) => {
-                return Err(IpcError::store(format!("claim failed: {e}")));
-            }
-            Err(LifecycleError::OwnershipConflict { held_by }) => {
-                return Err(IpcError::precondition_failed(format!(
-                    "name '{new_name}' raced with another claim ({held_by} won); \
-                     your local fork at {new_vol_ulid} can be re-purposed manually"
-                )));
-            }
-            Err(LifecycleError::InvalidTransition { from, .. }) => {
-                return Err(IpcError::conflict(format!(
-                    "names/{new_name} is in state {from:?}; cannot claim"
-                )));
-            }
-        }
-    }
-
-    // Pre-register the prefetch tracker entry before notifying the daemon's
-    // discovery loop. This closes the race where the CLI's
-    // `await-prefetch <new_vol_ulid>` (called immediately after this IPC
-    // returns) could land before the daemon has discovered the new fork
-    // and registered the entry — in which case `await-prefetch` would
-    // hit the "untracked → ok" path and falsely report prefetch complete.
-    // `register_prefetch_or_get` is idempotent: when discovery later runs,
-    // it gets back the same `Arc<Sender>` and passes it to
-    // `run_volume_tasks`. Drop the local Arc immediately; the tracker
-    // holds the entry until the per-fork task's Drop guard removes it.
-    let _ = register_prefetch_or_get(prefetch_tracker, new_vol_ulid_value);
-
-    rescan.notify_one();
-    info!("[inbound] forked volume {new_name} ({new_vol_ulid}) from {source_ulid_str}");
-    Ok(ForkCreateReply {
-        new_vol_ulid: new_vol_ulid_value,
-    })
-}
-
 // ── Volume stop / start ───────────────────────────────────────────────────────
 
 /// True if `<data_dir>/by_name/<name>` resolves to a fork with a live
@@ -2387,7 +1610,7 @@ async fn fork_create_op(
 /// on-disk state diverging from the bucket record. A `Released` or
 /// `StoppedManual` fork is parked (no daemon, supervisor refuses to
 /// relaunch) so it is not "running" for these checks.
-fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
+pub(crate) fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
     use elide_coordinator::volume_state::VolumeLifecycle;
     let link = data_dir.join("by_name").join(volume_name);
     match std::fs::canonicalize(&link) {
@@ -2503,7 +1726,7 @@ async fn stop_volume_op(
 /// panic), and on failure paths the `volume.stopped` marker is
 /// re-written so the volume returns to its pre-release state instead
 /// of being left running.
-struct DrainingMarkerGuard {
+pub(crate) struct DrainingMarkerGuard {
     vol_dir: std::path::PathBuf,
     /// Set to `true` once the release has reached a point where the
     /// caller has explicitly written `volume.stopped` (i.e. the
@@ -2514,7 +1737,7 @@ struct DrainingMarkerGuard {
 }
 
 impl DrainingMarkerGuard {
-    fn new(vol_dir: std::path::PathBuf) -> Self {
+    pub(crate) fn new(vol_dir: std::path::PathBuf) -> Self {
         Self {
             vol_dir,
             success: false,
@@ -2524,7 +1747,7 @@ impl DrainingMarkerGuard {
     /// Mark the release as having reached its own halt step — at this
     /// point `volume.stopped` is back in place via the normal path
     /// and we should *not* re-write it on drop.
-    fn defuse(&mut self) {
+    pub(crate) fn defuse(&mut self) {
         self.success = true;
     }
 }
@@ -2582,7 +1805,7 @@ impl Drop for DrainingMarkerGuard {
 /// window where the file exists but no listener is attached, so
 /// `connect()` returns `ECONNREFUSED`. We probe the connection itself
 /// and treat that as the readiness signal.
-async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> bool {
+pub(crate) async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> bool {
     let socket = vol_dir.join("control.sock");
     let deadline = std::time::Instant::now() + timeout;
     let probe_step = std::time::Duration::from_millis(50);
@@ -2801,16 +2024,16 @@ async fn force_release_volume_op(
 /// 2. **Slow path** (WAL non-empty / pending uploads / GC handoffs /
 ///    new segments since last snapshot): bring the daemon up in
 ///    drain mode, run the existing snapshot pipeline, halt, flip.
-#[allow(clippy::too_many_arguments)]
 async fn release_volume_op(
     volume_name: &str,
-    data_dir: &Path,
-    snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    rescan: &Notify,
+    ctx: &IpcContext,
 ) -> Result<ReleaseReply, IpcError> {
+    let identity = &ctx.identity;
+    let data_dir: &Path = &ctx.data_dir;
+    let snapshot_locks = &ctx.snapshot_locks;
+    let part_size_bytes = ctx.part_size_bytes;
+    let rescan: &Notify = &ctx.rescan;
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
@@ -3208,143 +2431,6 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
 /// The result always leaves the volume `Stopped` (no daemon launched).
 /// The CLI calls `start` afterwards if `volume start --claim` was the
 /// composed flow.
-async fn claim_volume_bucket_op(
-    volume_name: &str,
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-) -> Result<ClaimReply, IpcError> {
-    let coord_id = identity.coordinator_id_str();
-    use elide_core::name_record::NameState;
-
-    // Claim always lands the volume in `Stopped`. A running local
-    // daemon contradicts that — refuse and point the operator at
-    // `volume stop` first.
-    if local_daemon_running(data_dir, volume_name) {
-        return Err(IpcError::conflict(format!(
-            "volume '{volume_name}' is running on this host; \
-             stop it first with: elide volume stop {volume_name}"
-        )));
-    }
-
-    let record_opt = elide_coordinator::name_store::read_name_record(store, volume_name)
-        .await
-        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
-
-    let (record, _version) = record_opt.ok_or_else(|| {
-        IpcError::not_found(format!(
-            "name '{volume_name}' has no S3 record; nothing to claim"
-        ))
-    })?;
-
-    match record.state {
-        NameState::Released => {
-            // Determine whether we hold a matching local fork.
-            let link = data_dir.join("by_name").join(volume_name);
-            let local_vol_ulid = match std::fs::canonicalize(&link) {
-                Ok(p) => p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| ulid::Ulid::from_string(s).ok()),
-                Err(_) => None,
-            };
-
-            if local_vol_ulid == Some(record.vol_ulid) {
-                use elide_coordinator::lifecycle::{
-                    LifecycleError, MarkReclaimedLocalOutcome, mark_reclaimed_local,
-                };
-                match mark_reclaimed_local(
-                    store,
-                    volume_name,
-                    coord_id,
-                    identity.hostname(),
-                    record.vol_ulid,
-                    NameState::Stopped,
-                )
-                .await
-                {
-                    Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
-                        info!(
-                            "[inbound] reclaimed {volume_name} in place (vol_ulid {})",
-                            record.vol_ulid
-                        );
-                        // Best-effort: drop the display-only marker now
-                        // that the bucket record is no longer Released.
-                        if let Ok(vol_dir) = std::fs::canonicalize(&link)
-                            && let Err(e) = clear_released_marker(&vol_dir)
-                        {
-                            warn!(
-                                "[inbound] reclaim {volume_name}: clearing \
-                                 volume.released marker: {e}"
-                            );
-                        }
-                        elide_coordinator::volume_event_store::emit_best_effort(
-                            store,
-                            identity.as_ref(),
-                            volume_name,
-                            elide_core::volume_event::EventKind::Claimed,
-                            record.vol_ulid,
-                        )
-                        .await;
-                        Ok(ClaimReply::Reclaimed)
-                    }
-                    Ok(MarkReclaimedLocalOutcome::Absent) => Err(IpcError::precondition_failed(
-                        format!("names/{volume_name} vanished between read and reclaim"),
-                    )),
-                    Ok(MarkReclaimedLocalOutcome::NotReleased { observed_state, .. }) => {
-                        Err(IpcError::precondition_failed(format!(
-                            "names/{volume_name} changed underneath us; now in state \
-                             {observed_state:?}"
-                        )))
-                    }
-                    Ok(MarkReclaimedLocalOutcome::ForkMismatch {
-                        released_vol_ulid, ..
-                    }) => {
-                        // Race: someone rebound between our read and write.
-                        // Surface as MustClaimFresh routing — same shape as
-                        // the foreign-content path below.
-                        Ok(ClaimReply::MustClaimFresh {
-                            released_vol_ulid,
-                            handoff_snapshot: record.handoff_snapshot,
-                        })
-                    }
-                    Err(LifecycleError::Store(e)) => {
-                        Err(IpcError::store(format!("reclaim failed: {e}")))
-                    }
-                    Err(LifecycleError::OwnershipConflict { .. })
-                    | Err(LifecycleError::InvalidTransition { .. }) => Err(IpcError::conflict(
-                        format!("in-place reclaim of {volume_name} refused"),
-                    )),
-                }
-            } else {
-                // Foreign content — CLI must orchestrate the claim.
-                Ok(ClaimReply::MustClaimFresh {
-                    released_vol_ulid: record.vol_ulid,
-                    handoff_snapshot: record.handoff_snapshot,
-                })
-            }
-        }
-        NameState::Live | NameState::Stopped => match record.coordinator_id.as_deref() {
-            Some(owner) if owner == coord_id => {
-                // Already ours — nothing to claim.
-                Err(IpcError::conflict(format!(
-                    "name '{volume_name}' is already held by this coordinator"
-                )))
-            }
-            Some(owner) => Err(IpcError::conflict(format!(
-                "name '{volume_name}' is held by coordinator {owner}"
-            ))),
-            None => Err(IpcError::internal(format!(
-                "name '{volume_name}' has no coordinator_id (malformed record)"
-            ))),
-        },
-        NameState::Readonly => Err(IpcError::conflict(format!(
-            "name '{volume_name}' is readonly (immutable handle); \
-             pull it with `volume pull` to serve locally"
-        ))),
-    }
-}
-
 async fn start_volume_op(
     volume_name: &str,
     data_dir: &Path,
@@ -3547,285 +2633,6 @@ fn issue_credentials(
     })
 }
 
-// ── Fork orchestrator (consolidated `fork-start` / `fork-attach`) ────────────
-
-/// Register a fork job and spawn the orchestrator task.
-///
-/// Returns immediately once the job is in the registry; the actual
-/// chain pull / snapshot / fork-create / prefetch flow runs in the
-/// background. Errors here are synchronous validation failures
-/// (duplicate name in flight, bad inputs); orchestrator errors are
-/// surfaced via `attach_fork` instead.
-fn start_fork(
-    new_name: String,
-    from: ForkSource,
-    force_snapshot: bool,
-    flags: Vec<String>,
-    ctx: IpcContext,
-) -> Result<ForkStartReply, IpcError> {
-    {
-        let mut reg = ctx.fork_registry.lock().expect("fork registry poisoned");
-        if let Some(job) = reg.get(&new_name)
-            && matches!(job.state(), ForkJobState::Running)
-        {
-            return Err(IpcError::conflict(format!(
-                "fork '{new_name}' is already in progress"
-            )));
-        }
-        reg.insert(new_name.clone(), ForkJob::new());
-    }
-
-    let job = {
-        let reg = ctx.fork_registry.lock().expect("fork registry poisoned");
-        reg.get(&new_name).cloned().expect("just inserted")
-    };
-
-    tokio::spawn(async move {
-        let outcome = run_fork_job(job.clone(), new_name, from, force_snapshot, flags, ctx).await;
-        match outcome {
-            Ok(()) => {
-                job.append(ForkAttachEvent::Done);
-                job.finish(ForkJobState::Done);
-            }
-            Err(e) => job.finish(ForkJobState::Failed(e)),
-        }
-    });
-
-    Ok(ForkStartReply::default())
-}
-
-/// Drive one fork-job to completion. Pushes per-stage events into
-/// `job` so an attached subscriber sees progress in real time.
-async fn run_fork_job(
-    job: Arc<ForkJob>,
-    new_name: String,
-    from: ForkSource,
-    force_snapshot: bool,
-    flags: Vec<String>,
-    ctx: IpcContext,
-) -> Result<(), IpcError> {
-    use elide_core::volume;
-
-    let by_id_dir = ctx.data_dir.join("by_id");
-
-    // Step 1: resolve `from` to (source_vol_ulid, optional source_name,
-    // optional pre-pinned snap). Pulls the chain when the source isn't
-    // already local.
-    let (source_vol_ulid, source_name, snap_hint): (
-        ulid::Ulid,
-        Option<String>,
-        Option<ulid::Ulid>,
-    ) = match &from {
-        ForkSource::Pinned {
-            vol_ulid,
-            snap_ulid,
-        } => (*vol_ulid, None, Some(*snap_ulid)),
-        ForkSource::BareUlid { vol_ulid } => (*vol_ulid, None, None),
-        ForkSource::Name { name } => {
-            let local = ctx.data_dir.join("by_name").join(name);
-            if local.exists() {
-                let canon = std::fs::canonicalize(&local)
-                    .map_err(|e| IpcError::internal(format!("canonicalize by_name/{name}: {e}")))?;
-                let ulid_str = canon
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or_else(|| IpcError::internal("by_name link has non-utf8 target"))?;
-                let vol_ulid = ulid::Ulid::from_string(ulid_str).map_err(|e| {
-                    IpcError::internal(format!(
-                        "by_name/{name} target {ulid_str:?} not a ULID: {e}"
-                    ))
-                })?;
-                (vol_ulid, Some(name.clone()), None)
-            } else {
-                job.append(ForkAttachEvent::ResolvingName { name: name.clone() });
-                let store = ctx.stores.coordinator_wide();
-                let reply = resolve_name_op(name, &store).await?;
-                (reply.vol_ulid, Some(name.clone()), None)
-            }
-        }
-    };
-
-    // Step 2: walk the ancestor chain, pulling each missing entry.
-    let mut next: Option<ulid::Ulid> = Some(source_vol_ulid);
-    while let Some(vol_ulid) = next.take() {
-        let dir = volume::resolve_ancestor_dir(&by_id_dir, &vol_ulid.to_string());
-        if dir.exists() {
-            break;
-        }
-        job.append(ForkAttachEvent::PullingAncestor { vol_ulid });
-        let store = ctx.stores.for_volume(&vol_ulid);
-        // Fork orchestrator is the `volume create --from` path — there's
-        // no released ancestor to claim, so peer-fetch can't authenticate
-        // (no `names/<volume>` rebind to anchor against). S3-only here.
-        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store, None).await?;
-        next = reply.parent;
-    }
-
-    let source_ulid_str = source_vol_ulid.to_string();
-    let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &source_ulid_str);
-    if !source_dir.exists() {
-        return Err(IpcError::not_found(format!(
-            "source volume {source_ulid_str} not found in remote store"
-        )));
-    }
-    if source_dir.join(IMPORTING_FILE).exists() {
-        return Err(IpcError::conflict(format!(
-            "source '{source_ulid_str}' is still importing; wait for import to complete"
-        )));
-    }
-
-    // Step 3: decide which snapshot the fork pins to.
-    let mut parent_key_hex: Option<String> = None;
-    let snap_ulid: Option<ulid::Ulid> = if let Some(snap) = snap_hint {
-        // Pinned source already names the snapshot.
-        Some(snap)
-    } else if source_dir.join("volume.readonly").exists() {
-        if force_snapshot {
-            let store = ctx.stores.coordinator_wide();
-            let reply = force_snapshot_now_op(source_vol_ulid, &ctx.data_dir, &store).await?;
-            parent_key_hex = Some(reply.attestation_pubkey_hex.clone());
-            job.append(ForkAttachEvent::AttestedSnapshot {
-                snap_ulid: reply.snap_ulid,
-                pubkey_hex: reply.attestation_pubkey_hex,
-            });
-            Some(reply.snap_ulid)
-        } else if let Some(snap) = volume::latest_snapshot(&source_dir)
-            .map_err(|e| IpcError::internal(format!("reading local snapshots: {e}")))?
-        {
-            Some(snap)
-        } else {
-            let store = ctx.stores.for_volume(&source_vol_ulid);
-            match latest_snapshot_op(source_vol_ulid, &store)
-                .await?
-                .snapshot_ulid
-            {
-                Some(snap) => Some(snap),
-                None => {
-                    return Err(IpcError::not_found(format!(
-                        "source volume {source_ulid_str} has no snapshots; pass \
-                         force_snapshot=true to upload a new 'now' marker"
-                    )));
-                }
-            }
-        }
-    } else {
-        // Writable source: take an implicit snapshot. Need the
-        // source's name to drive `snapshot_volume`; for `BareUlid` we
-        // read it out of `volume.toml`.
-        let name = if let Some(n) = source_name.clone() {
-            n
-        } else {
-            elide_core::config::VolumeConfig::read(&source_dir)
-                .map_err(|e| IpcError::internal(format!("read volume.toml: {e}")))?
-                .name
-                .ok_or_else(|| IpcError::internal("source volume has no name in volume.toml"))?
-        };
-
-        // If the source is stopped, transparently bring its daemon up
-        // in transport-suppressed mode so we can drive the implicit
-        // snapshot. The `DrainingMarkerGuard` re-writes
-        // `volume.stopped` and shuts the daemon down on any failure
-        // path; the success path defuses the guard and halts
-        // explicitly so the volume returns to its pre-fork state.
-        let was_stopped = source_dir.join(STOPPED_FILE).exists();
-        let mut draining_guard: Option<DrainingMarkerGuard> = None;
-        if was_stopped {
-            std::fs::write(source_dir.join("volume.draining"), "")
-                .map_err(|e| IpcError::internal(format!("writing volume.draining: {e}")))?;
-            if let Err(e) = std::fs::remove_file(source_dir.join(STOPPED_FILE)) {
-                let _ = std::fs::remove_file(source_dir.join("volume.draining"));
-                return Err(IpcError::internal(format!(
-                    "clearing volume.stopped for fork drain: {e}"
-                )));
-            }
-            ctx.rescan.notify_one();
-            draining_guard = Some(DrainingMarkerGuard::new(source_dir.clone()));
-            if !wait_for_control_sock(&source_dir, std::time::Duration::from_secs(30)).await {
-                return Err(IpcError::internal(format!(
-                    "timed out waiting for source volume '{name}' to come up for fork drain"
-                )));
-            }
-        }
-
-        let store = ctx.stores.coordinator_wide();
-        let reply = snapshot_volume(
-            &name,
-            &ctx.data_dir,
-            &ctx.snapshot_locks,
-            &store,
-            ctx.part_size_bytes,
-        )
-        .await?;
-        job.append(ForkAttachEvent::SnapshotTaken {
-            snap_ulid: reply.snap_ulid,
-        });
-
-        // Snapshot succeeded: restore the source to `Stopped` if we
-        // brought it up. Defuse the guard so it doesn't fight the
-        // explicit halt; write the marker before shutdown so the
-        // supervisor won't respawn between exit and our final state.
-        if was_stopped {
-            if let Some(g) = draining_guard.as_mut() {
-                g.defuse();
-            }
-            std::fs::write(source_dir.join(STOPPED_FILE), "").map_err(|e| {
-                IpcError::internal(format!("restoring volume.stopped after fork drain: {e}"))
-            })?;
-            use elide_coordinator::control::ShutdownOutcome;
-            match elide_coordinator::control::shutdown(&source_dir).await {
-                ShutdownOutcome::Acknowledged | ShutdownOutcome::NotRunning => {}
-                ShutdownOutcome::Failed(msg) => {
-                    warn!(
-                        "[fork {name}] post-drain shutdown of source daemon failed: {msg}; \
-                         supervisor will respect volume.stopped marker"
-                    );
-                }
-            }
-        }
-        Some(reply.snap_ulid)
-    };
-
-    // Step 4: mint the fork.
-    job.append(ForkAttachEvent::ForkingFrom {
-        source_vol_ulid,
-        snap_ulid,
-    });
-    let store = ctx.stores.coordinator_wide();
-    let reply = fork_create_op(
-        &new_name,
-        source_vol_ulid,
-        snap_ulid,
-        parent_key_hex.as_deref(),
-        false,
-        &flags,
-        // For a `Name` source the orchestrator already knows the
-        // user-facing name; pass it as a hint so a pulled source
-        // (whose `volume.toml` lacks `name`) still produces a
-        // `ForkedFrom` journal event instead of falling back to
-        // `Created`. ULID-only sources (`BareUlid` / `Pinned`) have
-        // no orchestrator-known name and rely on `src_cfg.name`.
-        source_name.as_deref(),
-        &ctx.data_dir,
-        &store,
-        &ctx.identity,
-        &ctx.rescan,
-        &ctx.prefetch_tracker,
-    )
-    .await?;
-    job.append(ForkAttachEvent::ForkCreated {
-        new_vol_ulid: reply.new_vol_ulid,
-    });
-
-    // Step 5: surface the coordinator's background prefetch. The fork
-    // is already durable above; prefetch failure here is non-fatal —
-    // the volume opens regardless and `volume start` re-awaits.
-    job.append(ForkAttachEvent::PrefetchStarted);
-    let _ = await_prefetch_op(reply.new_vol_ulid, &ctx.prefetch_tracker).await;
-    job.append(ForkAttachEvent::PrefetchDone);
-
-    Ok(())
-}
-
 /// Stream buffered and live fork events to `writer` as a sequence of
 /// [`Envelope<ForkAttachEvent>`] messages, terminating with either
 /// `ForkAttachEvent::Done` (success) or `Envelope::Err` (failure).
@@ -3870,582 +2677,6 @@ async fn stream_fork_by_name(new_name: &str, writer: &mut OwnedWriteHalf, regist
             }
         }
     }
-}
-
-// ── Claim orchestrator (consolidated `claim-start` / `claim-attach`) ────────
-
-/// Run the bucket-side claim synchronously and either return
-/// `Reclaimed` (no further work) or register a job and spawn the
-/// foreign-claim orchestrator. Returns immediately in both branches —
-/// `Claiming` callers subscribe via `claim-attach` to stream progress.
-async fn start_claim(volume: String, ctx: IpcContext) -> Result<ClaimStartReply, IpcError> {
-    let store = ctx.stores.coordinator_wide();
-    let bucket_started = std::time::Instant::now();
-    let bucket = claim_volume_bucket_op(&volume, &ctx.data_dir, &store, &ctx.identity).await?;
-    info!(
-        "[claim {volume}] bucket-side claim resolved in {:.2?}",
-        bucket_started.elapsed()
-    );
-    match bucket {
-        ClaimReply::Reclaimed => Ok(ClaimStartReply::Reclaimed),
-        ClaimReply::MustClaimFresh {
-            released_vol_ulid,
-            handoff_snapshot,
-        } => {
-            let snap = handoff_snapshot.ok_or_else(|| {
-                IpcError::not_found(format!(
-                    "name '{volume}' is Released but has no handoff snapshot — \
-                     manual recovery required (see docs/operations.md)"
-                ))
-            })?;
-
-            {
-                let mut reg = ctx.claim_registry.lock().expect("claim registry poisoned");
-                if let Some(job) = reg.get(&volume)
-                    && matches!(job.state(), ClaimJobState::Running)
-                {
-                    return Err(IpcError::conflict(format!(
-                        "claim for '{volume}' is already in progress"
-                    )));
-                }
-                reg.insert(volume.clone(), ClaimJob::new());
-            }
-            let job = ctx
-                .claim_registry
-                .lock()
-                .expect("claim registry poisoned")
-                .get(&volume)
-                .cloned()
-                .expect("just inserted");
-
-            tokio::spawn(async move {
-                let outcome =
-                    run_claim_job(job.clone(), volume, released_vol_ulid, snap, ctx).await;
-                match outcome {
-                    Ok(()) => {
-                        job.append(ClaimAttachEvent::Done);
-                        job.finish(ClaimJobState::Done);
-                    }
-                    Err(e) => job.finish(ClaimJobState::Failed(e)),
-                }
-            });
-
-            Ok(ClaimStartReply::Claiming { released_vol_ulid })
-        }
-    }
-}
-
-/// Walk back through empty intermediate forks and return the
-/// deepest non-empty ancestor as the source we should hand to
-/// `fork_create_op`.
-///
-/// Each iteration:
-///   1. Read the current effective fork's signed `volume.provenance`
-///      to find its `parent` ref.
-///   2. Fetch and verify its handoff manifest from S3.
-///   3. If `max(segment_ulids) < parent.snapshot_ulid`, the fork
-///      produced no writes of its own (every segment is inherited)
-///      — advance to its parent and loop.
-///   4. Otherwise, stop.
-///
-/// On loop advance, also pulls the parent's directory locally if
-/// not already present — chain-pull in step 1 of `run_claim_job`
-/// stops at the first existing dir, but the skip walk may need to
-/// reach further back.
-///
-/// Returns `(source_vol_ulid, snapshot_ulid, parent_key_hex)` ready
-/// to pass to `fork_create_op`. `parent_key_hex` is the
-/// manifest_pubkey override carried in the chosen ancestor
-/// reference (Some only for ancestors whose snapshot was a recovery
-/// snapshot).
-#[allow(clippy::too_many_arguments)]
-async fn skip_empty_intermediates(
-    job: &Arc<ClaimJob>,
-    volume: &str,
-    released_vol_ulid: ulid::Ulid,
-    handoff_snap: ulid::Ulid,
-    initial_parent_key_hex: Option<String>,
-    data_dir: &Path,
-    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
-    peer: Option<&elide_coordinator::prefetch::PeerFetchContext>,
-    guard: &mut PulledAncestorsGuard,
-) -> Result<(ulid::Ulid, ulid::Ulid, Option<String>), IpcError> {
-    use elide_core::signing::{
-        VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, encode_hex, load_verifying_key,
-        read_lineage_verifying_signature,
-    };
-    use elide_core::volume;
-
-    let by_id_dir = data_dir.join("by_id");
-
-    let mut effective_vol = released_vol_ulid;
-    let mut effective_snap = handoff_snap;
-    let mut effective_parent_key_hex = initial_parent_key_hex;
-
-    loop {
-        let dir = volume::resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
-        let lineage =
-            read_lineage_verifying_signature(&dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
-                .map_err(|e| {
-                    IpcError::internal(format!("reading provenance for {effective_vol}: {e}"))
-                })?;
-        let Some(parent) = lineage.parent else {
-            // Root volume — nothing to skip to.
-            break;
-        };
-        let parent_vol_ulid = ulid::Ulid::from_string(&parent.volume_ulid).map_err(|e| {
-            IpcError::internal(format!(
-                "malformed parent volume_ulid in {effective_vol}: {e}"
-            ))
-        })?;
-        let parent_snap_ulid = ulid::Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
-            IpcError::internal(format!(
-                "malformed parent snapshot_ulid in {effective_vol}: {e}"
-            ))
-        })?;
-
-        // Verify and read this fork's handoff manifest. The fallback
-        // pubkey for a non-recovery manifest is the fork's own
-        // `volume.pub` on disk; recovery manifests are auto-resolved
-        // by the helper.
-        let fallback_pubkey = load_verifying_key(&dir, VOLUME_PUB_FILE).map_err(|e| {
-            IpcError::internal(format!("loading volume.pub for {effective_vol}: {e}"))
-        })?;
-
-        let store = stores.for_volume(&effective_vol);
-        let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
-            &store,
-            effective_vol,
-            effective_snap,
-            &fallback_pubkey,
-            peer,
-        )
-        .await
-        .map_err(|e| {
-            IpcError::internal(format!(
-                "fetching handoff manifest {effective_vol}/{effective_snap}: {e}"
-            ))
-        })?;
-
-        let is_empty = manifest
-            .segment_ulids
-            .last()
-            .is_none_or(|m| *m < parent_snap_ulid);
-        if !is_empty {
-            break;
-        }
-
-        // Advance to parent. Pull it locally if not already there —
-        // step 1 of `run_claim_job` may not have reached this far
-        // back in the chain. Register the pull with the guard so a
-        // downstream verification failure cleans it up.
-        let parent_dir = volume::resolve_ancestor_dir(&by_id_dir, &parent.volume_ulid);
-        if !parent_dir.exists() {
-            job.append(ClaimAttachEvent::PullingAncestor {
-                vol_ulid: parent_vol_ulid,
-            });
-            let parent_store = stores.for_volume(&parent_vol_ulid);
-            guard.record(parent_vol_ulid);
-            let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store, peer).await?;
-        }
-
-        info!(
-            "[claim {volume}] skipping empty intermediate {effective_vol}; \
-             using {parent_vol_ulid}/{parent_snap_ulid}"
-        );
-
-        effective_vol = parent_vol_ulid;
-        effective_snap = parent_snap_ulid;
-        effective_parent_key_hex = parent.manifest_pubkey.map(|k| encode_hex(&k));
-    }
-
-    Ok((effective_vol, effective_snap, effective_parent_key_hex))
-}
-
-/// Stage 1 of the claim flow: mint a fresh fork ULID + keypair, upload
-/// `volume.pub` to S3, and `mark_claimed` to rebind `names/<volume>`
-/// to this coordinator. After this returns the bucket says we own the
-/// name, peer-fetch auth accepts our coord_id for the chain walk that
-/// follows, and the local fork dir holds `volume.{key,pub}` only —
-/// crucially **no `wal/`, no `pending/`, no `index/`**, so the daemon's
-/// discovery loop won't pick the partial fork up and try to open it
-/// before [`finalize_claim_fork`] writes the provenance.
-///
-/// Crash semantics. If the coordinator dies between this returning and
-/// `finalize_claim_fork`'s `volume.provenance` upload, the bucket
-/// points at a fork that has a pubkey but no provenance. The fork is
-/// unmountable but recoverable: `volume release --force` treats a
-/// missing provenance as a crashed-during-create empty fork (its
-/// `recovery::list_and_verify_segments` finds zero segments and
-/// publishes an empty synthesised handoff manifest). After force-
-/// release, a fresh `claim` mints a new vol_ulid and proceeds.
-async fn early_rebind_for_claim(
-    volume: &str,
-    ctx: &IpcContext,
-) -> Result<(ulid::Ulid, std::path::PathBuf, ed25519_dalek::SigningKey), IpcError> {
-    use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
-    use elide_core::name_record::NameState;
-    use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PUB_FILE, generate_keypair};
-
-    let new_vol_ulid = ulid::Ulid::new();
-    let new_vol_ulid_str = new_vol_ulid.to_string();
-    let new_fork_dir = ctx.data_dir.join("by_id").join(&new_vol_ulid_str);
-
-    // Bare dir + keypair only. No wal/, no pending/, no index/ — daemon
-    // discovery requires one of those to consider a dir a volume, so
-    // this skeleton stays invisible to the supervisor until
-    // `finalize_claim_fork` adds them.
-    std::fs::create_dir_all(&new_fork_dir)
-        .map_err(|e| IpcError::internal(format!("creating fork dir: {e}")))?;
-    let signing_key = generate_keypair(&new_fork_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
-        .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
-
-    // Upload volume.pub to S3 so peer-fetch ancestry walks (which read
-    // `by_id/<id>/volume.pub` to verify our parent provenance) and
-    // future claimants doing release --force on a stuck fork have the
-    // file they expect.
-    let store = ctx.stores.for_volume(&new_vol_ulid);
-    elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vol_ulid_str, &store)
-        .await
-        .map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
-
-    // Bucket rebind. Peer-fetch auth accepts our coord_id from this
-    // point onward.
-    let store_wide = ctx.stores.coordinator_wide();
-    match mark_claimed(
-        &store_wide,
-        volume,
-        &ctx.coord_id,
-        ctx.identity.hostname(),
-        new_vol_ulid,
-        NameState::Stopped,
-    )
-    .await
-    {
-        Ok(MarkClaimedOutcome::Claimed) => {
-            info!(
-                "[claim {volume}] early-rebind: bucket → {new_vol_ulid_str} \
-                 (provenance pending)"
-            );
-            elide_coordinator::volume_event_store::emit_best_effort(
-                &store_wide,
-                ctx.identity.as_ref(),
-                volume,
-                elide_core::volume_event::EventKind::Claimed,
-                new_vol_ulid,
-            )
-            .await;
-            Ok((new_vol_ulid, new_fork_dir, signing_key))
-        }
-        Ok(MarkClaimedOutcome::Absent) => Err(IpcError::not_found(format!(
-            "names/{volume} disappeared between bucket-side claim and rebind"
-        ))),
-        Ok(MarkClaimedOutcome::NotReleased { observed }) => Err(IpcError::conflict(format!(
-            "names/{volume} changed underneath us; now in state {observed:?}"
-        ))),
-        Err(LifecycleError::Store(e)) => Err(IpcError::store(format!("rebind failed: {e}"))),
-        Err(LifecycleError::OwnershipConflict { held_by }) => Err(IpcError::precondition_failed(
-            format!("name '{volume}' raced with another claim ({held_by} won)"),
-        )),
-        Err(LifecycleError::InvalidTransition { from, .. }) => Err(IpcError::conflict(format!(
-            "names/{volume} is in unexpected state {from:?}"
-        ))),
-    }
-}
-
-/// Stage 2 of the claim flow: now that ancestor verification has
-/// passed and `effective_vol` / `effective_snap` are known, sign and
-/// upload `volume.provenance`, write the local config + `wal/` +
-/// `pending/`, link `by_name/<volume>`, drop the `volume.stopped`
-/// marker, and emit the journal event. Once this returns the fork is
-/// fully materialised and the daemon's next discovery tick will find
-/// and supervise it.
-#[allow(clippy::too_many_arguments)]
-async fn finalize_claim_fork(
-    volume: &str,
-    new_vol_ulid: ulid::Ulid,
-    new_fork_dir: &std::path::Path,
-    signing_key: &ed25519_dalek::SigningKey,
-    effective_vol: ulid::Ulid,
-    effective_snap: ulid::Ulid,
-    effective_parent_key_hex: Option<&str>,
-    ctx: &IpcContext,
-) -> Result<(), IpcError> {
-    use elide_core::signing::{
-        ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, load_verifying_key,
-        write_provenance,
-    };
-    use elide_core::volume::resolve_ancestor_dir;
-
-    let new_vol_ulid_str = new_vol_ulid.to_string();
-    let by_id_dir = ctx.data_dir.join("by_id");
-
-    // Ancestor's identity pubkey for the embedded `ParentRef.pubkey`
-    // trust anchor. Loaded from the just-pulled (and verified)
-    // ancestor skeleton.
-    let parent_dir = resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
-    let parent_pubkey = load_verifying_key(&parent_dir, VOLUME_PUB_FILE)
-        .map_err(|e| IpcError::internal(format!("loading parent volume.pub: {e}")))?;
-
-    let manifest_pubkey = match effective_parent_key_hex {
-        Some(hex) => {
-            let arr = decode_hex32(hex)
-                .map_err(|e| IpcError::internal(format!("bad parent-key: {e}")))?;
-            Some(arr)
-        }
-        None => None,
-    };
-
-    let lineage = ProvenanceLineage {
-        parent: Some(ParentRef {
-            volume_ulid: effective_vol.to_string(),
-            snapshot_ulid: effective_snap.to_string(),
-            pubkey: parent_pubkey.to_bytes(),
-            manifest_pubkey,
-        }),
-        extent_index: Vec::new(),
-        oci_source: None,
-    };
-    write_provenance(new_fork_dir, signing_key, VOLUME_PROVENANCE_FILE, &lineage)
-        .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
-
-    let store = ctx.stores.for_volume(&new_vol_ulid);
-    elide_coordinator::upload::upload_volume_provenance_initial(
-        new_fork_dir,
-        &new_vol_ulid_str,
-        &store,
-    )
-    .await
-    .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
-
-    // wal/ and pending/ now — daemon discovery becomes interested only
-    // after these exist, by which point the provenance is on S3 and
-    // the volume is fully openable.
-    std::fs::create_dir_all(new_fork_dir.join("wal"))
-        .map_err(|e| IpcError::internal(format!("creating wal/: {e}")))?;
-    std::fs::create_dir_all(new_fork_dir.join("pending"))
-        .map_err(|e| IpcError::internal(format!("creating pending/: {e}")))?;
-
-    // Local volume.toml: size from the released NameRecord (claim is
-    // a continuation of the same logical volume identity, not a
-    // resize).
-    let store_wide = ctx.stores.coordinator_wide();
-    let size = match elide_coordinator::name_store::read_name_record(&store_wide, volume).await {
-        Ok(Some((rec, _))) => rec.size,
-        Ok(None) => {
-            return Err(IpcError::not_found(format!(
-                "names/{volume} disappeared during finalize"
-            )));
-        }
-        Err(e) => return Err(IpcError::store(format!("reading names/{volume}: {e}"))),
-    };
-    elide_core::config::VolumeConfig {
-        name: Some(volume.to_owned()),
-        size: Some(size),
-        nbd: None,
-        ublk: None,
-        lazy: None,
-    }
-    .write(new_fork_dir)
-    .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
-
-    // by_name symlink + volume.stopped marker.
-    let by_name_dir = ctx.data_dir.join("by_name");
-    let symlink_path = by_name_dir.join(volume);
-    std::fs::create_dir_all(&by_name_dir)
-        .map_err(|e| IpcError::internal(format!("creating by_name dir: {e}")))?;
-    if symlink_path.exists() || symlink_path.is_symlink() {
-        std::fs::remove_file(&symlink_path)
-            .map_err(|e| IpcError::internal(format!("removing stale by_name link: {e}")))?;
-    }
-    std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid_str}"), &symlink_path)
-        .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
-    std::fs::write(new_fork_dir.join(STOPPED_FILE), "")
-        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
-
-    register_prefetch_or_get(&ctx.prefetch_tracker, new_vol_ulid);
-    ctx.rescan.notify_one();
-    info!(
-        "[claim {volume}] finalized fork {new_vol_ulid_str} (parent {effective_vol}/{effective_snap})"
-    );
-    Ok(())
-}
-
-/// Drive one claim-job to completion. Mints the fresh fork and
-/// rebinds `names/<volume>` early so peer-fetch auth accepts the
-/// chain-walk requests that follow; pulls the released volume's
-/// chain (peer-first); resolves the handoff key; finalises the local
-/// fork by signing and uploading provenance once the verified parent
-/// is known; surfaces the coordinator's background prefetch.
-async fn run_claim_job(
-    job: Arc<ClaimJob>,
-    volume: String,
-    released_vol_ulid: ulid::Ulid,
-    handoff_snap: ulid::Ulid,
-    ctx: IpcContext,
-) -> Result<(), IpcError> {
-    use elide_core::volume;
-
-    let by_id_dir = ctx.data_dir.join("by_id");
-
-    // Step 1: early rebind. Mint our fork ULID + keypair, upload
-    // `volume.pub`, and `mark_claimed` so the bucket points at us.
-    // Peer-fetch auth gates on `names/<volume>.coordinator_id` matching
-    // our token's coord id, so this has to land before the chain walk
-    // for any peer request to authenticate.
-    let early_started = std::time::Instant::now();
-    let (new_vol_ulid, new_fork_dir, signing_key) = early_rebind_for_claim(&volume, &ctx).await?;
-    info!(
-        "[claim {volume}] early-rebind completed in {:.2?}",
-        early_started.elapsed()
-    );
-
-    // Step 2: discover the previous claimer. Best-effort — peer is
-    // `Some` only when `[peer_fetch].port` is configured, the event
-    // log yields a clean Released, and the previous claimer published
-    // a peer endpoint. The peer auth pipeline now accepts our
-    // coord_id (we `mark_claimed` above), so peer requests will
-    // succeed.
-    let peer_ctx: Option<elide_coordinator::prefetch::PeerFetchContext> =
-        match ctx.peer_fetch.as_ref() {
-            Some(handle) => {
-                let store_wide = ctx.stores.coordinator_wide();
-                elide_coordinator::peer_discovery::discover_peer_for_claim(&store_wide, &volume)
-                    .await
-                    .map(|discovered| elide_coordinator::prefetch::PeerFetchContext {
-                        client: handle.client.clone(),
-                        endpoint: discovered.endpoint,
-                        volume_name: volume.clone(),
-                    })
-            }
-            None => None,
-        };
-
-    // Verification-failure cleanup guard. Records every ancestor
-    // skeleton we write during this attempt; on drop without commit,
-    // each is `remove_dir_all`'d so a retry refetches cleanly. Commit
-    // happens once all signature checks against S3-rooted artifacts
-    // have passed — see the `commit()` site below. The partial fork
-    // we just minted is a separate concern: its on-disk state is
-    // bare (no `wal/` / `pending/` / `index/` yet) so daemon
-    // discovery ignores it; recovery via `volume release --force`
-    // sees the orphan `volume.pub` and treats it as a
-    // crashed-during-create empty fork.
-    let mut pulled_guard = PulledAncestorsGuard::new(by_id_dir.clone());
-
-    // Step 3: pull the released chain locally if absent. Peer-first
-    // when a context is available — auth now accepts our coord_id.
-    let chain_started = std::time::Instant::now();
-    let mut chain_pulled = 0usize;
-    let mut next: Option<ulid::Ulid> = Some(released_vol_ulid);
-    while let Some(vol_ulid) = next.take() {
-        let dir = volume::resolve_ancestor_dir(&by_id_dir, &vol_ulid.to_string());
-        if dir.exists() {
-            break;
-        }
-        job.append(ClaimAttachEvent::PullingAncestor { vol_ulid });
-        let store = ctx.stores.for_volume(&vol_ulid);
-        pulled_guard.record(vol_ulid);
-        let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store, peer_ctx.as_ref()).await?;
-        chain_pulled += 1;
-        next = reply.parent;
-    }
-    info!(
-        "[claim {volume}] ancestor chain pulled: {chain_pulled} in {:.2?}",
-        chain_started.elapsed()
-    );
-
-    let source_dir = volume::resolve_ancestor_dir(&by_id_dir, &released_vol_ulid.to_string());
-    if !source_dir.exists() {
-        return Err(IpcError::not_found(format!(
-            "source volume {released_vol_ulid} not found in remote store"
-        )));
-    }
-
-    // Step 4: resolve the handoff key. Recovery snapshots are signed
-    // by an attestation key the fork's provenance must record so its
-    // own signature verifies later. **This is the first step that
-    // verifies a peer-served pubkey against an S3-rooted artifact**:
-    // the released volume's signed handoff manifest comes from the
-    // bucket and is checked against the just-pulled `volume.pub`. A
-    // tampering peer is detected here; on `?` propagation
-    // `pulled_guard` tears down the bogus skeletons before the error
-    // returns. (The partial fork we minted in step 1 is left for
-    // `volume release --force` to clean up; see early_rebind_for_claim
-    // for the recovery story.)
-    let handoff_started = std::time::Instant::now();
-    let store = ctx.stores.for_volume(&released_vol_ulid);
-    let key = resolve_handoff_key_op(released_vol_ulid, handoff_snap, &store).await?;
-    info!(
-        "[claim {volume}] handoff key resolved in {:.2?}",
-        handoff_started.elapsed()
-    );
-    let parent_key_hex = match &key {
-        ResolveHandoffKeyReply::Normal => None,
-        ResolveHandoffKeyReply::Recovery {
-            manifest_pubkey_hex,
-        } => Some(manifest_pubkey_hex.clone()),
-    };
-    job.append(ClaimAttachEvent::HandoffKeyResolved { key });
-
-    // Step 4b: skip empty intermediates. A fork that produced no
-    // writes between claim and release leaves a handoff snapshot
-    // whose segment list is identical to its parent's — every
-    // segment was inherited, none minted under this fork. Forking
-    // from such a no-op intermediate just bloats the chain by one
-    // link per cycle. Detect it and rewrite `effective_vol` /
-    // `effective_snap` to point at the deepest non-empty ancestor.
-    let (effective_vol, effective_snap, effective_parent_key_hex) = skip_empty_intermediates(
-        &job,
-        &volume,
-        released_vol_ulid,
-        handoff_snap,
-        parent_key_hex,
-        ctx.data_dir.as_path(),
-        &ctx.stores,
-        peer_ctx.as_ref(),
-        &mut pulled_guard,
-    )
-    .await?;
-
-    // All signature checks against S3-rooted artifacts have passed.
-    // Commit so the pulled skeletons survive the rest of this job.
-    pulled_guard.commit();
-
-    // Step 5: finalize the local fork. Sign + upload provenance with
-    // the verified parent, write `volume.toml`, link `by_name`, drop
-    // the `volume.stopped` marker, and emit `ForkedFrom`.
-    let fork_create_started = std::time::Instant::now();
-    finalize_claim_fork(
-        &volume,
-        new_vol_ulid,
-        &new_fork_dir,
-        &signing_key,
-        effective_vol,
-        effective_snap,
-        effective_parent_key_hex.as_deref(),
-        &ctx,
-    )
-    .await?;
-    job.append(ClaimAttachEvent::ForkCreated { new_vol_ulid });
-    info!(
-        "[claim {volume}] fork finalized in {:.2?}",
-        fork_create_started.elapsed()
-    );
-
-    // Step 6: surface prefetch warm-up. Same non-fatal semantics as
-    // the fork flow: the bucket-side claim and local fork are durable
-    // by this point.
-    let prefetch_wait_started = std::time::Instant::now();
-    job.append(ClaimAttachEvent::PrefetchStarted);
-    let _ = await_prefetch_op(new_vol_ulid, &ctx.prefetch_tracker).await;
-    job.append(ClaimAttachEvent::PrefetchDone);
-    info!(
-        "[claim {volume}] prefetch awaited in {:.2?}",
-        prefetch_wait_started.elapsed()
-    );
-
-    Ok(())
 }
 
 /// Stream buffered + live claim events to `writer`, terminating with
@@ -5264,8 +3495,6 @@ mod tests {
     async fn release_op_refuses_when_volume_is_running() {
         let store = mem_store();
         let data_dir = TempDir::new().unwrap();
-        let snapshot_locks = SnapshotLockRegistry::default();
-        let rescan = Notify::new();
 
         // Running volume: by_name symlink + by_id dir, NO volume.stopped.
         let vol_ulid = make_running_volume(data_dir.path());
@@ -5281,17 +3510,26 @@ mod tests {
         rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let err = release_volume_op(
-            "vol",
-            data_dir.path(),
-            &snapshot_locks,
-            &store,
-            8 * 1024 * 1024,
-            &identity,
-            &rescan,
-        )
-        .await
-        .expect_err("running volume must refuse release");
+        let ctx = IpcContext {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            rescan: Arc::new(Notify::new()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            part_size_bytes: 8 * 1024 * 1024,
+            identity,
+            peer_fetch: None,
+        };
+
+        let err = release_volume_op("vol", &store, &ctx)
+            .await
+            .expect_err("running volume must refuse release");
 
         assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
         assert!(
@@ -5707,452 +3945,5 @@ mod tests {
         );
     }
 
-    // ── skip_empty_intermediates ──────────────────────────────────────────
-    //
-    // Setup: build a chain of forks on local disk (volume.pub +
-    // volume.provenance) and upload signed handoff manifests to a memstore.
-    // Then call `skip_empty_intermediates` and assert the effective
-    // (vol, snap, parent_key_hex) the claim path would feed into
-    // `fork_create_op`.
-
-    mod skip_empty_intermediates_tests {
-        use super::super::{PulledAncestorsGuard, skip_empty_intermediates};
-        use crate::claim::ClaimJob;
-        use elide_coordinator::stores::PassthroughStores;
-        use elide_core::signing::{
-            ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
-            build_snapshot_manifest_bytes, encode_hex, load_verifying_key, setup_readonly_identity,
-        };
-        use elide_core::ulid_mint::UlidMint;
-        use object_store::{ObjectStore, PutPayload, memory::InMemory};
-        use std::sync::Arc;
-        use tempfile::TempDir;
-        use ulid::Ulid;
-
-        struct Fork {
-            vol: Ulid,
-            snap: Ulid,
-            signer: Arc<dyn elide_core::segment::SegmentSigner>,
-            verifying_key: ed25519_dalek::VerifyingKey,
-        }
-
-        fn build_fork(
-            data_dir: &std::path::Path,
-            vol: Ulid,
-            snap: Ulid,
-            parent: Option<&Fork>,
-        ) -> Fork {
-            let dir = data_dir.join("by_id").join(vol.to_string());
-            std::fs::create_dir_all(&dir).unwrap();
-
-            let lineage = match parent {
-                None => ProvenanceLineage::default(),
-                Some(p) => ProvenanceLineage {
-                    parent: Some(ParentRef {
-                        volume_ulid: p.vol.to_string(),
-                        snapshot_ulid: p.snap.to_string(),
-                        pubkey: p.verifying_key.to_bytes(),
-                        manifest_pubkey: None,
-                    }),
-                    extent_index: vec![],
-                    oci_source: None,
-                },
-            };
-
-            let signer =
-                setup_readonly_identity(&dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
-                    .unwrap();
-            let verifying_key = load_verifying_key(&dir, VOLUME_PUB_FILE).unwrap();
-            Fork {
-                vol,
-                snap,
-                signer,
-                verifying_key,
-            }
-        }
-
-        async fn upload_handoff_manifest(
-            store: &Arc<dyn ObjectStore>,
-            fork: &Fork,
-            segment_ulids: &[Ulid],
-        ) {
-            let bytes = build_snapshot_manifest_bytes(fork.signer.as_ref(), segment_ulids, None);
-            let key = elide_coordinator::upload::snapshot_manifest_key(
-                &fork.vol.to_string(),
-                &fork.snap.to_string(),
-            )
-            .unwrap();
-            store.put(&key, PutPayload::from(bytes)).await.unwrap();
-        }
-
-        fn passthrough(
-            store: Arc<dyn ObjectStore>,
-        ) -> Arc<dyn elide_coordinator::stores::ScopedStores> {
-            Arc::new(PassthroughStores::new(store))
-        }
-
-        #[tokio::test]
-        async fn empty_fork_is_skipped() {
-            // R(writes) → F1(empty, released). Claim should fork from R, not F1.
-            let tmp = TempDir::new().unwrap();
-            let data_dir = tmp.path();
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-            let mut mint = UlidMint::new(Ulid::nil());
-            let seg_a = mint.next();
-            let seg_b = mint.next();
-            let r_snap = mint.next(); // > seg_a, seg_b
-            let f1_snap = mint.next(); // > r_snap
-
-            let r = build_fork(data_dir, mint.next(), r_snap, None);
-            let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
-
-            // R's handoff manifest = [seg_a, seg_b].
-            upload_handoff_manifest(&store, &r, &[seg_a, seg_b]).await;
-            // F1 wrote nothing → manifest inherits R's segments verbatim.
-            upload_handoff_manifest(&store, &f1, &[seg_a, seg_b]).await;
-
-            let job = ClaimJob::new();
-            let stores = passthrough(store);
-            let (vol, snap, key_hex) = skip_empty_intermediates(
-                &job,
-                "vol",
-                f1.vol,
-                f1.snap,
-                None,
-                data_dir,
-                &stores,
-                None,
-                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-            )
-            .await
-            .unwrap();
-            assert_eq!(vol, r.vol);
-            assert_eq!(snap, r.snap);
-            assert!(key_hex.is_none());
-        }
-
-        #[tokio::test]
-        async fn chained_empties_collapse_to_deepest_non_empty() {
-            // R(writes) → F1(empty) → F2(empty, released). Claim → R.
-            let tmp = TempDir::new().unwrap();
-            let data_dir = tmp.path();
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-            let mut mint = UlidMint::new(Ulid::nil());
-            let seg_a = mint.next();
-            let r_snap = mint.next();
-            let f1_snap = mint.next();
-            let f2_snap = mint.next();
-
-            let r = build_fork(data_dir, mint.next(), r_snap, None);
-            let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
-            let f2 = build_fork(data_dir, mint.next(), f2_snap, Some(&f1));
-
-            upload_handoff_manifest(&store, &r, &[seg_a]).await;
-            upload_handoff_manifest(&store, &f1, &[seg_a]).await;
-            upload_handoff_manifest(&store, &f2, &[seg_a]).await;
-
-            let job = ClaimJob::new();
-            let stores = passthrough(store);
-            let (vol, snap, _) = skip_empty_intermediates(
-                &job,
-                "vol",
-                f2.vol,
-                f2.snap,
-                None,
-                data_dir,
-                &stores,
-                None,
-                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-            )
-            .await
-            .unwrap();
-            assert_eq!(vol, r.vol);
-            assert_eq!(snap, r.snap);
-        }
-
-        #[tokio::test]
-        async fn non_empty_fork_is_not_skipped() {
-            // R(writes) → F1(writes, released). Claim should fork from F1.
-            let tmp = TempDir::new().unwrap();
-            let data_dir = tmp.path();
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-            let mut mint = UlidMint::new(Ulid::nil());
-            let seg_a = mint.next();
-            let r_snap = mint.next();
-            let seg_b = mint.next(); // > r_snap → owned by F1
-            let f1_snap = mint.next();
-
-            let r = build_fork(data_dir, mint.next(), r_snap, None);
-            let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
-
-            upload_handoff_manifest(&store, &r, &[seg_a]).await;
-            upload_handoff_manifest(&store, &f1, &[seg_a, seg_b]).await;
-
-            let job = ClaimJob::new();
-            let stores = passthrough(store);
-            let (vol, snap, _) = skip_empty_intermediates(
-                &job,
-                "vol",
-                f1.vol,
-                f1.snap,
-                None,
-                data_dir,
-                &stores,
-                None,
-                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-            )
-            .await
-            .unwrap();
-            assert_eq!(vol, f1.vol);
-            assert_eq!(snap, f1.snap);
-        }
-
-        #[tokio::test]
-        async fn root_fork_with_no_parent_is_not_skipped() {
-            // Released name points at a root volume (no parent). Even if its
-            // handoff manifest is empty, there's nothing to skip to.
-            let tmp = TempDir::new().unwrap();
-            let data_dir = tmp.path();
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-            let mut mint = UlidMint::new(Ulid::nil());
-            let r_snap = mint.next();
-            let r = build_fork(data_dir, mint.next(), r_snap, None);
-            // Empty manifest — but no parent to redirect to.
-            upload_handoff_manifest(&store, &r, &[]).await;
-
-            let job = ClaimJob::new();
-            let stores = passthrough(store);
-            let (vol, snap, _) = skip_empty_intermediates(
-                &job,
-                "vol",
-                r.vol,
-                r.snap,
-                None,
-                data_dir,
-                &stores,
-                None,
-                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-            )
-            .await
-            .unwrap();
-            assert_eq!(vol, r.vol);
-            assert_eq!(snap, r.snap);
-        }
-
-        #[tokio::test]
-        async fn manifest_pubkey_override_flows_through_when_skipping() {
-            // F1's parent ref carries a manifest_pubkey override (recovery
-            // snapshot at the grandparent). When we skip F1 (empty), the
-            // override must be propagated as the new fork's parent_key_hex.
-            let tmp = TempDir::new().unwrap();
-            let data_dir = tmp.path();
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-            let mut mint = UlidMint::new(Ulid::nil());
-            let seg_a = mint.next();
-            let r_snap = mint.next();
-            let f1_snap = mint.next();
-
-            let r = build_fork(data_dir, mint.next(), r_snap, None);
-            let f1_vol = mint.next();
-
-            // Construct F1 manually so we can inject a manifest_pubkey override.
-            let f1_dir = data_dir.join("by_id").join(f1_vol.to_string());
-            std::fs::create_dir_all(&f1_dir).unwrap();
-            let override_pubkey_bytes = [0xCDu8; 32];
-            let lineage = ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: r.vol.to_string(),
-                    snapshot_ulid: r.snap.to_string(),
-                    pubkey: r.verifying_key.to_bytes(),
-                    manifest_pubkey: Some(override_pubkey_bytes),
-                }),
-                extent_index: vec![],
-                oci_source: None,
-            };
-            let f1_signer =
-                setup_readonly_identity(&f1_dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
-                    .unwrap();
-            let f1_vk = load_verifying_key(&f1_dir, VOLUME_PUB_FILE).unwrap();
-            let f1 = Fork {
-                vol: f1_vol,
-                snap: f1_snap,
-                signer: f1_signer,
-                verifying_key: f1_vk,
-            };
-
-            upload_handoff_manifest(&store, &r, &[seg_a]).await;
-            upload_handoff_manifest(&store, &f1, &[seg_a]).await;
-
-            let job = ClaimJob::new();
-            let stores = passthrough(store);
-            let (vol, snap, key_hex) = skip_empty_intermediates(
-                &job,
-                "vol",
-                f1.vol,
-                f1.snap,
-                None,
-                data_dir,
-                &stores,
-                None,
-                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-            )
-            .await
-            .unwrap();
-            assert_eq!(vol, r.vol);
-            assert_eq!(snap, r.snap);
-            assert_eq!(
-                key_hex.as_deref(),
-                Some(encode_hex(&override_pubkey_bytes).as_str())
-            );
-        }
-    }
-
-    /// Tests for [`classify_resumable_orphan`] — exercises the
-    /// `for_claim` resume-detection logic now living coordinator-side
-    /// (was previously a CLI-side classifier + provenance check).
-    mod classify_resumable_orphan_tests {
-        use super::super::classify_resumable_orphan;
-        use std::os::unix::fs::symlink;
-        use tempfile::TempDir;
-
-        fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
-            let tmp = TempDir::new().unwrap();
-            let by_id = tmp.path().join("by_id");
-            let by_name = tmp.path().join("by_name");
-            std::fs::create_dir_all(&by_id).unwrap();
-            std::fs::create_dir_all(&by_name).unwrap();
-            (tmp, by_id, by_name)
-        }
-
-        /// Write a fork directory whose signed `volume.provenance`
-        /// records `(parent_ulid, snap_ulid)` as the parent ref.
-        /// Mirrors the on-disk shape `fork_volume_at` produces.
-        fn write_orphan_fork(
-            dir: &std::path::Path,
-            parent_ulid: ulid::Ulid,
-            snap_ulid: ulid::Ulid,
-        ) {
-            std::fs::create_dir_all(dir).unwrap();
-            let key = elide_core::signing::generate_keypair(
-                dir,
-                elide_core::signing::VOLUME_KEY_FILE,
-                elide_core::signing::VOLUME_PUB_FILE,
-            )
-            .unwrap();
-            let lineage = elide_core::signing::ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_ulid.to_string(),
-                    snapshot_ulid: snap_ulid.to_string(),
-                    pubkey: [0u8; 32],
-                    manifest_pubkey: None,
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-            };
-            elide_core::signing::write_provenance(
-                dir,
-                &key,
-                elide_core::signing::VOLUME_PROVENANCE_FILE,
-                &lineage,
-            )
-            .unwrap();
-        }
-
-        fn ulids() -> (ulid::Ulid, ulid::Ulid, ulid::Ulid, ulid::Ulid) {
-            // Distinct, deterministic — order doesn't matter, only equality.
-            let mut mint = elide_core::ulid_mint::UlidMint::new(ulid::Ulid::nil());
-            (mint.next(), mint.next(), mint.next(), mint.next())
-        }
-
-        #[test]
-        fn returns_none_when_symlink_absent() {
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, _, _) = ulids();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
-                None
-            );
-        }
-
-        #[test]
-        fn returns_some_when_provenance_records_expected_parent_and_snap() {
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, orphan, _) = ulids();
-            write_orphan_fork(&by_id.join(orphan.to_string()), released, snap);
-            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
-                Some(orphan)
-            );
-        }
-
-        #[test]
-        fn returns_none_when_parent_ulid_differs() {
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, orphan, other) = ulids();
-            write_orphan_fork(&by_id.join(orphan.to_string()), other, snap);
-            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
-                None
-            );
-        }
-
-        #[test]
-        fn returns_none_when_snap_differs() {
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, orphan, other_snap) = ulids();
-            write_orphan_fork(&by_id.join(orphan.to_string()), released, other_snap);
-            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
-                None
-            );
-        }
-
-        #[test]
-        fn returns_none_when_target_dir_missing() {
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, orphan, _) = ulids();
-            // Symlink points at by_id/<orphan>/ but no fork was written.
-            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
-                None
-            );
-        }
-
-        #[test]
-        fn returns_none_when_provenance_corrupted() {
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, orphan, _) = ulids();
-            let dir = by_id.join(orphan.to_string());
-            write_orphan_fork(&dir, released, snap);
-            // Truncate provenance to invalidate the signature.
-            std::fs::write(dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE), "").unwrap();
-            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, Some(snap)),
-                None
-            );
-        }
-
-        #[test]
-        fn returns_none_when_no_snap_supplied() {
-            // No snap ⇒ can't match any provenance, regardless of state.
-            let (_t, by_id, by_name) = setup();
-            let (released, snap, orphan, _) = ulids();
-            write_orphan_fork(&by_id.join(orphan.to_string()), released, snap);
-            symlink(format!("../by_id/{orphan}"), by_name.join("vol")).unwrap();
-            assert_eq!(
-                classify_resumable_orphan(&by_name.join("vol"), &by_id, released, None),
-                None
-            );
-        }
-    }
+    // skip_empty_intermediates tests now live in crate::claim::tests.
 }
