@@ -54,6 +54,26 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     result
 }
 
+/// Pick the largest ULID present in `index/*.idx`, or mint a fresh
+/// one if `index/` is empty. Mirrors the snapshot-ULID selection in
+/// `actor_proptest.rs` so volume-level signing tests cover both the
+/// "snapshot over real data" and "degenerate empty manifest" shapes.
+fn pick_snap_ulid(fork_dir: &Path) -> Ulid {
+    fs::read_dir(fork_dir.join("index"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_str()?;
+            let stem = s.strip_suffix(".idx")?;
+            Ulid::from_string(stem).ok()
+        })
+        .max()
+        .unwrap_or_else(Ulid::new)
+}
+
 /// Generate 4096 bytes of incompressible data from a seed.
 ///
 /// Uses blake3 in counter mode to fill the block with pseudo-random bytes.
@@ -173,6 +193,24 @@ enum SimOp {
     /// offload. Exercised against a subsequent `Crash` + rebuild so the
     /// crash-recovery invariants fire on this specific shape.
     HalfPromotePending,
+    /// Phase 5 Tier 1 dictionary-delta repack of post-snapshot pending
+    /// segments. No-op when there is no sealed snapshot or no Data
+    /// entries match same-LBA extents in the prior snapshot. Segment
+    /// files are rewritten in place under their original ULID via
+    /// atomic rename, so no new ULID files appear. The actor-layer
+    /// proptest covers this through `ActorOp::DeltaRepack`; modelling
+    /// it here exercises the same invariants directly against the
+    /// volume layer (ULID set unchanged, oracle preserved across
+    /// subsequent crash + rebuild).
+    DeltaRepack,
+    /// Seal a snapshot manifest over the current `index/` set: pick
+    /// the max ULID in `index/` (or a fresh one if empty) and call
+    /// `vol.sign_snapshot_manifest`. Writes `snapshots/<ulid>.manifest`
+    /// and the `snapshots/<ulid>` marker — neither file lands in the
+    /// ULID-tracking directories (`wal/`, `pending/`, `index/`), so
+    /// the segment-ULID set is unaffected. Signing must not touch
+    /// data paths; oracle preservation is verified by the next Crash.
+    SignSnapshot,
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -212,6 +250,8 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_count,
         }),
         Just(SimOp::HalfPromotePending),
+        Just(SimOp::DeltaRepack),
+        Just(SimOp::SignSnapshot),
     ]
 }
 
@@ -690,6 +730,46 @@ proptest! {
                     // original pending ULID. Nothing to assert for monotonicity.
                     let _ = common::half_promote_first_pending(fork_dir);
                 }
+                SimOp::DeltaRepack => {
+                    // Rewrites post-snapshot pending segments in place
+                    // under their original ULID via atomic rename. The
+                    // ULID set must be unchanged: no new ULIDs appear
+                    // and no existing ULID is dropped by this op.
+                    let _ = vol.delta_repack_post_snapshot();
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            false,
+                            "delta_repack produced unexpected new ULID {u}"
+                        );
+                    }
+                    for u in ulids_before.difference(&after) {
+                        prop_assert!(
+                            false,
+                            "delta_repack dropped existing ULID {u}"
+                        );
+                    }
+                }
+                SimOp::SignSnapshot => {
+                    // Manifest + marker land under `snapshots/`, which
+                    // `all_segment_ulids` does not scan. The segment
+                    // ULID set must therefore be identical before/after.
+                    let snap_ulid = pick_snap_ulid(fork_dir);
+                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            false,
+                            "sign_snapshot_manifest produced unexpected new ULID {u}"
+                        );
+                    }
+                    for u in ulids_before.difference(&after) {
+                        prop_assert!(
+                            false,
+                            "sign_snapshot_manifest dropped existing ULID {u}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -872,6 +952,19 @@ proptest! {
                     // will verify reclaim's contribution alongside everything else.
                     let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
+                SimOp::DeltaRepack => {
+                    // Rewrites Data entries in post-snapshot pending
+                    // segments to thin Deltas. Observable content is
+                    // unchanged; oracle survival is verified by the
+                    // next Crash handler.
+                    let _ = vol.delta_repack_post_snapshot();
+                }
+                SimOp::SignSnapshot => {
+                    // Signing must not touch the data path; oracle
+                    // survival is verified by the next Crash handler.
+                    let snap_ulid = pick_snap_ulid(fork_dir);
+                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                }
             }
         }
     }
@@ -1031,6 +1124,13 @@ proptest! {
                     // the oracle per-op: PopulateFetched leaves in-memory
                     // lbamap stale until Crash rebuilds it.
                     let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
+                }
+                SimOp::DeltaRepack => {
+                    let _ = vol.delta_repack_post_snapshot();
+                }
+                SimOp::SignSnapshot => {
+                    let snap_ulid = pick_snap_ulid(fork_dir);
+                    let _ = vol.sign_snapshot_manifest(snap_ulid);
                 }
             }
         }
