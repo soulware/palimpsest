@@ -53,6 +53,12 @@ use elide_core::process::pid_is_alive;
 ///
 /// All fields are cheap to clone (Arc-wrapped or Copy), so per-connection
 /// fan-out in `serve` is a flat clone rather than a long argument list.
+///
+/// The dispatcher legitimately needs all 12 fields (it routes to handlers
+/// touching different subsets); orchestrators and per-domain helpers do
+/// not. They take narrower context structs ([`crate::claim::ClaimContext`],
+/// [`crate::fork::ForkContext`], [`crate::import::ImportContext`]) that
+/// hold the [`CoordinatorCore`] plus the registries they actually use.
 #[derive(Clone)]
 pub struct IpcContext {
     pub data_dir: Arc<PathBuf>,
@@ -77,6 +83,64 @@ pub struct IpcContext {
     /// `names/<name>` (so peer auth accepts our coord_id) to warm the
     /// ancestor chain over peer-fetch instead of S3.
     pub peer_fetch: Option<elide_coordinator::tasks::PeerFetchHandle>,
+}
+
+/// Universal coordinator state — every IPC handler and every domain
+/// orchestrator needs these four fields. Carried inside the per-domain
+/// context structs so they don't have to embed `IpcContext`'s full bag
+/// when most of it would be unused.
+#[derive(Clone)]
+pub struct CoordinatorCore {
+    pub data_dir: Arc<PathBuf>,
+    pub rescan: Arc<Notify>,
+    pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
+    pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
+}
+
+impl IpcContext {
+    /// Snapshot the universal hot-core fields. Cheap (Arc clones).
+    fn core(&self) -> CoordinatorCore {
+        CoordinatorCore {
+            data_dir: self.data_dir.clone(),
+            rescan: self.rescan.clone(),
+            stores: self.stores.clone(),
+            identity: self.identity.clone(),
+        }
+    }
+
+    /// Construct a [`crate::claim::ClaimContext`] — the hot core plus
+    /// the claim-domain registries (claim_registry, prefetch_tracker,
+    /// peer_fetch).
+    pub(crate) fn for_claim(&self) -> crate::claim::ClaimContext {
+        crate::claim::ClaimContext {
+            core: self.core(),
+            claim_registry: self.claim_registry.clone(),
+            prefetch_tracker: self.prefetch_tracker.clone(),
+            peer_fetch: self.peer_fetch.clone(),
+        }
+    }
+
+    /// Construct a [`crate::fork::ForkContext`] — the hot core plus the
+    /// fork-domain registries (fork_registry, prefetch_tracker,
+    /// snapshot_locks, part_size_bytes).
+    pub(crate) fn for_fork(&self) -> crate::fork::ForkContext {
+        crate::fork::ForkContext {
+            core: self.core(),
+            fork_registry: self.fork_registry.clone(),
+            prefetch_tracker: self.prefetch_tracker.clone(),
+            snapshot_locks: self.snapshot_locks.clone(),
+            part_size_bytes: self.part_size_bytes,
+        }
+    }
+
+    /// Construct a [`crate::import::ImportContext`] — the hot core plus
+    /// the import registry.
+    pub(crate) fn for_import(&self) -> crate::import::ImportContext {
+        crate::import::ImportContext {
+            core: self.core(),
+            registry: self.registry.clone(),
+        }
+    }
 }
 
 pub async fn serve(
@@ -296,13 +360,14 @@ async fn dispatch_json(
             // Mixed: names/<volume> mark_initial; the spawned import
             // subprocess writes locally only.
             let store = ctx.stores.coordinator_wide();
+            let import_ctx = ctx.for_import();
             let result = start_import(
                 &volume,
                 &oci_ref,
                 &extents_from,
                 &store,
                 elide_import_bin,
-                ctx,
+                &import_ctx,
             )
             .await;
             let env: Envelope<ImportStartReply> = result.into();
@@ -411,7 +476,7 @@ async fn dispatch_json(
             flags,
         } => {
             let result =
-                crate::fork::start_fork(new_name, from, force_snapshot, flags, ctx.clone());
+                crate::fork::start_fork(new_name, from, force_snapshot, flags, ctx.for_fork());
             let env: Envelope<ForkStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -419,7 +484,7 @@ async fn dispatch_json(
             stream_fork_by_name(&new_name, writer, &ctx.fork_registry).await;
         }
         Request::ClaimStart { volume } => {
-            let result = crate::claim::start_claim(volume, ctx.clone()).await;
+            let result = crate::claim::start_claim(volume, ctx.for_claim()).await;
             let env: Envelope<ClaimStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -465,7 +530,7 @@ async fn start_import(
     extents_from: &[String],
     store: &Arc<dyn ObjectStore>,
     elide_import_bin: &Path,
-    ctx: &IpcContext,
+    ctx: &crate::import::ImportContext,
 ) -> Result<ImportStartReply, IpcError> {
     let req = import::ImportRequest {
         vol_name: volume,

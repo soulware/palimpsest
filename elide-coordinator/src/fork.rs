@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::inbound::{
-    DrainingMarkerGuard, IpcContext, await_prefetch_op, decode_hex32, parse_transport_flags,
+    CoordinatorCore, DrainingMarkerGuard, await_prefetch_op, decode_hex32, parse_transport_flags,
     pull_readonly_op, snapshot_volume, validate_volume_name, wait_for_control_sock,
 };
 use elide_coordinator::ipc::{
@@ -37,6 +37,20 @@ use elide_coordinator::ipc::{
 };
 use elide_coordinator::register_prefetch_or_get;
 use elide_coordinator::volume_state::{IMPORTING_FILE, STOPPED_FILE};
+
+// ── Per-domain context ───────────────────────────────────────────────────────
+
+/// Coordinator state needed by the fork flow: the universal hot core
+/// plus the fork-domain registries and config. Constructed via
+/// [`crate::inbound::IpcContext::for_fork`].
+#[derive(Clone)]
+pub(crate) struct ForkContext {
+    pub core: CoordinatorCore,
+    pub fork_registry: ForkRegistry,
+    pub prefetch_tracker: elide_coordinator::PrefetchTracker,
+    pub snapshot_locks: elide_coordinator::SnapshotLockRegistry,
+    pub part_size_bytes: usize,
+}
 
 // ── Job + registry ────────────────────────────────────────────────────────────
 
@@ -119,7 +133,7 @@ pub(crate) fn start_fork(
     from: ForkSource,
     force_snapshot: bool,
     flags: Vec<String>,
-    ctx: IpcContext,
+    ctx: ForkContext,
 ) -> Result<ForkStartReply, IpcError> {
     {
         let mut reg = ctx.fork_registry.lock().expect("fork registry poisoned");
@@ -173,7 +187,7 @@ pub(crate) struct ForkOrchestrator {
     from: ForkSource,
     force_snapshot: bool,
     flags: Vec<String>,
-    ctx: IpcContext,
+    ctx: ForkContext,
     by_id_dir: PathBuf,
 
     // Stage outputs.
@@ -198,9 +212,9 @@ impl ForkOrchestrator {
         from: ForkSource,
         force_snapshot: bool,
         flags: Vec<String>,
-        ctx: IpcContext,
+        ctx: ForkContext,
     ) -> Self {
-        let by_id_dir = ctx.data_dir.join("by_id");
+        let by_id_dir = ctx.core.data_dir.join("by_id");
         Self {
             job,
             new_name,
@@ -245,7 +259,7 @@ impl ForkOrchestrator {
                 snap_hint: None,
             },
             ForkSource::Name { name } => {
-                let local = self.ctx.data_dir.join("by_name").join(name);
+                let local = self.ctx.core.data_dir.join("by_name").join(name);
                 if local.exists() {
                     let canon = std::fs::canonicalize(&local).map_err(|e| {
                         IpcError::internal(format!("canonicalize by_name/{name}: {e}"))
@@ -267,7 +281,7 @@ impl ForkOrchestrator {
                 } else {
                     self.job
                         .append(ForkAttachEvent::ResolvingName { name: name.clone() });
-                    let store = self.ctx.stores.coordinator_wide();
+                    let store = self.ctx.core.stores.coordinator_wide();
                     let reply = resolve_name_op(name, &store).await?;
                     ResolvedSource {
                         vol_ulid: reply.vol_ulid,
@@ -302,8 +316,8 @@ impl ForkOrchestrator {
             }
             self.job
                 .append(ForkAttachEvent::PullingAncestor { vol_ulid });
-            let store = self.ctx.stores.for_volume(&vol_ulid);
-            let reply = pull_readonly_op(vol_ulid, &self.ctx.data_dir, &store, None).await?;
+            let store = self.ctx.core.stores.for_volume(&vol_ulid);
+            let reply = pull_readonly_op(vol_ulid, &self.ctx.core.data_dir, &store, None).await?;
             next = reply.parent;
         }
 
@@ -354,9 +368,9 @@ impl ForkOrchestrator {
 
         if source_dir.join("volume.readonly").exists() {
             let snap_ulid = if self.force_snapshot {
-                let store = self.ctx.stores.coordinator_wide();
+                let store = self.ctx.core.stores.coordinator_wide();
                 let reply =
-                    force_snapshot_now_op(source_vol_ulid, &self.ctx.data_dir, &store).await?;
+                    force_snapshot_now_op(source_vol_ulid, &self.ctx.core.data_dir, &store).await?;
                 self.parent_key_hex = Some(reply.attestation_pubkey_hex.clone());
                 self.job.append(ForkAttachEvent::AttestedSnapshot {
                     snap_ulid: reply.snap_ulid,
@@ -368,7 +382,7 @@ impl ForkOrchestrator {
             {
                 snap
             } else {
-                let store = self.ctx.stores.for_volume(&source_vol_ulid);
+                let store = self.ctx.core.stores.for_volume(&source_vol_ulid);
                 match latest_snapshot_op(source_vol_ulid, &store)
                     .await?
                     .snapshot_ulid
@@ -415,7 +429,7 @@ impl ForkOrchestrator {
                     "clearing volume.stopped for fork drain: {e}"
                 )));
             }
-            self.ctx.rescan.notify_one();
+            self.ctx.core.rescan.notify_one();
             draining_guard = Some(DrainingMarkerGuard::new(source_dir.clone()));
             if !wait_for_control_sock(&source_dir, std::time::Duration::from_secs(30)).await {
                 return Err(IpcError::internal(format!(
@@ -424,10 +438,10 @@ impl ForkOrchestrator {
             }
         }
 
-        let store = self.ctx.stores.coordinator_wide();
+        let store = self.ctx.core.stores.coordinator_wide();
         let reply = snapshot_volume(
             &name,
-            &self.ctx.data_dir,
+            &self.ctx.core.data_dir,
             &self.ctx.snapshot_locks,
             &store,
             self.ctx.part_size_bytes,
@@ -484,7 +498,7 @@ impl ForkOrchestrator {
             source_vol_ulid,
             snap_ulid,
         });
-        let store = self.ctx.stores.coordinator_wide();
+        let store = self.ctx.core.stores.coordinator_wide();
         let reply = fork_create_op(
             &self.new_name,
             source_vol_ulid,
@@ -737,11 +751,11 @@ async fn fork_create_op(
     flags: &[String],
     source_name_hint: Option<&str>,
     store: &Arc<dyn ObjectStore>,
-    ctx: &IpcContext,
+    ctx: &ForkContext,
 ) -> Result<ForkCreateReply, IpcError> {
-    let identity = &ctx.identity;
-    let data_dir: &Path = &ctx.data_dir;
-    let rescan: &Notify = &ctx.rescan;
+    let identity = &ctx.core.identity;
+    let data_dir: &Path = &ctx.core.data_dir;
+    let rescan: &Notify = &ctx.core.rescan;
     let prefetch_tracker = &ctx.prefetch_tracker;
     let coord_id = identity.coordinator_id_str();
     validate_volume_name(new_name).map_err(IpcError::bad_request)?;

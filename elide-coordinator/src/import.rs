@@ -25,6 +25,19 @@ use ulid::Ulid;
 use elide_coordinator::lifecycle::{MarkInitialOutcome, mark_initial_readonly};
 use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
 
+use crate::inbound::CoordinatorCore;
+
+// ── Per-domain context ───────────────────────────────────────────────────────
+
+/// Coordinator state needed by the import flow: the universal hot core
+/// plus the in-flight import registry. Constructed via
+/// [`crate::inbound::IpcContext::for_import`].
+#[derive(Clone)]
+pub(crate) struct ImportContext {
+    pub core: CoordinatorCore,
+    pub registry: ImportRegistry,
+}
+
 /// Hard cap on entries in the new volume's `extent_index` provenance field.
 ///
 /// Each entry costs a full `.idx` file load at volume open time (and at
@@ -260,12 +273,12 @@ pub async fn spawn_import(
     req: ImportRequest<'_>,
     elide_import_bin: &Path,
     store: Arc<dyn ObjectStore>,
-    ctx: &crate::inbound::IpcContext,
+    ctx: &ImportContext,
 ) -> std::io::Result<String> {
-    let data_dir: &Path = &ctx.data_dir;
+    let data_dir: &Path = &ctx.core.data_dir;
     let registry = &ctx.registry;
-    let rescan_notify = ctx.rescan.clone();
-    let identity = ctx.identity.clone();
+    let rescan_notify = ctx.core.rescan.clone();
+    let identity = ctx.core.identity.clone();
     let ImportRequest {
         vol_name,
         oci_ref,
