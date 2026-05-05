@@ -199,13 +199,49 @@ pub fn gc_fork(
     // any existing stale scratch.
     cleanup_staging_files(&gc_dir);
 
-    // Pending segments created by WAL auto-flush during drain are safe to
-    // ignore here: collect_stats (below) only considers index/<ulid>.idx files,
-    // so un-promoted segments (no .idx yet) are never GC candidates.
-    // rebuild_segments includes pending/ with highest priority, so the LBA map
-    // correctly reflects those writes and their LBAs are not included in
-    // older-segment candidates.
+    let pass = load_pass_state(fork_dir, by_id_dir)?;
+    let total_segments = pass.total_segments;
+    let deferred_count = pass.deferred_count;
 
+    match select_bucket(pass.eligible_stats, config, u_gc) {
+        SelectionOutcome::NoCandidates => Ok(GcStats {
+            strategy: GcStrategy::None(NoneReason::NoCandidates),
+            candidates: 0,
+            bytes_freed: 0,
+            dead_cleaned: 0,
+            deferred: deferred_count,
+            total_segments,
+        }),
+        SelectionOutcome::Compact(packed) => {
+            compact_segments(packed.bucket, &gc_dir, u_gc, &pass.live_hashes)
+                .context("gc compaction")?;
+            Ok(GcStats {
+                strategy: GcStrategy::Compact,
+                candidates: packed.candidates,
+                bytes_freed: packed.bytes_freed,
+                dead_cleaned: packed.dead_cleaned,
+                deferred: deferred_count,
+                total_segments,
+            })
+        }
+    }
+}
+
+/// Per-pass state loaded from disk — vk, ancestor-walked extent index, lbamap
+/// (with WAL replay), live hashes, and segment stats. Pending segments
+/// created by WAL auto-flush during drain are safe to ignore: collect_stats
+/// only considers index/<ulid>.idx files, so un-promoted segments are never
+/// GC candidates. rebuild_segments includes pending/ with highest priority,
+/// so the LBA map correctly reflects those writes and their LBAs are not
+/// included in older-segment candidates.
+struct PassState {
+    eligible_stats: Vec<SegmentStats>,
+    live_hashes: HashSet<blake3::Hash>,
+    total_segments: usize,
+    deferred_count: usize,
+}
+
+fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
@@ -227,14 +263,13 @@ pub fn gc_fork(
 
     // Replay any in-progress WAL files into the LBA map so that hashes
     // referenced by post-checkpoint writes are visible to the liveness
-    // check.  Without this, a DedupRef written to the WAL after
-    // gc_checkpoint would be invisible to the coordinator — the hash
-    // would appear dead, be excluded from the GC output, and the
-    // volume's stale-liveness check would reject the handoff in a loop.
+    // check. Without this, a DedupRef written to the WAL after gc_checkpoint
+    // would be invisible to the coordinator — the hash would appear dead, be
+    // excluded from the GC output, and the volume's stale-liveness check
+    // would reject the handoff in a loop.
     replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lbamap)?;
 
     let live_hashes = lbamap.lba_referenced_hashes();
-
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
     let all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
@@ -246,10 +281,9 @@ pub fn gc_fork(
     // body to reconstruct the composite against. They sit out this pass
     // and retry next tick, when later writes may re-establish a source.
     // Data/Inline/DedupRef partial death, and Delta with at least one
-    // resolvable source, are all handled in-band via
-    // `expand_partial_death`. See
-    // `docs/design-gc-partial-death-compaction.md`.
-    let (deferred, all_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
+    // resolvable source, are all handled in-band via `expand_partial_death`.
+    // See `docs/design-gc-partial-death-compaction.md`.
+    let (deferred, eligible_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
     let deferred_count = deferred.len();
     if !deferred.is_empty() {
@@ -264,6 +298,31 @@ pub fn gc_fork(
         );
     }
 
+    Ok(PassState {
+        eligible_stats,
+        live_hashes,
+        total_segments,
+        deferred_count,
+    })
+}
+
+/// Bucket plus the accounting numbers `gc_fork` needs to fill `GcStats`.
+struct PackedBucket {
+    bucket: Vec<SegmentStats>,
+    candidates: usize,
+    bytes_freed: u64,
+    dead_cleaned: usize,
+}
+
+enum SelectionOutcome {
+    Compact(PackedBucket),
+    NoCandidates,
+}
+
+/// Partition eligible stats into dead/small/large, filter sparse-large
+/// fillers, run the bin-pack, skip-check the result, then sort by ULID
+/// and emit the per-pass log line.
+fn select_bucket(eligible: Vec<SegmentStats>, config: &GcConfig, u_gc: Ulid) -> SelectionOutcome {
     // Partition the stats into three disjoint buckets by shape:
     //   * dead  — no live entries, no removed hashes (tombstone-only input).
     //   * small — live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD.
@@ -281,7 +340,7 @@ pub fn gc_fork(
     let mut dead_inputs: Vec<SegmentStats> = Vec::new();
     let mut small_inputs: Vec<SegmentStats> = Vec::new();
     let mut large_inputs: Vec<SegmentStats> = Vec::new();
-    for s in all_stats {
+    for s in eligible {
         if s.live_entries.is_empty() && s.removed_hashes.is_empty() {
             dead_inputs.push(s);
         } else if s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD {
@@ -362,17 +421,7 @@ pub fn gc_fork(
         .any(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty());
     let has_sparse = bucket.iter().any(|s| s.density() < density_threshold);
     if !has_dead && !has_sparse && bucket.len() < 2 {
-        if deferred_count > 0 {
-            return Ok(GcStats {
-                strategy: GcStrategy::None(NoneReason::NoCandidates),
-                candidates: 0,
-                bytes_freed: 0,
-                dead_cleaned: 0,
-                deferred: deferred_count,
-                total_segments,
-            });
-        }
-        return Ok(GcStats::none(NoneReason::NoCandidates, total_segments));
+        return SelectionOutcome::NoCandidates;
     }
 
     // Sort the bucket back into ULID order before handing it to
@@ -401,15 +450,12 @@ pub fn gc_fork(
         removed_hashes,
         dead_cleaned,
     );
-    compact_segments(bucket, &gc_dir, u_gc, &live_hashes).context("gc compaction")?;
 
-    Ok(GcStats {
-        strategy: GcStrategy::Compact,
+    SelectionOutcome::Compact(PackedBucket {
+        bucket,
         candidates,
         bytes_freed,
         dead_cleaned,
-        deferred: deferred_count,
-        total_segments,
     })
 }
 
@@ -443,11 +489,50 @@ pub async fn apply_done_handoffs(
         return Ok(0);
     }
 
-    // Bare-named `gc/<ulid>` files are volume-applied handoffs awaiting S3
-    // upload. Under the self-describing protocol, a bare file's `inputs`
-    // header field lists the consumed source ULIDs — everything needed to
-    // finish the handoff (upload → promote → S3 delete → local delete).
-    let mut bare: Vec<fs::DirEntry> = fs::read_dir(&gc_dir)
+    let bare = collect_bare_handoffs(&gc_dir)?;
+    if bare.is_empty() {
+        return Ok(0);
+    }
+
+    // Load vk + parse volume_ulid once. Both are needed by every iteration;
+    // the original loop reloaded vk per file, but we've already gated on a
+    // non-empty bare set, so volume.pub must exist.
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .context("loading volume verifying key")?;
+    let volume_ulid = Ulid::from_string(volume_id)
+        .map_err(|e| anyhow::anyhow!("invalid volume_id '{volume_id}': {e}"))?;
+    let cursor = HandoffCursor {
+        fork_dir,
+        cache_dir: fork_dir.join("cache"),
+        volume_ulid,
+        vk,
+        uploader: crate::upload::SegmentUploader {
+            volume_id,
+            store,
+            part_size_bytes,
+        },
+    };
+
+    let mut count = 0;
+    for entry in &bare {
+        let filename = entry.file_name();
+        let name = filename
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("gc filename is not valid UTF-8"))?;
+        if cursor.process_one(name, &entry.path()).await? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Bare-named `gc/<ulid>` files are volume-applied handoffs awaiting S3
+/// upload. Under the self-describing protocol, a bare file's `inputs`
+/// header field lists the consumed source ULIDs — everything needed to
+/// finish the handoff (upload → promote → S3 delete → local delete).
+fn collect_bare_handoffs(gc_dir: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut bare: Vec<fs::DirEntry> = fs::read_dir(gc_dir)
         .context("reading gc dir")?
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -467,33 +552,32 @@ pub async fn apply_done_handoffs(
             !gc_dir.join(format!("{name}.plan")).exists()
         })
         .collect();
-
-    if bare.is_empty() {
-        return Ok(0);
-    }
-
     bare.sort_by_key(|e| e.file_name());
-    let cache_dir = fork_dir.join("cache");
-    let mut count = 0;
+    Ok(bare)
+}
 
-    for entry in &bare {
-        let filename = entry.file_name();
-        let name = filename
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("gc filename is not valid UTF-8"))?;
+/// Per-pass state for finishing each volume-committed handoff. Carries
+/// resources loaded once across the bare file set so a 90-line iteration
+/// body collapses to one `process_one(name, gc_body)` call.
+struct HandoffCursor<'a> {
+    fork_dir: &'a Path,
+    cache_dir: std::path::PathBuf,
+    volume_ulid: Ulid,
+    vk: elide_core::signing::VerifyingKey,
+    uploader: crate::upload::SegmentUploader<'a>,
+}
+
+impl HandoffCursor<'_> {
+    /// Run upload → promote → marker → input-cache cleanup → finalize for
+    /// one bare `gc/<name>` file. Returns `true` if the handoff completed
+    /// end-to-end; `false` if a step deferred (volume not running) — the
+    /// next tick retries idempotently.
+    async fn process_one(&self, name: &str, gc_body: &Path) -> Result<bool> {
         let new_ulid =
             Ulid::from_string(name).map_err(|e| anyhow::anyhow!("invalid gc filename: {e}"))?;
         let new_ulid_str = new_ulid.to_string();
-        let gc_body = entry.path();
-        let cache_body = cache_dir.join(format!("{new_ulid_str}.body"));
 
-        // Verify signature and extract the inputs list. Loading the volume
-        // key here (rather than at the top) keeps this function usable for
-        // empty-gc-dir cases without requiring volume.pub.
-        let vk =
-            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
-                .context("loading volume verifying key")?;
-        let (_, gc_entries, inputs) = segment::read_and_verify_segment_index(&gc_body, &vk)
+        let (_, gc_entries, inputs) = segment::read_and_verify_segment_index(gc_body, &self.vk)
             .with_context(|| {
                 format!("signature verification failed for compacted segment {new_ulid_str}")
             })?;
@@ -511,37 +595,31 @@ pub async fn apply_done_handoffs(
         // Upload + promote are idempotent: if a previous pass already
         // uploaded and promoted, the store PUT is a re-PUT of the same
         // bytes and `promote_segment` short-circuits on cache body presence.
-        crate::upload::upload_segment_file(
-            &gc_body,
-            &new_ulid_str,
-            volume_id,
-            store,
-            part_size_bytes,
-        )
-        .await
-        .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
+        self.uploader
+            .upload(gc_body, &new_ulid_str)
+            .await
+            .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
         // Promote IPC: volume writes index/<new>.idx, copies body to cache,
         // deletes stale index/<old>.idx for each input. The gc body stays
         // in place — we delete it at the end via `finalize_gc_handoff`.
-        if !crate::control::promote_segment(fork_dir, new_ulid).await {
+        if !crate::control::promote_segment(self.fork_dir, new_ulid).await {
             warn!("[gc] promote {new_ulid_str}: volume not running; will retry next tick");
-            continue;
+            return Ok(false);
         }
 
         // Write a retention marker at `retention/<gc_output_ulid>` listing
         // the consumed input ULIDs. The reaper deletes those inputs from
         // S3 (and the marker) once `ulid_timestamp(<gc_output_ulid>) +
-        // retention_retention` has passed — giving replicas a
-        // guaranteed grace period. See `docs/design-replica-model.md`.
+        // retention_retention` has passed — giving replicas a guaranteed
+        // grace period. See `docs/design-replica-model.md`.
         //
         // Idempotency: the marker key is the GC output ULID, so re-running
         // this loop after a crash re-PUTs the same key with the same body.
-        let volume_ulid = Ulid::from_string(volume_id)
-            .map_err(|e| anyhow::anyhow!("invalid volume_id '{volume_id}': {e}"))?;
         let body = render_marker(&inputs);
-        let key: StorePath = marker_key(volume_ulid, new_ulid);
-        store
+        let key: StorePath = marker_key(self.volume_ulid, new_ulid);
+        self.uploader
+            .store
             .put(&key, Bytes::from(body).into())
             .await
             .with_context(|| format!("writing retention marker {new_ulid_str}"))?;
@@ -553,23 +631,20 @@ pub async fn apply_done_handoffs(
         // sole deleter, so this does not race the volume's apply path.
         for old_ulid in &inputs {
             let old_ulid_str = old_ulid.to_string();
-            let _ = fs::remove_file(cache_dir.join(format!("{old_ulid_str}.body")));
-            let _ = fs::remove_file(cache_dir.join(format!("{old_ulid_str}.present")));
+            let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.body")));
+            let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.present")));
         }
 
         // Finalize: volume deletes bare `gc/<new>` inside the actor, under
         // the same lock as `apply_gc_handoffs`. This is the "done" signal —
         // no more retries for this handoff.
-        if !crate::control::finalize_gc_handoff(fork_dir, new_ulid).await {
+        if !crate::control::finalize_gc_handoff(self.fork_dir, new_ulid).await {
             warn!("[gc] finalize {new_ulid_str}: volume not running; will retry next tick");
-            continue;
+            return Ok(false);
         }
 
-        let _ = cache_body; // previously used for seg_promoted detection
-        count += 1;
+        Ok(true)
     }
-
-    Ok(count)
 }
 
 /// Delete any `gc/<ulid>.fetch` files left by a coordinator crash.
