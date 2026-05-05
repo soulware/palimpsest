@@ -1326,15 +1326,11 @@ proptest! {
 /// shrunk by `reclaim_crash_recovery` to the 7-op sequence below.
 ///
 /// After the fourth `WriteLargeMulti` overlaps a previously-written
-/// region, `reclaim_alias_merge` followed by `repack` and a crash leaves
+/// region, `reclaim_alias_merge` followed by `repack` and a crash left
 /// a previously-readable LBA returning all-zeros instead of the bytes
-/// the oracle wrote.
-///
-/// **Pre-existing bug** — reproduces on `main` and on every branch
-/// touched after this test was minted. Tracking issue: this branch's
-/// PR. The minimal sequence is materialised here per
-/// `feedback_proptest_deterministic_repro` so any fix attempt has a
-/// stable repro outside the proptest harness.
+/// the oracle wrote. Now fixed; kept as a regression guard so any
+/// future change to the reclaim → repack → crash path that re-breaks
+/// this shape fails outside the proptest harness.
 #[test]
 fn reclaim_crash_recovery_seed_a978281b_regression() {
     use elide_core::volume::Volume;
@@ -1409,12 +1405,10 @@ fn reclaim_crash_recovery_seed_a978281b_regression() {
 /// then 26..34, both with `seed = 102`), bracketed by
 /// `reclaim_alias_merge(24, 1)` calls and a final `WriteLargeMulti` at
 /// LBA 24..32 with `seed = 0`. After `sweep_pending` + crash, LBA 32
-/// reads back something other than the bytes the third
-/// `WriteLargeMulti` wrote — its content is not preserved across the
-/// crash boundary the way the oracle expects.
-///
-/// Materialised here per `feedback_proptest_deterministic_repro` so a
-/// fix attempt has a stable repro outside the proptest harness.
+/// read back something other than the bytes the third
+/// `WriteLargeMulti` wrote — its content was not preserved across the
+/// crash boundary the way the oracle expects. Now fixed; kept as a
+/// regression guard.
 #[test]
 fn reclaim_crash_recovery_seed_b0f166f0_regression() {
     use elide_core::volume::Volume;
