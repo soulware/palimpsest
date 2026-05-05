@@ -1,3 +1,4 @@
+pub mod bins;
 pub mod config;
 pub mod control;
 pub mod eligibility;

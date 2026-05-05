@@ -48,12 +48,7 @@ const EXIT_CONFIG: i32 = 78;
 
 /// Supervise a single fork: spawn `elide serve-volume`, restart on exit.
 /// Runs indefinitely; cancel the task to stop supervision.
-pub async fn supervise(
-    fork_dir: PathBuf,
-    data_dir: PathBuf,
-    elide_bin: PathBuf,
-    child_env: ChildEnv,
-) {
+pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, child_env: ChildEnv) {
     let label = fork_dir.display().to_string();
     let mut fast_failures: u32 = 0;
 
@@ -159,7 +154,7 @@ pub async fn supervise(
             remove_pid(&fork_dir);
         }
 
-        match spawn_volume(&fork_dir, &elide_bin, &child_env) {
+        match spawn_volume(&fork_dir, &child_env) {
             Ok(mut child) => {
                 let pid = child.id().unwrap_or(0);
                 info!("[supervisor {label}] started pid {pid}");
@@ -204,10 +199,9 @@ pub async fn supervise(
 
 fn spawn_volume(
     fork_dir: &Path,
-    elide_bin: &Path,
     child_env: &[(&'static str, String)],
 ) -> std::io::Result<tokio::process::Child> {
-    let mut cmd = Command::new(elide_bin);
+    let mut cmd = Command::new(elide_coordinator::bins::elide_bin());
     cmd.arg("serve-volume").arg(fork_dir);
 
     for (k, v) in child_env {

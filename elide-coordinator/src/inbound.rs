@@ -144,7 +144,6 @@ impl IpcContext {
 pub async fn serve(
     socket_path: &Path,
     ctx: IpcContext,
-    elide_import_bin: Arc<PathBuf>,
     store_config: Arc<StoreSection>,
     issuer: Arc<dyn CredentialIssuer>,
 ) {
@@ -185,7 +184,6 @@ pub async fn serve(
                 tokio::spawn(handle(
                     stream,
                     ctx.clone(),
-                    elide_import_bin.clone(),
                     store_config.clone(),
                     issuer.clone(),
                 ));
@@ -198,7 +196,6 @@ pub async fn serve(
 async fn handle(
     stream: tokio::net::UnixStream,
     ctx: IpcContext,
-    elide_import_bin: Arc<PathBuf>,
     store_config: Arc<StoreSection>,
     issuer: Arc<dyn CredentialIssuer>,
 ) {
@@ -226,7 +223,6 @@ async fn handle(
         &ctx,
         peer_pid,
         &mut writer,
-        &elide_import_bin,
         &store_config,
         issuer.as_ref(),
     )
@@ -241,17 +237,14 @@ async fn handle(
 /// verbs fail at the `serde_json::from_str` step — `serde` rejects
 /// unrecognised variants by default for internally-tagged enums.
 ///
-/// `elide_import_bin`, `store_config`, and `issuer` are daemon-owned
-/// resources used by exactly one handler each (`ImportStart`,
-/// `GetStoreConfig`, `Credentials`). Routed alongside the broadly-
-/// shared `ctx` rather than carried inside it.
-#[allow(clippy::too_many_arguments)]
+/// `store_config` and `issuer` are daemon-owned resources used by exactly
+/// one handler each (`GetStoreConfig`, `Credentials`). Routed alongside the
+/// broadly-shared `ctx` rather than carried inside it.
 async fn dispatch_json(
     line: &str,
     ctx: &IpcContext,
     peer_pid: Option<i32>,
     writer: &mut OwnedWriteHalf,
-    elide_import_bin: &Path,
     store_config: &StoreSection,
     issuer: &dyn CredentialIssuer,
 ) {
@@ -359,15 +352,7 @@ async fn dispatch_json(
             // subprocess writes locally only.
             let store = ctx.stores.coordinator_wide();
             let import_ctx = ctx.for_import();
-            let result = start_import(
-                &volume,
-                &oci_ref,
-                &extents_from,
-                &store,
-                elide_import_bin,
-                &import_ctx,
-            )
-            .await;
+            let result = start_import(&volume, &oci_ref, &extents_from, &store, &import_ctx).await;
             let env: Envelope<ImportStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -520,7 +505,6 @@ async fn start_import(
     oci_ref: &str,
     extents_from: &[String],
     store: &Arc<dyn ObjectStore>,
-    elide_import_bin: &Path,
     ctx: &crate::import::ImportContext,
 ) -> Result<ImportStartReply, IpcError> {
     let req = import::ImportRequest {
@@ -528,7 +512,7 @@ async fn start_import(
         oci_ref,
         extents_from,
     };
-    let ulid_str = import::spawn_import(req, elide_import_bin, store.clone(), ctx)
+    let ulid_str = import::spawn_import(req, store.clone(), ctx)
         .await
         .map_err(|e| IpcError::internal(format!("{e}")))?;
     let import_ulid = ulid::Ulid::from_string(&ulid_str)

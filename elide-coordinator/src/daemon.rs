@@ -49,13 +49,15 @@ use elide_coordinator::{
 pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Result<()> {
     let drain_interval = config.supervisor.drain_interval;
     let scan_interval = config.supervisor.scan_interval;
-    let elide_bin = config.elide_bin.clone();
-    let elide_import_bin = Arc::new(config.elide_import_bin.clone());
     let gc_config = config.gc.clone();
     // Install the configured multipart chunk size as a process-global so
     // SegmentUploader (deep in the upload path) can read it without us
     // threading the value through every layer between here and there.
     elide_coordinator::upload::set_part_size_bytes(config.store.multipart_part_size_bytes());
+    // Same pattern for the sibling-binary paths used by the supervisor
+    // (`elide serve-volume`) and the import path (`elide-import`).
+    elide_coordinator::bins::set_elide_bin(config.elide_bin.clone());
+    elide_coordinator::bins::set_elide_import_bin(config.elide_import_bin.clone());
     let socket_path = config.resolved_socket_path();
     let data_dir = Arc::new(config.data_dir.clone());
     let child_env: supervisor::ChildEnv = {
@@ -150,7 +152,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         data_dir.display(),
         humantime::format_duration(drain_interval),
         humantime::format_duration(scan_interval),
-        elide_bin.display(),
+        elide_coordinator::bins::elide_bin().display(),
     );
 
     // Reconcile by_name/ against by_id/: remove symlinks whose target no longer
@@ -223,7 +225,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             peer_fetch: peer_fetch_handle.clone(),
         };
         tasks.spawn(async move {
-            inbound::serve(&socket_path, ctx, elide_import_bin, store_config, issuer).await;
+            inbound::serve(&socket_path, ctx, store_config, issuer).await;
         });
     }
 
@@ -382,7 +384,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     tasks.spawn(supervisor::supervise(
                         vol_dir,
                         data_dir.as_ref().clone(),
-                        elide_bin.clone(),
                         child_env.clone(),
                     ));
                 }

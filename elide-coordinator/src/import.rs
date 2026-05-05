@@ -271,10 +271,10 @@ pub struct ImportRequest<'a> {
 /// symlink. Returns the import job ULID.
 pub async fn spawn_import(
     req: ImportRequest<'_>,
-    elide_import_bin: &Path,
     store: Arc<dyn ObjectStore>,
     ctx: &ImportContext,
 ) -> std::io::Result<String> {
+    let elide_import_bin = elide_coordinator::bins::elide_import_bin();
     let data_dir: &Path = &ctx.core.data_dir;
     let registry = &ctx.registry;
     let rescan_notify = ctx.core.rescan.clone();
