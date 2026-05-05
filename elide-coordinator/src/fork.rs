@@ -437,14 +437,7 @@ impl ForkOrchestrator {
             }
         }
 
-        let store = self.ctx.core.stores.coordinator_wide();
-        let reply = snapshot_volume(
-            &name,
-            &self.ctx.core.data_dir,
-            &self.ctx.snapshot_locks,
-            &store,
-        )
-        .await?;
+        let reply = snapshot_volume(&name, &self.ctx.core, &self.ctx.snapshot_locks).await?;
         self.job.append(ForkAttachEvent::SnapshotTaken {
             snap_ulid: reply.snap_ulid,
         });
