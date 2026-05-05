@@ -811,7 +811,7 @@ impl ClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
 
         register_prefetch_or_get(&self.ctx.prefetch_tracker, new_fork.vol_ulid);
-        self.ctx.core.rescan.notify_one();
+        crate::rescan::trigger();
         self.job.append(ClaimAttachEvent::ForkCreated {
             new_vol_ulid: new_fork.vol_ulid,
         });

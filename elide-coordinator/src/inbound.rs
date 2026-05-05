@@ -26,7 +26,6 @@ use object_store::ObjectStore;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::claim::{ClaimJobState, ClaimRegistry};
@@ -62,7 +61,6 @@ use elide_core::process::pid_is_alive;
 #[derive(Clone)]
 pub struct IpcContext {
     pub data_dir: Arc<PathBuf>,
-    pub rescan: Arc<Notify>,
     pub registry: ImportRegistry,
     pub fork_registry: ForkRegistry,
     pub claim_registry: ClaimRegistry,
@@ -86,7 +84,6 @@ pub struct IpcContext {
 #[derive(Clone)]
 pub struct CoordinatorCore {
     pub data_dir: Arc<PathBuf>,
-    pub rescan: Arc<Notify>,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
 }
@@ -96,7 +93,6 @@ impl IpcContext {
     pub(crate) fn core(&self) -> CoordinatorCore {
         CoordinatorCore {
             data_dir: self.data_dir.clone(),
-            rescan: self.rescan.clone(),
             stores: self.stores.clone(),
             identity: self.identity.clone(),
         }
@@ -229,7 +225,7 @@ async fn dispatch_json(
 
     match request {
         Request::Rescan => {
-            ctx.rescan.notify_one();
+            crate::rescan::trigger();
             let env: Envelope<()> = Envelope::ok(());
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -1303,7 +1299,7 @@ async fn create_volume_op(
         return Err(IpcError::internal(format!("create failed: {e}")));
     }
 
-    core.rescan.notify_one();
+    crate::rescan::trigger();
     info!("[inbound] created volume {name} ({vol_ulid_str})");
     Ok(CreateReply { vol_ulid })
 }
@@ -1948,7 +1944,6 @@ async fn release_volume_op(
     let identity = &ctx.identity;
     let data_dir: &Path = &ctx.data_dir;
     let snapshot_locks = &ctx.snapshot_locks;
-    let rescan: &Notify = &ctx.rescan;
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
@@ -2067,7 +2062,7 @@ async fn release_volume_op(
             "clearing volume.stopped for release: {e}"
         )));
     }
-    rescan.notify_one();
+    crate::rescan::trigger();
     let mut _draining_guard = Some(DrainingMarkerGuard::new(vol_dir.clone()));
 
     let bringup_started = std::time::Instant::now();
@@ -2400,7 +2395,7 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
 
     std::fs::remove_file(vol_dir.join(STOPPED_FILE))
         .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
-    core.rescan.notify_one();
+    crate::rescan::trigger();
     info!("[inbound] started volume {volume_name}");
     Ok(())
 }
@@ -3415,7 +3410,6 @@ mod tests {
 
         let ctx = IpcContext {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
-            rescan: Arc::new(Notify::new()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
             claim_registry: crate::claim::new_registry(),

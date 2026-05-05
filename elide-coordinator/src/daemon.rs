@@ -29,7 +29,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use elide_coordinator::stores::ScopedStores;
 use humantime_serde::re::humantime;
-use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
@@ -177,9 +176,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // ublk.id remains), or an operator manually deleted a device.
     crate::ublk_sweep::reconcile(&data_dir).await;
 
-    // Shared notify: inbound socket triggers this to request an immediate rescan.
-    let rescan_notify = Arc::new(Notify::new());
-
     // Import job registry: tracks running and recently-completed import jobs.
     let import_registry = import::new_registry();
 
@@ -221,7 +217,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     {
         let ctx = inbound::IpcContext {
             data_dir: data_dir.clone(),
-            rescan: rescan_notify.clone(),
             registry: import_registry.clone(),
             fork_registry: fork_registry.clone(),
             claim_registry: claim_registry.clone(),
@@ -401,7 +396,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
         tokio::select! {
             _ = scan_tick.tick() => {}
-            _ = rescan_notify.notified() => {
+            _ = crate::rescan::wait() => {
                 info!("[coordinator] rescan triggered via socket");
             }
             _ = tokio::signal::ctrl_c() => {
