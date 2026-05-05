@@ -1505,10 +1505,14 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
 /// checkpoint. After `Crash`, LBA 48 reads back all-zeros instead of
 /// `incompressible_block(1)`.
 ///
-/// **Pre-existing bug** — the dedup-across-LBAs + half-promote +
-/// gc-apply interaction loses the second LBA's reference during
-/// rebuild. Materialised here per `feedback_proptest_deterministic_repro`
-/// so a fix attempt has a stable repro outside the proptest harness.
+/// Root cause was in the test helper `simulate_coord_gc_local`'s
+/// compactor: a point query (`lba_map.hash_at(start_lba)`) misclassified
+/// any multi-LBA entry whose head LBA had been overwritten as fully
+/// LBA-dead and demoted it to `Canonical`. Production
+/// `elide-coordinator::gc::collect_stats` already used a full-range scan
+/// via `extents_in_range`; the helper was rewritten to mirror that and
+/// emit `PlanOutput::Run` for surviving sub-runs. Kept as a regression
+/// guard.
 #[test]
 fn crash_recovery_writemulti_dedup_regression() {
     use elide_core::volume::Volume;
