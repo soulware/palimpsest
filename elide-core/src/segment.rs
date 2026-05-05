@@ -143,6 +143,13 @@ pub trait SegmentFetcher: Send + Sync {
     /// Implementations should issue exactly one GET against the owner
     /// rather than fanning out a chain walk that 404s on every
     /// non-owner ancestor.
+    ///
+    /// `presence` is the in-memory presence bitset for this segment,
+    /// shared via `Arc` with every reader's snapshot. The fetcher
+    /// updates it inside its per-segment `.present` write lock to
+    /// match the freshly-written on-disk bitmap, so the next read
+    /// observes the new bits via a single atomic load. Implementations
+    /// that don't track presence (test mocks) may ignore the argument.
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
@@ -150,6 +157,7 @@ pub trait SegmentFetcher: Send + Sync {
         index_dir: &Path,
         body_dir: &Path,
         extent: &ExtentFetch,
+        presence: Option<Arc<crate::extentindex::SegmentPresence>>,
     ) -> io::Result<()>;
 
     /// Fetch a segment's delta body section and write it atomically to
@@ -235,6 +243,7 @@ pub trait SegmentFetcher: Send + Sync {
                     body_length: entry.stored_length,
                     entry_idx: idx,
                 },
+                None,
             )?;
             bytes_fetched = bytes_fetched.saturating_add(entry.stored_length as u64);
         }

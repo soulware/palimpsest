@@ -198,6 +198,7 @@ impl SegmentFetcher for LocalStoreFetcher {
         _index_dir: &Path,
         body_dir: &Path,
         extent: &segment::ExtentFetch,
+        _presence: Option<std::sync::Arc<elide_core::extentindex::SegmentPresence>>,
     ) -> io::Result<()> {
         let sid = segment_id.to_string();
         let store_path = self.store_dir.join(&sid);

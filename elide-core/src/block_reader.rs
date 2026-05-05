@@ -425,7 +425,7 @@ impl BlockReader {
     }
 
     /// Demand-fetch the body for `loc` if it's a `Cached` extent missing its
-    /// `.present` bit. No-op for `Local` extents.
+    /// presence bit. No-op for `Local` extents.
     fn ensure_extent_present(&self, loc: &ExtentLocation) -> io::Result<()> {
         let extentindex::BodySource::Cached(entry_idx) = loc.body_source else {
             return Ok(());
@@ -441,8 +441,8 @@ impl BlockReader {
                     ),
                 )
             })?;
-        let present_path = body_dir.join(format!("{}.present", loc.segment_id));
-        if segment::check_present_bit(&present_path, entry_idx)? {
+        let presence = self.extent_index.segment_presence(loc.segment_id);
+        if presence.is_some_and(|p| p.test(entry_idx)) {
             return Ok(());
         }
         match &self.fetcher {
@@ -457,6 +457,7 @@ impl BlockReader {
                     body_length: loc.body_length,
                     entry_idx,
                 },
+                presence.cloned(),
             ),
             None => Err(io::Error::other(format!(
                 "extent {}[{}] not cached and no fetcher configured",
@@ -570,6 +571,7 @@ fn apply_snapshot_layer(
     layer: &SnapshotLayer,
 ) -> io::Result<()> {
     let index_dir = layer.dir.join("index");
+    let cache_dir = layer.dir.join("cache");
     for seg in &layer.segs {
         let idx_path = index_dir.join(format!("{seg}.idx"));
         let body_section_start = segment::idx_body_section_start(&idx_path)?;
@@ -587,6 +589,22 @@ fn apply_snapshot_layer(
         } else {
             Vec::new()
         };
+
+        // Snapshot-pinned layers index Cached-tier segments only — same
+        // shape as the `Index` branch of `extentindex::rebuild`.
+        let present_path = cache_dir.join(format!("{seg}.present"));
+        let present_bytes = match std::fs::read(&present_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        extent_index.set_segment_presence(
+            *seg,
+            std::sync::Arc::new(extentindex::SegmentPresence::from_bytes(
+                &present_bytes,
+                entries.len() as u32,
+            )),
+        );
 
         for (raw_idx, entry) in entries.iter().enumerate() {
             // LBA map: every non-canonical entry contributes its range →

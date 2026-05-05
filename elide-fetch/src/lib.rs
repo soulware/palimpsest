@@ -448,6 +448,7 @@ impl SegmentFetcher for RemoteFetcher {
         index_dir: &Path,
         body_dir: &Path,
         extent: &segment::ExtentFetch,
+        presence: Option<Arc<elide_core::extentindex::SegmentPresence>>,
     ) -> io::Result<()> {
         fetch_one_extent(
             &*self.store,
@@ -461,6 +462,7 @@ impl SegmentFetcher for RemoteFetcher {
                 max_batch_bytes: self.max_batch_bytes,
             },
             &self.coalescer,
+            presence.as_deref(),
         )
     }
 
@@ -519,6 +521,7 @@ fn fetch_one_extent(
     body_dir: &Path,
     extent: &ExtentFetchParams,
     coalescer: &FetchCoalescer,
+    presence: Option<&elide_core::extentindex::SegmentPresence>,
 ) -> io::Result<()> {
     let segment_id = segment_ulid.to_string();
     let idx_path = index_dir.join(format!("{segment_id}.idx"));
@@ -634,6 +637,7 @@ fn fetch_one_extent(
                 batch_last,
                 next_expected_offset,
                 coalescer,
+                presence,
             },
             lease,
         );
@@ -671,6 +675,11 @@ struct BatchContext<'a> {
     /// this lock so disjoint leases on the same segment don't
     /// clobber each other's bits via a stale-snapshot RMW.
     coalescer: &'a FetchCoalescer,
+    /// In-memory presence bitset shared with every reader's snapshot.
+    /// Refreshed under the same per-segment lock so the bitset
+    /// re-converges to the on-disk state on every fetch — covers the
+    /// post-eviction case where the on-disk file restarted from zero.
+    presence: Option<&'a elide_core::extentindex::SegmentPresence>,
 }
 
 fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
@@ -687,6 +696,7 @@ fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
         batch_last,
         next_expected_offset,
         coalescer,
+        presence,
     } = ctx;
     let batch_body_start = entries[start].stored_offset;
     let batch_body_end = next_expected_offset; // = entries[batch_last].stored_offset + len
@@ -792,6 +802,17 @@ fn fetch_batch(ctx: BatchContext<'_>, _lease: BatchLease) -> io::Result<()> {
     }
     segment::write_file_atomic(present_path, &new_present)
         .map_err(|e| io::Error::other(format!("write .present: {e}")))?;
+
+    // Re-sync the in-memory bitset to the bytes we just persisted.
+    // This is the post-eviction recovery path: if the on-disk file
+    // restarted from zero between two reads on the same volume, the
+    // in-memory bitset still carries the pre-eviction "all set"
+    // bits. Replacing here clears those stale bits and installs the
+    // freshly-fetched ones inside the same per-segment lock that
+    // serialises every other writer on this segment.
+    if let Some(p) = presence {
+        p.replace_from_bytes(&new_present);
+    }
 
     tracing::debug!(
         segment_id,
@@ -1365,6 +1386,7 @@ mod tests {
                     body_length: entries[0].stored_length,
                     entry_idx: 0,
                 },
+                None,
             )
             .unwrap();
 
@@ -1467,6 +1489,7 @@ mod tests {
                     body_length: entries[0].stored_length,
                     entry_idx: 0,
                 },
+                None,
             )
             .unwrap();
 
@@ -1562,6 +1585,7 @@ mod tests {
                     body_length: entries[0].stored_length,
                     entry_idx: 0,
                 },
+                None,
             )
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -2027,6 +2051,7 @@ mod tests {
                             body_length: entry0_length,
                             entry_idx: 0,
                         },
+                        None,
                     );
                     if let Err(e) = result {
                         errs.lock().unwrap().push(format!("{e:#}"));
@@ -2197,6 +2222,7 @@ mod tests {
                             body_length,
                             entry_idx: i as u32,
                         },
+                        None,
                     );
                     if let Err(e) = result {
                         errs.lock().unwrap().push(format!("entry {i}: {e:#}"));

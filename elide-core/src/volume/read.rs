@@ -254,11 +254,35 @@ pub(crate) fn read_extents(
             continue;
         }
 
-        // For cached entries, always call find_segment to check the .present
-        // bitset — the .body file may exist but the specific entry may not
-        // yet be fetched.
+        // Skip `find_segment` entirely on FD-cache hit + bit-set: the
+        // FileCache keeps the FD and the file layout for this segment,
+        // and the in-memory presence bitset already tells us this
+        // entry's bytes are durable in the cached file. The dir-probe
+        // chain in `find_segment_in_dirs` is the dominant per-extent
+        // cost on a pulled host, so this is the steady-state win.
+        //
+        // We must still call `find_segment` when:
+        //   * the FD isn't cached yet (first read of this segment),
+        //   * the bit is clear (file may exist but this entry's bytes
+        //     are not yet fetched — `find_segment` will demand-fetch),
+        //   * or no bitset is registered for this segment, in which
+        //     case `find_segment_in_dirs` falls back to reading the
+        //     on-disk `.present` (covers test bypasses / pre-rebuild).
+        //
+        // The fetcher updates the bitset under its per-segment lock,
+        // and `cache/<id>.body` is grown in place (no rename), so a
+        // hot FD remains valid across demand-fetch completion. Inode
+        // replacement events (sweep/drain/GC apply) bump `flush_gen`
+        // and clear the entire FileCache, so a hot FD here is
+        // guaranteed to point at the same inode the bitset describes.
+        let presence_known_set = match body_source {
+            BodySource::Local => true,
+            BodySource::Cached(idx) => extent_index
+                .segment_presence(segment_id)
+                .is_some_and(|p| p.test(idx)),
+        };
         let mut cache = file_cache.borrow_mut();
-        if matches!(body_source, BodySource::Cached(_)) || cache.get(segment_id).is_none() {
+        if !presence_known_set || cache.get(segment_id).is_none() {
             let path = find_segment(segment_id, body_section_start, body_source)?;
             let layout = SegmentLayout::from_path(&path);
             cache.insert(segment_id, layout, fs::File::open(&path)?);
@@ -397,10 +421,18 @@ fn try_read_delta_extent(
             idata.to_vec()
         }
     } else {
+        // Same FD-cache + bitset short-circuit as the main read path:
+        // skip `find_segment` when the FD is hot and presence is known
+        // set, since `cache/<id>.body` is grown in place and inode
+        // replacement bumps `flush_gen` (which clears the FileCache).
+        let presence_known_set = match source_loc.body_source {
+            BodySource::Local => true,
+            BodySource::Cached(idx) => extent_index
+                .segment_presence(source_loc.segment_id)
+                .is_some_and(|p| p.test(idx)),
+        };
         let mut cache = file_cache.borrow_mut();
-        if matches!(source_loc.body_source, BodySource::Cached(_))
-            || cache.get(source_loc.segment_id).is_none()
-        {
+        if !presence_known_set || cache.get(source_loc.segment_id).is_none() {
             let path = find_segment(
                 source_loc.segment_id,
                 source_loc.body_section_start,
@@ -556,14 +588,23 @@ pub(crate) fn open_delta_body_in_dirs(
     ))
 }
 
-/// Gate a `cache/<id>.body` hit on the `.present` bit for `Cached` entries.
-/// Returns true for any non-cache layout (wal/pending/gc) and for cache hits
-/// on `Local` entries. For `Cached` cache hits, checks the corresponding
-/// `cache/<id>.present` bit alongside the `.body` file in `dir`.
+/// Gate a `cache/<id>.body` hit on the per-entry presence bit for
+/// `Cached` entries. Returns true for any non-cache layout
+/// (wal/pending/gc) and for cache hits on `Local` entries.
+///
+/// For `Cached` cache hits, prefer the in-memory presence bitset
+/// (one atomic load, no syscall — the steady-state case after a
+/// normal rebuild). Fall back to reading the on-disk
+/// `cache/<id>.present` when the bitset isn't installed in memory:
+/// this covers paths that bypass the actor's normal promote/drain
+/// flow (e.g. test helpers that move files directly), and any
+/// transient window during init where `find_segment_in_dirs` is
+/// invoked before the relevant segment's bitset has been loaded.
 fn cache_hit_allowed(
     layout: segment::SegmentBodyLayout,
     dir: &Path,
-    sid: &str,
+    extent_index: &extentindex::ExtentIndex,
+    segment_id: Ulid,
     body_source: BodySource,
 ) -> bool {
     if layout != segment::SegmentBodyLayout::BodyOnly {
@@ -572,6 +613,10 @@ fn cache_hit_allowed(
     match body_source {
         BodySource::Local => true,
         BodySource::Cached(idx) => {
+            if let Some(p) = extent_index.segment_presence(segment_id) {
+                return p.test(idx);
+            }
+            let sid = segment_id.to_string();
             let present_path = dir.join("cache").join(format!("{sid}.present"));
             segment::check_present_bit(&present_path, idx).unwrap_or(false)
         }
@@ -599,6 +644,7 @@ pub(crate) fn find_segment_in_dirs(
     base_dir: &Path,
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
+    extent_index: &extentindex::ExtentIndex,
     body_section_start: u64,
     body_source: BodySource,
 ) -> io::Result<PathBuf> {
@@ -609,18 +655,17 @@ pub(crate) fn find_segment_in_dirs(
     // commit point of apply), before the coordinator has promoted the body to
     // `cache/`.
     if let Some((path, layout)) = segment::locate_segment_body(base_dir, segment_id)
-        && cache_hit_allowed(layout, base_dir, &sid, body_source)
+        && cache_hit_allowed(layout, base_dir, extent_index, segment_id, body_source)
     {
         return Ok(path);
     }
     // Ancestor layers: segments here are always fork-parent state. They cannot
     // be mid-GC-handoff from this child's perspective, and they have no live
     // wal/, but pending/ and cache/<id>.body can both appear — the same helper
-    // yields the right path; we just re-gate cache hits on the layer's own
-    // `.present` file.
+    // yields the right path; cache hits re-gate on the same in-memory bitset.
     for layer in ancestor_layers.iter().rev() {
         if let Some((path, layout)) = segment::locate_segment_body(&layer.dir, segment_id)
-            && cache_hit_allowed(layout, &layer.dir, &sid, body_source)
+            && cache_hit_allowed(layout, &layer.dir, extent_index, segment_id, body_source)
         {
             return Ok(path);
         }
@@ -657,6 +702,12 @@ pub(crate) fn find_segment_in_dirs(
             })?;
         let index_dir = owner_dir.join("index");
         let body_dir = owner_dir.join("cache");
+        // Hand the fetcher the same Arc<SegmentPresence> reachable from
+        // every reader's snapshot. The fetcher refreshes the bitset
+        // from the freshly-written on-disk `.present` inside its
+        // per-segment lock, so post-eviction stale bits get cleared
+        // there rather than via any actor coordination.
+        let presence = extent_index.segment_presence(segment_id).cloned();
         fetcher.fetch_extent(
             segment_id,
             owner_vol_id,
@@ -668,6 +719,7 @@ pub(crate) fn find_segment_in_dirs(
                 body_length: 0,
                 entry_idx: idx,
             },
+            presence,
         )?;
         return Ok(body_dir.join(format!("{sid}.body")));
     }
