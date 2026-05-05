@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use object_store::ObjectStore;
-use tokio::sync::Notify;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -428,7 +427,7 @@ impl ForkOrchestrator {
                     "clearing volume.stopped for fork drain: {e}"
                 )));
             }
-            self.ctx.core.rescan.notify_one();
+            crate::rescan::trigger();
             draining_guard = Some(DrainingMarkerGuard::new(source_dir.clone()));
             if !wait_for_control_sock(&source_dir, std::time::Duration::from_secs(30)).await {
                 return Err(IpcError::internal(format!(
@@ -746,7 +745,6 @@ async fn fork_create_op(
 ) -> Result<ForkCreateReply, IpcError> {
     let identity = &ctx.core.identity;
     let data_dir: &Path = &ctx.core.data_dir;
-    let rescan: &Notify = &ctx.core.rescan;
     let prefetch_tracker = &ctx.prefetch_tracker;
     let coord_id = identity.coordinator_id_str();
     validate_volume_name(new_name).map_err(IpcError::bad_request)?;
@@ -1039,7 +1037,7 @@ async fn fork_create_op(
     // holds the entry until the per-fork task's Drop guard removes it.
     let _ = register_prefetch_or_get(prefetch_tracker, new_vol_ulid_value);
 
-    rescan.notify_one();
+    crate::rescan::trigger();
     info!("[inbound] forked volume {new_name} ({new_vol_ulid}) from {source_ulid_str}");
     Ok(ForkCreateReply {
         new_vol_ulid: new_vol_ulid_value,

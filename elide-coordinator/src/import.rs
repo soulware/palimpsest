@@ -277,7 +277,6 @@ pub async fn spawn_import(
     let elide_import_bin = elide_coordinator::bins::elide_import_bin();
     let data_dir: &Path = &ctx.core.data_dir;
     let registry = &ctx.registry;
-    let rescan_notify = ctx.core.rescan.clone();
     let identity = ctx.core.identity.clone();
     let ImportRequest {
         vol_name,
@@ -419,7 +418,7 @@ pub async fn spawn_import(
         tokio::spawn(async move {
             loop {
                 if watch_dir.join("control.sock").exists() {
-                    rescan_notify.notify_one();
+                    crate::rescan::trigger();
                     break;
                 }
                 if !watch_lock.exists() {

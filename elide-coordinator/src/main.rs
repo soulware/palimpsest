@@ -16,6 +16,7 @@ mod fork;
 mod import;
 mod inbound;
 mod macaroon;
+mod rescan;
 mod supervisor;
 mod ublk_sweep;
 
