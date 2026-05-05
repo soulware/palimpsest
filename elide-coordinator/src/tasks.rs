@@ -12,7 +12,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use object_store::ObjectStore;
@@ -87,14 +87,39 @@ fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
 ///
 /// Exits when the volume directory is removed. Intended to be spawned as a
 /// tokio task.
-/// Peer-fetch handle passed into [`run_volume_tasks`] when the
-/// coordinator has peer-fetch configured. `client` mints tokens via
-/// the coordinator's identity and pools HTTP/2 connections; the
-/// per-volume task uses it to construct a [`prefetch::PeerFetchContext`]
-/// after running the discovery hook.
+/// Peer-fetch handle. `Some` when `[peer_fetch].port` is configured;
+/// installed as a process-global by `daemon::run` and read on demand by
+/// the per-volume task ([`run_volume_tasks`]), the claim orchestrator
+/// (peer discovery), and the IPC `Register` handler. `client` mints
+/// tokens via the coordinator's identity and pools HTTP/2 connections.
 #[derive(Clone)]
 pub struct PeerFetchHandle {
     pub client: elide_peer_fetch::PeerFetchClient,
+}
+
+/// Process-global peer-fetch handle. Set once by `daemon::run`
+/// (always — `None` when `[peer_fetch].port` is not configured); read
+/// from the per-volume task, the claim orchestrator's peer-discovery
+/// stage, and the `Request::Register` IPC handler. Stored as
+/// `Option<&'static PeerFetchHandle>` via `Box::leak` so reads cost
+/// nothing and the value can be plumbed nowhere.
+static PEER_FETCH: OnceLock<Option<&'static PeerFetchHandle>> = OnceLock::new();
+
+/// Install the daemon-wide peer-fetch handle. Called once by
+/// `daemon::run` before per-volume tasks spawn or the IPC socket is
+/// bound. Pass `None` when peer-fetch is disabled. Later calls are
+/// silently ignored.
+pub fn set_peer_fetch_handle(handle: Option<PeerFetchHandle>) {
+    let leaked: Option<&'static PeerFetchHandle> = handle.map(|h| &*Box::leak(Box::new(h)));
+    let _ = PEER_FETCH.set(leaked);
+}
+
+/// Read the daemon-wide peer-fetch handle. Returns `None` when
+/// peer-fetch is disabled in config, or when the setter has not been
+/// called (the path tests of leaf helpers like `peer_discovery::*`
+/// take — they bypass the daemon plumbing entirely).
+pub fn peer_fetch_handle() -> Option<&'static PeerFetchHandle> {
+    PEER_FETCH.get().copied().unwrap_or(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -107,7 +132,6 @@ pub async fn run_volume_tasks(
     snapshot_locks: SnapshotLockRegistry,
     prefetch_done: Arc<watch::Sender<PrefetchState>>,
     prefetch_tracker: PrefetchTracker,
-    peer_fetch: Option<PeerFetchHandle>,
 ) {
     // Drop guard: when this task exits (clean break, await-point cancellation
     // on JoinSet abort, or panic) the tracker entry is removed. Combined with
@@ -176,7 +200,7 @@ pub async fn run_volume_tasks(
         // has a clean Released predecessor with a published peer-endpoint.
         // Discovery is best-effort — every failure path here collapses
         // to `None` and prefetch falls through to S3 cleanly.
-        let peer_ctx = match (peer_fetch.as_ref(), read_volume_name(&fork_dir)) {
+        let peer_ctx = match (peer_fetch_handle(), read_volume_name(&fork_dir)) {
             (Some(handle), Some(volume_name)) => {
                 crate::peer_discovery::discover_peer_for_claim(&store, &volume_name)
                     .await

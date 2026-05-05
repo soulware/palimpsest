@@ -43,13 +43,14 @@ use elide_coordinator::volume_state::STOPPED_FILE;
 
 /// Coordinator state needed by the claim flow: the universal hot core
 /// plus the claim-domain registries. Constructed via
-/// [`crate::inbound::IpcContext::for_claim`].
+/// [`crate::inbound::IpcContext::for_claim`]. The peer-fetch handle is
+/// a process-global; the orchestrator reads it on demand inside
+/// `discover_peer` rather than carrying it on the context.
 #[derive(Clone)]
 pub(crate) struct ClaimContext {
     pub core: CoordinatorCore,
     pub claim_registry: ClaimRegistry,
     pub prefetch_tracker: elide_coordinator::PrefetchTracker,
-    pub peer_fetch: Option<elide_coordinator::tasks::PeerFetchHandle>,
 }
 
 // ── Job + registry ────────────────────────────────────────────────────────────
@@ -571,7 +572,7 @@ impl ClaimOrchestrator {
     /// claimer published a peer endpoint. Peer auth now accepts our coord_id
     /// (we `mark_claimed` in stage 1), so peer requests will succeed.
     async fn discover_peer(&mut self) {
-        let Some(handle) = self.ctx.peer_fetch.as_ref() else {
+        let Some(handle) = elide_coordinator::tasks::peer_fetch_handle() else {
             return;
         };
         let store_wide = self.ctx.core.stores.coordinator_wide();
