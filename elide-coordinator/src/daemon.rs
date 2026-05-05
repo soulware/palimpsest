@@ -52,7 +52,10 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     let elide_bin = config.elide_bin.clone();
     let elide_import_bin = Arc::new(config.elide_import_bin.clone());
     let gc_config = config.gc.clone();
-    let part_size_bytes = config.store.multipart_part_size_bytes();
+    // Install the configured multipart chunk size as a process-global so
+    // SegmentUploader (deep in the upload path) can read it without us
+    // threading the value through every layer between here and there.
+    elide_coordinator::upload::set_part_size_bytes(config.store.multipart_part_size_bytes());
     let socket_path = config.resolved_socket_path();
     let data_dir = Arc::new(config.data_dir.clone());
     let child_env: supervisor::ChildEnv = {
@@ -216,7 +219,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             snapshot_locks: snapshot_locks.clone(),
             prefetch_tracker: prefetch_tracker.clone(),
             stores: stores.clone(),
-            part_size_bytes,
             identity: identity.clone(),
             peer_fetch: peer_fetch_handle.clone(),
         };
@@ -367,7 +369,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     vol_store,
                     drain_interval,
                     gc_config.clone(),
-                    part_size_bytes,
                     evict_rx,
                     snapshot_locks.clone(),
                     prefetch_tx,

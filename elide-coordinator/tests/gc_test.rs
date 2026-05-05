@@ -434,7 +434,6 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ))
     .unwrap();
 
@@ -474,7 +473,6 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ))
     .unwrap();
 
@@ -587,7 +585,6 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ))
     .unwrap();
 
@@ -707,7 +704,6 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ))
     .unwrap();
 
@@ -809,7 +805,6 @@ fn drain_failure_skips_gc_and_data_survives() {
             fork_dir,
             "00000000000000000000000000",
             &fail_store,
-            upload::DEFAULT_PART_SIZE_BYTES,
         ))
         .expect("drain_pending itself should not error");
     assert!(
@@ -844,7 +839,6 @@ fn drain_failure_skips_gc_and_data_survives() {
             fork_dir,
             "00000000000000000000000000",
             &good_store,
-            upload::DEFAULT_PART_SIZE_BYTES,
         ))
         .expect("drain should succeed with good store");
     assert_eq!(
@@ -861,7 +855,6 @@ fn drain_failure_skips_gc_and_data_survives() {
         fork_dir,
         "00000000000000000000000000",
         &good_store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ))
     .unwrap();
 
@@ -998,7 +991,6 @@ fn gc_restart_safety_applied_handoff() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ))
     .unwrap();
 
@@ -1165,7 +1157,6 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
             fork_dir,
             "00000000000000000000000000",
             &store,
-            elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
         ));
     };
 
@@ -1299,7 +1290,6 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
             fork_dir,
             "00000000000000000000000000",
             &store,
-            elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
         ));
     };
 
@@ -1445,7 +1435,6 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
             fork_dir,
             "00000000000000000000000000",
             &store,
-            elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
         ));
     };
 
