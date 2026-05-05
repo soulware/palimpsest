@@ -58,6 +58,11 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // (`elide serve-volume`) and the import path (`elide-import`).
     elide_coordinator::bins::set_elide_bin(config.elide_bin.clone());
     elide_coordinator::bins::set_elide_import_bin(config.elide_import_bin.clone());
+    // And for the `[store]` config vended over `GetStoreConfig` to
+    // spawned volume subprocesses. Box::leak keeps the value as a
+    // `&'static StoreSection` so the IPC handler reads it without any
+    // threading from `daemon::run`.
+    elide_coordinator::config::set_store_config(config.store.clone());
     let socket_path = config.resolved_socket_path();
     let data_dir = Arc::new(config.data_dir.clone());
     let child_env: supervisor::ChildEnv = {
@@ -72,8 +77,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         ));
         Arc::new(env)
     };
-    let store_config = Arc::new(config.store.clone());
-
     std::fs::create_dir_all(data_dir.as_ref())
         .with_context(|| format!("creating data_dir: {}", data_dir.display()))?;
     std::fs::create_dir_all(data_dir.join("by_id"))
@@ -225,7 +228,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             peer_fetch: peer_fetch_handle.clone(),
         };
         tasks.spawn(async move {
-            inbound::serve(&socket_path, ctx, store_config, issuer).await;
+            inbound::serve(&socket_path, ctx, issuer).await;
         });
     }
 

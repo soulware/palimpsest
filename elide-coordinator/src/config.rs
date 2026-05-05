@@ -45,7 +45,7 @@
 // All duration fields use humantime ("5s", "30m", "24h").
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -323,6 +323,36 @@ impl StoreSection {
             ))
         }
     }
+}
+
+/// Process-global daemon `[store]` configuration. Set once by
+/// `daemon::run` from the parsed `CoordinatorConfig`; read by the IPC
+/// handler that vends store config to volume subprocesses
+/// (`render_store_config` for `Request::GetStoreConfig`). Stored as
+/// `&'static StoreSection` via `Box::leak` so the value can be plumbed
+/// nowhere — IPC handlers read it directly — and so reads cost nothing
+/// (no `Arc` clones, no `OnceLock` lookup falling back to a default).
+static STORE_CONFIG: OnceLock<&'static StoreSection> = OnceLock::new();
+
+/// Install the daemon-wide `[store]` config. Called once by
+/// `daemon::run` before the IPC socket is bound; later calls are
+/// silently ignored.
+pub fn set_store_config(store: StoreSection) {
+    let _ = STORE_CONFIG.set(Box::leak(Box::new(store)));
+}
+
+/// Read the daemon-wide `[store]` config.
+///
+/// Panics if `set_store_config` has not been called. The only caller
+/// is `render_store_config` in `inbound::dispatch_json`, reachable
+/// only via the IPC server bound after `daemon::run` installs the
+/// value — so the unset case is an impossible-to-violate invariant
+/// in production, and no test path reaches this getter.
+pub fn store_config() -> &'static StoreSection {
+    STORE_CONFIG
+        .get()
+        .copied()
+        .expect("store_config not set before IPC dispatch")
 }
 
 #[derive(Deserialize)]
