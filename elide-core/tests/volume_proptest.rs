@@ -230,6 +230,17 @@ enum SimOp {
         lba_count: u8,
         seed: u8,
     },
+    /// Capture and evict the highest-ULID `cache/<id>.body` file:
+    /// copy it to the test store dir (so the attached
+    /// `CapturedBodyFetcher` can serve it back), delete the cache
+    /// `.body` and `.present` files, and zero the in-memory
+    /// `SegmentPresence` bitset. No-op if no cache body file exists.
+    ///
+    /// The next read for any LBA backed by this segment must fall
+    /// through `cache_hit_allowed`'s in-memory bitset check and
+    /// invoke the fetcher. The oracle is unchanged — eviction is
+    /// supposed to be transparent to readers.
+    EvictCacheBody,
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -278,6 +289,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
                 seed,
             }
         }),
+        Just(SimOp::EvictCacheBody),
     ]
 }
 
@@ -503,10 +515,16 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
 proptest! {
     #[test]
     fn ulid_monotonicity(ops in arb_sim_ops()) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let fork_dir = dir.path();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Fork dir is named after a ULID so the read path's owner-vol-id
+        // resolution accepts it (find_segment_in_dirs requires the dir
+        // name to parse as Ulid before invoking the fetcher).
+        let fork_dir = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        let fork_dir = fork_dir.as_path();
+        let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
-        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
         // Tracks the latest snapshot ULID; segments at or below this are frozen.
         let mut snapshot_floor: Option<Ulid> = None;
         // Pending GcCheckpoint ULIDs awaiting GcApply.
@@ -672,7 +690,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
                     pending_gc = None;
                     // No assertion here: the next Flush or SweepPending
                     // will verify that the mint was correctly reseeded.
@@ -809,6 +827,27 @@ proptest! {
                     }
                     let _ = vol.write(40 + *start_lba as u64, &payload);
                 }
+                SimOp::EvictCacheBody => {
+                    // Removes `cache/<id>.{body,present}` and zeroes the
+                    // in-memory bitset. Capturing to `store_dir` happens
+                    // inside the helper so the fetcher can serve the body
+                    // back. ULIDs in `wal/`, `pending/`, `index/` are not
+                    // touched, so monotonicity is unaffected.
+                    let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            false,
+                            "evict_cache_body produced unexpected new ULID {u}"
+                        );
+                    }
+                    for u in ulids_before.difference(&after) {
+                        prop_assert!(
+                            false,
+                            "evict_cache_body dropped ULID {u}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -821,10 +860,13 @@ proptest! {
     /// sequence of volume operations + GC + crash can produce a stale read.
     #[test]
     fn crash_recovery_oracle(ops in arb_sim_ops()) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let fork_dir = dir.path();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fork_dir = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        let fork_dir = fork_dir.as_path();
+        let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
-        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
         let mut pending_gc: Option<Ulid> = None;
@@ -890,7 +932,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
                     pending_gc = None;
                     // For any pending/<ulid> whose cache/<ulid>.body survived
                     // (a HalfPromotePending before this crash), retrying
@@ -1036,6 +1078,14 @@ proptest! {
                         }
                     }
                 }
+                SimOp::EvictCacheBody => {
+                    // Capture + delete a cache body, zero its bitset.
+                    // The next read against any LBA backed by this
+                    // segment must fall through to the fetcher; the
+                    // next Crash handler also re-runs the oracle, which
+                    // verifies the post-eviction read path end to end.
+                    let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
+                }
             }
         }
     }
@@ -1047,10 +1097,13 @@ proptest! {
     /// material to compact on most sequences rather than silently no-opping.
     #[test]
     fn gc_interleaved_oracle(ops in arb_gc_interleaved_ops()) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let fork_dir = dir.path();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fork_dir = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        let fork_dir = fork_dir.as_path();
+        let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
-        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
         let mut pending_gc: Option<Ulid> = None;
@@ -1116,7 +1169,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
                     pending_gc = None;
                     // See crash_recovery_oracle for rationale.
                     common::assert_promote_recovery(&mut vol, fork_dir);
@@ -1220,6 +1273,9 @@ proptest! {
                             oracle.insert(start + i as u64, block);
                         }
                     }
+                }
+                SimOp::EvictCacheBody => {
+                    let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
                 }
             }
         }

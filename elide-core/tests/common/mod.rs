@@ -450,3 +450,124 @@ pub fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut lbamap::LbaMap) {
         }
     }
 }
+
+/// A `SegmentFetcher` that serves `cache/<id>.body` from a local
+/// `store_dir`, simulating an upstream object store.
+///
+/// Differs from `evict_test::LocalStoreFetcher` in what the store
+/// holds: this version stores **post-promote body sections** —
+/// captured from `cache/<id>.body` immediately before the proptest
+/// evicts that file. This sidesteps the body-section-start mismatch
+/// that would arise from capturing a pre-redact `pending/<id>` (where
+/// the pre-redact bss differs from the post-redact bss in `.idx`).
+///
+/// `fetch_extent` copies the captured body file back into `cache/`
+/// (whole-segment copy, no range slicing) and sets the requested
+/// `entry_idx`'s present bit. Subsequent fetches against other
+/// entries find the body file already present and only flip more
+/// bits — matching the per-entry `.present` granularity.
+pub struct CapturedBodyFetcher {
+    pub store_dir: PathBuf,
+}
+
+impl segment::SegmentFetcher for CapturedBodyFetcher {
+    fn fetch_extent(
+        &self,
+        segment_id: Ulid,
+        _owner_vol_id: Ulid,
+        _index_dir: &Path,
+        body_dir: &Path,
+        extent: &segment::ExtentFetch,
+        _presence: Option<std::sync::Arc<elide_core::extentindex::SegmentPresence>>,
+    ) -> std::io::Result<()> {
+        let sid = segment_id.to_string();
+        let body_path = body_dir.join(format!("{sid}.body"));
+        if !body_path.exists() {
+            let store_body = self.store_dir.join(format!("{sid}.body"));
+            fs::copy(&store_body, &body_path)?;
+        }
+        segment::set_present_bit(
+            &body_dir.join(format!("{sid}.present")),
+            extent.entry_idx,
+            extent.entry_idx + 1,
+        )?;
+        Ok(())
+    }
+
+    fn fetch_delta_body(
+        &self,
+        segment_id: Ulid,
+        _owner_vol_id: Ulid,
+        _index_dir: &Path,
+        _body_dir: &Path,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other(format!(
+            "CapturedBodyFetcher: fetch_delta_body unused (seg {segment_id})"
+        )))
+    }
+}
+
+/// Open `fork_dir` and attach a `CapturedBodyFetcher` rooted at
+/// `store_dir`. Replaces the bare `Volume::open(...).unwrap()` pattern
+/// in tests that exercise eviction + demand-fetch.
+pub fn open_with_captured_body_fetcher(
+    fork_dir: &Path,
+    store_dir: &Path,
+) -> elide_core::volume::Volume {
+    let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+    vol.set_fetcher(std::sync::Arc::new(CapturedBodyFetcher {
+        store_dir: store_dir.to_path_buf(),
+    }));
+    vol
+}
+
+/// Capture-and-evict one `cache/<id>.body` from `cache/`.
+///
+/// Picks the highest-ULID body file, copies it to `store_dir/<id>.body`
+/// (idempotent — skipped if already captured), deletes the cache
+/// `.body` and `.present` files, and zeroes the in-memory
+/// `SegmentPresence` bitset so subsequent reads fall through to the
+/// fetcher. Returns the chosen ULID, or `None` if no cache body file
+/// exists.
+///
+/// Models the runtime path that PR #238's in-memory bitset enabled:
+/// the read path's `cache_hit_allowed` queries the in-memory bitset
+/// first, so eviction must update that state — not just the on-disk
+/// files — for the next read to correctly trigger a fetch.
+pub fn capture_and_evict_cache_body(
+    vol: &elide_core::volume::Volume,
+    fork_dir: &Path,
+    store_dir: &Path,
+) -> Option<Ulid> {
+    let cache_dir = fork_dir.join("cache");
+    let entries = fs::read_dir(&cache_dir).ok()?;
+    let mut bodies: Vec<Ulid> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let stem = name.strip_suffix(".body")?;
+            Ulid::from_string(stem).ok()
+        })
+        .collect();
+    bodies.sort();
+    let seg_id = *bodies.last()?;
+    let sid = seg_id.to_string();
+
+    let _ = fs::create_dir_all(store_dir);
+    let body_src = cache_dir.join(format!("{sid}.body"));
+    let body_dst = store_dir.join(format!("{sid}.body"));
+    if !body_dst.exists() {
+        fs::copy(&body_src, &body_dst).ok()?;
+    }
+
+    let _ = fs::remove_file(&body_src);
+    let _ = fs::remove_file(cache_dir.join(format!("{sid}.present")));
+
+    let (_, ei) = vol.snapshot_maps();
+    if let Some(p) = ei.segment_presence(seg_id) {
+        p.replace_from_bytes(&[]);
+    }
+
+    Some(seg_id)
+}
