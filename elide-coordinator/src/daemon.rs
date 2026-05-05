@@ -140,8 +140,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }
-    let coord_id_str: String = identity.coordinator_id_str().to_owned();
-    let macaroon_root: [u8; 32] = *identity.macaroon_root();
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
 
     info!(
@@ -214,21 +212,16 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             registry: import_registry.clone(),
             fork_registry: fork_registry.clone(),
             claim_registry: claim_registry.clone(),
-            elide_import_bin: elide_import_bin.clone(),
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),
             prefetch_tracker: prefetch_tracker.clone(),
             stores: stores.clone(),
-            store_config,
             part_size_bytes,
-            coord_id: coord_id_str.clone(),
-            macaroon_root,
             identity: identity.clone(),
-            issuer: issuer.clone(),
             peer_fetch: peer_fetch_handle.clone(),
         };
         tasks.spawn(async move {
-            inbound::serve(&socket_path, ctx).await;
+            inbound::serve(&socket_path, ctx, elide_import_bin, store_config, issuer).await;
         });
     }
 
@@ -310,7 +303,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                         &coord_wide,
                         &vol_dir,
                         &name,
-                        &coord_id_str,
+                        identity.coordinator_id_str(),
                     )
                     .await;
                 }

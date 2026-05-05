@@ -64,25 +64,18 @@ pub struct IpcContext {
     pub registry: ImportRegistry,
     pub fork_registry: ForkRegistry,
     pub claim_registry: ClaimRegistry,
-    pub elide_import_bin: Arc<PathBuf>,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
     pub prefetch_tracker: PrefetchTracker,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
-    pub store_config: Arc<StoreSection>,
     pub part_size_bytes: usize,
-    /// Crockford-Base32 ULID-shaped coordinator id, derived once at
-    /// startup from `coordinator.pub`. Cheap to clone (26 bytes).
-    pub coord_id: String,
-    /// 32-byte MAC root for `macaroon::mint` / `macaroon::verify`,
-    /// derived in-memory from `coordinator.key` at startup.
-    pub macaroon_root: [u8; 32],
-    /// The coordinator's identity bundle, used as a `SegmentSigner`
+    /// The coordinator's identity bundle. Used as a `SegmentSigner`
     /// when minting synthesised handoff snapshots during
-    /// `volume release --force`. Arc-shared so per-connection clones
-    /// stay cheap.
+    /// `volume release --force`, and as the source of the coordinator
+    /// id (`identity.coordinator_id_str()`) and the 32-byte macaroon
+    /// MAC root (`identity.macaroon_root()`). Arc-shared so per-
+    /// connection clones stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    pub issuer: Arc<dyn CredentialIssuer>,
     /// Peer-fetch client handle. `Some` when `[peer_fetch].port` is
     /// configured. Used by the claim orchestrator after it rebinds
     /// `names/<name>` (so peer auth accepts our coord_id) to warm the
@@ -90,7 +83,13 @@ pub struct IpcContext {
     pub peer_fetch: Option<elide_coordinator::tasks::PeerFetchHandle>,
 }
 
-pub async fn serve(socket_path: &Path, ctx: IpcContext) {
+pub async fn serve(
+    socket_path: &Path,
+    ctx: IpcContext,
+    elide_import_bin: Arc<PathBuf>,
+    store_config: Arc<StoreSection>,
+    issuer: Arc<dyn CredentialIssuer>,
+) {
     let _ = std::fs::remove_file(socket_path);
 
     let listener = match UnixListener::bind(socket_path) {
@@ -125,14 +124,26 @@ pub async fn serve(socket_path: &Path, ctx: IpcContext) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(handle(stream, ctx.clone()));
+                tokio::spawn(handle(
+                    stream,
+                    ctx.clone(),
+                    elide_import_bin.clone(),
+                    store_config.clone(),
+                    issuer.clone(),
+                ));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
     }
 }
 
-async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
+async fn handle(
+    stream: tokio::net::UnixStream,
+    ctx: IpcContext,
+    elide_import_bin: Arc<PathBuf>,
+    store_config: Arc<StoreSection>,
+    issuer: Arc<dyn CredentialIssuer>,
+) {
     // Capture peer credentials before splitting the stream — needed for
     // SO_PEERCRED on the `register` and `credentials` verbs. Other
     // verbs ignore the peer pid; capturing once here keeps the code
@@ -152,7 +163,16 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     };
     let line = line.trim().to_owned();
 
-    dispatch_json(&line, &ctx, peer_pid, &mut writer).await;
+    dispatch_json(
+        &line,
+        &ctx,
+        peer_pid,
+        &mut writer,
+        &elide_import_bin,
+        &store_config,
+        issuer.as_ref(),
+    )
+    .await;
 }
 
 /// Typed JSON dispatch. Each match arm runs the verb-specific
@@ -162,11 +182,20 @@ async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
 /// sequence terminated by either an `Ok(Done)` or `Err`. Unknown
 /// verbs fail at the `serde_json::from_str` step — `serde` rejects
 /// unrecognised variants by default for internally-tagged enums.
+///
+/// `elide_import_bin`, `store_config`, and `issuer` are daemon-owned
+/// resources used by exactly one handler each (`ImportStart`,
+/// `GetStoreConfig`, `Credentials`). Routed alongside the broadly-
+/// shared `ctx` rather than carried inside it.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_json(
     line: &str,
     ctx: &IpcContext,
     peer_pid: Option<i32>,
     writer: &mut OwnedWriteHalf,
+    elide_import_bin: &Path,
+    store_config: &StoreSection,
+    issuer: &dyn CredentialIssuer,
 ) {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -191,7 +220,9 @@ async fn dispatch_json(
         Request::StatusRemote { volume } => {
             // Reads names/<volume>: coordinator-wide.
             let store = ctx.stores.coordinator_wide();
-            let result = volume_status_remote_typed(&volume, &store, &ctx.coord_id).await;
+            let result =
+                volume_status_remote_typed(&volume, &store, ctx.identity.coordinator_id_str())
+                    .await;
             let env: Envelope<StatusRemoteReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -202,7 +233,7 @@ async fn dispatch_json(
                 &volume,
                 &ctx.data_dir,
                 &store,
-                &ctx.coord_id,
+                ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
             )
             .await;
@@ -237,7 +268,7 @@ async fn dispatch_json(
                 &volume,
                 &ctx.data_dir,
                 &store,
-                &ctx.coord_id,
+                ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
                 &ctx.rescan,
             )
@@ -282,12 +313,9 @@ async fn dispatch_json(
                 &volume,
                 &oci_ref,
                 &extents_from,
-                &ctx.data_dir,
-                &ctx.elide_import_bin,
-                &ctx.registry,
                 &store,
-                &ctx.rescan,
-                &ctx.identity,
+                elide_import_bin,
+                ctx,
             )
             .await;
             let env: Envelope<ImportStartReply> = result.into();
@@ -353,13 +381,17 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::GetStoreConfig => {
-            let reply = render_store_config(&ctx.store_config);
+            let reply = render_store_config(store_config);
             let env: Envelope<StoreConfigReply> = Envelope::ok(reply);
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Register { volume_ulid } => {
-            let mut result =
-                register_volume(volume_ulid, &ctx.data_dir, peer_pid, &ctx.macaroon_root);
+            let mut result = register_volume(
+                volume_ulid,
+                &ctx.data_dir,
+                peer_pid,
+                ctx.identity.macaroon_root(),
+            );
             if let Ok(reply) = &mut result {
                 reply.peer_endpoint = resolve_peer_endpoint_for_volume(
                     volume_ulid,
@@ -377,8 +409,8 @@ async fn dispatch_json(
                 &macaroon,
                 &ctx.data_dir,
                 peer_pid,
-                &ctx.macaroon_root,
-                ctx.issuer.as_ref(),
+                ctx.identity.macaroon_root(),
+                issuer,
             );
             let env: Envelope<StoreCredsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -493,17 +525,13 @@ async fn latest_snapshot_op(
 
 // ── Import operations ─────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn start_import(
     volume: &str,
     oci_ref: &str,
     extents_from: &[String],
-    data_dir: &Path,
-    elide_import_bin: &Path,
-    registry: &ImportRegistry,
     store: &Arc<dyn ObjectStore>,
-    rescan: &Arc<Notify>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    elide_import_bin: &Path,
+    ctx: &IpcContext,
 ) -> Result<ImportStartReply, IpcError> {
     let req = import::ImportRequest {
         vol_name: volume,
@@ -512,12 +540,12 @@ async fn start_import(
     };
     let ulid_str = import::spawn_import(
         req,
-        data_dir,
+        &ctx.data_dir,
         elide_import_bin,
-        registry,
+        &ctx.registry,
         store.clone(),
-        rescan.clone(),
-        identity.clone(),
+        ctx.rescan.clone(),
+        ctx.identity.clone(),
     )
     .await
     .map_err(|e| IpcError::internal(format!("{e}")))?;
@@ -1815,15 +1843,6 @@ async fn force_snapshot_now_op(
     })
 }
 
-/// Fork an existing source volume into a new writable volume.
-///
-/// Mirrors the CLI's `fork_volume_at*` + by_name symlink + volume.toml write.
-/// `source_ulid` resolves to any volume in `by_id/<ulid>/` — writable,
-/// imported readonly base, or pulled ancestor. `snap` is optional: if
-/// omitted, falls back to `volume::fork_volume` (latest local snapshot).
-/// `parent-key` is the hex ephemeral pubkey from `force-snapshot-now`,
-/// recorded in the new fork's provenance for force-snapshot pins.
-#[allow(clippy::too_many_arguments)]
 /// Classify a pre-existing `by_name/<name>` symlink seen during a
 /// `for_claim` fork-create.
 ///
@@ -1872,9 +1891,20 @@ fn classify_resumable_orphan(
     }
 }
 
-// IPC handler: arguments mirror the dispatcher's per-call context.
-// Packing them into a struct would create a one-shot type with no
-// other callers.
+/// Fork an existing source volume into a new writable volume.
+///
+/// Mirrors the CLI's `fork_volume_at*` + by_name symlink + volume.toml write.
+/// `source_vol_ulid` resolves to any volume in `by_id/<ulid>/` — writable,
+/// imported readonly base, or pulled ancestor. `snap` is optional: if
+/// omitted, falls back to `volume::fork_volume` (latest local snapshot).
+/// `parent_key_hex` is the hex ephemeral pubkey from `force-snapshot-now`,
+/// recorded in the new fork's provenance for force-snapshot pins.
+/// `source_name_hint` is the orchestrator-supplied source name, used as a
+/// fallback when the source's on-disk `volume.toml` has no `name` field —
+/// typically because the source was pulled from S3 (`pull.rs` writes
+/// `name: None` for pulled ancestors). Without this hint, forks from a
+/// pulled source emit a `Created` journal event instead of the more
+/// useful `ForkedFrom { source_name, ... }`.
 #[allow(clippy::too_many_arguments)]
 async fn fork_create_op(
     new_name: &str,
@@ -1883,19 +1913,14 @@ async fn fork_create_op(
     parent_key_hex: Option<&str>,
     for_claim: bool,
     flags: &[String],
-    // Orchestrator-supplied source name. Used as a fallback when the
-    // source's on-disk `volume.toml` has no `name` field — typically
-    // because the source was pulled from S3 (`pull.rs` writes
-    // `name: None` for pulled ancestors). Without this hint, forks
-    // from a pulled source emit a `Created` journal event instead of
-    // the more useful `ForkedFrom { source_name, ... }`.
     source_name_hint: Option<&str>,
-    data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    rescan: &Notify,
-    prefetch_tracker: &PrefetchTracker,
+    ctx: &IpcContext,
 ) -> Result<ForkCreateReply, IpcError> {
+    let identity = &ctx.identity;
+    let data_dir: &Path = &ctx.data_dir;
+    let rescan: &Notify = &ctx.rescan;
+    let prefetch_tracker = &ctx.prefetch_tracker;
     let coord_id = identity.coordinator_id_str();
     validate_volume_name(new_name).map_err(IpcError::bad_request)?;
     let source_ulid_str = source_vol_ulid.to_string();
@@ -3791,6 +3816,12 @@ async fn run_fork_job(
         snap_ulid,
     });
     let store = ctx.stores.coordinator_wide();
+    // For a `Name` source the orchestrator already knows the user-facing
+    // name; pass it as a hint so a pulled source (whose `volume.toml`
+    // lacks `name`) still produces a `ForkedFrom` journal event instead
+    // of falling back to `Created`. ULID-only sources (`BareUlid` /
+    // `Pinned`) have no orchestrator-known name and rely on
+    // `src_cfg.name`.
     let reply = fork_create_op(
         &new_name,
         source_vol_ulid,
@@ -3798,18 +3829,9 @@ async fn run_fork_job(
         parent_key_hex.as_deref(),
         false,
         &flags,
-        // For a `Name` source the orchestrator already knows the
-        // user-facing name; pass it as a hint so a pulled source
-        // (whose `volume.toml` lacks `name`) still produces a
-        // `ForkedFrom` journal event instead of falling back to
-        // `Created`. ULID-only sources (`BareUlid` / `Pinned`) have
-        // no orchestrator-known name and rely on `src_cfg.name`.
         source_name.as_deref(),
-        &ctx.data_dir,
         &store,
-        &ctx.identity,
-        &ctx.rescan,
-        &ctx.prefetch_tracker,
+        &ctx,
     )
     .await?;
     job.append(ForkAttachEvent::ForkCreated {
@@ -4115,7 +4137,7 @@ async fn early_rebind_for_claim(
     match mark_claimed(
         &store_wide,
         volume,
-        &ctx.coord_id,
+        ctx.identity.coordinator_id_str(),
         ctx.identity.hostname(),
         new_vol_ulid,
         NameState::Stopped,
