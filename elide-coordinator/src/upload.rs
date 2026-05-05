@@ -134,29 +134,21 @@ pub fn derive_names(vol_dir: &Path) -> Result<String> {
 /// Build the object store key for a segment.
 ///
 /// Format: `by_id/<volume_ulid>/segments/YYYYMMDD/<segment_ulid>`
-pub fn segment_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
-    let ulid: Ulid = ulid_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
+pub fn segment_key(volume_id: &str, ulid: Ulid) -> StorePath {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
-    Ok(StorePath::from(format!(
-        "by_id/{volume_id}/segments/{date}/{ulid_str}"
-    )))
+    StorePath::from(format!("by_id/{volume_id}/segments/{date}/{ulid}"))
 }
 
 /// Build the object store key for a signed snapshot manifest.
 ///
 /// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.manifest`
-pub fn snapshot_manifest_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
-    let ulid: Ulid = ulid_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
+pub fn snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
-    Ok(StorePath::from(format!(
-        "by_id/{volume_id}/snapshots/{date}/{ulid_str}.manifest"
-    )))
+    StorePath::from(format!(
+        "by_id/{volume_id}/snapshots/{date}/{ulid}.manifest"
+    ))
 }
 
 /// Upload all committed segments from `pending/` to the object store, then
@@ -217,7 +209,7 @@ pub async fn drain_pending(
         // DedupRef bodies are never in the file to begin with.
         crate::control::redact_segment(vol_dir, ulid).await;
 
-        match uploader.upload(&segment_path, name).await {
+        match uploader.upload(&segment_path, ulid).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
@@ -416,9 +408,9 @@ pub async fn upload_snapshot_metadata(
         let Some(snap_str) = name.strip_suffix(".manifest") else {
             continue;
         };
-        if ulid::Ulid::from_string(snap_str).is_err() {
+        let Ok(snap_ulid) = ulid::Ulid::from_string(snap_str) else {
             continue;
-        }
+        };
 
         let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{snap_str}"));
         if is_already_uploaded(&sentinel, &[]) {
@@ -426,7 +418,7 @@ pub async fn upload_snapshot_metadata(
         }
 
         let manifest_path = snap_dir.join(name);
-        let key = snapshot_manifest_key(volume_id, snap_str)?;
+        let key = snapshot_manifest_key(volume_id, snap_ulid);
         let data = std::fs::read(&manifest_path)
             .with_context(|| format!("reading snapshot manifest: {}", manifest_path.display()))?;
         let len = data.len();
@@ -466,11 +458,11 @@ impl SegmentUploader<'_> {
     /// so parallel parts don't saturate the upload link and trip reqwest's
     /// 30s per-request timeout. Two parts in flight is enough to hide one
     /// request's handshake latency without fanning out.
-    pub(crate) async fn upload(&self, path: &Path, ulid_str: &str) -> Result<()> {
+    pub(crate) async fn upload(&self, path: &Path, ulid: Ulid) -> Result<()> {
         const MAX_CONCURRENT_PARTS: usize = 2;
 
-        let key = segment_key(self.volume_id, ulid_str)?;
-        let data = std::fs::read(path).with_context(|| format!("reading segment {ulid_str}"))?;
+        let key = segment_key(self.volume_id, ulid);
+        let data = std::fs::read(path).with_context(|| format!("reading segment {ulid}"))?;
         let len = data.len();
         let mut bytes = Bytes::from(data);
 
@@ -493,7 +485,7 @@ impl SegmentUploader<'_> {
         writer
             .finish()
             .await
-            .with_context(|| format!("uploading segment {ulid_str} to {key}"))?;
+            .with_context(|| format!("uploading segment {ulid} to {key}"))?;
         info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
         Ok(())
     }
@@ -585,7 +577,7 @@ mod tests {
         let dt: DateTime<Utc> = ulid.datetime().into();
         let expected_date = dt.format("%Y%m%d").to_string();
 
-        let key = segment_key(VOL_ULID, &ulid_str).unwrap();
+        let key = segment_key(VOL_ULID, ulid);
         assert_eq!(
             key.as_ref(),
             format!("by_id/{VOL_ULID}/segments/{expected_date}/{ulid_str}")
@@ -665,8 +657,8 @@ mod tests {
         assert!(cache_dir.join(format!("{ulid2}.body")).exists());
         assert!(cache_dir.join(format!("{ulid2}.present")).exists());
 
-        let key1 = segment_key(VOL_ULID, &ulid1).unwrap();
-        let key2 = segment_key(VOL_ULID, &ulid2).unwrap();
+        let key1 = segment_key(VOL_ULID, ulid1.parse().unwrap());
+        let key2 = segment_key(VOL_ULID, ulid2.parse().unwrap());
         store
             .head(&key1)
             .await
@@ -846,7 +838,7 @@ mod tests {
             .unwrap();
 
         // Manifest is in store.
-        let manifest_key = snapshot_manifest_key(VOL_ULID, &snap_str).unwrap();
+        let manifest_key = snapshot_manifest_key(VOL_ULID, snap_ulid);
         let meta = store
             .head(&manifest_key)
             .await

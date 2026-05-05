@@ -710,8 +710,7 @@ async fn force_snapshot_now_op(
         .join(format!("{snap_str}.manifest"));
     let manifest_bytes = std::fs::read(&manifest_path)
         .map_err(|e| IpcError::internal(format!("reading just-written manifest: {e}")))?;
-    let manifest_key = elide_coordinator::upload::snapshot_manifest_key(&volume_id, &snap_str)
-        .map_err(|e| IpcError::internal(format!("snapshot_manifest_key: {e}")))?;
+    let manifest_key = elide_coordinator::upload::snapshot_manifest_key(&volume_id, snap);
     store
         .put(&manifest_key, PutPayload::from(manifest_bytes))
         .await

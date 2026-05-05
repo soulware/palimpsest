@@ -147,7 +147,7 @@ impl World {
         let signer = self.vol_signers.get(&vol_ulid)?;
         let snap_ulid = Ulid::new();
         let bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
-        let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string()).ok()?;
+        let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
         // Use put_if_absent so we don't accidentally overwrite an
         // existing manifest minted by a parallel op.
         portable::put_if_absent(self.store.as_ref(), &key, Bytes::from(bytes))
@@ -257,8 +257,7 @@ impl World {
     /// `coordinator.pub`, which the coordinator-pub fetcher itself
     /// path-binds to its derived id.
     async fn verify_handoff_manifest(&self, vol_ulid: Ulid, snap: Ulid, name: &str) {
-        let snap_key =
-            snapshot_manifest_key(&vol_ulid.to_string(), &snap.to_string()).expect("snapshot key");
+        let snap_key = snapshot_manifest_key(&vol_ulid.to_string(), snap);
         let body = self
             .store
             .get(&snap_key)

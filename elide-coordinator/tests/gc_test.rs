@@ -309,7 +309,7 @@ async fn drain_pending_to_store(
                 continue;
             }
             let data = fs::read(entry.path()).unwrap();
-            let key = elide_coordinator::upload::segment_key(volume_id, ulid_str).unwrap();
+            let key = elide_coordinator::upload::segment_key(volume_id, ulid_str.parse().unwrap());
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
