@@ -54,6 +54,26 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     result
 }
 
+/// Pick the largest ULID present in `index/*.idx`, or mint a fresh
+/// one if `index/` is empty. Mirrors the snapshot-ULID selection in
+/// `actor_proptest.rs` so volume-level signing tests cover both the
+/// "snapshot over real data" and "degenerate empty manifest" shapes.
+fn pick_snap_ulid(fork_dir: &Path) -> Ulid {
+    fs::read_dir(fork_dir.join("index"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_str()?;
+            let stem = s.strip_suffix(".idx")?;
+            Ulid::from_string(stem).ok()
+        })
+        .max()
+        .unwrap_or_else(Ulid::new)
+}
+
 /// Generate 4096 bytes of incompressible data from a seed.
 ///
 /// Uses blake3 in counter mode to fill the block with pseudo-random bytes.
@@ -173,6 +193,43 @@ enum SimOp {
     /// offload. Exercised against a subsequent `Crash` + rebuild so the
     /// crash-recovery invariants fire on this specific shape.
     HalfPromotePending,
+    /// Phase 5 Tier 1 dictionary-delta repack of post-snapshot pending
+    /// segments. No-op when there is no sealed snapshot or no Data
+    /// entries match same-LBA extents in the prior snapshot. Segment
+    /// files are rewritten in place under their original ULID via
+    /// atomic rename, so no new ULID files appear. The actor-layer
+    /// proptest covers this through `ActorOp::DeltaRepack`; modelling
+    /// it here exercises the same invariants directly against the
+    /// volume layer (ULID set unchanged, oracle preserved across
+    /// subsequent crash + rebuild).
+    DeltaRepack,
+    /// Seal a snapshot manifest over the current `index/` set: pick
+    /// the max ULID in `index/` (or a fresh one if empty) and call
+    /// `vol.sign_snapshot_manifest`. Writes `snapshots/<ulid>.manifest`
+    /// and the `snapshots/<ulid>` marker — neither file lands in the
+    /// ULID-tracking directories (`wal/`, `pending/`, `index/`), so
+    /// the segment-ULID set is unaffected. Signing must not touch
+    /// data paths; oracle preservation is verified by the next Crash.
+    SignSnapshot,
+    /// Write `lba_count` (2..=4) contiguous incompressible blocks
+    /// starting at `40 + start_lba`. Unlike `Write` (single LBA,
+    /// inline-compressible) and `WriteLarge` (single LBA, body), this
+    /// exercises the multi-block write/read path: a single payload
+    /// produces multiple body-section entries, and reads with
+    /// `lba_count > 1` traverse the partial-range
+    /// `payload_block_offset` arithmetic. Frequent overlaps with
+    /// later WriteMulti / Write ops on the same range create the
+    /// mixed live/dead partial-extent shapes that
+    /// `sweep_pending`/`repack` need to handle.
+    ///
+    /// LBA range 40..52 — disjoint from Write (0..8), WriteZeroes
+    /// (8..16), PopulateFetched (16..24), WriteLarge (24..32),
+    /// SameContentWrite (32..40), and ReadUnwritten (64).
+    WriteMulti {
+        start_lba: u8,
+        lba_count: u8,
+        seed: u8,
+    },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -212,6 +269,15 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_count,
         }),
         Just(SimOp::HalfPromotePending),
+        Just(SimOp::DeltaRepack),
+        Just(SimOp::SignSnapshot),
+        (0u8..8, 2u8..=4, any::<u8>()).prop_map(|(start_lba, lba_count, seed)| {
+            SimOp::WriteMulti {
+                start_lba,
+                lba_count,
+                seed,
+            }
+        }),
     ]
 }
 
@@ -690,6 +756,59 @@ proptest! {
                     // original pending ULID. Nothing to assert for monotonicity.
                     let _ = common::half_promote_first_pending(fork_dir);
                 }
+                SimOp::DeltaRepack => {
+                    // Rewrites post-snapshot pending segments in place
+                    // under their original ULID via atomic rename. The
+                    // ULID set must be unchanged: no new ULIDs appear
+                    // and no existing ULID is dropped by this op.
+                    let _ = vol.delta_repack_post_snapshot();
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            false,
+                            "delta_repack produced unexpected new ULID {u}"
+                        );
+                    }
+                    for u in ulids_before.difference(&after) {
+                        prop_assert!(
+                            false,
+                            "delta_repack dropped existing ULID {u}"
+                        );
+                    }
+                }
+                SimOp::SignSnapshot => {
+                    // Manifest + marker land under `snapshots/`, which
+                    // `all_segment_ulids` does not scan. The segment
+                    // ULID set must therefore be identical before/after.
+                    let snap_ulid = pick_snap_ulid(fork_dir);
+                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            false,
+                            "sign_snapshot_manifest produced unexpected new ULID {u}"
+                        );
+                    }
+                    for u in ulids_before.difference(&after) {
+                        prop_assert!(
+                            false,
+                            "sign_snapshot_manifest dropped existing ULID {u}"
+                        );
+                    }
+                }
+                SimOp::WriteMulti {
+                    start_lba,
+                    lba_count,
+                    seed,
+                } => {
+                    // Append-only WAL write — like Write/WriteLarge,
+                    // produces no new ULID files until Flush.
+                    let mut payload = Vec::with_capacity(*lba_count as usize * 4096);
+                    for i in 0..*lba_count {
+                        payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+                    }
+                    let _ = vol.write(40 + *start_lba as u64, &payload);
+                }
             }
         }
     }
@@ -872,6 +991,51 @@ proptest! {
                     // will verify reclaim's contribution alongside everything else.
                     let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
+                SimOp::DeltaRepack => {
+                    // Rewrites Data entries in post-snapshot pending
+                    // segments to thin Deltas. Observable content is
+                    // unchanged; oracle survival is verified by the
+                    // next Crash handler.
+                    let _ = vol.delta_repack_post_snapshot();
+                }
+                SimOp::SignSnapshot => {
+                    // Signing must not touch the data path; oracle
+                    // survival is verified by the next Crash handler.
+                    let snap_ulid = pick_snap_ulid(fork_dir);
+                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                }
+                SimOp::WriteMulti {
+                    start_lba,
+                    lba_count,
+                    seed,
+                } => {
+                    // Multi-block write: produces lba_count contiguous
+                    // body-section extents in one segment. Verify the
+                    // multi-block read path immediately (lba_count > 1
+                    // exercises payload_block_offset arithmetic), then
+                    // record per-LBA in the oracle so the next Crash
+                    // confirms each block survives WAL recovery.
+                    let mut payload = Vec::with_capacity(*lba_count as usize * 4096);
+                    for i in 0..*lba_count {
+                        payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+                    }
+                    let start = 40 + *start_lba as u64;
+                    if vol.write(start, &payload).is_ok() {
+                        let actual = vol.read(start, *lba_count as u32).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            payload.as_slice(),
+                            "multi-block read mismatch at lba {} count {}",
+                            start,
+                            lba_count
+                        );
+                        for i in 0..*lba_count as usize {
+                            let mut block = [0u8; 4096];
+                            block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                            oracle.insert(start + i as u64, block);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1032,6 +1196,31 @@ proptest! {
                     // lbamap stale until Crash rebuilds it.
                     let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
+                SimOp::DeltaRepack => {
+                    let _ = vol.delta_repack_post_snapshot();
+                }
+                SimOp::SignSnapshot => {
+                    let snap_ulid = pick_snap_ulid(fork_dir);
+                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                }
+                SimOp::WriteMulti {
+                    start_lba,
+                    lba_count,
+                    seed,
+                } => {
+                    let mut payload = Vec::with_capacity(*lba_count as usize * 4096);
+                    for i in 0..*lba_count {
+                        payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+                    }
+                    let start = 40 + *start_lba as u64;
+                    if vol.write(start, &payload).is_ok() {
+                        for i in 0..*lba_count as usize {
+                            let mut block = [0u8; 4096];
+                            block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                            oracle.insert(start + i as u64, block);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1137,15 +1326,11 @@ proptest! {
 /// shrunk by `reclaim_crash_recovery` to the 7-op sequence below.
 ///
 /// After the fourth `WriteLargeMulti` overlaps a previously-written
-/// region, `reclaim_alias_merge` followed by `repack` and a crash leaves
+/// region, `reclaim_alias_merge` followed by `repack` and a crash left
 /// a previously-readable LBA returning all-zeros instead of the bytes
-/// the oracle wrote.
-///
-/// **Pre-existing bug** — reproduces on `main` and on every branch
-/// touched after this test was minted. Tracking issue: this branch's
-/// PR. The minimal sequence is materialised here per
-/// `feedback_proptest_deterministic_repro` so any fix attempt has a
-/// stable repro outside the proptest harness.
+/// the oracle wrote. Now fixed; kept as a regression guard so any
+/// future change to the reclaim → repack → crash path that re-breaks
+/// this shape fails outside the proptest harness.
 #[test]
 fn reclaim_crash_recovery_seed_a978281b_regression() {
     use elide_core::volume::Volume;
@@ -1220,12 +1405,10 @@ fn reclaim_crash_recovery_seed_a978281b_regression() {
 /// then 26..34, both with `seed = 102`), bracketed by
 /// `reclaim_alias_merge(24, 1)` calls and a final `WriteLargeMulti` at
 /// LBA 24..32 with `seed = 0`. After `sweep_pending` + crash, LBA 32
-/// reads back something other than the bytes the third
-/// `WriteLargeMulti` wrote — its content is not preserved across the
-/// crash boundary the way the oracle expects.
-///
-/// Materialised here per `feedback_proptest_deterministic_repro` so a
-/// fix attempt has a stable repro outside the proptest harness.
+/// read back something other than the bytes the third
+/// `WriteLargeMulti` wrote — its content was not preserved across the
+/// crash boundary the way the oracle expects. Now fixed; kept as a
+/// regression guard.
 #[test]
 fn reclaim_crash_recovery_seed_b0f166f0_regression() {
     use elide_core::volume::Volume;
@@ -1298,4 +1481,100 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
     drop(vol);
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
     assert_oracle(&mut vol, &oracle, "Crash");
+}
+
+/// Deterministic regression for the failure surfaced by
+/// `crash_recovery_oracle` after `SimOp::WriteMulti` was added in this
+/// branch. Shrunk to the 7-op sequence below.
+///
+/// Two overlapping multi-LBA writes set up a content-dedup case across
+/// distinct LBAs:
+///   - First WriteMulti at LBA 47..49: writes `incompressible_block(0)`
+///     and `incompressible_block(1)`.
+///   - Second WriteMulti at LBA 46..48: writes `incompressible_block(1)`
+///     and `incompressible_block(2)`, overwriting LBA 47.
+/// LBA 46 (live, written second) and LBA 48 (live, written first) now
+/// share content `incompressible_block(1)` — same hash, different LBAs,
+/// in the same WAL window.
+///
+/// `GcCheckpoint` flushes the WAL into a pending segment.
+/// `HalfPromotePending` performs the worker-phase file I/O for that
+/// pending segment without the actor-phase apply, leaving the
+/// extent-index in the mid-promote state. `PopulateFetched` writes a
+/// directly-staged cache entry, then `GcApply` consumes the stashed
+/// checkpoint. After `Crash`, LBA 48 reads back all-zeros instead of
+/// `incompressible_block(1)`.
+///
+/// **Pre-existing bug** — the dedup-across-LBAs + half-promote +
+/// gc-apply interaction loses the second LBA's reference during
+/// rebuild. Materialised here per `feedback_proptest_deterministic_repro`
+/// so a fix attempt has a stable repro outside the proptest harness.
+#[test]
+fn crash_recovery_writemulti_dedup_regression() {
+    use elide_core::volume::Volume;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    // Mirrors `SimOp::WriteMulti` in the proptest body.
+    let write_multi = |vol: &mut Volume,
+                       oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+                       start_lba: u8,
+                       lba_count: u8,
+                       seed: u8| {
+        let mut payload = Vec::with_capacity(lba_count as usize * 4096);
+        for i in 0..lba_count {
+            payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+        }
+        let start = 40 + start_lba as u64;
+        if vol.write(start, &payload).is_ok() {
+            for i in 0..lba_count as usize {
+                let mut block = [0u8; 4096];
+                block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                oracle.insert(start + i as u64, block);
+            }
+        }
+    };
+
+    write_multi(&mut vol, &mut oracle, 7, 2, 0);
+    write_multi(&mut vol, &mut oracle, 6, 2, 1);
+
+    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let _ = common::half_promote_first_pending(fork_dir);
+
+    // Mirrors `SimOp::PopulateFetched { lba: 0, seed: 0 }`: writes a
+    // direct-fetch cache entry at LBA 16 with effective_seed 0x80.
+    let effective_seed: u8 = 0x80;
+    let cache_ulid = vol.gc_checkpoint_for_test().unwrap();
+    common::populate_cache(fork_dir, cache_ulid, 16, effective_seed);
+    oracle.insert(16, [effective_seed; 4096]);
+
+    // GcApply n=2.
+    let to_delete =
+        if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
+            paths
+        } else {
+            vec![]
+        };
+    let applied = vol.apply_gc_handoffs().unwrap_or(0);
+    if applied > 0 {
+        for path in &to_delete {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    common::assert_promote_recovery(&mut vol, fork_dir);
+    for (&lba, expected) in &oracle {
+        let actual = vol.read(lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {lba} wrong after Crash"
+        );
+    }
 }
