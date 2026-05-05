@@ -247,16 +247,7 @@ async fn dispatch_json(
             let result = if force {
                 force_release_volume_op(&volume, &ctx.data_dir, &store, &ctx.identity).await
             } else {
-                release_volume_op(
-                    &volume,
-                    &ctx.data_dir,
-                    &ctx.snapshot_locks,
-                    &store,
-                    ctx.part_size_bytes,
-                    &ctx.identity,
-                    &ctx.rescan,
-                )
-                .await
+                release_volume_op(&volume, &store, ctx).await
             };
             let env: Envelope<ReleaseReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -2728,16 +2719,16 @@ async fn force_release_volume_op(
 /// 2. **Slow path** (WAL non-empty / pending uploads / GC handoffs /
 ///    new segments since last snapshot): bring the daemon up in
 ///    drain mode, run the existing snapshot pipeline, halt, flip.
-#[allow(clippy::too_many_arguments)]
 async fn release_volume_op(
     volume_name: &str,
-    data_dir: &Path,
-    snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    rescan: &Notify,
+    ctx: &IpcContext,
 ) -> Result<ReleaseReply, IpcError> {
+    let identity = &ctx.identity;
+    let data_dir: &Path = &ctx.data_dir;
+    let snapshot_locks = &ctx.snapshot_locks;
+    let part_size_bytes = ctx.part_size_bytes;
+    let rescan: &Notify = &ctx.rescan;
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
@@ -4475,8 +4466,6 @@ mod tests {
     async fn release_op_refuses_when_volume_is_running() {
         let store = mem_store();
         let data_dir = TempDir::new().unwrap();
-        let snapshot_locks = SnapshotLockRegistry::default();
-        let rescan = Notify::new();
 
         // Running volume: by_name symlink + by_id dir, NO volume.stopped.
         let vol_ulid = make_running_volume(data_dir.path());
@@ -4492,17 +4481,26 @@ mod tests {
         rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let err = release_volume_op(
-            "vol",
-            data_dir.path(),
-            &snapshot_locks,
-            &store,
-            8 * 1024 * 1024,
-            &identity,
-            &rescan,
-        )
-        .await
-        .expect_err("running volume must refuse release");
+        let ctx = IpcContext {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            rescan: Arc::new(Notify::new()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            part_size_bytes: 8 * 1024 * 1024,
+            identity,
+            peer_fetch: None,
+        };
+
+        let err = release_volume_op("vol", &store, &ctx)
+            .await
+            .expect_err("running volume must refuse release");
 
         assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
         assert!(
