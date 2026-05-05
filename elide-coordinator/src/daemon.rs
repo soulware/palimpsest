@@ -148,6 +148,11 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }
+    // Install the peer-fetch handle as a process-global so per-volume
+    // tasks, the claim orchestrator, and the IPC `Register` handler
+    // can read it without us threading the value through. `None` when
+    // peer-fetch is unconfigured.
+    elide_coordinator::tasks::set_peer_fetch_handle(peer_fetch_handle);
     set_credential_issuer(SharedKeyPassthrough::new_with_warning());
 
     info!(
@@ -225,7 +230,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             prefetch_tracker: prefetch_tracker.clone(),
             stores: stores.clone(),
             identity: identity.clone(),
-            peer_fetch: peer_fetch_handle.clone(),
         };
         tasks.spawn(async move {
             inbound::serve(&socket_path, ctx).await;
@@ -378,7 +382,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     snapshot_locks.clone(),
                     prefetch_tx,
                     prefetch_tracker.clone(),
-                    peer_fetch_handle.clone(),
                 ));
 
                 // Readonly volumes (imported bases) have no live process —

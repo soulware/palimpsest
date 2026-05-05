@@ -77,11 +77,6 @@ pub struct IpcContext {
     /// MAC root (`identity.macaroon_root()`). Arc-shared so per-
     /// connection clones stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    /// Peer-fetch client handle. `Some` when `[peer_fetch].port` is
-    /// configured. Used by the claim orchestrator after it rebinds
-    /// `names/<name>` (so peer auth accepts our coord_id) to warm the
-    /// ancestor chain over peer-fetch instead of S3.
-    pub peer_fetch: Option<elide_coordinator::tasks::PeerFetchHandle>,
 }
 
 /// Universal coordinator state — every IPC handler and every domain
@@ -108,14 +103,12 @@ impl IpcContext {
     }
 
     /// Construct a [`crate::claim::ClaimContext`] — the hot core plus
-    /// the claim-domain registries (claim_registry, prefetch_tracker,
-    /// peer_fetch).
+    /// the claim-domain registries (claim_registry, prefetch_tracker).
     pub(crate) fn for_claim(&self) -> crate::claim::ClaimContext {
         crate::claim::ClaimContext {
             core: self.core(),
             claim_registry: self.claim_registry.clone(),
             prefetch_tracker: self.prefetch_tracker.clone(),
-            peer_fetch: self.peer_fetch.clone(),
         }
     }
 
@@ -377,13 +370,8 @@ async fn dispatch_json(
                 ctx.identity.macaroon_root(),
             );
             if let Ok(reply) = &mut result {
-                reply.peer_endpoint = resolve_peer_endpoint_for_volume(
-                    volume_ulid,
-                    &ctx.data_dir,
-                    ctx.peer_fetch.is_some(),
-                    &ctx.stores,
-                )
-                .await;
+                reply.peer_endpoint =
+                    resolve_peer_endpoint_for_volume(volume_ulid, &ctx.data_dir, &ctx.stores).await;
             }
             let env: Envelope<RegisterReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -2483,12 +2471,9 @@ fn register_volume(
 async fn resolve_peer_endpoint_for_volume(
     volume_ulid: ulid::Ulid,
     data_dir: &Path,
-    peer_fetch_enabled: bool,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Option<PeerEndpoint> {
-    if !peer_fetch_enabled {
-        return None;
-    }
+    elide_coordinator::tasks::peer_fetch_handle()?;
     let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
     let store = stores.coordinator_wide();
@@ -3441,7 +3426,6 @@ mod tests {
                 store.clone(),
             )),
             identity,
-            peer_fetch: None,
         };
 
         let err = release_volume_op("vol", &store, &ctx)
