@@ -472,17 +472,9 @@ async fn start_import(
         oci_ref,
         extents_from,
     };
-    let ulid_str = import::spawn_import(
-        req,
-        &ctx.data_dir,
-        elide_import_bin,
-        &ctx.registry,
-        store.clone(),
-        ctx.rescan.clone(),
-        ctx.identity.clone(),
-    )
-    .await
-    .map_err(|e| IpcError::internal(format!("{e}")))?;
+    let ulid_str = import::spawn_import(req, elide_import_bin, store.clone(), ctx)
+        .await
+        .map_err(|e| IpcError::internal(format!("{e}")))?;
     let import_ulid = ulid::Ulid::from_string(&ulid_str)
         .map_err(|e| IpcError::internal(format!("import ulid {ulid_str:?}: {e}")))?;
     Ok(ImportStartReply { import_ulid })

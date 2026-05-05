@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::Notify;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -180,21 +179,6 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
     Ok(result)
 }
 
-/// Validate a volume name: non-empty, only `[a-zA-Z0-9._-]`.
-fn validate_volume_name(name: &str) -> std::io::Result<()> {
-    if name.is_empty() {
-        return Err(std::io::Error::other("volume name must not be empty"));
-    }
-    if let Some(c) = name
-        .chars()
-        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_' && *c != '.')
-    {
-        return Err(std::io::Error::other(format!(
-            "invalid character {c:?} in volume name {name:?}: only [a-zA-Z0-9._-] allowed"
-        )));
-    }
-    Ok(())
-}
 /// Pidfile for the import subprocess (distinct from the volume daemon's
 /// `volume.pid`). Local to this module since the supervisor never spawns
 /// or adopts an import subprocess via this file.
@@ -274,19 +258,20 @@ pub struct ImportRequest<'a> {
 /// symlink. Returns the import job ULID.
 pub async fn spawn_import(
     req: ImportRequest<'_>,
-    data_dir: &Path,
     elide_import_bin: &Path,
-    registry: &ImportRegistry,
     store: Arc<dyn ObjectStore>,
-    rescan_notify: Arc<Notify>,
-    identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    ctx: &crate::inbound::IpcContext,
 ) -> std::io::Result<String> {
+    let data_dir: &Path = &ctx.data_dir;
+    let registry = &ctx.registry;
+    let rescan_notify = ctx.rescan.clone();
+    let identity = ctx.identity.clone();
     let ImportRequest {
         vol_name,
         oci_ref,
         extents_from,
     } = req;
-    validate_volume_name(vol_name)?;
+    crate::inbound::validate_volume_name(vol_name).map_err(std::io::Error::other)?;
 
     let by_name_dir = data_dir.join("by_name");
     let symlink_path = by_name_dir.join(vol_name);
