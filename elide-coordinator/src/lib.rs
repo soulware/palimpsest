@@ -2,6 +2,7 @@ pub mod config;
 pub mod control;
 pub mod eligibility;
 pub mod gc;
+pub mod gc_cycle;
 pub mod identity;
 pub mod ipc;
 pub mod lifecycle;

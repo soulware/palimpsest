@@ -13,22 +13,20 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use object_store::ObjectStore;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::PrefetchState;
 
 use crate::config::GcConfig;
-use crate::control;
-use crate::gc;
+use crate::gc_cycle::{GcCycleOrchestrator, TickOutcome};
 use crate::prefetch;
 use crate::upload;
-use crate::volume_state::IMPORTING_FILE;
-use crate::{PrefetchTracker, SnapshotLockRegistry, snapshot_lock_for, unregister_prefetch};
+use crate::{PrefetchTracker, SnapshotLockRegistry, unregister_prefetch};
 
 /// Request type for the per-fork evict channel.
 /// The sender receives the eviction result (count of bodies deleted).
@@ -158,16 +156,6 @@ pub async fn run_volume_tasks(
         .map(|n| format!(" ({n})"))
         .unwrap_or_default();
 
-    let gc_interval = gc_config.interval;
-
-    // Run GC on the first tick to clear any backlog from a previous run.
-    let mut last_gc = Instant::now()
-        .checked_sub(gc_interval)
-        .unwrap_or_else(Instant::now);
-    // Track whether the previous GC tick did any work, so we can log once
-    // when GC transitions from active → idle (converged).
-    let mut gc_was_active = true;
-
     // Prefetch segment indexes on startup if the fork has no local index files.
     // This covers the common case of a volume pulled from the store with only
     // the directory skeleton — without .idx files Volume::open cannot rebuild
@@ -250,6 +238,15 @@ pub async fn run_volume_tasks(
         prefetch_done.send_replace(Some(Ok(())));
     }
 
+    let mut orch = GcCycleOrchestrator::new(
+        fork_dir.clone(),
+        volume_id,
+        store,
+        part_size_bytes,
+        gc_config,
+        &snapshot_locks,
+    );
+
     let mut tick = tokio::time::interval(drain_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -258,221 +255,16 @@ pub async fn run_volume_tasks(
             // Eviction requests are processed between ticks — never mid-GC.
             Some((ulid_str, reply_tx)) = evict_rx.recv() => {
                 let result = match ulid_str {
-                    Some(ref s) => evict_one_body(&fork_dir, s),
-                    None => evict_bodies(&fork_dir),
+                    Some(ref s) => evict_one_body(orch.fork_dir(), s),
+                    None => evict_bodies(orch.fork_dir()),
                 };
                 let _ = reply_tx.send(result);
-                continue;
             }
-            _ = tick.tick() => {}
-        }
-
-        if !fork_dir.exists() {
-            info!(
-                "[coordinator] fork removed, stopping: {}",
-                fork_dir.display()
-            );
-            break;
-        }
-
-        // Skip drain/GC while an import is in its write phase (volume.importing
-        // present but no control.sock yet).  When both are present the import
-        // is in its serve phase and is ready to handle promote IPC — fall
-        // through to the normal drain path.
-        if fork_dir.join(IMPORTING_FILE).exists() && !fork_dir.join("control.sock").exists() {
-            continue;
-        }
-
-        // Skip drain/GC while a snapshot is in flight for this volume. The
-        // snapshot handler holds this lock for its full sequence (flush →
-        // drain → sign manifest → upload); racing the tick loop against it
-        // would reorder pending/ uploads against the manifest's index view.
-        let snap_lock = snapshot_lock_for(&snapshot_locks, &fork_dir);
-        let _tick_guard = match snap_lock.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::debug!(
-                    "[coordinator] skipping tick for {}: snapshot in flight",
-                    fork_dir.display()
-                );
-                continue;
-            }
-        };
-
-        // Steps 1-3: compact pending segments via volume IPC (best-effort;
-        // skipped silently if the control socket is absent so that upload
-        // still runs for forks without a live volume process).
-        // Skipped for readonly volumes: flush/sweep/repack are WAL and
-        // compaction operations that only make sense for writable volumes.
-        // During an import serve phase, control.sock is bound by the import
-        // process which only handles promote IPC.
-        if fork_dir.join("control.sock").exists() && !fork_dir.join("volume.readonly").exists() {
-            control::promote_wal(&fork_dir).await;
-
-            if let Some(s) = control::sweep_pending(&fork_dir).await
-                && s.segments_compacted > 0
-            {
-                info!(
-                    "[drain {volume_id}] sweep: {} segment(s), ~{} bytes freed",
-                    s.segments_compacted, s.bytes_freed
-                );
-            }
-
-            if let Some(s) = control::repack(&fork_dir, gc_config.density_threshold).await
-                && s.segments_compacted > 0
-            {
-                info!(
-                    "[drain {volume_id}] repack: {} segment(s), ~{} bytes freed",
-                    s.segments_compacted, s.bytes_freed
-                );
-            }
-
-            // Alias-merge extent reclamation: rewrites LBA sub-ranges of
-            // bloated hashes (partial-overwrite survivors) into fresh
-            // compact entries. One candidate per tick caps per-tick
-            // latency; the scanner sorts most-wasteful-first, so
-            // sustained bloat converges across ticks. Default scanner
-            // thresholds gate tiny / weakly-bloated hashes out.
-            if let Some(s) = control::reclaim(&fork_dir, Some(1)).await
-                && s.runs_rewritten > 0
-            {
-                info!(
-                    "[drain {volume_id}] reclaim: scanned={} runs={} bytes={} discarded={}",
-                    s.candidates_scanned, s.runs_rewritten, s.bytes_rewritten, s.discarded,
-                );
-            }
-
-            // Phase 5 Tier 1: rewrite post-snapshot pending segments with
-            // zstd-dictionary deltas against same-LBA extents from the latest
-            // sealed snapshot. Runs before drain so converted segments reach
-            // S3 as thin Delta entries rather than full bodies.
-            if let Some(s) = control::delta_repack_post_snapshot(&fork_dir).await
-                && s.entries_converted > 0
-            {
-                info!(
-                    "[drain {volume_id}] delta_repack: {}/{} segment(s) rewritten, \
-                     {} entries converted, {} → {} bytes",
-                    s.segments_rewritten,
-                    s.segments_scanned,
-                    s.entries_converted,
-                    s.original_body_bytes,
-                    s.delta_body_bytes,
-                );
-            }
-        }
-
-        // Step 4: drain pending segments to S3.
-        //
-        // Skip GC this tick if drain had upload or promote failures.  Pending
-        // segments that failed to promote still have no cache/<ulid>.body, so
-        // collect_stats would skip them and GC would not compact them — but
-        // their LBAs would not appear in the GC candidate set either.  Deferring
-        // GC until drain succeeds avoids repeated no-ops and ensures GC always
-        // operates on a fully-promoted, consistent segment set.
-        let mut drain_ok = true;
-        if fork_dir.join("pending").exists() {
-            match upload::drain_pending(&fork_dir, &volume_id, &store, part_size_bytes).await {
-                Ok(r) if r.failed > 0 => {
-                    error!(
-                        "[drain {volume_id}] {} segment(s) failed to upload; \
-                         skipping GC this tick to preserve ULID ordering invariant",
-                        r.failed
-                    );
-                    drain_ok = false;
-                }
-                Ok(r) if r.uploaded > 0 => {
-                    info!("[drain {volume_id}] {} uploaded", r.uploaded);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "[drain {volume_id}] drain error: {e:#}; \
-                         skipping GC this tick to preserve ULID ordering invariant"
-                    );
-                    drain_ok = false;
+            _ = tick.tick() => {
+                if matches!(orch.run_tick().await, TickOutcome::Stop) {
+                    break;
                 }
             }
-        }
-
-        // Step 5: GC pass (rate-limited to gc_interval).
-        if last_gc.elapsed() >= gc_interval {
-            // Finalize outstanding bare `gc/<ulid>` files first, independent
-            // of `gc_checkpoint` and `drain_ok`. A bare file is a handoff the
-            // volume already committed (`.staged` → bare) but which the
-            // coordinator has not yet uploaded + promoted. If the coordinator
-            // crashes between those steps on a quiescent volume, the next
-            // `gc_checkpoint` returns `Idle` (WAL empty + no `.staged`), and
-            // gating cleanup behind the checkpoint would strand the bare file
-            // indefinitely — `has_pending_results` would then also block
-            // every future `gc_fork` pass. Always run this.
-            match gc::apply_done_handoffs(&fork_dir, &volume_id, &store, part_size_bytes).await {
-                Ok(0) => {}
-                Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
-                Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
-            }
-
-            if !drain_ok {
-                continue;
-            }
-
-            let Some(u_gc) = control::gc_checkpoint(&fork_dir).await else {
-                last_gc = Instant::now();
-                continue;
-            };
-
-            let handoffs_applied = control::apply_gc_handoffs(&fork_dir).await;
-            if handoffs_applied > 0 {
-                info!("[gc {volume_id}] volume applied {handoffs_applied} GC handoff(s)");
-            }
-
-            let gc_result = {
-                let fork_dir = fork_dir.clone();
-                let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_path_buf();
-                let gc_config = gc_config.clone();
-                tokio::task::spawn_blocking(move || {
-                    gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, u_gc)
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
-            };
-            match gc_result {
-                Ok(gc::GcStats {
-                    strategy: gc::GcStrategy::Compact,
-                    candidates,
-                    bytes_freed,
-                    dead_cleaned,
-                    ..
-                }) => {
-                    gc_was_active = true;
-                    info!(
-                        "[gc {volume_id}] compact: {candidates} input(s) ({dead_cleaned} dead), \
-                         ~{bytes_freed} bytes freed"
-                    );
-                }
-                Ok(gc::GcStats {
-                    strategy: gc::GcStrategy::None(reason),
-                    total_segments,
-                    ..
-                }) => {
-                    // Only the NoCandidates reason reflects a real idle-pass
-                    // result. NoIndex and PendingHandoffs are transient bail-outs
-                    // that do not advance the active→idle state — another tick
-                    // will re-evaluate once the bail condition clears. The
-                    // "volume applied" / "completed N handoff(s)" logs already
-                    // cover PendingHandoffs visibility.
-                    if matches!(reason, gc::NoneReason::NoCandidates) && gc_was_active {
-                        info!(
-                            "[gc {volume_id}] idle — {total_segments} segment(s), \
-                             nothing eligible (threshold {:.2})",
-                            gc_config.density_threshold
-                        );
-                        gc_was_active = false;
-                    }
-                }
-                Err(e) => error!("[gc {volume_id}] error: {e:#}"),
-            }
-
-            last_gc = Instant::now();
         }
     }
 }
