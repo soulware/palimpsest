@@ -245,35 +245,89 @@ fn compact_candidates_inner(
             continue;
         };
         for (entry_idx, entry) in entries.iter().enumerate() {
-            let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+            let entry_idx = entry_idx as u32;
             let extent_live = extent_index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == *ulid);
-            let keep = match entry.kind {
-                EntryKind::DedupRef => lba_live,
-                _ => lba_live || (extent_live && live_hashes.contains(&entry.hash)),
-            };
-            if !keep {
-                continue;
-            }
-            // LBA-dead but hash-live Data/Inline must land as Canonical so
-            // the stale LBA binding does not shadow newer writes at the GC
-            // output's higher ULID. Mirrors coordinator `collect_stats`
-            // which calls `into_canonical()` in the same case.
-            let demote_to_canonical =
-                !lba_live && matches!(entry.kind, EntryKind::Data | EntryKind::Inline);
-            let output = if demote_to_canonical {
-                PlanOutput::Canonical {
+
+            // Multi-LBA partial-death classification: count how many of
+            // the entry's blocks still map to its hash via a full-range
+            // scan, not a point query at start_lba. Mirrors production
+            // `elide-coordinator::gc::collect_stats`. Without this, an
+            // entry whose head LBA is overwritten but whose tail blocks
+            // are still live would be demoted whole to Canonical, losing
+            // the surviving tail's LBA claim on rebuild.
+            let end_lba = entry.start_lba + entry.lba_length as u64;
+            let runs = lba_map.extents_in_range(entry.start_lba, end_lba);
+            let matching_blocks: u64 = runs
+                .iter()
+                .filter(|r| r.hash == entry.hash)
+                .map(|r| r.range_end - r.range_start)
+                .sum();
+            let total_blocks = entry.lba_length as u64;
+
+            if matching_blocks == total_blocks {
+                // Fully alive — pass through unchanged.
+                outputs.push(PlanOutput::Keep {
                     input: *ulid,
-                    entry_idx: entry_idx as u32,
+                    entry_idx,
+                });
+            } else if matching_blocks == 0 {
+                // Fully LBA-dead.
+                match entry.kind {
+                    EntryKind::Data | EntryKind::Inline
+                        if extent_live && live_hashes.contains(&entry.hash) =>
+                    {
+                        outputs.push(PlanOutput::Canonical {
+                            input: *ulid,
+                            entry_idx,
+                        });
+                    }
+                    EntryKind::DedupRef if lba_map.hash_at(entry.start_lba) == Some(entry.hash) => {
+                        // Defensive — extents_in_range said no match but
+                        // the point query agrees with the entry. Keep.
+                        outputs.push(PlanOutput::Keep {
+                            input: *ulid,
+                            entry_idx,
+                        });
+                    }
+                    _ => {
+                        // Drop entry (no body to preserve).
+                    }
                 }
             } else {
-                PlanOutput::Keep {
-                    input: *ulid,
-                    entry_idx: entry_idx as u32,
+                // Partially alive — emit one Run per surviving sub-run,
+                // each with the payload_block_offset that lets the
+                // materialise side slice the original entry's body.
+                match entry.kind {
+                    EntryKind::Data | EntryKind::Inline | EntryKind::DedupRef => {
+                        for run in &runs {
+                            if run.hash != entry.hash {
+                                continue;
+                            }
+                            let lba_length = (run.range_end - run.range_start) as u32;
+                            outputs.push(PlanOutput::Run {
+                                input: *ulid,
+                                entry_idx,
+                                payload_block_offset: run.payload_block_offset,
+                                start_lba: run.range_start,
+                                lba_length,
+                            });
+                        }
+                    }
+                    _ => {
+                        // Delta / Zero / Canonical* not exercised by the
+                        // current proptest's partial-death shapes; the
+                        // production coordinator handles them but the
+                        // test helper does not need to until those shapes
+                        // are added.
+                        outputs.push(PlanOutput::Keep {
+                            input: *ulid,
+                            entry_idx,
+                        });
+                    }
                 }
-            };
-            outputs.push(output);
+            }
         }
     }
 
