@@ -323,9 +323,7 @@ pub async fn mint_and_publish_synthesised_snapshot(
     // Reuse the existing key shape so this manifest sits next to any
     // historical snapshots under the dead fork's prefix.
     let dead_vol_str = dead_vol_ulid.to_string();
-    let snap_str = snap_ulid.to_string();
-    let key = snapshot_manifest_key(&dead_vol_str, &snap_str)
-        .map_err(|e| PublishSnapshotError::Other(e.context("computing snapshot manifest key")))?;
+    let key = snapshot_manifest_key(&dead_vol_str, snap_ulid);
 
     match portable::put_if_absent(store.as_ref(), &key, Bytes::from(bytes)).await {
         Ok(_) => Ok(PublishedSynthesisedSnapshot { snap_ulid, key }),
@@ -425,8 +423,7 @@ pub async fn resolve_handoff_verifier(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
 ) -> Result<HandoffVerifier, ResolveHandoffError> {
-    let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string())
-        .map_err(|e| ResolveHandoffError::ManifestRead(e.context("computing manifest key")))?;
+    let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
     let bytes = store
         .get(&key)
         .await
@@ -555,8 +552,7 @@ async fn fetch_manifest_from_store(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
 ) -> Result<Bytes, ResolveHandoffError> {
-    let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string())
-        .map_err(|e| ResolveHandoffError::ManifestRead(e.context("computing manifest key")))?;
+    let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
     store
         .get(&key)
         .await
@@ -1047,7 +1043,7 @@ mod tests {
             &[Ulid::new()],
             None,
         );
-        let key = snapshot_manifest_key(&dead_vol.to_string(), &snap_ulid.to_string()).unwrap();
+        let key = snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
         store.put(&key, PutPayload::from(bytes)).await.unwrap();
 
         let outcome = resolve_handoff_verifier(&store, dead_vol, snap_ulid)

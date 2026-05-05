@@ -1063,11 +1063,8 @@ mod tests {
         segment_ulids: &[Ulid],
     ) {
         let bytes = build_snapshot_manifest_bytes(fork.signer.as_ref(), segment_ulids, None);
-        let key = elide_coordinator::upload::snapshot_manifest_key(
-            &fork.vol.to_string(),
-            &fork.snap.to_string(),
-        )
-        .unwrap();
+        let key =
+            elide_coordinator::upload::snapshot_manifest_key(&fork.vol.to_string(), fork.snap);
         store.put(&key, PutPayload::from(bytes)).await.unwrap();
     }
 

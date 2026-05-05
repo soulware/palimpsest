@@ -596,7 +596,7 @@ impl HandoffCursor<'_> {
         // uploaded and promoted, the store PUT is a re-PUT of the same
         // bytes and `promote_segment` short-circuits on cache body presence.
         self.uploader
-            .upload(gc_body, &new_ulid_str)
+            .upload(gc_body, new_ulid)
             .await
             .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
@@ -1545,7 +1545,7 @@ mod tests {
             let ulid_str = ulid.to_string();
             let seg_path = pending_dir.join(&ulid_str);
             let data = fs::read(&seg_path).unwrap();
-            let key = segment_key(volume_id, &ulid_str).unwrap();
+            let key = segment_key(volume_id, ulid);
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
@@ -2529,7 +2529,7 @@ mod tests {
         )
         .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
-        let key = segment_key("00000000000000000000000000", &delta_ulid.to_string()).unwrap();
+        let key = segment_key("00000000000000000000000000", delta_ulid);
         store
             .put(&key, bytes::Bytes::from(bytes).into())
             .await

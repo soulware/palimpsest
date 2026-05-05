@@ -724,8 +724,7 @@ fn manifest_driven_fetch_set(
             result.skipped += 1;
             continue;
         }
-        let key = crate::upload::segment_key(volume_id, &ulid_str)
-            .with_context(|| format!("computing segment key for {ulid_str}"))?;
+        let key = crate::upload::segment_key(volume_id, ulid);
         out.push((key, ulid_str, ulid));
     }
     Ok(out)
@@ -1007,7 +1006,7 @@ async fn prefetch_branch_snapshot_artifacts(
     }
 
     trace!("[prefetch] peer miss for snapshot artifact {manifest_name}; falling through to S3");
-    let key = crate::upload::snapshot_manifest_key(&volume_id, &snap_ulid_str)?;
+    let key = crate::upload::snapshot_manifest_key(&volume_id, snap_ulid);
     let data = store
         .get(&key)
         .await
@@ -1113,7 +1112,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(parent_ulid, seg_ulid).unwrap();
+        let key = crate::upload::segment_key(parent_ulid, seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Upload the parent's signed snapshot manifest at the branch
@@ -1124,7 +1123,8 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid).unwrap();
+        let manifest_key =
+            crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid.parse().unwrap());
         store
             .put(&manifest_key, manifest_bytes.into())
             .await
@@ -1217,7 +1217,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(parent_ulid, seg_ulid).unwrap();
+        let key = crate::upload::segment_key(parent_ulid, seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Parent's signed manifest at the branch point — required by
@@ -1227,7 +1227,8 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid).unwrap();
+        let manifest_key =
+            crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid.parse().unwrap());
         store
             .put(&manifest_key, manifest_bytes.into())
             .await
@@ -1336,7 +1337,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let seg_key = crate::upload::segment_key(parent_ulid, seg_ulid).unwrap();
+        let seg_key = crate::upload::segment_key(parent_ulid, seg_ulid.parse().unwrap());
         store.put(&seg_key, seg_bytes.into()).await.unwrap();
 
         // Synthesised manifest signed under the *recovering coord*
@@ -1355,7 +1356,8 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid).unwrap();
+        let manifest_key =
+            crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid.parse().unwrap());
         store
             .put(&manifest_key, manifest_bytes.into())
             .await
@@ -1414,7 +1416,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(root_ulid, seg_ulid).unwrap();
+        let key = crate::upload::segment_key(root_ulid, seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Publish a snapshot manifest at a snap ULID > seg ULID, signed
@@ -1426,7 +1428,8 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key = crate::upload::snapshot_manifest_key(root_ulid, snap_ulid).unwrap();
+        let manifest_key =
+            crate::upload::snapshot_manifest_key(root_ulid, snap_ulid.parse().unwrap());
         store
             .put(&manifest_key, manifest_bytes.into())
             .await
@@ -1484,7 +1487,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(root_ulid, seg_ulid).unwrap();
+        let key = crate::upload::segment_key(root_ulid, seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
@@ -1546,14 +1549,14 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         store
             .put(
-                &crate::upload::segment_key(root_ulid_str, old_ulid_str).unwrap(),
+                &crate::upload::segment_key(root_ulid_str, old_ulid_str.parse().unwrap()),
                 old_bytes.into(),
             )
             .await
             .unwrap();
         store
             .put(
-                &crate::upload::segment_key(root_ulid_str, new_ulid_str).unwrap(),
+                &crate::upload::segment_key(root_ulid_str, new_ulid_str.parse().unwrap()),
                 new_bytes.into(),
             )
             .await
@@ -1635,7 +1638,7 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         store
             .put(
-                &crate::upload::segment_key(root_ulid_str, old_ulid_str).unwrap(),
+                &crate::upload::segment_key(root_ulid_str, old_ulid_str.parse().unwrap()),
                 bytes_old.into(),
             )
             .await
@@ -1698,7 +1701,7 @@ mod tests {
         let manifest_bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
         store
             .put(
-                &crate::upload::snapshot_manifest_key(vol_ulid, snap_ulid).unwrap(),
+                &crate::upload::snapshot_manifest_key(vol_ulid, snap_ulid.parse().unwrap()),
                 manifest_bytes.into(),
             )
             .await
@@ -1796,7 +1799,8 @@ mod tests {
         let branch_manifest_bytes =
             build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
         for snap in [earlier, branch, later] {
-            let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap).unwrap();
+            let manifest_key =
+                crate::upload::snapshot_manifest_key(parent_ulid, snap.parse().unwrap());
             let manifest_payload = if snap == branch {
                 branch_manifest_bytes.clone().into()
             } else {
@@ -1952,7 +1956,8 @@ mod tests {
         // below to confirm prefetch ignores pre-#215 bucket residue.
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
-        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, branch).unwrap();
+        let manifest_key =
+            crate::upload::snapshot_manifest_key(parent_ulid, branch.parse().unwrap());
         store
             .put(&manifest_key, manifest_bytes.into())
             .await
