@@ -98,7 +98,7 @@ pub struct CoordinatorCore {
 
 impl IpcContext {
     /// Snapshot the universal hot-core fields. Cheap (Arc clones).
-    fn core(&self) -> CoordinatorCore {
+    pub(crate) fn core(&self) -> CoordinatorCore {
         CoordinatorCore {
             data_dir: self.data_dir.clone(),
             rescan: self.rescan.clone(),
@@ -305,16 +305,7 @@ async fn dispatch_json(
         }
         Request::Start { volume } => {
             // Conditional PUT on names/<volume>: coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
-            let result = start_volume_op(
-                &volume,
-                &ctx.data_dir,
-                &store,
-                ctx.identity.coordinator_id_str(),
-                ctx.identity.hostname(),
-                &ctx.rescan,
-            )
-            .await;
+            let result = start_volume_op(&volume, &ctx.core()).await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -324,17 +315,7 @@ async fn dispatch_json(
             flags,
         } => {
             // Mixed: names/<volume> claim + per-volume artefacts.
-            let store = ctx.stores.coordinator_wide();
-            let result = create_volume_op(
-                &volume,
-                size_bytes,
-                &flags,
-                &ctx.data_dir,
-                &store,
-                &ctx.identity,
-                &ctx.rescan,
-            )
-            .await;
+            let result = create_volume_op(&volume, size_bytes, &flags, &ctx.core()).await;
             let env: Envelope<CreateReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -368,8 +349,7 @@ async fn dispatch_json(
             // Per-volume artefact upload + events/<volume>/ emit.
             // Coordinator-wide today; future Tigris work splits the
             // upload from the event emit.
-            let store = ctx.stores.coordinator_wide();
-            let result = snapshot_volume(&volume, &ctx.data_dir, &ctx.snapshot_locks, &store).await;
+            let result = snapshot_volume(&volume, &ctx.core(), &ctx.snapshot_locks).await;
             let env: Envelope<SnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -714,11 +694,11 @@ async fn evict_volume(
 /// the returned `MutexGuard`).
 pub(crate) async fn snapshot_volume(
     vol_name: &str,
-    data_dir: &Path,
+    core: &CoordinatorCore,
     snapshot_locks: &SnapshotLockRegistry,
-    store: &Arc<dyn ObjectStore>,
 ) -> Result<SnapshotReply, IpcError> {
-    let link = data_dir.join("by_name").join(vol_name);
+    let store = core.stores.coordinator_wide();
+    let link = core.data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
         .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
     if !fork_dir.join("control.sock").exists() {
@@ -749,7 +729,7 @@ pub(crate) async fn snapshot_volume(
     //    upload any snapshot files already sitting under snapshots/.
     //    We run this before sign_snapshot_manifest so that index/ is populated
     //    with every segment up to the flush point.
-    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store).await {
+    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, &store).await {
         Ok(r) if r.failed > 0 => {
             return Err(IpcError::store(format!(
                 "drain reported {} failed segment(s)",
@@ -773,7 +753,7 @@ pub(crate) async fn snapshot_volume(
     //    `try_lock`s the same lock and skips the tick while we hold it,
     //    so there is no race with a concurrent apply_done_handoffs.
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
-    elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store)
+    elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, &store)
         .await
         .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
 
@@ -807,7 +787,7 @@ pub(crate) async fn snapshot_volume(
     // because the importer already has ext4 layout in hand.
 
     // 5. Upload the new snapshot marker and manifest.
-    elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, &volume_id, store)
+    elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, &volume_id, &store)
         .await
         .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
 
@@ -1156,11 +1136,11 @@ async fn create_volume_op(
     name: &str,
     size_bytes: u64,
     flags: &[String],
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    rescan: &Notify,
+    core: &CoordinatorCore,
 ) -> Result<CreateReply, IpcError> {
+    let identity = &core.identity;
+    let store = core.stores.coordinator_wide();
+    let data_dir: &Path = &core.data_dir;
     let coord_id = identity.coordinator_id_str();
 
     validate_volume_name(name).map_err(IpcError::bad_request)?;
@@ -1253,13 +1233,13 @@ async fn create_volume_op(
     // names/<name> references them, so they're harmless and
     // GC-reclaimable).
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, store).await
+        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, &store).await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &vol_ulid_str, store)
+        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &vol_ulid_str, &store)
             .await
     {
         cleanup_local();
@@ -1274,7 +1254,7 @@ async fn create_volume_op(
     // is always possible from here on.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
     match mark_initial(
-        store,
+        &store,
         name,
         coord_id,
         identity.hostname(),
@@ -1285,7 +1265,7 @@ async fn create_volume_op(
     {
         Ok(MarkInitialOutcome::Claimed) => {
             elide_coordinator::volume_event_store::emit_best_effort(
-                store,
+                &store,
                 identity.as_ref(),
                 name,
                 elide_core::volume_event::EventKind::Created,
@@ -1359,7 +1339,7 @@ async fn create_volume_op(
         return Err(IpcError::internal(format!("create failed: {e}")));
     }
 
-    rescan.notify_one();
+    core.rescan.notify_one();
     info!("[inbound] created volume {name} ({vol_ulid_str})");
     Ok(CreateReply { vol_ulid })
 }
@@ -2157,7 +2137,7 @@ async fn release_volume_op(
     // zero-entry snapshot as a fresh empty root.
     let snap_started = std::time::Instant::now();
     info!("[release {volume_name}] draining WAL and publishing handoff snapshot");
-    let snap_ulid = snapshot_volume(volume_name, data_dir, snapshot_locks, store)
+    let snap_ulid = snapshot_volume(volume_name, &ctx.core(), snapshot_locks)
         .await
         .map_err(|e| IpcError::internal(format!("snapshot for release failed: {e}")))?
         .snap_ulid;
@@ -2396,14 +2376,11 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
 /// The result always leaves the volume `Stopped` (no daemon launched).
 /// The CLI calls `start` afterwards if `volume start --claim` was the
 /// composed flow.
-async fn start_volume_op(
-    volume_name: &str,
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
-    hostname: Option<&str>,
-    rescan: &Notify,
-) -> Result<(), IpcError> {
+async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<(), IpcError> {
+    let data_dir: &Path = &core.data_dir;
+    let store = core.stores.coordinator_wide();
+    let coord_id = core.identity.coordinator_id_str();
+    let hostname = core.identity.hostname();
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return Err(IpcError::not_found(format!(
@@ -2419,7 +2396,7 @@ async fn start_volume_op(
     }
 
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
-    match mark_live(store, volume_name, coord_id, hostname).await {
+    match mark_live(&store, volume_name, coord_id, hostname).await {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
         Ok(MarkLiveOutcome::Absent) => {
             // No S3 record yet — proceed local-only.
@@ -2459,7 +2436,7 @@ async fn start_volume_op(
 
     std::fs::remove_file(vol_dir.join(STOPPED_FILE))
         .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
-    rescan.notify_one();
+    core.rescan.notify_one();
     info!("[inbound] started volume {volume_name}");
     Ok(())
 }
