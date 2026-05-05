@@ -30,7 +30,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::claim::{ClaimJobState, ClaimRegistry};
-use crate::credential::CredentialIssuer;
+use crate::credential::{CredentialIssuer, credential_issuer};
 use crate::fork::{ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
@@ -141,7 +141,7 @@ impl IpcContext {
     }
 }
 
-pub async fn serve(socket_path: &Path, ctx: IpcContext, issuer: Arc<dyn CredentialIssuer>) {
+pub async fn serve(socket_path: &Path, ctx: IpcContext) {
     let _ = std::fs::remove_file(socket_path);
 
     let listener = match UnixListener::bind(socket_path) {
@@ -176,18 +176,14 @@ pub async fn serve(socket_path: &Path, ctx: IpcContext, issuer: Arc<dyn Credenti
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(handle(stream, ctx.clone(), issuer.clone()));
+                tokio::spawn(handle(stream, ctx.clone()));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
     }
 }
 
-async fn handle(
-    stream: tokio::net::UnixStream,
-    ctx: IpcContext,
-    issuer: Arc<dyn CredentialIssuer>,
-) {
+async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     // Capture peer credentials before splitting the stream — needed for
     // SO_PEERCRED on the `register` and `credentials` verbs. Other
     // verbs ignore the peer pid; capturing once here keeps the code
@@ -207,7 +203,7 @@ async fn handle(
     };
     let line = line.trim().to_owned();
 
-    dispatch_json(&line, &ctx, peer_pid, &mut writer, issuer.as_ref()).await;
+    dispatch_json(&line, &ctx, peer_pid, &mut writer).await;
 }
 
 /// Typed JSON dispatch. Each match arm runs the verb-specific
@@ -218,16 +214,15 @@ async fn handle(
 /// verbs fail at the `serde_json::from_str` step — `serde` rejects
 /// unrecognised variants by default for internally-tagged enums.
 ///
-/// `issuer` is a daemon-owned resource used by exactly one handler
-/// (`Credentials`). Routed alongside the broadly-shared `ctx` rather
-/// than carried inside it. The `[store]` section is process-global
-/// (set in `daemon::run`) and read directly inside `GetStoreConfig`.
+/// The `[store]` section and the credential issuer are both
+/// process-global (set in `daemon::run`) and read directly inside
+/// the `GetStoreConfig` and `Credentials` arms — they don't need to
+/// be threaded through `ctx`.
 async fn dispatch_json(
     line: &str,
     ctx: &IpcContext,
     peer_pid: Option<i32>,
     writer: &mut OwnedWriteHalf,
-    issuer: &dyn CredentialIssuer,
 ) {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -419,7 +414,7 @@ async fn dispatch_json(
                 &ctx.data_dir,
                 peer_pid,
                 ctx.identity.macaroon_root(),
-                issuer,
+                credential_issuer(),
             );
             let env: Envelope<StoreCredsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;

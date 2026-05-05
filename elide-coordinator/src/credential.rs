@@ -14,6 +14,7 @@
 // § "Coordinator identity".
 
 use std::io;
+use std::sync::OnceLock;
 
 use tracing::warn;
 
@@ -75,4 +76,40 @@ impl CredentialIssuer for SharedKeyPassthrough {
             expiry_unix: None,
         })
     }
+}
+
+/// Process-global credential issuer. Set once by `daemon::run` from the
+/// configured backend (`SharedKeyPassthrough` today; per-volume IAM
+/// backends slot in here later) and read by the IPC handler that
+/// services `Request::Credentials` (`issue_credentials` in
+/// `inbound::dispatch_json`). Stored as `&'static dyn CredentialIssuer`
+/// via `Box::leak` so the IPC dispatch path doesn't have to clone an
+/// `Arc` per connection or thread the value through `serve`/`handle`.
+///
+/// The leaf `issue_credentials` still takes a `&dyn CredentialIssuer`
+/// argument so its unit tests can drive it with a stub issuer
+/// (`FixedIssuer`) without touching the global.
+static CREDENTIAL_ISSUER: OnceLock<&'static dyn CredentialIssuer> = OnceLock::new();
+
+/// Install the daemon-wide credential issuer. Called once by
+/// `daemon::run` before the IPC socket is bound; later calls are
+/// silently ignored.
+pub fn set_credential_issuer<I: CredentialIssuer + 'static>(issuer: I) {
+    let leaked: &'static dyn CredentialIssuer = Box::leak(Box::new(issuer));
+    let _ = CREDENTIAL_ISSUER.set(leaked);
+}
+
+/// Read the daemon-wide credential issuer.
+///
+/// Panics if `set_credential_issuer` has not been called. The only
+/// caller is `inbound::dispatch_json`'s `Request::Credentials` arm,
+/// reachable only via the IPC server bound after `daemon::run`
+/// installs the value — so the unset case is an
+/// impossible-to-violate invariant in production. Unit tests for
+/// `issue_credentials` pass their stub issuer directly and never hit
+/// this getter.
+pub fn credential_issuer() -> &'static dyn CredentialIssuer {
+    *CREDENTIAL_ISSUER
+        .get()
+        .expect("credential_issuer not set before IPC dispatch")
 }

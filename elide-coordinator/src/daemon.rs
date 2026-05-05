@@ -35,7 +35,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::config::CoordinatorConfig;
-use crate::credential::{CredentialIssuer, SharedKeyPassthrough};
+use crate::credential::{SharedKeyPassthrough, set_credential_issuer};
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
@@ -148,7 +148,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }
-    let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
+    set_credential_issuer(SharedKeyPassthrough::new_with_warning());
 
     info!(
         "[coordinator] data_dir: {}; drain every {}, scan every {}; elide bin: {}",
@@ -228,7 +228,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             peer_fetch: peer_fetch_handle.clone(),
         };
         tasks.spawn(async move {
-            inbound::serve(&socket_path, ctx, issuer).await;
+            inbound::serve(&socket_path, ctx).await;
         });
     }
 
