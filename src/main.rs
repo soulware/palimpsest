@@ -516,7 +516,7 @@ fn main() {
 
     let args = Args::parse();
 
-    let socket_path = args.data_dir.join("control.sock");
+    let coord = coordinator_client::Client::new(args.data_dir.join("control.sock"));
     let by_id_dir = args.data_dir.join("by_id");
 
     match args.command {
@@ -529,7 +529,7 @@ fn main() {
                 } else {
                     ListFilter::All
                 };
-                if let Err(e) = list_volumes(&args.data_dir, &socket_path, filter, all) {
+                if let Err(e) = list_volumes(&args.data_dir, &coord, filter, all) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -564,7 +564,7 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Snapshot { name } => match snapshot_volume(&args.data_dir, &name) {
+            VolumeCommand::Snapshot { name } => match coord.snapshot_volume(&name) {
                 Ok(ulid) => println!("{ulid}"),
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -573,8 +573,7 @@ fn main() {
             },
 
             VolumeCommand::GenerateFilemap { name, snapshot } => {
-                match coordinator_client::generate_filemap(&socket_path, &name, snapshot.as_deref())
-                {
+                match coord.generate_filemap(&name, snapshot.as_deref()) {
                     Ok(ulid) => println!("{name}: filemap written for snapshot {ulid}"),
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -606,7 +605,7 @@ fn main() {
                         &args.data_dir,
                         &name,
                         from,
-                        &socket_path,
+                        &coord,
                         &by_id_dir,
                         &flags,
                         force_snapshot,
@@ -636,12 +635,7 @@ fn main() {
                     let flags = encode_transport_flags(
                         nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
                     );
-                    let ulid = match coordinator_client::create_volume_remote(
-                        &socket_path,
-                        &name,
-                        bytes,
-                        &flags,
-                    ) {
+                    let ulid = match coord.create_volume_remote(&name, bytes, &flags) {
                         Ok(u) => u,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -668,7 +662,7 @@ fn main() {
                 let flags = encode_transport_flags(
                     nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, ublk_id, no_ublk,
                 );
-                match coordinator_client::update_volume(&socket_path, &name, &flags) {
+                match coord.update_volume(&name, &flags) {
                     Ok(reply) if reply.restarted => {
                         println!("volume restarting with new config")
                     }
@@ -684,7 +678,7 @@ fn main() {
 
             VolumeCommand::Status { name, remote } => {
                 if remote {
-                    match coordinator_client::status_remote(&socket_path, &name) {
+                    match coord.status_remote(&name) {
                         Ok(rs) => print_remote_status(&name, &rs),
                         Err(e) => {
                             eprintln!("{name}: {e}");
@@ -692,7 +686,7 @@ fn main() {
                         }
                     }
                 } else {
-                    match coordinator_client::status(&socket_path, &name) {
+                    match coord.status(&name) {
                         Ok(reply) => println!("{name}: {}", reply.lifecycle.wire_body()),
                         Err(e) => {
                             eprintln!("{name}: {e}");
@@ -702,34 +696,32 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Events { name, json } => {
-                match coordinator_client::volume_events(&socket_path, &name) {
-                    Ok(reply) => {
-                        if json {
-                            for entry in &reply.events {
-                                match serde_json::to_string(entry) {
-                                    Ok(s) => println!("{s}"),
-                                    Err(e) => {
-                                        eprintln!("{name}: serialise event: {e}");
-                                        std::process::exit(1);
-                                    }
+            VolumeCommand::Events { name, json } => match coord.volume_events(&name) {
+                Ok(reply) => {
+                    if json {
+                        for entry in &reply.events {
+                            match serde_json::to_string(entry) {
+                                Ok(s) => println!("{s}"),
+                                Err(e) => {
+                                    eprintln!("{name}: serialise event: {e}");
+                                    std::process::exit(1);
                                 }
                             }
-                        } else {
-                            print_volume_events(&reply);
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("{name}: {e}");
-                        std::process::exit(1);
+                    } else {
+                        print_volume_events(&reply);
                     }
                 }
-            }
+                Err(e) => {
+                    eprintln!("{name}: {e}");
+                    std::process::exit(1);
+                }
+            },
 
             VolumeCommand::Import(import_args) => match import_args.command {
                 Some(ImportSubcommand::Status { name }) => {
                     use coordinator_client::ImportStatusReply;
-                    match coordinator_client::import_status_by_name(&socket_path, &name) {
+                    match coord.import_status_by_name(&name) {
                         Ok(ImportStatusReply::Running) => println!("{name}: running"),
                         Ok(ImportStatusReply::Done) => println!("{name}: done"),
                         Err(e) => {
@@ -740,9 +732,7 @@ fn main() {
                 }
                 Some(ImportSubcommand::Attach { name }) => {
                     let mut stdout = std::io::stdout();
-                    if let Err(e) =
-                        coordinator_client::import_attach_by_name(&socket_path, &name, &mut stdout)
-                    {
+                    if let Err(e) = coord.import_attach_by_name(&name, &mut stdout) {
                         eprintln!("import failed: {e}");
                         std::process::exit(1);
                     }
@@ -761,12 +751,7 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    if let Err(e) = coordinator_client::import_start(
-                        &socket_path,
-                        &name,
-                        &oci_ref,
-                        &import_args.extents_from,
-                    ) {
+                    if let Err(e) = coord.import_start(&name, &oci_ref, &import_args.extents_from) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -789,11 +774,7 @@ fn main() {
                         .ok();
 
                         let mut stdout = std::io::stdout();
-                        if let Err(e) = coordinator_client::import_attach_by_name(
-                            &socket_path,
-                            &name,
-                            &mut stdout,
-                        ) {
+                        if let Err(e) = coord.import_attach_by_name(&name, &mut stdout) {
                             eprintln!("import failed: {e}");
                             std::process::exit(1);
                         }
@@ -803,7 +784,7 @@ fn main() {
                                 &args.data_dir,
                                 &fork_name,
                                 &name,
-                                &socket_path,
+                                &coord,
                                 &by_id_dir,
                                 &[],
                                 false,
@@ -817,7 +798,7 @@ fn main() {
             },
 
             VolumeCommand::Evict { segment, name } => {
-                match coordinator_client::evict_volume(&socket_path, &name, segment.as_deref()) {
+                match coord.evict_volume(&name, segment.as_deref()) {
                     Ok(n) => {
                         let label = if n == 1 { "segment" } else { "segments" };
                         println!("evicted {n} {label}");
@@ -830,19 +811,19 @@ fn main() {
             }
 
             VolumeCommand::Remove { name, force } => {
-                if let Err(e) = coordinator_client::remove_volume(&socket_path, &name, force) {
+                if let Err(e) = coord.remove_volume(&name, force) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
 
             VolumeCommand::Stop { name, release } => {
-                if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
+                if let Err(e) = coord.stop_volume(&name) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
                 if release {
-                    match coordinator_client::release_volume(&socket_path, &name, false) {
+                    match coord.release_volume(&name, false) {
                         Ok(reply) => {
                             println!(
                                 "{name}: released at handoff snapshot {}",
@@ -863,7 +844,7 @@ fn main() {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
                     // already; no second await needed here.
-                    if let Err(e) = run_claim(&name, &socket_path) {
+                    if let Err(e) = run_claim(&name, &coord) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -877,13 +858,11 @@ fn main() {
                     // wait so start isn't a silent multi-second hang.
                     install_prefetch_ctrlc_handler(&name, "[start]");
                     let quick = std::time::Duration::from_millis(250);
-                    if coordinator_client::await_prefetch(&socket_path, &vol_ulid, quick).is_err() {
+                    if coord.await_prefetch(&vol_ulid, quick).is_err() {
                         eprintln!("[start] waiting for ancestor prefetch...");
-                        match coordinator_client::await_prefetch(
-                            &socket_path,
-                            &vol_ulid,
-                            coordinator_client::PREFETCH_AWAIT_BUDGET,
-                        ) {
+                        match coord
+                            .await_prefetch(&vol_ulid, coordinator_client::PREFETCH_AWAIT_BUDGET)
+                        {
                             Ok(()) => eprintln!("[start] ready"),
                             Err(e) => eprintln!(
                                 "[start] prefetch did not finish in time ({e}); \
@@ -892,7 +871,7 @@ fn main() {
                         }
                     }
                 }
-                if let Err(e) = coordinator_client::start_volume(&socket_path, &name) {
+                if let Err(e) = coord.start_volume(&name) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -904,32 +883,30 @@ fn main() {
             }
 
             VolumeCommand::Claim { name } => {
-                if let Err(e) = run_claim(&name, &socket_path) {
+                if let Err(e) = run_claim(&name, &coord) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
                 println!("{name}: claimed");
             }
 
-            VolumeCommand::Release { name, force } => {
-                match coordinator_client::release_volume(&socket_path, &name, force) {
-                    Ok(reply) => {
-                        let kind = if force {
-                            format!(
-                                "force-released at synthesised handoff snapshot {}",
-                                reply.handoff_snapshot
-                            )
-                        } else {
-                            format!("released at handoff snapshot {}", reply.handoff_snapshot)
-                        };
-                        println!("{name}: {kind}");
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
+            VolumeCommand::Release { name, force } => match coord.release_volume(&name, force) {
+                Ok(reply) => {
+                    let kind = if force {
+                        format!(
+                            "force-released at synthesised handoff snapshot {}",
+                            reply.handoff_snapshot
+                        )
+                    } else {
+                        format!("released at handoff snapshot {}", reply.handoff_snapshot)
+                    };
+                    println!("{name}: {kind}");
                 }
-            }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
         },
 
         Command::ServeVolume {
@@ -1109,19 +1086,6 @@ fn main() {
     }
 }
 
-/// Snapshot a volume by asking the coordinator to orchestrate the full
-/// sequence (flush → drain → sign manifest → upload). The coordinator is
-/// the only path — there is no in-process fallback, because the snapshot
-/// cannot write a signed `.manifest` file without the drain step, and
-/// the drain step requires the coordinator's per-volume lock and S3
-/// client.
-///
-/// Returns the snapshot ULID on success.
-fn snapshot_volume(data_dir: &Path, name: &str) -> std::io::Result<String> {
-    let socket = data_dir.join("control.sock");
-    coordinator_client::snapshot_volume(&socket, name)
-}
-
 enum ListFilter {
     Writable,
     Readonly,
@@ -1165,11 +1129,11 @@ struct VolumeRow {
 
 fn list_volumes(
     data_dir: &Path,
-    socket_path: &Path,
+    coord: &coordinator_client::Client,
     filter: ListFilter,
     include_ancestors: bool,
 ) -> std::io::Result<()> {
-    let coordinator_up = coordinator_client::is_reachable(socket_path);
+    let coordinator_up = coord.is_reachable();
     let by_name_dir = data_dir.join("by_name");
     let by_id_dir = data_dir.join("by_id");
     let mut rows: Vec<VolumeRow> = Vec::new();
@@ -1248,7 +1212,10 @@ fn list_volumes(
     if rows.is_empty() {
         println!("no volumes found in {}", data_dir.display());
         if !coordinator_up {
-            println!("coordinator is not running ({})", socket_path.display());
+            println!(
+                "coordinator is not running ({})",
+                coord.socket_path().display()
+            );
         }
         return Ok(());
     }
@@ -1284,7 +1251,10 @@ fn list_volumes(
     }
     if !coordinator_up {
         println!();
-        println!("coordinator is not running ({})", socket_path.display());
+        println!(
+            "coordinator is not running ({})",
+            coord.socket_path().display()
+        );
     }
     Ok(())
 }
@@ -1437,7 +1407,7 @@ fn create_fork(
     data_dir: &Path,
     fork_name: &str,
     from: &str,
-    socket_path: &Path,
+    coord: &coordinator_client::Client,
     by_id_dir: &Path,
     flags: &[String],
     force_snapshot: bool,
@@ -1476,14 +1446,13 @@ fn create_fork(
         }
     };
 
-    coordinator_client::fork_start(socket_path, fork_name, source, force_snapshot, flags)?;
+    coord.fork_start(fork_name, source, force_snapshot, flags)?;
 
     // Stream coordinator-side progress to stderr (chain pull, snapshot
     // decision, fork mint, prefetch warm-up). The terminal `Done`
     // event hands back the new fork's ULID.
     let mut stderr = std::io::stderr();
-    let new_vol_ulid =
-        coordinator_client::fork_attach_by_name(socket_path, fork_name, &mut stderr)?;
+    let new_vol_ulid = coord.fork_attach_by_name(fork_name, &mut stderr)?;
     let new_fork_dir = by_id_dir.join(new_vol_ulid.to_string());
     println!("{}", new_fork_dir.display());
     Ok(())
@@ -1499,9 +1468,9 @@ fn create_fork(
 ///     conditional PUT inside `rebind-name` resolves races; the local
 ///     fork is left in place as a usable orphan if another
 ///     coordinator wins.
-fn run_claim(name: &str, socket_path: &Path) -> std::io::Result<()> {
+fn run_claim(name: &str, coord: &coordinator_client::Client) -> std::io::Result<()> {
     use coordinator_client::ClaimStartReply;
-    match coordinator_client::claim_start(socket_path, name)? {
+    match coord.claim_start(name)? {
         ClaimStartReply::Reclaimed => Ok(()),
         ClaimStartReply::Claiming { released_vol_ulid } => {
             eprintln!("[claim] claiming '{name}' from {released_vol_ulid}");
@@ -1511,7 +1480,7 @@ fn run_claim(name: &str, socket_path: &Path) -> std::io::Result<()> {
             // the prefetch step — the bucket-side claim and local fork
             // are durable by the time we get here, mirroring the prior
             // CLI behaviour. Pre-prefetch errors do still surface.
-            match coordinator_client::claim_attach_by_name(socket_path, name, &mut stderr) {
+            match coord.claim_attach_by_name(name, &mut stderr) {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     eprintln!(
@@ -1567,9 +1536,9 @@ fn resolve_local_volume_ulid(data_dir: &Path, name: &str) -> Option<String> {
 /// fall back to `FetchConfig::load` from the volume directory.
 fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchInputs> {
     if let Ok(sock) = std::env::var("ELIDE_COORDINATOR_SOCKET") {
-        let socket_path = Path::new(&sock);
+        let coord = coordinator_client::Client::new(&sock);
         let volume_ulid = elide_fetch::derive_volume_id(fork_dir)?;
-        if let Some(inputs) = fetch_config_via_coordinator_macaroon(socket_path, &volume_ulid)? {
+        if let Some(inputs) = fetch_config_via_coordinator_macaroon(&coord, &volume_ulid)? {
             return Ok(inputs);
         }
     }
@@ -1590,13 +1559,13 @@ fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchIn
 /// the event log); it is returned alongside the fetch config so the
 /// daemon can stack a peer body byte-range fetcher in front of S3.
 fn fetch_config_via_coordinator_macaroon(
-    socket_path: &Path,
+    coord: &coordinator_client::Client,
     volume_ulid: &str,
 ) -> std::io::Result<Option<VolumeFetchInputs>> {
-    if !socket_path.exists() {
+    if !coord.socket_path().exists() {
         return Ok(None);
     }
-    let config = match coordinator_client::get_store_config(socket_path) {
+    let config = match coord.get_store_config() {
         Ok(c) => c,
         Err(e)
             if matches!(
@@ -1625,7 +1594,7 @@ fn fetch_config_via_coordinator_macaroon(
             "coordinator returned empty store config",
         ));
     };
-    let registered = coordinator_client::register_and_get_creds(socket_path, volume_ulid)?;
+    let registered = coord.register_and_get_creds(volume_ulid)?;
     // SAFETY: serve-volume startup is single-threaded at this point — no
     // background tasks have been spawned, so there are no concurrent env
     // readers.
