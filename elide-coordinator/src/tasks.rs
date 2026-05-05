@@ -103,7 +103,6 @@ pub async fn run_volume_tasks(
     store: Arc<dyn ObjectStore>,
     drain_interval: Duration,
     gc_config: GcConfig,
-    part_size_bytes: usize,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
     snapshot_locks: SnapshotLockRegistry,
     prefetch_done: Arc<watch::Sender<PrefetchState>>,
@@ -242,7 +241,6 @@ pub async fn run_volume_tasks(
         fork_dir.clone(),
         volume_id,
         store,
-        part_size_bytes,
         gc_config,
         &snapshot_locks,
     );

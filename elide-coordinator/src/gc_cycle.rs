@@ -32,7 +32,6 @@ pub struct GcCycleOrchestrator {
     by_id_dir: PathBuf,
     volume_id: String,
     store: Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
     gc_config: GcConfig,
     snap_lock: Arc<AsyncMutex<()>>,
     last_gc: Instant,
@@ -44,7 +43,6 @@ impl GcCycleOrchestrator {
         fork_dir: PathBuf,
         volume_id: String,
         store: Arc<dyn ObjectStore>,
-        part_size_bytes: usize,
         gc_config: GcConfig,
         snapshot_locks: &SnapshotLockRegistry,
     ) -> Self {
@@ -62,7 +60,6 @@ impl GcCycleOrchestrator {
             by_id_dir,
             volume_id,
             store,
-            part_size_bytes,
             gc_config,
             snap_lock,
             last_gc,
@@ -216,9 +213,7 @@ impl GcCycleOrchestrator {
             return true;
         }
         let volume_id = &self.volume_id;
-        match upload::drain_pending(&self.fork_dir, volume_id, &self.store, self.part_size_bytes)
-            .await
-        {
+        match upload::drain_pending(&self.fork_dir, volume_id, &self.store).await {
             Ok(r) if r.failed > 0 => {
                 error!(
                     "[drain {volume_id}] {} segment(s) failed to upload; \
@@ -245,9 +240,7 @@ impl GcCycleOrchestrator {
 
     async fn run_handoff_cleanup(&self) {
         let volume_id = &self.volume_id;
-        match gc::apply_done_handoffs(&self.fork_dir, volume_id, &self.store, self.part_size_bytes)
-            .await
-        {
+        match gc::apply_done_handoffs(&self.fork_dir, volume_id, &self.store).await {
             Ok(0) => {}
             Ok(n) => info!("[gc {volume_id}] completed {n} GC handoff(s)"),
             Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),

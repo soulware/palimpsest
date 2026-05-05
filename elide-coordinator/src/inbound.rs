@@ -70,7 +70,6 @@ pub struct IpcContext {
     pub snapshot_locks: SnapshotLockRegistry,
     pub prefetch_tracker: PrefetchTracker,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
-    pub part_size_bytes: usize,
     /// The coordinator's identity bundle. Used as a `SegmentSigner`
     /// when minting synthesised handoff snapshots during
     /// `volume release --force`, and as the source of the coordinator
@@ -122,14 +121,13 @@ impl IpcContext {
 
     /// Construct a [`crate::fork::ForkContext`] — the hot core plus the
     /// fork-domain registries (fork_registry, prefetch_tracker,
-    /// snapshot_locks, part_size_bytes).
+    /// snapshot_locks).
     pub(crate) fn for_fork(&self) -> crate::fork::ForkContext {
         crate::fork::ForkContext {
             core: self.core(),
             fork_registry: self.fork_registry.clone(),
             prefetch_tracker: self.prefetch_tracker.clone(),
             snapshot_locks: self.snapshot_locks.clone(),
-            part_size_bytes: self.part_size_bytes,
         }
     }
 
@@ -386,14 +384,7 @@ async fn dispatch_json(
             // Coordinator-wide today; future Tigris work splits the
             // upload from the event emit.
             let store = ctx.stores.coordinator_wide();
-            let result = snapshot_volume(
-                &volume,
-                &ctx.data_dir,
-                &ctx.snapshot_locks,
-                &store,
-                ctx.part_size_bytes,
-            )
-            .await;
+            let result = snapshot_volume(&volume, &ctx.data_dir, &ctx.snapshot_locks, &store).await;
             let env: Envelope<SnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -742,7 +733,6 @@ pub(crate) async fn snapshot_volume(
     data_dir: &Path,
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
 ) -> Result<SnapshotReply, IpcError> {
     let link = data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
@@ -775,9 +765,7 @@ pub(crate) async fn snapshot_volume(
     //    upload any snapshot files already sitting under snapshots/.
     //    We run this before sign_snapshot_manifest so that index/ is populated
     //    with every segment up to the flush point.
-    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store, part_size_bytes)
-        .await
-    {
+    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, store).await {
         Ok(r) if r.failed > 0 => {
             return Err(IpcError::store(format!(
                 "drain reported {} failed segment(s)",
@@ -801,7 +789,7 @@ pub(crate) async fn snapshot_volume(
     //    `try_lock`s the same lock and skips the tick while we hold it,
     //    so there is no race with a concurrent apply_done_handoffs.
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
-    elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store, part_size_bytes)
+    elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store)
         .await
         .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
 
@@ -2032,7 +2020,6 @@ async fn release_volume_op(
     let identity = &ctx.identity;
     let data_dir: &Path = &ctx.data_dir;
     let snapshot_locks = &ctx.snapshot_locks;
-    let part_size_bytes = ctx.part_size_bytes;
     let rescan: &Notify = &ctx.rescan;
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
@@ -2186,16 +2173,10 @@ async fn release_volume_op(
     // zero-entry snapshot as a fresh empty root.
     let snap_started = std::time::Instant::now();
     info!("[release {volume_name}] draining WAL and publishing handoff snapshot");
-    let snap_ulid = snapshot_volume(
-        volume_name,
-        data_dir,
-        snapshot_locks,
-        store,
-        part_size_bytes,
-    )
-    .await
-    .map_err(|e| IpcError::internal(format!("snapshot for release failed: {e}")))?
-    .snap_ulid;
+    let snap_ulid = snapshot_volume(volume_name, data_dir, snapshot_locks, store)
+        .await
+        .map_err(|e| IpcError::internal(format!("snapshot for release failed: {e}")))?
+        .snap_ulid;
     info!(
         "[release {volume_name}] handoff snapshot {snap_ulid} published in {:.2?}",
         snap_started.elapsed()
@@ -3522,7 +3503,6 @@ mod tests {
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
                 store.clone(),
             )),
-            part_size_bytes: 8 * 1024 * 1024,
             identity,
             peer_fetch: None,
         };

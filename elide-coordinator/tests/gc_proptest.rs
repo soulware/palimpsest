@@ -389,7 +389,6 @@ proptest! {
                         fork_dir,
                         "00000000000000000000000000",
                         &store,
-                        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
                                             ));
 
                     if let Ok(stats) = gc_stats
@@ -613,7 +612,6 @@ proptest! {
                         fork_dir,
                         "00000000000000000000000000",
                         &store,
-                        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
                                             ));
 
                     // Assert: every oracle LBA still reads its expected value.
@@ -730,7 +728,6 @@ fn gc_oracle_repro_bug_h() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
     // Read both LBAs to populate file cache with the pending/ segment.
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
@@ -753,7 +750,6 @@ fn gc_oracle_repro_bug_h() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
 
     // These reads triggered "failed to fill whole buffer" before the fix.
@@ -819,7 +815,6 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
     eprintln!(
         "index/ after sweep 1: [{}]",
@@ -853,7 +848,6 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         fork_dir,
         "00000000000000000000000000",
         &store,
-        elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
     let final_idx = list_dir(&index_dir);
     eprintln!("index/ final: [{}]", final_idx.join(", "));

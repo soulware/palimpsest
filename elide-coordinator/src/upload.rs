@@ -28,7 +28,7 @@
 // .idx file the coordinator sees is safe to fetch from the object store.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -45,9 +45,36 @@ use ulid::Ulid;
 /// `Content-Type` for plain UTF-8 text files (volume.pub, provenance, manifest, etc.).
 const MIME_TEXT: &str = "text/plain; charset=utf-8";
 
-/// Default multipart part size for tests and non-configurable callers.
-/// Operational code paths read the value from `StoreSection::multipart_part_size_bytes()`.
+/// Fallback multipart part size when the daemon hasn't initialised
+/// [`PART_SIZE_BYTES`] (tests, batch tools that bypass daemon startup).
+/// Production reads the configured value via `StoreSection::multipart_part_size_bytes()`
+/// and installs it once at daemon boot via [`set_part_size_bytes`].
 pub const DEFAULT_PART_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Process-global multipart part size, set once at daemon startup from
+/// `StoreSection::multipart_part_size_bytes()`. Threading this through
+/// `daemon → tasks → gc_cycle → drain_pending → SegmentUploader` (plus
+/// the IPC context chain) is pure ceremony for a value that is constant
+/// across the process lifetime and only changes when the operator edits
+/// `elide.toml` and restarts.
+static PART_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
+
+/// Install the configured part size. Idempotent: a second call after
+/// the value is already set is silently ignored. Called by `daemon`
+/// during boot.
+pub fn set_part_size_bytes(bytes: usize) {
+    let _ = PART_SIZE_BYTES.set(bytes);
+}
+
+/// Resolve the part size to use for the next multipart upload. Falls
+/// back to [`DEFAULT_PART_SIZE_BYTES`] if `set_part_size_bytes` has not
+/// been called — the path tests take.
+fn part_size_bytes() -> usize {
+    PART_SIZE_BYTES
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_PART_SIZE_BYTES)
+}
 
 /// Build `PutOptions` that set `Content-Type` on the uploaded object.
 fn put_opts_with_type(content_type: &'static str) -> PutOptions {
@@ -169,7 +196,6 @@ pub async fn drain_pending(
     vol_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
-    part_size_bytes: usize,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
 
@@ -182,11 +208,7 @@ pub async fn drain_pending(
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
-    let uploader = SegmentUploader {
-        volume_id,
-        store,
-        part_size_bytes,
-    };
+    let uploader = SegmentUploader { volume_id, store };
 
     for entry in entries {
         let entry = entry.context("reading pending dir entry")?;
@@ -438,13 +460,13 @@ pub async fn upload_snapshot_metadata(
 }
 
 /// Bundles the loop-invariants every segment upload threads through —
-/// destination volume, object store handle, and multipart chunk size — so
-/// callers (drain path, GC handoff cursor) construct one above the loop
-/// rather than passing the same three arguments per file.
+/// destination volume and object store handle — so callers (drain path,
+/// GC handoff cursor) construct one above the loop rather than passing
+/// the same arguments per file. Multipart chunk size is read from the
+/// process-global [`PART_SIZE_BYTES`].
 pub(crate) struct SegmentUploader<'a> {
     pub(crate) volume_id: &'a str,
     pub(crate) store: &'a Arc<dyn ObjectStore>,
-    pub(crate) part_size_bytes: usize,
 }
 
 impl SegmentUploader<'_> {
@@ -465,6 +487,7 @@ impl SegmentUploader<'_> {
         let data = std::fs::read(path).with_context(|| format!("reading segment {ulid}"))?;
         let len = data.len();
         let mut bytes = Bytes::from(data);
+        let part_size = part_size_bytes();
 
         let started = Instant::now();
         let upload = self
@@ -472,9 +495,9 @@ impl SegmentUploader<'_> {
             .put_multipart(&key)
             .await
             .with_context(|| format!("initiating multipart upload for {key}"))?;
-        let mut writer = WriteMultipart::new_with_chunk_size(upload, self.part_size_bytes);
+        let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
         while !bytes.is_empty() {
-            let take = bytes.len().min(self.part_size_bytes);
+            let take = bytes.len().min(part_size);
             let part = bytes.split_to(take);
             writer
                 .wait_for_capacity(MAX_CONCURRENT_PARTS)
@@ -639,9 +662,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.failed, 0);
@@ -690,9 +711,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
         assert_eq!(result.uploaded, 0);
         assert_eq!(result.failed, 0);
 
@@ -730,9 +749,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         let name_key = StorePath::from("names/my-vol");
         assert!(
@@ -766,9 +783,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         // Delete the store object behind the coordinator's back. If gating
         // works, re-drain sees a matching `uploaded/volume.pub` and skips —
@@ -777,17 +792,13 @@ mod tests {
         let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
         store.delete(&pub_key).await.unwrap();
 
-        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         assert!(store.head(&pub_key).await.is_err());
 
         // Now change volume.pub content — re-drain must upload.
         std::fs::write(vol_dir.join("volume.pub"), b"rotated").unwrap();
-        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
         let got = store.get(&pub_key).await.expect("volume.pub re-uploaded");
         assert_eq!(got.bytes().await.unwrap().as_ref(), b"rotated");
     }
@@ -833,9 +844,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store, DEFAULT_PART_SIZE_BYTES)
-            .await
-            .unwrap();
+        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         // Manifest is in store.
         let manifest_key = snapshot_manifest_key(VOL_ULID, snap_ulid);

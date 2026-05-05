@@ -49,7 +49,6 @@ pub(crate) struct ForkContext {
     pub fork_registry: ForkRegistry,
     pub prefetch_tracker: elide_coordinator::PrefetchTracker,
     pub snapshot_locks: elide_coordinator::SnapshotLockRegistry,
-    pub part_size_bytes: usize,
 }
 
 // ── Job + registry ────────────────────────────────────────────────────────────
@@ -444,7 +443,6 @@ impl ForkOrchestrator {
             &self.ctx.core.data_dir,
             &self.ctx.snapshot_locks,
             &store,
-            self.ctx.part_size_bytes,
         )
         .await?;
         self.job.append(ForkAttachEvent::SnapshotTaken {
