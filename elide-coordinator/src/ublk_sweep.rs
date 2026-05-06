@@ -3,20 +3,22 @@
 // Under the shutdown-park policy (docs/design-ublk-shutdown-park.md), volume
 // daemons no longer del_dev on shutdown — they leave the kernel device QUIESCED
 // for the next serve to recover via UBLK_F_USER_RECOVERY_REISSUE. This means
-// stale kernel devices and stale `ublk.id` bindings can accumulate when a volume
-// directory is removed out-of-band, when the host reboots, or when an operator
-// manually deletes a device.
+// stale kernel devices and stale per-volume bindings (the `[ublk] dev_id`
+// field in `volume.toml`) can accumulate when a volume directory is removed
+// out-of-band, when the host reboots, or when an operator manually deletes
+// a device.
 //
 // `reconcile` runs once at coordinator startup and brings the two sources of
 // truth back into agreement:
 //
 //   1. Enumerate `/sys/class/ublk-char/ublkc<N>` to get the set of live ids.
-//   2. Walk `<data_dir>/by_id/*/ublk.id` to get the set of bound ids.
+//   2. Walk `<data_dir>/by_id/*/volume.toml` for `[ublk] dev_id` values.
 //   3. Live id with no matching binding → orphan: kill_dev + del_dev via
 //      libublk on a `tokio::task::spawn_blocking` thread (bounded by a
 //      per-device timeout).
-//   4. Binding pointing at a non-existent live id → stale: remove the file.
-//      The next serve sees no binding + no sysfs entry and does a fresh ADD.
+//   4. Binding pointing at a non-existent live id → stale: clear the
+//      `dev_id` field (preserving the `[ublk]` section). The next serve
+//      sees no bound id + no sysfs entry and does a fresh ADD.
 //
 // The sweep is idempotent and cheap. On non-Linux hosts the sysfs path simply
 // does not exist and the sweep is a no-op.
@@ -70,13 +72,13 @@ pub async fn reconcile(data_dir: &Path) {
         }
     }
 
-    for (path, id) in stale_bindings {
+    for (vol_dir, id) in stale_bindings {
         info!(
             "[ublk-sweep] clearing stale binding {} → ublk{id} (kernel device gone)",
-            path.display()
+            vol_dir.display()
         );
-        if let Err(e) = std::fs::remove_file(&path) {
-            warn!("[ublk-sweep] remove {}: {e}", path.display());
+        if let Err(e) = elide_core::config::VolumeConfig::clear_bound_ublk_id(&vol_dir) {
+            warn!("[ublk-sweep] clear dev_id in {}: {e}", vol_dir.display());
         }
     }
 }
@@ -99,9 +101,10 @@ fn scan_sysfs() -> std::io::Result<HashSet<i32>> {
     Ok(ids)
 }
 
-/// Walk `<data_dir>/by_id/*/ublk.id`, returning a map from binding-file path
-/// to the id it contains. Unreadable or unparseable files are skipped with a
-/// warning — they will be ignored until the operator cleans them up.
+/// Walk `<data_dir>/by_id/*/volume.toml`, returning a map from volume
+/// directory to the bound dev_id. Volumes without a `[ublk]` section or
+/// without a `dev_id` are skipped (no binding to reconcile). Unreadable
+/// configs are skipped with a warning.
 fn scan_bindings(data_dir: &Path) -> HashMap<PathBuf, i32> {
     let mut out = HashMap::new();
     let by_id = data_dir.join("by_id");
@@ -116,22 +119,19 @@ fn scan_bindings(data_dir: &Path) -> HashMap<PathBuf, i32> {
         }
     };
     for vol_entry in entries.flatten() {
-        let path = vol_entry.path().join("ublk.id");
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        let vol_dir = vol_entry.path();
+        let cfg = match elide_core::config::VolumeConfig::read(&vol_dir) {
+            Ok(c) => c,
             Err(e) => {
-                warn!("[ublk-sweep] read {}: {e}", path.display());
+                warn!(
+                    "[ublk-sweep] read {}: {e}",
+                    vol_dir.join("volume.toml").display()
+                );
                 continue;
             }
         };
-        match raw.trim().parse::<i32>() {
-            Ok(id) => {
-                out.insert(path, id);
-            }
-            Err(e) => {
-                warn!("[ublk-sweep] parse {}: {e}", path.display());
-            }
+        if let Some(id) = cfg.ublk.and_then(|u| u.dev_id) {
+            out.insert(vol_dir, id);
         }
     }
     out
@@ -156,6 +156,27 @@ fn diff(live: &HashSet<i32>, bindings: &HashMap<PathBuf, i32>) -> (Vec<i32>, Vec
         .collect();
     stale.sort_by(|a, b| a.0.cmp(&b.0));
     (orphans, stale)
+}
+
+/// Tear down a previously-bound kernel ublk device for this volume.
+///
+/// `bound_id` is the dev_id captured from `volume.toml` *before* the
+/// caller wrote the new config (which may have removed the `[ublk]`
+/// section entirely). On a `update --no-ublk` flow the new cfg has
+/// already had its dev_id dropped along with the section, so there's
+/// nothing left to clear here — only the kernel device to remove.
+///
+/// Caller must have already shut the volume daemon down so the kernel's
+/// queue io_uring fds are released. `kill_dev` itself is safe-from-
+/// anywhere, but `del_dev` blocks until refcounts drop.
+pub(crate) async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
+    info!(
+        "[ublk-teardown] removing kernel device ublk{bound_id} bound to {}",
+        vol_dir.display()
+    );
+    if let Err(e) = delete_device(bound_id).await {
+        warn!("[ublk-teardown] del_dev ublk{bound_id}: {e}");
+    }
 }
 
 /// Open a fresh `new_simple` control device and issue `kill_dev` + `del_dev`
@@ -202,8 +223,18 @@ async fn delete_device(_id: i32) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn binding(path: &str, id: i32) -> (PathBuf, i32) {
-        (PathBuf::from(path), id)
+    fn binding(vol_dir: &str, id: i32) -> (PathBuf, i32) {
+        (PathBuf::from(vol_dir), id)
+    }
+
+    /// Write a `volume.toml` for a test volume directory with the given
+    /// optional bound ublk dev id.
+    fn write_cfg(vol_dir: &Path, dev_id: Option<i32>) {
+        let cfg = elide_core::config::VolumeConfig {
+            ublk: Some(elide_core::config::UblkConfig { dev_id }),
+            ..Default::default()
+        };
+        cfg.write(vol_dir).unwrap();
     }
 
     #[test]
@@ -216,7 +247,7 @@ mod tests {
     #[test]
     fn diff_matched_binding_is_kept() {
         let live = HashSet::from([0]);
-        let bindings = HashMap::from([binding("/d/by_id/A/ublk.id", 0)]);
+        let bindings = HashMap::from([binding("/d/by_id/A", 0)]);
         let (orphans, stale) = diff(&live, &bindings);
         assert!(orphans.is_empty(), "matched device must not be orphaned");
         assert!(stale.is_empty(), "matched binding must not be stale");
@@ -227,7 +258,7 @@ mod tests {
         // Kernel still has ublk0 but no volume claims it (volume dir was
         // removed out-of-band). Sweep should delete it.
         let live = HashSet::from([0, 1]);
-        let bindings = HashMap::from([binding("/d/by_id/A/ublk.id", 1)]);
+        let bindings = HashMap::from([binding("/d/by_id/A", 1)]);
         let (orphans, stale) = diff(&live, &bindings);
         assert_eq!(orphans, vec![0]);
         assert!(stale.is_empty());
@@ -236,51 +267,50 @@ mod tests {
     #[test]
     fn diff_stale_binding_is_flagged() {
         // Volume bound to ublk0, but the kernel forgot the device (host
-        // reboot). The binding file should be cleared so the next serve
-        // does a fresh ADD.
+        // reboot). The binding should be cleared so the next serve does
+        // a fresh ADD.
         let live = HashSet::new();
-        let bindings = HashMap::from([binding("/d/by_id/A/ublk.id", 0)]);
+        let bindings = HashMap::from([binding("/d/by_id/A", 0)]);
         let (orphans, stale) = diff(&live, &bindings);
         assert!(orphans.is_empty());
-        assert_eq!(stale, vec![binding("/d/by_id/A/ublk.id", 0)]);
+        assert_eq!(stale, vec![binding("/d/by_id/A", 0)]);
     }
 
     #[test]
     fn diff_handles_orphan_and_stale_concurrently() {
         // Mixed: one matched, one orphan kernel device, one stale binding.
         let live = HashSet::from([0, 7]);
-        let bindings = HashMap::from([
-            binding("/d/by_id/A/ublk.id", 0),
-            binding("/d/by_id/B/ublk.id", 9),
-        ]);
+        let bindings = HashMap::from([binding("/d/by_id/A", 0), binding("/d/by_id/B", 9)]);
         let (orphans, stale) = diff(&live, &bindings);
         assert_eq!(orphans, vec![7]);
-        assert_eq!(stale, vec![binding("/d/by_id/B/ublk.id", 9)]);
+        assert_eq!(stale, vec![binding("/d/by_id/B", 9)]);
     }
 
     #[test]
-    fn scan_bindings_reads_valid_ignores_garbage_and_missing() {
+    fn scan_bindings_reads_cfg_skips_volumes_without_dev_id() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let by_id = tmp.path().join("by_id");
         std::fs::create_dir_all(&by_id).unwrap();
 
-        // Valid binding.
+        // Valid binding: cfg.ublk = Some, dev_id = Some(3).
         let a = by_id.join("A");
         std::fs::create_dir_all(&a).unwrap();
-        std::fs::write(a.join("ublk.id"), "3\n").unwrap();
+        write_cfg(&a, Some(3));
 
-        // Garbage binding — must be skipped, not crash.
+        // Volume with [ublk] but no bound id (auto-allocate, never
+        // ADDed). Must be skipped — there's no binding to reconcile.
         let b = by_id.join("B");
         std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(b.join("ublk.id"), "not-a-number").unwrap();
+        write_cfg(&b, None);
 
-        // Volume directory with no ublk.id at all — silently absent.
+        // Volume with no volume.toml at all (e.g. ancestor skeleton).
+        // Must be skipped silently.
         let c = by_id.join("C");
         std::fs::create_dir_all(&c).unwrap();
 
         let out = scan_bindings(tmp.path());
         assert_eq!(out.len(), 1);
-        assert_eq!(out.get(&a.join("ublk.id")).copied(), Some(3));
+        assert_eq!(out.get(&a).copied(), Some(3));
     }
 
     #[test]

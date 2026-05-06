@@ -1332,6 +1332,9 @@ async fn update_volume_op(
 
     let mut cfg = elide_core::config::VolumeConfig::read(&vol_dir)
         .map_err(|e| IpcError::internal(format!("reading volume.toml: {e}")))?;
+    // Capture the previously-bound dev_id before mutating cfg, so we can
+    // tear the kernel device down after the new config takes effect.
+    let prev_bound_id = cfg.ublk.as_ref().and_then(|u| u.dev_id);
 
     // Mirror the CLI's apply order: nbd flags first, then ublk. The setters
     // clear the opposite transport so the two sections remain mutually
@@ -1358,12 +1361,44 @@ async fn update_volume_op(
 
     if patch.no_ublk {
         cfg.ublk = None;
-    } else if patch.ublk || patch.ublk_id.is_some() {
-        cfg.ublk = Some(elide_core::config::UblkConfig {
-            dev_id: patch.ublk_id,
-        });
+    } else if let Some(id) = patch.ublk_id {
+        // Explicit pin (or repin): record the user's chosen id. If this
+        // differs from the currently-bound id, the teardown logic below
+        // will remove the old kernel device.
+        cfg.ublk = Some(elide_core::config::UblkConfig { dev_id: Some(id) });
         cfg.nbd = None;
+    } else if patch.ublk {
+        // Enable ublk without specifying an id. Preserve any existing
+        // binding — clobbering it with `None` would silently invalidate
+        // the kernel-stamped recovery path on the next serve.
+        if cfg.ublk.is_none() {
+            cfg.ublk = Some(elide_core::config::UblkConfig::default());
+            cfg.nbd = None;
+        }
     }
+
+    // Decide which previously-bound kernel device (if any) to tear down
+    // *after* writing the new config. Two cases require teardown:
+    //
+    //   * Transport disabled / switched: the volume previously had a
+    //     bound id and the new cfg has no `[ublk]` section. The kernel
+    //     device must go — leaving it QUIESCED contradicts the new
+    //     transport policy and leaves an orphan whose stamped owner can
+    //     take down the daemon on the next `elide ublk delete`.
+    //
+    //   * Repin: cfg still has ublk but the user pinned a different id
+    //     than what's currently bound. The old kernel device must be
+    //     torn down so the next serve ADDs the requested new id rather
+    //     than ending up with two devices.
+    //
+    // Plain `volume stop` / restart with no transport change does NOT
+    // take this path — that's the maintenance bounce, where QUIESCED +
+    // recover is the desired behaviour.
+    let teardown_id: Option<i32> = match (prev_bound_id, cfg.ublk.as_ref().and_then(|u| u.dev_id)) {
+        (Some(prev), None) => Some(prev),
+        (Some(prev), Some(new)) if prev != new => Some(prev),
+        _ => None,
+    };
 
     cfg.write(&vol_dir)
         .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
@@ -1372,17 +1407,30 @@ async fn update_volume_op(
     // ENOENT mean the volume isn't running — fine, the new config takes effect
     // on next start.
     use elide_coordinator::control::ShutdownOutcome;
-    match elide_coordinator::control::shutdown(&vol_dir).await {
+    let restarted = match elide_coordinator::control::shutdown(&vol_dir).await {
         ShutdownOutcome::Acknowledged => {
             info!("[inbound] updated volume {name}; restart triggered");
-            Ok(UpdateReply { restarted: true })
+            true
         }
-        ShutdownOutcome::Failed(msg) => Err(IpcError::internal(format!("shutdown failed: {msg}"))),
+        ShutdownOutcome::Failed(msg) => {
+            return Err(IpcError::internal(format!("shutdown failed: {msg}")));
+        }
         ShutdownOutcome::NotRunning => {
             info!("[inbound] updated volume {name}; not running");
-            Ok(UpdateReply { restarted: false })
+            false
         }
+    };
+
+    // Tear down after shutdown so the kernel's queue io_uring fds are
+    // released before del_dev waits on refcounts. The supervisor's
+    // respawn is racing us, but the new daemon reads the new cfg —
+    // either no ublk, or a different bound id — and never touches the
+    // old kernel device, so there is no conflict.
+    if let Some(id) = teardown_id {
+        crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
+
+    Ok(UpdateReply { restarted })
 }
 
 // ── Volume fork (create --from) plumbing ──────────────────────────────────────

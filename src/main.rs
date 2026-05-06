@@ -1762,10 +1762,10 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: b
     }
 }
 
-/// Summarise the configured block-device transport for display: `nbd <endpoint>`,
-/// `ublk <device>`, or `-` if neither is configured. For ublk, prefers the
-/// kernel-assigned id recorded in `ublk.id` (set on a successful ADD); falls
-/// back to the configured `dev_id` or `auto` for not-yet-bound volumes.
+/// Summarise the configured block-device transport for display:
+/// `nbd <endpoint>`, `ublk <device>`, or `-` if neither is configured.
+/// For ublk, the bound id (written back to `volume.toml` on a successful
+/// ADD) is shown; `auto` indicates a `[ublk]` section with no id yet.
 fn transport_summary(vol_dir: &Path) -> String {
     let cfg = match elide_core::config::VolumeConfig::read(vol_dir) {
         Ok(c) => c,
@@ -1777,12 +1777,8 @@ fn transport_summary(vol_dir: &Path) -> String {
             None => "nbd".to_owned(),
         };
     }
-    if cfg.ublk.is_some() {
-        let runtime_id = std::fs::read_to_string(vol_dir.join("ublk.id"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok());
-        let id = runtime_id.or(cfg.ublk.as_ref().and_then(|u| u.dev_id));
-        return match id {
+    if let Some(ublk) = cfg.ublk.as_ref() {
+        return match ublk.dev_id {
             Some(id) => format!("ublk /dev/ublkb{id}"),
             None => "ublk auto".to_owned(),
         };
