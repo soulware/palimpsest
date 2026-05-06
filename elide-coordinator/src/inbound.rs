@@ -1050,14 +1050,19 @@ pub(crate) struct TransportPatch {
     pub(crate) nbd_socket: Option<std::path::PathBuf>,
     pub(crate) no_nbd: bool,
     pub(crate) ublk: bool,
-    pub(crate) ublk_id: Option<i32>,
     pub(crate) no_ublk: bool,
 }
 
 /// Parse a flat space-separated flag list. Recognised tokens:
 ///   nbd-port=<u16>, nbd-bind=<addr>, nbd-socket=<path>, no-nbd,
-///   ublk, ublk-id=<i32>, no-ublk
+///   ublk, no-ublk
+///
 /// Unknown tokens produce an error so silent typos don't get accepted.
+/// There is no `ublk-id=<n>` token: the kernel auto-allocates on first
+/// ADD and the chosen id is sticky across restarts (recorded in
+/// `volume.toml`). Direct `elide serve-volume --ublk-id <n>` invocations
+/// still allow pinning at the lowest layer for tests / emergency
+/// override; that path bypasses this parser.
 pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String> {
     let mut patch = TransportPatch::default();
     for tok in args.split_whitespace() {
@@ -1073,9 +1078,6 @@ pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String
             ("nbd-socket", Some(v)) => patch.nbd_socket = Some(v.into()),
             ("no-nbd", None) => patch.no_nbd = true,
             ("ublk", None) => patch.ublk = true,
-            ("ublk-id", Some(v)) => {
-                patch.ublk_id = Some(v.parse().map_err(|e| format!("bad ublk-id {v:?}: {e}"))?);
-            }
             ("no-ublk", None) => patch.no_ublk = true,
             _ => return Err(format!("unknown flag: {tok}")),
         }
@@ -1124,7 +1126,7 @@ async fn create_volume_op(
         ));
     }
     if (patch.nbd_port.is_some() || patch.nbd_bind.is_some() || patch.nbd_socket.is_some())
-        && (patch.ublk || patch.ublk_id.is_some())
+        && patch.ublk
     {
         return Err(IpcError::bad_request(
             "nbd-* flags are mutually exclusive with ublk",
@@ -1145,10 +1147,8 @@ async fn create_volume_op(
     } else {
         None
     };
-    let ublk_cfg = if patch.ublk || patch.ublk_id.is_some() {
-        Some(elide_core::config::UblkConfig {
-            dev_id: patch.ublk_id,
-        })
+    let ublk_cfg = if patch.ublk {
+        Some(elide_core::config::UblkConfig::default())
     } else {
         None
     };
@@ -1361,42 +1361,31 @@ async fn update_volume_op(
 
     if patch.no_ublk {
         cfg.ublk = None;
-    } else if let Some(id) = patch.ublk_id {
-        // Explicit pin (or repin): record the user's chosen id. If this
-        // differs from the currently-bound id, the teardown logic below
-        // will remove the old kernel device.
-        cfg.ublk = Some(elide_core::config::UblkConfig { dev_id: Some(id) });
-        cfg.nbd = None;
     } else if patch.ublk {
-        // Enable ublk without specifying an id. Preserve any existing
-        // binding — clobbering it with `None` would silently invalidate
-        // the kernel-stamped recovery path on the next serve.
+        // Enable ublk. The kernel auto-allocates a dev_id on first ADD;
+        // any existing binding is preserved (clobbering it with `None`
+        // would silently invalidate the kernel-stamped recovery path on
+        // the next serve).
         if cfg.ublk.is_none() {
             cfg.ublk = Some(elide_core::config::UblkConfig::default());
             cfg.nbd = None;
         }
     }
 
-    // Decide which previously-bound kernel device (if any) to tear down
-    // *after* writing the new config. Two cases require teardown:
-    //
-    //   * Transport disabled / switched: the volume previously had a
-    //     bound id and the new cfg has no `[ublk]` section. The kernel
-    //     device must go — leaving it QUIESCED contradicts the new
-    //     transport policy and leaves an orphan whose stamped owner can
-    //     take down the daemon on the next `elide ublk delete`.
-    //
-    //   * Repin: cfg still has ublk but the user pinned a different id
-    //     than what's currently bound. The old kernel device must be
-    //     torn down so the next serve ADDs the requested new id rather
-    //     than ending up with two devices.
+    // Decide which previously-bound kernel device (if any) to tear
+    // down *after* writing the new config. With `--ublk-id` removed
+    // from the user CLI, the only path that requires teardown here is
+    // transport disabled / switched: the volume previously had a bound
+    // id and the new cfg has no `[ublk]` section. The kernel device
+    // must go — leaving it QUIESCED contradicts the new transport
+    // policy and leaves an orphan whose stamped owner can take down
+    // the daemon on the next `elide ublk delete`.
     //
     // Plain `volume stop` / restart with no transport change does NOT
     // take this path — that's the maintenance bounce, where QUIESCED +
     // recover is the desired behaviour.
-    let teardown_id: Option<i32> = match (prev_bound_id, cfg.ublk.as_ref().and_then(|u| u.dev_id)) {
-        (Some(prev), None) => Some(prev),
-        (Some(prev), Some(new)) if prev != new => Some(prev),
+    let teardown_id: Option<i32> = match (prev_bound_id, cfg.ublk.is_some()) {
+        (Some(prev), false) => Some(prev),
         _ => None,
     };
 
@@ -2889,7 +2878,6 @@ mod tests {
         assert!(p.nbd_bind.is_none());
         assert!(p.nbd_socket.is_none());
         assert!(!p.no_nbd && !p.ublk && !p.no_ublk);
-        assert!(p.ublk_id.is_none());
     }
 
     #[test]
@@ -2901,9 +2889,21 @@ mod tests {
 
     #[test]
     fn parse_flags_ublk() {
-        let p = parse_transport_flags("ublk ublk-id=7").unwrap();
+        let p = parse_transport_flags("ublk").unwrap();
         assert!(p.ublk);
-        assert_eq!(p.ublk_id, Some(7));
+    }
+
+    #[test]
+    fn parse_flags_ublk_id_no_longer_recognised() {
+        // `ublk-id=N` was the user-facing pin token; removed in the
+        // collapse follow-up. Operator pinning happens via direct
+        // `elide serve-volume --ublk-id <n>` (the internal CLI), not
+        // via the coordinator IPC parser.
+        let err = match parse_transport_flags("ublk-id=7") {
+            Ok(_) => panic!("ublk-id=7 should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown flag"), "got {err:?}");
     }
 
     #[test]
