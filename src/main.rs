@@ -138,6 +138,39 @@ enum Command {
         #[command(subcommand)]
         command: UblkCommand,
     },
+
+    /// Manage the coordinator daemon (start, stop)
+    Coord {
+        #[command(subcommand)]
+        command: CoordCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoordCommand {
+    /// Start the coordinator as a detached background process.
+    ///
+    /// Spawns `elide-coordinator serve` in a new session (setsid),
+    /// redirects its stdout/stderr to `<data_dir>/coordinator.log`, and
+    /// waits for the control socket to come up before returning.
+    Up {
+        /// Path to the coordinator config file (forwarded to the
+        /// daemon). Defaults to `coordinator.toml` in the daemon's
+        /// working directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Stop the coordinator. By default, also terminates managed volume
+    /// processes. With `--keep-volumes`, the coordinator exits but its
+    /// volume children continue running detached — used for rolling
+    /// upgrades where the coordinator is being replaced without
+    /// disturbing live volumes.
+    Stop {
+        /// Leave volume children running (rolling-upgrade path).
+        #[arg(long)]
+        keep_volumes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1083,7 +1116,173 @@ fn main() {
                 }
             }
         },
+
+        Command::Coord { command } => match command {
+            CoordCommand::Up { config } => {
+                if let Err(e) = coord_up(&args.data_dir, config.as_deref()) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            CoordCommand::Stop { keep_volumes } => {
+                if let Err(e) = coord_stop(&coord, &args.data_dir, keep_volumes) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        },
     }
+}
+
+/// Time to wait for the coordinator's control socket to appear after
+/// `coord up` spawns the daemon.
+const COORD_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Time to wait for the coordinator to exit after `coord stop` sends
+/// the Shutdown IPC. Generous because full teardown waits for volume
+/// children to exit (10s SIGTERM grace + drain).
+const COORD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Spawn `elide-coordinator serve` as a detached background process.
+///
+/// Stdout/stderr are appended to `<data_dir>/coordinator.log`; the
+/// child is placed in a new session (setsid) so it survives the parent
+/// shell. We then poll for the control socket to appear, returning
+/// once it accepts connections.
+fn coord_up(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        std::io::Error::other(format!("creating data dir {}: {e}", data_dir.display()))
+    })?;
+    let pid_path = data_dir.join("coordinator.pid");
+    if let Ok(text) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && elide_core::process::pid_is_alive(pid)
+    {
+        return Err(std::io::Error::other(format!(
+            "coordinator already running (pid {pid})"
+        )));
+    }
+
+    let bin = sibling_bin("elide-coordinator");
+    let log_path = data_dir.join("coordinator.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| std::io::Error::other(format!("opening {}: {e}", log_path.display())))?;
+    let log_clone = log_file.try_clone()?;
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve").arg("--data-dir").arg(data_dir);
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_clone));
+    // Detach from the parent's session so the daemon survives the shell.
+    // pre_exec runs between fork() and exec(); setsid() is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| std::io::Error::other(format!("spawning {}: {e}", bin.display())))?;
+    let child_pid = child.id();
+
+    let socket_path = data_dir.join("control.sock");
+    let deadline = std::time::Instant::now() + COORD_UP_WAIT;
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            println!(
+                "coordinator started (pid {child_pid}, socket {})",
+                socket_path.display()
+            );
+            return Ok(());
+        }
+        // Detect early exit: try_wait reaps the zombie if the daemon
+        // already exited. pid_is_alive returns true for zombies (the
+        // process entry exists until the parent waits), which would
+        // mask early failures until our deadline expires.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(std::io::Error::other(format!(
+                "coordinator exited before becoming ready ({status}); see {}",
+                log_path.display()
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "timed out waiting for control socket {}; see {}",
+                socket_path.display(),
+                log_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Send the `Shutdown` IPC and poll until the coordinator process actually
+/// exits (socket disappears / pidfile pid stops responding).
+fn coord_stop(
+    coord: &coordinator_client::Client,
+    data_dir: &Path,
+    keep_volumes: bool,
+) -> std::io::Result<()> {
+    if !coord.is_reachable() {
+        eprintln!(
+            "coordinator not running ({})",
+            coord.socket_path().display()
+        );
+        return Ok(());
+    }
+    coord.shutdown(keep_volumes)?;
+
+    let pid_path = data_dir.join("coordinator.pid");
+    let pid = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let deadline = std::time::Instant::now() + COORD_STOP_WAIT;
+    loop {
+        let still_alive = match pid {
+            Some(p) => elide_core::process::pid_is_alive(p),
+            None => coord.is_reachable(),
+        };
+        if !still_alive {
+            println!(
+                "coordinator stopped{}",
+                if keep_volumes {
+                    " (volumes left running)"
+                } else {
+                    ""
+                }
+            );
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "coordinator did not exit within {COORD_STOP_WAIT:?}"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Locate a sibling binary alongside the running `elide` executable.
+/// Falls back to PATH lookup if the current exe path can't be resolved.
+fn sibling_bin(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 enum ListFilter {

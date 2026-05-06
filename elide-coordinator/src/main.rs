@@ -17,6 +17,7 @@ mod import;
 mod inbound;
 mod macaroon;
 mod rescan;
+mod shutdown;
 mod supervisor;
 mod ublk_sweep;
 
@@ -29,6 +30,13 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use elide_core::process::pid_is_alive;
+
+/// Coordinator-process pidfile. Lives at `<data_dir>/coordinator.pid` so
+/// `elide coord up` can refuse to start a second instance for the same
+/// data directory and `elide coord stop` can fall back to PID-based
+/// liveness if the IPC reply never arrives.
+const COORDINATOR_PID_FILE: &str = "coordinator.pid";
 
 #[derive(Parser)]
 #[command(about = "Elide coordinator: manages volumes, segment upload, and GC")]
@@ -92,6 +100,26 @@ async fn run() -> Result<()> {
             if let Some(dir) = data_dir {
                 config.data_dir = dir;
             }
+            // Refuse to start if another coordinator is already serving
+            // this data dir, and write our own pidfile. Removed when
+            // `daemon::run` returns (clean shutdown). On panic / kill -9
+            // a stale-but-dead pidfile is silently replaced by the next
+            // start.
+            std::fs::create_dir_all(&config.data_dir)
+                .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
+            let pid_path = config.data_dir.join(COORDINATOR_PID_FILE);
+            if let Ok(text) = std::fs::read_to_string(&pid_path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid_is_alive(pid)
+            {
+                bail!(
+                    "coordinator already running (pid {pid}, pidfile {})",
+                    pid_path.display()
+                );
+            }
+            std::fs::write(&pid_path, std::process::id().to_string())
+                .with_context(|| format!("writing pidfile: {}", pid_path.display()))?;
+
             let store = config.store.build()?;
             tracing::info!("[coordinator] store: {}", config.store.describe());
             tracing::info!(
@@ -125,7 +153,9 @@ async fn run() -> Result<()> {
 
             let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
                 std::sync::Arc::new(elide_coordinator::stores::PassthroughStores::new(store));
-            daemon::run(config, stores).await
+            let result = daemon::run(config, stores).await;
+            let _ = std::fs::remove_file(&pid_path);
+            result
         }
         Command::Init { config, force } => init_config(&config, force),
     }
