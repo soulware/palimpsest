@@ -127,6 +127,56 @@ mod imp {
 
     use elide_core::actor::{VolumeClient, VolumeReader};
 
+    /// Elide-side payload stamped into libublk's per-device JSON
+    /// (`/run/ublksrvd/<id>.json`, field `target_data`). Lets operators
+    /// and the `elide ublk` CLI correlate kernel devices with their
+    /// owning volumes without walking `<data_dir>/by_id/*/ublk.id`.
+    ///
+    /// Wrapped under the `"elide"` key so libublk (or other code that
+    /// learns to write target_data) can add sibling fields without
+    /// clashing.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct UblkTargetData {
+        elide: UblkBinding,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct UblkBinding {
+        /// Absolute path to the volume directory that owns this kernel device.
+        volume_dir: String,
+        /// ULID basename of `volume_dir`. Recorded explicitly so readers
+        /// don't have to re-derive it from the path.
+        volume_ulid: String,
+    }
+
+    impl UblkTargetData {
+        /// Build the payload for the given volume directory under the
+        /// `by_id/<ulid>/` layout. Falls back to an empty ULID string
+        /// when the basename is non-UTF8 or the directory is unusual —
+        /// the `volume_dir` field is still authoritative for lookup.
+        fn for_volume(vol_dir: &Path) -> Self {
+            let volume_ulid = vol_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned();
+            Self {
+                elide: UblkBinding {
+                    volume_dir: vol_dir.display().to_string(),
+                    volume_ulid,
+                },
+            }
+        }
+
+        /// Parse the payload from libublk's `target_data` JSON value.
+        /// Returns `None` when the value is absent or doesn't carry the
+        /// `"elide"` key — i.e. the device wasn't created by this
+        /// codebase, or by an older version that didn't yet stamp it.
+        fn from_target_json(value: &serde_json::Value) -> Option<Self> {
+            serde_json::from_value(value.clone()).ok()
+        }
+    }
+
     const BLOCK: u64 = 4096;
     const LOGICAL_BS_SHIFT: u8 = 12;
     const PHYSICAL_BS_SHIFT: u8 = 12;
@@ -249,7 +299,19 @@ mod imp {
         };
         let detail = format!("ublk {phase} failed: {rendered}");
 
-        let permanent = match &e {
+        // EEXIST/ENOSPC against a bound id means the kernel says "id N is
+        // already in use" — and id N can't change without operator action,
+        // so retrying with the same id will never succeed. Surface this as
+        // a Config error so the supervisor parks volume.stopped instead of
+        // backoff-looping silently. The most common cause when sysfs is
+        // empty is a leaked kernel idr slot from a previous device whose
+        // last reference never dropped.
+        let id_in_use = matches!(
+            &e,
+            UblkError::UringIOError(neg_errno) if matches!(-*neg_errno, libc::EEXIST | libc::ENOSPC)
+        ) && target_id.is_some();
+
+        let module_or_priv = match &e {
             UblkError::UringIOError(neg_errno) => {
                 matches!(
                     -neg_errno,
@@ -263,7 +325,16 @@ mod imp {
             _ => false,
         };
 
-        if permanent {
+        if id_in_use {
+            let id = target_id.expect("id_in_use implies target_id.is_some()");
+            super::UblkRunError::Config(format!(
+                "{detail} — ublk dev id {id} is already in use at the kernel level. \
+                 If /sys/class/ublk-char/ublkc{id} exists, run `elide ublk delete {id}` \
+                 (or pick a different --ublk-id). If sysfs is empty but the slot is \
+                 still pinned, an earlier device leaked a kernel reference; \
+                 reload the module (`rmmod ublk_drv && modprobe ublk_drv`) or reboot"
+            ))
+        } else if module_or_priv {
             super::UblkRunError::Config(format!(
                 "{detail} — likely the ublk_drv kernel module is not loaded \
                  or the daemon lacks CAP_SYS_ADMIN (rerun under sudo)"
@@ -586,8 +657,17 @@ mod imp {
                 .map_err(|e| classify_build_error(e, target_id, recovering))?,
         );
 
+        // Stamp the per-device JSON (`/run/ublksrvd/<id>.json`) with the
+        // owning volume directory and ULID so operators (and the
+        // `elide ublk` CLI) can correlate kernel devices with elide
+        // volumes without walking `<data_dir>/by_id/*/ublk.id`.
+        let target_data = UblkTargetData::for_volume(dir);
         let tgt_init = move |dev: &mut UblkDev| {
             set_params(dev, size_bytes);
+            match serde_json::to_value(&target_data) {
+                Ok(v) => dev.set_target_json(v),
+                Err(e) => tracing::warn!("ublk target_data serialization failed: {e}"),
+            }
             Ok(())
         };
 
@@ -971,13 +1051,88 @@ mod imp {
 
         let ctrl = UblkCtrl::new_simple(id)
             .map_err(|e| io::Error::other(format!("open ctrl for dev {id}: {e}")))?;
+
+        // If the device was created by an elide volume daemon, target_data
+        // tells us which volume owns it. Stop that daemon gracefully before
+        // tearing down the kernel device — otherwise libublk's queue threads
+        // race the del_dev and may leave a wedged process behind.
+        let owner = ctrl
+            .get_target_data_from_json()
+            .as_ref()
+            .and_then(UblkTargetData::from_target_json);
+        if let Some(ref owner) = owner {
+            stop_owning_daemon(id, Path::new(&owner.elide.volume_dir));
+        }
+
         // kill_dev is the documented safe-from-anywhere stop; del_dev then
         // removes the kernel entry and libublk's json file.
         let _ = ctrl.kill_dev();
         ctrl.del_dev()
             .map_err(|e| io::Error::other(format!("del_dev {id}: {e}")))?;
-        println!("deleted ublk device {id}");
+
+        // Now that the kernel device is gone, clear the volume's binding
+        // file so the next serve does a fresh ADD instead of trying to
+        // recover a device that no longer exists.
+        if let Some(owner) = owner {
+            let binding = Path::new(&owner.elide.volume_dir).join(UBLK_ID_FILE);
+            match std::fs::remove_file(&binding) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!(
+                    "warning: failed to clear {}: {e} (next serve may try to recover dev {id})",
+                    binding.display()
+                ),
+            }
+            println!(
+                "deleted ublk device {id} (volume {})",
+                owner.elide.volume_ulid
+            );
+        } else {
+            println!("deleted ublk device {id}");
+        }
         Ok(())
+    }
+
+    /// SIGTERM the volume daemon recorded in `<vol_dir>/volume.pid` and
+    /// poll until it exits or the bounded grace expires. Best-effort
+    /// throughout: a missing/unparseable pid file or an unsignalable
+    /// pid means there's no owning daemon to stop, which is fine.
+    fn stop_owning_daemon(id: i32, vol_dir: &Path) {
+        use elide_coordinator::volume_state::PID_FILE;
+        use elide_core::process::pid_is_alive;
+
+        let pid_path = vol_dir.join(PID_FILE);
+        let Ok(text) = std::fs::read_to_string(&pid_path) else {
+            return;
+        };
+        let Ok(pid) = text.trim().parse::<u32>() else {
+            return;
+        };
+        if !pid_is_alive(pid) {
+            return;
+        }
+
+        let Ok(raw) = i32::try_from(pid) else {
+            return;
+        };
+        let nix_pid = nix::unistd::Pid::from_raw(raw);
+        eprintln!("ublk{id}: signalling owning volume daemon (pid {pid}) to stop");
+        if let Err(e) = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM) {
+            eprintln!("warning: SIGTERM pid {pid}: {e} (proceeding with del_dev anyway)");
+            return;
+        }
+
+        // Poll for exit. Bound the wait so a wedged daemon can't trap the
+        // operator — del_dev will then race the live daemon, which is no
+        // worse than the pre-target_data behaviour.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if !pid_is_alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("warning: pid {pid} did not exit within 10s; proceeding with del_dev");
     }
 
     pub fn delete_all_devices() -> io::Result<()> {
@@ -1100,6 +1255,29 @@ mod imp {
         }
 
         #[test]
+        fn target_data_roundtrip_carries_volume_dir_and_ulid() {
+            let dir = std::path::PathBuf::from("/elide_data/by_id/01ABCDEF");
+            let payload = UblkTargetData::for_volume(&dir);
+            assert_eq!(payload.elide.volume_ulid, "01ABCDEF");
+            assert_eq!(payload.elide.volume_dir, "/elide_data/by_id/01ABCDEF");
+
+            let value = serde_json::to_value(&payload).unwrap();
+            let parsed = UblkTargetData::from_target_json(&value).expect("parses back");
+            assert_eq!(parsed.elide.volume_ulid, "01ABCDEF");
+            assert_eq!(parsed.elide.volume_dir, "/elide_data/by_id/01ABCDEF");
+        }
+
+        #[test]
+        fn target_data_parse_returns_none_for_foreign_payload() {
+            // A device created by something other than elide (or by an
+            // older binary that didn't stamp target_data) lacks the
+            // "elide" key. Parsing must not fall back to defaults — the
+            // CLI uses None to mean "no owning daemon to stop".
+            let foreign = serde_json::json!({ "other_target": { "x": 1 } });
+            assert!(UblkTargetData::from_target_json(&foreign).is_none());
+        }
+
+        #[test]
         fn ublk_device_exists_false_for_absent_id() {
             // i32::MAX is vastly larger than any real device id the kernel
             // would allocate, so /sys/class/ublk-char/ublkc<MAX> never
@@ -1205,8 +1383,14 @@ mod imp {
         }
 
         #[test]
-        fn classify_build_error_transient_for_busy_and_exists() {
-            for errno in [libc::EBUSY, libc::EEXIST, libc::ENOENT, libc::EAGAIN] {
+        fn classify_build_error_transient_for_busy() {
+            // EBUSY is the canonical "kernel still finalising a prior delete";
+            // ENOENT/EAGAIN cover unrelated transient io_uring conditions.
+            // EEXIST/ENOSPC are deliberately not in this set — they are
+            // permanent for bound ids (see the dedicated test below) and
+            // unreachable for auto-allocated ids (the kernel picks a free
+            // slot, so collision is impossible).
+            for errno in [libc::EBUSY, libc::ENOENT, libc::EAGAIN] {
                 let err = classify_build_error(
                     UblkError::UringIOError(-errno),
                     Some(0),
@@ -1222,6 +1406,49 @@ mod imp {
                     "expected errno {errno} in message, got: {msg}"
                 );
             }
+        }
+
+        #[test]
+        fn classify_build_error_permanent_for_bound_id_in_use() {
+            // EEXIST/ENOSPC against a bound id means the kernel idr slot is
+            // taken. Retrying with the same id can never succeed — the
+            // supervisor must park rather than backoff-loop silently.
+            for errno in [libc::EEXIST, libc::ENOSPC] {
+                let err = classify_build_error(
+                    UblkError::UringIOError(-errno),
+                    Some(7),
+                    /*recovering=*/ false,
+                );
+                assert!(
+                    matches!(err, super::super::UblkRunError::Config(_)),
+                    "errno {errno} with bound id should be permanent (Config), got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("dev id 7 is already in use"),
+                    "expected id-in-use hint mentioning id 7: {msg}"
+                );
+                assert!(
+                    msg.contains("elide ublk delete 7"),
+                    "expected operator hint mentioning the bound id: {msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn classify_build_error_transient_for_eexist_when_auto() {
+            // Auto-allocated id (target_id=None) cannot legitimately EEXIST
+            // — the kernel picks. If we somehow see it, treat as transient
+            // rather than permanently parking the volume.
+            let err = classify_build_error(
+                UblkError::UringIOError(-libc::EEXIST),
+                None,
+                /*recovering=*/ false,
+            );
+            assert!(
+                matches!(err, super::super::UblkRunError::Other(_)),
+                "EEXIST with auto id should be transient (Other), got {err:?}"
+            );
         }
 
         #[test]
