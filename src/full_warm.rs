@@ -95,11 +95,21 @@ fn run(
         let cursor = Arc::clone(&cursor);
         let work = Arc::clone(&work);
         let fetcher = Arc::clone(&fetcher);
+        let extent_index = Arc::clone(&extent_index);
         let bytes_fetched = Arc::clone(&bytes_fetched);
         let segments_with_fetch = Arc::clone(&segments_with_fetch);
         if let Ok(h) = thread::Builder::new()
             .name(format!("full-warm-{w}"))
-            .spawn(move || worker(cursor, work, fetcher, bytes_fetched, segments_with_fetch))
+            .spawn(move || {
+                worker(
+                    cursor,
+                    work,
+                    fetcher,
+                    extent_index,
+                    bytes_fetched,
+                    segments_with_fetch,
+                )
+            })
         {
             handles.push(h);
         }
@@ -197,6 +207,7 @@ fn worker(
     cursor: Arc<AtomicUsize>,
     work: Arc<Vec<SegmentWork>>,
     fetcher: BoxFetcher,
+    extent_index: Arc<ExtentIndex>,
     bytes_fetched: Arc<AtomicU64>,
     segments_with_fetch: Arc<AtomicUsize>,
 ) {
@@ -206,7 +217,7 @@ fn worker(
             return;
         }
         let w = &work[i];
-        match warm_one_segment(w, &*fetcher) {
+        match warm_one_segment(w, &*fetcher, &extent_index) {
             Ok(n) => {
                 if n > 0 {
                     bytes_fetched.fetch_add(n, Ordering::Relaxed);
@@ -223,6 +234,7 @@ fn worker(
 fn warm_one_segment(
     w: &SegmentWork,
     fetcher: &dyn segment::SegmentFetcher,
+    extent_index: &ExtentIndex,
 ) -> std::io::Result<u64> {
     let index_dir = w.owner_dir.join("index");
     let cache_dir = w.owner_dir.join("cache");
@@ -243,6 +255,7 @@ fn warm_one_segment(
         &cache_dir,
         layout.body_section_start,
         &w.populated_entries,
+        extent_index.segment_presence(w.seg_ulid).cloned(),
     )
 }
 

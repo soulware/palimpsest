@@ -518,6 +518,7 @@ impl SegmentFetcher for RemoteFetcher {
         body_dir: &Path,
         body_section_start: u64,
         populated_entries: &[u32],
+        presence: Option<Arc<elide_core::extentindex::SegmentPresence>>,
     ) -> io::Result<u64> {
         let store = self.store_snapshot();
         warm_segment_impl(
@@ -530,6 +531,7 @@ impl SegmentFetcher for RemoteFetcher {
             body_dir,
             body_section_start,
             populated_entries,
+            presence.as_deref(),
         )
     }
 }
@@ -1075,6 +1077,7 @@ fn warm_segment_impl(
     body_dir: &Path,
     body_section_start: u64,
     populated_entries: &[u32],
+    presence: Option<&elide_core::extentindex::SegmentPresence>,
 ) -> io::Result<u64> {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -1213,6 +1216,16 @@ fn warm_segment_impl(
     }
     segment::write_file_atomic(&present_path, &new_present)
         .map_err(|e| io::Error::other(format!("write .present for warm: {e}")))?;
+
+    // Re-sync the in-memory bitset to the bytes we just persisted, on
+    // the same convergence rule as `fetch_batch`. Without this, the
+    // body-prefetch → full-warm sequence leaves the read-path fast
+    // path stale: `cache_hit_allowed` rejects a hit, falls through to
+    // `fetch_extent`, and pays a per-read disk re-check until the next
+    // index rebuild reloads `.present`.
+    if let Some(p) = presence {
+        p.replace_from_bytes(&new_present);
+    }
 
     let bytes_fetched = bytes_fetched.load(Ordering::Relaxed);
     tracing::debug!(
@@ -2392,6 +2405,7 @@ mod tests {
                 &cache_dir,
                 bss,
                 &[0, 1, 2, 3],
+                None,
             )
             .unwrap();
 
@@ -2439,6 +2453,7 @@ mod tests {
                 &cache_dir,
                 bss,
                 &[0, 1, 2, 3],
+                None,
             )
             .unwrap();
 
@@ -2453,6 +2468,50 @@ mod tests {
         assert_eq!(final_present[0] & 0b0000_1111, 0b0000_1111);
     }
 
+    /// `warm_segment` refreshes the in-memory `SegmentPresence` Arc
+    /// to match the freshly-written on-disk bitmap. Without this, the
+    /// body-prefetch → full-warm sequence leaves the read-path fast
+    /// path stale (and `full_warm::plan_segments` keeps re-planning
+    /// already-warm segments, producing "N attempted; 0 fetched"
+    /// log lines).
+    #[test]
+    fn warm_segment_mirrors_present_bits_into_memory() {
+        use elide_core::extentindex::SegmentPresence;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        let (fetcher, seg_ulid, owner_vol_id, bss, _payloads, index_dir, cache_dir) =
+            build_warm_fixture(tmp.path(), store.path(), 4, 4096);
+
+        let presence = Arc::new(SegmentPresence::zeroed(4));
+        for i in 0..4 {
+            assert!(
+                !presence.test(i),
+                "presence pre-warm: bit {i} should be clear"
+            );
+        }
+
+        fetcher
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &[0, 1, 2, 3],
+                Some(Arc::clone(&presence)),
+            )
+            .unwrap();
+
+        for i in 0..4 {
+            assert!(
+                presence.test(i),
+                "presence post-warm: bit {i} should be set"
+            );
+        }
+    }
+
     /// `warm_segment` is a no-op when `populated_entries` is empty —
     /// no `.body` file gets created and no `.present` write happens.
     #[test]
@@ -2465,7 +2524,15 @@ mod tests {
             build_warm_fixture(tmp.path(), store.path(), 4, 4096);
 
         fetcher
-            .warm_segment(seg_ulid, owner_vol_id, &index_dir, &cache_dir, bss, &[])
+            .warm_segment(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                bss,
+                &[],
+                None,
+            )
             .unwrap();
 
         assert!(!cache_dir.join(format!("{seg_ulid}.body")).exists());
@@ -2511,6 +2578,7 @@ mod tests {
                 &cache_dir,
                 bss,
                 &populated,
+                None,
             )
             .unwrap();
 
@@ -2634,6 +2702,7 @@ mod tests {
                 &cache_dir,
                 bss,
                 &populated,
+                None,
             )
             .unwrap();
 

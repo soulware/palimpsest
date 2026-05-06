@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
@@ -28,7 +29,7 @@ pub struct ReadonlyVolume {
     base_dir: PathBuf,
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
-    extent_index: extentindex::ExtentIndex,
+    extent_index: Arc<extentindex::ExtentIndex>,
     file_cache: RefCell<FileCache>,
     fetcher: Option<BoxFetcher>,
 }
@@ -45,10 +46,17 @@ impl ReadonlyVolume {
             base_dir: fork_dir.to_owned(),
             ancestor_layers,
             lbamap,
-            extent_index,
+            extent_index: Arc::new(extent_index),
             file_cache: RefCell::new(FileCache::default()),
             fetcher: None,
         })
+    }
+
+    /// Shared handle on the in-memory extent index. The body-prefetch
+    /// pool uses this so its `.present` writes mirror back into the
+    /// same `Arc<SegmentPresence>` reachable from the read path.
+    pub fn extent_index_arc(&self) -> Arc<extentindex::ExtentIndex> {
+        Arc::clone(&self.extent_index)
     }
 
     /// Read `lba_count` 4KB blocks starting at `start_lba`.

@@ -213,6 +213,13 @@ pub trait SegmentFetcher: Send + Sync {
     /// remote/peer tier — already-`.present` entries contribute zero,
     /// so callers can distinguish "warmed N bytes" from "everything
     /// already on disk".
+    ///
+    /// `presence` carries the same in-memory bitset semantics as
+    /// [`Self::fetch_extent`]: the implementation refreshes it inside
+    /// the per-segment `.present` write lock so the read-path fast
+    /// path observes the freshly-warmed bits without waiting for the
+    /// next index rebuild.
+    #[allow(clippy::too_many_arguments)]
     fn warm_segment(
         &self,
         segment_id: ulid::Ulid,
@@ -221,6 +228,7 @@ pub trait SegmentFetcher: Send + Sync {
         body_dir: &Path,
         body_section_start: u64,
         populated_entries: &[u32],
+        presence: Option<Arc<crate::extentindex::SegmentPresence>>,
     ) -> io::Result<u64> {
         let idx_path = index_dir.join(format!("{segment_id}.idx"));
         let (_, entries, _) = read_segment_index(&idx_path)?;
@@ -243,7 +251,7 @@ pub trait SegmentFetcher: Send + Sync {
                     body_length: entry.stored_length,
                     entry_idx: idx,
                 },
-                None,
+                presence.clone(),
             )?;
             bytes_fetched = bytes_fetched.saturating_add(entry.stored_length as u64);
         }

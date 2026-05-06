@@ -923,9 +923,10 @@ fn serve_readonly_volume_listener(
         let arc_fetcher: std::sync::Arc<dyn elide_core::segment::SegmentFetcher> =
             std::sync::Arc::clone(&fetcher) as _;
         let fork_dirs = volume.fork_dirs();
+        let extent_index = volume.extent_index_arc();
         volume.set_fetcher(std::sync::Arc::clone(&arc_fetcher));
         let fetcher_for_swap = std::sync::Arc::clone(&fetcher);
-        crate::body_prefetch::spawn(fork_dirs, arc_fetcher, move || {
+        crate::body_prefetch::spawn(fork_dirs, arc_fetcher, extent_index, move || {
             fetcher_for_swap.set_store(s3_store);
         });
         println!("[demand-fetch enabled]");
@@ -979,6 +980,7 @@ fn run_volume_ipc_only(
         let body_prefetch_done = crate::body_prefetch::spawn(
             fork_dirs.clone(),
             std::sync::Arc::clone(&arc_fetcher),
+            std::sync::Arc::clone(&extent_index),
             move || fetcher_for_swap.set_store(s3_store),
         );
         crate::full_warm::spawn(
@@ -1038,6 +1040,7 @@ fn serve_volume_listener(
         let body_prefetch_done = crate::body_prefetch::spawn(
             fork_dirs.clone(),
             std::sync::Arc::clone(&arc_fetcher),
+            std::sync::Arc::clone(&extent_index),
             move || fetcher_for_swap.set_store(s3_store),
         );
         crate::full_warm::spawn(
