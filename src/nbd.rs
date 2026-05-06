@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use elide_core::volume::ReadonlyVolume;
 
@@ -701,33 +701,27 @@ pub fn run_volume_signed(
         NbdBind::Tcp { bind, port } => {
             let l = TcpListener::bind(format!("{}:{}", bind, port))?;
             let addr = l.local_addr()?;
-            println!("NBD volume server on {}", addr);
-            println!(
-                "Volume: {} ({:.1} MB)",
+            info!(
+                "NBD volume server on {} — volume {} ({:.1} MB); \
+                 connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                addr,
                 dir.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 addr.ip(),
                 addr.port()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Tcp(l)
         }
         NbdBind::Unix(path) => {
             let _ = std::fs::remove_file(&path);
             let l = UnixListener::bind(&path)?;
-            println!(
-                "NBD volume server on {} ({:.1} MB)",
+            info!(
+                "NBD volume server on {} ({:.1} MB); \
+                 connect with: sudo nbd-client -u {} -N export /dev/nbdX",
                 path.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client -u {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 path.display()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Unix(l)
         }
     };
@@ -754,33 +748,27 @@ pub fn run_volume_readonly(
         NbdBind::Tcp { bind, port } => {
             let l = TcpListener::bind(format!("{}:{}", bind, port))?;
             let addr = l.local_addr()?;
-            println!("NBD readonly volume server on {}", addr);
-            println!(
-                "Volume: {} ({:.1} MB)  [read-only]",
+            info!(
+                "NBD readonly volume server on {} — volume {} ({:.1} MB) [read-only]; \
+                 connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                addr,
                 dir.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 addr.ip(),
                 addr.port()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Tcp(l)
         }
         NbdBind::Unix(path) => {
             let _ = std::fs::remove_file(&path);
             let l = UnixListener::bind(&path)?;
-            println!(
-                "NBD readonly volume server on {} ({:.1} MB)  [read-only]",
+            info!(
+                "NBD readonly volume server on {} ({:.1} MB) [read-only]; \
+                 connect with: sudo nbd-client -u {} -N export /dev/nbdX",
                 path.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client -u {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 path.display()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Unix(l)
         }
     };

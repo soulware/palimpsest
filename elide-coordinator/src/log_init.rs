@@ -62,9 +62,19 @@ pub fn init_with_data_dir(data_dir: &Path) -> io::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let file_writer = SharedFile::new(file);
     if tee_stderr {
+        // Use SilentStderr instead of `io::stderr`: every write that
+        // would have returned EIO/EPIPE (e.g. inherited terminal fd
+        // deleted after parent Ctrl-C) is silently dropped instead.
+        // Without this, tracing-subscriber's fmt layer reacts to a
+        // write error by calling `eprintln!("[tracing-subscriber]
+        // Unable to write...")` which writes to the *same* broken fd,
+        // hits EIO again, and the `eprintln!` macro panics on stderr
+        // write failure. That panic kills the calling thread —
+        // including the volume's signal watchdog mid-shutdown — and
+        // the daemon never reaches `_exit`.
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
-            .with_writer(file_writer.and(io::stderr))
+            .with_writer(file_writer.and(SilentStderr))
             .try_init()
             .ok();
     } else {
@@ -75,6 +85,34 @@ pub fn init_with_data_dir(data_dir: &Path) -> io::Result<()> {
             .ok();
     }
     Ok(())
+}
+
+/// `MakeWriter` over `stderr` that pretends every write succeeded —
+/// the underlying `write_all` is a `let _ = ...`. Required so a
+/// transiently-dead inherited stderr fd (e.g. sudo's pty after
+/// Ctrl-C) cannot cause tracing-subscriber's fmt layer to panic via
+/// its eprintln-on-error fallback. See the comment at the call site
+/// for the full chain.
+#[derive(Clone, Copy)]
+struct SilentStderr;
+
+impl<'a> MakeWriter<'a> for SilentStderr {
+    type Writer = SilentStderrWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        SilentStderrWriter
+    }
+}
+
+struct SilentStderrWriter;
+
+impl io::Write for SilentStderrWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _ = io::Write::write_all(&mut io::stderr(), buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Return `Ok(true)` iff fd 2 (stderr) refers to a different

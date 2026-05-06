@@ -476,7 +476,7 @@ mod imp {
                 body_prefetch_done,
             );
             peer_counters = build.peer_counters;
-            println!("[demand-fetch enabled]");
+            tracing::info!("[demand-fetch enabled]");
         }
 
         let (actor, client) = elide_core::actor::spawn(volume);
@@ -552,7 +552,7 @@ mod imp {
             simple
                 .start_user_recover()
                 .map_err(|e| io::Error::other(format!("ublk start_user_recover {id}: {e}")))?;
-            println!("[ublk dev {id}: resuming from QUIESCED — reissuing buffered I/O]");
+            tracing::info!("[ublk dev {id}: resuming from QUIESCED — reissuing buffered I/O]");
         }
 
         let dev_lifecycle = if recovering {
@@ -617,7 +617,7 @@ mod imp {
             if let Err(e) = write_ublk_id(&binding_dir, id) {
                 tracing::error!("ublk record binding for dev {id} failed: {e}");
             }
-            println!("[ublk device ready: /dev/ublkb{id}]");
+            tracing::info!("[ublk device ready: /dev/ublkb{id}]");
         };
 
         // Run the queue threads to completion. Under shutdown-park this
