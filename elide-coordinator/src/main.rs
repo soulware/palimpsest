@@ -96,9 +96,22 @@ async fn run() -> Result<()> {
             // each opening it independently. When stderr already points
             // at the same file (e.g. `elide coord start` redirected the
             // daemon's stdio there), the tee is suppressed.
-            elide_coordinator::log_init::init_with_data_dir(&config.data_dir).with_context(
-                || format!("initialising tracing in {}", config.data_dir.display()),
-            )?;
+            elide_coordinator::log_init::init_for_coord(&config.data_dir).with_context(|| {
+                format!("initialising tracing in {}", config.data_dir.display())
+            })?;
+            // Start the volume → coord log relay server so volumes
+            // tee their output through whichever coord is currently
+            // attached to the operator's terminal. No-op when stderr
+            // already routes to elide.log (daemon mode). Best-effort:
+            // a failure here just means volumes lose the live-tee
+            // path and fall back to file-only — coord itself is
+            // unaffected, so we log and continue rather than refuse
+            // to start.
+            if let Err(e) = elide_coordinator::log_relay::start(&config.data_dir) {
+                tracing::warn!(
+                    "[log-relay] failed to start ({e}); volumes will log to elide.log only"
+                );
+            }
             // Refuse to start if another coordinator is already serving
             // this data dir, and write our own pidfile. Removed when
             // `daemon::run` returns (clean shutdown). On panic / kill -9

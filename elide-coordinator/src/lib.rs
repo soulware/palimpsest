@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod lifecycle;
 pub mod local_cond_store;
 pub mod log_init;
+pub mod log_relay;
 pub mod name_store;
 pub mod park;
 pub mod peer_discovery;

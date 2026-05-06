@@ -571,8 +571,10 @@ fn main() {
     // Initialise tracing. `serve-volume` is a long-lived host process
     // that shares the unified `<data_dir>/elide.log` with the
     // coordinator (each writer opens its own fd; concurrent appends
-    // compose). Every other subcommand is short-lived CLI work and
-    // logs to stderr only.
+    // compose). It also tees through the coord-side log relay socket
+    // so live output reaches whichever coord is currently attached
+    // to the operator's terminal. Every other subcommand is
+    // short-lived CLI work and logs to stderr only.
     match &args.command {
         Command::ServeVolume { fork_dir, .. } => {
             // fork_dir is `<data_dir>/by_id/<ulid>/`, so data_dir is two
@@ -584,7 +586,7 @@ fn main() {
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| data_dir.clone());
-            if elide_coordinator::log_init::init_with_data_dir(&inferred).is_err() {
+            if elide_coordinator::log_init::init_for_volume(&inferred).is_err() {
                 elide_coordinator::log_init::init_stderr();
             }
         }
