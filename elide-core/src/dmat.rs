@@ -286,6 +286,77 @@ impl Dmat {
     }
 }
 
+/// One record's metadata, surfaced by `scan_readonly` for inspection.
+#[derive(Clone, Copy, Debug)]
+pub struct DmatRecordMeta {
+    /// File offset of the record's header (the start of the 9-byte frame).
+    pub record_offset: u64,
+    pub entry_idx: u32,
+    pub flags: DmatFlags,
+    pub stored_length: u32,
+}
+
+/// Read-only scan of a `.dmat` file. Used by inspection tooling. Returns the
+/// metadata of every framed record up to the first malformed/truncated one,
+/// plus a `ScanStats` describing what (if anything) the scan would truncate
+/// in `open_or_create` mode. The file is never modified.
+pub fn scan_readonly(path: &Path) -> io::Result<(Vec<DmatRecordMeta>, ScanStats)> {
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_len = metadata.len();
+    if file_len < MAGIC.len() as u64 {
+        return Err(io::Error::other("dmat file shorter than magic"));
+    }
+    let mut magic_buf = [0u8; 8];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut magic_buf)?;
+    if &magic_buf != MAGIC {
+        return Err(io::Error::other("bad dmat magic"));
+    }
+
+    let mut metas: Vec<DmatRecordMeta> = Vec::new();
+    let mut stats = ScanStats::default();
+    let mut cursor = MAGIC.len() as u64;
+
+    loop {
+        if cursor == file_len {
+            break;
+        }
+        if file_len - cursor < RECORD_HEADER_LEN {
+            stats.truncated = true;
+            break;
+        }
+        let mut header = [0u8; RECORD_HEADER_LEN as usize];
+        file.read_exact(&mut header)?;
+        let entry_idx = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let raw_flags = header[4];
+        let stored_length = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
+        let Some(flags) = DmatFlags::from_bits(raw_flags) else {
+            stats.invalid = 1;
+            stats.truncated = true;
+            break;
+        };
+        let record_offset = cursor;
+        let data_offset = cursor + RECORD_HEADER_LEN;
+        let record_end = data_offset + stored_length as u64;
+        if record_end > file_len {
+            stats.truncated = true;
+            break;
+        }
+        // Skip the body to advance the cursor.
+        file.seek(SeekFrom::Start(record_end))?;
+        metas.push(DmatRecordMeta {
+            record_offset,
+            entry_idx,
+            flags,
+            stored_length,
+        });
+        stats.accepted += 1;
+        cursor = record_end;
+    }
+    Ok((metas, stats))
+}
+
 fn scan_records<V: FnMut(u32, &[u8]) -> bool>(
     file: &mut File,
     file_len: u64,
