@@ -1848,24 +1848,19 @@ impl Volume {
         let snapshots_dir = self.base_dir.join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;
 
-        // Collect every segment ULID now under `index/` for the signed
-        // manifest — this is the full set of segments belonging to this
-        // volume up to `snap_ulid`, including promoted-this-call and
-        // anything already there from prior activity.
+        // Collect every live segment ULID under `index/` for the signed
+        // manifest. The shared filter drops any segment whose entries
+        // are all dead under the liveness predicate — see
+        // [`crate::actor::live_index_segments`]. Reclamation of those
+        // segment files is GC's job; this is a manifest-only filter.
         let index_dir = self.base_dir.join("index");
-        let mut index_ulids: Vec<Ulid> = Vec::new();
-        if let Ok(entries) = fs::read_dir(&index_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(s) = name.to_str() else { continue };
-                let Some(stem) = s.strip_suffix(".idx") else {
-                    continue;
-                };
-                if let Ok(u) = Ulid::from_string(stem) {
-                    index_ulids.push(u);
-                }
-            }
-        }
+        let index_ulids = crate::actor::live_index_segments(
+            &index_dir,
+            &self.extent_index,
+            &self.lbamap,
+            &self.verifying_key,
+            &self.segment_cache,
+        )?;
         // The manifest's existence under `snapshots/` is the
         // snapshot's existence; `write_snapshot_manifest` writes
         // atomically, so a partial sequence leaves no snapshot visible.
@@ -1915,13 +1910,19 @@ impl Volume {
     }
 
     /// Prep phase of `sign_snapshot_manifest` — runs on the actor
-    /// thread. Cheap: clones the signer `Arc` and captures the base dir
-    /// and target ULID.
+    /// thread. Cheap: clones the signer / index / lbamap / cache `Arc`s
+    /// and captures the base dir and target ULID. The worker uses the
+    /// extent index and lbamap snapshots to filter fully-dead segments
+    /// out of the manifest — see [`crate::actor::execute_sign_snapshot_manifest`].
     pub fn prepare_sign_snapshot_manifest(&self, snap_ulid: Ulid) -> SignSnapshotManifestJob {
         SignSnapshotManifestJob {
             snap_ulid,
             base_dir: self.base_dir.clone(),
             signer: Arc::clone(&self.signer),
+            extent_index: Arc::clone(&self.extent_index),
+            lbamap: Arc::clone(&self.lbamap),
+            verifying_key: self.verifying_key,
+            segment_cache: Arc::clone(&self.segment_cache),
         }
     }
 
