@@ -1230,6 +1230,18 @@ const COORD_START_WAIT: std::time::Duration = std::time::Duration::from_secs(10)
 /// children to exit (10s SIGTERM grace + drain).
 const COORD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// In the direct-teardown fallback, how long to give a volume child to
+/// react to SIGTERM (graceful flush + exit) before escalating to
+/// SIGKILL. The ublk transport's signal watcher caps its own flush at
+/// 3s, so 10s is well past the worst legitimate case.
+const SIGTERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// After SIGKILL, how long to wait for the kernel to actually reap the
+/// process before giving up. SIGKILL can't be blocked, so anything
+/// past this is a kernel-side stuck process (e.g. D-state on broken
+/// I/O) that no supervisor can clean up.
+const SIGKILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Spawn `elide-coordinator serve` as a detached background process.
 ///
 /// Stdout/stderr are appended to `<data_dir>/coordinator.log`; the
@@ -1438,22 +1450,57 @@ fn fallback_stop_volumes(data_dir: &Path) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let deadline = std::time::Instant::now() + COORD_STOP_WAIT;
+    // Phase 1: wait up to SIGTERM_GRACE for graceful exit.
+    let term_deadline = std::time::Instant::now() + SIGTERM_GRACE;
+    let mut survivors = wait_for_exit(&pids, term_deadline);
+    if survivors.is_empty() {
+        println!("all volume processes stopped");
+        return Ok(());
+    }
+
+    // Phase 2: anything still alive after SIGTERM_GRACE gets SIGKILL.
+    // The volume's ublk/NBD signal watcher caps its own flush at 3s,
+    // so anything past SIGTERM_GRACE is a wedged process the operator
+    // wants gone. Mirrors `systemctl stop`'s TimeoutStopSec → SIGKILL.
+    for (pid, label) in &survivors {
+        let Ok(raw) = i32::try_from(*pid) else {
+            continue;
+        };
+        // SAFETY: libc::kill takes a pid + signal; the kernel checks
+        // permission and existence. SIGKILL cannot be caught or
+        // blocked, so this either succeeds or returns ESRCH.
+        if unsafe { libc::kill(raw, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("SIGKILL {label} (pid {pid}): {err}");
+            continue;
+        }
+        println!("SIGKILL {label} (pid {pid}) — did not exit within {SIGTERM_GRACE:?}");
+    }
+
+    let kill_deadline = std::time::Instant::now() + SIGKILL_WAIT;
+    survivors = wait_for_exit(&survivors, kill_deadline);
+    if survivors.is_empty() {
+        println!("all volume processes stopped");
+        return Ok(());
+    }
+    let labels: Vec<&str> = survivors.iter().map(|(_, l)| l.as_str()).collect();
+    Err(std::io::Error::other(format!(
+        "{n} process(es) still alive after SIGKILL+{SIGKILL_WAIT:?}: {labels:?}",
+        n = survivors.len()
+    )))
+}
+
+/// Wait until `deadline` for every pid in `pids` to exit; return the
+/// ones still alive when the wait expires. Polls at 100ms intervals.
+fn wait_for_exit(pids: &[(u32, String)], deadline: std::time::Instant) -> Vec<(u32, String)> {
     loop {
-        let still_alive: Vec<&(u32, String)> = pids
+        let still: Vec<(u32, String)> = pids
             .iter()
             .filter(|(p, _)| elide_core::process::pid_is_alive(*p))
+            .cloned()
             .collect();
-        if still_alive.is_empty() {
-            println!("all volume processes stopped");
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            let labels: Vec<&str> = still_alive.iter().map(|(_, l)| l.as_str()).collect();
-            return Err(std::io::Error::other(format!(
-                "{n} process(es) still alive after {COORD_STOP_WAIT:?}: {labels:?}",
-                n = still_alive.len()
-            )));
+        if still.is_empty() || std::time::Instant::now() >= deadline {
+            return still;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
