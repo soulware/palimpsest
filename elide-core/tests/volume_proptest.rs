@@ -113,6 +113,9 @@ fn assert_manifest_filter_correct(
         }
     };
 
+    // Collect parsed entries once; pass 1 needs them for the live-Delta
+    // source-hash augmentation and pass 2 reuses them for the predicate.
+    let mut parsed_segments: Vec<(Ulid, Vec<elide_core::segment::SegmentEntry>)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(s) = name.to_str() else { continue };
@@ -122,13 +125,37 @@ fn assert_manifest_filter_correct(
         let Ok(seg_ulid) = Ulid::from_string(stem) else {
             continue;
         };
-
         let Ok((_bss, parsed, _inputs)) =
             elide_core::segment::read_and_verify_segment_index(&entry.path(), &vk)
         else {
             continue;
         };
+        parsed_segments.push((seg_ulid, parsed));
+    }
 
+    // Pass 1: live_hashes = lbamap-referenced ∪ live-Delta source hashes.
+    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.lba_referenced_hashes();
+    for (_seg_ulid, parsed) in &parsed_segments {
+        for e in parsed {
+            if e.kind != EntryKind::Delta {
+                continue;
+            }
+            let end = e.start_lba + e.lba_length as u64;
+            let lba_live = lbamap
+                .extents_in_range(e.start_lba, end)
+                .iter()
+                .any(|r| r.hash == e.hash);
+            if !lba_live {
+                continue;
+            }
+            for opt in &e.delta_options {
+                live_hashes.insert(opt.source_hash);
+            }
+        }
+    }
+
+    // Pass 2: apply predicate and cross-check against the manifest.
+    for (seg_ulid, parsed) in &parsed_segments {
         let any_live = parsed.iter().any(|e| match e.kind {
             EntryKind::Zero => {
                 let end = e.start_lba + e.lba_length as u64;
@@ -147,12 +174,15 @@ fn assert_manifest_filter_correct(
             EntryKind::Data
             | EntryKind::Inline
             | EntryKind::CanonicalData
-            | EntryKind::CanonicalInline => extent_index.lookup(&e.hash).is_some_and(|loc| {
-                loc.segment_id == seg_ulid && loc.body_offset == e.stored_offset
-            }),
+            | EntryKind::CanonicalInline => {
+                live_hashes.contains(&e.hash)
+                    && extent_index.lookup(&e.hash).is_some_and(|loc| {
+                        loc.segment_id == *seg_ulid && loc.body_offset == e.stored_offset
+                    })
+            }
         });
 
-        let is_listed = listed.contains(&seg_ulid);
+        let is_listed = listed.contains(seg_ulid);
         if any_live && !is_listed {
             prop_assert!(
                 false,

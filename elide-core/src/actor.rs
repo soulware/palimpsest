@@ -2685,6 +2685,14 @@ pub(crate) fn execute_sign_snapshot_manifest(
 /// removed; reclamation is GC's job. Unparseable filenames are
 /// skipped silently to match the prior enumeration behaviour.
 ///
+/// Two passes over the cached `.idx` set:
+/// 1. Build `live_hashes` — the union of `lbamap.lba_referenced_hashes()`
+///    with every live `Delta`'s `source_hash`. A body whose hash is not
+///    in this set has nothing reading it, even if the extent index still
+///    points at it.
+/// 2. Apply the predicate with `live_hashes` as the body-reachability
+///    side condition.
+///
 /// Returns `Ok(Vec::new())` if `index_dir` does not exist.
 pub(crate) fn live_index_segments(
     index_dir: &std::path::Path,
@@ -2699,7 +2707,9 @@ pub(crate) fn live_index_segments(
         Err(e) => return Err(e),
     };
 
-    let mut live: Vec<Ulid> = Vec::new();
+    // Collect (ulid, parsed) once. The `Arc` clone keeps memory cost flat
+    // (we hold the cache's slot, not a copy).
+    let mut parsed_segments: Vec<(Ulid, Arc<crate::segment_cache::ParsedIndex>)> = Vec::new();
     for entry in read_dir.flatten() {
         let name = entry.file_name();
         let Some(s) = name.to_str() else { continue };
@@ -2709,14 +2719,45 @@ pub(crate) fn live_index_segments(
         let Ok(seg_ulid) = Ulid::from_string(stem) else {
             continue;
         };
-
         let parsed = segment_cache.read_and_verify(&entry.path(), verifying_key)?;
+        parsed_segments.push((seg_ulid, parsed));
+    }
+
+    // Pass 1: live_hashes = LBA-referenced hashes ∪ live-Delta source hashes.
+    //
+    // A `Delta` entry is live when some LBA in its range still maps to
+    // `entry.hash`; in that case its `source_hash` body is needed to
+    // reconstruct the delta, so the source must be carried into
+    // `live_hashes` even if no LBA references the source directly.
+    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.lba_referenced_hashes();
+    for (_seg_ulid, parsed) in &parsed_segments {
+        for entry in &parsed.entries {
+            if entry.kind != segment::EntryKind::Delta {
+                continue;
+            }
+            let end = entry.start_lba + entry.lba_length as u64;
+            let lba_live = lbamap
+                .extents_in_range(entry.start_lba, end)
+                .iter()
+                .any(|r| r.hash == entry.hash);
+            if !lba_live {
+                continue;
+            }
+            for opt in &entry.delta_options {
+                live_hashes.insert(opt.source_hash);
+            }
+        }
+    }
+
+    // Pass 2: apply predicate.
+    let mut live: Vec<Ulid> = Vec::with_capacity(parsed_segments.len());
+    for (seg_ulid, parsed) in &parsed_segments {
         let any_live = parsed
             .entries
             .iter()
-            .any(|e| is_index_entry_live(seg_ulid, e, extent_index, lbamap));
+            .any(|e| is_index_entry_live(*seg_ulid, e, extent_index, lbamap, &live_hashes));
         if any_live {
-            live.push(seg_ulid);
+            live.push(*seg_ulid);
         }
     }
     Ok(live)
@@ -2726,22 +2767,21 @@ pub(crate) fn live_index_segments(
 ///
 /// - Body-bearing kinds (`Data`, `Inline`, `CanonicalData`,
 ///   `CanonicalInline`): live iff the extent index points the entry's
-///   hash at this `(seg_ulid, stored_offset)`. The lowest-ULID-wins
-///   rule means duplicate Data entries in newer segments fail this
-///   check, which is correct: their bodies are unreferenced.
+///   hash at this `(seg_ulid, stored_offset)` **and** the hash is in
+///   `live_hashes`. The first conjunct rules out duplicate copies the
+///   lowest-ULID rule has displaced; the second rules out orphan
+///   bodies whose hash is no longer referenced anywhere.
 /// - `DedupRef` and `Delta`: live iff some LBA in
 ///   `[start_lba, start_lba + lba_length)` still maps to `entry.hash`
-///   in the lbamap.
+///   in the lbamap. (When live, a `Delta`'s source hash is already in
+///   `live_hashes` via the pass-1 augmentation.)
 /// - `Zero`: live iff some LBA in range still maps to `ZERO_HASH`.
-///
-/// Conservative: a body whose hash is canonical here but no longer
-/// LBA-referenced anywhere is treated as live. GC's full
-/// classification reclaims those; the snapshot filter does not.
 fn is_index_entry_live(
     seg_ulid: Ulid,
     entry: &segment::SegmentEntry,
     extent_index: &ExtentIndex,
     lbamap: &LbaMap,
+    live_hashes: &std::collections::HashSet<blake3::Hash>,
 ) -> bool {
     use segment::EntryKind;
     match entry.kind {
@@ -2762,9 +2802,12 @@ fn is_index_entry_live(
         EntryKind::Data
         | EntryKind::Inline
         | EntryKind::CanonicalData
-        | EntryKind::CanonicalInline => extent_index.lookup(&entry.hash).is_some_and(|loc| {
-            loc.segment_id == seg_ulid && loc.body_offset == entry.stored_offset
-        }),
+        | EntryKind::CanonicalInline => {
+            live_hashes.contains(&entry.hash)
+                && extent_index.lookup(&entry.hash).is_some_and(|loc| {
+                    loc.segment_id == seg_ulid && loc.body_offset == entry.stored_offset
+                })
+        }
     }
 }
 

@@ -81,6 +81,46 @@ fn snapshot_manifest_omits_fully_dead_segment() {
     );
 }
 
+/// Body-bearing orphan case: write LBA 0 with content X → drain → seg A
+/// (Data hash_X). Overwrite LBA 0 with different content Y → drain →
+/// seg B (Data hash_Y). At this point hash_X is still in the extent index
+/// pointing at A, but no LBA references hash_X and no Delta uses it as a
+/// source — it's an orphan.
+///
+/// The predicate's `live_hashes` augmentation rules out body-bearing
+/// orphans: A's only entry has `hash_X` not in `live_hashes`, so A is
+/// fully dead and the manifest must omit it.
+#[test]
+fn snapshot_manifest_omits_orphan_body_segment() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    vol.write(0, &block(0xAA)).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_redact(&mut vol);
+    let after_a = index_ulids(fork_dir);
+    assert_eq!(after_a.len(), 1);
+    let seg_a = after_a[0];
+
+    vol.write(0, &block(0xBB)).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_redact(&mut vol);
+    let after_b = index_ulids(fork_dir);
+    assert_eq!(after_b.len(), 2);
+    let seg_b = *after_b.iter().find(|u| **u != seg_a).expect("seg B");
+
+    let snap_ulid = vol.sign_snapshot_manifest_at_max().unwrap();
+    let listed = manifest_segments(fork_dir, snap_ulid);
+    assert!(listed.contains(&seg_b));
+    assert!(
+        !listed.contains(&seg_a),
+        "manifest must omit orphan-body segment A {seg_a}: got {listed:?}",
+    );
+}
+
 /// A segment whose LBAs are still mapped (no overwrite, no GC) must remain
 /// listed in the manifest. Guards against a too-aggressive predicate that
 /// would incorrectly classify a fully-alive segment as dead.
