@@ -2,6 +2,7 @@ pub mod actor;
 pub mod block_reader;
 pub mod config;
 pub mod delta_compute;
+pub mod dmat;
 pub mod ext4_scan;
 pub mod extentindex;
 pub mod filemap;
