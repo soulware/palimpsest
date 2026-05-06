@@ -1446,16 +1446,17 @@ fn fallback_stop_volumes(data_dir: &Path) -> std::io::Result<()> {
             let Ok(raw) = i32::try_from(pid) else {
                 continue;
             };
+            let label = format!("{filename}={pid} in {}", dir.display());
             // SAFETY: libc::kill takes a pid + signal; the kernel checks
             // permission and existence. SIGTERM has no observable
             // side-effect on this process.
             if unsafe { libc::kill(raw, libc::SIGTERM) } != 0 {
                 let err = std::io::Error::last_os_error();
-                eprintln!("SIGTERM {filename}={pid} ({}): {err}", dir.display());
+                eprintln!("SIGTERM {label}: {err}");
                 continue;
             }
-            println!("SIGTERM {filename}={pid} in {}", dir.display());
-            pids.push((pid, format!("{}/{filename}", dir.display())));
+            println!("SIGTERM {label}");
+            pids.push((pid, label));
         }
     }
 
@@ -1485,10 +1486,10 @@ fn fallback_stop_volumes(data_dir: &Path) -> std::io::Result<()> {
         // blocked, so this either succeeds or returns ESRCH.
         if unsafe { libc::kill(raw, libc::SIGKILL) } != 0 {
             let err = std::io::Error::last_os_error();
-            eprintln!("SIGKILL {label} (pid {pid}): {err}");
+            eprintln!("SIGKILL {label}: {err}");
             continue;
         }
-        println!("SIGKILL {label} (pid {pid}) — did not exit within {SIGTERM_GRACE:?}");
+        println!("SIGKILL {label} (did not exit within {SIGTERM_GRACE:?})");
     }
 
     let kill_deadline = std::time::Instant::now() + SIGKILL_WAIT;
