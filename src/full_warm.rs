@@ -6,10 +6,14 @@
 //! it just buys a 404 round-trip.
 //!
 //! Enumeration walks `LbaMap.lba_referenced_hashes() ∩ ExtentIndex` —
-//! the post-overlap live view — and skips `BodySource::Local` (already
-//! on disk) and entries already in `.present` (filtered inside
-//! `warm_segment_impl`). Skipped on read-only mounts and when
-//! `volume.toml` opts in via `lazy = true`.
+//! the post-overlap live view — skips `BodySource::Local` (already on
+//! disk), and filters each segment's populated entries against the
+//! per-segment `SegmentPresence` bitset the `ExtentIndex` holds (loaded
+//! from `cache/<id>.present` during rebuild). Segments whose live
+//! entries are all present are dropped from the plan entirely, so the
+//! "N segment(s) to warm" log reflects actual residual fetch work.
+//! Skipped on read-only mounts and when `volume.toml` opts in via
+//! `lazy = true`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -178,10 +182,14 @@ fn plan_segments(
             });
         work.populated_entries.push(entry_idx);
     }
-    for w in by_segment.values_mut() {
+    by_segment.retain(|seg_id, w| {
         w.populated_entries.sort_unstable();
         w.populated_entries.dedup();
-    }
+        if let Some(presence) = extent_index.segment_presence(*seg_id) {
+            w.populated_entries.retain(|idx| !presence.test(*idx));
+        }
+        !w.populated_entries.is_empty()
+    });
     Ok(by_segment)
 }
 
@@ -421,5 +429,82 @@ mod tests {
         let plan = plan_segments(&[owner], &lba_map, &extent_index).unwrap();
         let work = plan.get(&seg).expect("seg present");
         assert_eq!(work.populated_entries, vec![1, 5, 9]);
+    }
+
+    #[test]
+    fn plan_segments_drops_entries_already_in_presence() {
+        use elide_core::extentindex::SegmentPresence;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&owner).unwrap();
+
+        let seg_full = Ulid::new();
+        let seg_partial = Ulid::new();
+        touch_idx(&owner, seg_full);
+        touch_idx(&owner, seg_partial);
+
+        let h_full = blake3::hash(b"full");
+        let h_partial_done = blake3::hash(b"partial-done");
+        let h_partial_todo = blake3::hash(b"partial-todo");
+
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(0, 8, h_full);
+        lba_map.insert(8, 8, h_partial_done);
+        lba_map.insert(16, 8, h_partial_todo);
+
+        let mut extent_index = ExtentIndex::new();
+        extent_index.insert(
+            h_full,
+            ExtentLocation {
+                segment_id: seg_full,
+                body_offset: 0,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Cached(2),
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+        extent_index.insert(
+            h_partial_done,
+            ExtentLocation {
+                segment_id: seg_partial,
+                body_offset: 0,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Cached(3),
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+        extent_index.insert(
+            h_partial_todo,
+            ExtentLocation {
+                segment_id: seg_partial,
+                body_offset: 4096,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Cached(7),
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+
+        // seg_full: every populated entry is already present → drop segment.
+        let presence_full = SegmentPresence::zeroed(8);
+        presence_full.set(2);
+        extent_index.set_segment_presence(seg_full, Arc::new(presence_full));
+
+        // seg_partial: entry 3 is present, entry 7 is missing → keep
+        // segment with only entry 7.
+        let presence_partial = SegmentPresence::zeroed(8);
+        presence_partial.set(3);
+        extent_index.set_segment_presence(seg_partial, Arc::new(presence_partial));
+
+        let plan = plan_segments(&[owner], &lba_map, &extent_index).unwrap();
+        assert_eq!(plan.len(), 1, "only seg_partial should remain");
+        let work = plan.get(&seg_partial).expect("seg_partial present");
+        assert_eq!(work.populated_entries, vec![7]);
     }
 }
