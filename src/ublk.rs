@@ -354,12 +354,23 @@ mod imp {
     ///      Anything the actor accepted before this call is durable;
     ///      anything still in flight after it is reissued by the kernel
     ///      from its `UBLK_F_USER_RECOVERY_REISSUE` buffer on next serve.
-    ///   3. `process::exit(0)`. Queue threads, control socket, actor
-    ///      thread are all killed; their fds are reaped by the kernel,
-    ///      the io_uring fds close, and the kernel parks the device.
+    ///   3. `_exit(0)`. Queue threads, control socket, actor thread are
+    ///      all killed; their fds are reaped by the kernel, the io_uring
+    ///      fds close, and the kernel parks the device.
     ///
-    /// A second signal short-circuits to `process::exit(130)` so an
-    /// impatient operator is never trapped.
+    /// We use `libc::_exit` (direct `exit_group` syscall) rather than
+    /// `std::process::exit` because the daemon's stdio fds may point at
+    /// a now-destroyed pty (e.g. when `elide coord run` was started
+    /// under `sudo` and Ctrl-C'd: sudo's pty master is closed, the
+    /// slave dentry is unlinked, but the volume — having been spawned
+    /// before that — still holds fds onto it). `process::exit` calls
+    /// `libc::exit` which runs glibc's `__cxa_finalize` and stdio
+    /// flush/fclose; both can deadlock against a destroyed pty,
+    /// stranding the daemon. `_exit` skips all of that and goes
+    /// straight to the kernel.
+    ///
+    /// A second signal short-circuits to `_exit(130)` so an impatient
+    /// operator is never trapped.
     fn spawn_ublk_signal_watcher(
         client: VolumeClient,
         peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle>,
@@ -382,18 +393,19 @@ mod imp {
                         tracing::error!(
                             "ublk-signal: signalfd read returned None on a blocking fd"
                         );
-                        std::process::exit(130);
+                        // SAFETY: _exit is async-signal-safe and never returns.
+                        unsafe { libc::_exit(130) };
                     }
                     Err(e) => {
                         tracing::error!("ublk-signal: signalfd read failed: {e}");
-                        std::process::exit(130);
+                        unsafe { libc::_exit(130) };
                     }
                 }
 
                 // Watchdog: if the flush stalls (actor wedged, disk
                 // unresponsive), force-exit after a bounded wait so the
                 // kernel can park the device on its own. Races the flush
-                // below; whichever calls process::exit first wins.
+                // below; whichever calls _exit first wins.
                 let _watchdog = std::thread::Builder::new()
                     .name("ublk-shutdown-watchdog".into())
                     .spawn(|| {
@@ -404,14 +416,14 @@ mod imp {
                              daemon-exit detection",
                             SHUTDOWN_FLUSH_TIMEOUT
                         );
-                        std::process::exit(0);
+                        unsafe { libc::_exit(0) };
                     });
 
                 if let Err(e) = client.flush() {
                     tracing::warn!("ublk shutdown flush: {e}");
                 }
                 crate::log_peer_fetch_counters_at_shutdown(peer_counters.as_ref());
-                std::process::exit(0);
+                unsafe { libc::_exit(0) };
             })
             .map_err(io::Error::other)
     }

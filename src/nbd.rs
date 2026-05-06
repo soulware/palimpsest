@@ -196,7 +196,9 @@ fn block_shutdown_signals() -> io::Result<()> {
 ///      actor accepted before this call is durable.
 ///   3. Log the final peer-fetch counter snapshot (no-op when
 ///      peer-fetch was disabled for this run).
-///   4. `process::exit(0)`.
+///   4. `_exit(0)` (direct exit_group; bypasses libc atexit handlers
+///      so a destroyed-pty stdio fd inherited from Ctrl-C'd `coord run`
+///      cannot wedge stdio flush during shutdown).
 ///
 /// signalfd is Linux-only; on other Unix targets this is a no-op
 /// (returns an empty join handle).
@@ -215,11 +217,16 @@ fn spawn_nbd_signal_watcher(
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         error!("nbd-signal: signalfd read returned None on a blocking fd");
-                        std::process::exit(130);
+                        // SAFETY: _exit is async-signal-safe and never returns.
+                        // We deliberately use _exit (direct exit_group) rather
+                        // than process::exit so libc atexit handlers — stdio
+                        // flush in particular — cannot deadlock on a destroyed
+                        // pty fd inherited from a Ctrl-C'd `coord run`.
+                        unsafe { libc::_exit(130) };
                     }
                     Err(e) => {
                         error!("nbd-signal: signalfd read failed: {e}");
-                        std::process::exit(130);
+                        unsafe { libc::_exit(130) };
                     }
                 }
 
@@ -231,14 +238,14 @@ fn spawn_nbd_signal_watcher(
                             "nbd shutdown flush did not complete within {:?}; exiting anyway",
                             NBD_SHUTDOWN_FLUSH_TIMEOUT
                         );
-                        std::process::exit(0);
+                        unsafe { libc::_exit(0) };
                     });
 
                 if let Err(e) = client.flush() {
                     warn!("nbd shutdown flush: {e}");
                 }
                 crate::log_peer_fetch_counters_at_shutdown(peer_counters.as_ref());
-                std::process::exit(0);
+                unsafe { libc::_exit(0) };
             })
             .map_err(io::Error::other)
     }
