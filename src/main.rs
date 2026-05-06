@@ -300,23 +300,21 @@ enum VolumeCommand {
         #[arg(long)]
         from: Option<String>,
         /// Port for the NBD server (exposes the volume over NBD on first start)
-        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk", "ublk_id"])]
+        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk"])]
         nbd_port: Option<u16>,
         /// Address to bind the NBD server (default: 127.0.0.1)
-        #[arg(long, conflicts_with_all = ["ublk", "ublk_id"])]
+        #[arg(long, conflicts_with_all = ["ublk"])]
         nbd_bind: Option<String>,
         /// Unix socket path for the NBD server. Omit the path to use the
         /// default (nbd.sock inside the volume directory).
-        #[arg(long, conflicts_with_all = ["nbd_port", "ublk", "ublk_id"], num_args = 0..=1, default_missing_value = "nbd.sock")]
+        #[arg(long, conflicts_with_all = ["nbd_port", "ublk"], num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
         /// Serve this volume over ublk (Linux userspace block device) instead
-        /// of NBD. Mutually exclusive with the --nbd-* flags.
+        /// of NBD. The kernel auto-allocates a device id on first start; the
+        /// chosen id is then sticky across restarts (recorded in volume.toml).
+        /// Mutually exclusive with the --nbd-* flags.
         #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket"])]
         ublk: bool,
-        /// Pin an explicit ublk device id (maps to /dev/ublkb<id>). If
-        /// omitted, the kernel auto-allocates on first start. Implies --ublk.
-        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket"])]
-        ublk_id: Option<i32>,
         /// When forking: upload a new "now" snapshot marker to the remote
         /// store and branch from it, instead of relying on an existing
         /// snapshot. Required when the source has no snapshot (e.g.
@@ -331,29 +329,25 @@ enum VolumeCommand {
         /// Volume name
         name: String,
         /// Change the NBD server port (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk", "ublk_id", "no_ublk"])]
+        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk", "no_ublk"])]
         nbd_port: Option<u16>,
         /// Change the NBD bind address (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["ublk", "ublk_id", "no_ublk"])]
+        #[arg(long, conflicts_with_all = ["ublk", "no_ublk"])]
         nbd_bind: Option<String>,
         /// Set or change the Unix socket path for the NBD server. Omit the
         /// path to use the default (nbd.sock inside the volume directory).
         /// Restarts the volume process.
-        #[arg(long, conflicts_with_all = ["nbd_port", "ublk", "ublk_id", "no_ublk"], num_args = 0..=1, default_missing_value = "nbd.sock")]
+        #[arg(long, conflicts_with_all = ["nbd_port", "ublk", "no_ublk"], num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
         /// Disable NBD serving (removes the [nbd] section; restarts the volume process)
-        #[arg(long, conflicts_with_all = ["ublk", "ublk_id", "no_ublk"])]
+        #[arg(long, conflicts_with_all = ["ublk", "no_ublk"])]
         no_nbd: bool,
         /// Switch this volume to ublk transport (writes [ublk] section;
         /// restarts the volume process). Mutually exclusive with the --nbd-* flags.
         #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd"])]
         ublk: bool,
-        /// Pin an explicit ublk device id. Implies --ublk. Restarts the
-        /// volume process.
-        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd"])]
-        ublk_id: Option<i32>,
         /// Disable ublk serving (removes the [ublk] section; restarts the volume process)
-        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd", "ublk", "ublk_id"])]
+        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd", "ublk"])]
         no_ublk: bool,
     },
 
@@ -664,7 +658,6 @@ fn main() {
                 nbd_bind,
                 nbd_socket,
                 ublk,
-                ublk_id,
                 force_snapshot,
             } => {
                 if let Some(from) = &from {
@@ -672,9 +665,8 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    let flags = encode_transport_flags(
-                        nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
-                    );
+                    let flags =
+                        encode_transport_flags(nbd_port, nbd_bind, nbd_socket, false, ublk, false);
                     if let Err(e) = create_fork(
                         &data_dir,
                         &name,
@@ -706,9 +698,8 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let flags = encode_transport_flags(
-                        nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
-                    );
+                    let flags =
+                        encode_transport_flags(nbd_port, nbd_bind, nbd_socket, false, ublk, false);
                     let ulid = match coord.create_volume_remote(&name, bytes, &flags) {
                         Ok(u) => u,
                         Err(e) => {
@@ -730,12 +721,10 @@ fn main() {
                 nbd_socket,
                 no_nbd,
                 ublk,
-                ublk_id,
                 no_ublk,
             } => {
-                let flags = encode_transport_flags(
-                    nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, ublk_id, no_ublk,
-                );
+                let flags =
+                    encode_transport_flags(nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, no_ublk);
                 match coord.update_volume(&name, &flags) {
                     Ok(reply) if reply.restarted => {
                         println!("volume restarting with new config")
@@ -1795,7 +1784,6 @@ fn encode_transport_flags(
     nbd_socket: Option<PathBuf>,
     no_nbd: bool,
     ublk: bool,
-    ublk_id: Option<i32>,
     no_ublk: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
@@ -1813,9 +1801,6 @@ fn encode_transport_flags(
     }
     if ublk {
         out.push("ublk".to_owned());
-    }
-    if let Some(id) = ublk_id {
-        out.push(format!("ublk-id={id}"));
     }
     if no_ublk {
         out.push("no-ublk".to_owned());

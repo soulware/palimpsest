@@ -783,10 +783,8 @@ async fn fork_create_op(
     } else {
         None
     };
-    let ublk_cfg = if patch.ublk || patch.ublk_id.is_some() {
-        Some(elide_core::config::UblkConfig {
-            dev_id: patch.ublk_id,
-        })
+    let ublk_cfg = if patch.ublk {
+        Some(elide_core::config::UblkConfig::default())
     } else {
         None
     };
