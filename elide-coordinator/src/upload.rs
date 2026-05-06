@@ -141,7 +141,12 @@ fn mark_uploaded(sentinel: &Path, content: &[u8]) -> std::io::Result<()> {
 
 pub struct DrainResult {
     pub uploaded: usize,
-    pub failed: usize,
+    /// Segments whose S3 PUT failed. Likely a persistent store-side issue.
+    pub upload_failed: usize,
+    /// Segments that uploaded to S3 but whose promote IPC to the volume
+    /// process did not succeed. Typically transient (startup/shutdown race);
+    /// the pending file stays in place and the next tick retries.
+    pub promote_failed: usize,
 }
 
 /// Return the volume ULID from a volume directory path.
@@ -207,7 +212,8 @@ pub async fn drain_pending(
         .with_context(|| format!("opening pending dir: {}", pending_dir.display()))?;
 
     let mut uploaded = 0usize;
-    let mut failed = 0usize;
+    let mut upload_failed = 0usize;
+    let mut promote_failed = 0usize;
     let uploader = SegmentUploader { volume_id, store };
 
     for entry in entries {
@@ -239,20 +245,29 @@ pub async fn drain_pending(
                 if crate::control::promote_segment(vol_dir, ulid).await {
                     uploaded += 1;
                 } else {
-                    // No process listening; pending/<ulid> stays in place.
-                    // The coordinator retries on the next drain tick.
-                    warn!("promote {name}: no process listening; will retry next tick");
-                    failed += 1;
+                    // S3 PUT succeeded but the volume control socket was
+                    // unreachable or the IPC reply was an error envelope.
+                    // pending/<ulid> stays in place; the next drain tick
+                    // re-uploads (idempotent re-PUT) and re-issues promote.
+                    warn!(
+                        "promote {name}: uploaded to S3 but volume promote IPC unavailable; \
+                         will retry next tick"
+                    );
+                    promote_failed += 1;
                 }
             }
             Err(e) => {
                 warn!("upload failed for segment {name}: {e:#}");
-                failed += 1;
+                upload_failed += 1;
             }
         }
     }
 
-    Ok(DrainResult { uploaded, failed })
+    Ok(DrainResult {
+        uploaded,
+        upload_failed,
+        promote_failed,
+    })
 }
 
 /// Upload volume metadata: public key, signed provenance, snapshot
@@ -665,7 +680,8 @@ mod tests {
         let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         assert_eq!(result.uploaded, 2);
-        assert_eq!(result.failed, 0);
+        assert_eq!(result.upload_failed, 0);
+        assert_eq!(result.promote_failed, 0);
 
         // pending/ entries are removed by the volume after promote IPC (mocked here).
         assert!(!pending_dir.join(&ulid1).exists());
@@ -713,7 +729,8 @@ mod tests {
 
         let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
         assert_eq!(result.uploaded, 0);
-        assert_eq!(result.failed, 0);
+        assert_eq!(result.upload_failed, 0);
+        assert_eq!(result.promote_failed, 0);
 
         let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
         let got = store.get(&pub_key).await.expect("volume.pub not in store");
