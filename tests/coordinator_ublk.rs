@@ -16,8 +16,10 @@
 //!   Phase 1 — fresh start under coordinator A
 //!     1. Coordinator boot — `elide-coordinator serve --config <toml>`
 //!        with a file-backed store (no S3) and a short scan interval.
-//!     2. `elide volume create ... --ublk --ublk-id <id>` + inbound
-//!        `rescan`.
+//!     2. `elide volume create ... --ublk` + inbound `rescan`. The
+//!        kernel auto-allocates a dev id; the test discovers it from
+//!        `[ublk] dev_id` in `volume.toml` after the daemon's wait_hook
+//!        writes it back.
 //!     3. Supervisor adopts the fork: `volume.pid`, `control.sock`, and
 //!        `/dev/ublkb<id>` (plus its sysfs entry and the `[ublk]
 //!        dev_id` field in `volume.toml`) all appear.
@@ -82,13 +84,25 @@ const SIGKILL: i32 = 9;
 const BLOCK: usize = 4096;
 const VOLUME_SIZE: &str = "64M";
 
-/// Device id chosen well above any realistic kernel auto-allocation and
-/// distinct from the ids used by `tests/ublk_crash.rs` (1001, 1002) so
-/// that runs do not collide if they ever overlap.
-const DEV_ID: i32 = 1003;
-
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Poll `volume.toml` until `[ublk] dev_id` is populated and return it.
+/// Used after `volume create --ublk` (no pin) to discover the kernel-
+/// assigned id once the daemon's `wait_hook` has written it back.
+fn wait_for_bound_id(fork_dir: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Ok(Some(id)) = elide_core::config::VolumeConfig::bound_ublk_id(fork_dir) {
+            return id;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "timed out waiting for [ublk] dev_id in {}",
+        fork_dir.join("volume.toml").display()
+    );
 }
 
 // ── Binary locations ────────────────────────────────────────────────────────
@@ -345,11 +359,11 @@ fn coordinator_ublk_lifecycle() {
         return;
     }
 
-    // Clean any QUIESCED device left behind by a previous failed run on
-    // the same machine. Without this, plan_route would take Route::Recover
-    // against a stale device and the test would not exercise the fresh
-    // ADD path.
-    force_delete_device(DEV_ID);
+    // No pre-cleanup needed: the kernel auto-allocates a fresh dev id
+    // per ADD, and each test run uses an isolated tempdir / data_dir
+    // (so no `[ublk] dev_id` is carried over). Devices leaked by a
+    // previous failed run on this host stay on whichever id the kernel
+    // had assigned them; the new ADD picks an unused id.
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().join("data");
@@ -388,19 +402,12 @@ fn coordinator_ublk_lifecycle() {
         || inbound.exists(),
     );
 
-    // Create a fresh 64 MiB volume backed by ublk on a pinned dev id.
+    // Create a fresh 64 MiB volume backed by ublk. The kernel auto-
+    // allocates the dev id; we discover it after the daemon has ADDed
+    // by reading `[ublk] dev_id` back from volume.toml.
     elide(
         &data_dir,
-        &[
-            "volume",
-            "create",
-            "vtest",
-            "--size",
-            VOLUME_SIZE,
-            "--ublk",
-            "--ublk-id",
-            &DEV_ID.to_string(),
-        ],
+        &["volume", "create", "vtest", "--size", VOLUME_SIZE, "--ublk"],
     );
 
     let name_link = data_dir.join("by_name").join("vtest");
@@ -410,10 +417,15 @@ fn coordinator_ublk_lifecycle() {
     let fork_dir = std::fs::canonicalize(&name_link).expect("canonicalize by_name/vtest");
 
     // Wait for the supervisor to spawn the volume, the volume to bind
-    // its control socket, and the kernel device + sysfs entry to appear.
+    // its control socket, and the kernel device + sysfs entry to
+    // appear. The dev id is whatever the kernel assigned — discover
+    // via `wait_for_bound_id` then resolve sysfs / bdev paths against
+    // it. The bound id is sticky for the rest of this test (and would
+    // be sticky across the coordinator restart in phase 2 too).
     let volume_pid = fork_dir.join("volume.pid");
     let volume_ctrl = fork_dir.join("control.sock");
-    let bdev = bdev_path(DEV_ID);
+    let dev_id = wait_for_bound_id(&fork_dir);
+    let bdev = bdev_path(dev_id);
     wait_until(
         Duration::from_secs(30),
         "[A] supervised ublk volume up",
@@ -421,11 +433,7 @@ fn coordinator_ublk_lifecycle() {
             volume_pid.exists()
                 && volume_ctrl.exists()
                 && bdev.exists()
-                && sysfs_entry_exists(DEV_ID)
-                && elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir)
-                    .ok()
-                    .flatten()
-                    == Some(DEV_ID)
+                && sysfs_entry_exists(dev_id)
         },
     );
     // Small settle so the kernel has published queue limits before our
@@ -444,8 +452,8 @@ fn coordinator_ublk_lifecycle() {
     // verify. fsync is implicit via O_SYNC + explicit fsync in
     // write_pattern. This pattern is the durability oracle for phase 2.
     let pattern_a: Vec<u8> = (0..BLOCK).map(|i| (i as u8) ^ 0x3c).collect();
-    write_pattern(DEV_ID, 0, &pattern_a);
-    let got = read_pattern(DEV_ID, 0, BLOCK);
+    write_pattern(dev_id, 0, &pattern_a);
+    let got = read_pattern(dev_id, 0, BLOCK);
     assert_eq!(got, pattern_a, "[A] ublk read-back pattern mismatch");
 
     // Coordinator-orchestrated snapshot, mid-service. Exercises:
@@ -524,14 +532,14 @@ fn coordinator_ublk_lifecycle() {
     //      accept-loop cleanup, which does not run under SIGTERM
     //      termination.
     assert!(
-        sysfs_entry_exists(DEV_ID),
+        sysfs_entry_exists(dev_id),
         "[A] sysfs entry should survive volume SIGTERM (shutdown-park)"
     );
     assert_eq!(
         elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir)
             .ok()
             .flatten(),
-        Some(DEV_ID),
+        Some(dev_id),
         "[A] bound dev_id must persist for Route::Recover on next serve"
     );
     let _ = volume_ctrl;
@@ -562,7 +570,7 @@ fn coordinator_ublk_lifecycle() {
             if !(volume_pid.exists() && volume_ctrl.exists() && bdev.exists()) {
                 return false;
             }
-            if !sysfs_entry_exists(DEV_ID) {
+            if !sysfs_entry_exists(dev_id) {
                 return false;
             }
             // Distinguish "fresh PID file" from "stale carryover".
@@ -584,7 +592,7 @@ fn coordinator_ublk_lifecycle() {
     //   (2) coord A exit (process boundary),
     //   (3) coord B startup + supervisor adoption,
     //   (4) daemon Route::Recover + USER_RECOVERY_REATTACH.
-    let got = read_pattern(DEV_ID, 0, BLOCK);
+    let got = read_pattern(dev_id, 0, BLOCK);
     assert_eq!(
         got, pattern_a,
         "[B] LBA 0 must survive coordinator-driven shutdown + Route::Recover"
@@ -595,15 +603,15 @@ fn coordinator_ublk_lifecycle() {
     // does not clobber the previously written block at LBA 0.
     const OFFSET_B: u64 = (BLOCK as u64) * 100;
     let pattern_b: Vec<u8> = (0..BLOCK).map(|i| (i as u8) ^ 0xa7).collect();
-    write_pattern(DEV_ID, OFFSET_B, &pattern_b);
-    let got = read_pattern(DEV_ID, OFFSET_B, BLOCK);
+    write_pattern(dev_id, OFFSET_B, &pattern_b);
+    let got = read_pattern(dev_id, OFFSET_B, BLOCK);
     assert_eq!(
         got, pattern_b,
         "[B] write/read at offset {OFFSET_B} on recovered device"
     );
 
     // LBA 0 is still the phase-1 pattern.
-    let got = read_pattern(DEV_ID, 0, BLOCK);
+    let got = read_pattern(dev_id, 0, BLOCK);
     assert_eq!(
         got, pattern_a,
         "[B] write at offset {OFFSET_B} must not clobber LBA 0"
@@ -642,20 +650,20 @@ fn coordinator_ublk_lifecycle() {
         !pid_alive(pid_b)
     });
     assert!(
-        sysfs_entry_exists(DEV_ID),
+        sysfs_entry_exists(dev_id),
         "[B] sysfs entry should survive volume SIGTERM (shutdown-park)"
     );
     assert_eq!(
         elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir)
             .ok()
             .flatten(),
-        Some(DEV_ID),
+        Some(dev_id),
         "[B] bound dev_id must persist across the second shutdown too"
     );
 
     // Cleanup: explicit DEL_DEV so the next CI run starts from a clean
     // kernel state. Failures here would indicate a leaked device.
-    delete_and_wait_sysfs_gone(DEV_ID);
+    delete_and_wait_sysfs_gone(dev_id);
 }
 
 /// Probe whether `pid` is alive without waiting on it. `kill(pid, 0)`
