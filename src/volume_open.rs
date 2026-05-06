@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use elide_core::volume::{ReadonlyVolume, Volume};
 use tracing::warn;
 
-use crate::coordinator_client::{PREFETCH_AWAIT_BUDGET, await_prefetch, is_reachable};
+use crate::coordinator_client::{Client, PREFETCH_AWAIT_BUDGET};
 
 /// How long volume open retries wait in total before giving up when an
 /// ancestor artifact is missing. The common case is the coordinator's
@@ -91,10 +91,11 @@ fn wait_for_prefetch_if_coordinator_present(dir: &Path) -> io::Result<()> {
     let Some((socket_path, vol_ulid)) = derive_coordinator_socket(dir) else {
         return Ok(());
     };
-    if !is_reachable(&socket_path) {
+    let coord = Client::new(socket_path);
+    if !coord.is_reachable() {
         return Ok(());
     }
-    await_prefetch(&socket_path, &vol_ulid, PREFETCH_AWAIT_BUDGET)
+    coord.await_prefetch(&vol_ulid, PREFETCH_AWAIT_BUDGET)
 }
 
 fn derive_coordinator_socket(dir: &Path) -> Option<(std::path::PathBuf, String)> {
