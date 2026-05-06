@@ -1271,17 +1271,29 @@ fn coord_start(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
 
 /// Send the `Shutdown` IPC and poll until the coordinator process actually
 /// exits (socket disappears / pidfile pid stops responding).
+///
+/// When the coordinator is *not* running, falls back to a direct
+/// per-volume teardown: walks `<data_dir>/by_id/*/`, SIGTERMs every
+/// `volume.pid` and `import.pid` it finds, and waits for them to exit.
+/// This makes `coord stop` the universal "clean up after me" verb,
+/// covering both the dev workflow (Ctrl+C'd a foreground `coord run`,
+/// orphans left behind) and post-crash cleanup. With `--keep-volumes`
+/// the fallback is a no-op since "coordinator gone, volumes running"
+/// is already the desired state.
 fn coord_stop(
     coord: &coordinator_client::Client,
     data_dir: &Path,
     keep_volumes: bool,
 ) -> std::io::Result<()> {
     if !coord.is_reachable() {
-        eprintln!(
-            "coordinator not running ({})",
-            coord.socket_path().display()
-        );
-        return Ok(());
+        if keep_volumes {
+            println!(
+                "coordinator not running ({}); volumes left running",
+                coord.socket_path().display()
+            );
+            return Ok(());
+        }
+        return fallback_stop_volumes(data_dir);
     }
     coord.shutdown(keep_volumes)?;
 
@@ -1309,6 +1321,80 @@ fn coord_stop(
         if std::time::Instant::now() >= deadline {
             return Err(std::io::Error::other(format!(
                 "coordinator did not exit within {COORD_STOP_WAIT:?}"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Direct teardown of every running volume + import process under
+/// `<data_dir>/by_id/*/` when the coordinator socket is unreachable.
+/// Reads each `volume.pid` / `import.pid`, SIGTERMs the live ones, and
+/// polls until they exit or the wait budget expires.
+fn fallback_stop_volumes(data_dir: &Path) -> std::io::Result<()> {
+    let by_id = data_dir.join("by_id");
+    let entries = match std::fs::read_dir(&by_id) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("no volume processes to stop ({} absent)", by_id.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut pids: Vec<(u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for filename in &["volume.pid", "import.pid"] {
+            let pid_path = dir.join(filename);
+            let Ok(text) = std::fs::read_to_string(&pid_path) else {
+                continue;
+            };
+            let Ok(pid) = text.trim().parse::<u32>() else {
+                continue;
+            };
+            if !elide_core::process::pid_is_alive(pid) {
+                continue;
+            }
+            let Ok(raw) = i32::try_from(pid) else {
+                continue;
+            };
+            // SAFETY: libc::kill takes a pid + signal; the kernel checks
+            // permission and existence. SIGTERM has no observable
+            // side-effect on this process.
+            if unsafe { libc::kill(raw, libc::SIGTERM) } != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("SIGTERM {filename}={pid} ({}): {err}", dir.display());
+                continue;
+            }
+            println!("SIGTERM {filename}={pid} in {}", dir.display());
+            pids.push((pid, format!("{}/{filename}", dir.display())));
+        }
+    }
+
+    if pids.is_empty() {
+        println!("no volume processes to stop");
+        return Ok(());
+    }
+
+    let deadline = std::time::Instant::now() + COORD_STOP_WAIT;
+    loop {
+        let still_alive: Vec<&(u32, String)> = pids
+            .iter()
+            .filter(|(p, _)| elide_core::process::pid_is_alive(*p))
+            .collect();
+        if still_alive.is_empty() {
+            println!("all volume processes stopped");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let labels: Vec<&str> = still_alive.iter().map(|(_, l)| l.as_str()).collect();
+            return Err(std::io::Error::other(format!(
+                "{n} process(es) still alive after {COORD_STOP_WAIT:?}: {labels:?}",
+                n = still_alive.len()
             )));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
