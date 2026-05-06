@@ -45,6 +45,10 @@ name = "actor_proptest"
 required-features = ["proptest"]
 
 [[test]]
+name = "dmat_proptest"
+required-features = ["proptest"]
+
+[[test]]
 name = "fork_proptest"
 required-features = ["proptest"]
 
