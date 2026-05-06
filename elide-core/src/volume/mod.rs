@@ -44,15 +44,21 @@ use crate::{
     writelog,
 };
 
+mod ancestry;
 mod compress;
 mod fork;
 mod jobs;
+mod open_state;
 mod read;
 mod readonly;
 mod reclaim;
 mod repack;
 mod wal;
 
+pub use ancestry::{
+    latest_snapshot, resolve_ancestor_dir, verify_ancestor_manifests, walk_ancestors,
+    walk_extent_ancestors,
+};
 pub(crate) use compress::maybe_compress;
 #[cfg(test)]
 pub(in crate::volume) use compress::{
@@ -65,14 +71,11 @@ pub use jobs::{
     PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob,
     SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
+use open_state::open_read_state;
 #[cfg(test)]
 pub(in crate::volume) use read::SegmentLayout;
 pub(crate) use read::{FileCache, find_segment_in_dirs, open_delta_body_in_dirs, read_extents};
-use readonly::open_read_state;
-pub use readonly::{
-    ReadonlyVolume, latest_snapshot, resolve_ancestor_dir, verify_ancestor_manifests,
-    walk_ancestors, walk_extent_ancestors,
-};
+pub use readonly::ReadonlyVolume;
 pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
     scan_reclaim_candidates,
