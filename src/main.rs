@@ -171,6 +171,20 @@ enum CoordCommand {
         #[arg(long)]
         keep_volumes: bool,
     },
+
+    /// Run the coordinator in the foreground.
+    ///
+    /// Thin wrapper that execs the sibling `elide-coordinator serve`
+    /// binary with stdio inherited. Use this as the `ExecStart` for a
+    /// `Type=simple` systemd unit, or for interactive debugging.
+    /// Signals reach the coordinator directly; both SIGINT and SIGTERM
+    /// trigger the defensive shutdown (volumes left running).
+    Run {
+        /// Path to the coordinator config file. Defaults to
+        /// `coordinator.toml` in the working directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1130,8 +1144,33 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            CoordCommand::Run { config } => {
+                let e = coord_run(&args.data_dir, config.as_deref());
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         },
     }
+}
+
+/// Exec the sibling `elide-coordinator serve` with stdio inherited.
+/// Returns only on failure — on success, exec replaces this process so
+/// signals and exit status flow directly through the coordinator.
+fn coord_run(data_dir: &Path, config: Option<&Path>) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let bin = sibling_bin("elide-coordinator");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve").arg("--data-dir").arg(data_dir);
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    // exec() returns only on failure; the success path replaces this
+    // process image with the coordinator's, so signals (SIGINT,
+    // SIGTERM, SIGHUP) and the exit code flow through directly.
+    let err = cmd.exec();
+    std::io::Error::other(format!("execing {}: {err}", bin.display()))
 }
 
 /// Time to wait for the coordinator's control socket to appear after
