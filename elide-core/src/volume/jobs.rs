@@ -201,10 +201,21 @@ pub enum PromoteSegmentPrep {
 /// Produced by [`super::Volume::prepare_sign_snapshot_manifest`] on the actor
 /// thread. The worker enumerates `index/` itself — keeping the
 /// `read_dir` off the actor is the whole point of the offload.
+///
+/// `extent_index` and `lbamap` are snapshot `Arc`s used to filter fully-dead
+/// segments out of the manifest at sign time. A segment is omitted if every
+/// entry in its `.idx` is dead under the liveness predicate (no body still
+/// canonical in `extent_index`, no LBA still mapped to a thin entry's hash).
+/// Reclamation of those segment files remains GC's responsibility — the
+/// filter is a manifest-only optimisation.
 pub struct SignSnapshotManifestJob {
     pub snap_ulid: Ulid,
     pub base_dir: PathBuf,
     pub signer: Arc<dyn segment::SegmentSigner>,
+    pub extent_index: Arc<extentindex::ExtentIndex>,
+    pub lbamap: Arc<crate::lbamap::LbaMap>,
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
 }
 
 /// Result of a [`SignSnapshotManifestJob`]. Consumed by

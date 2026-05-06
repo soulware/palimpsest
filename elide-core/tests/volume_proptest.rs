@@ -17,7 +17,9 @@
 use std::fs;
 use std::path::Path;
 
-use elide_core::volume::Volume;
+use elide_core::segment::EntryKind;
+use elide_core::signing::{self, VOLUME_PUB_FILE, read_snapshot_manifest};
+use elide_core::volume::{Volume, ZERO_HASH};
 use proptest::prelude::*;
 use ulid::Ulid;
 
@@ -72,6 +74,99 @@ fn pick_snap_ulid(fork_dir: &Path) -> Ulid {
         })
         .max()
         .unwrap_or_else(Ulid::new)
+}
+
+/// Cross-check the snapshot manifest's segment list against the volume's
+/// live state: every segment present in `index/` must be either listed in
+/// the manifest *or* fully dead under the liveness predicate, and every
+/// listed segment must in fact be alive.
+///
+/// Mirrors the production filter (`elide_core::actor::live_index_segments`)
+/// against the volume's exposed `lbamap` + `extent_index` so a bug in the
+/// production filter that drops a live segment, or keeps a dead one, will
+/// flag here. Runs after every `SignSnapshot` op.
+fn assert_manifest_filter_correct(
+    fork_dir: &Path,
+    vol: &Volume,
+    snap_ulid: Ulid,
+) -> Result<(), TestCaseError> {
+    let vk = signing::load_verifying_key(fork_dir, VOLUME_PUB_FILE).unwrap();
+    let manifest = match read_snapshot_manifest(fork_dir, &vk, &snap_ulid) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            prop_assert!(false, "manifest read failed: {e}");
+            unreachable!();
+        }
+    };
+    let listed: std::collections::BTreeSet<Ulid> = manifest.segment_ulids.iter().copied().collect();
+
+    let (lbamap, extent_index) = vol.snapshot_maps();
+
+    let index_dir = fork_dir.join("index");
+    let entries = match fs::read_dir(&index_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            prop_assert!(false, "index read failed: {e}");
+            unreachable!();
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Some(stem) = s.strip_suffix(".idx") else {
+            continue;
+        };
+        let Ok(seg_ulid) = Ulid::from_string(stem) else {
+            continue;
+        };
+
+        let Ok((_bss, parsed, _inputs)) =
+            elide_core::segment::read_and_verify_segment_index(&entry.path(), &vk)
+        else {
+            continue;
+        };
+
+        let any_live = parsed.iter().any(|e| match e.kind {
+            EntryKind::Zero => {
+                let end = e.start_lba + e.lba_length as u64;
+                lbamap
+                    .extents_in_range(e.start_lba, end)
+                    .iter()
+                    .any(|r| r.hash == ZERO_HASH)
+            }
+            EntryKind::DedupRef | EntryKind::Delta => {
+                let end = e.start_lba + e.lba_length as u64;
+                lbamap
+                    .extents_in_range(e.start_lba, end)
+                    .iter()
+                    .any(|r| r.hash == e.hash)
+            }
+            EntryKind::Data
+            | EntryKind::Inline
+            | EntryKind::CanonicalData
+            | EntryKind::CanonicalInline => extent_index.lookup(&e.hash).is_some_and(|loc| {
+                loc.segment_id == seg_ulid && loc.body_offset == e.stored_offset
+            }),
+        });
+
+        let is_listed = listed.contains(&seg_ulid);
+        if any_live && !is_listed {
+            prop_assert!(
+                false,
+                "live segment {seg_ulid} missing from manifest {snap_ulid}",
+            );
+        }
+        if !any_live && is_listed {
+            prop_assert!(
+                false,
+                "dead segment {seg_ulid} listed in manifest {snap_ulid}",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Generate 4096 bytes of incompressible data from a seed.
@@ -799,7 +894,7 @@ proptest! {
                     // `all_segment_ulids` does not scan. The segment
                     // ULID set must therefore be identical before/after.
                     let snap_ulid = pick_snap_ulid(fork_dir);
-                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                    let signed = vol.sign_snapshot_manifest(snap_ulid).is_ok();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -812,6 +907,9 @@ proptest! {
                             false,
                             "sign_snapshot_manifest dropped existing ULID {u}"
                         );
+                    }
+                    if signed {
+                        assert_manifest_filter_correct(fork_dir, &vol, snap_ulid)?;
                     }
                 }
                 SimOp::WriteMulti {
@@ -1254,7 +1352,9 @@ proptest! {
                 }
                 SimOp::SignSnapshot => {
                     let snap_ulid = pick_snap_ulid(fork_dir);
-                    let _ = vol.sign_snapshot_manifest(snap_ulid);
+                    if vol.sign_snapshot_manifest(snap_ulid).is_ok() {
+                        assert_manifest_filter_correct(fork_dir, &vol, snap_ulid)?;
+                    }
                 }
                 SimOp::WriteMulti {
                     start_lba,

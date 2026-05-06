@@ -2632,8 +2632,9 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
     Ok(DeltaRepackResult { stats, segments })
 }
 
-/// Execute a snapshot-manifest sign job: enumerate `index/`, Ed25519
-/// sign the manifest, atomic-write it, write the marker last.
+/// Execute a snapshot-manifest sign job: enumerate `index/`, drop
+/// fully-dead segments, Ed25519 sign the manifest, atomic-write it,
+/// write the marker last.
 ///
 /// `snapshots/` is created on demand. A `NotFound` on `index/` is
 /// treated as an empty list — matches the inline behaviour.
@@ -2644,26 +2645,20 @@ pub(crate) fn execute_sign_snapshot_manifest(
         snap_ulid,
         base_dir,
         signer,
+        extent_index,
+        lbamap,
+        verifying_key,
+        segment_cache,
     } = job;
 
     let index_dir = base_dir.join("index");
-    let mut seg_ulids: Vec<Ulid> = Vec::new();
-    match std::fs::read_dir(&index_dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(s) = name.to_str() else { continue };
-                let Some(stem) = s.strip_suffix(".idx") else {
-                    continue;
-                };
-                if let Ok(u) = Ulid::from_string(stem) {
-                    seg_ulids.push(u);
-                }
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    let seg_ulids = live_index_segments(
+        &index_dir,
+        &extent_index,
+        &lbamap,
+        &verifying_key,
+        &segment_cache,
+    )?;
 
     let snapshots_dir = base_dir.join("snapshots");
     std::fs::create_dir_all(&snapshots_dir)?;
@@ -2679,6 +2674,98 @@ pub(crate) fn execute_sign_snapshot_manifest(
     )?;
 
     Ok(SignSnapshotManifestResult { snap_ulid })
+}
+
+/// Enumerate `index/<u>.idx`, drop fully-dead segments, and return the
+/// surviving ULIDs. Used by both [`execute_sign_snapshot_manifest`] and
+/// the in-process [`crate::volume::Volume::snapshot`] path.
+///
+/// A segment is fully dead when no entry in its `.idx` passes the
+/// liveness predicate ([`is_index_entry_live`]). Files are not
+/// removed; reclamation is GC's job. Unparseable filenames are
+/// skipped silently to match the prior enumeration behaviour.
+///
+/// Returns `Ok(Vec::new())` if `index_dir` does not exist.
+pub(crate) fn live_index_segments(
+    index_dir: &std::path::Path,
+    extent_index: &ExtentIndex,
+    lbamap: &LbaMap,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    segment_cache: &crate::segment_cache::SegmentIndexCache,
+) -> io::Result<Vec<Ulid>> {
+    let read_dir = match std::fs::read_dir(index_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut live: Vec<Ulid> = Vec::new();
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Some(stem) = s.strip_suffix(".idx") else {
+            continue;
+        };
+        let Ok(seg_ulid) = Ulid::from_string(stem) else {
+            continue;
+        };
+
+        let parsed = segment_cache.read_and_verify(&entry.path(), verifying_key)?;
+        let any_live = parsed
+            .entries
+            .iter()
+            .any(|e| is_index_entry_live(seg_ulid, e, extent_index, lbamap));
+        if any_live {
+            live.push(seg_ulid);
+        }
+    }
+    Ok(live)
+}
+
+/// Liveness predicate for one entry in an `index/<seg_ulid>.idx`.
+///
+/// - Body-bearing kinds (`Data`, `Inline`, `CanonicalData`,
+///   `CanonicalInline`): live iff the extent index points the entry's
+///   hash at this `(seg_ulid, stored_offset)`. The lowest-ULID-wins
+///   rule means duplicate Data entries in newer segments fail this
+///   check, which is correct: their bodies are unreferenced.
+/// - `DedupRef` and `Delta`: live iff some LBA in
+///   `[start_lba, start_lba + lba_length)` still maps to `entry.hash`
+///   in the lbamap.
+/// - `Zero`: live iff some LBA in range still maps to `ZERO_HASH`.
+///
+/// Conservative: a body whose hash is canonical here but no longer
+/// LBA-referenced anywhere is treated as live. GC's full
+/// classification reclaims those; the snapshot filter does not.
+fn is_index_entry_live(
+    seg_ulid: Ulid,
+    entry: &segment::SegmentEntry,
+    extent_index: &ExtentIndex,
+    lbamap: &LbaMap,
+) -> bool {
+    use segment::EntryKind;
+    match entry.kind {
+        EntryKind::Zero => {
+            let end = entry.start_lba + entry.lba_length as u64;
+            lbamap
+                .extents_in_range(entry.start_lba, end)
+                .iter()
+                .any(|r| r.hash == crate::volume::ZERO_HASH)
+        }
+        EntryKind::DedupRef | EntryKind::Delta => {
+            let end = entry.start_lba + entry.lba_length as u64;
+            lbamap
+                .extents_in_range(entry.start_lba, end)
+                .iter()
+                .any(|r| r.hash == entry.hash)
+        }
+        EntryKind::Data
+        | EntryKind::Inline
+        | EntryKind::CanonicalData
+        | EntryKind::CanonicalInline => extent_index.lookup(&entry.hash).is_some_and(|loc| {
+            loc.segment_id == seg_ulid && loc.body_offset == entry.stored_offset
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
