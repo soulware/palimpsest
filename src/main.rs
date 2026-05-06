@@ -150,7 +150,7 @@ enum CoordCommand {
     /// Start the coordinator as a detached background process.
     ///
     /// Spawns `elide-coordinator serve` in a new session (setsid),
-    /// redirects its stdout/stderr to `<data_dir>/coordinator.log`, and
+    /// redirects its stdout/stderr to `<data_dir>/elide.log`, and
     /// waits for the control socket to come up before returning.
     Start {
         /// Path to the coordinator config file (forwarded to the
@@ -548,15 +548,6 @@ enum ImportSubcommand {
 }
 
 fn main() {
-    tracing_log::LogTracer::init().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-        .ok();
-
     // rustls 0.23 requires a process-level default `CryptoProvider` to be
     // installed before any TLS connection is made. Feature-flag auto-detect
     // fails in our dependency graph (rustls pulled in transitively, not as
@@ -576,6 +567,29 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from("elide_data"));
     let coord = coordinator_client::Client::new(data_dir.join("control.sock"));
     let by_id_dir = data_dir.join("by_id");
+
+    // Initialise tracing. `serve-volume` is a long-lived host process
+    // that shares the unified `<data_dir>/elide.log` with the
+    // coordinator (each writer opens its own fd; concurrent appends
+    // compose). Every other subcommand is short-lived CLI work and
+    // logs to stderr only.
+    match &args.command {
+        Command::ServeVolume { fork_dir, .. } => {
+            // fork_dir is `<data_dir>/by_id/<ulid>/`, so data_dir is two
+            // levels up. Fall back to `data_dir` from the CLI flag if the
+            // path shape is unexpected — init failure should not stop the
+            // volume coming up.
+            let inferred = fork_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| data_dir.clone());
+            if elide_coordinator::log_init::init_with_data_dir(&inferred).is_err() {
+                elide_coordinator::log_init::init_stderr();
+            }
+        }
+        _ => elide_coordinator::log_init::init_stderr(),
+    }
 
     match args.command {
         Command::Volume { command } => match command {
@@ -1244,7 +1258,7 @@ const SIGKILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Spawn `elide-coordinator serve` as a detached background process.
 ///
-/// Stdout/stderr are appended to `<data_dir>/coordinator.log`; the
+/// Stdout/stderr are appended to `<data_dir>/elide.log`; the
 /// child is placed in a new session (setsid) so it survives the parent
 /// shell. We then poll for the control socket to appear, returning
 /// once it accepts connections.
@@ -1270,7 +1284,7 @@ fn coord_start(
     }
 
     let bin = sibling_bin("elide-coordinator");
-    let log_path = data_dir.join("coordinator.log");
+    let log_path = data_dir.join("elide.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

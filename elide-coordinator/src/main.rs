@@ -76,15 +76,6 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    tracing_log::LogTracer::init().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-        .ok();
-
     if let Err(e) = run().await {
         tracing::error!("{e:#}");
         process::exit(1);
@@ -100,6 +91,14 @@ async fn run() -> Result<()> {
             if let Some(dir) = data_dir {
                 config.data_dir = dir;
             }
+            // Initialise tracing now that we know the resolved data_dir.
+            // Coordinator + every volume share `<data_dir>/elide.log`,
+            // each opening it independently. When stderr already points
+            // at the same file (e.g. `elide coord start` redirected the
+            // daemon's stdio there), the tee is suppressed.
+            elide_coordinator::log_init::init_with_data_dir(&config.data_dir).with_context(
+                || format!("initialising tracing in {}", config.data_dir.display()),
+            )?;
             // Refuse to start if another coordinator is already serving
             // this data dir, and write our own pidfile. Removed when
             // `daemon::run` returns (clean shutdown). On panic / kill -9
@@ -157,7 +156,10 @@ async fn run() -> Result<()> {
             let _ = std::fs::remove_file(&pid_path);
             result
         }
-        Command::Init { config, force } => init_config(&config, force),
+        Command::Init { config, force } => {
+            elide_coordinator::log_init::init_stderr();
+            init_config(&config, force)
+        }
     }
 }
 
