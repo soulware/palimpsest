@@ -699,10 +699,10 @@ pub(crate) async fn snapshot_volume(
     //    We run this before sign_snapshot_manifest so that index/ is populated
     //    with every segment up to the flush point.
     match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, &store).await {
-        Ok(r) if r.failed > 0 => {
+        Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
             return Err(IpcError::store(format!(
-                "drain reported {} failed segment(s)",
-                r.failed
+                "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
+                r.upload_failed, r.promote_failed
             )));
         }
         Ok(_) => {}

@@ -731,7 +731,8 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
 /// verifies two things:
 ///
 ///   1. `drain_pending` correctly reports upload failures via
-///      `DrainResult.failed > 0` when the store rejects `put` operations.
+///      `DrainResult.upload_failed > 0` when the store rejects `put`
+///      operations.
 ///
 ///   2. After a failed drain, pending segments are still present in
 ///      `pending/` — they have not been lost.  The next tick can retry
@@ -797,8 +798,8 @@ fn drain_failure_skips_gc_and_data_survives() {
     // --- Tick N: drain fails ---
     //
     // The FailStore rejects all put operations. drain_pending returns
-    // Ok(DrainResult { failed: 1 }), so the daemon sets drain_ok = false
-    // and skips GC for this tick.
+    // Ok(DrainResult { upload_failed: 1, .. }), so the daemon sets
+    // drain_ok = false and skips GC for this tick.
     let fail_store: Arc<dyn ObjectStore> = Arc::new(FailStore);
     let drain_result = rt
         .block_on(upload::drain_pending(
@@ -808,12 +809,13 @@ fn drain_failure_skips_gc_and_data_survives() {
         ))
         .expect("drain_pending itself should not error");
     assert!(
-        drain_result.failed > 0,
-        "expected drain to report upload failure (failed={})",
-        drain_result.failed
+        drain_result.upload_failed > 0,
+        "expected drain to report S3 upload failure (upload_failed={}, promote_failed={})",
+        drain_result.upload_failed,
+        drain_result.promote_failed,
     );
     // drain_ok would be false in the daemon — GC is skipped.
-    let drain_ok = drain_result.failed == 0;
+    let drain_ok = drain_result.upload_failed == 0 && drain_result.promote_failed == 0;
     assert!(
         !drain_ok,
         "drain_ok must be false when uploads fail so GC is skipped"
@@ -842,8 +844,12 @@ fn drain_failure_skips_gc_and_data_survives() {
         ))
         .expect("drain should succeed with good store");
     assert_eq!(
-        drain_result2.failed, 0,
-        "drain should report no failures with good store"
+        drain_result2.upload_failed, 0,
+        "drain should report no upload failures with good store"
+    );
+    assert_eq!(
+        drain_result2.promote_failed, 0,
+        "drain should report no promote failures with good store"
     );
 
     // GC runs after successful drain: pending/ is now empty, all prior

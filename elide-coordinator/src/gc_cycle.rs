@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use object_store::ObjectStore;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::GcConfig;
 use crate::volume_state::IMPORTING_FILE;
@@ -214,12 +214,22 @@ impl GcCycleOrchestrator {
         }
         let volume_id = &self.volume_id;
         match upload::drain_pending(&self.fork_dir, volume_id, &self.store).await {
-            Ok(r) if r.failed > 0 => {
-                error!(
-                    "[drain {volume_id}] {} segment(s) failed to upload; \
-                     skipping GC this tick to preserve ULID ordering invariant",
-                    r.failed
-                );
+            Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
+                if r.upload_failed > 0 {
+                    error!(
+                        "[drain {volume_id}] {} segment(s) failed to upload to S3; \
+                         skipping GC this tick to preserve ULID ordering invariant",
+                        r.upload_failed
+                    );
+                }
+                if r.promote_failed > 0 {
+                    warn!(
+                        "[drain {volume_id}] {} segment(s) uploaded to S3 but volume \
+                         promote IPC unavailable; skipping GC this tick to preserve \
+                         ULID ordering invariant",
+                        r.promote_failed
+                    );
+                }
                 false
             }
             Ok(r) => {
