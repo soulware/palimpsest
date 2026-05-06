@@ -15,13 +15,12 @@ use elide::{
 #[derive(Parser)]
 struct Args {
     /// Directory containing volumes and the coordinator socket.
-    #[arg(
-        long,
-        env = "ELIDE_DATA_DIR",
-        default_value = "elide_data",
-        global = true
-    )]
-    data_dir: PathBuf,
+    /// When unset, defaults to `elide_data` for non-coord commands;
+    /// `coord run`/`start`/`stop` instead consult `--config` (if given)
+    /// and fall back to `elide_data` only when neither is provided, so
+    /// the value in `coordinator.toml` is honoured.
+    #[arg(long, env = "ELIDE_DATA_DIR", global = true)]
+    data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -170,6 +169,11 @@ enum CoordCommand {
         /// Leave volume children running (rolling-upgrade path).
         #[arg(long)]
         keep_volumes: bool,
+        /// Path to the coordinator config file. Used to resolve the
+        /// data_dir (and thus the control socket) when `--data-dir`
+        /// is not given. Falls back to `elide_data` if neither is set.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Run the coordinator in the foreground.
@@ -563,8 +567,15 @@ fn main() {
 
     let args = Args::parse();
 
-    let coord = coordinator_client::Client::new(args.data_dir.join("control.sock"));
-    let by_id_dir = args.data_dir.join("by_id");
+    // Concrete data_dir for non-coord commands: CLI flag (or env) wins,
+    // otherwise fall back to `elide_data`. The coord subcommands use
+    // their own resolution that also considers `--config`.
+    let cli_data_dir = args.data_dir.clone();
+    let data_dir = cli_data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("elide_data"));
+    let coord = coordinator_client::Client::new(data_dir.join("control.sock"));
+    let by_id_dir = data_dir.join("by_id");
 
     match args.command {
         Command::Volume { command } => match command {
@@ -576,14 +587,14 @@ fn main() {
                 } else {
                     ListFilter::All
                 };
-                if let Err(e) = list_volumes(&args.data_dir, &coord, filter, all) {
+                if let Err(e) = list_volumes(&data_dir, &coord, filter, all) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
 
             VolumeCommand::Info { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                let vol_dir = resolve_volume_dir(&data_dir, &name);
                 if let Err(e) = inspect::run(&vol_dir, &by_id_dir) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -591,7 +602,7 @@ fn main() {
             }
 
             VolumeCommand::Verify { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                let vol_dir = resolve_volume_dir(&data_dir, &name);
                 match verify::run(&vol_dir) {
                     Ok(counts) if counts.mismatches == 0 && counts.scan_errors == 0 => {}
                     Ok(counts) if counts.mismatches > 0 => std::process::exit(1),
@@ -604,7 +615,7 @@ fn main() {
             }
 
             VolumeCommand::Ls { name, path } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                let vol_dir = resolve_volume_dir(&data_dir, &name);
                 if let Err(e) = ls::run(&vol_dir, &path) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -649,7 +660,7 @@ fn main() {
                         nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
                     );
                     if let Err(e) = create_fork(
-                        &args.data_dir,
+                        &data_dir,
                         &name,
                         from,
                         &coord,
@@ -689,8 +700,8 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let by_name = args.data_dir.join("by_name").join(&name);
-                    let by_id = args.data_dir.join("by_id").join(&ulid);
+                    let by_name = data_dir.join("by_name").join(&name);
+                    let by_id = data_dir.join("by_id").join(&ulid);
                     println!("{}", by_name.display());
                     println!("{}", by_id.display());
                 }
@@ -828,7 +839,7 @@ fn main() {
                         // Optionally create a fork immediately after import.
                         if let Some(fork_name) = import_args.fork
                             && let Err(e) = create_fork(
-                                &args.data_dir,
+                                &data_dir,
                                 &fork_name,
                                 &name,
                                 &coord,
@@ -895,7 +906,7 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                } else if let Some(vol_ulid) = resolve_local_volume_ulid(&args.data_dir, &name) {
+                } else if let Some(vol_ulid) = resolve_local_volume_ulid(&data_dir, &name) {
                     // Plain start. Common case: volume was claimed and
                     // started before, prefetch is long done — quick probe
                     // returns Ok instantly and we stay silent. Edge case:
@@ -1133,19 +1144,32 @@ fn main() {
 
         Command::Coord { command } => match command {
             CoordCommand::Start { config } => {
-                if let Err(e) = coord_start(&args.data_dir, config.as_deref()) {
+                let result = resolve_coord_data_dir(cli_data_dir.as_deref(), config.as_deref())
+                    .and_then(|dd| coord_start(&dd, cli_data_dir.as_deref(), config.as_deref()));
+                if let Err(e) = result {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
-            CoordCommand::Stop { keep_volumes } => {
-                if let Err(e) = coord_stop(&coord, &args.data_dir, keep_volumes) {
+            CoordCommand::Stop {
+                keep_volumes,
+                config,
+            } => {
+                let result = resolve_coord_data_dir(cli_data_dir.as_deref(), config.as_deref())
+                    .and_then(|dd| {
+                        let coord = coordinator_client::Client::new(dd.join("control.sock"));
+                        coord_stop(&coord, &dd, keep_volumes)
+                    });
+                if let Err(e) = result {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
             CoordCommand::Run { config } => {
-                let e = coord_run(&args.data_dir, config.as_deref());
+                // coord_run execs the coordinator and lets it own
+                // data_dir resolution from --config. We only forward
+                // --data-dir when the user explicitly set it.
+                let e = coord_run(cli_data_dir.as_deref(), config.as_deref());
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -1153,16 +1177,40 @@ fn main() {
     }
 }
 
+/// Resolve the data_dir for `coord` subcommands: explicit `--data-dir`
+/// (or `ELIDE_DATA_DIR`) wins, otherwise parse `--config` to read its
+/// `data_dir` field, otherwise fall back to `elide_data`. This mirrors
+/// the precedence used inside the coordinator itself, so the CLI and
+/// the daemon always agree on which directory holds the pidfile,
+/// socket, and per-volume state.
+fn resolve_coord_data_dir(cli: Option<&Path>, config: Option<&Path>) -> std::io::Result<PathBuf> {
+    if let Some(dd) = cli {
+        return Ok(dd.to_owned());
+    }
+    if let Some(cfg) = config {
+        let parsed = elide_coordinator::config::load(cfg)
+            .map_err(|e| std::io::Error::other(format!("loading {}: {e:#}", cfg.display())))?;
+        return Ok(parsed.data_dir);
+    }
+    Ok(PathBuf::from("elide_data"))
+}
+
 /// Exec the sibling `elide-coordinator serve` with stdio inherited.
 /// Returns only on failure — on success, exec replaces this process so
 /// signals and exit status flow directly through the coordinator.
-fn coord_run(data_dir: &Path, config: Option<&Path>) -> std::io::Error {
+fn coord_run(cli_data_dir: Option<&Path>, config: Option<&Path>) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     let bin = sibling_bin("elide-coordinator");
     let mut cmd = Command::new(&bin);
-    cmd.arg("serve").arg("--data-dir").arg(data_dir);
+    cmd.arg("serve");
+    // Only forward --data-dir if the user explicitly set it; otherwise
+    // let the coordinator's config loader own the default so the
+    // `data_dir` field in coordinator.toml is honoured.
+    if let Some(dd) = cli_data_dir {
+        cmd.arg("--data-dir").arg(dd);
+    }
     if let Some(cfg) = config {
         cmd.arg("--config").arg(cfg);
     }
@@ -1188,7 +1236,11 @@ const COORD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// child is placed in a new session (setsid) so it survives the parent
 /// shell. We then poll for the control socket to appear, returning
 /// once it accepts connections.
-fn coord_start(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
+fn coord_start(
+    data_dir: &Path,
+    cli_data_dir: Option<&Path>,
+    config: Option<&Path>,
+) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -1215,7 +1267,13 @@ fn coord_start(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
     let log_clone = log_file.try_clone()?;
 
     let mut cmd = Command::new(&bin);
-    cmd.arg("serve").arg("--data-dir").arg(data_dir);
+    cmd.arg("serve");
+    // Only forward --data-dir if the user explicitly set it; otherwise
+    // let the coordinator resolve from --config (or its own default)
+    // so the `data_dir` field in coordinator.toml is honoured.
+    if let Some(dd) = cli_data_dir {
+        cmd.arg("--data-dir").arg(dd);
+    }
     if let Some(cfg) = config {
         cmd.arg("--config").arg(cfg);
     }
