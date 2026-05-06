@@ -256,6 +256,18 @@ pub enum Request {
     /// the caller doesn't have to remember the freshly-minted fork
     /// ULID across reconnects.
     ClaimAttach { volume: String },
+
+    // ── Coordinator lifecycle ────────────────────────────────────────
+    /// Request the coordinator to shut down. Replies `Ok(())` once the
+    /// signal has been queued; the coordinator process exits shortly
+    /// after the reply is written. With `keep_volumes = false` the
+    /// coordinator SIGTERMs its volume children before exiting (the
+    /// default teardown). With `keep_volumes = true` the children are
+    /// left running for a rolling-upgrade restart.
+    Shutdown {
+        #[serde(default)]
+        keep_volumes: bool,
+    },
 }
 
 /// Source spec for [`Request::ForkStart`]. Mirrors the CLI's

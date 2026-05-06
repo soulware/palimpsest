@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use elide_core::volume::ReadonlyVolume;
 
@@ -196,7 +196,9 @@ fn block_shutdown_signals() -> io::Result<()> {
 ///      actor accepted before this call is durable.
 ///   3. Log the final peer-fetch counter snapshot (no-op when
 ///      peer-fetch was disabled for this run).
-///   4. `process::exit(0)`.
+///   4. `_exit(0)` (direct exit_group; bypasses libc atexit handlers
+///      so a destroyed-pty stdio fd inherited from Ctrl-C'd `coord run`
+///      cannot wedge stdio flush during shutdown).
 ///
 /// signalfd is Linux-only; on other Unix targets this is a no-op
 /// (returns an empty join handle).
@@ -215,11 +217,16 @@ fn spawn_nbd_signal_watcher(
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         error!("nbd-signal: signalfd read returned None on a blocking fd");
-                        std::process::exit(130);
+                        // SAFETY: _exit is async-signal-safe and never returns.
+                        // We deliberately use _exit (direct exit_group) rather
+                        // than process::exit so libc atexit handlers — stdio
+                        // flush in particular — cannot deadlock on a destroyed
+                        // pty fd inherited from a Ctrl-C'd `coord run`.
+                        unsafe { libc::_exit(130) };
                     }
                     Err(e) => {
                         error!("nbd-signal: signalfd read failed: {e}");
-                        std::process::exit(130);
+                        unsafe { libc::_exit(130) };
                     }
                 }
 
@@ -231,14 +238,14 @@ fn spawn_nbd_signal_watcher(
                             "nbd shutdown flush did not complete within {:?}; exiting anyway",
                             NBD_SHUTDOWN_FLUSH_TIMEOUT
                         );
-                        std::process::exit(0);
+                        unsafe { libc::_exit(0) };
                     });
 
                 if let Err(e) = client.flush() {
                     warn!("nbd shutdown flush: {e}");
                 }
                 crate::log_peer_fetch_counters_at_shutdown(peer_counters.as_ref());
-                std::process::exit(0);
+                unsafe { libc::_exit(0) };
             })
             .map_err(io::Error::other)
     }
@@ -694,33 +701,27 @@ pub fn run_volume_signed(
         NbdBind::Tcp { bind, port } => {
             let l = TcpListener::bind(format!("{}:{}", bind, port))?;
             let addr = l.local_addr()?;
-            println!("NBD volume server on {}", addr);
-            println!(
-                "Volume: {} ({:.1} MB)",
+            info!(
+                "NBD volume server on {} — volume {} ({:.1} MB); \
+                 connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                addr,
                 dir.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 addr.ip(),
                 addr.port()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Tcp(l)
         }
         NbdBind::Unix(path) => {
             let _ = std::fs::remove_file(&path);
             let l = UnixListener::bind(&path)?;
-            println!(
-                "NBD volume server on {} ({:.1} MB)",
+            info!(
+                "NBD volume server on {} ({:.1} MB); \
+                 connect with: sudo nbd-client -u {} -N export /dev/nbdX",
                 path.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client -u {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 path.display()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Unix(l)
         }
     };
@@ -747,33 +748,27 @@ pub fn run_volume_readonly(
         NbdBind::Tcp { bind, port } => {
             let l = TcpListener::bind(format!("{}:{}", bind, port))?;
             let addr = l.local_addr()?;
-            println!("NBD readonly volume server on {}", addr);
-            println!(
-                "Volume: {} ({:.1} MB)  [read-only]",
+            info!(
+                "NBD readonly volume server on {} — volume {} ({:.1} MB) [read-only]; \
+                 connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                addr,
                 dir.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client {} {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 addr.ip(),
                 addr.port()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Tcp(l)
         }
         NbdBind::Unix(path) => {
             let _ = std::fs::remove_file(&path);
             let l = UnixListener::bind(&path)?;
-            println!(
-                "NBD readonly volume server on {} ({:.1} MB)  [read-only]",
+            info!(
+                "NBD readonly volume server on {} ({:.1} MB) [read-only]; \
+                 connect with: sudo nbd-client -u {} -N export /dev/nbdX",
                 path.display(),
-                size_bytes as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "Connect with: sudo nbd-client -u {} -N export /dev/nbdX",
+                size_bytes as f64 / (1024.0 * 1024.0),
                 path.display()
             );
-            println!("Waiting for connection...\n");
             NbdListener::Unix(l)
         }
     };

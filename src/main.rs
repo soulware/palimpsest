@@ -15,13 +15,12 @@ use elide::{
 #[derive(Parser)]
 struct Args {
     /// Directory containing volumes and the coordinator socket.
-    #[arg(
-        long,
-        env = "ELIDE_DATA_DIR",
-        default_value = "elide_data",
-        global = true
-    )]
-    data_dir: PathBuf,
+    /// When unset, defaults to `elide_data` for non-coord commands;
+    /// `coord run`/`start`/`stop` instead consult `--config` (if given)
+    /// and fall back to `elide_data` only when neither is provided, so
+    /// the value in `coordinator.toml` is honoured.
+    #[arg(long, env = "ELIDE_DATA_DIR", global = true)]
+    data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -137,6 +136,58 @@ enum Command {
     Ublk {
         #[command(subcommand)]
         command: UblkCommand,
+    },
+
+    /// Manage the coordinator daemon (start, stop)
+    Coord {
+        #[command(subcommand)]
+        command: CoordCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoordCommand {
+    /// Start the coordinator as a detached background process.
+    ///
+    /// Spawns `elide-coordinator serve` in a new session (setsid),
+    /// redirects its stdout/stderr to `<data_dir>/elide.log`, and
+    /// waits for the control socket to come up before returning.
+    Start {
+        /// Path to the coordinator config file (forwarded to the
+        /// daemon). Defaults to `coordinator.toml` in the daemon's
+        /// working directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Stop the coordinator. By default, also terminates managed volume
+    /// processes. With `--keep-volumes`, the coordinator exits but its
+    /// volume children continue running detached — used for rolling
+    /// upgrades where the coordinator is being replaced without
+    /// disturbing live volumes.
+    Stop {
+        /// Leave volume children running (rolling-upgrade path).
+        #[arg(long)]
+        keep_volumes: bool,
+        /// Path to the coordinator config file. Used to resolve the
+        /// data_dir (and thus the control socket) when `--data-dir`
+        /// is not given. Falls back to `elide_data` if neither is set.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Run the coordinator in the foreground.
+    ///
+    /// Thin wrapper that execs the sibling `elide-coordinator serve`
+    /// binary with stdio inherited. Use this as the `ExecStart` for a
+    /// `Type=simple` systemd unit, or for interactive debugging.
+    /// Signals reach the coordinator directly; both SIGINT and SIGTERM
+    /// trigger the defensive shutdown (volumes left running).
+    Run {
+        /// Path to the coordinator config file. Defaults to
+        /// `coordinator.toml` in the working directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -497,15 +548,6 @@ enum ImportSubcommand {
 }
 
 fn main() {
-    tracing_log::LogTracer::init().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-        .ok();
-
     // rustls 0.23 requires a process-level default `CryptoProvider` to be
     // installed before any TLS connection is made. Feature-flag auto-detect
     // fails in our dependency graph (rustls pulled in transitively, not as
@@ -516,8 +558,40 @@ fn main() {
 
     let args = Args::parse();
 
-    let coord = coordinator_client::Client::new(args.data_dir.join("control.sock"));
-    let by_id_dir = args.data_dir.join("by_id");
+    // Concrete data_dir for non-coord commands: CLI flag (or env) wins,
+    // otherwise fall back to `elide_data`. The coord subcommands use
+    // their own resolution that also considers `--config`.
+    let cli_data_dir = args.data_dir.clone();
+    let data_dir = cli_data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("elide_data"));
+    let coord = coordinator_client::Client::new(data_dir.join("control.sock"));
+    let by_id_dir = data_dir.join("by_id");
+
+    // Initialise tracing. `serve-volume` is a long-lived host process
+    // that shares the unified `<data_dir>/elide.log` with the
+    // coordinator (each writer opens its own fd; concurrent appends
+    // compose). It also tees through the coord-side log relay socket
+    // so live output reaches whichever coord is currently attached
+    // to the operator's terminal. Every other subcommand is
+    // short-lived CLI work and logs to stderr only.
+    match &args.command {
+        Command::ServeVolume { fork_dir, .. } => {
+            // fork_dir is `<data_dir>/by_id/<ulid>/`, so data_dir is two
+            // levels up. Fall back to `data_dir` from the CLI flag if the
+            // path shape is unexpected — init failure should not stop the
+            // volume coming up.
+            let inferred = fork_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| data_dir.clone());
+            if elide_coordinator::log_init::init_for_volume(&inferred).is_err() {
+                elide_coordinator::log_init::init_stderr();
+            }
+        }
+        _ => elide_coordinator::log_init::init_stderr(),
+    }
 
     match args.command {
         Command::Volume { command } => match command {
@@ -529,14 +603,14 @@ fn main() {
                 } else {
                     ListFilter::All
                 };
-                if let Err(e) = list_volumes(&args.data_dir, &coord, filter, all) {
+                if let Err(e) = list_volumes(&data_dir, &coord, filter, all) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
 
             VolumeCommand::Info { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                let vol_dir = resolve_volume_dir(&data_dir, &name);
                 if let Err(e) = inspect::run(&vol_dir, &by_id_dir) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -544,7 +618,7 @@ fn main() {
             }
 
             VolumeCommand::Verify { name } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                let vol_dir = resolve_volume_dir(&data_dir, &name);
                 match verify::run(&vol_dir) {
                     Ok(counts) if counts.mismatches == 0 && counts.scan_errors == 0 => {}
                     Ok(counts) if counts.mismatches > 0 => std::process::exit(1),
@@ -557,7 +631,7 @@ fn main() {
             }
 
             VolumeCommand::Ls { name, path } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                let vol_dir = resolve_volume_dir(&data_dir, &name);
                 if let Err(e) = ls::run(&vol_dir, &path) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -602,7 +676,7 @@ fn main() {
                         nbd_port, nbd_bind, nbd_socket, false, ublk, ublk_id, false,
                     );
                     if let Err(e) = create_fork(
-                        &args.data_dir,
+                        &data_dir,
                         &name,
                         from,
                         &coord,
@@ -642,8 +716,8 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let by_name = args.data_dir.join("by_name").join(&name);
-                    let by_id = args.data_dir.join("by_id").join(&ulid);
+                    let by_name = data_dir.join("by_name").join(&name);
+                    let by_id = data_dir.join("by_id").join(&ulid);
                     println!("{}", by_name.display());
                     println!("{}", by_id.display());
                 }
@@ -781,7 +855,7 @@ fn main() {
                         // Optionally create a fork immediately after import.
                         if let Some(fork_name) = import_args.fork
                             && let Err(e) = create_fork(
-                                &args.data_dir,
+                                &data_dir,
                                 &fork_name,
                                 &name,
                                 &coord,
@@ -848,7 +922,7 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                } else if let Some(vol_ulid) = resolve_local_volume_ulid(&args.data_dir, &name) {
+                } else if let Some(vol_ulid) = resolve_local_volume_ulid(&data_dir, &name) {
                     // Plain start. Common case: volume was claimed and
                     // started before, prefetch is long done — quick probe
                     // returns Ok instantly and we stay silent. Edge case:
@@ -1083,7 +1157,379 @@ fn main() {
                 }
             }
         },
+
+        Command::Coord { command } => match command {
+            CoordCommand::Start { config } => {
+                let result = resolve_coord_data_dir(cli_data_dir.as_deref(), config.as_deref())
+                    .and_then(|dd| coord_start(&dd, cli_data_dir.as_deref(), config.as_deref()));
+                if let Err(e) = result {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            CoordCommand::Stop {
+                keep_volumes,
+                config,
+            } => {
+                let result = resolve_coord_data_dir(cli_data_dir.as_deref(), config.as_deref())
+                    .and_then(|dd| {
+                        let coord = coordinator_client::Client::new(dd.join("control.sock"));
+                        coord_stop(&coord, &dd, keep_volumes)
+                    });
+                if let Err(e) = result {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            CoordCommand::Run { config } => {
+                // coord_run execs the coordinator and lets it own
+                // data_dir resolution from --config. We only forward
+                // --data-dir when the user explicitly set it.
+                let e = coord_run(cli_data_dir.as_deref(), config.as_deref());
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
     }
+}
+
+/// Resolve the data_dir for `coord` subcommands: explicit `--data-dir`
+/// (or `ELIDE_DATA_DIR`) wins, otherwise parse `--config` to read its
+/// `data_dir` field, otherwise fall back to `elide_data`. This mirrors
+/// the precedence used inside the coordinator itself, so the CLI and
+/// the daemon always agree on which directory holds the pidfile,
+/// socket, and per-volume state.
+fn resolve_coord_data_dir(cli: Option<&Path>, config: Option<&Path>) -> std::io::Result<PathBuf> {
+    if let Some(dd) = cli {
+        return Ok(dd.to_owned());
+    }
+    if let Some(cfg) = config {
+        let parsed = elide_coordinator::config::load(cfg)
+            .map_err(|e| std::io::Error::other(format!("loading {}: {e:#}", cfg.display())))?;
+        return Ok(parsed.data_dir);
+    }
+    Ok(PathBuf::from("elide_data"))
+}
+
+/// Exec the sibling `elide-coordinator serve` with stdio inherited.
+/// Returns only on failure — on success, exec replaces this process so
+/// signals and exit status flow directly through the coordinator.
+fn coord_run(cli_data_dir: Option<&Path>, config: Option<&Path>) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let bin = sibling_bin("elide-coordinator");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve");
+    // Only forward --data-dir if the user explicitly set it; otherwise
+    // let the coordinator's config loader own the default so the
+    // `data_dir` field in coordinator.toml is honoured.
+    if let Some(dd) = cli_data_dir {
+        cmd.arg("--data-dir").arg(dd);
+    }
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    // exec() returns only on failure; the success path replaces this
+    // process image with the coordinator's, so signals (SIGINT,
+    // SIGTERM, SIGHUP) and the exit code flow through directly.
+    let err = cmd.exec();
+    std::io::Error::other(format!("execing {}: {err}", bin.display()))
+}
+
+/// Time to wait for the coordinator's control socket to appear after
+/// `coord start` spawns the daemon.
+const COORD_START_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Time to wait for the coordinator to exit after `coord stop` sends
+/// the Shutdown IPC. Generous because full teardown waits for volume
+/// children to exit (10s SIGTERM grace + drain).
+const COORD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// In the direct-teardown fallback, how long to give a volume child to
+/// react to SIGTERM (graceful flush + exit) before escalating to
+/// SIGKILL. The ublk transport's signal watcher caps its own flush at
+/// 3s, so 10s is well past the worst legitimate case.
+const SIGTERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// After SIGKILL, how long to wait for the kernel to actually reap the
+/// process before giving up. SIGKILL can't be blocked, so anything
+/// past this is a kernel-side stuck process (e.g. D-state on broken
+/// I/O) that no supervisor can clean up.
+const SIGKILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Spawn `elide-coordinator serve` as a detached background process.
+///
+/// Stdout/stderr are appended to `<data_dir>/elide.log`; the
+/// child is placed in a new session (setsid) so it survives the parent
+/// shell. We then poll for the control socket to appear, returning
+/// once it accepts connections.
+fn coord_start(
+    data_dir: &Path,
+    cli_data_dir: Option<&Path>,
+    config: Option<&Path>,
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        std::io::Error::other(format!("creating data dir {}: {e}", data_dir.display()))
+    })?;
+    let pid_path = data_dir.join("coordinator.pid");
+    if let Ok(text) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && elide_core::process::pid_is_alive(pid)
+    {
+        return Err(std::io::Error::other(format!(
+            "coordinator already running (pid {pid})"
+        )));
+    }
+
+    let bin = sibling_bin("elide-coordinator");
+    let log_path = data_dir.join("elide.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| std::io::Error::other(format!("opening {}: {e}", log_path.display())))?;
+    let log_clone = log_file.try_clone()?;
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve");
+    // Only forward --data-dir if the user explicitly set it; otherwise
+    // let the coordinator resolve from --config (or its own default)
+    // so the `data_dir` field in coordinator.toml is honoured.
+    if let Some(dd) = cli_data_dir {
+        cmd.arg("--data-dir").arg(dd);
+    }
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_clone));
+    // Detach from the parent's session so the daemon survives the shell.
+    // pre_exec runs between fork() and exec(); setsid() is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| std::io::Error::other(format!("spawning {}: {e}", bin.display())))?;
+    let child_pid = child.id();
+
+    let socket_path = data_dir.join("control.sock");
+    let deadline = std::time::Instant::now() + COORD_START_WAIT;
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            println!(
+                "coordinator started (pid {child_pid}, socket {})",
+                socket_path.display()
+            );
+            return Ok(());
+        }
+        // Detect early exit: try_wait reaps the zombie if the daemon
+        // already exited. pid_is_alive returns true for zombies (the
+        // process entry exists until the parent waits), which would
+        // mask early failures until our deadline expires.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(std::io::Error::other(format!(
+                "coordinator exited before becoming ready ({status}); see {}",
+                log_path.display()
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "timed out waiting for control socket {}; see {}",
+                socket_path.display(),
+                log_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Send the `Shutdown` IPC and poll until the coordinator process actually
+/// exits (socket disappears / pidfile pid stops responding).
+///
+/// When the coordinator is *not* running, falls back to a direct
+/// per-volume teardown: walks `<data_dir>/by_id/*/`, SIGTERMs every
+/// `volume.pid` and `import.pid` it finds, and waits for them to exit.
+/// This makes `coord stop` the universal "clean up after me" verb,
+/// covering both the dev workflow (Ctrl+C'd a foreground `coord run`,
+/// orphans left behind) and post-crash cleanup. With `--keep-volumes`
+/// the fallback is a no-op since "coordinator gone, volumes running"
+/// is already the desired state.
+fn coord_stop(
+    coord: &coordinator_client::Client,
+    data_dir: &Path,
+    keep_volumes: bool,
+) -> std::io::Result<()> {
+    if !coord.is_reachable() {
+        if keep_volumes {
+            println!(
+                "coordinator not running ({}); volumes left running",
+                coord.socket_path().display()
+            );
+            return Ok(());
+        }
+        return fallback_stop_volumes(data_dir);
+    }
+    coord.shutdown(keep_volumes)?;
+
+    let pid_path = data_dir.join("coordinator.pid");
+    let pid = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let deadline = std::time::Instant::now() + COORD_STOP_WAIT;
+    loop {
+        let still_alive = match pid {
+            Some(p) => elide_core::process::pid_is_alive(p),
+            None => coord.is_reachable(),
+        };
+        if !still_alive {
+            println!(
+                "coordinator stopped{}",
+                if keep_volumes {
+                    " (volumes left running)"
+                } else {
+                    ""
+                }
+            );
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "coordinator did not exit within {COORD_STOP_WAIT:?}"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Direct teardown of every running volume + import process under
+/// `<data_dir>/by_id/*/` when the coordinator socket is unreachable.
+/// Reads each `volume.pid` / `import.pid`, SIGTERMs the live ones, and
+/// polls until they exit or the wait budget expires.
+fn fallback_stop_volumes(data_dir: &Path) -> std::io::Result<()> {
+    let by_id = data_dir.join("by_id");
+    let entries = match std::fs::read_dir(&by_id) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("no volume processes to stop ({} absent)", by_id.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut pids: Vec<(u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for filename in &["volume.pid", "import.pid"] {
+            let pid_path = dir.join(filename);
+            let Ok(text) = std::fs::read_to_string(&pid_path) else {
+                continue;
+            };
+            let Ok(pid) = text.trim().parse::<u32>() else {
+                continue;
+            };
+            if !elide_core::process::pid_is_alive(pid) {
+                continue;
+            }
+            let Ok(raw) = i32::try_from(pid) else {
+                continue;
+            };
+            let label = format!("{filename}={pid} in {}", dir.display());
+            // SAFETY: libc::kill takes a pid + signal; the kernel checks
+            // permission and existence. SIGTERM has no observable
+            // side-effect on this process.
+            if unsafe { libc::kill(raw, libc::SIGTERM) } != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("SIGTERM {label}: {err}");
+                continue;
+            }
+            println!("SIGTERM {label}");
+            pids.push((pid, label));
+        }
+    }
+
+    if pids.is_empty() {
+        println!("no volume processes to stop");
+        return Ok(());
+    }
+
+    // Phase 1: wait up to SIGTERM_GRACE for graceful exit.
+    let term_deadline = std::time::Instant::now() + SIGTERM_GRACE;
+    let mut survivors = wait_for_exit(&pids, term_deadline);
+    if survivors.is_empty() {
+        println!("all volume processes stopped");
+        return Ok(());
+    }
+
+    // Phase 2: anything still alive after SIGTERM_GRACE gets SIGKILL.
+    // The volume's ublk/NBD signal watcher caps its own flush at 3s,
+    // so anything past SIGTERM_GRACE is a wedged process the operator
+    // wants gone. Mirrors `systemctl stop`'s TimeoutStopSec → SIGKILL.
+    for (pid, label) in &survivors {
+        let Ok(raw) = i32::try_from(*pid) else {
+            continue;
+        };
+        // SAFETY: libc::kill takes a pid + signal; the kernel checks
+        // permission and existence. SIGKILL cannot be caught or
+        // blocked, so this either succeeds or returns ESRCH.
+        if unsafe { libc::kill(raw, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("SIGKILL {label}: {err}");
+            continue;
+        }
+        println!("SIGKILL {label} (did not exit within {SIGTERM_GRACE:?})");
+    }
+
+    let kill_deadline = std::time::Instant::now() + SIGKILL_WAIT;
+    survivors = wait_for_exit(&survivors, kill_deadline);
+    if survivors.is_empty() {
+        println!("all volume processes stopped");
+        return Ok(());
+    }
+    let labels: Vec<&str> = survivors.iter().map(|(_, l)| l.as_str()).collect();
+    Err(std::io::Error::other(format!(
+        "{n} process(es) still alive after SIGKILL+{SIGKILL_WAIT:?}: {labels:?}",
+        n = survivors.len()
+    )))
+}
+
+/// Wait until `deadline` for every pid in `pids` to exit; return the
+/// ones still alive when the wait expires. Polls at 100ms intervals.
+fn wait_for_exit(pids: &[(u32, String)], deadline: std::time::Instant) -> Vec<(u32, String)> {
+    loop {
+        let still: Vec<(u32, String)> = pids
+            .iter()
+            .filter(|(p, _)| elide_core::process::pid_is_alive(*p))
+            .cloned()
+            .collect();
+        if still.is_empty() || std::time::Instant::now() >= deadline {
+            return still;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Locate a sibling binary alongside the running `elide` executable.
+/// Falls back to PATH lookup if the current exe path can't be resolved.
+fn sibling_bin(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 enum ListFilter {

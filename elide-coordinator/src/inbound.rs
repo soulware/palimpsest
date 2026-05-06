@@ -407,6 +407,15 @@ async fn dispatch_json(
         Request::ClaimAttach { volume } => {
             stream_claim_by_name(&volume, writer, &ctx.claim_registry).await;
         }
+        Request::Shutdown { keep_volumes } => {
+            // Reply ok first, then trigger the signal: the daemon's
+            // main-loop teardown aborts the inbound listener task, but
+            // the per-connection handler running this code is detached
+            // and gets to flush its reply before the runtime stops.
+            let env: Envelope<()> = Envelope::ok(());
+            let _ = ipc::write_message(writer, &env).await;
+            crate::shutdown::trigger(keep_volumes);
+        }
     }
 }
 

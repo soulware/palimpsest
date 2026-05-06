@@ -249,6 +249,16 @@ impl Client {
             .map_err(io::Error::other)
     }
 
+    /// Request the coordinator to shut down. Returns once the
+    /// coordinator has acknowledged the request; the caller polls
+    /// [`Self::is_reachable`] to detect actual exit. With
+    /// `keep_volumes = true` the coordinator leaves its volume children
+    /// running for a rolling-upgrade restart.
+    pub fn shutdown(&self, keep_volumes: bool) -> io::Result<()> {
+        self.call_typed::<()>(&Request::Shutdown { keep_volumes })?
+            .map_err(io::Error::other)
+    }
+
     /// Query the running state of a named volume.
     pub fn status(&self, volume: &str) -> io::Result<StatusReply> {
         self.call_typed(&Request::Status {

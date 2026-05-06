@@ -9,12 +9,17 @@
 //         `elide serve-volume`
 //   - The first scan fires immediately at startup to clear any backlog and
 //     adopt any volume processes already running.
-//   - Shutdown on Ctrl+C: all tasks are aborted and then drained with a
-//     bounded timeout so cancellation propagates while the tokio runtime is
-//     still healthy. Skipping the drain can panic the time driver if a task
-//     (e.g. an `object_store` retry mid-backoff) registers a `tokio::time`
-//     timer after runtime shutdown begins. Volume processes are detached
-//     (setsid) and continue running after the coordinator exits.
+//   - Shutdown: SIGINT and SIGTERM both run the defensive teardown — abort
+//     coordinator tasks and drain the JoinSet, but leave volume children
+//     running. Volumes are spawned with setsid so they survive the
+//     coordinator's exit and are re-adopted by the next coordinator
+//     instance. The drain has a bounded timeout so cancellation propagates
+//     while the tokio runtime is still healthy; skipping it can panic the
+//     time driver if a task (e.g. an `object_store` retry mid-backoff)
+//     registers a `tokio::time` timer after runtime shutdown begins.
+//     Full teardown (SIGTERM the volume children) is reachable only via
+//     the explicit `Shutdown { keep_volumes: false }` IPC sent by
+//     `elide coord stop`.
 //
 // Directory layout expected:
 //   <data_dir>/by_id/<ulid>/    — one directory per volume (ULID name = S3 prefix)
@@ -261,6 +266,17 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // Consume the first tick so the loop body runs immediately at startup.
     scan_tick.tick().await;
 
+    // Defensive signal policy: SIGINT and SIGTERM both leave the volume
+    // children running (the rolling-upgrade path). Volumes are expensive
+    // state — mounted devices, in-flight I/O, populated caches — and a
+    // coordinator going down for any reason (panic, OOM, supervisor
+    // bounce, `systemctl restart`) must not drag the data plane with
+    // it. The "tear down volumes too" path is the explicit
+    // `Shutdown { keep_volumes: false }` IPC sent by `elide coord stop`.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+
     loop {
         // Prune volumes that have been deleted since we last saw them so that
         // if the same ULID directory is recreated (e.g. by `volume remote pull`
@@ -394,17 +410,46 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         // Reap any tasks that have exited (e.g. fork directory removed).
         while tasks.try_join_next().is_some() {}
 
+        // Whether shutdown was requested, and whether to leave volume
+        // children running. `Some(true)` is the rolling-upgrade path
+        // (skip the SIGTERM step); `Some(false)` is the full teardown.
+        let mut keep_volumes: Option<bool> = None;
         tokio::select! {
             _ = scan_tick.tick() => {}
             _ = crate::rescan::wait() => {
                 info!("[coordinator] rescan triggered via socket");
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("[coordinator] shutting down (foreground mode)");
-                // Abort supervisor and drain tasks first so they cannot
-                // interfere with or restart processes we are about to stop.
-                tasks.abort_all();
+            _ = sigint.recv() => {
+                info!("[coordinator] shutting down (SIGINT, keep_volumes)");
+                keep_volumes = Some(true);
+            }
+            _ = sigterm.recv() => {
+                info!("[coordinator] shutting down (SIGTERM, keep_volumes)");
+                keep_volumes = Some(true);
+            }
+            kv = crate::shutdown::wait() => {
+                info!(
+                    "[coordinator] shutting down via IPC (keep_volumes = {kv})"
+                );
+                keep_volumes = Some(kv);
+            }
+        }
 
+        if let Some(keep) = keep_volumes {
+            // Abort supervisor and drain tasks first so they cannot
+            // interfere with or restart processes we are about to stop
+            // (or, in the keep-volumes path, would otherwise attempt to
+            // restart between us deciding to exit and the process
+            // actually terminating).
+            tasks.abort_all();
+
+            if keep {
+                // Rolling-upgrade path: leave volume children running.
+                // They were spawned with setsid and survive coordinator
+                // exit; their pid files remain so the next coordinator
+                // instance adopts them on its first scan.
+                info!("[coordinator] leaving volume processes running");
+            } else {
                 // SIGTERM every volume and import process across all known volumes.
                 let all_pids: Vec<u32> = known
                     .keys()
@@ -428,26 +473,24 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 for vol_dir in known.keys() {
                     let _ = std::fs::remove_file(vol_dir.join(PID_FILE));
                 }
-
-                // Drain the JoinSet so abort propagates while the
-                // runtime is still in normal state. Without this, an
-                // in-flight `object_store` retry calling
-                // `tokio::time::sleep` for backoff can race the
-                // runtime's time-driver shutdown and panic with
-                // "A Tokio 1.x context was found, but it is being
-                // shutdown."
-                let drain = async {
-                    while tasks.join_next().await.is_some() {}
-                };
-                if tokio::time::timeout(Duration::from_secs(2), drain)
-                    .await
-                    .is_err()
-                {
-                    warn!("[coordinator] shutdown drain timed out; some tasks did not unwind");
-                }
-
-                break;
             }
+
+            // Drain the JoinSet so abort propagates while the
+            // runtime is still in normal state. Without this, an
+            // in-flight `object_store` retry calling
+            // `tokio::time::sleep` for backoff can race the
+            // runtime's time-driver shutdown and panic with
+            // "A Tokio 1.x context was found, but it is being
+            // shutdown."
+            let drain = async { while tasks.join_next().await.is_some() {} };
+            if tokio::time::timeout(Duration::from_secs(2), drain)
+                .await
+                .is_err()
+            {
+                warn!("[coordinator] shutdown drain timed out; some tasks did not unwind");
+            }
+
+            break;
         }
     }
 
