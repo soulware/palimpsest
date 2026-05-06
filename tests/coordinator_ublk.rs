@@ -28,13 +28,18 @@
 //!     5. `elide volume snapshot` — exercises the coordinator's inbound
 //!        snapshot handler and the volume-side snapshot_manifest IPC,
 //!        mid-service while the ublk device is live.
-//!     6. SIGINT coord A → coordinator SIGTERMs the supervised volume
-//!        and waits. Under shutdown-park
+//!     6. SIGINT coord A → coordinator runs its defensive shutdown
+//!        (PR #254): aborts its tasks, drains, exits — leaving the
+//!        supervised volume running. The test then SIGTERMs the
+//!        orphaned volume directly. Under shutdown-park
 //!        (docs/design-ublk-shutdown-park.md) the daemon flushes and
-//!        exits without calling STOP_DEV; the kernel parks the device in
-//!        QUIESCED on daemon-exit detection. Post-shutdown invariants:
-//!        `volume.pid` is gone, but the sysfs entry and `ublk.id`
-//!        survive so the next serve takes Route::Recover.
+//!        exits without calling STOP_DEV; the kernel parks the device
+//!        in QUIESCED on daemon-exit detection. Post-shutdown
+//!        invariants: the sysfs entry and `ublk.id` survive so the
+//!        next serve takes Route::Recover. `volume.pid` is left as a
+//!        stale file (the supervisor task was aborted before its
+//!        remove_pid hook could run); the next coord's adoption
+//!        cleans it up.
 //!
 //!   Phase 2 — restart + recovery under coordinator B
 //!     7. Coordinator B boot — same `data_dir`, same store. The
@@ -50,8 +55,9 @@
 //!        recovered device serves new I/O end-to-end.
 //!    11. Re-read LBA 0 — original pattern still intact (no clobber by
 //!        the new write).
-//!    12. SIGINT coord B → same shutdown-park behaviour. Cleanup
-//!        explicitly deletes the device.
+//!    12. SIGINT coord B → defensive shutdown again, followed by
+//!        SIGTERM to the volume to exercise the same shutdown-park
+//!        path. Cleanup explicitly deletes the device.
 //!
 //! Distinct from `tests/ublk_crash.rs`: that test directly signals the
 //! daemon to exercise crash/recovery; this test exercises the
@@ -70,6 +76,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 const BLOCK: usize = 4096;
 const VOLUME_SIZE: &str = "64M";
@@ -456,10 +463,13 @@ fn coordinator_ublk_lifecycle() {
         },
     );
 
-    // Clean shutdown: SIGINT the coordinator (ctrl_c arm). It SIGTERMs
-    // the supervised volume and waits. Under shutdown-park the daemon
-    // flushes and exits without STOP_DEV; the kernel parks the device
-    // in QUIESCED on daemon-exit detection.
+    // SIGINT the coordinator. Under the defensive signal policy
+    // (PR #254) coord runs the rolling-upgrade teardown: aborts its
+    // tasks, drains, exits — the supervised volume is *not* signalled
+    // and stays alive across the coord exit. To exercise the
+    // shutdown-park path that phase 2's Route::Recover depends on,
+    // we then SIGTERM the volume directly (mirroring what `elide
+    // coord stop`'s fallback does).
     unsafe {
         let rc = kill(coord_a.id() as i32, SIGINT);
         assert_eq!(rc, 0, "[A] kill(SIGINT) to coordinator failed");
@@ -470,24 +480,48 @@ fn coordinator_ublk_lifecycle() {
         "[A] coordinator exited non-zero: {status_a:?}"
     );
 
-    // Post-shutdown invariants:
-    //
-    //   1. `volume.pid` is removed by the coordinator's shutdown handler
-    //      after the supervised process exits.
-    //   2. The sysfs entry and `ublk.id` BOTH survive — shutdown-park
-    //      leaves the device parked in QUIESCED and the volume↔device
-    //      binding intact, so the next serve takes Route::Recover.
-    //
-    // The control socket is intentionally not checked: it is unlinked
-    // only by the volume process's own accept-loop cleanup, which does
-    // not run under SIGTERM termination.
+    // Defensive-policy invariant: the volume process is still alive
+    // and `volume.pid` still points at it. Coord's shutdown does not
+    // signal volume children. Failure here would mean a regression
+    // back to the pre-PR-254 "coord SIGTERMs supervised processes"
+    // behaviour.
     assert!(
-        !volume_pid.exists(),
-        "[A] volume.pid still present after coordinator shutdown"
+        pid_alive(pid_a),
+        "[A] volume process {pid_a} died under coord SIGINT — defensive policy regressed"
     );
     assert!(
+        volume_pid.exists(),
+        "[A] volume.pid removed under defensive shutdown — coord should not signal children"
+    );
+
+    // Now exercise the volume's own shutdown-park path: SIGTERM the
+    // volume directly. The daemon flushes and exits without STOP_DEV;
+    // the kernel parks the device in QUIESCED on daemon-exit
+    // detection.
+    unsafe {
+        let rc = kill(pid_a, SIGTERM);
+        assert_eq!(rc, 0, "[A] kill(SIGTERM) to volume failed");
+    }
+    wait_until(Duration::from_secs(20), "[A] volume process exit", || {
+        !pid_alive(pid_a)
+    });
+
+    // Post-shutdown invariants:
+    //
+    //   1. The sysfs entry and `ublk.id` BOTH survive — shutdown-park
+    //      leaves the device parked in QUIESCED and the volume↔device
+    //      binding intact, so the next serve takes Route::Recover.
+    //   2. `volume.pid` is *not* checked here: under the defensive
+    //      shutdown the supervisor task was aborted before any
+    //      remove_pid hook could run, so the file is left as a stale
+    //      reference to the now-dead pid. The next coord's supervisor
+    //      removes it as part of adoption.
+    //   3. The control socket is unlinked only by the volume's own
+    //      accept-loop cleanup, which does not run under SIGTERM
+    //      termination.
+    assert!(
         sysfs_entry_exists(DEV_ID),
-        "[A] sysfs entry should survive coordinator-driven SIGTERM (shutdown-park)"
+        "[A] sysfs entry should survive volume SIGTERM (shutdown-park)"
     );
     assert!(
         ublk_id_file.exists(),
@@ -505,12 +539,13 @@ fn coordinator_ublk_lifecycle() {
         || inbound.exists(),
     );
 
-    // Wait for coordinator B's supervisor to scan the data_dir, find the
-    // existing fork (no live volume.pid), and spawn `serve-volume`. The
-    // daemon takes Route::Recover and re-attaches to the still-live
-    // /dev/ublkb<id>. We require:
-    //   - volume.pid reappears (and is a DIFFERENT pid from phase 1, so
-    //     we know it's a fresh process and not a stale file)
+    // Wait for coordinator B's supervisor to scan the data_dir, find
+    // the stale `volume.pid` left over from phase 1's defensive
+    // shutdown, observe its pid as dead, remove it, and spawn a fresh
+    // `serve-volume`. The daemon takes Route::Recover and re-attaches
+    // to the still-live /dev/ublkb<id>. We require:
+    //   - volume.pid contains a fresh, currently-alive PID different
+    //     from phase 1's
     //   - sysfs entry was never deleted (Route::Recover, not Route::Add)
     //   - bdev is still the same /dev/ublkb<id>
     wait_until(
@@ -523,15 +558,14 @@ fn coordinator_ublk_lifecycle() {
             if !sysfs_entry_exists(DEV_ID) {
                 return false;
             }
-            // Distinguish "fresh PID file" from "stale carryover": the
-            // coordinator's shutdown handler removed it in phase 1, so
-            // any visible volume.pid here was created by the new
-            // serve-volume process. Belt-and-braces: also require it to
-            // be a different integer.
+            // Distinguish "fresh PID file" from "stale carryover".
+            // The supervisor removed the stale file and rewrote it
+            // with the new spawn's PID; we additionally check the new
+            // PID is different from phase 1's and is alive.
             std::fs::read_to_string(&volume_pid)
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
-                .map(|pid_b| pid_b != pid_a)
+                .map(|pid_b| pid_b != pid_a && pid_alive(pid_b))
                 .unwrap_or(false)
         },
     );
@@ -568,7 +602,18 @@ fn coordinator_ublk_lifecycle() {
         "[B] write at offset {OFFSET_B} must not clobber LBA 0"
     );
 
-    // Clean shutdown of coord B; same shutdown-park assertions apply.
+    // Read the recovered volume's PID before signalling coord B so we
+    // can SIGTERM it directly after coord B exits (defensive shutdown
+    // doesn't kill it).
+    let pid_b: i32 = std::fs::read_to_string(&volume_pid)
+        .expect("[B] read volume.pid")
+        .trim()
+        .parse()
+        .expect("[B] parse volume.pid");
+
+    // Same defensive-shutdown sequence as phase 1: SIGINT coord B,
+    // wait for it to exit (volume left running), then SIGTERM the
+    // volume to exercise its own shutdown-park.
     unsafe {
         let rc = kill(coord_b.id() as i32, SIGINT);
         assert_eq!(rc, 0, "[B] kill(SIGINT) to coordinator failed");
@@ -579,12 +624,19 @@ fn coordinator_ublk_lifecycle() {
         "[B] coordinator exited non-zero: {status_b:?}"
     );
     assert!(
-        !volume_pid.exists(),
-        "[B] volume.pid still present after coordinator shutdown"
+        pid_alive(pid_b),
+        "[B] volume process {pid_b} died under coord SIGINT — defensive policy regressed"
     );
+    unsafe {
+        let rc = kill(pid_b, SIGTERM);
+        assert_eq!(rc, 0, "[B] kill(SIGTERM) to volume failed");
+    }
+    wait_until(Duration::from_secs(20), "[B] volume process exit", || {
+        !pid_alive(pid_b)
+    });
     assert!(
         sysfs_entry_exists(DEV_ID),
-        "[B] sysfs entry should survive coordinator-driven SIGTERM (shutdown-park)"
+        "[B] sysfs entry should survive volume SIGTERM (shutdown-park)"
     );
     assert!(
         ublk_id_file.exists(),
@@ -594,4 +646,17 @@ fn coordinator_ublk_lifecycle() {
     // Cleanup: explicit DEL_DEV so the next CI run starts from a clean
     // kernel state. Failures here would indicate a leaked device.
     delete_and_wait_sysfs_gone(DEV_ID);
+}
+
+/// Probe whether `pid` is alive without waiting on it. `kill(pid, 0)`
+/// returns 0 when the process exists and we have permission; ESRCH
+/// when it doesn't. EPERM (process exists but we can't signal it) is
+/// also "alive".
+fn pid_alive(pid: i32) -> bool {
+    let rc = unsafe { kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
 }
