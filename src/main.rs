@@ -153,7 +153,7 @@ enum CoordCommand {
     /// Spawns `elide-coordinator serve` in a new session (setsid),
     /// redirects its stdout/stderr to `<data_dir>/coordinator.log`, and
     /// waits for the control socket to come up before returning.
-    Up {
+    Start {
         /// Path to the coordinator config file (forwarded to the
         /// daemon). Defaults to `coordinator.toml` in the daemon's
         /// working directory.
@@ -1132,8 +1132,8 @@ fn main() {
         },
 
         Command::Coord { command } => match command {
-            CoordCommand::Up { config } => {
-                if let Err(e) = coord_up(&args.data_dir, config.as_deref()) {
+            CoordCommand::Start { config } => {
+                if let Err(e) = coord_start(&args.data_dir, config.as_deref()) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1174,8 +1174,8 @@ fn coord_run(data_dir: &Path, config: Option<&Path>) -> std::io::Error {
 }
 
 /// Time to wait for the coordinator's control socket to appear after
-/// `coord up` spawns the daemon.
-const COORD_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// `coord start` spawns the daemon.
+const COORD_START_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Time to wait for the coordinator to exit after `coord stop` sends
 /// the Shutdown IPC. Generous because full teardown waits for volume
@@ -1188,7 +1188,7 @@ const COORD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// child is placed in a new session (setsid) so it survives the parent
 /// shell. We then poll for the control socket to appear, returning
 /// once it accepts connections.
-fn coord_up(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
+fn coord_start(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -1239,7 +1239,7 @@ fn coord_up(data_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
     let child_pid = child.id();
 
     let socket_path = data_dir.join("control.sock");
-    let deadline = std::time::Instant::now() + COORD_UP_WAIT;
+    let deadline = std::time::Instant::now() + COORD_START_WAIT;
     loop {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
             println!(

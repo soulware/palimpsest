@@ -33,9 +33,9 @@ use clap::{Parser, Subcommand};
 use elide_core::process::pid_is_alive;
 
 /// Coordinator-process pidfile. Lives at `<data_dir>/coordinator.pid` so
-/// `elide coord up` can refuse to start a second instance for the same
-/// data directory and `elide coord stop` can fall back to PID-based
-/// liveness if the IPC reply never arrives.
+/// `elide coord start` can refuse to start a second instance for the
+/// same data directory and `elide coord stop` can fall back to
+/// PID-based liveness if the IPC reply never arrives.
 const COORDINATOR_PID_FILE: &str = "coordinator.pid";
 
 #[derive(Parser)]
