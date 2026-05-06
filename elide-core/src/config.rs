@@ -57,9 +57,16 @@ pub struct NbdConfig {
 /// time.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct UblkConfig {
-    /// Explicit ublk device id (maps to `/dev/ublkb<id>`). If omitted the
-    /// kernel auto-allocates on first start; the chosen id is then persisted
-    /// in `<vol>/ublk.id` for crash recovery.
+    /// Bound ublk device id (maps to `/dev/ublkb<id>`).
+    ///
+    /// Carries two related meanings:
+    ///   * Before the first ADD: user-supplied pin. `None` means "kernel
+    ///     auto-allocates on first start".
+    ///   * After a successful ADD: the kernel-assigned id, written back so
+    ///     the next serve recognises and recovers the QUIESCED device.
+    ///
+    /// Authoritative ownership lives in the kernel device's `target_data`
+    /// stamp; this field is the local hint for which id to look at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dev_id: Option<i32>,
 }
@@ -138,6 +145,48 @@ impl VolumeConfig {
         let s = toml::to_string(self)
             .map_err(|e| io::Error::other(format!("serializing {CONFIG_FILE}: {e}")))?;
         crate::segment::write_file_atomic(&dir.join(CONFIG_FILE), s.as_bytes())
+    }
+
+    /// Read the bound ublk device id, if any.
+    ///
+    /// `None` means either no ublk transport (no `[ublk]` section) or
+    /// `[ublk]` exists but no id has been bound yet (auto-allocate on
+    /// next ADD). Callers that need to distinguish the two cases must
+    /// inspect `cfg.ublk` directly.
+    pub fn bound_ublk_id(dir: &Path) -> io::Result<Option<i32>> {
+        Ok(Self::read(dir)?.ublk.and_then(|u| u.dev_id))
+    }
+
+    /// Persist the kernel-assigned ublk device id into `volume.toml`.
+    ///
+    /// Called from the ublk daemon's `wait_hook` once the kernel commits
+    /// to an id. Read-modify-write so unrelated config (size, name, nbd
+    /// settings) is preserved. Idempotent: rewriting the same id is a
+    /// no-op on disk if the file content is unchanged.
+    pub fn set_bound_ublk_id(dir: &Path, id: i32) -> io::Result<()> {
+        let mut cfg = Self::read(dir)?;
+        let ublk = cfg.ublk.get_or_insert_with(Default::default);
+        ublk.dev_id = Some(id);
+        cfg.write(dir)
+    }
+
+    /// Clear the bound ublk device id while preserving the `[ublk]`
+    /// section. Used by `elide ublk delete` and the coordinator's
+    /// reconciliation sweep: the operator removed the binding but did
+    /// not change transport policy, so the next serve auto-allocates.
+    ///
+    /// No-op (no write) if there is no `[ublk]` section or the id is
+    /// already absent.
+    pub fn clear_bound_ublk_id(dir: &Path) -> io::Result<()> {
+        let mut cfg = Self::read(dir)?;
+        let Some(ublk) = cfg.ublk.as_mut() else {
+            return Ok(());
+        };
+        if ublk.dev_id.is_none() {
+            return Ok(());
+        }
+        ublk.dev_id = None;
+        cfg.write(dir)
     }
 }
 
@@ -323,6 +372,63 @@ mod tests {
         write_config(tmp.path(), "[ublk]\ndev_id = 7\n");
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
         assert_eq!(cfg.ublk.unwrap().dev_id, Some(7));
+    }
+
+    #[test]
+    fn bound_ublk_id_returns_none_when_no_section() {
+        let tmp = TempDir::new().unwrap();
+        // No volume.toml at all.
+        assert_eq!(VolumeConfig::bound_ublk_id(tmp.path()).unwrap(), None);
+        // Empty volume.toml.
+        write_config(tmp.path(), "");
+        assert_eq!(VolumeConfig::bound_ublk_id(tmp.path()).unwrap(), None);
+        // [ublk] enabled but no id bound yet.
+        write_config(tmp.path(), "[ublk]\n");
+        assert_eq!(VolumeConfig::bound_ublk_id(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn set_bound_ublk_id_creates_section_and_preserves_other_fields() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "name = \"alpha\"\nsize = 1024\n");
+        VolumeConfig::set_bound_ublk_id(tmp.path(), 5).unwrap();
+
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+        assert_eq!(cfg.size, Some(1024));
+        assert_eq!(cfg.ublk.unwrap().dev_id, Some(5));
+    }
+
+    #[test]
+    fn set_bound_ublk_id_overwrites_existing_id() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "[ublk]\ndev_id = 3\n");
+        VolumeConfig::set_bound_ublk_id(tmp.path(), 9).unwrap();
+        assert_eq!(VolumeConfig::bound_ublk_id(tmp.path()).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn clear_bound_ublk_id_keeps_section_drops_id() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "[ublk]\ndev_id = 5\n");
+        VolumeConfig::clear_bound_ublk_id(tmp.path()).unwrap();
+
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        let ublk = cfg
+            .ublk
+            .expect("clearing the dev_id must not remove the [ublk] section");
+        assert_eq!(ublk.dev_id, None);
+    }
+
+    #[test]
+    fn clear_bound_ublk_id_is_noop_without_section() {
+        let tmp = TempDir::new().unwrap();
+        // Empty file: no [ublk] section means there's nothing to clear.
+        write_config(tmp.path(), "name = \"alpha\"\n");
+        VolumeConfig::clear_bound_ublk_id(tmp.path()).unwrap();
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert!(cfg.ublk.is_none());
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
     }
 
     #[test]

@@ -9,9 +9,10 @@
 //! SIGTERM and SIGKILL converge on the same kernel state: the daemon
 //! exits without calling STOP_DEV, the kernel's monitor work observes
 //! the io_uring fds close, and with `UBLK_F_USER_RECOVERY` set the
-//! device transitions LIVE → QUIESCED. Sysfs entry survives, `ublk.id`
-//! survives, mount survives — respawn takes `Route::Recover` and
-//! `START_USER_RECOVERY` reissues any buffered I/O.
+//! device transitions LIVE → QUIESCED. Sysfs entry survives, the
+//! `[ublk] dev_id` field in `volume.toml` survives, mount survives —
+//! respawn takes `Route::Recover` and `START_USER_RECOVERY` reissues
+//! any buffered I/O.
 //!
 //! - `sigkill_recovery` — daemon dies uncleanly, no shutdown flush
 //!   runs, but acked writes (which fsync via the actor flush path)
@@ -364,7 +365,8 @@ fn sigkill_recovery() {
 
     // Kill the daemon uncleanly. Kernel sees the uring_cmd fds close,
     // moves the device to QUIESCED, and keeps /dev/ublkbN alive pending
-    // a recovery attach. `ublk.id` on disk must survive.
+    // a recovery attach. The `[ublk] dev_id` field in volume.toml must
+    // survive — it's the next serve's hint of which id to recover.
     send_signal(&daemon, libc::SIGKILL);
     reap_killed(&mut daemon, "SIGKILL");
 
@@ -372,9 +374,10 @@ fn sigkill_recovery() {
         sysfs_entry_exists(DEV_ID_SIGKILL),
         "sysfs entry should survive SIGKILL (device should be QUIESCED, not DELETED)"
     );
-    assert!(
-        dir.join("ublk.id").exists(),
-        "volume <-> device binding file should survive SIGKILL"
+    assert_eq!(
+        elide_core::config::VolumeConfig::bound_ublk_id(&dir).unwrap(),
+        Some(DEV_ID_SIGKILL),
+        "bound dev_id must survive SIGKILL for Route::Recover on next serve"
     );
 
     // Round 2: respawn same volume, same id. plan_route sees
@@ -422,15 +425,17 @@ fn sigterm_clean_restart() {
 
     // Under shutdown-park, SIGTERM exits the daemon without calling
     // STOP_DEV / DEL_DEV. The kernel parks the device in QUIESCED via
-    // daemon-exit detection; sysfs entry and `ublk.id` must both
-    // survive so the next serve takes Route::Recover.
+    // daemon-exit detection; the sysfs entry and the `[ublk] dev_id`
+    // field in volume.toml must both survive so the next serve takes
+    // Route::Recover.
     assert!(
         sysfs_entry_exists(DEV_ID_SIGTERM),
         "sysfs entry should survive SIGTERM (device parked QUIESCED, not deleted)"
     );
-    assert!(
-        dir.join("ublk.id").exists(),
-        "ublk.id must persist across clean shutdown for Route::Recover"
+    assert_eq!(
+        elide_core::config::VolumeConfig::bound_ublk_id(&dir).unwrap(),
+        Some(DEV_ID_SIGTERM),
+        "bound dev_id must persist across clean shutdown for Route::Recover"
     );
 
     // Round 2: respawn — plan_route sees persisted=Some(id),

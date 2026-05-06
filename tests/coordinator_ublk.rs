@@ -19,8 +19,8 @@
 //!     2. `elide volume create ... --ublk --ublk-id <id>` + inbound
 //!        `rescan`.
 //!     3. Supervisor adopts the fork: `volume.pid`, `control.sock`, and
-//!        `/dev/ublkb<id>` (plus its sysfs entry and `ublk.id`) all
-//!        appear.
+//!        `/dev/ublkb<id>` (plus its sysfs entry and the `[ublk]
+//!        dev_id` field in `volume.toml`) all appear.
 //!     4. WRITE/READ over `/dev/ublkb<id>` via O_DIRECT pwrite/pread.
 //!        Pattern round-trip validates the daemon is actually serving
 //!        real I/O through the kernel device, not just owning the sysfs
@@ -35,8 +35,9 @@
 //!        (docs/design-ublk-shutdown-park.md) the daemon flushes and
 //!        exits without calling STOP_DEV; the kernel parks the device
 //!        in QUIESCED on daemon-exit detection. Post-shutdown
-//!        invariants: the sysfs entry and `ublk.id` survive so the
-//!        next serve takes Route::Recover. `volume.pid` is left as a
+//!        invariants: the sysfs entry and the `[ublk] dev_id` field
+//!        in `volume.toml` survive so the next serve takes
+//!        Route::Recover. `volume.pid` is left as a
 //!        stale file (the supervisor task was aborted before its
 //!        remove_pid hook could run); the next coord's adoption
 //!        cleans it up.
@@ -412,7 +413,6 @@ fn coordinator_ublk_lifecycle() {
     // its control socket, and the kernel device + sysfs entry to appear.
     let volume_pid = fork_dir.join("volume.pid");
     let volume_ctrl = fork_dir.join("control.sock");
-    let ublk_id_file = fork_dir.join("ublk.id");
     let bdev = bdev_path(DEV_ID);
     wait_until(
         Duration::from_secs(30),
@@ -422,7 +422,10 @@ fn coordinator_ublk_lifecycle() {
                 && volume_ctrl.exists()
                 && bdev.exists()
                 && sysfs_entry_exists(DEV_ID)
-                && ublk_id_file.exists()
+                && elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir)
+                    .ok()
+                    .flatten()
+                    == Some(DEV_ID)
         },
     );
     // Small settle so the kernel has published queue limits before our
@@ -508,9 +511,10 @@ fn coordinator_ublk_lifecycle() {
 
     // Post-shutdown invariants:
     //
-    //   1. The sysfs entry and `ublk.id` BOTH survive — shutdown-park
-    //      leaves the device parked in QUIESCED and the volume↔device
-    //      binding intact, so the next serve takes Route::Recover.
+    //   1. The sysfs entry and the `[ublk] dev_id` field in volume.toml
+    //      BOTH survive — shutdown-park leaves the device parked in
+    //      QUIESCED and the binding hint intact, so the next serve takes
+    //      Route::Recover.
     //   2. `volume.pid` is *not* checked here: under the defensive
     //      shutdown the supervisor task was aborted before any
     //      remove_pid hook could run, so the file is left as a stale
@@ -523,9 +527,12 @@ fn coordinator_ublk_lifecycle() {
         sysfs_entry_exists(DEV_ID),
         "[A] sysfs entry should survive volume SIGTERM (shutdown-park)"
     );
-    assert!(
-        ublk_id_file.exists(),
-        "[A] ublk.id must persist for Route::Recover on next serve"
+    assert_eq!(
+        elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir)
+            .ok()
+            .flatten(),
+        Some(DEV_ID),
+        "[A] bound dev_id must persist for Route::Recover on next serve"
     );
     let _ = volume_ctrl;
 
@@ -638,9 +645,12 @@ fn coordinator_ublk_lifecycle() {
         sysfs_entry_exists(DEV_ID),
         "[B] sysfs entry should survive volume SIGTERM (shutdown-park)"
     );
-    assert!(
-        ublk_id_file.exists(),
-        "[B] ublk.id must persist across the second shutdown too"
+    assert_eq!(
+        elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir)
+            .ok()
+            .flatten(),
+        Some(DEV_ID),
+        "[B] bound dev_id must persist across the second shutdown too"
     );
 
     // Cleanup: explicit DEL_DEV so the next CI run starts from a clean

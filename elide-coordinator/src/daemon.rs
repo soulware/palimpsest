@@ -177,8 +177,9 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // Reconcile ublk kernel devices against on-disk bindings. Under
     // shutdown-park, daemons leave devices QUIESCED for recovery; this
     // sweep handles the residual cases where the volume directory has
-    // been removed out-of-band, the host has rebooted (sysfs cleared but
-    // ublk.id remains), or an operator manually deleted a device.
+    // been removed out-of-band, the host has rebooted (sysfs cleared
+    // but the bound dev_id in volume.toml remains), or an operator
+    // manually deleted a device.
     crate::ublk_sweep::reconcile(&data_dir).await;
 
     // Import job registry: tracks running and recently-completed import jobs.
