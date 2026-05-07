@@ -18,19 +18,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use elide_core::signing::VOLUME_KEY_FILE;
-use elide_fetch::{FetchConfig, RangeFetcher, RemoteFetcher};
+use elide_fetch::{FetchConfig, RangeFetcher, RemoteFetcher, S3Credentials};
 use elide_peer_fetch::{
     BodyFetchClient, PeerEndpoint, PeerFetchCountersHandle, PeerRangeFetcher, VolumeBodySigner,
 };
-use object_store::ObjectStore;
 
 /// Bundle of inputs the volume daemon needs to construct its remote
-/// fetcher. `fetch_config` drives S3 / local-store access; when
-/// `peer_endpoint` is present the daemon stacks a `PeerRangeFetcher`
-/// in front of S3 to opportunistically serve body byte ranges from
-/// the previous claimer over LAN.
+/// fetcher. `fetch_config` drives S3 / local-store access; `creds`
+/// is required for S3 mode and ignored otherwise. When `peer_endpoint`
+/// is present the daemon stacks a `PeerRangeFetcher` in front of S3
+/// to opportunistically serve body byte ranges from the previous
+/// claimer over LAN.
 pub struct VolumeFetchInputs {
     pub fetch_config: Option<FetchConfig>,
+    pub creds: Option<S3Credentials>,
     pub peer_endpoint: Option<PeerEndpoint>,
 }
 
@@ -104,7 +105,7 @@ pub fn build_volume_fetcher(
     let Some(config) = inputs.fetch_config else {
         return Ok(None);
     };
-    let s3_store: Arc<dyn RangeFetcher> = config.build_fetcher()?;
+    let s3_store: Arc<dyn RangeFetcher> = config.build_fetcher(inputs.creds)?;
     let (demand_store, peer_counters) = match inputs.peer_endpoint {
         Some(endpoint) if fork_dir.join(VOLUME_KEY_FILE).exists() => {
             let vol_ulid_str = elide_fetch::derive_volume_id(fork_dir)?;
@@ -140,35 +141,6 @@ pub fn build_volume_fetcher(
         s3_store,
         peer_counters,
     }))
-}
-
-/// Build an `object_store` client from a [`FetchConfig`].
-///
-/// The volume binary uses this for CLI subcommands that hit S3 directly
-/// (`pull`, fork-from-S3) and for the embedded coordinator tasks loop
-/// (`volume up`). The async `object_store` API is needed there because that
-/// code already runs inside tokio. The demand-fetch hot path uses
-/// `elide_fetch::FetchConfig::build_fetcher()` instead — sync, no tokio.
-pub fn build_object_store(config: &FetchConfig) -> io::Result<Arc<dyn ObjectStore>> {
-    if let Some(path) = &config.local_path {
-        let store = object_store::local::LocalFileSystem::new_with_prefix(path)
-            .map_err(|e| io::Error::other(format!("local store at {path}: {e}")))?;
-        return Ok(Arc::new(store));
-    }
-    let bucket = config.bucket.as_deref().ok_or_else(|| {
-        io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
-    })?;
-    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
-    if let Some(endpoint) = &config.endpoint {
-        builder = builder.with_endpoint(endpoint);
-    }
-    if let Some(region) = &config.region {
-        builder = builder.with_region(region);
-    }
-    let store = builder
-        .build()
-        .map_err(|e| io::Error::other(format!("S3 store ({bucket}): {e}")))?;
-    Ok(Arc::new(store))
 }
 
 /// Resolve a volume name to its directory via `<data_dir>/by_name/<name>`.

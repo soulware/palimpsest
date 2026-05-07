@@ -672,6 +672,7 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         None,
         crate::VolumeFetchInputs {
             fetch_config: None,
+            creds: None,
             peer_endpoint: None,
         },
     )
@@ -1556,6 +1557,7 @@ mod tests {
                 None,
                 crate::VolumeFetchInputs {
                     fetch_config: None,
+                    creds: None,
                     peer_endpoint: None,
                 },
             )
@@ -1749,6 +1751,7 @@ mod tests {
                 NbdListener::Unix(listener),
                 crate::VolumeFetchInputs {
                     fetch_config: None,
+                    creds: None,
                     peer_endpoint: None,
                 },
             )

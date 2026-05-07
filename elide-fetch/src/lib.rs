@@ -5,13 +5,17 @@
 //   [S3 / S3-compatible]
 //   bucket   = "my-bucket"
 //   endpoint = "https://s3.amazonaws.com"  # optional; omit for AWS default
-//   region   = "us-east-1"                 # optional; from env if omitted
+//   region   = "us-east-1"                 # optional
 //
 //   [Local filesystem — for testing without a real object store]
 //   local_path = "/tmp/elide-store"
 //
-// If fetch.toml is absent, env vars are tried: ELIDE_S3_BUCKET (required),
-// AWS_ENDPOINT_URL and AWS_DEFAULT_REGION (optional).
+// `fetch.toml` does not carry S3 credentials. The volume binary obtains
+// them out-of-band — over the coordinator's macaroon-authenticated IPC
+// in the spawned-volume case, or by reading its own env in the
+// standalone fallback — and passes them explicitly into
+// [`FetchConfig::build_fetcher`] / [`S3RangeFetcher::new`]. This crate
+// itself never reads `AWS_*` env vars.
 //
 // Key layout mirrors the coordinator's upload layout:
 //   by_id/<volume_id>/segments/YYYYMMDD/<ulid>
@@ -47,6 +51,18 @@ use elide_core::segment::{self, SegmentFetcher};
 /// Default maximum bytes per coalesced fetch batch (256 KiB).
 pub const DEFAULT_FETCH_BATCH_BYTES: u64 = 256 * 1024;
 
+/// S3 credentials passed explicitly into [`S3RangeFetcher::new`] /
+/// [`FetchConfig::build_fetcher`]. The volume binary obtains these from
+/// the coordinator's macaroon handshake (or, in the standalone
+/// fallback, by reading its own env once at startup) and threads them
+/// in here. This crate never reads `AWS_*` env vars itself.
+#[derive(Debug, Clone)]
+pub struct S3Credentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FetchConfig {
@@ -56,7 +72,7 @@ pub struct FetchConfig {
     /// S3 endpoint URL override (e.g. MinIO). Defaults to AWS standard.
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// AWS region. Falls back to `AWS_DEFAULT_REGION` env var.
+    /// AWS region. Defaults to `us-east-1` when omitted.
     #[serde(default)]
     pub region: Option<String>,
     /// Local filesystem path for testing without a real object store.
@@ -82,10 +98,10 @@ impl FetchConfig {
     /// should prefer asking a running coordinator for config+creds via its
     /// IPC socket before falling through to this function. `FetchConfig`
     /// intentionally does not read `coordinator.toml` itself — the config
-    /// there names a bucket but the matching `AWS_ACCESS_KEY_ID` /
-    /// `AWS_SECRET_ACCESS_KEY` live in the coordinator's process env, not
-    /// on disk, so consuming just the `[store]` section would give the
-    /// illusion of being configured without having usable credentials.
+    /// there names a bucket but the matching credentials live in the
+    /// coordinator's process env, not on disk, so consuming just the
+    /// `[store]` section would give the illusion of being configured
+    /// without having usable credentials.
     pub fn load(data_dir: &Path) -> io::Result<Option<Self>> {
         let config_path = data_dir.join("fetch.toml");
         if config_path.exists() {
@@ -120,17 +136,26 @@ impl FetchConfig {
 
     /// Build a `RangeFetcher` from this config.
     ///
-    /// Returns a [`LocalRangeFetcher`] when `local_path` is set, otherwise an
-    /// [`S3RangeFetcher`] using the configured bucket / endpoint / region.
-    pub fn build_fetcher(&self) -> io::Result<Arc<dyn RangeFetcher>> {
+    /// Returns a [`LocalRangeFetcher`] when `local_path` is set
+    /// (`creds` is ignored), otherwise an [`S3RangeFetcher`] using the
+    /// configured bucket / endpoint / region. S3 mode requires `creds`
+    /// to be `Some`; the caller is responsible for sourcing them
+    /// (coordinator IPC, env, etc.).
+    pub fn build_fetcher(&self, creds: Option<S3Credentials>) -> io::Result<Arc<dyn RangeFetcher>> {
         if let Some(path) = &self.local_path {
             return Ok(Arc::new(LocalRangeFetcher::new(PathBuf::from(path))));
         }
         let bucket = self.bucket.as_deref().ok_or_else(|| {
             io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
         })?;
-        let fetcher =
-            S3RangeFetcher::new(bucket, self.endpoint.as_deref(), self.region.as_deref())?;
+        let creds =
+            creds.ok_or_else(|| io::Error::other("S3 fetcher requires explicit credentials"))?;
+        let fetcher = S3RangeFetcher::new(
+            bucket,
+            self.endpoint.as_deref(),
+            self.region.as_deref(),
+            creds,
+        )?;
         Ok(Arc::new(fetcher))
     }
 }
@@ -184,7 +209,7 @@ pub struct S3RangeFetcher {
 }
 
 impl S3RangeFetcher {
-    /// Build an S3 fetcher.
+    /// Build an S3 fetcher with explicit credentials.
     ///
     /// `endpoint` is optional — set it for S3-compatible stores (MinIO,
     /// Garage, R2, …). When set, path-style addressing is used; without an
@@ -192,18 +217,18 @@ impl S3RangeFetcher {
     ///
     /// `region` is required by AWS but accepted as a free-form string for
     /// custom endpoints (R2 uses `"auto"`, Garage uses `"garage"`, etc.).
-    /// Falls back to `AWS_DEFAULT_REGION`, then to `us-east-1`.
+    /// Defaults to `us-east-1` when omitted.
     ///
-    /// Credentials come from `aws-creds`'s default chain (env vars, profile,
-    /// IMDS).
+    /// Credentials are passed in by the caller — this constructor never
+    /// touches `AWS_*` env vars or profile / IMDS providers.
     pub fn new(
         bucket_name: &str,
         endpoint: Option<&str>,
         region: Option<&str>,
+        creds: S3Credentials,
     ) -> io::Result<Self> {
         let region_name = region
             .map(|s| s.to_owned())
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
             .unwrap_or_else(|| "us-east-1".to_owned());
         let region = match endpoint {
             Some(ep) => Region::Custom {
@@ -214,8 +239,16 @@ impl S3RangeFetcher {
                 .parse::<Region>()
                 .map_err(|e| io::Error::other(format!("aws region '{region_name}': {e}")))?,
         };
-        let creds = Credentials::default()
-            .map_err(|e| io::Error::other(format!("aws credentials: {e}")))?;
+        // `Credentials::new` short-circuits the env/profile/IMDS provider
+        // chain when `access_key` is `Some`.
+        let creds = Credentials::new(
+            Some(&creds.access_key_id),
+            Some(&creds.secret_access_key),
+            None,
+            creds.session_token.as_deref(),
+            None,
+        )
+        .map_err(|e| io::Error::other(format!("aws credentials: {e}")))?;
         let mut bucket = Bucket::new(bucket_name, region, creds)
             .map_err(|e| io::Error::other(format!("s3 bucket {bucket_name}: {e}")))?;
         if endpoint.is_some() {
@@ -422,9 +455,10 @@ pub struct RemoteFetcher {
 }
 
 impl RemoteFetcher {
-    /// Build a fetcher from a [`FetchConfig`].
-    pub fn new(config: &FetchConfig) -> io::Result<Self> {
-        let store = config.build_fetcher()?;
+    /// Build a fetcher from a [`FetchConfig`]. `creds` is required for
+    /// S3 mode and ignored in local-path mode.
+    pub fn new(config: &FetchConfig, creds: Option<S3Credentials>) -> io::Result<Self> {
+        let store = config.build_fetcher(creds)?;
         Ok(Self::from_store(
             store,
             config
@@ -1413,7 +1447,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
 
         // Fetch entry 0 — should coalesce entries 0, 1, 2 into one range-GET.
         fetcher
@@ -1517,7 +1551,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
 
         fetcher
             .fetch_extent(
@@ -1613,7 +1647,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
 
         let err = fetcher
             .fetch_extent(
@@ -1724,7 +1758,7 @@ mod tests {
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
 
         let err = fetcher
             .fetch_delta_body(seg_ulid, owner_vol_id, &index_dir, &cache_dir)
@@ -2373,7 +2407,7 @@ mod tests {
             local_path: Some(store_root.to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
         (
             fetcher,
             seg_ulid,
@@ -2567,7 +2601,7 @@ mod tests {
             local_path: Some(store.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: Some(16 * 1024),
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
 
         let populated: Vec<u32> = (0..n as u32).collect();
         fetcher
@@ -2688,7 +2722,7 @@ mod tests {
             local_path: Some(store.path().to_string_lossy().into_owned()),
             fetch_batch_bytes: None,
         };
-        let fetcher = RemoteFetcher::new(&cfg).unwrap();
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
 
         // Populated set excludes the pad entry so body_start lands at
         // 4096; includes the non-data entries to mirror what full_warm
