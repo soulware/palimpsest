@@ -798,11 +798,18 @@ mod imp {
     struct Job {
         op: u32,
         off: u64,
-        bytes: u32,
+        bytes: u64,
         buf_ptr: usize,
         buf_len: usize,
         eventfd: RawFd,
         result: Arc<AtomicI32>,
+    }
+
+    /// Only READ / WRITE consume the per-tag buffer; gating FLUSH / DISCARD /
+    /// WRITE_ZEROES on `max_io_buf_bytes` would reject mkfs.ext4's whole-
+    /// device discard with -EINVAL.
+    fn op_carries_payload(op: u32) -> bool {
+        op == UBLK_IO_OP_READ || op == UBLK_IO_OP_WRITE
     }
 
     /// Per-queue entry point. Runs on a dedicated thread spawned by
@@ -893,10 +900,11 @@ mod imp {
             let iod = *q.get_iod(tag);
             let op = iod.op_flags & 0xff;
             let off = iod.start_sector << 9;
-            let bytes = iod.nr_sectors << 9;
+            let bytes: u64 = (iod.nr_sectors as u64) << 9;
 
             let buf_slice = buf.as_slice();
-            let res = if (bytes as usize) <= buf_slice.len() {
+            let fits_buf = !op_carries_payload(op) || bytes <= buf_slice.len() as u64;
+            let res = if fits_buf {
                 result.store(0, Ordering::Relaxed);
                 let job = Job {
                     op,
@@ -951,7 +959,9 @@ mod imp {
             // window. So constructing a &mut [u8] here is sound.
             let slice: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(job.buf_ptr as *mut u8, job.buf_len) };
-            let res = if (job.bytes as usize) <= slice.len() {
+            let res = if !op_carries_payload(job.op) {
+                dispatch(&reader, job.op, job.off, job.bytes, &mut [])
+            } else if (job.bytes as usize) <= slice.len() {
                 dispatch(
                     &reader,
                     job.op,
@@ -1011,14 +1021,14 @@ mod imp {
     /// Translate one ublk I/O into a `VolumeReader` / `VolumeClient` call.
     /// Returns the kernel completion status: bytes on success, negative errno
     /// on failure.
-    fn dispatch(reader: &VolumeReader, op: u32, offset: u64, length: u32, buf: &mut [u8]) -> i32 {
+    fn dispatch(reader: &VolumeReader, op: u32, offset: u64, length: u64, buf: &mut [u8]) -> i32 {
         // ublk SET_PARAMS pinned logical_bs_shift=12, so offset and length
         // are always 4K-aligned — no RMW path needed.
         debug_assert!(offset.is_multiple_of(BLOCK));
-        debug_assert!((length as u64).is_multiple_of(BLOCK));
+        debug_assert!(length.is_multiple_of(BLOCK));
 
         let start_lba = offset / BLOCK;
-        let lba_count = (length as u64 / BLOCK) as u32;
+        let lba_count = (length / BLOCK) as u32;
 
         match op {
             UBLK_IO_OP_READ => match reader.read(start_lba, lba_count) {
@@ -1049,15 +1059,17 @@ mod imp {
                     -libc::EIO
                 }
             },
+            // DISCARD / WRITE_ZEROES report 0 on success: a 10 GiB discard
+            // doesn't fit i32 if we returned the byte count.
             UBLK_IO_OP_DISCARD => match reader.trim(start_lba, lba_count) {
-                Ok(()) => length as i32,
+                Ok(()) => 0,
                 Err(e) => {
                     tracing::error!("[ublk discard error offset={offset} len={length}: {e}]");
                     -libc::EIO
                 }
             },
             UBLK_IO_OP_WRITE_ZEROES => match reader.write_zeroes(start_lba, lba_count) {
-                Ok(()) => length as i32,
+                Ok(()) => 0,
                 Err(e) => {
                     tracing::error!("[ublk write-zeroes error offset={offset} len={length}: {e}]");
                     -libc::EIO
@@ -1542,7 +1554,7 @@ mod imp {
         fn dispatch_unwritten_read_returns_zeros() {
             let (dir, client, reader) = spawn_volume();
             let mut buf = [0xabu8; BLOCK as usize];
-            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut buf);
+            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut buf);
             assert_eq!(res, BLOCK as i32);
             assert!(buf.iter().all(|&b| b == 0));
             drop(reader);
@@ -1555,11 +1567,11 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let data: Vec<u8> = (0..BLOCK as u16).map(|i| (i & 0xff) as u8).collect();
             let mut wbuf = data.clone();
-            let res = dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK as u32, &mut wbuf);
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK, &mut wbuf);
             assert_eq!(res, BLOCK as i32);
 
             let mut rbuf = vec![0u8; BLOCK as usize];
-            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut rbuf);
+            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut rbuf);
             assert_eq!(res, BLOCK as i32);
             assert_eq!(rbuf, data);
 
@@ -1584,17 +1596,17 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let mut wbuf = vec![0xcdu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK as u32, &mut wbuf),
+                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK, &mut wbuf),
                 BLOCK as i32
             );
 
             let mut dbuf = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, 0, BLOCK as u32, &mut dbuf);
-            assert_eq!(res, BLOCK as i32);
+            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, 0, BLOCK, &mut dbuf);
+            assert_eq!(res, 0);
 
             let mut rbuf = vec![0xffu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut rbuf),
+                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut rbuf),
                 BLOCK as i32
             );
             assert!(rbuf.iter().all(|&b| b == 0));
@@ -1609,20 +1621,41 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let mut wbuf = vec![0xcdu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK as u32, &mut wbuf),
+                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK, &mut wbuf),
                 BLOCK as i32
             );
 
             let mut zbuf = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK as u32, &mut zbuf);
-            assert_eq!(res, BLOCK as i32);
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK, &mut zbuf);
+            assert_eq!(res, 0);
 
             let mut rbuf = vec![0xffu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut rbuf),
+                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut rbuf),
                 BLOCK as i32
             );
             assert!(rbuf.iter().all(|&b| b == 0));
+
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// Regression: mkfs.ext4 issues a single whole-device discard. For a
+        /// 10 GiB volume the byte count overflows u32 and would also exceed
+        /// the per-tag buffer; the dispatch path must still succeed.
+        #[test]
+        fn dispatch_whole_device_discard_succeeds() {
+            let (dir, client, reader) = spawn_volume();
+            let bytes: u64 = 10 * 1024 * 1024 * 1024;
+            assert!(bytes > u32::MAX as u64);
+
+            let mut empty = [0u8; 0];
+            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, 0, bytes, &mut empty);
+            assert_eq!(res, 0);
+
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, 0, bytes, &mut empty);
+            assert_eq!(res, 0);
 
             drop(reader);
             client.shutdown();
@@ -1634,7 +1667,7 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let mut buf = [0u8; BLOCK as usize];
             // 0xff is not any of the UBLK_IO_OP_* values we handle.
-            let res = dispatch(&reader, 0xff, 0, BLOCK as u32, &mut buf);
+            let res = dispatch(&reader, 0xff, 0, BLOCK, &mut buf);
             assert_eq!(res, -libc::EINVAL);
             drop(reader);
             client.shutdown();
