@@ -49,6 +49,11 @@ record of how the decision was reached; the synthesis doc is the current truth.
 | [design-ublk-transport.md](design-ublk-transport.md) | ublk as preferred host-local transport alongside NBD — multi-queue async handler, USER_RECOVERY_REISSUE crash recovery, phased rollout |
 | [design-ublk-shutdown-park.md](design-ublk-shutdown-park.md) | Shutdown leaves ublk device QUIESCED for recovery; deletion becomes an explicit verb. Makes `stop → start` reliable while a filesystem is still mounted |
 | [design-peer-segment-fetch.md](design-peer-segment-fetch.md) | Opportunistic LAN peer-fetch tier in front of S3 for index/body bytes. Targets cross-host handoff (release → claim) and large-fleet image pull |
+| [design-async-runtime-scope.md](design-async-runtime-scope.md) | Volume hot path is sync; async confined to coordinator and `elide-import`. Steps 1 (rust-s3 sync demand-fetch) and 2 (smol::LocalExecutor in ublk queue threads) landed; step 3 (drop tokio from elide binary) outstanding |
+| [design-credential-macaroons.md](design-credential-macaroons.md) | Landed: macaroon-gated credential distribution. PID-bound bearer tokens minted at registration; pluggable `CredentialIssuer` trait. `SharedKeyPassthrough` is the implemented issuer; AWS STS / Tigris IAM per-volume issuers planned behind the same trait |
+| [design-isolation-model.md](design-isolation-model.md) | Descriptive: what macaroons enforce (S3 cross-volume access via coordinator gating + IAM scoping) and what they don't (local filesystem; needs OS-level uid/namespace isolation) |
+| [design-operator-tokens.md](design-operator-tokens.md) | Proposed: macaroons minted by the coordinator for human operators (CLI usage). Not PID-bound; identity carried in token; supports audit logging and attenuation |
+| [design-dedup-delta-invariants.md](design-dedup-delta-invariants.md) | Worked examples for DedupRef and Delta correctness — same-hash-twice cases, why `lba_referenced_hashes()` is sourced from the LBA map, GC liveness rule extension for delta sources |
 
 ## Plans
 

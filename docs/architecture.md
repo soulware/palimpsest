@@ -69,19 +69,9 @@ process that serves block I/O.
 
 **Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, and streams its output to attached clients. The import process runs in two phases: a **write phase** (segments written to `pending/`) followed by a **serve phase** (the import binds `control.sock` and handles `promote` IPC from the coordinator until `pending/` is empty). The coordinator removes `import.lock` when the process exits. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume create <new-name> --from <import-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming and doubles as the initial snapshot ULID recorded at `snapshots/<import-ulid>` inside the imported volume. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
 
-### Proposed: Async runtime scope
+### Async runtime scope
 
-The volume process carries tokio today to satisfy `object_store`'s async trait on the demand-fetch path *and* to host the embedded coordinator tasks (drain, GC, prefetch) and CLI subcommands that hit S3. NBD I/O, the volume actor, and its worker thread are all synchronous. The target state is that the volume binary carries no async runtime at all, leaving tokio confined to the coordinator (supervision, IPC, S3 mutation) and `elide-import` (OCI registry pulls).
-
-Three independent changes compose to get there:
-
-1. **Sync demand-fetch.** Replace `object_store` inside `elide-fetch` with `rust-s3` (`sync` feature — uses `attohttpc`, no tokio). `elide-fetch` exposes a small sync `RangeFetcher` trait with two built-in impls (S3 via `rust-s3`, local filesystem via `std::fs`). The coordinator continues to use `object_store` for its own list/put/delete and adapts its store to `RangeFetcher` when constructing a fetcher (cheap wrapper, runs on a `spawn_blocking` thread).
-2. **Thread-bounded async in ublk queue threads.** ublk integration confines async to the per-queue event loop: one `smol::LocalExecutor` per queue thread running async per-tag tasks, with backend work offloaded to a per-queue `std::thread` worker pool. Each worker owns its own `VolumeReader` and blocks on `crossbeam-channel` into the actor exactly as the NBD path does. The async surface is local to `src/ublk.rs`; `VolumeClient`/`VolumeReader` and everything downstream stay synchronous. Completions cross from worker threads back into the queue's io_uring via an eventfd watched by the queue's own ring — see `docs/design-ublk-transport.md` for why that bridge is necessary.
-3. **Drop `tokio` from `elide/Cargo.toml`.** Requires (1), (2), *and* relocating the embedded coordinator-tasks loop and the CLI's S3 subcommands (`pull`, `ls`, fork-from-S3) out of the volume binary — either into `elide-coordinator` (the daemon) or behind a thin sync RPC to it.
-
-**Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping the actor and backend synchronous matches the I/O model at the actor interface (NBD and ublk both dispatch through synchronous `VolumeClient`/`VolumeReader` calls) and removes the only external dependency forcing a *global* async runtime into it. The `smol::LocalExecutor` inside each ublk queue thread is thread-local, not a runtime; it coexists fine with tokio if tokio is ever re-introduced for other reasons. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
-
-This is a direction, not a commitment. None of the three steps are required for current functionality; they are sequenced as the volume binary's dependencies are revisited. Step (1) is in progress: `elide-fetch` is being converted to a tokio-free crate even though the volume binary continues to depend on tokio for unrelated reasons.
+The volume's I/O hot path is synchronous: NBD I/O, the actor, the worker, demand-fetch (`elide-fetch` uses `rust-s3` sync). ublk queue threads run a thread-local `smol::LocalExecutor`, scoped to the queue. tokio remains a dependency of the volume binary only because of embedded coordinator-tasks code that has not yet been relocated. See [notes/design-async-runtime-scope.md](notes/design-async-runtime-scope.md).
 
 ## Correctness foundations
 
@@ -370,34 +360,6 @@ Regardless of mode, on startup the coordinator:
 
 Re-adoption means the supervisor task polls the existing process until it exits naturally, then restarts it as normal. The volume's WAL and segments are untouched.
 
-### Proposed: Volume stop/start and coordinator quiesce
-
-These operations give explicit control over individual volumes or all volumes while the coordinator keeps running. They are the right tool for planned maintenance, controlled shutdown of a single VM, or draining a host before an upgrade.
-
-**`volume stop <name>`** — stop a single volume:
-1. Send SIGTERM to the volume process (via `volume.pid`)
-2. Write `<vol-dir>/volume.stopped`
-3. Supervisor sees the marker and does not restart
-
-**`volume start <name>`** — start a previously stopped volume:
-1. Remove `<vol-dir>/volume.stopped`
-2. Supervisor picks it up on the next scan and starts the process normally
-
-**`coordinator quiesce`** — stop all running volumes:
-1. For each supervised fork: send SIGTERM, write `volume.stopped`
-2. Coordinator keeps running; drain, GC, and inbound socket remain active
-3. No volumes will be restarted until explicitly started again
-
-**`coordinator resume`** — start all stopped volumes:
-1. For each fork with `volume.stopped`: remove the marker
-2. Supervisor picks them up on the next scan
-
-The `volume.stopped` marker persists across coordinator restarts. A quiesced host stays quiesced even if the coordinator is restarted — this is intentional. Resumption is always an explicit act.
-
-**Foreground Ctrl-C** does not write `volume.stopped`. There is no need — the coordinator is exiting anyway. On next coordinator start, volumes will be started normally (or re-adopted if still running).
-
-**Relationship to `volume remove`:** `remove` requires `volume.stopped` to already be present — the volume must be halted first. `stop` is the right operation when you want the volume to remain but not serve I/O. `stop` is symmetric across writable and readonly volumes: in both modes it halts the local daemon and writes `volume.stopped`; the bucket-side `Live → Stopped` transition only applies to writable records (readonly records are already in their own terminal state).
-
 ### IPC is optional
 
 The coordinator skips compaction and GC steps gracefully if `control.sock` is absent (volume not running). Loss of the channel degrades background efficiency but never affects correctness or I/O availability — the volume never blocks on the coordinator.
@@ -532,183 +494,15 @@ Most verbs follow the standard one-request / one-reply model. `import-attach` is
 
 `rescan` is the lightweight hook used by `create` and `fork-create`. The coordinator runs a discovery pass immediately and starts supervising any new volumes found.
 
-**Authentication.** `register { volume_ulid }` uses SO_PEERCRED to bind the issued macaroon to the connecting volume process's PID — the coordinator refuses if the peer's PID does not match the volume's recorded `volume.pid`. `credentials { macaroon }` re-checks SO_PEERCRED against the macaroon's `pid` caveat, then delegates to the configured `CredentialIssuer`. See *S3 credential distribution via macaroons* below.
+**Authentication.** `register { volume_ulid }` uses SO_PEERCRED to bind the issued macaroon to the connecting volume's PID. `credentials { macaroon }` re-checks SO_PEERCRED against the macaroon's `pid` caveat, then delegates to the configured `CredentialIssuer`.
 
-The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**. See *Isolation model* below for what this does and does not enforce.
+## Credential distribution
 
-## Proposed: Operator tokens
+The coordinator holds the only copy of read-write S3 credentials. Volume processes hold short-lived read-only credentials for demand-fetch, gated by **macaroons**: typed, MAC-keyed bearer tokens minted at volume startup and verified statelessly on every credential request. Each macaroon is bound to the spawning process's PID via `SO_PEERCRED`, so a leaked token is useless from any other process.
 
-Operator tokens are macaroons minted by the coordinator for human operators (CLI usage). They are not PID-bound — identity is carried by the token itself, enabling audit logging and attenuation.
+The credential issuer is pluggable (`CredentialIssuer` trait, `elide-coordinator/src/credential.rs`). The default `SharedKeyPassthrough` returns the coordinator's own configured key, with no per-volume scoping — adequate for single-tenant deployments and equivalent to the previous `get-store-creds` behaviour. Per-volume scoped issuers (AWS STS, Tigris IAM `CreateAccessKey` with `DateLessThan`) are planned for multi-tenant deployments and slot in behind the same trait without changing the handshake.
 
-**Issuance:**
-
-```
-elide-coordinator token create [--expires 24h] [--volume <name>]
-```
-
-Prints a macaroon to stdout. The operator stores it in `~/.elide/operator-token` or passes it explicitly. The coordinator logs token creation with a unique nonce.
-
-**Caveats on an operator token:**
-
-| Caveat | Value | Purpose |
-|---|---|---|
-| `role` | `operator` | Distinguishes from volume tokens |
-| `not-after` | `<expiry>` | Required; no indefinite operator tokens |
-| `volume` | `<name>` | Optional; restrict to a specific volume |
-
-**How the CLI uses it:**
-
-The `elide` CLI locates the operator token in this order:
-1. `--token <value>` flag
-2. `ELIDE_OPERATOR_TOKEN` environment variable
-3. `~/.elide/operator-token` file
-
-It is presented with any coordinator mutation that requires one (currently: `delete`).
-
-**Attenuation:** an operator can narrow their token before sharing it — for example, scoping it to a single volume or shortening the expiry — without involving the coordinator. The coordinator verifies all caveats on receipt.
-
-**Audit log:** the coordinator logs every operator-token-authenticated operation with the token's nonce, the operation, and the timestamp. This provides a trail of who did what and when, traceable back to the `token create` event.
-
-## Proposed: Isolation model
-
-Volume processes on the same host share a uid and a filesystem. This has direct consequences for what the macaroon scheme can and cannot enforce.
-
-**What macaroons do not enforce — local filesystem:** a compromised volume process can read or corrupt any other volume's local directory directly, without touching the coordinator. Macaroons provide no protection here. Proper local isolation requires OS-level mechanisms: separate uids per volume, Linux user namespaces, or running each volume in its own container. This is a separate layer and is not addressed by the current design.
-
-**What macaroons do enforce — S3:** S3 credentials are scoped by IAM to a specific volume's prefix. This enforcement is external to Elide — AWS (or equivalent) rejects requests that exceed the credential's scope regardless of what the caller claims. The macaroon scheme ensures a volume process can only obtain credentials for its own volume. A compromised `myvm` process cannot request credentials for `othervm`, so it cannot read, write, or delete `othervm`'s S3 objects even with full local filesystem access.
-
-**What macaroons provide for coordinator operations — defense-in-depth:** requiring a volume-scoped macaroon for coordinator mutations (e.g. `delete`) raises the bar slightly over bare socket access, and provides an audit trail. It does not prevent a compromised process from achieving the same effect via direct filesystem manipulation. The value here is auditability and protocol clarity, not a hard security boundary.
-
-**Summary:**
-
-| Resource | Isolation mechanism | Enforced by |
-|---|---|---|
-| S3 data | IAM credential scoping + macaroon gating | AWS + coordinator |
-| Local filesystem | uid separation / namespacing | OS (not yet implemented) |
-| Coordinator mutations | Macaroon + audit log | Coordinator (defense-in-depth) |
-
-## Proposed: S3 credential distribution via macaroons
-
-The coordinator holds the only copy of read-write S3 credentials. Volume processes receive **short-lived read-only credentials** for demand-fetch only, authenticated via macaroons.
-
-### Macaroon model
-
-The coordinator holds a **root key** (32 random bytes, generated at first start, stored at `<data_dir>/coordinator.root_key` with mode 0600). It uses this to mint per-volume macaroons — keyed-BLAKE3 bearer tokens with a chain of typed caveats. Verification is stateless: the coordinator re-derives the expected MAC from the root key and the caveat chain; no token storage is needed.
-
-**Caveats on a volume macaroon:**
-
-| Caveat | Value | Purpose |
-|---|---|---|
-| `volume` | `<volume-name>` | Binds token to this volume only |
-| `scope` | `credentials` | Limits token to credential requests only |
-| `pid` | `<process-pid>` | Locks token to the spawned process (see below) |
-
-### Registration flow (how a volume gets its macaroon)
-
-The PID is only known after the volume process is spawned, so the macaroon cannot be minted before spawn. Instead, the volume registers with the coordinator on startup:
-
-1. Coordinator spawns volume process, records PID in `volume.pid`
-2. Volume connects to `control.sock` and sends `{"verb":"register","volume_ulid":"<ulid>"}`
-3. Coordinator reads peer credentials from the Unix socket connection → obtains peer PID
-4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>`? If not, replies with an `Envelope::Err { kind: "forbidden" }`
-5. Coordinator mints a macaroon with the caveats above (including `pid = <peer-pid>`) and replies `{"outcome":"ok","data":{"macaroon":"…"}}`
-6. Volume stores the macaroon in memory for all subsequent `credentials` requests
-
-The supervisor writes `volume.pid` immediately after `Command::spawn()` returns, but a fast-starting volume can reach step 2 before that write completes. The volume retries `register` a handful of times on a `forbidden` reply to absorb that window.
-
-### Credential exchange flow
-
-When the volume needs S3 credentials (at startup or before expiry):
-
-1. Volume sends `{"verb":"credentials","macaroon":"…"}` to `control.sock`
-2. Coordinator verifies the HMAC chain (proves it minted this token)
-3. Coordinator checks all caveats: volume/fork match, scope is `credentials`, `pid` matches `SO_PEERCRED` of the current connection
-4. Coordinator issues short-lived read-only credentials scoped to the volume's S3 prefix — `by_id/<volume-ulid>/*` (see *Directory layout on disk and in S3* above). The issuance mechanism depends on the backend; see *Credential backends* below.
-5. Replies `{"outcome":"ok","data":{access_key, secret_key, session_token, expiry_unix}}`
-
-The PID check on every request (step 3) means the macaroon is useless even if exfiltrated — it can only be presented from the original process. The HMAC chain means no volume can forge a token for a different volume.
-
-### Credential backends
-
-Step 4 delegates to a `CredentialIssuer` selected at coordinator startup from `coordinator.toml`. The macaroon handshake runs identically for every backend — only the credential material returned in step 5 changes.
-
-| Backend | Issuer | Notes |
-|---|---|---|
-| AWS S3 | STS `AssumeRole` with a session policy narrowing `s3:GetObject` to `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` | Session duration 15 min – 12 h; the coordinator's own role needs `sts:AssumeRole` on a dedicated read-only role |
-| S3-compatible with STS (e.g. MinIO, Ceph RGW/STS) | `AssumeRole` against the backend's STS endpoint with the same session policy | Compatibility varies by backend; the session policy shape is the portable part |
-| S3-compatible with IAM-keyed policies (e.g. Tigris) | Mint a per-volume access key via `CreateAccessKey`, attach a policy granting `s3:GetObject` on `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` with a `DateLessThan` condition for time-bounding | See *Issuer: Tigris-native* below. Coordinator's admin key needs `iam:CreateAccessKey` / `iam:DeleteAccessKey` / `iam:PutAccessKeyPolicy`; per-volume keys themselves remain narrowly scoped. |
-| S3-compatible without STS or per-key IAM | Coordinator returns its own configured read-only key pair with no per-volume scoping | Defense-in-depth only — the coordinator must be configured with a distinct read-only key, not the upload key. Logged as a downgrade at coordinator startup. |
-| Local filesystem (`elide_store/`) | No-op issuer — returns a sentinel the volume's fetcher treats as "no auth needed" | Used for tests and single-host deployments |
-
-The volume never negotiates the backend type. It treats the returned triple as opaque and passes it to `object_store`; the no-op sentinel is detected by the fetcher and skips signing entirely.
-
-### Issuer: Tigris-native (no STS, IAM-policied keys)
-
-Tigris does not implement STS, but its IAM API supports per-access-key policies, programmatic key management, and time-bounded `Date*` conditions. This is enough to provide per-volume credential scoping without falling back to a shared key.
-
-On a `credentials` request, the issuer:
-
-1. Calls `CreateAccessKey` against Tigris's IAM endpoint, authenticated with an admin key configured in `coordinator.toml`.
-2. Attaches a policy to the new key:
-
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [{
-       "Effect": "Allow",
-       "Action": ["s3:GetObject"],
-       "Resource": ["arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*"],
-       "Condition": {
-         "DateLessThan": {"aws:CurrentTime": "<now + lifetime>"}
-       }
-     }]
-   }
-   ```
-
-3. Returns `ok <access-key> <secret-key> "" <expiry-unix>` — the session-token slot is empty; the expiry comes from the policy condition, not from the credential material itself.
-
-The key remains usable until the `DateLessThan` deadline passes, after which Tigris rejects all signatures regardless of policy attachment or clock state. Refresh follows the path described in *Refresh and clock skew*: the volume re-issues `credentials` ahead of expiry, the coordinator mints a fresh key with an extended deadline, and the previous key is scheduled for `DeleteAccessKey` after a short grace period (e.g. 60 s) to cover signed requests already in flight.
-
-**Coordinator privilege.** Unlike the AWS-STS path (which only needs `sts:AssumeRole` on a single read-only role), the Tigris-native issuer requires the coordinator's admin key to hold `iam:CreateAccessKey`, `iam:DeleteAccessKey`, and `iam:PutAccessKeyPolicy`. This is a strictly stronger privilege set than today's S3 RW key, and the admin key must be guarded accordingly. Per-volume keys minted by it remain narrowly scoped — only the admin key itself is privileged.
-
-**Eventual consistency.** Newly created access keys may take a brief window (typically sub-second) before signed requests using them succeed. The fetcher's existing 403-retry-with-refresh path absorbs this; no separate logic is needed.
-
-**Quota.** Tigris does not document a per-organization access-key cap. For deployments managing thousands of concurrent volumes per coordinator this should be verified before relying on per-volume keys at scale; for tens of volumes it is not a concern.
-
-**Standalone-mode shortcut.** When the operator does not need per-volume scoping (single-tenant dev, no untrusted volumes), the same Tigris account can be used with the *S3-compatible without STS or per-key IAM* row above — i.e. a single static read-only key shared across volumes. The Tigris-native issuer is the per-volume upgrade path, not a requirement.
-
-### Token lifetime
-
-The macaroon lives for the lifetime of the volume process. "Token dies when process is stopped" is the revocation model: when the coordinator stops a volume (on `delete` or coordinator shutdown), the PID is no longer live. Any subsequent `credentials` request with the old macaroon fails the `SO_PEERCRED` check — the PID either doesn't exist or belongs to a different process.
-
-No revocation list is needed. This holds as long as the coordinator runs on the same host as the volumes. If the coordinator were ever moved off-host (not a current goal), the `SO_PEERCRED` check would be unavailable and explicit revocation would need to be designed.
-
-### Attenuation
-
-Because macaroons are additive-restriction-only, the volume can narrow its token before passing it to a subprocess (e.g. a future out-of-process demand-fetch helper):
-
-```
-original:   volume=myvm, scope=credentials, pid=1234
-attenuated: volume=myvm, scope=credentials, pid=1234, not-after=<+5m>
-```
-
-The attenuated token is derived by the volume in-process — no coordinator round-trip. The coordinator verifies all caveats including the narrowed `not-after`.
-
-### Refresh and clock skew
-
-Short-lived credentials require the volume to refresh before expiry. The fetcher holds a `CredentialProvider` that re-issues a `credentials <macaroon>` request when the remaining lifetime drops below 10%, or 60 s, whichever is greater. Refresh is lazy — driven by the next fetch request, not a background timer — so an idle volume holds stale credentials until it next needs to fetch.
-
-A fetch that receives HTTP 403 retries once after forcing a credential refresh. This absorbs clock skew between coordinator, volume, and the backend's signing check. A second 403 propagates as a fetch error.
-
-In-flight fetches started under the old credentials are not cancelled on refresh — they either succeed under the old signature or fail and retry with the new one. No lock is held across refresh.
-
-### Standalone mode (no coordinator)
-
-`serve-volume` accepts `--s3-access-key`, `--s3-secret-key`, `--s3-session-token` flags for direct credential passing. No macaroon is involved. This supports the fully standalone tier and is also useful for development.
-
-### Implementation note
-
-The caveat set is small and typed (`volume`, `scope`, `pid`, optionally `not-after`). It is implemented in `elide-coordinator/src/macaroon.rs` (~270 lines) using `blake3::keyed_hash` for the MAC; the existing `macaroon` crate on crates.io was considered but its untyped string-caveat surface is a worse fit than a typed enum here. Wire format is a single hex line over the existing IPC line protocol: `v1.<32-byte mac, hex>.<caveat blob, hex>`.
+The isolation boundary is narrow: macaroons enforce that a volume process can only request credentials for its own volume. They do **not** enforce local-filesystem isolation between co-resident volumes — that requires OS-level separation (uid, namespace, container) and is not part of the current design. See [notes/design-credential-macaroons.md](notes/design-credential-macaroons.md) for the full handshake, [notes/design-isolation-model.md](notes/design-isolation-model.md) for the boundary surface, and [notes/design-operator-tokens.md](notes/design-operator-tokens.md) for the proposed operator-token surface for human-driven CLI mutations.
 
 ## Import process lifecycle
 
@@ -946,54 +740,11 @@ The invariant **"every DedupRef target ULID ≤ the snapshot floor on its owning
 
 **2. Canonical-presence invariant.** For every live DedupRef hash H, `extent_index.lookup(H)` returns a DATA entry. The location of that DATA entry is irrelevant — it may be in any segment, local or S3-backed, and may be moved by GC via Repack — but it must exist. This is what makes the DedupRef resolvable at all.
 
-The canonical-presence invariant is maintained by GC's liveness rule: a DATA entry is kept alive if **any** LBA in the volume references its hash, including LBAs that reference the hash via a DedupRef. This is load-bearing on `lba_map::live_hashes()` being sourced from the LBA map directly (every `(lba → hash)` entry contributes, with no kind discrimination between DATA-sourced and DedupRef-sourced LBAs). See the worked examples below.
+The canonical-presence invariant is maintained by GC's liveness rule: a DATA entry is kept alive if **any** LBA in the volume references its hash, including LBAs that reference the hash via a DedupRef. This is load-bearing on `lba_map::live_hashes()` being sourced from the LBA map directly (every `(lba → hash)` entry contributes, with no kind discrimination between DATA-sourced and DedupRef-sourced LBAs).
 
 An unsnapshotted volume may hold DedupRefs whose targets are in the same live window and not yet pinned — but such a volume has no S3 presence for those segments either, so the thin-upload question does not arise until the first snapshot, at which point the invariant is re-established.
 
-### Worked examples: two DedupRefs with the same hash in one segment
-
-Two edge cases worth making explicit, since they test both invariants simultaneously.
-
-**Variant (a) — both DedupRefs to an external canonical.** A segment S contains two index entries with the same hash H, both DedupRef. The canonical DATA for H lives in some other segment S_canon (an ancestor segment, a prior segment in this volume, or a segment in another volume under the same dedup scope).
-
-- Format: both entries have `stored_offset = 0, stored_length = 0`. Neither contributes to S's `body_length`.
-- LBA map rebuild: both entries contribute `(lba → H)`. Two distinct LBAs both resolve to H.
-- Extent index rebuild: both are skipped (DedupRef never enters the extent index). The extent index maps `H → S_canon` from S_canon's own scan.
-- Reads of either LBA → `extent_index.lookup(H) → S_canon` → serve from S_canon's body. Correct.
-- GC of S: both DedupRef entries kept alive iff their LBAs are live. DedupRef passes through to the GC output unchanged. `H`'s canonical stays in S_canon (or is Repacked there by a separate GC pass).
-
-**Variant (b) — one DATA + one DedupRef to the sibling DATA, same segment.** A segment S contains a DATA entry for H at LBA1 and a DedupRef for H at LBA2. The DATA entry in S is the canonical for H.
-
-- Format: the DATA entry has `stored_offset = X, stored_length = L, body_length += L`. The DedupRef has `stored_offset = 0, stored_length = 0, body_length += 0`.
-- LBA map rebuild: both contribute: `LBA1 → H` and `LBA2 → H`.
-- Extent index rebuild: DATA inserts `H → {segment=S, body_offset=X, body_length=L}`. DedupRef is skipped (order-independent).
-- Reads of LBA1 and LBA2 both resolve through `extent_index.lookup(H)` back into S at offset X. Correct.
-- GC of S, with LBA1 overwritten (now maps to some other hash H'): the DATA at LBA1 has `lba_live = false` but `extent_live = true` (it is canonical for H) and `live_hashes.contains(H) = true` (because LBA2 still references H via the DedupRef). The DATA is therefore kept alive and carried into the GC output — the sibling DedupRef at LBA2 is what keeps it alive.
-
-**Why `live_hashes()` must be sourced from the LBA map, not from extent_index keys.** Variant (b) only works because `lba_map::live_hashes()` is `self.inner.values().map(|e| e.hash).collect()` — every hash in the LBA map contributes, whether the LBA was populated via a DATA write or a DedupRef write. If `live_hashes()` were ever "optimised" to a DATA-only filter, the DATA at LBA1 in variant (b) would become invisible to GC (not in live_hashes, not lba_live) and would be dropped as dead. The sibling DedupRef at LBA2 would then lose its canonical, violating the canonical-presence invariant. The function's name is worth hardening (`lba_referenced_hashes()` is more precise and hostile to this misreading) and the behaviour is worth a regression test.
-
-**Delta compression** is a separate concern from dedup. See [design-delta-compression.md](notes/design-delta-compression.md) for the full sequencing; the summary below covers the format interaction with GC, the extent index, and `lba_referenced_hashes`.
-
-**Source selection** is filemap path-matching across imported snapshots linked by `extent_index` provenance lineage. For a changed file in a child import, the natural delta source is the same path in the parent import. Filemap-based delta, computed in-process in `elide-import` after pending segments are written but before the volume is promoted, is the single production delta path.
-
-**Thin delta entries.** `EntryKind::Delta` mirrors the format-level shape of thin DedupRef: `stored_offset = 0`, `stored_length = 0`, no body bytes anywhere. The entry's content is materialised by fetching a delta blob from the segment's delta body section and decompressing it against a source extent body located via `extent_index.lookup(source_hash)`. Multiple delta options per entry act as hints; the reader picks the first whose source resolves (earliest-source preference).
-
-- **Delta source must be a DATA entry** — never another Delta. No delta-of-delta chains.
-- **Unified across `pending/`, `cache/`, and S3**, same as DedupRef. The delta body section is preserved on disk and in S3; Delta entries contribute nothing to `body_length`.
-- **Read path:** `extent_index.lookup(source_hash)` → fetch source body → fetch delta blob → zstd-dict decompress. If no option's source resolves, the fetch fails; there is no full-body fallback in the same segment (the price of thin delta).
-
-**Two invariants make thin Delta sound**, mirroring the DedupRef invariants:
-
-1. **Pinning invariant.** Every live Delta's source extent lives in a segment GC cannot rewrite or remove. Cross-import delta sources come from `extent_index` provenance lineage, which names only fully-snapshotted ancestors (enforced at import time). Combined with the snapshot floor + first-snapshot pinning rules, the source segment is GC-stable for the lifetime of any Delta referencing it.
-2. **Canonical-presence invariant.** For every live Delta with source hash H, `extent_index.lookup(H)` returns a DATA entry. Maintained by the liveness-rule extension below.
-
-**`lba_referenced_hashes()` extension.** The set is extended to include delta source hashes for every live Delta LBA. With this folding, GC's existing rule — "keep DATA alive iff any live LBA references its hash" — automatically covers delta sources with no new code path. The rule's load-bearing property (variant (b) DedupRef correctness) is unchanged; the set simply contains more hashes per live LBA in the Delta case.
-
-**GC under Delta entries.** GC carries Delta entries through `compact_candidates_inner` unchanged, same pattern as DedupRef: a match arm that debug-asserts `stored_offset == 0, stored_length == 0`, copies the entry through to the output, and skips `fetch_live_bodies`. The delta blob stays in its source segment's delta body section across GC runs — GC does not move delta blobs between segments. Repack handoff lines are emitted only for DATA entries.
-
-Historical note: an earlier design considered delta compression as purely S3-side, with local segments carrying full extents and the coordinator computing deltas fresh at upload. Thin delta collapses this — the producer writes the delta entry thin in-process during import, so local and S3 layouts stay unified (the same "no local/S3 asymmetry" property that thin DedupRef establishes).
-
-Delta compression is compelling for point-release image updates; not worth the complexity for cross-version (major version) updates where content is genuinely different throughout.
+**Delta entries (thin delta)** mirror the DedupRef shape: empty body slot, source resolved through `extent_index.lookup(source_hash)`, materialised by zstd-dict decompression at read time. The same pinning and canonical-presence invariants apply, with `lba_referenced_hashes()` extended to include each live Delta's source hash. See [notes/design-delta-compression.md](notes/design-delta-compression.md) for sequencing and [notes/design-dedup-delta-invariants.md](notes/design-dedup-delta-invariants.md) for worked examples and the GC interaction.
 
 ## Named Forks and Volume Addressing
 
