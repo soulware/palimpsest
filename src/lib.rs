@@ -179,9 +179,12 @@ fn build_s3_store(
     let bucket = config.bucket.clone().ok_or_else(|| {
         io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
     })?;
-    let creds =
-        creds.ok_or_else(|| io::Error::other("S3 fetcher requires explicit credentials"))?;
     if let Some(reissue) = reissue {
+        // Coordinator-vended path: cold-start the lazy wrapper. The
+        // first demand fetch (if any) will issue a `Credentials` IPC
+        // and build the inner `S3RangeFetcher`. Volumes whose warm
+        // plan is empty and whose reads are all cached never trigger
+        // an issuance.
         let issuer = Arc::new(creds_fetcher::CoordinatorIssuer::new(
             reissue.coordinator_socket,
             reissue.macaroon,
@@ -190,13 +193,15 @@ fn build_s3_store(
             bucket,
             config.endpoint.clone(),
             config.region.clone(),
-            creds,
             issuer,
             creds_fetcher::DEFAULT_CREDS_IDLE_TTL,
-        )?;
+        );
         return Ok(lazy);
     }
-    // Standalone fallback: hold creds for the life of the process.
+    // Standalone fallback: hold creds for the life of the process —
+    // there is no IPC path to ask for fresh ones.
+    let creds =
+        creds.ok_or_else(|| io::Error::other("S3 fetcher requires explicit credentials"))?;
     config.build_fetcher(Some(creds))
 }
 

@@ -38,13 +38,15 @@ pub use elide_coordinator::volume_state::VolumeLifecycle;
 /// the supervisor's restart loop fires.
 pub const PREFETCH_AWAIT_BUDGET: Duration = Duration::from_secs(60);
 
-/// Result of [`Client::register_and_get_creds`]: the issued credentials,
-/// the macaroon (retained so the volume can re-issue creds via
-/// [`Client::macaroon_credentials`] after dropping the cached set on
-/// idle), plus the optional peer-fetch endpoint vended in the
-/// registration reply.
+/// Result of [`Client::register_volume_with_retry`]: the macaroon
+/// (used by the lazy-creds wrapper to acquire S3 credentials on the
+/// first demand fetch and re-acquire after each idle drop) plus the
+/// optional peer-fetch endpoint vended in the registration reply.
+///
+/// No S3 credentials are issued at this point — the volume calls the
+/// coordinator's `Credentials` IPC lazily, only when its first cache
+/// miss requires an S3 GET.
 pub struct RegisteredVolume {
-    pub creds: StoreCreds,
     pub macaroon: String,
     pub peer_endpoint: Option<PeerEndpoint>,
 }
@@ -212,23 +214,27 @@ impl Client {
         .map_err(io::Error::other)
     }
 
-    /// Combined registration + credential fetch with retry.
+    /// Register the volume and obtain its macaroon, with retry on the
+    /// pid-not-yet-written race.
     ///
     /// The supervisor writes `volume.pid` after `Command::spawn()`
     /// returns, which can race against a fast-starting volume reaching
     /// this code path before the parent has flushed the pid file. We
     /// retry a handful of times with short backoff to absorb that
     /// window.
-    pub fn register_and_get_creds(&self, volume_ulid: &str) -> io::Result<RegisteredVolume> {
+    ///
+    /// No `Credentials` IPC is issued here — the lazy-creds wrapper
+    /// calls it on the first demand fetch only, so volumes whose warm
+    /// plan is empty and whose reads are all cached never trigger an
+    /// S3-credentials issuance.
+    pub fn register_volume_with_retry(&self, volume_ulid: &str) -> io::Result<RegisteredVolume> {
         const MAX_ATTEMPTS: u32 = 10;
         const BACKOFF_MS: u64 = 50;
         let mut last_err: Option<io::Error> = None;
         for _ in 0..MAX_ATTEMPTS {
             match self.register_volume(volume_ulid) {
                 Ok(reply) => {
-                    let creds = self.macaroon_credentials(&reply.macaroon)?;
                     return Ok(RegisteredVolume {
-                        creds,
                         macaroon: reply.macaroon,
                         peer_endpoint: reply.peer_endpoint,
                     });

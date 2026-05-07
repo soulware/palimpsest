@@ -2054,12 +2054,10 @@ fn fetch_config_via_coordinator_macaroon(
             "coordinator returned empty store config",
         ));
     };
-    let registered = coord.register_and_get_creds(volume_ulid)?;
-    let creds = elide_fetch::S3Credentials {
-        access_key_id: registered.creds.access_key_id,
-        secret_access_key: registered.creds.secret_access_key,
-        session_token: registered.creds.session_token,
-    };
+    // Register only — do not request credentials. The lazy-creds
+    // wrapper will issue a `Credentials` IPC the first time the
+    // volume actually needs to talk to S3.
+    let registered = coord.register_volume_with_retry(volume_ulid)?;
     let reissue = elide::CredsReissue {
         coordinator_socket: coord.socket_path().to_path_buf(),
         macaroon: registered.macaroon,
@@ -2072,7 +2070,7 @@ fn fetch_config_via_coordinator_macaroon(
             local_path: None,
             fetch_batch_bytes: None,
         }),
-        creds: Some(creds),
+        creds: None,
         reissue: Some(reissue),
         peer_endpoint: registered.peer_endpoint,
     }))

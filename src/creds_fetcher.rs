@@ -81,34 +81,28 @@ pub struct LazyCredsFetcher {
 }
 
 impl LazyCredsFetcher {
-    /// Build a wrapper pre-warmed with `initial_creds`. The TTL clock
-    /// starts immediately; warm-stage activity keeps the cached
-    /// fetcher alive.
+    /// Build a wrapper that holds no credentials. The first
+    /// `get_range` call invokes `issuer` to acquire creds and build
+    /// an `S3RangeFetcher` — volumes whose warm plan is empty and
+    /// whose reads are all cached never trigger an issuance.
     pub fn new(
         bucket: String,
         endpoint: Option<String>,
         region: Option<String>,
-        initial_creds: S3Credentials,
         issuer: Arc<dyn CredsIssuer>,
         ttl: Duration,
-    ) -> io::Result<Arc<Self>> {
-        let fetcher = S3RangeFetcher::new(
-            &bucket,
-            endpoint.as_deref(),
-            region.as_deref(),
-            initial_creds,
-        )?;
+    ) -> Arc<Self> {
         let me = Arc::new(Self {
             bucket,
             endpoint,
             region,
             issuer,
-            inner: RwLock::new(Some(Arc::new(fetcher))),
+            inner: RwLock::new(None),
             last_use_unix: AtomicU64::new(now_unix()),
             ttl,
         });
         spawn_idle_timer(Arc::downgrade(&me));
-        Ok(me)
+        me
     }
 
     fn touch(&self) {
@@ -228,64 +222,57 @@ mod tests {
         }
     }
 
+    fn build_fetcher(issuer: Arc<StubIssuer>, ttl: Duration) -> Arc<LazyCredsFetcher> {
+        LazyCredsFetcher::new(
+            "test-bucket".into(),
+            Some("http://127.0.0.1:1".into()),
+            Some("us-east-1".into()),
+            Arc::clone(&issuer) as Arc<dyn CredsIssuer>,
+            ttl,
+        )
+    }
+
     /// Drives the wrapper directly via [`LazyCredsFetcher::acquire`] /
     /// idle bookkeeping rather than [`RangeFetcher::get_range`], because
     /// the latter would issue a real S3 request against an unreachable
     /// bucket. The two paths share the same caching primitives, so this
     /// covers them both.
     #[test]
-    fn idle_timer_drops_cached_fetcher_after_ttl() {
+    fn cold_start_then_acquire_then_idle_drop() {
         let issuer = StubIssuer::new();
-        let initial = S3Credentials {
-            access_key_id: "init-key".into(),
-            secret_access_key: "init-secret".into(),
-            session_token: None,
-        };
         let ttl = Duration::from_secs(2);
-        let fetcher = LazyCredsFetcher::new(
-            "test-bucket".into(),
-            Some("http://127.0.0.1:1".into()),
-            Some("us-east-1".into()),
-            initial,
-            Arc::clone(&issuer) as Arc<dyn CredsIssuer>,
-            ttl,
-        )
-        .expect("build wrapper");
+        let fetcher = build_fetcher(Arc::clone(&issuer), ttl);
 
-        // Pre-warmed: inner is Some, no issuer call yet.
-        assert!(fetcher.inner.read().unwrap().is_some());
-        assert_eq!(issuer.count(), 0);
-
-        // Wait past the TTL + check interval. With ttl=2s, check
-        // interval is 1s, so within 4s the timer should drop.
-        thread::sleep(Duration::from_secs(4));
+        // Cold start — no inner fetcher, no issuer calls.
         assert!(fetcher.inner.read().unwrap().is_none());
         assert_eq!(issuer.count(), 0);
 
-        // Re-acquiring rebuilds the fetcher and bumps the counter.
-        let _ = fetcher.acquire().expect("re-acquire");
+        // First acquire issues creds and builds the inner fetcher.
+        let _ = fetcher.acquire().expect("acquire");
         assert!(fetcher.inner.read().unwrap().is_some());
         assert_eq!(issuer.count(), 1);
+
+        // Wait past TTL + check interval. With ttl=2s, check
+        // interval is 1s, so within 4s the timer should drop.
+        thread::sleep(Duration::from_secs(4));
+        assert!(fetcher.inner.read().unwrap().is_none());
+        assert_eq!(issuer.count(), 1);
+
+        // Next acquire re-issues.
+        let _ = fetcher.acquire().expect("re-acquire");
+        assert!(fetcher.inner.read().unwrap().is_some());
+        assert_eq!(issuer.count(), 2);
     }
 
     #[test]
     fn touch_resets_idle_clock() {
         let issuer = StubIssuer::new();
-        let initial = S3Credentials {
-            access_key_id: "init-key".into(),
-            secret_access_key: "init-secret".into(),
-            session_token: None,
-        };
         let ttl = Duration::from_secs(3);
-        let fetcher = LazyCredsFetcher::new(
-            "test-bucket".into(),
-            Some("http://127.0.0.1:1".into()),
-            Some("us-east-1".into()),
-            initial,
-            Arc::clone(&issuer) as Arc<dyn CredsIssuer>,
-            ttl,
-        )
-        .expect("build wrapper");
+        let fetcher = build_fetcher(Arc::clone(&issuer), ttl);
+
+        // Populate the inner so the timer has something to drop.
+        let _ = fetcher.acquire().expect("acquire");
+        assert_eq!(issuer.count(), 1);
 
         for _ in 0..6 {
             thread::sleep(Duration::from_millis(800));
@@ -293,9 +280,9 @@ mod tests {
         }
         // Total elapsed ~4.8s; with ttl=3s the timer would have
         // fired had touch() not reset the clock. Inner must still
-        // be present.
+        // be present and no re-issue.
         assert!(fetcher.inner.read().unwrap().is_some());
-        assert_eq!(issuer.count(), 0);
+        assert_eq!(issuer.count(), 1);
     }
 
     #[test]
@@ -304,21 +291,18 @@ mod tests {
         // a Weak; releasing the last strong reference must let the
         // thread observe `upgrade() == None` and exit cleanly.
         let issuer = StubIssuer::new();
-        let initial = S3Credentials {
-            access_key_id: "k".into(),
-            secret_access_key: "s".into(),
-            session_token: None,
-        };
-        let fetcher = LazyCredsFetcher::new(
-            "b".into(),
-            Some("http://127.0.0.1:1".into()),
-            Some("us-east-1".into()),
-            initial,
-            Arc::clone(&issuer) as Arc<dyn CredsIssuer>,
-            Duration::from_secs(2),
-        )
-        .expect("build");
+        let fetcher = build_fetcher(issuer, Duration::from_secs(2));
         drop(fetcher);
         thread::sleep(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cold_volume_never_issues_creds() {
+        // The whole point of cold-start: a volume that never calls
+        // get_range / acquire must never trigger an issuance.
+        let issuer = StubIssuer::new();
+        let _fetcher = build_fetcher(Arc::clone(&issuer), Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(3));
+        assert_eq!(issuer.count(), 0);
     }
 }
