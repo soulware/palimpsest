@@ -1,179 +1,50 @@
-# Plan: offload heavy work from the volume actor
+---
+status: landed
+related: [plan-promote-offload.md, plan-promote-segment-offload.md, plan-snapshot-offload.md]
+landed_in: ../architecture.md
+---
 
-**Status:** Complete. All seven steps are merged on `main`:
+# Offload heavy work from the volume actor
 
-- Step 1 — CAS inserts on `extent_index` (PR #51).
-- Step 2 — WAL promote offload + worker thread (PRs #55, #56, #57); WAL fsync itself moved onto the worker in PR #67.
-- Step 3 — `apply_gc_handoffs` offload (PR #58).
-- Step 4 — `promote_segment` offload (PR #59, landed out-of-sequence to prioritise per-upload actor stalls on a live dd workload).
-- Step 5 — shared `SegmentIndexCache` (PR #61), now covering all worker-thread segment reads and the actor-thread compact_pending scan.
-- Step 6 — `sweep_pending` (PR #62, 6a), `repack` (PR #64, 6b), `delta_repack_post_snapshot` (PR #65, 6c).
-- Step 7 — `sign_snapshot_manifest` offload + deletion of the dead `VolumeRequest::Snapshot` (PR #68); see [plan-snapshot-offload.md](plan-snapshot-offload.md).
+`VolumeActor` (`elide-core/src/actor.rs`) processes all mutating requests on a single thread. A clean design for correctness, but slow ops (`flush_wal`, `apply_gc_handoffs`, `sweep_pending`, `repack`, `delta_repack_post_snapshot`, `snapshot`, `promote_segment`) blocked queued writes behind them — 100 ms to seconds of write-tail latency under maintenance.
 
-The only remaining follow-ups are noted in-line: per-segment parallelism for delta_repack, and the out-of-scope coordinator-side blocking-GC issue at the bottom of this doc.
+The seven-step plan offloaded each of these onto a single long-lived **worker thread** dispatching `WorkerJob` variants, keeping write throughput unaffected during maintenance. Reads were already lock-free and stayed so.
 
-The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, `PromoteSegment`, `Sweep`, `Repack`, `DeltaRepack`, and `SignSnapshotManifest`). Further offloads would add new `WorkerJob` variants rather than spawning new threads.
+## The shape every offload shared
 
-## Problem
+1. **Prep** (on actor): snapshot inputs — live-hash set, `Arc<ExtentIndex>`, floor ULID, owned `pending_entries`, file paths.
+2. **Heavy middle** (pure, off actor): read segments, verify, decompress, write new segments, fsync, compute deltas. A pure function of the prep snapshot plus filesystem paths; touches no mutable `Volume` state.
+3. **Apply** (on actor): update `extent_index` via CAS primitives, evict `file_cache`, publish snapshot, rename/delete files.
 
-`VolumeActor` (`elide-core/src/actor.rs`) owns the `Volume` exclusively and processes all mutating requests on a single thread. Reads bypass the actor entirely via an `ArcSwap<ReadSnapshot>` and never contend. Writes, flushes, compaction, GC-handoff application, delta-repack, snapshot, and `promote_segment` all run on the actor thread and serialize against each other through the crossbeam channel.
+Only (1) and (3) need the actor. (2) runs on the worker thread and delivers its result back through a channel. No new locks, no new synchronization primitives.
 
-This is a clean design for correctness but creates write-tail latency under maintenance: a slow op on the actor blocks every queued write behind it. The worst offenders are in the 100 ms – seconds range.
+## Prerequisite: conditional inserts
 
-| Op | Typical cost | Frequency |
-|---|---|---|
-| `flush_wal` / promote | 10–500 ms | every 32 MiB written or 10 s idle |
-| `apply_gc_handoffs` re-sign | 10s–100s ms per handoff | idle tick + explicit |
-| `sweep_pending` / `repack` | 100s ms – seconds | explicit |
-| `delta_repack_post_snapshot` | seconds | explicit, post-snapshot |
-| `snapshot` (full) | seconds | explicit |
-| `promote_segment` | 10s–100s ms | every confirmed S3 upload |
+`ExtentIndex::replace_if_matches` (and later `remove_if_matches`) makes apply phases CAS-keyed on the source `(segment_id, body_offset)`. Concurrent overwrites between prep and apply naturally lose the CAS and survive untouched — conservative in the safe direction, never the reverse.
 
-Reads are unaffected throughout. The goal of this plan is to unblock **writes** during maintenance, not to speed up maintenance itself.
+## Steps
 
-## The shape every blocking op shares
+| # | Op | PR | Sub-plan |
+|---|---|---|---|
+| 1 | `extent_index` CAS primitives | #51 | — |
+| 2 | WAL promote | #55, #56, #57 | [plan-promote-offload.md](plan-promote-offload.md) |
+| 3 | `apply_gc_handoffs` | #58 | — |
+| 4 | `promote_segment` | #59 | [plan-promote-segment-offload.md](plan-promote-segment-offload.md) |
+| 5 | `SegmentIndexCache` (Arc-shared LRU, key = `(path, file_len)` + verifying-key hash) | #61 | — |
+| 6a/b/c | `sweep_pending` / `repack` / `delta_repack_post_snapshot` | #62, #64, #65 | — |
+| 7 | `sign_snapshot_manifest` + delete dead `VolumeRequest::Snapshot` | #68 | [plan-snapshot-offload.md](plan-snapshot-offload.md) |
 
-Each maintenance op decomposes cleanly into three phases:
+Step 4 landed out-of-sequence to prioritise per-upload actor stalls observed under a live `dd` workload. The flusher thread introduced in step 2 was generalised into the long-lived worker; further offloads add `WorkerJob` variants, not threads.
 
-1. **Prep** (on actor): snapshot the inputs — live-hash set, `Arc<ExtentIndex>`, floor ULID, owned `pending_entries`, file paths.
-2. **Heavy middle** (pure, off actor): read segments, verify signatures, decompress, write new segments, fsync, compute deltas, sign manifests. A pure function of the prep snapshot plus filesystem paths; touches no mutable `Volume` state.
-3. **Apply** (on actor): update `extent_index`, evict `file_cache`, publish snapshot, rename/delete files.
+Each step's `Volume::<op>(&mut self)` method survives as a thin synchronous wrapper (`prepare_*` + `execute_*` + `apply_*`) so existing tests still compile against the same signature; the actor uses the offload path directly.
 
-Only (1) and (3) need the actor. (2) can run on the shared worker thread and deliver its result back through a channel. No new locks, no new synchronization primitives.
+## Non-goals (kept)
 
-## Prerequisite: conditional inserts on `extent_index` — LANDED
+- Not speeding up maintenance — only isolating writes from it.
+- No read-path change.
+- No persistent job state — every offloaded job is idempotent from on-disk state; mid-flight crashes resume from scratch.
 
-**Landed in PR #51 (Landing 1 of the promote offload).**
+## Open follow-ups
 
-While (2) runs, concurrent writes may supersede entries the worker is operating on. The apply phase must tolerate this: every `extent_index.insert(hash, loc_new)` becomes a CAS — *only* replace the entry if it still points at the source segment the worker consumed.
-
-The CAS primitive is `ExtentIndex::replace_if_matches(hash, expected_segment_id, expected_body_offset, new_location)` in `extentindex.rs`. It is used by:
-
-- `flush_wal_to_pending_as` — inline promote path
-- `apply_promote` — off-actor promote apply phase
-- Recovery-time promote during `Volume::open_impl`
-
-`ExtentIndex::remove_if_matches` was added alongside the sweep/repack offloads so dead-entry removals can also be conditional on the source `(segment_id, body_offset)`. All three maintenance offloads (sweep, repack, delta_repack) now use the CAS primitives unconditionally — no direct `insert` / `remove` calls remain in their apply phases.
-
-## Flush vs promote — LANDED
-
-The flush/promote separation is fully implemented. See [plan-promote-offload.md](plan-promote-offload.md) for the complete design and implementation details.
-
-Summary: `VolumeRequest::Flush` is now a WAL fsync of the current WAL, plus (if any promote is in flight) a park on the promote generation counter. The actor returns to the select loop immediately in both cases — queued writes keep flowing while the FLUSH caller waits for the worker's old-WAL fsync. Promotion is triggered asynchronously by the threshold check and idle tick, dispatched to the worker thread as a `WorkerJob::Promote`; the old-WAL fsync runs as the first step of the worker job rather than on the actor. Results arrive on a dedicated bounded crossbeam channel (not a `VolumeRequest` variant). The actor's `select!` loop has three arms: `VolumeRequest`, worker results, and idle tick.
-
-## Op-by-op analysis
-
-### 1. WAL promote *(LANDED)*
-
-**Landed in PRs #51, #55, #56, #57.** See [plan-promote-offload.md](plan-promote-offload.md).
-
-The worker is a single long-lived thread with bounded channels (capacity 4). Multiple promotes can be in flight. `gc_checkpoint` routes through the same worker with a parked reply. The apply phase uses CAS (`replace_if_matches`) to handle concurrent writes.
-
-### 2. `apply_gc_handoffs` *(LANDED)*
-
-**Landed in PR #58.** The re-sign (read the coordinator-staged body, read the inputs' `.idx` files, rewrite with the volume key) now runs on the worker thread as `WorkerJob::GcHandoff`.
-
-Prep phase on the actor enumerates `gc/*.staged` files and builds a `GcHandoffJob` per entry. The worker reads the staged segment, collects body-owning entries from each input's `.idx`, reads inline + body data, re-signs, and writes `gc/<ulid>.tmp`. Apply phase on the actor runs `Volume::apply_gc_handoff_result`: conditional extent-index rewrites (CAS-compatible), rename `.tmp` → bare `<ulid>` (the commit point of apply), `publish_snapshot`. Batches dispatch one handoff at a time; the next is sent after the previous result applies.
-
-### 3a. `sweep_pending` *(LANDED)*
-
-Heavy bits: `read_and_verify_segment_index`, `read_inline_section`, `read_extent_bodies`, `write_segment`, `rename`, `fsync_dir`, looped over N segments.
-
-Prep on the actor (`Volume::prepare_sweep`) snapshots `Arc<LbaMap>`, the snapshot floor, and signer/key state into a `SweepJob`. Worker (`actor::execute_sweep`) does the per-segment loop, partitioning, body reads, and the merged `write_segment` + rename + `fsync_dir`. The result carries each surviving live entry and each dead entry paired with its source `(segment_id, body_offset)` CAS preconditions, captured before `write_segment` reassigns offsets. Apply (`Volume::apply_sweep_result`) drops dead entries via `remove_if_matches` and re-points carried-live entries via `replace_if_matches` — concurrent overwrites between prep and apply naturally lose the CAS and survive untouched.
-
-The liveness set is computed at prep time and is necessarily a *subset* of true liveness at apply time (concurrent writes can only add references). This is conservative in the safe direction — we might keep a now-dead hash alive for one more cycle, never the reverse.
-
-`Volume::sweep_pending(&mut self)` is preserved as a thin synchronous wrapper (`prepare_sweep` + `execute_sweep` + `apply_sweep_result`) so existing tests and any inline callers still compile against the same signature; the actor uses the offload path directly with parked replies and a `parked_sweep` slot that rejects concurrent requests.
-
-**Candidate selection: LANDED in PR #63.** The old `size < 8 MiB` test was replaced with an opportunistic bin-packing rule that targets filling output segments toward 32 MiB live bytes, plus a filler tier. Both `sweep_pending` (volume) and `gc_fork` (coordinator) use the new rule.
-
-### 3b. `repack` *(LANDED)*
-
-Per-segment rewrite: each eligible segment is rewritten in place, reusing its own ULID. Prep on the actor (`Volume::prepare_repack`) snapshots `Arc<LbaMap>`, the snapshot floor, and signer/key state into a `RepackJob`. Worker (`actor::execute_repack`) iterates every non-floor segment, computes live/total bytes against the captured `lbamap`, partitions entries with the same predicate as today, reads bodies for the live set, and writes a fresh `.tmp` that renames over the original path (output ULID = input ULID). Segments with zero live entries are deleted outright. Apply (`Volume::apply_repack_result`) drops dead entries via `remove_if_matches` and re-points carried-live entries via `replace_if_matches` — the CAS precondition is `(seg_id, source_body_offset)` captured before `write_segment` reassigned offsets, so concurrent writes between prep and apply lose the CAS and survive untouched.
-
-Unlike sweep, each segment produces its own output; the result carries a `Vec<RepackedSegment>` with per-segment CAS payloads. Apply walks that list serially — no per-segment parallelism is attempted yet; that's the delta_repack concern (step 3c / 6c).
-
-`Volume::repack(&mut self, min_live_ratio)` is preserved as a thin synchronous wrapper (`prepare_repack` + `execute_repack` + `apply_repack_result`) so existing tests still compile against the same signature; the actor uses the offload path directly with a `parked_repack` slot that rejects concurrent requests.
-
-### 3c. `delta_repack_post_snapshot` *(LANDED)*
-
-Heavy bit: `delta_compute::rewrite_post_snapshot_with_prior` per segment — zstd-dict delta computation against the prior snapshot. Seconds on large volumes.
-
-Prep on the actor (`Volume::prepare_delta_repack`) resolves the latest sealed snapshot and packages the signer, verifying key, and segment-cache handle into a `DeltaRepackJob`. Worker (`actor::execute_delta_repack`) constructs the snapshot-pinned `BlockReader` off the actor, iterates every post-snapshot segment in `pending/`, and invokes `rewrite_post_snapshot_with_prior` — which now takes the shared `SegmentIndexCache` so the parse is shared with the sweep/repack workers. The result carries a `RewrittenSegment` per rewritten input, each entry paired with its pre-rewrite `(kind, stored_offset)` so apply can CAS against the source location.
-
-Apply (`Volume::apply_delta_repack_result`) runs on the actor: evicts the fd cache, then walks entries with `replace_if_matches` for Data/Inline carried through, `remove_if_matches` + `insert_delta_if_absent` for Data→Delta conversions, and `insert_delta_if_absent` (no-op when the slot exists) for pre-existing Delta entries — matching the pre-offload behaviour. Concurrent overwrites between prep and apply naturally lose the CAS and survive untouched.
-
-`Volume::delta_repack_post_snapshot(&mut self)` is preserved as a thin synchronous wrapper (`prepare_delta_repack` + `execute_delta_repack` + `apply_delta_repack_result`) so existing tests and inline callers still compile; the actor uses the offload path directly with a `parked_delta_repack` slot that rejects concurrent requests.
-
-Per-segment parallelism (a small worker pool rather than a single worker) remains the obvious next-step optimisation — delta computation runs into seconds per segment — but is out of scope for the single-worker offload. The pre-offload behaviour is single-threaded already; this step is pure latency isolation for writes.
-
-### 4. `promote_segment` *(LANDED)*
-
-**Landed in PR #59.** See [plan-promote-segment-offload.md](plan-promote-segment-offload.md) for the full design and landing breakdown.
-
-Prep phase on the actor picks the source (`pending/<ulid>` > `gc/<ulid>` > body-exists early-return) and builds a `PromoteSegmentJob`. Worker thread reads + verifies the index once, handles the GC tombstone shortcut, writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}` (both idempotent on retry), and returns parsed entries + bss + inline bytes. Apply phase on the actor runs the extent-index CAS (Local → Cached) + `pending/<ulid>` delete for the drain path, or input-idx cleanup for the GC path. `WorkerResult::PromoteSegment` carries the ULID out-of-band so errors map to the right parked caller. Single-parse collapse folded in — the previous triple parse is now one `read_and_verify_segment_index` shared across tombstone check, idx extract, body copy, and apply-phase CAS.
-
-### 5. `snapshot` *(LANDED)*
-
-**Landed in PR #68.** Scope: `sign_snapshot_manifest` only, since the rest of the coordinator-driven snapshot sequence (`promote_wal` + per-segment `promote` + `apply_gc_handoffs`) already routes through the worker.
-
-Prep on the actor captures the signer `Arc` and base dir into a `SignSnapshotManifestJob`. Worker (`actor::execute_sign_snapshot_manifest`) enumerates `index/`, Ed25519-signs the manifest, fsync-writes it via `write_file_atomic`, and writes the marker. Apply on the actor flips `has_new_segments = false`. A single `parked_sign_snapshot_manifest` slot rejects concurrent requests; in practice the coordinator's per-volume snapshot lock already serialises.
-
-The dead `VolumeRequest::Snapshot` arm and `VolumeHandle::snapshot()` were deleted in the same landing — no live wire sender. `Volume::snapshot()` the method stays for in-process tests and never runs on the actor.
-
-See [plan-snapshot-offload.md](plan-snapshot-offload.md) for the design.
-
-## Shared optimization: segment-index cache *(LANDED)*
-
-`elide_core::segment_cache::SegmentIndexCache` is an `Arc`-shared LRU (capacity 64) keyed by `(path, file_len)` over `Arc<ParsedIndex>`, with a `VerifyingKey` hash discriminator so a stale entry from a different key never hits. The `Volume` owns one; worker jobs (`GcHandoffJob`, `PromoteSegmentJob`, `SweepJob`, `RepackJob`, `DeltaRepackJob`) carry cloned `Arc`s so the actor thread and the worker thread share cache slots.
-
-The following hot paths are routed through the cache:
-
-- `actor::execute_promote_segment` (worker thread; every confirmed S3 upload)
-- `actor::execute_sweep` (worker thread; sweep loop)
-- `actor::execute_repack` (worker thread; repack loop)
-- `actor::execute_delta_repack` → `delta_compute::rewrite_post_snapshot_with_prior` (worker thread; delta repack loop)
-- `Volume::evict_dead_segments` / compact_pending scan (actor thread)
-
-Still direct-call (low win or out-of-scope for this pass):
-
-- `Volume::apply_gc_handoffs` post-write re-parse of the tmp file (file just written; no prior parse to hit)
-- `Volume::delete_cached_inputs` scan of `gc/<ulid>` (rare)
-- `Volume::redact_segment` (rare, in-place)
-- `delta_compute::maybe_rewrite_segment` (runs in `elide-import` one-shot, not in the actor path)
-- `extentindex`/`lbamap` rebuild paths (boot-time; cache is empty then)
-
-Cache invalidation is file-length-based: tmp+rename rewrites change the entry count → the index section length → the file length, so a stale entry naturally misses. `redact_segment` punches body holes but preserves the index section and file length, so a cache hit returns the same parsed index. Cross-fork correctness is guarded by the verifying-key hash on each cached entry.
-
-## Sequencing
-
-1. **Make `extent_index` inserts conditional.** LANDED (PR #51). `replace_if_matches` on `ExtentIndex`.
-2. **Introduce a single worker thread and offload WAL promote.** LANDED (PRs #55, #56, #57). Dedicated bounded channels, three-arm `select!`, multi-promote queuing, GC checkpoint routing. See [plan-promote-offload.md](plan-promote-offload.md).
-3. **Offload `apply_gc_handoffs`.** LANDED (PR #58). Generalized the worker to carry a `WorkerJob` enum and added the `GcHandoff` variant.
-4. **Offload `promote_segment` (and fix the re-parse).** LANDED (PR #59, out-of-sequence with the original plan). Added `WorkerJob::PromoteSegment` + parked-reply dispatch. See [plan-promote-segment-offload.md](plan-promote-segment-offload.md).
-5. **Land the segment-index cache.** LANDED. `SegmentIndexCache` covers the worker-thread `promote_segment` / sweep / repack / delta_repack paths and the actor-thread `compact_pending` loop. `delta_compute::rewrite_post_snapshot_with_prior` was plumbed through in step 6c.
-6. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Per-segment parallelism (a small worker pool rather than a single worker) remains a future optimisation for delta_repack.
-   - **6a (LANDED):** `sweep_pending`. Added `WorkerJob::Sweep` + parked-reply dispatch. Apply uses `replace_if_matches` for carried-live entries and the new `remove_if_matches` for dead entries, both keyed on the source `(segment_id, body_offset)`.
-   - **6b (LANDED):** `repack`. Added `WorkerJob::Repack` + `parked_repack` slot. Per-segment rewrite with output ULID = input ULID; apply uses `replace_if_matches` / `remove_if_matches` keyed on the source `(seg_id, body_offset)` captured before `write_segment` reassigned offsets.
-   - **6c (LANDED):** `delta_repack_post_snapshot`. Added `WorkerJob::DeltaRepack` + `parked_delta_repack` slot. Worker constructs the snapshot-pinned `BlockReader` off the actor; `rewrite_post_snapshot_with_prior` now takes the shared `SegmentIndexCache`. Apply pairs each rewritten entry with its pre-rewrite `(kind, stored_offset)` and CAS-updates the extent index via `replace_if_matches` / `remove_if_matches` / `insert_delta_if_absent` depending on the kind transition.
-7. **Offload `sign_snapshot_manifest` + delete dead `VolumeRequest::Snapshot`.** LANDED (PR #68). Added `WorkerJob::SignSnapshotManifest` + `parked_sign_snapshot_manifest` slot; retired the dead `VolumeRequest::Snapshot` wire command and `VolumeHandle::snapshot()`. See [plan-snapshot-offload.md](plan-snapshot-offload.md).
-
-After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the worker `select!` arm. No new primitives, no new locks, no read-path changes.
-
-## Non-goals
-
-- Speeding up maintenance itself. The goal is latency isolation for writes, not throughput.
-- Any change to the read path. Reads are already lock-free.
-- Parallelising the actor. There is still exactly one actor thread applying mutations; the offload is into stateless workers whose results are re-applied serially on the actor.
-- Persistent job state across crashes. Every offloaded job is idempotent from on-disk state — if a worker is mid-flight when the process dies, the next startup re-scans `pending/` / `gc/` and retries from scratch.
-
-## Related: coordinator-side blocking GC *(out of scope, follow-up)*
-
-The coordinator's per-fork GC tick (`elide-coordinator/src/gc.rs::gc_fork`) is `async fn` but performs blocking IO inline (index rebuild, segment reads, S3 round-trips) on the per-fork tokio task — *not* via `spawn_blocking`. The TODO at `gc.rs:55-57` notes this is fine while passes stay short and to switch when they grow long enough to stall other coordinator tasks.
-
-This is a separate concern from the volume-actor offload tracked above:
-
-- The volume actor's offload protects **writes**. The coordinator's `gc_fork` never serves writes; its latency concern is starving the runtime / other forks scheduled on the same task pool.
-- It is structurally already isolated from the volume — coordinator and volume are different processes.
-
-When this needs work the fix is mechanical (`tokio::task::spawn_blocking` around the synchronous body of `gc_fork`), not a worker-thread architecture like this plan describes.
+- Per-segment parallelism for `delta_repack_post_snapshot` (single-threaded today; pre-offload was also single-threaded — pure latency isolation).
+- Coordinator-side `gc_fork` does blocking I/O on its tokio task. Out of scope for this plan: when it needs work, the fix is `tokio::task::spawn_blocking`, not the worker-thread architecture above.
