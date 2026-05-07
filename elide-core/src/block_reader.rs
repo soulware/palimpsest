@@ -6,8 +6,8 @@
 // the ext4 filesystem inside the volume can be parsed without mounting.
 //
 // Two modes:
-// - `open_live`: follows the current fork + WAL tail. Used by `elide volume ls`
-//   to inspect a possibly-running volume.
+// - `open_live`: follows the current fork + WAL tail, for inspecting a
+//   possibly-running volume.
 // - `open_snapshot`: pinned to a signed `snapshots/<ulid>.manifest`. Used by
 //   Phase 4 filemap generation to parse the ext4 filesystem exactly as it
 //   existed at snapshot time, with no WAL replay and no `pending/` state.

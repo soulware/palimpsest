@@ -456,7 +456,6 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 |---|---|
 | `elide volume list` | Scan `data_dir` for ULID dirs; show name, ULID, state |
 | `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
-| `elide volume ls <name\|ulid> [path]` | Browse ext4 filesystem contents |
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
 | `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` (explicit pin — recommended, forward-compatible), `<vol_ulid>` (bare; resolves to the latest snapshot), or `<name>` (local or remote lookup). Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design-replica-model.md](design-replica-model.md) for the direction of travel |
 | `elide volume create <name> --from <source> --force-snapshot` | Same as above, but uploads a new forker-attested "now" marker when the source has no usable snapshot. Interim mechanism; will be replaced by `volume materialize` (pending) |

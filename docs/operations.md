@@ -49,9 +49,9 @@ Any CLI operation that mutates a live volume's directory must go through coordin
 | `volume create` / `fork` / `remote pull` | Direct fs (+ optional IPC) | Safe — creates a new volume the coordinator picks up on rescan |
 | `volume update` | Direct fs + IPC restart | Safe (config only read at `Volume::open`) |
 | `volume snapshot` | IPC (primary) / offline fallback | Offline fallback races with coordinator drain — proposed: always route through coordinator |
-| `volume evict` | Direct fs | **Unsafe** — proposed: route through coordinator IPC; concurrent GC can read a body between `collect_stats` and `compact_segments` |
+| `volume evict` (hidden dev tool) | Direct fs | **Unsafe** — proposed: route through coordinator IPC; concurrent GC can read a body between `collect_stats` and `compact_segments` |
 | `volume import`/`delete`/`status` | Coordinator IPC | Safe |
-| `volume info`/`ls` | Direct fs (read-only) | Safe |
+| `volume info` | Direct fs (read-only) | Safe |
 
 ## S3 upload
 
@@ -88,13 +88,13 @@ region   = "us-east-1"
 
 **Automatic eviction (future).** Track mtime on fetch/read, enforce `max_cache_bytes`, evict LRU `cache/<ulid>.body` files. Must run inside the coordinator for the same sequencing reason as manual eviction.
 
-## Manual eviction
+## Manual eviction (hidden dev tool)
 
 ```
 elide volume evict <vol>
 ```
 
-Deletes `cache/<ulid>.body` and `cache/<ulid>.present` to reclaim local disk; evicted bodies are demand-fetched on next access. Evictable only if `index/<ulid>.idx` exists (S3 confirmation). `pending/` and `gc/` are never touched; unsafe segments are skipped silently.
+Hidden from `--help` — kept as a developer/debug tool. Deletes `cache/<ulid>.body` and `cache/<ulid>.present` to reclaim local disk; evicted bodies are demand-fetched on next access. Evictable only if `index/<ulid>.idx` exists (S3 confirmation). `pending/` and `gc/` are never touched; unsafe segments are skipped silently.
 
 Eviction is only safe on volumes with reachable S3 backing. The current CLI implementation is **unsafe** — it deletes files directly, racing with coordinator GC's `collect_stats` → `compact_segments`. Fix: route through a coordinator IPC that sequences deletion between ticks.
 
@@ -105,7 +105,6 @@ elide volume status --remote <name>       # GET names/<name> (authoritative reco
 elide volume claim <name>                 # take a Released name into local ownership (Stopped)
 elide volume start <name>                 # bring up the daemon
 elide volume start --claim <name>         # claim + start in one verb
-elide volume ls <name>                    # readable once prefetch completes
 ```
 
 `volume claim` reads `names/<name>` from the bucket. If the record is `Released`, the claim splits two ways:
@@ -131,7 +130,7 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 - **Unresponsive or dead upstream, need current state past the latest snapshot.** Today: `volume create --from <src> --force-snapshot` uploads a forker-attested "now" marker and branches from it. Proposed replacement: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design-replica-model.md](design-replica-model.md).
 - **Local `cache/` deletion.** Automatic recovery — `Volume::open` rebuilds from `index/*.idx` and reads demand-fetch bodies.
 - **Local `cache/` + `index/` deletion.** Prefetch re-runs on startup (empty `index/` + empty `pending/`) and the volume reopens writable.
-- **Partial `index/` deletion is silent data loss.** The prefetch trigger requires `index/` to be *completely* empty; a partial delete leaves the coordinator seeing locally-present data. Missing segments' LBAs read as zeros. The only safe way to remove individual body files is `elide volume evict`, which preserves `.idx`.
+- **Partial `index/` deletion is silent data loss.** The prefetch trigger requires `index/` to be *completely* empty; a partial delete leaves the coordinator seeing locally-present data. Missing segments' LBAs read as zeros. The only safe way to remove individual body files is the (hidden, dev-only) `elide volume evict`, which preserves `.idx`.
 
 `discover_volumes` skips ULID directories with neither `pending/` nor `index/`. Deleting both entirely hides the volume — fix with `mkdir <vol_dir>/index`.
 

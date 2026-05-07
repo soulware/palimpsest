@@ -411,8 +411,8 @@ fn delta_entry_demand_fetch_from_pull_host() {
 }
 
 /// Regression for the `BlockReader::read_block` delta dispatch bug
-/// (April 2026). `BlockReader` is the read path used by `volume ls`,
-/// `volume inspect`, and Phase 4 snapshot filemap generation — it is
+/// (April 2026). `BlockReader` is the read path used by `volume inspect`
+/// and Phase 4 snapshot filemap generation — it is
 /// *separate* from `ReadonlyVolume::read` (covered by the tests above).
 ///
 /// The original bug: `read_block` looked the lbamap winner up only in

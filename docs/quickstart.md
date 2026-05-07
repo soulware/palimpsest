@@ -59,12 +59,6 @@ On Apple Silicon, `elide-import` auto-selects `arm64`.
 ./target/debug/elide volume info ubuntu-22.04
 ```
 
-## Browse the filesystem (without mounting)
-
-```sh
-./target/debug/elide volume ls ubuntu-22.04 /etc
-```
-
 ## Branch a writable replica for a VM
 
 Create a writable replica branched from the imported base:

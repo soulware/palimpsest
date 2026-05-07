@@ -78,16 +78,7 @@ You should see `by_id/<volume-ulid>/segments/<YYYYMMDD>/<segment-ulid>` objects,
 
 ## Test demand-fetch
 
-Force the volume to go back to Tigris for a read:
-
-```sh
-./target/debug/elide volume evict vm1
-./target/debug/elide volume ls vm1 /etc
-```
-
-`evict` removes `cache/*.body` for S3-confirmed segments. The next `ls` triggers demand-fetch via the `S3RangeFetcher` — range-GET requests against Tigris re-hydrate just the extents needed, not whole segments.
-
-Watch the volume log: lines tagged `demand-fetch` confirm the round-trip to Tigris. If you see `NotFound`, the upload step above didn't complete — re-run `aws s3 ls` to check.
+`elide volume evict <vol>` is a hidden developer command that removes `cache/*.body` for S3-confirmed segments. After eviction, any read against the volume triggers demand-fetch via the `S3RangeFetcher` — range-GET requests against Tigris re-hydrate just the extents needed, not whole segments. Watch the volume log: lines tagged `demand-fetch` confirm the round-trip to Tigris.
 
 ## Troubleshooting
 

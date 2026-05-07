@@ -7,7 +7,7 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size,
+    VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, nbd, parse_size,
     resolve_volume_dir, resolve_volume_size, ublk, validate_volume_name, verify,
 };
 
@@ -238,18 +238,10 @@ enum VolumeCommand {
     /// location (wal, pending, gc, or cache), and reports any extent whose
     /// body does not match. Evicted bodies are skipped (reported as
     /// skipped). Exit code: 0 clean, 1 if any mismatches, 2 on scan errors.
+    #[command(hide = true)]
     Verify {
         /// Volume name
         name: String,
-    },
-
-    /// Browse ext4 filesystem contents of a volume
-    Ls {
-        /// Volume name
-        name: String,
-        /// Path within the ext4 filesystem (default: /)
-        #[arg(default_value = "/")]
-        path: String,
     },
 
     /// Write a snapshot marker; the volume stays live
@@ -397,6 +389,7 @@ enum VolumeCommand {
     /// volumes with S3 backing.
     ///
     /// --segment <ulid>: evict one specific body by ULID.
+    #[command(hide = true)]
     Evict {
         /// Evict a single segment body by ULID
         #[arg(long)]
@@ -627,14 +620,6 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(2);
                     }
-                }
-            }
-
-            VolumeCommand::Ls { name, path } => {
-                let vol_dir = resolve_volume_dir(&data_dir, &name);
-                if let Err(e) = ls::run(&vol_dir, &path) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
                 }
             }
 

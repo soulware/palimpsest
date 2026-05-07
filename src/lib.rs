@@ -8,7 +8,6 @@ pub mod extents;
 pub mod full_warm;
 pub mod inspect;
 pub mod inspect_files;
-pub mod ls;
 pub mod nbd;
 pub mod ublk;
 pub mod verify;
@@ -146,7 +145,7 @@ pub fn build_volume_fetcher(
 /// Build an `object_store` client from a [`FetchConfig`].
 ///
 /// The volume binary uses this for CLI subcommands that hit S3 directly
-/// (`pull`, `ls`, fork-from-S3) and for the embedded coordinator tasks loop
+/// (`pull`, fork-from-S3) and for the embedded coordinator tasks loop
 /// (`volume up`). The async `object_store` API is needed there because that
 /// code already runs inside tokio. The demand-fetch hot path uses
 /// `elide_fetch::FetchConfig::build_fetcher()` instead — sync, no tokio.
