@@ -106,6 +106,45 @@ Each entry below has a named deterministic regression test; see the listed file 
 - Bug E: on restart, the extent index was rebuilt from on-disk `.idx` files which still pointed at old segments, leaving the system stale once `apply_done_handoffs` removed them. Fix in the manifest era: re-apply `.applied` handoffs on restart. Under the self-describing protocol the bare `gc/<new>` body is picked up by `collect_gc_applied_segment_files` during rebuild and feeds the extent index at low priority — so the bug is resolved structurally and no explicit re-apply is needed.
 - GC compactor converted DEDUP_REF entries to DATA entries with `stored_length=0`, producing a zero-length body record that caused EIO on rebuild. Fix: check `is_dedup_ref` and emit `new_dedup_ref` in the coordinator GC path. This bug was invisible to `elide-core`'s proptest because the test helper was a *separate reimplementation* of GC that happened to handle DEDUP_REFs correctly — which is why `gc_proptest.rs` exists in the coordinator crate, calling the real code.
 
+### Runtime invariants gated behind `--features proptest`
+
+Some bugs are easier to catch at the introducing call site than at the eventual symptom. For those, the volume layer keeps "is the in-memory state consistent with disk?" assertions that fire at the end of every state-mutating method and panic on divergence with a labelled message identifying the calling method.
+
+These checks are **not free** — they typically involve a full rebuild of an in-memory data structure from disk. To keep the everyday `cargo test -p elide-core` suite fast, they are gated behind the `proptest` feature flag and compile out to no-op stubs otherwise.
+
+#### Wiring
+
+- Each crate that hosts proptest suites declares a `proptest` feature in `Cargo.toml`.
+- Downstream crates that re-run proptests (e.g. `elide-coordinator`) propagate via `proptest = ["elide-core/proptest"]`, so a single `cargo test --features proptest` enables every gated invariant in the dependency graph.
+- The invariant function is split into two definitions: a heavy implementation under `#[cfg(feature = "proptest")]`, and an `#[inline]` no-op stub under `#[cfg(not(feature = "proptest"))]`. Callers always invoke the same name; the compiler picks the right one. This avoids `#[cfg]` clutter at every call site.
+
+```rust
+#[cfg(feature = "proptest")]
+pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+    // ... rebuild from disk + WAL, compare to self.lbamap, panic on diverge.
+}
+
+#[cfg(not(feature = "proptest"))]
+#[inline]
+pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
+```
+
+#### Calling convention
+
+Each call passes a static `&'static str` identifying the caller — e.g. `"apply_promote_segment_result_drain"`. The label appears in the panic message so a failing test points at the exact mutating method that introduced the drift, without walking a backtrace through release-mode inlining. This matters in proptest output where threads and panics interleave.
+
+Call at the **end** of every method that may mutate the asserted state, on every successful exit path (early returns included). Putting the assert at the entry would fire on a precondition violation rather than the responsible operation.
+
+#### Active invariants
+
+- **`Volume::assert_lbamap_consistent(caller)`** — rebuilds the lbamap from `discover_fork_segments` + WAL replay and compares to `self.lbamap` per LBA. Panics with the offending LBAs and the calling method name. Catches the class of bug where a state-mutating op moves disk state without updating the in-memory mirror (e.g. promoting a pending segment changes its tier in the walk order, which can flip the per-LBA winner). Currently called from `Volume::open`, `write`, `write_zeroes`, `gc_checkpoint_for_test`, `apply_redact_result`, `apply_plan_apply_result`, and `apply_promote_segment_result`.
+
+#### When proptests trip the invariant on a hand-crafted segment
+
+Some tests construct a segment file directly (e.g. `write_segment_with_delta_body` to lay down a hand-crafted Delta entry). These bypass the normal `Volume::write` → WAL → flush path that incrementally populates `self.lbamap`, so the next mutating op trips the invariant.
+
+Resolution: drop and reopen the `Volume` between the hand-craft and the next mutating call. `Volume::open`'s rebuild folds the new segment in. Production code paths never hit this — they always write through `Volume::write`.
+
 ### Known gaps
 
 Open gaps in simulation coverage, documented so they are not forgotten:
