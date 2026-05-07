@@ -30,31 +30,39 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 
-/// Simulate coordinator drain: for each file in pending/, promote the segment
-/// body to cache/ and remove the pending file.  The volume already wrote
-/// `index/<ulid>.idx` at WAL flush time, so drain does not write it again.
+/// Simulate coordinator drain: for each file in pending/, redact + promote.
+///
+/// After PR #265, `redact_segment` may rewrite the segment under a freshly
+/// minted ULID and unlink the input pending file. Promote must use the
+/// *returned* ULID — using the original ULID would try to promote a file
+/// that no longer exists. Mirrors `coordinator/src/upload.rs`'s drain
+/// loop (`upload_ulid = redact_segment(...).unwrap_or(ulid)`) and the
+/// `common::drain_with_redact` test helper.
 fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    let Ok(entries) = fs::read_dir(&pending_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(ulid_str) = name.to_str() else {
-            continue;
+    // Re-snapshot pending after every redact: redact may produce two new
+    // pending entries (the rewritten segment + the flushed WAL contents)
+    // under fresh ULIDs and remove the input.
+    //
+    // Always pick the lowest-ULID pending segment next — see
+    // `elide_core::segment::read_ulid_dir_sorted`.
+    let mut promoted = std::collections::HashSet::new();
+    loop {
+        let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
+            return;
         };
-        if ulid_str.ends_with(".tmp") {
-            continue;
+        let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+            break;
+        };
+        let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
+        if redacted != ulid {
+            promoted.insert(ulid);
         }
-        let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
-            continue;
-        };
-        // Materialise thin DedupRef → DedupRef (filled), then promote.
-        let _ = vol.redact_segment(ulid);
-        let _ = vol.promote_segment(ulid);
+        let _ = vol.promote_segment(redacted);
+        promoted.insert(redacted);
     }
 }
 

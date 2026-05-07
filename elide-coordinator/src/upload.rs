@@ -208,28 +208,18 @@ pub async fn drain_pending(
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
     upload_volume_metadata(vol_dir, volume_id, store).await;
 
-    let entries = std::fs::read_dir(&pending_dir)
-        .with_context(|| format!("opening pending dir: {}", pending_dir.display()))?;
+    // Process pending segments in ULID-ascending order so the just-promoted
+    // ULID is always below every remaining pending ULID — see
+    // `read_ulid_dir_sorted` for why.
+    let pending_ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
+        .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
 
     let mut uploaded = 0usize;
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
     let uploader = SegmentUploader { volume_id, store };
 
-    for entry in entries {
-        let entry = entry.context("reading pending dir entry")?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if name.ends_with(".tmp") {
-            continue;
-        }
-        let ulid = match ulid::Ulid::from_string(name) {
-            Ok(u) => u,
-            Err(_) => continue,
-        };
-
+    for ulid in pending_ulids {
         // Redact drops hash-dead DATA entries before upload so deleted
         // data never leaves the host. When entries are dropped, the
         // segment is rewritten under a freshly minted ULID and the

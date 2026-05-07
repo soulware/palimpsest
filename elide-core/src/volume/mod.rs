@@ -464,7 +464,7 @@ impl Volume {
         let has_new_segments = !pending_entries.is_empty()
             || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
 
-        Ok(Self {
+        let ret = Self {
             base_dir: base_dir.to_owned(),
             ancestor_layers,
             lock_file,
@@ -485,7 +485,9 @@ impl Volume {
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
-        })
+        };
+        ret.assert_lbamap_consistent("Volume::open");
+        Ok(ret)
     }
 
     /// Write `data` starting at logical block address `lba`.
@@ -735,6 +737,7 @@ impl Volume {
         // Flush the current WAL to pending/ under u_flush. If the WAL is
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
+        self.assert_lbamap_consistent("gc_checkpoint_for_test");
         Ok(u_gc)
     }
 
@@ -1053,6 +1056,7 @@ impl Volume {
             // lets the next pass see the current truth (one wasted pass,
             // then convergence).
             self.rebuild_lbamap_from_disk()?;
+            self.assert_lbamap_consistent("apply_plan_apply_result_cancelled");
             return Ok(StagedApply::Cancelled);
         }
 
@@ -1123,6 +1127,7 @@ impl Volume {
         // Crash ordering: on a crash between rename and rebuild, restart
         // re-runs `Volume::open`'s rebuild which produces the same result.
         self.rebuild_lbamap_from_disk()?;
+        self.assert_lbamap_consistent("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
     }
@@ -1178,6 +1183,118 @@ impl Volume {
         self.lbamap = Arc::new(fresh);
         Ok(())
     }
+
+    /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
+    /// if it diverges from `self.lbamap`. Called at the end of every
+    /// **structural** op (segment-shape mutations: redact apply, promote,
+    /// GC plan apply, checkpoint flush, volume open) so any drift trips at
+    /// the introducing site, not three operations later as a stale-cancel
+    /// or oracle mismatch.
+    ///
+    /// Deliberately **not** called from `write` / `write_zeroes` — those
+    /// are high-frequency incremental `lbamap.insert` updates that have
+    /// been stable for a long time, and any drift they introduced would
+    /// be caught at the next structural op anyway. Asserting on every
+    /// individual write doubles proptest runtime.
+    ///
+    /// Gated behind the `proptest` feature so debug builds and the regular
+    /// `cargo test` suite aren't slowed by the per-op rebuild. The
+    /// `gc_proptest` runs already enable this feature; running with
+    /// `--features proptest` is what catches drift bugs of the class fixed
+    /// by sorting drain loops by ULID ascending.
+    #[cfg(feature = "lbamap-invariant")]
+    pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+        let mut chain: Vec<(PathBuf, Option<String>)> = self
+            .ancestor_layers
+            .iter()
+            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+            .collect();
+        chain.push((self.base_dir.clone(), None));
+        // Use the unverified rebuild — the signature verify is the dominant
+        // per-segment cost and we don't need it for an in-memory consistency
+        // check (signatures were already verified at Volume::open time, and
+        // on-disk segments are immutable after creation).
+        let mut fresh = match lbamap::rebuild_segments_unverified(&chain) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("assert_lbamap_consistent[{caller}]: rebuild failed: {e}");
+                return;
+            }
+        };
+        let wal_dir = self.base_dir.join("wal");
+        if let Ok(entries) = fs::read_dir(&wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let Ok((records, _)) = writelog::scan_readonly(&path) else {
+                    continue;
+                };
+                for record in records {
+                    match record {
+                        writelog::LogRecord::Data {
+                            hash,
+                            start_lba,
+                            lba_length,
+                            ..
+                        }
+                        | writelog::LogRecord::Ref {
+                            hash,
+                            start_lba,
+                            lba_length,
+                        } => {
+                            fresh.insert(start_lba, lba_length, hash);
+                        }
+                        writelog::LogRecord::Zero {
+                            start_lba,
+                            lba_length,
+                        } => {
+                            fresh.insert(start_lba, lba_length, ZERO_HASH);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut diverging: Vec<(u64, Option<blake3::Hash>, Option<blake3::Hash>)> = Vec::new();
+        let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (lba, _, _, _) in self.lbamap.iter_entries() {
+            all_lbas.insert(lba);
+        }
+        for (lba, _, _, _) in fresh.iter_entries() {
+            all_lbas.insert(lba);
+        }
+        for lba in all_lbas {
+            let mem = self.lbamap.hash_at(lba);
+            let disk = fresh.hash_at(lba);
+            if mem != disk {
+                diverging.push((lba, mem, disk));
+                if diverging.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        if !diverging.is_empty() {
+            let mut msg = format!(
+                "lbamap drift after [{caller}]: {} LBA(s) diverge",
+                diverging.len()
+            );
+            for (lba, mem, disk) in &diverging {
+                msg.push_str(&format!(
+                    "\n  lba={lba} in_memory={:?} disk_rebuild={:?}",
+                    mem.map(|h| h.to_hex().to_string()),
+                    disk.map(|h| h.to_hex().to_string()),
+                ));
+            }
+            panic!("{msg}");
+        }
+    }
+
+    /// No-op stub when `lbamap-invariant` feature is disabled.
+    #[cfg(not(feature = "lbamap-invariant"))]
+    #[inline]
+    pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,
     /// execute, and apply inline on the current thread. Used by tests and
@@ -1312,6 +1429,7 @@ impl Volume {
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
+            self.assert_lbamap_consistent("apply_promote_segment_result_tombstone");
             return Ok(());
         }
 
@@ -1407,6 +1525,11 @@ impl Volume {
                 Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
             );
         }
+        self.assert_lbamap_consistent(if is_drain {
+            "apply_promote_segment_result_drain"
+        } else {
+            "apply_promote_segment_result_gc_carried"
+        });
         Ok(())
     }
 

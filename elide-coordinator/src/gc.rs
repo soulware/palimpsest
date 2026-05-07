@@ -1439,29 +1439,15 @@ mod tests {
         let pending_dir = dir.join("pending");
         let mut promoted = std::collections::HashSet::<Ulid>::new();
         loop {
-            let mut next: Option<Ulid> = None;
-            for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-                let name = entry.file_name();
-                let Some(s) = name.to_str() else { continue };
-                if s.contains('.') {
-                    continue;
-                }
-                let Ok(ulid) = Ulid::from_string(s) else {
-                    continue;
-                };
-                if !promoted.contains(&ulid) {
-                    next = Some(ulid);
-                    break;
-                }
-            }
-            let Some(ulid) = next else { break };
+            let ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
+            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+                break;
+            };
             let redacted = vol.redact_segment(ulid).unwrap();
             if redacted != ulid {
-                // Old pending was deleted by redact; mark it processed.
                 promoted.insert(ulid);
             }
-            let upload_name = redacted.to_string();
-            let seg_path = pending_dir.join(&upload_name);
+            let seg_path = pending_dir.join(redacted.to_string());
             let data = fs::read(&seg_path).unwrap();
             let key = segment_key(volume_id, redacted);
             store
@@ -2433,6 +2419,12 @@ mod tests {
             .put(&key, bytes::Bytes::from(bytes).into())
             .await
             .unwrap();
+        // The hand-crafted Delta segment was written directly to pending/
+        // without going through Volume::write — self.lbamap doesn't know
+        // about its entries. Drop+reopen so Volume::open's rebuild folds
+        // them in before promote (which now asserts lbamap consistency).
+        drop(vol);
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
         vol.promote_segment(delta_ulid).unwrap();
 
         // ── S3: single-LBA overwrite at LBA 102, via the normal path.

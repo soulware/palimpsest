@@ -2008,6 +2008,40 @@ pub fn locate_segment_body(
     None
 }
 
+/// Return ULIDs of bare-named files in `dir`, sorted ascending.
+///
+/// Skips files with any extension (e.g. `.tmp`, `.idx`, `.plan`) and any
+/// name that doesn't parse as a ULID. Returns an empty vec if the
+/// directory does not exist.
+///
+/// Use this whenever processing a directory of ULID-named segment files
+/// where caller order matters — `pending/`, bare `gc/<u>` outputs, etc.
+/// `read_dir` itself returns entries in filesystem-defined order
+/// (inode-order on APFS, hash-bucket order on ext4 htree, …) which is
+/// **not** ULID-ascending. Drain loops in particular depend on the
+/// just-promoted ULID being below every remaining pending ULID so that
+/// `discover_fork_segments`'s walk-order winner doesn't flip when a
+/// segment crosses from pending to committed; sort here closes that gap.
+pub fn read_ulid_dir_sorted(dir: &Path) -> io::Result<Vec<ulid::Ulid>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut ulids: Vec<ulid::Ulid> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            if name.contains('.') {
+                return None;
+            }
+            ulid::Ulid::from_string(&name).ok()
+        })
+        .collect();
+    ulids.sort_unstable();
+    Ok(ulids)
+}
+
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),

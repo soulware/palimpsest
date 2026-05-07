@@ -41,9 +41,16 @@ libublk = "0.4"
 [features]
 # Gate the slow property-based test suites behind an explicit feature so that
 # `cargo test -p elide-coordinator` runs only the fast unit/integration tests.
+# Enables elide-core's `proptest` feature so its proptest helpers are
+# available, and `elide-core/lbamap-invariant` so the runtime drift checks
+# fire on every state-mutating Volume op during gc_proptest. The invariant
+# is gated separately from elide-core's proptest feature so this crate's
+# coordinator-layer stress tests get the checks while elide-core's own
+# proptest suites stay fast (resolver-2 feature unification means a
+# single-feature gate would slow both).
 #
 #   cargo test -p elide-coordinator --features proptest
-proptest = []
+proptest = ["elide-core/proptest", "elide-core/lbamap-invariant"]
 
 [dev-dependencies]
 async-trait = "0.1"

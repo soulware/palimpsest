@@ -145,7 +145,10 @@ impl Volume {
     /// unreferenced until the next pass picks it up.
     pub fn apply_redact_result(&mut self, result: RedactResult) -> io::Result<Ulid> {
         match result {
-            RedactResult::NoOp { input_ulid } => Ok(input_ulid),
+            RedactResult::NoOp { input_ulid } => {
+                self.assert_lbamap_consistent("apply_redact_result_noop");
+                Ok(input_ulid)
+            }
             RedactResult::Rewritten {
                 input_ulid,
                 new_ulid,
@@ -228,6 +231,7 @@ impl Volume {
                     out_entries.len(),
                     to_remove.len(),
                 );
+                self.assert_lbamap_consistent("apply_redact_result_rewritten");
                 Ok(new_ulid)
             }
         }
