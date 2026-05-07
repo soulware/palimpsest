@@ -52,22 +52,22 @@ pub fn write_test_keypair(dir: &Path) {
 /// `index/<u>.idx` + `cache/<u>.{body,present}` from the pending file
 /// and updates the extent index.
 ///
-/// Re-snapshots `pending_ulids` after every redact because redact may
-/// produce *two* new pending entries (the rewritten segment + the
-/// flushed WAL contents) under fresh ULIDs and remove the input.
+/// Two-pass drain: redact every pending in place, then promote each in
+/// ULID-ascending order. Mirrors the production drain in
+/// `coordinator/src/upload.rs::drain_pending`. Preserves the structural
+/// invariant `max(committed) < min(pending)` throughout.
 pub fn drain_with_redact(vol: &mut elide_core::volume::Volume) {
-    let mut promoted = std::collections::HashSet::new();
-    loop {
-        let next = pending_ulids(vol.base_dir())
-            .into_iter()
-            .find(|u| !promoted.contains(u));
-        let Some(ulid) = next else { break };
-        let redacted = vol.redact_segment(ulid).unwrap();
-        if redacted != ulid {
-            promoted.insert(ulid);
-        }
-        vol.promote_segment(redacted).unwrap();
-        promoted.insert(redacted);
+    // Pass 1: redact every pending in ULID-ascending order so fresh
+    // `u_redact_N` ULIDs preserve the temporal ordering of their inputs.
+    let snapshot = pending_ulids(vol.base_dir());
+    for ulid in snapshot {
+        vol.redact_segment(ulid).unwrap();
+    }
+    // Pass 2: promote in ULID-ascending order against the post-redact
+    // pending state.
+    let pending_after_redact = pending_ulids(vol.base_dir());
+    for ulid in pending_after_redact {
+        vol.promote_segment(ulid).unwrap();
     }
 }
 
@@ -79,18 +79,23 @@ pub fn drain_with_redact(vol: &mut elide_core::volume::Volume) {
 /// updated correctly. See `drain_with_redact` for the redact-may-mint
 /// rationale.
 pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
-    let mut promoted = std::collections::HashSet::new();
-    loop {
-        let next = pending_ulids(base_dir)
-            .into_iter()
-            .find(|u| !promoted.contains(u));
-        let Some(ulid) = next else { break };
-        let redacted = handle.redact_segment(ulid).unwrap();
-        if redacted != ulid {
-            promoted.insert(ulid);
-        }
-        handle.promote_segment(redacted).unwrap();
-        promoted.insert(redacted);
+    // Pass 1: redact every pending in ULID-ascending order. Sorting
+    // ascending matters: fresh `u_redact_N` ULIDs preserve the temporal
+    // ordering of their inputs so the subsequent rebuild walk's "pending
+    // wins last" semantic continues to match temporal-order even before
+    // promote runs.
+    let snapshot = pending_ulids(base_dir);
+    for ulid in snapshot {
+        handle.redact_segment(ulid).unwrap();
+    }
+    // Pass 2: promote in ULID-ascending order against the post-redact
+    // pending state. Each promote moves the lowest-ULID pending into
+    // committed; remaining pending ULIDs all sort above it, preserving
+    // `max(committed) < min(pending)` at every promote boundary —
+    // see `coordinator/src/upload.rs::drain_pending`.
+    let pending_after_redact = pending_ulids(base_dir);
+    for ulid in pending_after_redact {
+        handle.promote_segment(ulid).unwrap();
     }
 }
 

@@ -30,39 +30,32 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 
-/// Simulate coordinator drain: for each file in pending/, redact + promote.
+/// Simulate coordinator drain: redact every pending in pass 1, then
+/// promote each in pass 2 in ULID-ascending order.
 ///
-/// After PR #265, `redact_segment` may rewrite the segment under a freshly
-/// minted ULID and unlink the input pending file. Promote must use the
-/// *returned* ULID — using the original ULID would try to promote a file
-/// that no longer exists. Mirrors `coordinator/src/upload.rs`'s drain
-/// loop (`upload_ulid = redact_segment(...).unwrap_or(ulid)`) and the
-/// `common::drain_with_redact` test helper.
+/// Mirrors the production drain in `coordinator/src/upload.rs`. The two
+/// passes preserve the structural invariant `max(committed) < min(pending)`
+/// throughout the drain — see that file's docs for the architectural
+/// motivation.
 fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    // Re-snapshot pending after every redact: redact may produce two new
-    // pending entries (the rewritten segment + the flushed WAL contents)
-    // under fresh ULIDs and remove the input.
-    //
-    // Always pick the lowest-ULID pending segment next — see
-    // `elide_core::segment::read_ulid_dir_sorted`.
-    let mut promoted = std::collections::HashSet::new();
-    loop {
-        let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
-            return;
-        };
-        let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
-            break;
-        };
-        let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
-        if redacted != ulid {
-            promoted.insert(ulid);
-        }
-        let _ = vol.promote_segment(redacted);
-        promoted.insert(redacted);
+    // Pass 1: redact every pending in place, in ULID-ascending order so
+    // fresh `u_redact_N` ULIDs preserve the temporal ordering of their
+    // inputs.
+    let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+    for ulid in snapshot {
+        let _ = vol.redact_segment(ulid);
+    }
+
+    // Pass 2: promote in ULID-ascending order against the post-redact
+    // pending state.
+    let pending_after_redact =
+        elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+    for ulid in pending_after_redact {
+        let _ = vol.promote_segment(ulid);
     }
 }
 

@@ -169,7 +169,16 @@ proptest! {
                 ActorOp::DrainLocal => {
                     common::drain_via_handle(&handle, fork_dir);
                 }
-                ActorOp::CoordGcLocal { n } => {
+                 ActorOp::CoordGcLocal { n } => {
+                    // Match production sequencing: `tasks.rs` runs drain →
+                    // GC sequentially within each tick. Without an explicit
+                    // drain here, a prior `Flush` could leave a pending
+                    // segment in place during gc_checkpoint, and the
+                    // `apply_plan_apply_result_applied` commit would put
+                    // u_gc into committed while u_flush_old (lower ULID,
+                    // older content) still sits in pending — violating the
+                    // structural pending-above-committed invariant.
+                    common::drain_via_handle(&handle, fork_dir);
                     // Checkpoint: flush WAL and obtain a ULID for the GC
                     // output, matching the real coordinator's gc_checkpoint.
                     let Ok(gc_ulid) = handle.gc_checkpoint() else {

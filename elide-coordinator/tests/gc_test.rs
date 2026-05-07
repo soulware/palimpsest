@@ -1133,20 +1133,18 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     // mirrors the proptest's simulate_upload which works locally only).
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        let mut promoted: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
-        loop {
-            let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
-                return;
-            };
-            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
-                break;
-            };
-            let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
-            if redacted != ulid {
-                promoted.insert(ulid);
-            }
-            let _ = vol.promote_segment(redacted);
-            promoted.insert(redacted);
+        // Pass 1: redact every pending in ULID-ascending order.
+        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+        for ulid in snapshot {
+            let _ = vol.redact_segment(ulid);
+        }
+        // Pass 2: promote in ULID-ascending order against the post-redact
+        // pending state. Preserves `max(committed) < min(pending)`
+        // throughout — see `coordinator/src/upload.rs::drain_pending`.
+        let pending_after_redact =
+            elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+        for ulid in pending_after_redact {
+            let _ = vol.promote_segment(ulid);
         }
     };
 
@@ -1273,20 +1271,18 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        let mut promoted: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
-        loop {
-            let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
-                return;
-            };
-            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
-                break;
-            };
-            let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
-            if redacted != ulid {
-                promoted.insert(ulid);
-            }
-            let _ = vol.promote_segment(redacted);
-            promoted.insert(redacted);
+        // Pass 1: redact every pending in ULID-ascending order.
+        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+        for ulid in snapshot {
+            let _ = vol.redact_segment(ulid);
+        }
+        // Pass 2: promote in ULID-ascending order against the post-redact
+        // pending state. Preserves `max(committed) < min(pending)`
+        // throughout — see `coordinator/src/upload.rs::drain_pending`.
+        let pending_after_redact =
+            elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+        for ulid in pending_after_redact {
+            let _ = vol.promote_segment(ulid);
         }
     };
 
@@ -1420,20 +1416,18 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        let mut promoted: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
-        loop {
-            let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
-                return;
-            };
-            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
-                break;
-            };
-            let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
-            if redacted != ulid {
-                promoted.insert(ulid);
-            }
-            let _ = vol.promote_segment(redacted);
-            promoted.insert(redacted);
+        // Pass 1: redact every pending in ULID-ascending order.
+        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+        for ulid in snapshot {
+            let _ = vol.redact_segment(ulid);
+        }
+        // Pass 2: promote in ULID-ascending order against the post-redact
+        // pending state. Preserves `max(committed) < min(pending)`
+        // throughout — see `coordinator/src/upload.rs::drain_pending`.
+        let pending_after_redact =
+            elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+        for ulid in pending_after_redact {
+            let _ = vol.promote_segment(ulid);
         }
     };
 

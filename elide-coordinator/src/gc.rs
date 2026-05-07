@@ -1427,9 +1427,10 @@ mod tests {
     /// Redact, upload to store, and promote all pending segments.
     /// Mirrors the real coordinator path: redact → S3 PUT → promote.
     ///
-    /// Re-scans `pending/` after every redact because the redact may
-    /// produce a freshly minted ULID for the rewritten segment plus a
-    /// separate pending entry for the flushed WAL contents.
+    /// Two-pass drain: redact every pending in place, then upload + promote
+    /// each in ULID-ascending order. Preserves the structural invariant
+    /// `max(committed) < min(pending)` throughout — see
+    /// `coordinator/src/upload.rs::drain_pending` for why.
     async fn drain_with_redact(
         vol: &mut elide_core::volume::Volume,
         dir: &Path,
@@ -1437,25 +1438,25 @@ mod tests {
         store: &Arc<dyn ObjectStore>,
     ) {
         let pending_dir = dir.join("pending");
-        let mut promoted = std::collections::HashSet::<Ulid>::new();
-        loop {
-            let ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
-            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
-                break;
-            };
-            let redacted = vol.redact_segment(ulid).unwrap();
-            if redacted != ulid {
-                promoted.insert(ulid);
-            }
-            let seg_path = pending_dir.join(redacted.to_string());
+
+        // Pass 1: redact every pending in ULID-ascending order.
+        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
+        for ulid in snapshot {
+            vol.redact_segment(ulid).unwrap();
+        }
+
+        // Pass 2: upload + promote in ULID-ascending order against the
+        // post-redact pending state.
+        let pending_after_redact = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
+        for ulid in pending_after_redact {
+            let seg_path = pending_dir.join(ulid.to_string());
             let data = fs::read(&seg_path).unwrap();
-            let key = segment_key(volume_id, redacted);
+            let key = segment_key(volume_id, ulid);
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
                 .unwrap();
-            vol.promote_segment(redacted).unwrap();
-            promoted.insert(redacted);
+            vol.promote_segment(ulid).unwrap();
         }
     }
 

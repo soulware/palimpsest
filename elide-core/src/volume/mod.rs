@@ -486,6 +486,7 @@ impl Volume {
             )),
         };
         ret.assert_lbamap_consistent("Volume::open");
+        ret.assert_pending_above_committed("Volume::open");
         Ok(ret)
     }
 
@@ -737,6 +738,7 @@ impl Volume {
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
         self.assert_lbamap_consistent("gc_checkpoint_for_test");
+        self.assert_pending_above_committed("gc_checkpoint_for_test");
         Ok(u_gc)
     }
 
@@ -1056,6 +1058,7 @@ impl Volume {
             // then convergence).
             self.rebuild_lbamap_from_disk()?;
             self.assert_lbamap_consistent("apply_plan_apply_result_cancelled");
+            self.assert_pending_above_committed("apply_plan_apply_result_cancelled");
             return Ok(StagedApply::Cancelled);
         }
 
@@ -1127,6 +1130,7 @@ impl Volume {
         // re-runs `Volume::open`'s rebuild which produces the same result.
         self.rebuild_lbamap_from_disk()?;
         self.assert_lbamap_consistent("apply_plan_apply_result_applied");
+        self.assert_pending_above_committed("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
     }
@@ -1295,6 +1299,79 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
+    /// Stress-only invariant: every pending ULID must be greater than every
+    /// committed ULID on disk. This is the structural form of the
+    /// drain-ordering invariant the production drain (`coordinator/upload.rs`)
+    /// relies on — `discover_fork_segments` walks committed (sorted by ULID)
+    /// then pending (sorted by ULID) with the "pending wins last" semantic;
+    /// that semantic is correct *only* when every pending ULID sorts above
+    /// every committed ULID. If a lower-ULID pending peer ever ends up
+    /// alongside a higher-ULID committed segment claiming the same LBA, the
+    /// next promote crosses a tier boundary and flips the walk-order winner
+    /// in a way `self.lbamap` doesn't reflect — exactly the drain bug fixed
+    /// in #265.
+    ///
+    /// `assert_lbamap_consistent` catches that flip after the fact (via
+    /// lbamap drift); this assert catches it structurally before any drift
+    /// surfaces, with a clearer panic message.
+    ///
+    /// Same `lbamap-invariant` feature gate so the perf cost only applies
+    /// to coordinator-layer stress runs.
+    #[cfg(feature = "lbamap-invariant")]
+    pub(in crate::volume) fn assert_pending_above_committed(&self, caller: &'static str) {
+        let pending_dir = self.base_dir.join("pending");
+        let pending_ulids = match segment::read_ulid_dir_sorted(&pending_dir) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("assert_pending_above_committed[{caller}]: read pending failed: {e}");
+                return;
+            }
+        };
+        let Some(&pending_min) = pending_ulids.first() else {
+            return; // No pending — invariant vacuously holds.
+        };
+
+        let mut committed_max: Option<Ulid> = None;
+        let collect = |paths: Vec<PathBuf>, committed_max: &mut Option<Ulid>| {
+            for p in paths {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(u) = Ulid::from_string(stem) else {
+                    continue;
+                };
+                *committed_max = Some(committed_max.map_or(u, |m| m.max(u)));
+            }
+        };
+        if let Ok(idx_paths) = segment::collect_idx_files(&self.base_dir.join("index")) {
+            collect(idx_paths, &mut committed_max);
+        }
+        if let Ok(gc_paths) = segment::collect_gc_applied_segment_files(&self.base_dir) {
+            collect(gc_paths, &mut committed_max);
+        }
+
+        // Strict `>`: same-ULID-in-both-tiers (the mid-promote crash recovery
+        // state where `pending/<u>` and `index/<u>.idx` coexist briefly) is
+        // legitimate and the entries are byte-identical, so the walk-order
+        // winner is unambiguous. The bug shape is *different* ULIDs where
+        // pending's min sorts below a committed peer's higher ULID.
+        if let Some(c_max) = committed_max
+            && c_max > pending_min
+        {
+            panic!(
+                "pending-above-committed invariant violation after [{caller}]: \
+                 max(committed)={c_max} > min(pending)={pending_min} \
+                 (a lower-ULID pending peer is alongside a higher-ULID committed \
+                 segment; the next promote will flip the lbamap walk-order winner)"
+            );
+        }
+    }
+
+    /// No-op stub when `lbamap-invariant` feature is disabled.
+    #[cfg(not(feature = "lbamap-invariant"))]
+    #[inline]
+    pub(in crate::volume) fn assert_pending_above_committed(&self, _caller: &'static str) {}
+
     /// Synchronous single-shot variant of the plan apply path — runs prep,
     /// execute, and apply inline on the current thread. Used by tests and
     /// any caller that doesn't have an actor behind a worker thread.
@@ -1429,6 +1506,7 @@ impl Volume {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
             self.assert_lbamap_consistent("apply_promote_segment_result_tombstone");
+            self.assert_pending_above_committed("apply_promote_segment_result_tombstone");
             return Ok(());
         }
 
@@ -1524,11 +1602,13 @@ impl Volume {
                 Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
             );
         }
-        self.assert_lbamap_consistent(if is_drain {
+        let caller = if is_drain {
             "apply_promote_segment_result_drain"
         } else {
             "apply_promote_segment_result_gc_carried"
-        });
+        };
+        self.assert_lbamap_consistent(caller);
+        self.assert_pending_above_committed(caller);
         Ok(())
     }
 
