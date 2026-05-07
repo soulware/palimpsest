@@ -1050,6 +1050,12 @@ fn promote_segment_after_redact_produces_correct_idx_and_present() {
     let after_second = pending_ulids(&base);
     let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
 
+    // Promote S1 first (lower ULID) so we don't leave a lower-ULID pending
+    // peer alongside the about-to-be-promoted S2 — that would trip the
+    // pending-above-committed invariant. Production drain (`upload.rs`)
+    // sorts pending by ULID for the same reason.
+    vol.promote_segment(s1_ulid).unwrap();
+
     // Redact and promote S2 (simulating the coordinator drain path).
     vol.redact_segment(s2_ulid).unwrap();
     vol.promote_segment(s2_ulid).unwrap();
@@ -1103,6 +1109,9 @@ fn reads_work_after_redact_and_promote() {
     let after_second = pending_ulids(&base);
     let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
 
+    // Promote S1 first to keep pending ULIDs above committed ULIDs (the
+    // pending-above-committed invariant production drain relies on).
+    vol.promote_segment(s1_ulid).unwrap();
     vol.redact_segment(s2_ulid).unwrap();
     vol.promote_segment(s2_ulid).unwrap();
 

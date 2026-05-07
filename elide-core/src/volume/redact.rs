@@ -147,6 +147,7 @@ impl Volume {
         match result {
             RedactResult::NoOp { input_ulid } => {
                 self.assert_lbamap_consistent("apply_redact_result_noop");
+                self.assert_pending_above_committed("apply_redact_result_noop");
                 Ok(input_ulid)
             }
             RedactResult::Rewritten {
@@ -232,6 +233,7 @@ impl Volume {
                     to_remove.len(),
                 );
                 self.assert_lbamap_consistent("apply_redact_result_rewritten");
+                self.assert_pending_above_committed("apply_redact_result_rewritten");
                 Ok(new_ulid)
             }
         }
