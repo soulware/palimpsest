@@ -101,53 +101,48 @@ pub struct SweptInput {
 /// Data needed by the worker to repack sparse segments in `pending/`.
 /// Produced by [`super::Volume::prepare_repack`] on the actor thread.
 ///
-/// Same shape as [`SweepJob`] plus `min_live_ratio` — the worker iterates
-/// every non-floor segment, recomputes liveness against the `lbamap`
-/// snapshot, and rewrites (in place, reusing the input ULID) any segment
-/// whose live ratio falls below the threshold.
+/// Per-segment output ULIDs are pre-minted in `output_ulids` (one per
+/// pending segment at prep time, monotonically increasing, all below
+/// `u_flush` and the next WAL ULID). The worker assigns them in
+/// input-ULID order and only consumes as many as it actually rewrites.
 pub struct RepackJob {
-    pub lbamap: Arc<lbamap::LbaMap>,
-    pub floor: Option<Ulid>,
+    pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
+    pub floor: Option<Ulid>,
+    pub min_live_ratio: f64,
+    pub output_ulids: Vec<Ulid>,
+    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
+    pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
+    pub ancestor_layers: Vec<super::AncestorLayer>,
+    pub fetcher: Option<segment::BoxFetcher>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub verifying_key: ed25519_dalek::VerifyingKey,
     pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
-    pub min_live_ratio: f64,
 }
 
-/// A live entry carried into the repacked output, paired with the CAS
-/// precondition from its source segment. Apply uses
-/// `replace_if_matches(hash, seg_id, source_body_offset, ..)` — the
-/// output reuses the same ULID, so only `body_offset` changes on success.
-pub struct RepackedLiveEntry {
-    pub entry: segment::SegmentEntry,
-    pub source_body_offset: u64,
-}
-
-/// A dead entry dropped by repack, paired with the CAS precondition from
-/// its source segment. Apply uses `remove_if_matches`. Only Data and
-/// Inline entries appear here — Zero, DedupRef, and Delta are thin
-/// entries with no extent-index slot.
-pub struct RepackedDeadEntry {
-    pub hash: blake3::Hash,
-    pub source_body_offset: u64,
-}
-
-/// Per-segment payload from a [`RepackJob`]. One of these is produced for
-/// every segment the worker rewrote or deleted.
+/// Per-segment payload from a [`RepackJob`]. One of these is produced
+/// for every input segment the worker repacked or deleted.
 ///
-/// When `all_dead_deleted` is `true`, the worker has already `remove_file`d
-/// the segment; `live` is empty and `new_body_section_start` is 0. When
-/// `false`, the worker renamed a fresh `.tmp` over the original file, so
-/// `new_body_section_start` and the `live` entries (with post-write
-/// offsets) are valid.
+/// `output` is `None` when every entry classified as fully dead and the
+/// worker deleted the file outright — apply still removes any
+/// owned-body hashes from the extent index. When `Some`, the worker
+/// has materialised a fresh segment under `new_ulid` and written it to
+/// `pending/<new_ulid>`; apply CAS-updates the extent index against
+/// the per-input gate (`current loc.segment_id == input_ulid`) and
+/// unlinks the old `pending/<input_ulid>`.
 pub struct RepackedSegment {
-    pub seg_id: Ulid,
-    pub new_body_section_start: u64,
-    pub live: Vec<RepackedLiveEntry>,
-    pub dead: Vec<RepackedDeadEntry>,
-    pub all_dead_deleted: bool,
+    pub input_ulid: Ulid,
+    pub input_path: PathBuf,
+    pub owned_hashes: Vec<blake3::Hash>,
+    pub output: Option<RepackedOutput>,
     pub bytes_freed: u64,
+}
+
+/// Materialised rewrite output for a single repacked input.
+pub struct RepackedOutput {
+    pub new_ulid: Ulid,
+    pub new_body_section_start: u64,
+    pub out_entries: Vec<segment::SegmentEntry>,
 }
 
 /// Result of a [`RepackJob`]. Consumed by [`super::Volume::apply_repack_result`]
@@ -219,16 +214,16 @@ impl Volume {
 
     /// Prep phase of `repack` — runs on the actor thread.
     ///
-    /// Snapshots `lbamap` (used by the worker to recompute liveness),
-    /// resolves the snapshot floor, and packages the directory + signer
-    /// state into a [`RepackJob`]. Returns `None` when `pending/` is
-    /// missing or has no segments.
+    /// Pre-mints `u_flush` and one output ULID per pending segment at
+    /// prep time, then flushes the WAL into `pending/<u_flush>`. The
+    /// pre-minted ULIDs are monotonically increasing and all sort
+    /// below the next WAL ULID so subsequent flushes win on rebuild —
+    /// preserves `max(pending) < running_WAL`. Snapshots `lbamap`,
+    /// `extent_index`, `ancestor_layers`, and `fetcher` for the
+    /// worker's classifier and body resolver.
     ///
-    /// All segment reads, eligibility decisions, and rewrites run in
-    /// [`crate::actor::execute_repack`]. The apply phase
-    /// [`Self::apply_repack_result`] does the conditional extent-index
-    /// updates and file-cache eviction.
-    pub fn prepare_repack(&self, min_live_ratio: f64) -> io::Result<Option<RepackJob>> {
+    /// Returns `None` when `pending/` is missing or has no segments.
+    pub fn prepare_repack(&mut self, min_live_ratio: f64) -> io::Result<Option<RepackJob>> {
         let pending_dir = self.base_dir.join("pending");
         let segs = match segment::collect_segment_files(&pending_dir) {
             Ok(v) => v,
@@ -239,77 +234,145 @@ impl Volume {
             return Ok(None);
         }
         let floor = latest_snapshot(&self.base_dir)?;
+
+        // Pre-mint output ULIDs (one per current pending segment) +
+        // u_flush. Actor is single-threaded; no new pending segments
+        // can appear between prep and worker run, so this is an upper
+        // bound on what the worker consumes.
+        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(segs.len());
+        for _ in 0..segs.len() {
+            output_ulids.push(self.mint.next());
+        }
+        let u_flush = self.mint.next();
+        self.flush_wal_to_pending_as(u_flush)?;
+
         Ok(Some(RepackJob {
-            lbamap: Arc::clone(&self.lbamap),
-            floor,
+            base_dir: self.base_dir.clone(),
             pending_dir,
+            floor,
+            min_live_ratio,
+            output_ulids,
+            lbamap_snapshot: Arc::clone(&self.lbamap),
+            extent_index_snapshot: Arc::clone(&self.extent_index),
+            ancestor_layers: self.ancestor_layers.clone(),
+            fetcher: self.fetcher.clone(),
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
             segment_cache: Arc::clone(&self.segment_cache),
-            min_live_ratio,
         }))
     }
 
     /// Apply phase of `repack` — runs on the actor thread after the
     /// worker returns.
     ///
-    /// For each rewritten segment: re-points live Data/Inline entries via
-    /// `replace_if_matches((hash, seg_id, source_body_offset) → new_loc)`,
-    /// where the new location reuses the same `seg_id` but with the
-    /// post-write `body_offset`. A concurrent writer that superseded the
-    /// hash between prep and apply fails the CAS and is preserved
-    /// untouched — the repacked body simply becomes unreferenced until
-    /// the next pass picks it up.
-    ///
-    /// Dead entries are dropped with `remove_if_matches` for the same
-    /// reason. File-cache eviction runs for every touched segment so a
-    /// cached fd on the old inode cannot serve stale offsets after the
-    /// rename.
+    /// For each repacked segment:
+    ///   - CAS-remove dropped owned hashes (`current loc.segment_id ==
+    ///     input_ulid`); concurrent writers that re-pointed the hash
+    ///     win.
+    ///   - If a fresh output was written: insert carried entries into
+    ///     the extent index under the same per-input CAS gate, and
+    ///     unlink `pending/<input_ulid>`. The worker has already
+    ///     written `pending/<new_ulid>` separately.
+    ///   - If every entry was dead: the worker already deleted the
+    ///     input file; nothing more to unlink.
+    ///   - Evict the file-cache fd for the input ULID either way.
+    /// Then `rebuild_lbamap_from_disk` so any sub-run hashes from
+    /// `Run` records introduced by the rewrite are reflected.
     pub fn apply_repack_result(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
         let RepackResult {
             mut stats,
             segments,
         } = result;
 
+        let pending_dir = self.base_dir.join("pending");
+        let mut any_changes = false;
+
         for seg in &segments {
-            for dead in &seg.dead {
-                if Arc::make_mut(&mut self.extent_index).remove_if_matches(
-                    &dead.hash,
-                    seg.seg_id,
-                    dead.source_body_offset,
-                ) {
-                    stats.extents_removed += 1;
+            let carried_hashes: std::collections::HashSet<blake3::Hash> = seg
+                .output
+                .as_ref()
+                .map(|o| {
+                    o.out_entries
+                        .iter()
+                        .filter(|e| e.kind != EntryKind::DedupRef)
+                        .map(|e| e.hash)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            {
+                let index = Arc::make_mut(&mut self.extent_index);
+                for hash in &seg.owned_hashes {
+                    if carried_hashes.contains(hash) {
+                        continue;
+                    }
+                    if index
+                        .lookup(hash)
+                        .is_some_and(|loc| loc.segment_id == seg.input_ulid)
+                    {
+                        index.remove(hash);
+                        stats.extents_removed += 1;
+                    }
                 }
-            }
 
-            self.evict_cached_segment(seg.seg_id);
-
-            if !seg.all_dead_deleted {
-                for live in &seg.live {
-                    let entry = &live.entry;
-                    let inline_data = match entry.kind {
-                        EntryKind::Data | EntryKind::CanonicalData => None,
-                        EntryKind::Inline | EntryKind::CanonicalInline => {
-                            entry.data.clone().map(Vec::into_boxed_slice)
+                if let Some(out) = &seg.output {
+                    for e in &out.out_entries {
+                        if e.kind == EntryKind::DedupRef {
+                            continue;
                         }
-                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
-                    };
-                    Arc::make_mut(&mut self.extent_index).replace_if_matches(
-                        entry.hash,
-                        seg.seg_id,
-                        live.source_body_offset,
-                        extentindex::ExtentLocation {
-                            segment_id: seg.seg_id,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            body_source: BodySource::Local,
-                            body_section_start: seg.new_body_section_start,
-                            inline_data,
-                        },
-                    );
+                        let current = index.lookup(&e.hash);
+                        let should_update = match current {
+                            None => true,
+                            Some(loc) => loc.segment_id == seg.input_ulid,
+                        };
+                        if !should_update {
+                            continue;
+                        }
+                        let inline_data = if e.kind.is_inline() {
+                            e.data.clone().map(Vec::into_boxed_slice)
+                        } else {
+                            None
+                        };
+                        index.insert(
+                            e.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: out.new_ulid,
+                                body_offset: e.stored_offset,
+                                body_length: e.stored_length,
+                                compressed: e.compressed,
+                                body_source: BodySource::Local,
+                                body_section_start: out.new_body_section_start,
+                                inline_data,
+                            },
+                        );
+                    }
                 }
             }
+
+            if let Some(out) = &seg.output {
+                if self.last_segment_ulid < Some(out.new_ulid) {
+                    self.last_segment_ulid = Some(out.new_ulid);
+                }
+                self.has_new_segments = true;
+            }
+
+            self.evict_cached_segment(seg.input_ulid);
+
+            if seg.output.is_some() {
+                match fs::remove_file(&seg.input_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            stats.bytes_freed += seg.bytes_freed;
+            any_changes = true;
+        }
+
+        if any_changes {
+            segment::fsync_dir(&pending_dir)?;
+            self.rebuild_lbamap_from_disk()?;
         }
 
         Ok(stats)

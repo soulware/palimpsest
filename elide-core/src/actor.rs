@@ -43,10 +43,9 @@ use crate::volume::{
     DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep,
     PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult,
-    ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, RepackedDeadEntry,
-    RepackedLiveEntry, RepackedSegment, SignSnapshotManifestJob, SignSnapshotManifestResult,
-    SweepJob, SweepResult, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, SignSnapshotManifestJob,
+    SignSnapshotManifestResult, SweepJob, SweepResult, Volume, WorkerJob, WorkerResult,
+    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -668,6 +667,12 @@ impl VolumeActor {
                 return;
             }
         };
+        // `prepare_repack` flushes the WAL before pre-minting output
+        // ULIDs (mirrors `start_sweep` / `start_redact`). The flush
+        // mutates the extent index and may delete the old WAL file —
+        // republish so readers don't resolve hashes through the
+        // pre-flush snapshot into a deleted WAL.
+        self.publish_snapshot();
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::Repack(job)) {
                 warn!("worker channel closed during repack: {e}");
@@ -2552,26 +2557,39 @@ pub(crate) fn invalidate_promote_siblings(
 }
 
 /// Execute a repack job: iterate every non-floor segment in `pending/`,
-/// compute liveness against the captured `lbamap`, and rewrite (in place,
-/// reusing the input ULID) any segment whose live ratio is below
-/// `min_live_ratio`. Segments with no live entries are deleted.
-///
-/// Produces a per-segment `RepackedSegment` with CAS preconditions for
-/// every Data/Inline entry touched — the apply phase on the actor uses
-/// those to update the extent index without clobbering concurrent writes.
+/// classify entries via the shared
+/// [`crate::segment_classify::classify_entry`], and rewrite — under a
+/// freshly-minted ULID — any segment whose live ratio falls below
+/// `min_live_ratio`. Segments with no live entries are deleted
+/// outright. The fresh ULID closes the path-aliasing race the prior
+/// in-place rewrite carried, mirroring sweep / redact / GC.
 pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
-    let seg_paths = segment::collect_segment_files(&job.pending_dir)?;
-    let live: std::collections::HashSet<blake3::Hash> = job.lbamap.lba_referenced_hashes();
-    // pending_dir is `<base>/pending`; its parent is `<base>`.
-    let base_dir = job.pending_dir.parent().ok_or_else(|| {
-        io::Error::other("repack: pending_dir has no parent; cannot locate index/ or cache/")
-    })?;
-    let index_dir = base_dir.join("index");
-    let cache_dir = base_dir.join("cache");
+    use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
+    use crate::segment_classify::{self, ClassifyCtx, EntryClassification};
 
-    let mut stats = CompactionStats::default();
-    let mut segments: Vec<RepackedSegment> = Vec::new();
+    let RepackJob {
+        base_dir,
+        pending_dir,
+        floor,
+        min_live_ratio,
+        output_ulids,
+        lbamap_snapshot,
+        extent_index_snapshot,
+        ancestor_layers,
+        fetcher,
+        signer,
+        verifying_key,
+        segment_cache,
+    } = job;
 
+    let seg_paths = segment::collect_segment_files(&pending_dir)?;
+    let live_hashes = lbamap_snapshot.lba_referenced_hashes();
+
+    // Sort inputs ULID-ascending so the worker assigns pre-minted
+    // output ULIDs in matching order — keeps each rewrite output
+    // sorted just above its input on rebuild.
+    let mut inputs: Vec<(Ulid, std::path::PathBuf)> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
             .file_name()
@@ -2579,169 +2597,204 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .ok_or_else(|| io::Error::other("bad segment filename"))?;
         let seg_id =
             Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
-        if job.floor.is_some_and(|f| seg_id <= f) {
+        inputs.push((seg_id, seg_path.clone()));
+    }
+    inputs.sort_by_key(|(u, _)| *u);
+
+    let index_dir = base_dir.join("index");
+    let cache_dir = base_dir.join("cache");
+
+    let mut stats = CompactionStats::default();
+    let mut segments: Vec<crate::volume::RepackedSegment> = Vec::new();
+    let mut next_output_idx: usize = 0;
+
+    for (seg_id, seg_path) in &inputs {
+        if floor.is_some_and(|f| *seg_id <= f) {
             continue;
         }
 
-        let parsed = match job
-            .segment_cache
-            .read_and_verify(seg_path, &job.verifying_key)
-        {
+        let parsed = match segment_cache.read_and_verify(seg_path, &verifying_key) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        let body_section_start = parsed.body_section_start;
-        let mut entries = parsed.entries.clone();
+        let entries = parsed.entries.clone();
 
         let total_bytes: u64 = entries
             .iter()
             .filter(|e| e.kind.has_body_bytes())
             .map(|e| e.stored_length as u64)
             .sum();
-
         if total_bytes == 0 {
             continue;
         }
-
-        let live_bytes: u64 = entries
+        let live_bytes_estimate: u64 = entries
             .iter()
-            .filter(|e| e.kind.has_body_bytes() && live.contains(&e.hash))
+            .filter(|e| e.kind.has_body_bytes() && live_hashes.contains(&e.hash))
             .map(|e| e.stored_length as u64)
             .sum();
-
-        if live_bytes as f64 / total_bytes as f64 >= job.min_live_ratio {
+        if live_bytes_estimate as f64 / total_bytes as f64 >= min_live_ratio {
             continue;
         }
 
-        let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
-            entries.drain(..).partition(|e| match e.kind {
-                // Thin entries (Zero/DedupRef/Delta) span `lba_length`
-                // LBAs and can be *partially* overwritten — a later Data
-                // write may shadow the head while leaving the tail live.
-                // Drop only when *no* LBA in the range still maps to
-                // this entry's hash; checking just `start_lba` would
-                // discard a partially-live entry whose tail is the only
-                // on-disk record of those LBAs' mapping, producing zero
-                // reads after crash + rebuild.
-                segment::EntryKind::Zero => {
-                    let end_lba = e.start_lba + e.lba_length as u64;
-                    job.lbamap
-                        .extents_in_range(e.start_lba, end_lba)
-                        .iter()
-                        .any(|r| r.hash == crate::volume::ZERO_HASH)
-                }
-                segment::EntryKind::DedupRef | segment::EntryKind::Delta => {
-                    let end_lba = e.start_lba + e.lba_length as u64;
-                    job.lbamap
-                        .extents_in_range(e.start_lba, end_lba)
-                        .iter()
-                        .any(|r| r.hash == e.hash)
-                }
-                // Body-bearing kinds (Data, Inline, CanonicalData,
-                // CanonicalInline): kept whenever their hash is still
-                // referenced anywhere in the volume. Canonical-only entries
-                // already have no LBA claim; non-canonical entries might
-                // have been LBA-overwritten but their body still backs a
-                // DedupRef or Delta source somewhere.
-                k if k.has_body_bytes() => live.contains(&e.hash),
-                _ => unreachable!("EntryKind::{:?} not covered in partition", e.kind),
-            });
+        let classify_ctx = ClassifyCtx {
+            lba_map: &lbamap_snapshot,
+            extent_index: &extent_index_snapshot,
+            live_hashes: &live_hashes,
+            segment_id: *seg_id,
+        };
+        let classifications: Vec<EntryClassification> = entries
+            .iter()
+            .map(|e| segment_classify::classify_entry(e, &classify_ctx))
+            .collect();
 
-        let mut dead: Vec<RepackedDeadEntry> = Vec::new();
-        for entry in &dead_entries {
-            // Zero, DedupRef, and Delta are thin entries with no
-            // extent-index slot; the apply phase's `remove_if_matches`
-            // would always miss. Skipping keeps the dead set focused
-            // on entries apply can actually act on.
-            if matches!(
-                entry.kind,
-                segment::EntryKind::Zero | segment::EntryKind::DedupRef | segment::EntryKind::Delta
-            ) {
-                continue;
+        let mut owned_hashes: Vec<blake3::Hash> = Vec::new();
+        let mut outputs: Vec<PlanOutput> = Vec::with_capacity(classifications.len());
+        for (entry_idx, (entry, action)) in entries.iter().zip(classifications.iter()).enumerate() {
+            let entry_idx = entry_idx as u32;
+            if entry.kind.has_body_bytes() {
+                owned_hashes.push(entry.hash);
             }
-            dead.push(RepackedDeadEntry {
-                hash: entry.hash,
-                source_body_offset: entry.stored_offset,
-            });
+            match action {
+                EntryClassification::FullyLive => outputs.push(PlanOutput::Keep {
+                    input: *seg_id,
+                    entry_idx,
+                }),
+                EntryClassification::DemoteToCanonical => outputs.push(PlanOutput::Canonical {
+                    input: *seg_id,
+                    entry_idx,
+                }),
+                EntryClassification::ZeroSubRuns(runs) => {
+                    for run in runs {
+                        outputs.push(PlanOutput::ZeroSplit {
+                            input: *seg_id,
+                            entry_idx,
+                            start_lba: run.range_start,
+                            lba_length: (run.range_end - run.range_start) as u32,
+                        });
+                    }
+                }
+                EntryClassification::PartialDeath {
+                    live_runs,
+                    emit_canonical,
+                } => {
+                    if *emit_canonical {
+                        outputs.push(PlanOutput::Canonical {
+                            input: *seg_id,
+                            entry_idx,
+                        });
+                    }
+                    for run in live_runs.iter() {
+                        outputs.push(PlanOutput::Run {
+                            input: *seg_id,
+                            entry_idx,
+                            payload_block_offset: run.payload_block_offset,
+                            start_lba: run.range_start,
+                            lba_length: (run.range_end - run.range_start) as u32,
+                        });
+                    }
+                }
+                EntryClassification::DeferUnresolvableDelta => outputs.push(PlanOutput::Keep {
+                    input: *seg_id,
+                    entry_idx,
+                }),
+                EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
+            }
         }
 
-        let mut repacked_live: Vec<RepackedLiveEntry> = Vec::new();
-        let mut new_body_section_start = 0u64;
-        let mut all_dead_deleted = false;
+        // Before writing or deleting the input, invalidate any sibling
+        // promote files left over from a half-crashed prior promote.
+        invalidate_promote_siblings(&index_dir, &cache_dir, *seg_id)?;
 
-        // Before rewriting or deleting `pending/<seg_id>`, invalidate any
-        // sibling files that a prior half-crashed promote may have left
-        // behind. Under normal flow a pending segment has no siblings —
-        // `promote_segment` writes `index/<u>.idx` + `cache/<u>.body` +
-        // `cache/<u>.present` only after the pending body is immutable
-        // and deletes `pending/<u>` on apply. A crash between those two
-        // steps leaves the siblings referencing the pre-repack layout;
-        // rewriting the pending body without removing them produces an
-        // inconsistent segment view on rebuild. Best-effort: each file
-        // may or may not exist.
-        invalidate_promote_siblings(&index_dir, &cache_dir, seg_id)?;
+        let bytes_freed = total_bytes - live_bytes_estimate;
 
-        if !live_entries.is_empty() {
-            let inline_bytes = segment::read_inline_section(seg_path)?;
-            segment::read_extent_bodies(
-                seg_path,
-                body_section_start,
-                &mut live_entries,
-                &inline_bytes,
-            )?;
-
-            // Verify bodies hash to their declared hash. Without this, a
-            // poisoned segment (zero-filled body) would be silently
-            // rewritten under the same extent index, surviving eviction of
-            // the only good copy.
-            for entry in &live_entries {
-                if let Some(body) = entry.data.as_deref() {
-                    segment::verify_body_hash(entry, body).map_err(|e| {
-                        io::Error::new(e.kind(), format!("repack: input segment {seg_id}: {e}"))
-                    })?;
-                }
-            }
-
-            // Capture pre-write offsets — `write_segment` reassigns
-            // `stored_offset` to the new body positions.
-            let source_offsets: Vec<u64> = live_entries.iter().map(|e| e.stored_offset).collect();
-
-            let new_ulid_str = seg_id.to_string();
-            let tmp_path = job.pending_dir.join(format!("{new_ulid_str}.tmp"));
-            let final_path = job.pending_dir.join(&new_ulid_str);
-            new_body_section_start =
-                segment::write_segment(&tmp_path, &mut live_entries, job.signer.as_ref())?;
-            std::fs::rename(&tmp_path, &final_path)?;
-            segment::fsync_dir(&final_path)?;
-            stats.new_segments += 1;
-
-            for (entry, source_body_offset) in live_entries.into_iter().zip(source_offsets) {
-                repacked_live.push(RepackedLiveEntry {
-                    entry,
-                    source_body_offset,
-                });
-            }
-        } else {
-            // Every entry is dead — delete the segment file outright.
-            // Leaving it on disk would keep DedupRef bodies visible to a
-            // later drain after their canonical hashes have been
-            // dropped from the extent index by the apply phase.
+        if outputs.is_empty() {
+            // Every entry classified Drop / DropAndRemoveHash — delete
+            // the segment outright. Apply still removes the owned
+            // hashes from the extent index.
             std::fs::remove_file(seg_path)?;
             segment::fsync_dir(seg_path)?;
-            all_dead_deleted = true;
+            stats.segments_compacted += 1;
+            stats.bytes_freed += bytes_freed;
+            segments.push(crate::volume::RepackedSegment {
+                input_ulid: *seg_id,
+                input_path: seg_path.clone(),
+                owned_hashes,
+                output: None,
+                bytes_freed,
+            });
+            continue;
         }
 
+        let new_ulid = *output_ulids
+            .get(next_output_idx)
+            .ok_or_else(|| io::Error::other("repack: ran out of pre-minted output ULIDs"))?;
+        next_output_idx += 1;
+
+        let plan = RewritePlan { new_ulid, outputs };
+        let resolver = WorkerBodyResolver {
+            base_dir: &base_dir,
+            ancestor_layers: &ancestor_layers,
+            fetcher: fetcher.as_ref(),
+            extent_index: &extent_index_snapshot,
+        };
+        let plan_inputs = plan.inputs();
+        let ctx = match MaterialiseCtx::new_for_pending(
+            &base_dir,
+            &plan_inputs,
+            &extent_index_snapshot,
+            &resolver,
+        ) {
+            Ok(c) => c,
+            Err(MaterialiseOutcome::Io(e)) => return Err(e),
+            Err(MaterialiseOutcome::Cancel(e)) => {
+                return Err(io::Error::other(format!(
+                    "repack {seg_id}: materialise prep cancelled: {e}"
+                )));
+            }
+        };
+        let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
+            Ok(m) => m,
+            Err(MaterialiseOutcome::Io(e)) => return Err(e),
+            Err(MaterialiseOutcome::Cancel(e)) => {
+                return Err(io::Error::other(format!(
+                    "repack {seg_id}: materialise cancelled: {e}"
+                )));
+            }
+        };
+        drop(ctx);
+
+        let Materialised {
+            entries: mut out_entries,
+            delta_body,
+        } = materialised;
+
+        let new_ulid_str = new_ulid.to_string();
+        let final_path = pending_dir.join(&new_ulid_str);
+        let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
+        let _ = std::fs::remove_file(&tmp_path);
+        let new_body_section_start = segment::write_segment_full(
+            &tmp_path,
+            &mut out_entries,
+            &delta_body,
+            &[],
+            signer.as_ref(),
+        )?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        segment::fsync_dir(&final_path)?;
+        stats.new_segments += 1;
         stats.segments_compacted += 1;
-        let bytes_freed = total_bytes - live_bytes;
         stats.bytes_freed += bytes_freed;
 
-        segments.push(RepackedSegment {
-            seg_id,
-            new_body_section_start,
-            live: repacked_live,
-            dead,
-            all_dead_deleted,
+        segments.push(crate::volume::RepackedSegment {
+            input_ulid: *seg_id,
+            input_path: seg_path.clone(),
+            owned_hashes,
+            output: Some(crate::volume::RepackedOutput {
+                new_ulid,
+                new_body_section_start,
+                out_entries,
+            }),
             bytes_freed,
         });
     }

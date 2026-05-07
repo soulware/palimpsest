@@ -1472,6 +1472,7 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     vol.write(0, &dedup_data_0).unwrap();
     vol.write(6, &dedup_data_0).unwrap();
     vol.flush_wal().unwrap();
+    let pre_repack: std::collections::HashSet<_> = pending_ulids(&base).into_iter().collect();
 
     // DedupWrite seed=1: overwrite both LBAs with new data.
     let dedup_data_1 = vec![1u8; 4096];
@@ -1482,14 +1483,19 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     // min_live_ratio=0.01 so the segment (0% live) is eligible.
     vol.repack(0.01).unwrap();
 
-    // The fully-dead segment must have been deleted.
-    let ulids = pending_ulids(&base);
+    // The fully-dead seed=0 segment must have been deleted. Repack's
+    // prep also flushes the WAL (the seed=1 writes) into a fresh
+    // pending/<u_flush>, so check that the original input is gone
+    // rather than asserting an empty pending dir.
+    let after_repack: std::collections::HashSet<_> = pending_ulids(&base).into_iter().collect();
+    let surviving_inputs: Vec<_> = pre_repack.intersection(&after_repack).collect();
     assert!(
-        ulids.is_empty(),
-        "repack should delete fully-dead segment, but found: {ulids:?}"
+        surviving_inputs.is_empty(),
+        "repack should delete fully-dead segment, but it survived: {surviving_inputs:?}"
     );
 
-    // DrainWithRedact: flush the WAL (seed=1), redact, promote.
+    // DrainWithRedact: redact + promote each remaining pending segment.
+    // (The WAL was already flushed during prepare_repack.)
     vol.flush_wal().unwrap();
     for ulid in pending_ulids(&base) {
         let redacted = vol.redact_segment(ulid).unwrap();
