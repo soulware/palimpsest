@@ -1,15 +1,18 @@
-//! Volume-side materialisation of a coordinator-emitted [`GcPlan`].
+//! Materialise a [`RewritePlan`] into the entries + delta-body bytes that
+//! make up the new segment.
 //!
-//! See `docs/design-gc-plan-handoff.md`.
+//! Used by every rewriter that produces a fresh-ULID segment from one or
+//! more inputs — coordinator-driven GC, redact, sweep_pending, repack,
+//! delta_repack. The plan ([`crate::rewrite_plan::PlanOutput`]) is a
+//! declarative description; this module turns it into a concrete
+//! `(Vec<SegmentEntry>, Vec<u8>)` ready for [`crate::segment::write_segment_full`].
 //!
-//! The coordinator classifies inputs and writes a [`GcPlan`]; the volume
-//! reads it, resolves bodies through its own ancestor-aware / fetcher-aware
-//! primitives, builds the output segment's entries and delta body bytes, and
-//! hands them off to the caller to sign and commit.
+//! See `docs/design-gc-plan-handoff.md` for the original GC handoff
+//! design that this module's primitives were factored out of.
 //!
-//! This module contains only the pure materialisation step. The commit path
-//! — writing the signed segment, renaming tmp → bare, deriving extent-index
-//! updates — lives in `volume.rs` next to the existing handoff commit logic.
+//! Body resolution is abstracted via [`BodyResolver`] — the production
+//! impl walks the volume's self + ancestor dirs and the demand fetcher;
+//! tests can mock the trait against an in-memory tree.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,7 +22,7 @@ use std::path::Path;
 use ulid::Ulid;
 
 use crate::extentindex::{BodySource, ExtentIndex};
-use crate::gc_plan::{GcPlan, PlanOutput};
+use crate::rewrite_plan::{PlanOutput, RewritePlan};
 use crate::segment::{self, BoxFetcher, EntryKind, SegmentBodyLayout, SegmentEntry, SegmentFlags};
 
 /// Block size in bytes (4 KiB).
@@ -148,22 +151,39 @@ pub trait BodyResolver {
     fn open_delta_body(&self, segment_id: Ulid) -> io::Result<fs::File>;
 }
 
-/// Load per-input idx state. Returns `Err(MissingInput(...))` if any input's
-/// `.idx` is absent — in that case the caller cancels the plan (the input
-/// was deleted between plan emission and apply).
+/// Load per-input idx state for inputs that live in the GC handoff
+/// `index/<u>.idx` shape — coordinator-driven GC. Returns
+/// `Err(MissingInput(...))` if any input's `.idx` is absent (the input
+/// was deleted between plan emission and apply); the caller cancels.
 fn load_input_states(
     base_dir: &Path,
     inputs: &[Ulid],
 ) -> Result<HashMap<Ulid, InputState>, MaterialiseOutcome> {
     let index_dir = base_dir.join("index");
+    load_input_states_from(inputs, |u| index_dir.join(format!("{u}.idx")))
+}
+
+/// Generic input-state loader. The caller supplies a resolver that maps
+/// each input ULID to the file holding its segment index — `index/<u>.idx`
+/// for GC, `pending/<u>` for redact / sweep / repack / delta_repack.
+/// `read_segment_index` accepts both shapes (a full pending segment or
+/// just the .idx head) so a single loader handles every tier.
+fn load_input_states_from<F>(
+    inputs: &[Ulid],
+    resolve_path: F,
+) -> Result<HashMap<Ulid, InputState>, MaterialiseOutcome>
+where
+    F: Fn(&Ulid) -> std::path::PathBuf,
+{
     let mut out = HashMap::with_capacity(inputs.len());
     for input_ulid in inputs {
-        let idx_path = index_dir.join(format!("{input_ulid}.idx"));
+        let idx_path = resolve_path(input_ulid);
         let parsed = match segment::read_segment_index(&idx_path) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(MaterialiseError::MissingInput(format!(
-                    "input {input_ulid} .idx missing"
+                    "input {input_ulid} segment file missing at {}",
+                    idx_path.display()
                 ))
                 .into());
             }
@@ -188,7 +208,7 @@ fn load_input_states(
 /// Materialise a plan into output entries + delta body. See the module
 /// docstring.
 pub fn materialise_plan(
-    plan: &GcPlan,
+    plan: &RewritePlan,
     ctx: &MaterialiseCtx<'_>,
 ) -> Result<Materialised, MaterialiseOutcome> {
     let mut out_entries: Vec<SegmentEntry> = Vec::new();
@@ -722,7 +742,9 @@ fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> Result<(), Materialise
 }
 
 impl<'a> MaterialiseCtx<'a> {
-    /// Construct a ctx by eagerly loading per-input idx state from disk.
+    /// Construct a ctx by eagerly loading per-input idx state from
+    /// `<base_dir>/index/<u>.idx`. Used by the GC handoff path —
+    /// inputs are committed segments confirmed in S3.
     pub fn new(
         base_dir: &'a Path,
         inputs: &[Ulid],
@@ -730,6 +752,26 @@ impl<'a> MaterialiseCtx<'a> {
         resolver: &'a dyn BodyResolver,
     ) -> Result<Self, MaterialiseOutcome> {
         let input_states = load_input_states(base_dir, inputs)?;
+        Ok(Self {
+            base_dir,
+            input_states,
+            extent_index,
+            resolver,
+        })
+    }
+
+    /// Construct a ctx for inputs in `<base_dir>/pending/<u>` (full
+    /// segment files, not just the `.idx` head). Used by redact /
+    /// sweep / repack / delta_repack — synchronous rewriters that
+    /// run on the actor against not-yet-uploaded segments.
+    pub fn new_for_pending(
+        base_dir: &'a Path,
+        inputs: &[Ulid],
+        extent_index: &'a ExtentIndex,
+        resolver: &'a dyn BodyResolver,
+    ) -> Result<Self, MaterialiseOutcome> {
+        let pending_dir = base_dir.join("pending");
+        let input_states = load_input_states_from(inputs, |u| pending_dir.join(u.to_string()))?;
         Ok(Self {
             base_dir,
             input_states,
@@ -752,7 +794,7 @@ mod tests {
     //! `gc_delta_partial_death_compaction` deterministic test.
 
     use super::*;
-    use crate::gc_plan::{GcPlan, PlanOutput};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
     use crate::segment::{self, DeltaOption, SegmentEntry, SegmentFlags};
 
     struct MockResolver {
@@ -843,7 +885,7 @@ mod tests {
 
         let index = ExtentIndex::default();
         let new_ulid = Ulid::new();
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid,
             outputs: vec![PlanOutput::Keep {
                 input: input_ulid,
@@ -880,7 +922,7 @@ mod tests {
             delta_files: HashMap::new(),
         };
         let index = ExtentIndex::default();
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid: Ulid::new(),
             outputs: vec![PlanOutput::ZeroSplit {
                 input: input_ulid,

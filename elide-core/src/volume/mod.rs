@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 use crate::{
     extentindex::{self, BodySource},
-    gc_plan, lbamap,
+    lbamap, rewrite_plan,
     segment::{self, EntryKind},
     segment_cache,
     ulid_mint::UlidMint,
@@ -52,6 +52,7 @@ mod open_state;
 mod read;
 mod readonly;
 mod reclaim;
+mod redact;
 mod repack;
 mod wal;
 
@@ -81,10 +82,11 @@ pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
     scan_reclaim_candidates,
 };
+pub use redact::{RedactJob, RedactResult};
 pub use repack::{
     CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats, DeltaRepackedSegment,
     RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry, RepackedSegment, SweepJob,
-    SweepResult, SweptDeadEntry, SweptLiveEntry,
+    SweepResult, SweptInput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -462,7 +464,7 @@ impl Volume {
         let has_new_segments = !pending_entries.is_empty()
             || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
 
-        Ok(Self {
+        let ret = Self {
             base_dir: base_dir.to_owned(),
             ancestor_layers,
             lock_file,
@@ -483,7 +485,9 @@ impl Volume {
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
-        })
+        };
+        ret.assert_lbamap_consistent("Volume::open");
+        Ok(ret)
     }
 
     /// Write `data` starting at logical block address `lba`.
@@ -733,6 +737,7 @@ impl Volume {
         // Flush the current WAL to pending/ under u_flush. If the WAL is
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
+        self.assert_lbamap_consistent("gc_checkpoint_for_test");
         Ok(u_gc)
     }
 
@@ -920,7 +925,7 @@ impl Volume {
         plan_path: PathBuf,
         new_ulid: Ulid,
     ) -> io::Result<Option<GcPlanApplyJob>> {
-        let plan = match gc_plan::GcPlan::read(&plan_path) {
+        let plan = match rewrite_plan::RewritePlan::read(&plan_path) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!(
@@ -1051,6 +1056,7 @@ impl Volume {
             // lets the next pass see the current truth (one wasted pass,
             // then convergence).
             self.rebuild_lbamap_from_disk()?;
+            self.assert_lbamap_consistent("apply_plan_apply_result_cancelled");
             return Ok(StagedApply::Cancelled);
         }
 
@@ -1121,6 +1127,7 @@ impl Volume {
         // Crash ordering: on a crash between rename and rebuild, restart
         // re-runs `Volume::open`'s rebuild which produces the same result.
         self.rebuild_lbamap_from_disk()?;
+        self.assert_lbamap_consistent("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
     }
@@ -1130,7 +1137,7 @@ impl Volume {
     /// construction in `Volume::open`. Used by the GC apply path on both
     /// the stale-cancel and commit branches to keep the in-memory view
     /// from drifting relative to on-disk state.
-    fn rebuild_lbamap_from_disk(&mut self) -> io::Result<()> {
+    pub(in crate::volume) fn rebuild_lbamap_from_disk(&mut self) -> io::Result<()> {
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -1176,6 +1183,118 @@ impl Volume {
         self.lbamap = Arc::new(fresh);
         Ok(())
     }
+
+    /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
+    /// if it diverges from `self.lbamap`. Called at the end of every
+    /// **structural** op (segment-shape mutations: redact apply, promote,
+    /// GC plan apply, checkpoint flush, volume open) so any drift trips at
+    /// the introducing site, not three operations later as a stale-cancel
+    /// or oracle mismatch.
+    ///
+    /// Deliberately **not** called from `write` / `write_zeroes` — those
+    /// are high-frequency incremental `lbamap.insert` updates that have
+    /// been stable for a long time, and any drift they introduced would
+    /// be caught at the next structural op anyway. Asserting on every
+    /// individual write doubles proptest runtime.
+    ///
+    /// Gated behind the `proptest` feature so debug builds and the regular
+    /// `cargo test` suite aren't slowed by the per-op rebuild. The
+    /// `gc_proptest` runs already enable this feature; running with
+    /// `--features proptest` is what catches drift bugs of the class fixed
+    /// by sorting drain loops by ULID ascending.
+    #[cfg(feature = "lbamap-invariant")]
+    pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+        let mut chain: Vec<(PathBuf, Option<String>)> = self
+            .ancestor_layers
+            .iter()
+            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+            .collect();
+        chain.push((self.base_dir.clone(), None));
+        // Use the unverified rebuild — the signature verify is the dominant
+        // per-segment cost and we don't need it for an in-memory consistency
+        // check (signatures were already verified at Volume::open time, and
+        // on-disk segments are immutable after creation).
+        let mut fresh = match lbamap::rebuild_segments_unverified(&chain) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("assert_lbamap_consistent[{caller}]: rebuild failed: {e}");
+                return;
+            }
+        };
+        let wal_dir = self.base_dir.join("wal");
+        if let Ok(entries) = fs::read_dir(&wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let Ok((records, _)) = writelog::scan_readonly(&path) else {
+                    continue;
+                };
+                for record in records {
+                    match record {
+                        writelog::LogRecord::Data {
+                            hash,
+                            start_lba,
+                            lba_length,
+                            ..
+                        }
+                        | writelog::LogRecord::Ref {
+                            hash,
+                            start_lba,
+                            lba_length,
+                        } => {
+                            fresh.insert(start_lba, lba_length, hash);
+                        }
+                        writelog::LogRecord::Zero {
+                            start_lba,
+                            lba_length,
+                        } => {
+                            fresh.insert(start_lba, lba_length, ZERO_HASH);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut diverging: Vec<(u64, Option<blake3::Hash>, Option<blake3::Hash>)> = Vec::new();
+        let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (lba, _, _, _) in self.lbamap.iter_entries() {
+            all_lbas.insert(lba);
+        }
+        for (lba, _, _, _) in fresh.iter_entries() {
+            all_lbas.insert(lba);
+        }
+        for lba in all_lbas {
+            let mem = self.lbamap.hash_at(lba);
+            let disk = fresh.hash_at(lba);
+            if mem != disk {
+                diverging.push((lba, mem, disk));
+                if diverging.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        if !diverging.is_empty() {
+            let mut msg = format!(
+                "lbamap drift after [{caller}]: {} LBA(s) diverge",
+                diverging.len()
+            );
+            for (lba, mem, disk) in &diverging {
+                msg.push_str(&format!(
+                    "\n  lba={lba} in_memory={:?} disk_rebuild={:?}",
+                    mem.map(|h| h.to_hex().to_string()),
+                    disk.map(|h| h.to_hex().to_string()),
+                ));
+            }
+            panic!("{msg}");
+        }
+    }
+
+    /// No-op stub when `lbamap-invariant` feature is disabled.
+    #[cfg(not(feature = "lbamap-invariant"))]
+    #[inline]
+    pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,
     /// execute, and apply inline on the current thread. Used by tests and
@@ -1310,6 +1429,7 @@ impl Volume {
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
+            self.assert_lbamap_consistent("apply_promote_segment_result_tombstone");
             return Ok(());
         }
 
@@ -1405,6 +1525,11 @@ impl Volume {
                 Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
             );
         }
+        self.assert_lbamap_consistent(if is_drain {
+            "apply_promote_segment_result_drain"
+        } else {
+            "apply_promote_segment_result_gc_carried"
+        });
         Ok(())
     }
 
@@ -1435,128 +1560,6 @@ impl Volume {
         // Best-effort cleanup of any stray `.plan` sibling left over from
         // a crash between the bare rename and `.plan` removal.
         let _ = fs::remove_file(gc_dir.join(format!("{ulid}.plan")));
-        Ok(())
-    }
-
-    /// Drop hash-dead DATA entries from `pending/<ulid>`, so that deleted
-    /// data never leaves the local host via S3 upload. Called by the
-    /// coordinator just before the segment is read for upload.
-    ///
-    /// A DATA entry is **hash-dead** when:
-    /// - Its LBA no longer maps to this hash (LBA-dead), and
-    /// - No other live LBA in the volume references this hash.
-    ///
-    /// Such an entry has no readers (by construction) and its bytes are
-    /// safe to drop. LBA-dead-but-hash-alive entries are kept — their
-    /// bytes still back a DedupRef or Delta source somewhere. DedupRef,
-    /// Zero, Inline, Canonical*, and Delta entries are kept untouched.
-    ///
-    /// Implementation: the pending segment is rewritten via tmp+rename
-    /// with the dropped entries removed from the index and their body
-    /// bytes excluded. Removing the entries (rather than only
-    /// hole-punching their bodies) is required for correctness: on
-    /// crash+rebuild, `extent_index::rebuild` walks segments in ULID
-    /// ascending order and takes the first insert per hash; a stale
-    /// hash-dead entry surviving in a lower-ULID .idx would shadow the
-    /// same hash's live body in a later segment.
-    ///
-    /// Idempotent: a second call is a no-op because the first call
-    /// already dropped every hash-dead entry.
-    ///
-    /// Fast path: if no hash-dead DATA entries exist, the function
-    /// returns without rewriting.
-    pub fn redact_segment(&mut self, ulid: Ulid) -> io::Result<()> {
-        let ulid_str = ulid.to_string();
-        let pending_dir = self.base_dir.join("pending");
-        let seg_path = pending_dir.join(&ulid_str);
-
-        let (body_section_start, entries, inputs) =
-            segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
-
-        let live_hashes = self.lbamap.lba_referenced_hashes();
-        let is_hash_dead = |entry: &segment::SegmentEntry| -> bool {
-            if !entry.kind.is_data() || entry.stored_length == 0 {
-                return false;
-            }
-            let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
-            !lba_live && !live_hashes.contains(&entry.hash)
-        };
-
-        if !entries.iter().any(&is_hash_dead) {
-            return Ok(());
-        }
-
-        // Partition: dropped hashes (for extent-index cleanup) vs
-        // surviving entries (rewritten into the new segment).
-        let (mut kept_entries, dropped_entries): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|e| !is_hash_dead(e));
-        let dropped_count = dropped_entries.len();
-        let dropped_bytes: u64 = dropped_entries.iter().map(|e| e.stored_length as u64).sum();
-        let dropped_hashes: Vec<blake3::Hash> =
-            dropped_entries.into_iter().map(|e| e.hash).collect();
-
-        // Load live body bytes + inline section + delta body verbatim.
-        let inline_bytes = segment::read_inline_section(&seg_path)?;
-        segment::read_extent_bodies(
-            &seg_path,
-            body_section_start,
-            &mut kept_entries,
-            &inline_bytes,
-        )?;
-        let delta_body = segment::read_delta_body_section(&seg_path)?;
-
-        // Rewrite via tmp+rename. `write_segment_full` reassigns
-        // `stored_offset` for surviving entries based on the compacted
-        // body layout, so new offsets may shift downward.
-        let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
-        // `create_new` inside write_segment_full requires no stale .tmp.
-        let _ = fs::remove_file(&tmp_path);
-        segment::write_segment_full(
-            &tmp_path,
-            &mut kept_entries,
-            &delta_body,
-            &inputs,
-            self.signer.as_ref(),
-        )?;
-        fs::rename(&tmp_path, &seg_path)?;
-        segment::fsync_dir(&seg_path)?;
-
-        // If a previous drain crashed mid-promote, this segment may
-        // have sibling `index/<u>.idx` + `cache/<u>.{body,present,delta}`
-        // files left over from the pre-redact layout. Those now point
-        // at stale body offsets — `promote_segment`'s idempotence guard
-        // would keep them. Remove them so the following promote rewrites
-        // them from the freshly-redacted pending body.
-        crate::actor::invalidate_promote_siblings(
-            &self.base_dir.join("index"),
-            &self.base_dir.join("cache"),
-            ulid,
-        )?;
-
-        // Body offsets and the file's inode contents both changed — any
-        // cached fd for this segment must be dropped.
-        self.evict_cached_segment(ulid);
-
-        // Clear extent-index entries for dropped hashes if they still
-        // point at this segment. A later GC/repack may have already
-        // moved the canonical location elsewhere; leave those alone.
-        //
-        // Without this, the dedup write shortcut (`write_commit`) would
-        // see a surviving extent-index entry for the dropped hash and
-        // emit a thin DedupRef whose canonical body is gone.
-        if !dropped_hashes.is_empty() {
-            let index = Arc::make_mut(&mut self.extent_index);
-            for hash in &dropped_hashes {
-                if index.lookup(hash).is_some_and(|loc| loc.segment_id == ulid) {
-                    index.remove(hash);
-                }
-            }
-        }
-
-        log::info!(
-            "redact {ulid_str}: dropped {dropped_count} hash-dead DATA entries ({dropped_bytes} bytes)"
-        );
-
         Ok(())
     }
 
@@ -1621,7 +1624,10 @@ impl Volume {
     ///
     /// Leaves `self.wal = None` on success — the next write lazily opens a
     /// fresh WAL. No-op when no WAL is currently open.
-    fn flush_wal_to_pending_as(&mut self, segment_ulid: Ulid) -> io::Result<()> {
+    pub(in crate::volume) fn flush_wal_to_pending_as(
+        &mut self,
+        segment_ulid: Ulid,
+    ) -> io::Result<()> {
         let Some(mut open) = self.wal.take() else {
             return Ok(());
         };

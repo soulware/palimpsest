@@ -987,21 +987,30 @@ fn redact_segment_drops_hash_dead_data_entry() {
 
     let secret_hash = blake3::hash(&secret);
 
-    vol.redact_segment(seg_ulid).unwrap();
+    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    assert_ne!(
+        new_ulid, seg_ulid,
+        "slow-path redact must return a freshly minted ULID"
+    );
 
-    // No tmp leftovers — rewrite is tmp+rename.
-    let seg_path = base.join("pending").join(seg_ulid.to_string());
-    assert!(seg_path.exists(), "pending/<ulid> must still exist");
+    // Old pending file is removed; new ULID's file exists; no .tmp leftover.
+    let pending_dir = base.join("pending");
     assert!(
-        !base
-            .join("pending")
-            .join(format!("{}.tmp", seg_ulid))
-            .exists(),
+        !pending_dir.join(seg_ulid.to_string()).exists(),
+        "pending/<old_ulid> must be removed after redact"
+    );
+    let new_seg_path = pending_dir.join(new_ulid.to_string());
+    assert!(
+        new_seg_path.exists(),
+        "pending/<new_ulid> must hold the rewritten segment"
+    );
+    assert!(
+        !pending_dir.join(format!("{}.tmp", new_ulid)).exists(),
         "no .tmp should survive redact"
     );
 
     let (_, entries, _) =
-        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+        segment::read_and_verify_segment_index(&new_seg_path, &vol.verifying_key).unwrap();
     assert!(
         entries.iter().all(|e| e.hash != secret_hash),
         "redact must drop the hash-dead entry from the index"
@@ -1009,7 +1018,7 @@ fn redact_segment_drops_hash_dead_data_entry() {
 
     // The dropped secret's high-entropy bytes must not be findable
     // anywhere in the rewritten segment.
-    let bytes = fs::read(&seg_path).unwrap();
+    let bytes = fs::read(&new_seg_path).unwrap();
     let needle: &[u8] = &secret[..64];
     assert!(
         bytes.windows(needle.len()).all(|w| w != needle),
@@ -1111,8 +1120,10 @@ fn reads_work_after_redact_and_promote() {
 
 #[test]
 fn redact_segment_idempotent() {
-    // A second redact call is a no-op because the first call already
-    // punched all hash-dead DATA regions.
+    // The first redact rewrites the segment under a freshly minted
+    // ULID and removes the input. A second redact against the new
+    // ULID is a no-op (no hash-dead entries remain) and returns the
+    // same ULID unchanged.
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1126,17 +1137,25 @@ fn redact_segment_idempotent() {
     let replacement: Vec<u8> = (0..8192).map(|i| (i * 23 + 41) as u8).collect();
     vol.write(0, &replacement).unwrap();
 
-    // First redact punches the dead region; second is a no-op.
-    vol.redact_segment(seg_ulid).unwrap();
-    vol.redact_segment(seg_ulid).unwrap();
+    // First redact: slow path, mints new ULID. Second redact on the
+    // new ULID: fast path, returns the same ULID with no rewrite.
+    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    assert_ne!(new_ulid, seg_ulid);
+    let new_ulid_again = vol.redact_segment(new_ulid).unwrap();
+    assert_eq!(new_ulid_again, new_ulid);
 
-    // Segment file still present, no sidecar produced.
-    assert!(base.join("pending").join(seg_ulid.to_string()).exists());
+    let pending_dir = base.join("pending");
     assert!(
-        !base
-            .join("pending")
-            .join(format!("{}.materialized", seg_ulid))
-            .exists()
+        !pending_dir.join(seg_ulid.to_string()).exists(),
+        "input ULID's pending file must be removed after slow-path redact"
+    );
+    assert!(
+        pending_dir.join(new_ulid.to_string()).exists(),
+        "new ULID's pending file must exist"
+    );
+    assert!(
+        !pending_dir.join(format!("{}.tmp", new_ulid)).exists(),
+        "no .tmp should remain"
     );
 
     fs::remove_dir_all(base).unwrap();
@@ -1253,22 +1272,81 @@ fn redact_drops_entry_when_hash_fully_dead() {
 
     let dead_hash = blake3::hash(&data);
 
-    vol.redact_segment(seg_ulid).unwrap();
+    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    assert_ne!(new_ulid, seg_ulid);
 
-    let seg_path = base.join("pending").join(seg_ulid.to_string());
+    let new_seg_path = base.join("pending").join(new_ulid.to_string());
     let (_, entries, _) =
-        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+        segment::read_and_verify_segment_index(&new_seg_path, &vol.verifying_key).unwrap();
     assert!(
         entries.iter().all(|e| e.hash != dead_hash),
         "redact must drop the fully-dead entry from the index"
     );
 
-    // The original body bytes must not be findable in the segment file.
-    let bytes = fs::read(&seg_path).unwrap();
+    // The original body bytes must not be findable in the rewritten segment.
+    let bytes = fs::read(&new_seg_path).unwrap();
     let needle: &[u8] = &data[..64];
     assert!(
         bytes.windows(needle.len()).all(|w| w != needle),
         "dead entry body bytes must not remain in the segment file"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn redact_keeps_extent_index_offsets_in_sync_for_surviving_entries() {
+    // Regression: redact rewrites pending/<ulid> with the hash-dead Data
+    // entries removed, which shrinks the index section AND reassigns
+    // body_offset for every surviving Data entry. Before the fix, the
+    // in-memory extent index kept the pre-redact body_section_start and
+    // body_offset values, so a subsequent read of any surviving entry
+    // seeked past its real body bytes — producing garbage that failed
+    // lz4 decompression downstream (observed in production as ublk
+    // EIO + rustc SIGBUS during a real workload).
+    //
+    // The test writes two body-section Data entries, makes the first
+    // hash-dead, redacts, then reads the surviving entry. Without the
+    // fix, the in-memory extent index records body_section_start sized
+    // for two entries while the on-disk file has body_section_start
+    // sized for one, so the read fails or returns wrong bytes.
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Two distinct, high-entropy payloads — must stay in the body
+    // section (not inline) so body_offset shifts on redact.
+    let payload_a: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+    let payload_b: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
+
+    // Two Data entries in one segment.
+    vol.write(0, &payload_a).unwrap();
+    vol.write(4, &payload_b).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 1);
+    let seg_ulid = ulids[0];
+
+    // Overwrite LBA 0-1 so the first Data entry is fully hash-dead.
+    let payload_c: Vec<u8> = (0..8192).map(|i| (i * 13 + 5) as u8).collect();
+    vol.write(0, &payload_c).unwrap();
+
+    // Redact drops the dead entry and rewrites the segment under a
+    // freshly minted ULID with a smaller index section + reassigned
+    // body offsets for the survivor.
+    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    assert_ne!(new_ulid, seg_ulid);
+
+    // Read the surviving entry. With the in-memory extent index
+    // refreshed (segment_id flipped to new_ulid; body_section_start
+    // and body_offset reassigned), this returns payload_b. Without
+    // the fix, the read either errors with a decompression failure
+    // or returns garbage.
+    assert_eq!(
+        vol.read(4, 2).unwrap(),
+        payload_b,
+        "surviving body-section entry must read back correctly after redact \
+         compacts body offsets"
     );
 
     fs::remove_dir_all(base).unwrap();
@@ -1301,10 +1379,10 @@ fn redact_invalidates_extent_index_for_punched_hash() {
     // and no other LBA references it — hash-fully-dead.
     vol.write(28, &payload_b).unwrap();
 
-    // Drain: redact (punches payload_A body bytes in place) then promote
-    // to index/ + cache/. This mirrors the coordinator upload flow.
-    vol.redact_segment(seg_ulid).unwrap();
-    vol.promote_segment(seg_ulid).unwrap();
+    // Drain: redact (drops payload_A, rewrites under fresh ULID) then
+    // promote to index/ + cache/. Mirrors the coordinator upload flow.
+    let redacted_ulid = vol.redact_segment(seg_ulid).unwrap();
+    vol.promote_segment(redacted_ulid).unwrap();
 
     // A fresh write with content matching payload_A. Without the fix, the
     // surviving extent-index entry for H_A makes `write_commit` emit a
@@ -1375,16 +1453,16 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     vol.write(2, &data_a).unwrap();
     vol.flush_wal().unwrap();
     for ulid in pending_ulids(&base) {
-        vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(ulid).unwrap();
+        let redacted = vol.redact_segment(ulid).unwrap();
+        vol.promote_segment(redacted).unwrap();
     }
 
     let data_b = vec![34u8; 4096];
     vol.write(3, &data_b).unwrap();
     vol.flush_wal().unwrap();
     for ulid in pending_ulids(&base) {
-        vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(ulid).unwrap();
+        let redacted = vol.redact_segment(ulid).unwrap();
+        vol.promote_segment(redacted).unwrap();
     }
 
     vol.snapshot().unwrap();
@@ -1414,8 +1492,8 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     // DrainWithRedact: flush the WAL (seed=1), redact, promote.
     vol.flush_wal().unwrap();
     for ulid in pending_ulids(&base) {
-        vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(ulid).unwrap();
+        let redacted = vol.redact_segment(ulid).unwrap();
+        vol.promote_segment(redacted).unwrap();
     }
 
     // Verify reads.
@@ -1567,7 +1645,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 // emit one `Keep` per entry that's still LBA-live or
                 // extent-canonical. Mirrors the coordinator's `collect_stats`
                 // → `PlanOutput::Keep` path for the fully-alive case.
-                use crate::gc_plan::{GcPlan, PlanOutput};
+                use crate::rewrite_plan::{PlanOutput, RewritePlan};
 
                 let mut outputs: Vec<PlanOutput> = Vec::new();
                 let mut kept_any = false;
@@ -1596,7 +1674,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 }
 
                 if kept_any {
-                    let plan = GcPlan {
+                    let plan = RewritePlan {
                         new_ulid: gc_ulid,
                         outputs,
                     };
@@ -2091,7 +2169,7 @@ fn gc_handoff_applies_and_renames() {
 /// Matches what the real coordinator emits for fully-alive inputs under
 /// the plan handoff protocol (see `docs/design-gc-plan-handoff.md`).
 fn simulate_coord_gc_staged(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
-    use crate::gc_plan::{GcPlan, PlanOutput};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
     use crate::segment;
 
     let idx_path = fork_dir.join("index").join(format!("{old_ulid}.idx"));
@@ -2111,7 +2189,7 @@ fn simulate_coord_gc_staged(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -
             entry_idx,
         })
         .collect();
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     let plan_path = gc_dir.join(format!("{new_ulid_str}.plan"));
     plan.write_atomic(&plan_path).unwrap();
 
@@ -2249,7 +2327,7 @@ fn simulate_coord_gc_staged_two_inputs(
     seg_a_ulid: &str,
     seg_b_ulid: &str,
 ) -> String {
-    use crate::gc_plan::{GcPlan, PlanOutput};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
     use crate::segment;
 
     let idx_b = fork_dir.join("index").join(format!("{seg_b_ulid}.idx"));
@@ -2275,7 +2353,7 @@ fn simulate_coord_gc_staged_two_inputs(
             entry_idx,
         }),
     );
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     plan.write_atomic(&gc_dir.join(format!("{new_ulid_str}.plan")))
         .unwrap();
 

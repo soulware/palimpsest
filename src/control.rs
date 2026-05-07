@@ -22,7 +22,7 @@ use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::ReclaimThresholds;
 use elide_core::volume_ipc::{
     ApplyGcHandoffsReply, CompactionReply, ConnectedReply, DeltaRepackReply, GcCheckpointReply,
-    ReclaimReply, VolumeRequest,
+    ReclaimReply, RedactReply, VolumeRequest,
 };
 
 /// Start the control socket server for `fork_dir`.
@@ -191,9 +191,17 @@ fn dispatch(
                 );
             }
         },
-        VolumeRequest::Redact { segment_ulid } => {
-            write_unit(writer, handle.redact_segment(segment_ulid))
-        }
+        VolumeRequest::Redact { segment_ulid } => match handle.redact_segment(segment_ulid) {
+            Ok(current_ulid) => {
+                let _ = write_envelope(writer, &Envelope::ok(RedactReply { current_ulid }));
+            }
+            Err(e) => {
+                let _ = write_envelope::<RedactReply>(
+                    writer,
+                    &Envelope::err(IpcError::internal(e.to_string())),
+                );
+            }
+        },
         VolumeRequest::SnapshotManifest { snap_ulid } => {
             write_unit(writer, handle.sign_snapshot_manifest(snap_ulid))
         }

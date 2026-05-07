@@ -45,8 +45,8 @@ use crate::volume::{
     PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult,
     ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, RepackedDeadEntry,
     RepackedLiveEntry, RepackedSegment, SignSnapshotManifestJob, SignSnapshotManifestResult,
-    SweepJob, SweepResult, SweptDeadEntry, SweptLiveEntry, Volume, WorkerJob, WorkerResult,
-    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    SweepJob, SweepResult, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
+    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ pub(crate) enum VolumeRequest {
     },
     RedactSegment {
         ulid: Ulid,
-        reply: Sender<io::Result<()>>,
+        reply: Sender<io::Result<Ulid>>,
     },
     Promote {
         ulid: Ulid,
@@ -262,6 +262,11 @@ pub struct VolumeActor {
     /// output segment. `None` when no reclaim is in progress;
     /// concurrent `Reclaim` requests are rejected with an error.
     parked_reclaim: Option<Sender<io::Result<ReclaimOutcome>>>,
+    /// Reply channel for an in-flight `RedactSegment` request, parked
+    /// while the worker thread reads, classifies, and materialises the
+    /// rewritten output. `None` when no redact is in progress;
+    /// concurrent `RedactSegment` requests are rejected with an error.
+    parked_redact: Option<Sender<io::Result<Ulid>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -629,6 +634,13 @@ impl VolumeActor {
                 return;
             }
         };
+        // `prepare_sweep` flushes the WAL before minting the sweep
+        // output ULID (mirroring `start_reclaim` / `start_redact`).
+        // The flush mutates the extent index (WAL-relative offsets →
+        // segment-relative) and may delete the old WAL file. Republish
+        // so readers don't resolve hashes through the pre-flush
+        // snapshot into a deleted WAL.
+        self.publish_snapshot();
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::Sweep(job)) {
                 warn!("worker channel closed during sweep: {e}");
@@ -739,6 +751,37 @@ impl VolumeActor {
         }
     }
 
+    /// Run the redact prep on the actor and dispatch the heavy middle
+    /// (read input + classify + materialise + tmp+rename) to the
+    /// worker. Reply is parked until
+    /// [`crate::volume::RedactResult`] arrives and is applied.
+    fn start_redact(&mut self, ulid: Ulid, reply: Sender<io::Result<Ulid>>) {
+        let job = match self.volume.prepare_redact(ulid) {
+            Ok(j) => j,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        // `prepare_redact` flushes the WAL before minting `u_redact`
+        // (see the `u_redact < u_flush` invariant on
+        // `Volume::prepare_redact`). That mutates the extent index
+        // (WAL-relative offsets → segment-relative) and deletes the
+        // old WAL file. Republish so readers don't resolve hashes
+        // through the pre-flush snapshot into a deleted WAL.
+        self.publish_snapshot();
+        if let Some(tx) = &self.worker_tx {
+            if let Err(e) = tx.send(WorkerJob::Redact(job)) {
+                warn!("worker channel closed during redact: {e}");
+                let _ = reply.send(Err(io::Error::other("worker channel closed during redact")));
+                return;
+            }
+            self.parked_redact = Some(reply);
+        } else {
+            let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
     /// Run the snapshot-manifest prep on the actor and dispatch the
     /// heavy middle (`index/` enumeration + signing + manifest/marker
     /// writes) to the worker.  Reply is parked until
@@ -779,6 +822,7 @@ impl VolumeActor {
             || self.parked_delta_repack.is_some()
             || self.parked_sign_snapshot_manifest.is_some()
             || self.parked_reclaim.is_some()
+            || self.parked_redact.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -906,6 +950,25 @@ impl VolumeActor {
                         }
                         Err(e) => {
                             warn!("worker reclaim failed during shutdown: {e}");
+                            Err(e)
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                Ok(WorkerResult::Redact(result)) => {
+                    let reply = self.parked_redact.take();
+                    let outcome = match result {
+                        Ok(r) => {
+                            let apply_result = self.volume.apply_redact_result(r);
+                            if apply_result.is_ok() {
+                                self.publish_snapshot();
+                            }
+                            apply_result
+                        }
+                        Err(e) => {
+                            warn!("worker redact failed during shutdown: {e}");
                             Err(e)
                         }
                     };
@@ -1058,7 +1121,13 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::RedactSegment { ulid, reply } => {
-                            let _ = reply.send(self.volume.redact_segment(ulid));
+                            if self.parked_redact.is_some() {
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent redact_segment not allowed",
+                                )));
+                            } else {
+                                self.start_redact(ulid, reply);
+                            }
                         }
                         VolumeRequest::Promote { ulid, reply } => {
                             // Prep on the actor: cheap directory stat +
@@ -1322,6 +1391,31 @@ impl VolumeActor {
                                 let _ = reply.send(outcome);
                             }
                         }
+                        Ok(WorkerResult::Redact(result)) => {
+                            let reply = self.parked_redact.take();
+                            let outcome = match result {
+                                Ok(r) => {
+                                    let apply_result = self.volume.apply_redact_result(r);
+                                    // Always publish — the rewrite path
+                                    // mutated extent_index + lbamap, and
+                                    // the no-op path returns the input
+                                    // ULID unchanged but readers should
+                                    // still observe the post-flush state
+                                    // from prep.
+                                    if apply_result.is_ok() {
+                                        self.publish_snapshot();
+                                    }
+                                    apply_result
+                                }
+                                Err(e) => {
+                                    warn!("worker redact failed: {e}");
+                                    Err(e)
+                                }
+                            };
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
                         Err(_) => {
                             warn!("worker result channel closed unexpectedly");
                         }
@@ -1556,12 +1650,15 @@ impl VolumeClient {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Redact a pending segment: hole-punch hash-dead DATA entries in place
-    /// so deleted data never leaves the host via S3 upload.
+    /// Redact a pending segment: drop hash-dead DATA entries so deleted
+    /// data never leaves the host via S3 upload.
     ///
-    /// Called by the coordinator before reading `pending/<ulid>` for S3
-    /// upload. Idempotent; no-op when the segment has no hash-dead entries.
-    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<()> {
+    /// Called by the coordinator before reading the pending segment for
+    /// upload. Returns the ULID under which the segment now lives in
+    /// `pending/`: the input ULID when nothing was hash-dead (no-op),
+    /// or a freshly minted ULID when the segment was rewritten. Callers
+    /// must use the returned ULID for the subsequent upload + promote.
+    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<Ulid> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::RedactSegment {
@@ -1761,6 +1858,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
             }
             WorkerJob::Reclaim(job) => WorkerResult::Reclaim(execute_reclaim(job)),
+            WorkerJob::Redact(job) => WorkerResult::Redact(execute_redact(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -1790,7 +1888,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
 /// `outcome = Cancelled`; the actor's apply phase treats this as a no-op.
 /// Hard I/O failures propagate as `Err`.
 pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResult> {
-    use crate::gc_apply;
+    use crate::rewrite_apply;
 
     let GcPlanApplyJob {
         plan_path,
@@ -1814,19 +1912,20 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         extent_index: &extent_index,
     };
     let inputs = plan.inputs();
-    let ctx = match gc_apply::MaterialiseCtx::new(&base_dir, &inputs, &extent_index, &resolver) {
+    let ctx = match rewrite_apply::MaterialiseCtx::new(&base_dir, &inputs, &extent_index, &resolver)
+    {
         Ok(c) => c,
-        Err(gc_apply::MaterialiseOutcome::Io(e)) => return Err(e),
-        Err(gc_apply::MaterialiseOutcome::Cancel(e)) => {
+        Err(rewrite_apply::MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(rewrite_apply::MaterialiseOutcome::Cancel(e)) => {
             log::warn!("plan {new_ulid}: prepare cancelled ({e}); removing");
             let _ = fs::remove_file(&plan_path);
             return Ok(cancelled_result(new_ulid, plan_path, gc_dir, inputs));
         }
     };
-    let materialised = match gc_apply::materialise_plan(&plan, &ctx) {
+    let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
         Ok(m) => m,
-        Err(gc_apply::MaterialiseOutcome::Io(e)) => return Err(e),
-        Err(gc_apply::MaterialiseOutcome::Cancel(e)) => {
+        Err(rewrite_apply::MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(rewrite_apply::MaterialiseOutcome::Cancel(e)) => {
             log::warn!("plan {new_ulid}: materialise cancelled ({e}); removing");
             let _ = fs::remove_file(&plan_path);
             return Ok(cancelled_result(new_ulid, plan_path, gc_dir, inputs));
@@ -1834,7 +1933,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     };
     drop(ctx);
 
-    let gc_apply::Materialised {
+    let rewrite_apply::Materialised {
         mut entries,
         delta_body,
     } = materialised;
@@ -1906,17 +2005,19 @@ fn cancelled_result(
     }
 }
 
-/// Worker-side `BodyResolver` — owns no Volume borrow. Mirrors
-/// `volume::VolumeBodyResolver` but takes owned-field references so it can
-/// run on the worker thread without an active Volume.
-struct WorkerBodyResolver<'a> {
-    base_dir: &'a std::path::Path,
-    ancestor_layers: &'a [AncestorLayer],
-    fetcher: Option<&'a BoxFetcher>,
-    extent_index: &'a crate::extentindex::ExtentIndex,
+/// `BodyResolver` impl that holds borrowed references to the volume's
+/// segment-resolution dependencies. Used both by the worker-thread GC
+/// apply path (which doesn't have a live Volume to borrow) and by
+/// synchronous, on-actor rewriters (redact / sweep / repack /
+/// delta_repack) that hold a `&Volume` and can lend its fields.
+pub(crate) struct WorkerBodyResolver<'a> {
+    pub(crate) base_dir: &'a std::path::Path,
+    pub(crate) ancestor_layers: &'a [AncestorLayer],
+    pub(crate) fetcher: Option<&'a BoxFetcher>,
+    pub(crate) extent_index: &'a crate::extentindex::ExtentIndex,
 }
 
-impl crate::gc_apply::BodyResolver for WorkerBodyResolver<'_> {
+impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
     fn find_segment(
         &self,
         segment_id: Ulid,
@@ -2066,34 +2167,34 @@ const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_TARGET_LIVE / 2;
 const SWEEP_ENTRY_CAP: usize = 8192;
 
 /// Per-segment scratch state for sweep candidate selection.
-///
-/// `live_part` and `dead_part` are computed in the cheap scan phase
-/// using the segment-index cache; the inline section and body bytes
-/// are only fetched in the second phase, after selection has chosen
-/// which candidates actually contribute to the merged output.
 struct SweepCandidate {
     seg_path: PathBuf,
     seg_ulid: Ulid,
-    body_section_start: u64,
-    live_part: Vec<segment::SegmentEntry>,
-    dead_part: Vec<segment::SegmentEntry>,
-    /// Live `Data + Inline` body bytes — the budget unit.  `DedupRef`
-    /// and `Zero` are thin entries with no body cost.
+    entries: Vec<segment::SegmentEntry>,
+    classifications: Vec<crate::segment_classify::EntryClassification>,
+    /// Approximate live `Data + Inline` body bytes — the budget unit.
+    /// Computed from the classifier's per-entry decisions, including
+    /// surviving sub-runs of partial-death entries.
     live_bytes: u64,
+    /// Bytes that will not be carried into the rewrite output —
+    /// reported via `CompactionStats::bytes_freed`.
     dead_bytes: u64,
+    /// Number of entries that will be emitted into the rewrite output
+    /// for this input — used to enforce `SWEEP_ENTRY_CAP`.
+    live_entry_count: usize,
 }
 
-/// Execute a sweep job: scan every `pending/` segment for liveness,
-/// pack a bucket of candidates up to [`SWEEP_TARGET_LIVE`] live bytes,
-/// and merge their live extents into a single new segment named with
-/// the max input ULID.
+/// Execute a sweep job: scan every `pending/` segment, classify each
+/// entry, bin-pack a bucket of candidates up to [`SWEEP_TARGET_LIVE`]
+/// live bytes, build a [`crate::rewrite_plan::RewritePlan`] from the
+/// bucket, and materialise it into a new segment named under the
+/// pre-minted `output_ulid`.
 ///
 /// Pure with respect to in-memory `Volume` state — only touches the
-/// filesystem and the snapshot maps in `job`. The CAS preconditions
-/// returned in [`SweepResult::merged_live`] / [`SweepResult::dead_entries`]
-/// are the source `(segment_id, body_offset)` pairs, captured before
-/// `write_segment` reassigns offsets, so the apply phase can safely
-/// rewrite the extent index under concurrent writes.
+/// filesystem and the snapshot Arcs in `job`. Apply uses a per-input
+/// CAS gate (`current loc.segment_id ∈ inputs`) so concurrent writes
+/// during the worker phase that re-pointed a hash leave the rewrite's
+/// stale view as a no-op rather than a clobber.
 ///
 /// **Selection is purely about packing, not dead-data removal.** A
 /// segment with mostly-dead but large live bytes is *not* a sweep
@@ -2101,12 +2202,32 @@ struct SweepCandidate {
 /// Sweep clears any dead entries within its selected inputs as a
 /// side-effect of the rewrite, but does not select on that signal.
 pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
-    let seg_paths = segment::collect_segment_files(&job.pending_dir)?;
-    let live: std::collections::HashSet<blake3::Hash> = job.lbamap.lba_referenced_hashes();
+    use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
+    use crate::segment_classify::{self, ClassifyCtx, EntryClassification};
 
-    // Phase 1 — scan: parse + verify every non-floor segment, compute
-    // (live_part, dead_part, live_bytes). The segment cache makes the
-    // parse cheap on the second visit (apply phase doesn't re-parse).
+    let SweepJob {
+        output_ulid,
+        base_dir,
+        pending_dir,
+        floor,
+        lbamap_snapshot,
+        extent_index_snapshot,
+        ancestor_layers,
+        fetcher,
+        signer,
+        verifying_key,
+        segment_cache,
+    } = job;
+
+    let seg_paths = segment::collect_segment_files(&pending_dir)?;
+    let live_hashes = lbamap_snapshot.lba_referenced_hashes();
+
+    // Phase 1 — scan: parse + verify every non-floor segment, classify
+    // every entry. The segment cache makes the parse cheap on the
+    // second visit. live_bytes is approximate (sum of stored_length
+    // for entries the rewrite will preserve as Data/Inline) — it
+    // governs bin-pack budgets, not correctness.
     let mut all: Vec<SweepCandidate> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
@@ -2115,63 +2236,79 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             .ok_or_else(|| io::Error::other("bad segment filename"))?;
         let seg_ulid =
             Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
-        if job.floor.is_some_and(|f| seg_ulid <= f) {
+        if floor.is_some_and(|f| seg_ulid <= f) {
             continue;
         }
 
-        let parsed = job
-            .segment_cache
-            .read_and_verify(seg_path, &job.verifying_key)?;
-        let body_section_start = parsed.body_section_start;
-        let mut entries = parsed.entries.clone();
-        let (live_part, dead_part): (Vec<_>, Vec<_>) =
-            entries.drain(..).partition(|e| match e.kind {
-                segment::EntryKind::DedupRef => {
-                    // A dedup ref is live if any LBA in its claimed range
-                    // still maps to this hash. Checking only the head
-                    // misclassifies the entry as dead when the head has
-                    // been overwritten but a tail (or interior) still
-                    // references the hash — dropping it loses the
-                    // surviving LBAs on rebuild.
-                    let start = e.start_lba;
-                    let end = start + e.lba_length as u64;
-                    (start..end).any(|lba| job.lbamap.hash_at(lba) == Some(e.hash))
-                }
-                _ => live.contains(&e.hash),
-            });
-        let live_bytes: u64 = live_part
+        let parsed = segment_cache.read_and_verify(seg_path, &verifying_key)?;
+        let entries = parsed.entries.clone();
+        let classify_ctx = ClassifyCtx {
+            lba_map: &lbamap_snapshot,
+            extent_index: &extent_index_snapshot,
+            live_hashes: &live_hashes,
+            segment_id: seg_ulid,
+        };
+        let classifications: Vec<EntryClassification> = entries
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    segment::EntryKind::Data | segment::EntryKind::Inline
-                )
-            })
-            .map(|e| e.stored_length as u64)
-            .sum();
-        let dead_bytes: u64 = dead_part.iter().map(|e| e.stored_length as u64).sum();
+            .map(|e| segment_classify::classify_entry(e, &classify_ctx))
+            .collect();
+
+        let mut live_bytes: u64 = 0;
+        let mut dead_bytes: u64 = 0;
+        let mut live_entry_count: usize = 0;
+        for (entry, action) in entries.iter().zip(classifications.iter()) {
+            let is_data_like = matches!(
+                entry.kind,
+                segment::EntryKind::Data | segment::EntryKind::Inline
+            );
+            match action {
+                EntryClassification::FullyLive | EntryClassification::DeferUnresolvableDelta => {
+                    if is_data_like {
+                        live_bytes += entry.stored_length as u64;
+                    }
+                    live_entry_count += 1;
+                }
+                EntryClassification::DemoteToCanonical => {
+                    if is_data_like {
+                        live_bytes += entry.stored_length as u64;
+                    }
+                    live_entry_count += 1;
+                }
+                EntryClassification::PartialDeath {
+                    live_runs,
+                    emit_canonical,
+                } => {
+                    let live_blocks: u64 =
+                        live_runs.iter().map(|r| r.range_end - r.range_start).sum();
+                    let total = entry.lba_length as u64;
+                    if is_data_like && total > 0 {
+                        let kept = entry.stored_length as u64 * live_blocks / total;
+                        live_bytes += kept;
+                        dead_bytes += entry.stored_length as u64 - kept;
+                    }
+                    live_entry_count += live_runs.len() + if *emit_canonical { 1 } else { 0 };
+                }
+                EntryClassification::ZeroSubRuns(runs) => {
+                    live_entry_count += runs.len();
+                }
+                EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {
+                    dead_bytes += entry.stored_length as u64;
+                }
+            }
+        }
+
         all.push(SweepCandidate {
             seg_path: seg_path.clone(),
             seg_ulid,
-            body_section_start,
-            live_part,
-            dead_part,
+            entries,
+            classifications,
             live_bytes,
             dead_bytes,
+            live_entry_count,
         });
     }
 
     // Phase 2 — select: bin-pack toward SWEEP_TARGET_LIVE.
-    //
-    // Tier 1: smalls (live_bytes ≤ SMALL_THRESHOLD), sorted ascending so
-    // we fit the maximum count of inputs into the budget — every
-    // included input reduces the segment count of the next pass.
-    //
-    // Tier 2: at most one filler (live_bytes > SMALL_THRESHOLD) chosen
-    // best-fit against the remaining headroom. The filler trades
-    // copy-cost (rewriting a large segment) for one-fewer total
-    // segments, which is only worth it when there's already a small
-    // bucket to attach to.
     let (smalls, fillers): (Vec<_>, Vec<_>) = all
         .into_iter()
         .partition(|c| c.live_bytes <= SWEEP_SMALL_THRESHOLD);
@@ -2183,10 +2320,9 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
     let mut budget = SWEEP_TARGET_LIVE;
     let mut entry_budget = SWEEP_ENTRY_CAP;
     for c in smalls {
-        let c_entries = c.live_part.len();
-        if c.live_bytes <= budget && c_entries <= entry_budget {
+        if c.live_bytes <= budget && c.live_entry_count <= entry_budget {
             budget -= c.live_bytes;
-            entry_budget -= c_entries;
+            entry_budget -= c.live_entry_count;
             bucket.push(c);
         }
     }
@@ -2196,7 +2332,7 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
         && let Some(pos) = fillers
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.live_bytes <= budget && c.live_part.len() <= entry_budget)
+            .filter(|(_, c)| c.live_bytes <= budget && c.live_entry_count <= entry_budget)
             .max_by_key(|(_, c)| c.live_bytes)
             .map(|(i, _)| i)
     {
@@ -2212,120 +2348,158 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             stats: CompactionStats::default(),
             new_ulid: None,
             new_body_section_start: 0,
-            merged_live: Vec::new(),
-            dead_entries: Vec::new(),
-            candidate_paths: Vec::new(),
+            out_entries: Vec::new(),
+            inputs: Vec::new(),
         });
     }
 
-    // Sort selected candidates by ULID ascending so entries land in the
-    // merged output in write order — rebuild applies entries in sequence
-    // and the last entry wins for each LBA.
+    // Sort selected candidates by ULID ascending so PlanOutput records
+    // emit input entries in write order.
     bucket.sort_by_key(|c| c.seg_ulid);
 
-    // Phase 3 — fetch and merge.
+    // Phase 3 — translate classifications into PlanOutput records.
+    // Same mapping the coordinator GC uses; the classifier is shared
+    // infrastructure.
+    let mut outputs: Vec<PlanOutput> = Vec::new();
+    let mut inputs: Vec<crate::volume::SweptInput> = Vec::with_capacity(bucket.len());
     let mut stats = CompactionStats::default();
-    let mut merged_live: Vec<SweptLiveEntry> = Vec::new();
-    let mut dead_entries: Vec<SweptDeadEntry> = Vec::new();
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-
-    for c in &mut bucket {
-        for entry in &c.dead_part {
-            // Zero/DedupRef are thin entries with no extent-index slot.
-            // Delta entries live in the deltas table, not `inner`, so
-            // `remove_if_matches` would always miss — skipping keeps the
-            // dead set focused on entries the apply phase can actually
-            // remove.
-            if matches!(
-                entry.kind,
-                segment::EntryKind::Zero | segment::EntryKind::DedupRef | segment::EntryKind::Delta
-            ) {
-                continue;
+    for c in &bucket {
+        let mut owned_hashes: Vec<blake3::Hash> = Vec::new();
+        for (entry_idx, (entry, action)) in
+            c.entries.iter().zip(c.classifications.iter()).enumerate()
+        {
+            let entry_idx = entry_idx as u32;
+            if entry.kind.has_body_bytes() {
+                owned_hashes.push(entry.hash);
             }
-            dead_entries.push(SweptDeadEntry {
-                hash: entry.hash,
-                source_segment_id: c.seg_ulid,
-                source_body_offset: entry.stored_offset,
-            });
-        }
-        let inline_bytes = segment::read_inline_section(&c.seg_path)?;
-        segment::read_extent_bodies(
-            &c.seg_path,
-            c.body_section_start,
-            &mut c.live_part,
-            &inline_bytes,
-        )?;
-        // Verify each body matches its declared hash before it's carried
-        // into the merged output. See apply_staged_handoff for background.
-        for entry in &c.live_part {
-            if let Some(body) = entry.data.as_deref() {
-                segment::verify_body_hash(entry, body).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("sweep: input segment {}: {e}", c.seg_ulid),
-                    )
-                })?;
+            match action {
+                EntryClassification::FullyLive => outputs.push(PlanOutput::Keep {
+                    input: c.seg_ulid,
+                    entry_idx,
+                }),
+                EntryClassification::DemoteToCanonical => outputs.push(PlanOutput::Canonical {
+                    input: c.seg_ulid,
+                    entry_idx,
+                }),
+                EntryClassification::ZeroSubRuns(runs) => {
+                    for run in runs {
+                        outputs.push(PlanOutput::ZeroSplit {
+                            input: c.seg_ulid,
+                            entry_idx,
+                            start_lba: run.range_start,
+                            lba_length: (run.range_end - run.range_start) as u32,
+                        });
+                    }
+                }
+                EntryClassification::PartialDeath {
+                    live_runs,
+                    emit_canonical,
+                } => {
+                    if *emit_canonical {
+                        outputs.push(PlanOutput::Canonical {
+                            input: c.seg_ulid,
+                            entry_idx,
+                        });
+                    }
+                    for run in live_runs.iter() {
+                        outputs.push(PlanOutput::Run {
+                            input: c.seg_ulid,
+                            entry_idx,
+                            payload_block_offset: run.payload_block_offset,
+                            start_lba: run.range_start,
+                            lba_length: (run.range_end - run.range_start) as u32,
+                        });
+                    }
+                }
+                EntryClassification::DeferUnresolvableDelta => outputs.push(PlanOutput::Keep {
+                    input: c.seg_ulid,
+                    entry_idx,
+                }),
+                EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
             }
         }
-        for entry in std::mem::take(&mut c.live_part) {
-            let source_body_offset = entry.stored_offset;
-            merged_live.push(SweptLiveEntry {
-                entry,
-                source_segment_id: c.seg_ulid,
-                source_body_offset,
-            });
-        }
-        candidate_paths.push(c.seg_path.clone());
+        inputs.push(crate::volume::SweptInput {
+            seg_ulid: c.seg_ulid,
+            seg_path: c.seg_path.clone(),
+            owned_hashes,
+        });
         stats.segments_compacted += 1;
         stats.bytes_freed += c.dead_bytes;
     }
 
-    // Use max(candidate ULIDs) as the output ULID. This guarantees the
-    // output sorts below the current WAL ULID (all pending segments were
-    // created before the WAL was opened), so a subsequent WAL flush
-    // always produces a higher ULID and wins on rebuild. Using
-    // mint.next() here would generate a ULID past the WAL ULID and
-    // break that ordering.
-    let new_ulid = bucket
-        .iter()
-        .map(|c| c.seg_ulid)
-        .max()
-        .ok_or_else(|| io::Error::other("sweep: no valid candidate ULIDs"))?;
+    // Phase 4 — materialise the plan and write the output.
+    if outputs.is_empty() {
+        return Ok(SweepResult {
+            stats,
+            new_ulid: None,
+            new_body_section_start: 0,
+            out_entries: Vec::new(),
+            inputs,
+        });
+    }
 
-    let mut new_body_section_start = 0u64;
-    let new_ulid_out = if merged_live.is_empty() {
-        // Every input was fully dead — no segment to write, but the
-        // dead-removal + candidate deletion still need to run.
-        None
-    } else {
-        // write_segment reassigns each entry's stored_offset to its
-        // new position. Operate on a borrowed buffer of SegmentEntry,
-        // then read the new offsets back into our SweptLiveEntry list.
-        let mut entries: Vec<segment::SegmentEntry> =
-            merged_live.iter().map(|e| e.entry.clone()).collect();
-        let new_ulid_str = new_ulid.to_string();
-        let tmp_path = job.pending_dir.join(format!("{new_ulid_str}.tmp"));
-        let final_path = job.pending_dir.join(&new_ulid_str);
-        new_body_section_start =
-            segment::write_segment(&tmp_path, &mut entries, job.signer.as_ref())?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        segment::fsync_dir(&final_path)?;
-        stats.new_segments += 1;
-        // Replace the cloned entry on each SweptLiveEntry with the
-        // post-write copy so the apply phase sees the new offsets.
-        for (sw, written) in merged_live.iter_mut().zip(entries) {
-            sw.entry = written;
-        }
-        Some(new_ulid)
+    let plan = RewritePlan {
+        new_ulid: output_ulid,
+        outputs,
     };
+    let resolver = WorkerBodyResolver {
+        base_dir: &base_dir,
+        ancestor_layers: &ancestor_layers,
+        fetcher: fetcher.as_ref(),
+        extent_index: &extent_index_snapshot,
+    };
+    let plan_inputs = plan.inputs();
+    let ctx = match MaterialiseCtx::new_for_pending(
+        &base_dir,
+        &plan_inputs,
+        &extent_index_snapshot,
+        &resolver,
+    ) {
+        Ok(c) => c,
+        Err(MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(MaterialiseOutcome::Cancel(e)) => {
+            return Err(io::Error::other(format!(
+                "sweep {output_ulid}: materialise prep cancelled: {e}"
+            )));
+        }
+    };
+    let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
+        Ok(m) => m,
+        Err(MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(MaterialiseOutcome::Cancel(e)) => {
+            return Err(io::Error::other(format!(
+                "sweep {output_ulid}: materialise cancelled: {e}"
+            )));
+        }
+    };
+    drop(ctx);
+
+    let Materialised {
+        entries: mut out_entries,
+        delta_body,
+    } = materialised;
+
+    let new_ulid_str = output_ulid.to_string();
+    let final_path = pending_dir.join(&new_ulid_str);
+    let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
+    let _ = std::fs::remove_file(&tmp_path);
+    let new_body_section_start = segment::write_segment_full(
+        &tmp_path,
+        &mut out_entries,
+        &delta_body,
+        &[],
+        signer.as_ref(),
+    )?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    segment::fsync_dir(&final_path)?;
+    stats.new_segments += 1;
 
     Ok(SweepResult {
         stats,
-        new_ulid: new_ulid_out,
+        new_ulid: Some(output_ulid),
         new_body_section_start,
-        merged_live,
-        dead_entries,
-        candidate_paths,
+        out_entries,
+        inputs,
     })
 }
 
@@ -2894,6 +3068,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         parked_delta_repack: None,
         parked_sign_snapshot_manifest: None,
         parked_reclaim: None,
+        parked_redact: None,
     };
 
     let client = VolumeClient {
@@ -3083,6 +3258,199 @@ fn read_reclaim_extent_body(
 ///
 /// Apply on the actor checks `Arc::ptr_eq` against the live lbamap; on
 /// mismatch the segment is deleted as an orphan.
+/// Worker-side execution of a [`crate::volume::RedactJob`].
+///
+/// Reads `pending/<input_ulid>`, classifies every entry against the
+/// snapshot maps in the job, fast-paths `NoOp` if all entries are
+/// fully-live, otherwise translates classifications to
+/// [`crate::rewrite_plan::PlanOutput`] records, runs `materialise_plan`,
+/// and atomically writes the output to `pending/<new_ulid>` via
+/// tmp+rename. Pure with respect to in-memory `Volume` state — only
+/// touches the filesystem and the snapshot Arcs in `job`.
+pub(crate) fn execute_redact(
+    job: crate::volume::RedactJob,
+) -> io::Result<crate::volume::RedactResult> {
+    use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
+    use crate::segment_classify::{self, ClassifyCtx, EntryClassification};
+
+    let crate::volume::RedactJob {
+        input_ulid,
+        new_ulid,
+        base_dir,
+        pending_dir,
+        lbamap_snapshot,
+        extent_index_snapshot,
+        ancestor_layers,
+        fetcher,
+        signer,
+        verifying_key,
+    } = job;
+
+    let old_seg_path = pending_dir.join(input_ulid.to_string());
+    let (_input_bss, entries, _inputs) =
+        segment::read_and_verify_segment_index(&old_seg_path, &verifying_key)?;
+
+    let live_hashes = lbamap_snapshot.lba_referenced_hashes();
+    let classify_ctx = ClassifyCtx {
+        lba_map: &lbamap_snapshot,
+        extent_index: &extent_index_snapshot,
+        live_hashes: &live_hashes,
+        segment_id: input_ulid,
+    };
+    let classifications: Vec<EntryClassification> = entries
+        .iter()
+        .map(|e| segment_classify::classify_entry(e, &classify_ctx))
+        .collect();
+
+    // Redact's *trigger* is narrow: only rewrite when at least one entry
+    // is hash-dead (Drop / DropAndRemoveHash). That preserves the
+    // "don't ship deleted data to S3" framing — segments with no
+    // hash-dead entries are uploaded unchanged.
+    //
+    // When we *do* rewrite, the policy must be broad (full classifier
+    // semantics: DemoteToCanonical, PartialDeath, ZeroSubRuns), because
+    // the rewrite mints a fresh ULID that sorts above every input
+    // segment. Carrying stale LBA claims forward into the higher ULID
+    // would shadow newer writes on rebuild — the same correctness
+    // hazard GC already strips. Narrow trigger + broad rewrite keeps
+    // redact's name accurate without sacrificing rebuild safety.
+    let any_hash_dead = classifications.iter().any(|c| {
+        matches!(
+            c,
+            EntryClassification::Drop | EntryClassification::DropAndRemoveHash
+        )
+    });
+    if !any_hash_dead {
+        return Ok(crate::volume::RedactResult::NoOp { input_ulid });
+    }
+
+    // Translate each classification into PlanOutput record(s). Same
+    // mapping the coordinator GC uses — the classifier is shared
+    // infrastructure; once we've decided to rewrite, the policy lines
+    // up with GC.
+    let mut outputs: Vec<PlanOutput> = Vec::with_capacity(classifications.len());
+    for (entry_idx, (_entry, action)) in entries.iter().zip(classifications.iter()).enumerate() {
+        let entry_idx = entry_idx as u32;
+        match action {
+            EntryClassification::FullyLive => outputs.push(PlanOutput::Keep {
+                input: input_ulid,
+                entry_idx,
+            }),
+            EntryClassification::DemoteToCanonical => outputs.push(PlanOutput::Canonical {
+                input: input_ulid,
+                entry_idx,
+            }),
+            EntryClassification::ZeroSubRuns(runs) => {
+                for run in runs {
+                    outputs.push(PlanOutput::ZeroSplit {
+                        input: input_ulid,
+                        entry_idx,
+                        start_lba: run.range_start,
+                        lba_length: (run.range_end - run.range_start) as u32,
+                    });
+                }
+            }
+            EntryClassification::PartialDeath {
+                live_runs,
+                emit_canonical,
+            } => {
+                if *emit_canonical {
+                    outputs.push(PlanOutput::Canonical {
+                        input: input_ulid,
+                        entry_idx,
+                    });
+                }
+                for run in live_runs.iter() {
+                    outputs.push(PlanOutput::Run {
+                        input: input_ulid,
+                        entry_idx,
+                        payload_block_offset: run.payload_block_offset,
+                        start_lba: run.range_start,
+                        lba_length: (run.range_end - run.range_start) as u32,
+                    });
+                }
+            }
+            // DeferUnresolvableDelta: redact has no defer-the-segment
+            // escape hatch (every pending segment must drain). Keep the
+            // entry as-is; a later GC pass can convert/replan it once
+            // a source is resolvable.
+            EntryClassification::DeferUnresolvableDelta => outputs.push(PlanOutput::Keep {
+                input: input_ulid,
+                entry_idx,
+            }),
+            EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
+        }
+    }
+
+    let plan = RewritePlan { new_ulid, outputs };
+
+    let resolver = WorkerBodyResolver {
+        base_dir: &base_dir,
+        ancestor_layers: &ancestor_layers,
+        fetcher: fetcher.as_ref(),
+        extent_index: &extent_index_snapshot,
+    };
+    let inputs = plan.inputs();
+    let ctx = match MaterialiseCtx::new_for_pending(
+        &base_dir,
+        &inputs,
+        &extent_index_snapshot,
+        &resolver,
+    ) {
+        Ok(c) => c,
+        Err(MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(MaterialiseOutcome::Cancel(e)) => {
+            return Err(io::Error::other(format!(
+                "redact {input_ulid}: materialise prep cancelled: {e}"
+            )));
+        }
+    };
+    let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
+        Ok(m) => m,
+        Err(MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(MaterialiseOutcome::Cancel(e)) => {
+            return Err(io::Error::other(format!(
+                "redact {input_ulid}: materialise cancelled: {e}"
+            )));
+        }
+    };
+    drop(ctx);
+
+    let Materialised {
+        entries: mut out_entries,
+        delta_body,
+    } = materialised;
+
+    let new_ulid_str = new_ulid.to_string();
+    let new_seg_path = pending_dir.join(&new_ulid_str);
+    let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
+    let _ = std::fs::remove_file(&tmp_path);
+    let new_body_section_start = segment::write_segment_full(
+        &tmp_path,
+        &mut out_entries,
+        &delta_body,
+        &[],
+        signer.as_ref(),
+    )?;
+    std::fs::rename(&tmp_path, &new_seg_path)?;
+    segment::fsync_dir(&new_seg_path)?;
+
+    let input_owned_hashes: Vec<blake3::Hash> = entries
+        .iter()
+        .filter(|e| e.kind.has_body_bytes())
+        .map(|e| e.hash)
+        .collect();
+
+    Ok(crate::volume::RedactResult::Rewritten {
+        input_ulid,
+        new_ulid,
+        new_body_section_start,
+        out_entries,
+        input_owned_hashes,
+    })
+}
+
 pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     let target_start = job.target_start_lba;
     let target_end = target_start + job.target_lba_length as u64;

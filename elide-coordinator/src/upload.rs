@@ -208,56 +208,53 @@ pub async fn drain_pending(
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
     upload_volume_metadata(vol_dir, volume_id, store).await;
 
-    let entries = std::fs::read_dir(&pending_dir)
-        .with_context(|| format!("opening pending dir: {}", pending_dir.display()))?;
+    // Process pending segments in ULID-ascending order so the just-promoted
+    // ULID is always below every remaining pending ULID — see
+    // `read_ulid_dir_sorted` for why.
+    let pending_ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
+        .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
 
     let mut uploaded = 0usize;
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
     let uploader = SegmentUploader { volume_id, store };
 
-    for entry in entries {
-        let entry = entry.context("reading pending dir entry")?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if name.ends_with(".tmp") {
-            continue;
-        }
-        let ulid = match ulid::Ulid::from_string(name) {
-            Ok(u) => u,
-            Err(_) => continue,
-        };
-        let segment_path = entry.path();
+    for ulid in pending_ulids {
+        // Redact drops hash-dead DATA entries before upload so deleted
+        // data never leaves the host. When entries are dropped, the
+        // segment is rewritten under a freshly minted ULID and the
+        // input ULID's pending file is removed; the upload + promote
+        // below must use the returned ULID. When redact was a no-op
+        // (or unreachable), it returns the input ULID and we proceed
+        // unchanged.
+        let upload_ulid = crate::control::redact_segment(vol_dir, ulid)
+            .await
+            .unwrap_or(ulid);
+        let upload_name = upload_ulid.to_string();
+        let segment_path = pending_dir.join(&upload_name);
 
-        // Redact dead DATA regions in place before upload. Best-effort: if
-        // the volume is not running, proceed anyway — segments with no
-        // hash-dead entries are a no-op, and the thin DedupRef format means
-        // DedupRef bodies are never in the file to begin with.
-        crate::control::redact_segment(vol_dir, ulid).await;
-
-        match uploader.upload(&segment_path, ulid).await {
+        match uploader.upload(&segment_path, upload_ulid).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
-                // cache/ and delete pending/<ulid>.
-                if crate::control::promote_segment(vol_dir, ulid).await {
+                // cache/ and delete pending/<upload_ulid>.
+                if crate::control::promote_segment(vol_dir, upload_ulid).await {
                     uploaded += 1;
                 } else {
                     // S3 PUT succeeded but the volume control socket was
                     // unreachable or the IPC reply was an error envelope.
-                    // pending/<ulid> stays in place; the next drain tick
-                    // re-uploads (idempotent re-PUT) and re-issues promote.
+                    // pending/<upload_ulid> stays in place; the next drain
+                    // tick re-uploads (idempotent re-PUT) and re-issues
+                    // promote.
                     warn!(
-                        "promote {name}: uploaded to S3 but volume promote IPC unavailable; \
+                        "promote {upload_name}: uploaded to S3 but volume promote IPC unavailable; \
                          will retry next tick"
                     );
                     promote_failed += 1;
                 }
             }
             Err(e) => {
-                warn!("upload failed for segment {name}: {e:#}");
+                warn!("upload failed for segment {upload_name}: {e:#}");
                 upload_failed += 1;
             }
         }

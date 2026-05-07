@@ -1133,18 +1133,20 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     // mirrors the proptest's simulate_upload which works locally only).
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        if let Ok(entries) = fs::read_dir(&pending_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(s) = name.to_str() else { continue };
-                if s.contains('.') {
-                    continue;
-                }
-                if let Ok(ulid) = ulid::Ulid::from_string(s) {
-                    let _ = vol.redact_segment(ulid);
-                    let _ = vol.promote_segment(ulid);
-                }
+        let mut promoted: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
+        loop {
+            let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
+                return;
+            };
+            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+                break;
+            };
+            let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
+            if redacted != ulid {
+                promoted.insert(ulid);
             }
+            let _ = vol.promote_segment(redacted);
+            promoted.insert(redacted);
         }
     };
 
@@ -1271,18 +1273,20 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        if let Ok(entries) = fs::read_dir(&pending_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(s) = name.to_str() else { continue };
-                if s.contains('.') {
-                    continue;
-                }
-                if let Ok(ulid) = ulid::Ulid::from_string(s) {
-                    let _ = vol.redact_segment(ulid);
-                    let _ = vol.promote_segment(ulid);
-                }
+        let mut promoted: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
+        loop {
+            let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
+                return;
+            };
+            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+                break;
+            };
+            let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
+            if redacted != ulid {
+                promoted.insert(ulid);
             }
+            let _ = vol.promote_segment(redacted);
+            promoted.insert(redacted);
         }
     };
 
@@ -1416,18 +1420,20 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        if let Ok(entries) = fs::read_dir(&pending_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(s) = name.to_str() else { continue };
-                if s.contains('.') {
-                    continue;
-                }
-                if let Ok(ulid) = ulid::Ulid::from_string(s) {
-                    let _ = vol.redact_segment(ulid);
-                    let _ = vol.promote_segment(ulid);
-                }
+        let mut promoted: std::collections::HashSet<ulid::Ulid> = std::collections::HashSet::new();
+        loop {
+            let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
+                return;
+            };
+            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+                break;
+            };
+            let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
+            if redacted != ulid {
+                promoted.insert(ulid);
             }
+            let _ = vol.promote_segment(redacted);
+            promoted.insert(redacted);
         }
     };
 

@@ -387,6 +387,44 @@ impl ExtentIndex {
         }
     }
 
+    /// Migrate a Delta entry's `DeltaBodySource::Full` location to a
+    /// new segment ULID with refreshed `body_section_start` and
+    /// `body_length`. Only applied if the hash is present, points at
+    /// `expected_segment_id`, and is currently in the `Full` shape.
+    /// Returns `true` if the migration happened.
+    ///
+    /// Used by `Volume::redact_segment` after rewriting `pending/<ulid>`
+    /// under a fresh ULID: surviving Delta entries' locations must be
+    /// re-pointed at the new segment, and both fields of the `Full`
+    /// shape (`bss` and `body_length`) shift because the index and
+    /// body sections in front of the delta region change size.
+    pub fn migrate_delta_full_location_if_matches(
+        &mut self,
+        hash: &blake3::Hash,
+        expected_segment_id: Ulid,
+        new_segment_id: Ulid,
+        new_body_section_start: u64,
+        new_body_length: u64,
+    ) -> bool {
+        match self.deltas.get_mut(hash) {
+            Some(loc) if loc.segment_id == expected_segment_id => {
+                if let DeltaBodySource::Full {
+                    body_section_start,
+                    body_length,
+                } = &mut loc.body_source
+                {
+                    loc.segment_id = new_segment_id;
+                    *body_section_start = new_body_section_start;
+                    *body_length = new_body_length;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Remove the entry for `hash`, if present.
     pub fn remove(&mut self, hash: &blake3::Hash) {
         self.inner.remove(hash);

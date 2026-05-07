@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use elide_core::gc_plan::{GcPlan, PlanOutput};
+use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 use elide_core::volume::Volume;
 use ulid::Ulid;
 
@@ -59,7 +59,7 @@ fn plan_keep_two_data_entries_round_trips() {
     // `gc_checkpoint` so the volume's ULID mint advances consistently.
     let new_ulid = vol.gc_checkpoint_for_test().unwrap();
 
-    let plan = GcPlan {
+    let plan = RewritePlan {
         new_ulid,
         outputs: vec![
             PlanOutput::Keep {
@@ -114,7 +114,7 @@ fn plan_missing_input_is_cancelled() {
 
     let new_ulid = Ulid::new();
     let phantom_input = Ulid::new();
-    let plan = GcPlan {
+    let plan = RewritePlan {
         new_ulid,
         outputs: vec![PlanOutput::Drop {
             input: phantom_input,
@@ -150,7 +150,7 @@ fn plan_with_empty_inputs_is_cancelled() {
     fs::create_dir_all(&gc_dir).unwrap();
 
     let new_ulid = Ulid::new();
-    let plan = GcPlan {
+    let plan = RewritePlan {
         new_ulid,
         outputs: vec![],
     };
@@ -213,7 +213,7 @@ fn plan_partial_death_data_reconstructs_sub_runs() {
     // stale-liveness check requires the hash to be carried) plus two
     // `run` lines — [0..2) and [3..4).
     let new_ulid = vol.gc_checkpoint_for_test().unwrap();
-    let plan = GcPlan {
+    let plan = RewritePlan {
         new_ulid,
         outputs: vec![
             PlanOutput::Canonical {

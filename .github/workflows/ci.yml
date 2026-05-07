@@ -52,8 +52,17 @@ jobs:
         with:
           shared-key: rust-build
 
-      - name: cargo test (proptest)
-        run: "cargo test --workspace --features proptest --tests --no-fail-fast"
+      # Split per crate so feature unification doesn't activate
+      # `lbamap-invariant` for elide-core's own proptest binaries —
+      # those don't exercise the coordinator-layer paths the invariant
+      # protects, and the per-op disk-rebuild dominates their runtime.
+      # `elide-coordinator/proptest` propagates `elide-core/lbamap-invariant`
+      # so the gc_proptest run gets the drift detection.
+      - name: cargo test (elide-core proptests)
+        run: "cargo test -p elide-core --features proptest --tests --no-fail-fast"
+
+      - name: cargo test (elide-coordinator proptests)
+        run: "cargo test -p elide-coordinator --features proptest --tests --no-fail-fast"
 
       - name: Upload proptest regressions
         if: failure()

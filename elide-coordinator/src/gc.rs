@@ -69,10 +69,10 @@ use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
-use elide_core::gc_plan::{GcPlan, PlanOutput};
 use elide_core::lbamap::{self, LbaMap};
+use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 use elide_core::segment::{self, EntryKind, SegmentEntry};
-use elide_core::volume::{ZERO_HASH, latest_snapshot};
+use elide_core::volume::latest_snapshot;
 
 use crate::config::GcConfig;
 use crate::retention::{marker_key, render_marker};
@@ -712,7 +712,7 @@ struct SegmentStats {
     /// Live entries — already classified by `collect_stats` (Zero sub-splits
     /// expanded, fully-LBA-dead-hash-live entries demoted via `into_canonical`).
     /// The coordinator uses these plus `partial_death_runs` to emit a
-    /// [`elide_core::gc_plan::GcPlan`]; the volume materialises bodies on apply.
+    /// [`elide_core::rewrite_plan::RewritePlan`]; the volume materialises bodies on apply.
     live_entries: Vec<SegmentEntry>,
     /// Per-entry position in the source segment's index section, parallel to
     /// `live_entries`. Referenced by plan outputs so the volume's materialise
@@ -860,6 +860,12 @@ fn collect_stats(
         }
         let mut dead_diag: Vec<DeadEntry> = Vec::new();
 
+        let classify_ctx = elide_core::segment_classify::ClassifyCtx {
+            lba_map,
+            extent_index: index,
+            live_hashes,
+            segment_id: seg_ulid,
+        };
         for (entry_idx, mut entry) in entries.into_iter().enumerate() {
             let entry_idx = entry_idx as u32;
             // Pre-populate inline entry data from the .idx inline section.
@@ -873,177 +879,81 @@ fn collect_stats(
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
             total_lba_bytes += lba_bytes;
-
-            // Zero extents have no body bytes and use ZERO_HASH as a sentinel
-            // (never in the extent index). Liveness is LBA-map ownership: a
-            // sub-range of the entry is live iff the lbamap still maps it to
-            // ZERO_HASH. A Zero entry can span thousands of LBAs (e.g. whole
-            // mkfs TRIM), any subset of which may have since been overwritten
-            // by later writes. Re-emitting the original span at the GC-output
-            // ULID would shadow those later writes on rebuild — so split the
-            // entry into sub-Zeros covering only the surviving ZERO_HASH runs.
-            if entry.kind == EntryKind::Zero {
-                let end = entry.start_lba + entry.lba_length as u64;
-                for ext in lba_map.extents_in_range(entry.start_lba, end) {
-                    if ext.hash != ZERO_HASH {
-                        continue;
-                    }
-                    let run_len = (ext.range_end - ext.range_start) as u32;
-                    let run_bytes = run_len as u64 * BLOCK_BYTES;
-                    live_lba_bytes += run_bytes;
-                    let mut live = entry.clone();
-                    live.start_lba = ext.range_start;
-                    live.lba_length = run_len;
-                    live_entries.push(live);
-                    live_entry_indices.push(entry_idx);
-                    partial_death_runs.push(None);
-                }
-                continue;
-            }
-            // Inline/CanonicalInline entries have stored bytes in the inline
-            // section (part of .idx, not S3 body). They do not contribute to
-            // physical_body_bytes but do participate in liveness.
+            // Inline/CanonicalInline entries have stored bytes in the
+            // inline section (part of .idx, not S3 body). They do not
+            // contribute to physical_body_bytes but do participate in
+            // liveness. Zero entries have stored_length 0, so skipping
+            // the accumulator for them is harmless.
             if !entry.kind.is_inline() {
                 physical_body_bytes += entry.stored_length as u64;
             }
-            // DATA / Inline / DedupRef / Delta entries all carry both a hash
-            // and an LBA claim. Liveness classification uses a full-range
-            // scan against the lbamap, not a point query at `start_lba`,
-            // because a multi-LBA entry's head, tail, or interior may have
-            // been overwritten by later writes while `start_lba` is
-            // unaffected (and vice versa). See
-            // `docs/design-gc-overlap-correctness.md`.
-            //
-            // DedupRef is a thin record (`stored_length=0`, no body bytes),
-            // so it contributes nothing to `physical_body_bytes` (the
-            // accumulator above already zero-passes it). For the canonical-
-            // emit path it's a no-op: DedupRef's canonical body lives at
-            // `extent_index[entry.hash].segment_id`, a segment that's not
-            // being compacted, so no body needs to be preserved in the
-            // compacted output.
-            //
-            // Outcomes:
-            //   - **fully alive** (every LBA in the range maps to
-            //     `entry.hash`): keep the entry intact. Its LBA binding is
-            //     authoritative and compacts cleanly.
-            //   - **fully dead** (no LBA in the range maps to `entry.hash`):
-            //     * owned-body kinds (Data/Inline) with hash still
-            //       referenced elsewhere: demote to `canonical_only`. Body
-            //       survives for extent-index resolution; no LBA claim on
-            //       rebuild.
-            //     * DedupRef: drop the entry. (No body to demote; if the
-            //       segment happens to own the hash in the extent index,
-            //       also schedule removal via `removed_hashes`.)
-            //     * hash orphaned entirely: record for extent-index removal
-            //       and drop.
-            //   - **partially alive** (some LBAs still live at `entry.hash`,
-            //     others overwritten): route into `partial_death_runs` for
-            //     expansion in `compact_segments`. Delta with no
-            //     resolvable `source_hash` is the sole remaining defer
-            //     case — no base body means no reconstruction this pass.
-            let end_lba = entry.start_lba + entry.lba_length as u64;
-            let runs = lba_map.extents_in_range(entry.start_lba, end_lba);
-            let matching_blocks: u64 = runs
-                .iter()
-                .filter(|r| r.hash == entry.hash)
-                .map(|r| r.range_end - r.range_start)
-                .sum();
-            let total_blocks = entry.lba_length as u64;
-            let extent_live = index
-                .lookup(&entry.hash)
-                .is_some_and(|loc| loc.segment_id == seg_ulid);
 
-            if matching_blocks == total_blocks {
-                // Fully alive.
-                live_lba_bytes += lba_bytes;
-                live_entries.push(entry);
-                live_entry_indices.push(entry_idx);
-                partial_death_runs.push(None);
-            } else if matching_blocks == 0 {
-                match entry.kind {
-                    EntryKind::Data | EntryKind::Inline | EntryKind::Delta
-                        if extent_live && live_hashes.contains(&entry.hash) =>
-                    {
-                        // Fully LBA-dead but hash still externally live.
-                        // Demote the source entry into its canonical variant —
-                        // body preserved for dedup resolution, LBA claim
-                        // dropped.
-                        live_entries.push(entry.into_canonical());
+            use elide_core::segment_classify::EntryClassification;
+            match elide_core::segment_classify::classify_entry(&entry, &classify_ctx) {
+                EntryClassification::FullyLive => {
+                    live_lba_bytes += lba_bytes;
+                    live_entries.push(entry);
+                    live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(None);
+                }
+                EntryClassification::DemoteToCanonical => {
+                    // LBA-dead but hash still externally referenced.
+                    // Demote so the body survives for dedup resolution
+                    // without making a (now-stale) LBA claim.
+                    live_entries.push(entry.into_canonical());
+                    live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(None);
+                }
+                EntryClassification::ZeroSubRuns(runs) => {
+                    // A multi-LBA Zero is split into one Zero per
+                    // surviving sub-run. Empty `runs` means fully
+                    // overwritten — nothing to emit.
+                    for ext in runs {
+                        let run_len = (ext.range_end - ext.range_start) as u32;
+                        let run_bytes = run_len as u64 * BLOCK_BYTES;
+                        live_lba_bytes += run_bytes;
+                        let mut live = entry.clone();
+                        live.start_lba = ext.range_start;
+                        live.lba_length = run_len;
+                        live_entries.push(live);
                         live_entry_indices.push(entry_idx);
                         partial_death_runs.push(None);
-                    }
-                    _ if extent_live => {
-                        // Fully dead and this segment owns the hash in the
-                        // extent index — schedule removal.
-                        removed_hashes.push(entry.hash);
-                        if entry.kind.has_body_bytes() && dead_diag.len() < 8 {
-                            let per_lba: Vec<(u64, Option<blake3::Hash>)> = (entry.start_lba
-                                ..entry.start_lba + entry.lba_length as u64)
-                                .map(|lba| (lba, lba_map.hash_at(lba)))
-                                .collect();
-                            dead_diag.push(DeadEntry {
-                                hash: entry.hash,
-                                start_lba: entry.start_lba,
-                                lba_length: entry.lba_length,
-                                per_lba,
-                            });
-                        }
-                    }
-                    _ => {
-                        // Fully dead with no extent-index ownership here.
-                        // Nothing to preserve or remove — drop silently.
                     }
                 }
-            } else {
-                // Partially alive. For Data/Inline/DedupRef the composite body
-                // can be resolved at expand time (from entry.data for owned
-                // bodies, or via extent_index lookup for DedupRef — see
-                // `expand_partial_death`), so `compact_segments` can slice it
-                // into live sub-runs without deferring the segment.
-                //
-                // Delta routes through the same path provided at least one
-                // `delta_options[i].source_hash` resolves via `extent_index`
-                // (the Data-body map). If none resolve, there is no base
-                // body to reconstruct against — fall back to the segment-
-                // level defer (`has_partial_death = true`) and retry next
-                // pass, when later writes may have re-established a source.
-                live_lba_bytes += matching_blocks * BLOCK_BYTES;
-                match entry.kind {
-                    EntryKind::Data | EntryKind::Inline | EntryKind::DedupRef => {
-                        let live_runs: Arc<[lbamap::ExtentRead]> =
-                            runs.into_iter().filter(|r| r.hash == entry.hash).collect();
-                        live_entries.push(entry);
-                        live_entry_indices.push(entry_idx);
-                        partial_death_runs.push(Some(live_runs));
+                EntryClassification::PartialDeath { live_runs, .. } => {
+                    let live_blocks: u64 =
+                        live_runs.iter().map(|r| r.range_end - r.range_start).sum();
+                    live_lba_bytes += live_blocks * BLOCK_BYTES;
+                    live_entries.push(entry);
+                    live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(Some(live_runs));
+                }
+                EntryClassification::DeferUnresolvableDelta => {
+                    // Delta with no resolvable source — defer the segment
+                    // to a later pass.
+                    live_entries.push(entry);
+                    live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(None);
+                    has_partial_death = true;
+                }
+                EntryClassification::DropAndRemoveHash => {
+                    removed_hashes.push(entry.hash);
+                    if entry.kind.has_body_bytes() && dead_diag.len() < 8 {
+                        let per_lba: Vec<(u64, Option<blake3::Hash>)> = (entry.start_lba
+                            ..entry.start_lba + entry.lba_length as u64)
+                            .map(|lba| (lba, lba_map.hash_at(lba)))
+                            .collect();
+                        dead_diag.push(DeadEntry {
+                            hash: entry.hash,
+                            start_lba: entry.start_lba,
+                            lba_length: entry.lba_length,
+                            per_lba,
+                        });
                     }
-                    EntryKind::Delta => {
-                        let has_resolvable_source = entry
-                            .delta_options
-                            .iter()
-                            .any(|opt| index.lookup(&opt.source_hash).is_some());
-                        if has_resolvable_source {
-                            let live_runs: Arc<[lbamap::ExtentRead]> =
-                                runs.into_iter().filter(|r| r.hash == entry.hash).collect();
-                            live_entries.push(entry);
-                            live_entry_indices.push(entry_idx);
-                            partial_death_runs.push(Some(live_runs));
-                        } else {
-                            live_entries.push(entry);
-                            live_entry_indices.push(entry_idx);
-                            partial_death_runs.push(None);
-                            has_partial_death = true;
-                        }
-                    }
-                    _ => {
-                        // Zero is pre-split above; CanonicalData/CanonicalInline
-                        // never reach this loop (they carry no LBA claim, so
-                        // their `lba_length` is 0 and the earlier `total_lba_bytes`
-                        // accounting zero-passes them). Treat as fully alive
-                        // to stay safe.
-                        live_entries.push(entry);
-                        live_entry_indices.push(entry_idx);
-                        partial_death_runs.push(None);
-                    }
+                }
+                EntryClassification::Drop => {
+                    // Fully dead with no extent-index ownership here —
+                    // nothing to preserve, nothing to remove.
                 }
             }
         }
@@ -1304,7 +1214,7 @@ fn compact_segments(
         }
     }
 
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     let plan_path = gc_dir.join(format!("{new_ulid_str}.plan"));
     plan.write_atomic(&plan_path)
         .context("writing GC plan file")?;
@@ -1516,6 +1426,10 @@ mod tests {
 
     /// Redact, upload to store, and promote all pending segments.
     /// Mirrors the real coordinator path: redact → S3 PUT → promote.
+    ///
+    /// Re-scans `pending/` after every redact because the redact may
+    /// produce a freshly minted ULID for the rewritten segment plus a
+    /// separate pending entry for the flushed WAL contents.
     async fn drain_with_redact(
         vol: &mut elide_core::volume::Volume,
         dir: &Path,
@@ -1523,30 +1437,25 @@ mod tests {
         store: &Arc<dyn ObjectStore>,
     ) {
         let pending_dir = dir.join("pending");
-        let mut ulids = Vec::new();
-        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-            let name = entry.file_name();
-            let Some(s) = name.to_str() else { continue };
-            if s.contains('.') {
-                continue;
+        let mut promoted = std::collections::HashSet::<Ulid>::new();
+        loop {
+            let ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
+            let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+                break;
+            };
+            let redacted = vol.redact_segment(ulid).unwrap();
+            if redacted != ulid {
+                promoted.insert(ulid);
             }
-            if let Ok(ulid) = Ulid::from_string(s) {
-                ulids.push(ulid);
-            }
-        }
-        for &ulid in &ulids {
-            vol.redact_segment(ulid).unwrap();
-            // Upload the pending segment directly — redact hole-punches in
-            // place, so there is no sidecar. The in-place file is the upload.
-            let ulid_str = ulid.to_string();
-            let seg_path = pending_dir.join(&ulid_str);
+            let seg_path = pending_dir.join(redacted.to_string());
             let data = fs::read(&seg_path).unwrap();
-            let key = segment_key(volume_id, ulid);
+            let key = segment_key(volume_id, redacted);
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
                 .unwrap();
-            vol.promote_segment(ulid).unwrap();
+            vol.promote_segment(redacted).unwrap();
+            promoted.insert(redacted);
         }
     }
 
@@ -1774,7 +1683,7 @@ mod tests {
             .map(|e| e.path())
             .find(|p| p.extension().and_then(|s| s.to_str()) == Some("plan"))
             .expect("gc/ must contain a .plan file");
-        let plan = elide_core::gc_plan::GcPlan::read(&plan_path).unwrap();
+        let plan = elide_core::rewrite_plan::RewritePlan::read(&plan_path).unwrap();
 
         assert_eq!(
             plan.inputs(),
@@ -1829,8 +1738,8 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
-            vol.promote_segment(*ulid).unwrap();
+            let redacted = vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(redacted).unwrap();
         }
 
         // Rebuild from disk — extent_index has H101→S2 (S2 processed last).
@@ -1952,8 +1861,8 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
-            vol.promote_segment(*ulid).unwrap();
+            let redacted = vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(redacted).unwrap();
         }
         let s1_ulid = ulids[0].to_string();
 
@@ -2076,8 +1985,8 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
-            vol.promote_segment(*ulid).unwrap();
+            let redacted = vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(redacted).unwrap();
         }
         let s1_ulid = ulids[0].to_string();
 
@@ -2149,8 +2058,8 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
-            vol.promote_segment(*ulid).unwrap();
+            let redacted = vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(redacted).unwrap();
         }
         ulids
     }
@@ -2510,6 +2419,12 @@ mod tests {
             .put(&key, bytes::Bytes::from(bytes).into())
             .await
             .unwrap();
+        // The hand-crafted Delta segment was written directly to pending/
+        // without going through Volume::write — self.lbamap doesn't know
+        // about its entries. Drop+reopen so Volume::open's rebuild folds
+        // them in before promote (which now asserts lbamap consistency).
+        drop(vol);
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
         vol.promote_segment(delta_ulid).unwrap();
 
         // ── S3: single-LBA overwrite at LBA 102, via the normal path.

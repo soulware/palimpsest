@@ -1,18 +1,27 @@
-//! Coordinator→volume GC handoff plan.
+//! Declarative description of a segment-rewrite output.
 //!
-//! The coordinator classifies each input-segment entry during `collect_stats`
-//! but no longer fetches bodies or writes the compacted segment. Instead it
-//! emits a plaintext tab-separated plan file at `gc/<new_ulid>.plan`. The
-//! volume (idle tick) reads the plan, resolves bodies through its own
-//! `BlockReader` (ancestor-aware, fetcher-aware, S3-aware), assembles the
-//! output segment, signs it with the volume key, and renames it into place
-//! as a bare `gc/<new_ulid>`.
+//! Used by every site that produces a new pending or committed segment by
+//! transforming the entries of one or more input segments under a freshly
+//! minted ULID — coordinator-driven GC, redact, sweep_pending, repack, and
+//! delta_repack. The plan is the same data structure regardless of which
+//! storage tier (`pending/`, `index/`+`cache/`) the inputs sit in: it
+//! says, per output entry, what to do with which input entry, leaving the
+//! body resolution and segment-assembly work to [`crate::rewrite_apply`].
+//!
+//! The plan separates *what* the output should look like (a sequence of
+//! [`PlanOutput`] records) from *how* to materialise the bodies (a
+//! [`crate::rewrite_apply::BodyResolver`] supplied by the caller). The
+//! coordinator's GC handoff persists a plan to disk for cross-process
+//! handoff (`gc/<u>.plan`); synchronous rewriters (redact / sweep /
+//! repack / delta_repack) build a plan in memory and pass it straight to
+//! [`crate::rewrite_apply::materialise_plan`].
 //!
 //! # Wire format
 //!
-//! One record per line, tab-separated. The first non-blank / non-comment
-//! line is a version tag (`v1`). Each record translates **directly** to a
-//! single output entry in the new segment:
+//! Plans are also serialisable for the GC handoff use case. One record
+//! per line, tab-separated. The first non-blank / non-comment line is a
+//! version tag (`v1`). Each record translates **directly** to a single
+//! output entry in the new segment:
 //!
 //! ```text
 //! v1
@@ -45,12 +54,11 @@
 //! ```
 //!
 //! Inputs are the set of `<input-ulid>` ULIDs referenced by any record —
-//! [`GcPlan::inputs`] recovers them as a sorted, deduplicated list.
+//! [`RewritePlan::inputs`] recovers them as a sorted, deduplicated list.
 //!
 //! Removals (hash-level extent-index evictions) are not listed in the plan:
-//! the volume derives them at apply time by diffing each input's `.idx`
-//! against the plan's output entries, the same way the self-describing
-//! handoff already derives extent-index updates.
+//! the apply path derives them at apply time by diffing each input's `.idx`
+//! against the plan's output entries.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -112,7 +120,7 @@ pub enum PlanOutput {
 
 /// Full plan for one compacted segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GcPlan {
+pub struct RewritePlan {
     pub new_ulid: Ulid,
     pub outputs: Vec<PlanOutput>,
 }
@@ -132,7 +140,7 @@ impl PlanOutput {
     }
 }
 
-impl GcPlan {
+impl RewritePlan {
     /// Sorted, deduplicated list of input ULIDs referenced by this plan's
     /// records.
     pub fn inputs(&self) -> Vec<Ulid> {
@@ -276,7 +284,7 @@ impl GcPlan {
             }
         }
 
-        Ok(GcPlan { new_ulid, outputs })
+        Ok(RewritePlan { new_ulid, outputs })
     }
 
     /// Read a plan from `path`. The filename stem must be a valid ULID —
@@ -349,7 +357,7 @@ mod tests {
     #[test]
     fn round_trip_minimal_plan() {
         let new = ulid("01HZZZZZZZZZZZZZZZZZZZZZZZ");
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid: new,
             outputs: vec![PlanOutput::Keep {
                 input: ulid("01HYYYYYYYYYYYYYYYYYYYYYYY"),
@@ -358,7 +366,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         plan.write_to(&mut buf).unwrap();
-        let parsed = GcPlan::read_from(new, &buf[..]).unwrap();
+        let parsed = RewritePlan::read_from(new, &buf[..]).unwrap();
         assert_eq!(plan, parsed);
     }
 
@@ -367,7 +375,7 @@ mod tests {
         let a = ulid("01HAAAAAAAAAAAAAAAAAAAAAAA");
         let b = ulid("01HBBBBBBBBBBBBBBBBBBBBBBB");
         let new = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid: new,
             outputs: vec![
                 PlanOutput::Keep {
@@ -402,7 +410,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         plan.write_to(&mut buf).unwrap();
-        let parsed = GcPlan::read_from(new, &buf[..]).unwrap();
+        let parsed = RewritePlan::read_from(new, &buf[..]).unwrap();
         assert_eq!(plan, parsed);
     }
 
@@ -412,7 +420,7 @@ mod tests {
         let b = ulid("01HBBBBBBBBBBBBBBBBBBBBBBB");
         let c = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
         let new = ulid("01HZZZZZZZZZZZZZZZZZZZZZZZ");
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid: new,
             outputs: vec![
                 PlanOutput::Keep {
@@ -444,7 +452,7 @@ mod tests {
         let new = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
         let bytes =
             b"v1\n\n# this is a comment\nkeep\t01HAAAAAAAAAAAAAAAAAAAAAAA\t0\n\n# another\n";
-        let plan = GcPlan::read_from(new, &bytes[..]).unwrap();
+        let plan = RewritePlan::read_from(new, &bytes[..]).unwrap();
         assert_eq!(plan.outputs.len(), 1);
         assert_eq!(plan.inputs(), vec![ulid("01HAAAAAAAAAAAAAAAAAAAAAAA")]);
     }
@@ -453,7 +461,7 @@ mod tests {
     fn rejects_unknown_version() {
         let new = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
         let bytes = b"v2\n";
-        let err = GcPlan::read_from(new, &bytes[..]).unwrap_err();
+        let err = RewritePlan::read_from(new, &bytes[..]).unwrap_err();
         assert!(err.to_string().contains("unknown version"));
     }
 
@@ -461,7 +469,7 @@ mod tests {
     fn rejects_unknown_record() {
         let new = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
         let bytes = b"v1\nsomething_else\t01HAAAAAAAAAAAAAAAAAAAAAAA\t0\n";
-        let err = GcPlan::read_from(new, &bytes[..]).unwrap_err();
+        let err = RewritePlan::read_from(new, &bytes[..]).unwrap_err();
         assert!(err.to_string().contains("unknown record"));
     }
 
@@ -469,7 +477,7 @@ mod tests {
     fn rejects_extra_field() {
         let new = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
         let bytes = b"v1\nkeep\t01HAAAAAAAAAAAAAAAAAAAAAAA\t0\textra\n";
-        let err = GcPlan::read_from(new, &bytes[..]).unwrap_err();
+        let err = RewritePlan::read_from(new, &bytes[..]).unwrap_err();
         assert!(err.to_string().contains("extra field"));
     }
 
@@ -478,7 +486,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let new = ulid("01HCCCCCCCCCCCCCCCCCCCCCCC");
         let path = dir.path().join(format!("{new}.plan"));
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid: new,
             outputs: vec![PlanOutput::Keep {
                 input: ulid("01HAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -486,7 +494,7 @@ mod tests {
             }],
         };
         plan.write_atomic(&path).unwrap();
-        let parsed = GcPlan::read(&path).unwrap();
+        let parsed = RewritePlan::read(&path).unwrap();
         assert_eq!(plan, parsed);
         assert!(!dir.path().join(format!("{new}.plan.tmp")).exists());
     }

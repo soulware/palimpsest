@@ -31,7 +31,7 @@ use crate::signing;
 ///
 /// Returned by [`LbaMap::extents_in_range`]. Describes exactly which blocks
 /// the caller needs to copy from the stored payload.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExtentRead {
     /// Content hash — key into the extent index to find the segment file and offset.
     pub hash: blake3::Hash,
@@ -480,6 +480,28 @@ impl Default for LbaMap {
 /// The caller (`Volume::open`) is responsible for replaying the in-progress
 /// WAL on top of the result.
 pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaMap> {
+    rebuild_segments_inner(layers, true)
+}
+
+/// Same as [`rebuild_segments`] but skips ed25519 signature verification.
+///
+/// Used only by the `--features lbamap-invariant` runtime invariants
+/// (`Volume::assert_*_consistent`) — they need to compare in-memory state
+/// against the on-disk projection on every mutating op, and the signature
+/// check dominates the cost (~50 µs per segment). The signatures are
+/// already verified at `Volume::open` time and segments don't change after
+/// that, so re-verifying on every consistency check is paranoid overhead.
+///
+/// **Do not use for production rebuild paths** — they must verify.
+#[cfg(feature = "lbamap-invariant")]
+pub fn rebuild_segments_unverified(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaMap> {
+    rebuild_segments_inner(layers, false)
+}
+
+fn rebuild_segments_inner(
+    layers: &[(PathBuf, Option<String>)],
+    verify: bool,
+) -> io::Result<LbaMap> {
     let mut map = LbaMap::new();
 
     for (fork_dir, branch_ulid) in layers {
@@ -498,22 +520,33 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             continue;
         }
 
-        // Load the verifying key only when this layer has segments to check.
-        let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
+        // Load the verifying key only when this layer has segments to check
+        // *and* the caller wants verification.
+        let vk = if verify {
+            Some(signing::load_verifying_key(
+                fork_dir,
+                signing::VOLUME_PUB_FILE,
+            )?)
+        } else {
+            None
+        };
 
         for sref in &segments {
-            let (_bss, entries, _inputs) =
-                match segment::read_and_verify_segment_index(&sref.path, &vk) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!(
-                            "segment vanished during rebuild (GC race): {}",
-                            sref.path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let parsed = match &vk {
+                Some(vk) => segment::read_and_verify_segment_index(&sref.path, vk),
+                None => segment::read_segment_index(&sref.path),
+            };
+            let (_bss, entries, _inputs) = match parsed {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        sref.path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for entry in entries {
                 // CanonicalData / CanonicalInline entries carry a body for
                 // dedup resolution via the extent index but make no LBA claim
