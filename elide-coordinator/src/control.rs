@@ -17,7 +17,7 @@ use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::{CompactionStats, DeltaRepackStats};
 use elide_core::volume_ipc::{
     ApplyGcHandoffsReply, CompactionReply, ConnectedReply, DeltaRepackReply, GcCheckpointReply,
-    ReclaimReply, VolumeRequest,
+    ReclaimReply, RedactReply, VolumeRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -84,10 +84,18 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
     reply.map(|r| r.processed as usize).unwrap_or(0)
 }
 
-/// Redact a pending segment: hole-punch hash-dead DATA entries in place
-/// before S3 upload. Returns `true` on success.
-pub async fn redact_segment(fork_dir: &Path, segment_ulid: Ulid) -> bool {
-    call_unit(fork_dir, &VolumeRequest::Redact { segment_ulid }).await
+/// Redact a pending segment: drop hash-dead DATA entries before S3
+/// upload.
+///
+/// Returns the ULID under which the segment now lives in `pending/` —
+/// the input `segment_ulid` when redact was a no-op, or a freshly
+/// minted ULID when the segment was rewritten. Callers must use the
+/// returned ULID for the subsequent upload + promote. Returns `None`
+/// when the volume socket is unreachable or the call returned an
+/// error envelope.
+pub async fn redact_segment(fork_dir: &Path, segment_ulid: Ulid) -> Option<Ulid> {
+    let reply: RedactReply = call_typed(fork_dir, &VolumeRequest::Redact { segment_ulid }).await?;
+    Some(reply.current_ulid)
 }
 
 /// Sign and write a snapshot manifest plus the snapshot marker.

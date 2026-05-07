@@ -73,6 +73,20 @@ pub struct GcCheckpointReply {
     pub gc_ulid: Ulid,
 }
 
+/// Reply for [`VolumeRequest::Redact`].
+///
+/// `current_ulid` is the ULID under which the segment now lives in
+/// `pending/`. It equals the request's `segment_ulid` when redact was
+/// a no-op (no hash-dead DATA entries to drop) and is a freshly minted
+/// ULID otherwise — redact rewrites the segment under a new path to
+/// avoid path-aliasing a concurrent reader's pre-redact snapshot.
+/// Callers must use this ULID for the subsequent `Promote` (and any
+/// upload) call.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RedactReply {
+    pub current_ulid: Ulid,
+}
+
 /// Reply for [`VolumeRequest::ApplyGcHandoffs`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ApplyGcHandoffsReply {

@@ -1516,6 +1516,10 @@ mod tests {
 
     /// Redact, upload to store, and promote all pending segments.
     /// Mirrors the real coordinator path: redact → S3 PUT → promote.
+    ///
+    /// Re-scans `pending/` after every redact because the redact may
+    /// produce a freshly minted ULID for the rewritten segment plus a
+    /// separate pending entry for the flushed WAL contents.
     async fn drain_with_redact(
         vol: &mut elide_core::volume::Volume,
         dir: &Path,
@@ -1523,30 +1527,39 @@ mod tests {
         store: &Arc<dyn ObjectStore>,
     ) {
         let pending_dir = dir.join("pending");
-        let mut ulids = Vec::new();
-        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
-            let name = entry.file_name();
-            let Some(s) = name.to_str() else { continue };
-            if s.contains('.') {
-                continue;
+        let mut promoted = std::collections::HashSet::<Ulid>::new();
+        loop {
+            let mut next: Option<Ulid> = None;
+            for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+                let name = entry.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.contains('.') {
+                    continue;
+                }
+                let Ok(ulid) = Ulid::from_string(s) else {
+                    continue;
+                };
+                if !promoted.contains(&ulid) {
+                    next = Some(ulid);
+                    break;
+                }
             }
-            if let Ok(ulid) = Ulid::from_string(s) {
-                ulids.push(ulid);
+            let Some(ulid) = next else { break };
+            let redacted = vol.redact_segment(ulid).unwrap();
+            if redacted != ulid {
+                // Old pending was deleted by redact; mark it processed.
+                promoted.insert(ulid);
             }
-        }
-        for &ulid in &ulids {
-            vol.redact_segment(ulid).unwrap();
-            // Upload the pending segment directly — redact hole-punches in
-            // place, so there is no sidecar. The in-place file is the upload.
-            let ulid_str = ulid.to_string();
-            let seg_path = pending_dir.join(&ulid_str);
+            let upload_name = redacted.to_string();
+            let seg_path = pending_dir.join(&upload_name);
             let data = fs::read(&seg_path).unwrap();
-            let key = segment_key(volume_id, ulid);
+            let key = segment_key(volume_id, redacted);
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
                 .unwrap();
-            vol.promote_segment(ulid).unwrap();
+            vol.promote_segment(redacted).unwrap();
+            promoted.insert(redacted);
         }
     }
 
@@ -1829,7 +1842,7 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
+            let _redacted = vol.redact_segment(*ulid).unwrap();
             vol.promote_segment(*ulid).unwrap();
         }
 
@@ -1952,7 +1965,7 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
+            let _redacted = vol.redact_segment(*ulid).unwrap();
             vol.promote_segment(*ulid).unwrap();
         }
         let s1_ulid = ulids[0].to_string();
@@ -2076,7 +2089,7 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
+            let _redacted = vol.redact_segment(*ulid).unwrap();
             vol.promote_segment(*ulid).unwrap();
         }
         let s1_ulid = ulids[0].to_string();
@@ -2149,7 +2162,7 @@ mod tests {
         }
         ulids.sort();
         for ulid in &ulids {
-            vol.redact_segment(*ulid).unwrap();
+            let _redacted = vol.redact_segment(*ulid).unwrap();
             vol.promote_segment(*ulid).unwrap();
         }
         ulids

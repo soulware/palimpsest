@@ -45,26 +45,52 @@ pub fn write_test_keypair(dir: &Path) {
 /// Drain via the full redact → promote path, matching the production
 /// coordinator upload protocol.
 ///
-/// For each pending segment: calls `vol.redact_segment(ulid)` (in-place
-/// hole-punching of hash-dead DATA regions) then `vol.promote_segment(ulid)`
-/// which writes `index/<ulid>.idx` + `cache/<ulid>.{body,present}` from the
-/// pending file and updates the extent index.
+/// For each pending segment: calls `vol.redact_segment(ulid)` (drops
+/// hash-dead DATA entries; may rewrite the segment under a freshly
+/// minted ULID and a folded WAL into a separate pending segment) then
+/// `vol.promote_segment(returned_ulid)` which writes
+/// `index/<u>.idx` + `cache/<u>.{body,present}` from the pending file
+/// and updates the extent index.
+///
+/// Re-snapshots `pending_ulids` after every redact because redact may
+/// produce *two* new pending entries (the rewritten segment + the
+/// flushed WAL contents) under fresh ULIDs and remove the input.
 pub fn drain_with_redact(vol: &mut elide_core::volume::Volume) {
-    for ulid in pending_ulids(vol.base_dir()) {
-        vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(ulid).unwrap();
+    let mut promoted = std::collections::HashSet::new();
+    loop {
+        let next = pending_ulids(vol.base_dir())
+            .into_iter()
+            .find(|u| !promoted.contains(u));
+        let Some(ulid) = next else { break };
+        let redacted = vol.redact_segment(ulid).unwrap();
+        if redacted != ulid {
+            promoted.insert(ulid);
+        }
+        vol.promote_segment(redacted).unwrap();
+        promoted.insert(redacted);
     }
 }
 
 /// Drain via the actor handle: redact + promote each pending segment.
 ///
-/// Equivalent to `drain_with_redact` but works when the `Volume` is behind
-/// an actor — sends `RedactSegment` and `Promote` messages through the
-/// handle's channel, so the actor's in-memory snapshot is updated correctly.
+/// Equivalent to `drain_with_redact` but works when the `Volume` is
+/// behind an actor — sends `RedactSegment` and `Promote` messages
+/// through the handle's channel, so the actor's in-memory snapshot is
+/// updated correctly. See `drain_with_redact` for the redact-may-mint
+/// rationale.
 pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
-    for ulid in pending_ulids(base_dir) {
-        handle.redact_segment(ulid).unwrap();
-        handle.promote_segment(ulid).unwrap();
+    let mut promoted = std::collections::HashSet::new();
+    loop {
+        let next = pending_ulids(base_dir)
+            .into_iter()
+            .find(|u| !promoted.contains(u));
+        let Some(ulid) = next else { break };
+        let redacted = handle.redact_segment(ulid).unwrap();
+        if redacted != ulid {
+            promoted.insert(ulid);
+        }
+        handle.promote_segment(redacted).unwrap();
+        promoted.insert(redacted);
     }
 }
 

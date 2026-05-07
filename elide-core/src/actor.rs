@@ -136,7 +136,7 @@ pub(crate) enum VolumeRequest {
     },
     RedactSegment {
         ulid: Ulid,
-        reply: Sender<io::Result<()>>,
+        reply: Sender<io::Result<Ulid>>,
     },
     Promote {
         ulid: Ulid,
@@ -1058,7 +1058,19 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::RedactSegment { ulid, reply } => {
-                            let _ = reply.send(self.volume.redact_segment(ulid));
+                            let result = self.volume.redact_segment(ulid);
+                            // redact_segment may have rewritten the segment
+                            // under a freshly minted ULID and migrated
+                            // extent-index entries to point at it. Republish
+                            // so concurrent VolumeReaders observe the new
+                            // flush_gen, drop their FileCache, and pick up
+                            // the new extent index. Even on the no-op fast
+                            // path the cost is one snapshot store, which is
+                            // cheap.
+                            if result.is_ok() {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Promote { ulid, reply } => {
                             // Prep on the actor: cheap directory stat +
@@ -1556,12 +1568,15 @@ impl VolumeClient {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Redact a pending segment: hole-punch hash-dead DATA entries in place
-    /// so deleted data never leaves the host via S3 upload.
+    /// Redact a pending segment: drop hash-dead DATA entries so deleted
+    /// data never leaves the host via S3 upload.
     ///
-    /// Called by the coordinator before reading `pending/<ulid>` for S3
-    /// upload. Idempotent; no-op when the segment has no hash-dead entries.
-    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<()> {
+    /// Called by the coordinator before reading the pending segment for
+    /// upload. Returns the ULID under which the segment now lives in
+    /// `pending/`: the input ULID when nothing was hash-dead (no-op),
+    /// or a freshly minted ULID when the segment was rewritten. Callers
+    /// must use the returned ULID for the subsequent upload + promote.
+    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<Ulid> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::RedactSegment {

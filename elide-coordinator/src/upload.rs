@@ -229,35 +229,42 @@ pub async fn drain_pending(
             Ok(u) => u,
             Err(_) => continue,
         };
-        let segment_path = entry.path();
 
-        // Redact dead DATA regions in place before upload. Best-effort: if
-        // the volume is not running, proceed anyway — segments with no
-        // hash-dead entries are a no-op, and the thin DedupRef format means
-        // DedupRef bodies are never in the file to begin with.
-        crate::control::redact_segment(vol_dir, ulid).await;
+        // Redact drops hash-dead DATA entries before upload so deleted
+        // data never leaves the host. When entries are dropped, the
+        // segment is rewritten under a freshly minted ULID and the
+        // input ULID's pending file is removed; the upload + promote
+        // below must use the returned ULID. When redact was a no-op
+        // (or unreachable), it returns the input ULID and we proceed
+        // unchanged.
+        let upload_ulid = crate::control::redact_segment(vol_dir, ulid)
+            .await
+            .unwrap_or(ulid);
+        let upload_name = upload_ulid.to_string();
+        let segment_path = pending_dir.join(&upload_name);
 
-        match uploader.upload(&segment_path, ulid).await {
+        match uploader.upload(&segment_path, upload_ulid).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
-                // cache/ and delete pending/<ulid>.
-                if crate::control::promote_segment(vol_dir, ulid).await {
+                // cache/ and delete pending/<upload_ulid>.
+                if crate::control::promote_segment(vol_dir, upload_ulid).await {
                     uploaded += 1;
                 } else {
                     // S3 PUT succeeded but the volume control socket was
                     // unreachable or the IPC reply was an error envelope.
-                    // pending/<ulid> stays in place; the next drain tick
-                    // re-uploads (idempotent re-PUT) and re-issues promote.
+                    // pending/<upload_ulid> stays in place; the next drain
+                    // tick re-uploads (idempotent re-PUT) and re-issues
+                    // promote.
                     warn!(
-                        "promote {name}: uploaded to S3 but volume promote IPC unavailable; \
+                        "promote {upload_name}: uploaded to S3 but volume promote IPC unavailable; \
                          will retry next tick"
                     );
                     promote_failed += 1;
                 }
             }
             Err(e) => {
-                warn!("upload failed for segment {name}: {e:#}");
+                warn!("upload failed for segment {upload_name}: {e:#}");
                 upload_failed += 1;
             }
         }
