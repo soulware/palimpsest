@@ -39,10 +39,13 @@ pub use elide_coordinator::volume_state::VolumeLifecycle;
 pub const PREFETCH_AWAIT_BUDGET: Duration = Duration::from_secs(60);
 
 /// Result of [`Client::register_and_get_creds`]: the issued credentials,
-/// plus the optional peer-fetch endpoint vended in the registration
-/// reply.
+/// the macaroon (retained so the volume can re-issue creds via
+/// [`Client::macaroon_credentials`] after dropping the cached set on
+/// idle), plus the optional peer-fetch endpoint vended in the
+/// registration reply.
 pub struct RegisteredVolume {
     pub creds: StoreCreds,
+    pub macaroon: String,
     pub peer_endpoint: Option<PeerEndpoint>,
 }
 
@@ -226,6 +229,7 @@ impl Client {
                     let creds = self.macaroon_credentials(&reply.macaroon)?;
                     return Ok(RegisteredVolume {
                         creds,
+                        macaroon: reply.macaroon,
                         peer_endpoint: reply.peer_endpoint,
                     });
                 }

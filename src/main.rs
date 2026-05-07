@@ -1969,7 +1969,8 @@ fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchIn
     // Standalone fallback (no coordinator): if the resolved config is
     // S3 mode, source credentials directly from this process's env
     // once at startup. The volume binary itself never reads `AWS_*`
-    // anywhere else.
+    // anywhere else. No re-issue path — these creds live for the life
+    // of the process.
     let creds = match fetch_config.as_ref() {
         Some(cfg) if cfg.bucket.is_some() => Some(s3_creds_from_env()?),
         _ => None,
@@ -1977,6 +1978,7 @@ fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchIn
     Ok(VolumeFetchInputs {
         fetch_config,
         creds,
+        reissue: None,
         peer_endpoint: None,
     })
 }
@@ -2043,6 +2045,7 @@ fn fetch_config_via_coordinator_macaroon(
                 fetch_batch_bytes: None,
             }),
             creds: None,
+            reissue: None,
             peer_endpoint: None,
         }));
     }
@@ -2057,6 +2060,10 @@ fn fetch_config_via_coordinator_macaroon(
         secret_access_key: registered.creds.secret_access_key,
         session_token: registered.creds.session_token,
     };
+    let reissue = elide::CredsReissue {
+        coordinator_socket: coord.socket_path().to_path_buf(),
+        macaroon: registered.macaroon,
+    };
     Ok(Some(VolumeFetchInputs {
         fetch_config: Some(elide_fetch::FetchConfig {
             bucket: Some(bucket),
@@ -2066,6 +2073,7 @@ fn fetch_config_via_coordinator_macaroon(
             fetch_batch_bytes: None,
         }),
         creds: Some(creds),
+        reissue: Some(reissue),
         peer_endpoint: registered.peer_endpoint,
     }))
 }

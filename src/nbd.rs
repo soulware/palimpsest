@@ -673,6 +673,7 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         crate::VolumeFetchInputs {
             fetch_config: None,
             creds: None,
+            reissue: None,
             peer_endpoint: None,
         },
     )
@@ -1558,6 +1559,7 @@ mod tests {
                 crate::VolumeFetchInputs {
                     fetch_config: None,
                     creds: None,
+                    reissue: None,
                     peer_endpoint: None,
                 },
             )
@@ -1752,6 +1754,7 @@ mod tests {
                 crate::VolumeFetchInputs {
                     fetch_config: None,
                     creds: None,
+                    reissue: None,
                     peer_endpoint: None,
                 },
             )

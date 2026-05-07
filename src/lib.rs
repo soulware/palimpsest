@@ -4,6 +4,7 @@
 pub mod body_prefetch;
 pub mod control;
 pub mod coordinator_client;
+pub mod creds_fetcher;
 pub mod extents;
 pub mod full_warm;
 pub mod inspect;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use elide_core::signing::VOLUME_KEY_FILE;
-use elide_fetch::{FetchConfig, RangeFetcher, RemoteFetcher, S3Credentials};
+use elide_fetch::{FetchConfig, LocalRangeFetcher, RangeFetcher, RemoteFetcher, S3Credentials};
 use elide_peer_fetch::{
     BodyFetchClient, PeerEndpoint, PeerFetchCountersHandle, PeerRangeFetcher, VolumeBodySigner,
 };
@@ -29,10 +30,25 @@ use elide_peer_fetch::{
 /// is present the daemon stacks a `PeerRangeFetcher` in front of S3
 /// to opportunistically serve body byte ranges from the previous
 /// claimer over LAN.
+///
+/// `reissue` is the coordinator-IPC path the lazy-creds wrapper uses
+/// to re-acquire credentials after dropping them on idle. Populated
+/// only when running under a coordinator (i.e. when `creds` came
+/// from the macaroon handshake); standalone-env mode has no re-issue
+/// path and the wrapper degrades to plain `S3RangeFetcher`.
 pub struct VolumeFetchInputs {
     pub fetch_config: Option<FetchConfig>,
     pub creds: Option<S3Credentials>,
+    pub reissue: Option<CredsReissue>,
     pub peer_endpoint: Option<PeerEndpoint>,
+}
+
+/// Inputs the lazy-creds wrapper needs to re-acquire credentials via
+/// the coordinator's macaroon-authenticated `Credentials` IPC after
+/// dropping a cached set.
+pub struct CredsReissue {
+    pub coordinator_socket: PathBuf,
+    pub macaroon: String,
 }
 
 /// Process-wide multi-thread tokio runtime used by the volume daemon
@@ -105,7 +121,7 @@ pub fn build_volume_fetcher(
     let Some(config) = inputs.fetch_config else {
         return Ok(None);
     };
-    let s3_store: Arc<dyn RangeFetcher> = config.build_fetcher(inputs.creds)?;
+    let s3_store: Arc<dyn RangeFetcher> = build_s3_store(&config, inputs.creds, inputs.reissue)?;
     let (demand_store, peer_counters) = match inputs.peer_endpoint {
         Some(endpoint) if fork_dir.join(VOLUME_KEY_FILE).exists() => {
             let vol_ulid_str = elide_fetch::derive_volume_id(fork_dir)?;
@@ -141,6 +157,47 @@ pub fn build_volume_fetcher(
         s3_store,
         peer_counters,
     }))
+}
+
+/// Build the bottom-of-stack `RangeFetcher` for the volume.
+///
+/// Local-store mode produces a [`LocalRangeFetcher`] (creds ignored).
+/// S3 mode with a coordinator-vended re-issue path produces a
+/// [`creds_fetcher::LazyCredsFetcher`], which drops cached creds after
+/// idle and re-acquires them transparently on the next demand fetch.
+/// S3 mode without a re-issue path (standalone fallback) falls back
+/// to a plain `S3RangeFetcher` that holds creds for the life of the
+/// process — there is nothing to ask for fresh ones.
+fn build_s3_store(
+    config: &FetchConfig,
+    creds: Option<S3Credentials>,
+    reissue: Option<CredsReissue>,
+) -> io::Result<Arc<dyn RangeFetcher>> {
+    if let Some(path) = &config.local_path {
+        return Ok(Arc::new(LocalRangeFetcher::new(PathBuf::from(path))));
+    }
+    let bucket = config.bucket.clone().ok_or_else(|| {
+        io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
+    })?;
+    let creds =
+        creds.ok_or_else(|| io::Error::other("S3 fetcher requires explicit credentials"))?;
+    if let Some(reissue) = reissue {
+        let issuer = Arc::new(creds_fetcher::CoordinatorIssuer::new(
+            reissue.coordinator_socket,
+            reissue.macaroon,
+        ));
+        let lazy = creds_fetcher::LazyCredsFetcher::new(
+            bucket,
+            config.endpoint.clone(),
+            config.region.clone(),
+            creds,
+            issuer,
+            creds_fetcher::DEFAULT_CREDS_IDLE_TTL,
+        )?;
+        return Ok(lazy);
+    }
+    // Standalone fallback: hold creds for the life of the process.
+    config.build_fetcher(Some(creds))
 }
 
 /// Resolve a volume name to its directory via `<data_dir>/by_name/<name>`.
