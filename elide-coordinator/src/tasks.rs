@@ -56,6 +56,7 @@ fn evict_bodies(fork_dir: &Path) -> io::Result<usize> {
         }
         let _ = std::fs::remove_file(entry.path());
         let _ = std::fs::remove_file(cache_dir.join(format!("{ulid_str}.present")));
+        let _ = std::fs::remove_file(cache_dir.join(format!("{ulid_str}.dmat")));
         count += 1;
     }
     Ok(count)
@@ -77,6 +78,7 @@ fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
     }
     std::fs::remove_file(&body_path)?;
     let _ = std::fs::remove_file(fork_dir.join("cache").join(format!("{ulid_str}.present")));
+    let _ = std::fs::remove_file(fork_dir.join("cache").join(format!("{ulid_str}.dmat")));
     Ok(1)
 }
 
@@ -330,16 +332,18 @@ mod tests {
     }
 
     #[test]
-    fn evict_bodies_removes_body_and_present_leaves_idx() {
+    fn evict_bodies_removes_body_present_and_dmat_leaves_idx() {
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
         let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
         write_stub_body(&vol, ulid);
+        fs::write(vol.join("cache").join(format!("{ulid}.dmat")), b"dmat").unwrap();
         fs::write(vol.join("index").join(format!("{ulid}.idx")), b"idx").unwrap();
 
         assert_eq!(evict_bodies(&vol).unwrap(), 1);
         assert!(!vol.join("cache").join(format!("{ulid}.body")).exists());
         assert!(!vol.join("cache").join(format!("{ulid}.present")).exists());
+        assert!(!vol.join("cache").join(format!("{ulid}.dmat")).exists());
         assert!(vol.join("index").join(format!("{ulid}.idx")).exists());
     }
 
@@ -374,11 +378,13 @@ mod tests {
         let vol = setup_vol(&tmp);
         let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
         write_stub_body(&vol, ulid);
+        fs::write(vol.join("cache").join(format!("{ulid}.dmat")), b"dmat").unwrap();
         fs::write(vol.join("index").join(format!("{ulid}.idx")), b"idx").unwrap();
 
         assert_eq!(evict_one_body(&vol, ulid).unwrap(), 1);
         assert!(!vol.join("cache").join(format!("{ulid}.body")).exists());
         assert!(!vol.join("cache").join(format!("{ulid}.present")).exists());
+        assert!(!vol.join("cache").join(format!("{ulid}.dmat")).exists());
         assert!(vol.join("index").join(format!("{ulid}.idx")).exists());
     }
 

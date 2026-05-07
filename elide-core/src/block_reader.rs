@@ -631,6 +631,7 @@ fn apply_snapshot_layer(
                         entry.hash,
                         DeltaLocation {
                             segment_id: *seg,
+                            entry_idx: raw_idx as u32,
                             body_source: DeltaBodySource::Cached,
                             options: entry.delta_options.clone(),
                         },

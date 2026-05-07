@@ -399,7 +399,7 @@ impl Volume {
 
         let lbamap = Arc::make_mut(&mut self.lbamap);
         let extent_index = Arc::make_mut(&mut self.extent_index);
-        for re in &result.entries {
+        for (raw_idx, re) in result.entries.iter().enumerate() {
             let entry = &re.entry;
             match entry.kind {
                 EntryKind::Data => {
@@ -456,6 +456,7 @@ impl Volume {
                         entry.hash,
                         extentindex::DeltaLocation {
                             segment_id: result.segment_ulid,
+                            entry_idx: raw_idx as u32,
                             body_source: extentindex::DeltaBodySource::Full {
                                 body_section_start: result.body_section_start,
                                 body_length: result.body_length,

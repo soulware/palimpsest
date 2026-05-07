@@ -515,3 +515,139 @@ fn block_reader_read_block_dispatches_to_delta() {
         "unmapped LBA must read as zeros"
     );
 }
+
+/// First read of a Delta LBA writes the materialised bytes to
+/// `cache/<delta_seg>.dmat` and a second read returns identical bytes.
+/// Sanity-checks that the dmat record header sits past the magic and that
+/// the file persists after dropping/reopening the volume.
+#[test]
+fn delta_read_populates_dmat_and_second_read_matches() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    fs::create_dir_all(vol_dir.join("index")).unwrap();
+    fs::create_dir_all(vol_dir.join("cache")).unwrap();
+
+    let parent_bytes = vec![0x55u8; 4096];
+    let parent_hash = blake3::hash(&parent_bytes);
+    let mut child_bytes = vec![0x55u8; 4096];
+    for (i, byte) in child_bytes.iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
+    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let mut parent_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        1,
+        SegmentFlags::empty(),
+        parent_bytes.clone(),
+    )];
+    write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
+
+    let delta_seg_ulid = mint.next();
+    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_option = DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
+    };
+    let mut delta_entries = vec![SegmentEntry::new_delta(
+        child_hash,
+        10,
+        1,
+        vec![delta_option],
+    )];
+    write_segment_with_delta_body(
+        &delta_seg_path,
+        &mut delta_entries,
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    for ulid in [parent_seg_ulid, delta_seg_ulid] {
+        let pending = vol_dir.join(format!("pending/{ulid}"));
+        let idx = vol_dir.join(format!("index/{ulid}.idx"));
+        let body = vol_dir.join(format!("cache/{ulid}.body"));
+        let present = vol_dir.join(format!("cache/{ulid}.present"));
+        extract_idx(&pending, &idx).unwrap();
+        promote_to_cache(&pending, &body, &present).unwrap();
+        fs::remove_file(&pending).unwrap();
+    }
+
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+        None,
+    )
+    .unwrap();
+
+    let dmat_path = vol_dir.join(format!("cache/{delta_seg_ulid}.dmat"));
+    assert!(
+        !dmat_path.exists(),
+        "dmat must not exist before any delta read"
+    );
+
+    {
+        let vol = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
+        let first = vol.read(10, 1).unwrap();
+        assert_eq!(
+            first, child_bytes,
+            "first delta read must match child bytes"
+        );
+
+        let stats_after_first = vol.dmat_stats();
+        assert_eq!(stats_after_first.lookup_total, 1);
+        assert_eq!(stats_after_first.miss_total, 1);
+        assert_eq!(stats_after_first.hit_total, 0);
+        assert_eq!(stats_after_first.write_total, 1);
+        assert!(stats_after_first.write_bytes_total > 0);
+
+        assert!(
+            dmat_path.exists(),
+            "dmat must be created after a successful delta read"
+        );
+        let after_first = fs::metadata(&dmat_path).unwrap().len();
+        assert!(
+            after_first > 8,
+            "dmat must contain a record past the 8-byte magic, got {after_first} bytes"
+        );
+
+        let second = vol.read(10, 1).unwrap();
+        assert_eq!(
+            second, child_bytes,
+            "second delta read must match child bytes"
+        );
+        let after_second = fs::metadata(&dmat_path).unwrap().len();
+        assert_eq!(
+            after_first, after_second,
+            "second read must hit the dmat (no new record appended)"
+        );
+
+        let stats_after_second = vol.dmat_stats();
+        assert_eq!(stats_after_second.lookup_total, 2);
+        assert_eq!(stats_after_second.hit_total, 1);
+        assert_eq!(stats_after_second.miss_total, 1);
+        assert_eq!(stats_after_second.write_total, 1);
+    }
+
+    // Reopen and read again — the dmat must survive across volume open/close.
+    let vol = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
+    let third = vol.read(10, 1).unwrap();
+    assert_eq!(third, child_bytes, "post-reopen delta read must match");
+    let after_third = fs::metadata(&dmat_path).unwrap().len();
+    assert!(after_third > 8, "dmat must still contain its record");
+
+    // The dmat starts with the magic header.
+    let bytes = fs::read(&dmat_path).unwrap();
+    assert_eq!(&bytes[..8], elide_core::dmat::MAGIC);
+}

@@ -9,9 +9,15 @@
 // inspect-wal <path>
 //   Prints every record in a WAL file (wal/<ulid>). Uses scan_readonly so
 //   the file is never modified.
+//
+// inspect-dmat <path>
+//   Prints every materialised record in a `cache/<ulid>.dmat` file. The
+//   scan is strictly read-only — the file is never modified, and the magic
+//   is required to be already present.
 
 use std::path::Path;
 
+use elide_core::dmat::{self, DmatFlags};
 use elide_core::segment::{self, EntryKind};
 use elide_core::writelog;
 
@@ -229,6 +235,61 @@ pub fn inspect_wal(path: &Path) -> std::io::Result<()> {
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+// --- inspect-dmat ---
+
+pub fn inspect_dmat(path: &Path) -> std::io::Result<()> {
+    let (records, scan) = dmat::scan_readonly(path)?;
+    let file_size = std::fs::metadata(path)?.len();
+
+    let compressed_count = records
+        .iter()
+        .filter(|r| r.flags.contains(DmatFlags::COMPRESSED))
+        .count();
+    let total_stored: u64 = records.iter().map(|r| r.stored_length as u64).sum();
+
+    println!("file:        {}", path.display());
+    println!("file_size:   {file_size}");
+    println!("records:     {}", records.len());
+    println!(
+        "compressed:  {compressed_count} ({} raw)",
+        records.len() - compressed_count
+    );
+    println!("stored:      {total_stored} bytes (sum of record payloads)");
+    if scan.truncated {
+        println!(
+            "WARNING:     would-truncate-on-open: {} record(s) past last clean frame",
+            scan.invalid
+        );
+    }
+
+    if records.is_empty() {
+        println!("(no records)");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{:>6}  {:>10}  {:>10}  {:>6}",
+        "idx", "offset", "len", "comp"
+    );
+    println!("{}", "-".repeat(40));
+    for r in &records {
+        println!(
+            "{:>6}  {:>10}  {:>10}  {:>6}",
+            r.entry_idx,
+            r.record_offset,
+            r.stored_length,
+            if r.flags.contains(DmatFlags::COMPRESSED) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
     }
 
     Ok(())

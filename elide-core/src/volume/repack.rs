@@ -421,7 +421,7 @@ impl Volume {
 
             let entries_len = entries.len();
             let ei = Arc::make_mut(&mut self.extent_index);
-            for item in &entries {
+            for (raw_idx, item) in entries.iter().enumerate() {
                 let post = &item.post;
                 match (item.pre_kind, post.kind) {
                     (EntryKind::Data, EntryKind::Data) => {
@@ -462,6 +462,7 @@ impl Volume {
                             post.hash,
                             extentindex::DeltaLocation {
                                 segment_id: seg_id,
+                                entry_idx: raw_idx as u32,
                                 body_source: extentindex::DeltaBodySource::Full {
                                     body_section_start: new_bss,
                                     body_length: delta_region_body_length,
@@ -487,6 +488,7 @@ impl Volume {
                             post.hash,
                             extentindex::DeltaLocation {
                                 segment_id: seg_id,
+                                entry_idx: raw_idx as u32,
                                 body_source: extentindex::DeltaBodySource::Full {
                                     body_section_start: new_bss,
                                     body_length: delta_region_body_length,

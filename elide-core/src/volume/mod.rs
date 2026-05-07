@@ -72,6 +72,7 @@ pub use jobs::{
     SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
 use open_state::open_read_state;
+pub use read::DmatCache;
 #[cfg(test)]
 pub(in crate::volume) use read::SegmentLayout;
 pub(crate) use read::{FileCache, find_segment_in_dirs, open_delta_body_in_dirs, read_extents};
@@ -186,6 +187,13 @@ pub struct Volume {
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
     pub(in crate::volume) file_cache: RefCell<FileCache>,
+    /// In-memory cache of opened `cache/<ULID>.dmat` sidecars. Populated
+    /// lazily on first delta read for each segment; cleared on cache
+    /// eviction. See `docs/design-delta-materialisation.md`.
+    pub(in crate::volume) dmat_cache: read::DmatCache,
+    /// Telemetry counters for the dmat cache. Wrapped in `Arc` so the
+    /// stats can be cloned and shared with `VolumeReader`s and IPC.
+    pub(in crate::volume) dmat_stats: Arc<crate::dmat::DmatStats>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -465,6 +473,8 @@ impl Volume {
             has_new_segments,
             last_segment_ulid,
             file_cache: RefCell::new(FileCache::default()),
+            dmat_cache: RefCell::new(std::collections::HashMap::new()),
+            dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             signer,
             verifying_key,
             fetcher: None,
@@ -665,12 +675,16 @@ impl Volume {
     /// fetched extent-by-extent: one file open and one read (or decompress)
     /// per extent, regardless of how many blocks within the extent are needed.
     pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let cache_dir = self.base_dir.join("cache");
         read_extents(
             lba,
             lba_count,
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
+            &self.dmat_cache,
+            &self.dmat_stats,
+            &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {
                 open_delta_body_in_dirs(
@@ -681,6 +695,11 @@ impl Volume {
                 )
             },
         )
+    }
+
+    /// Snapshot the dmat telemetry counters for this volume.
+    pub fn dmat_stats(&self) -> crate::dmat::DmatStatsSnapshot {
+        self.dmat_stats.snapshot()
     }
 
     /// Flush buffered WAL writes and fsync to disk. No-op when no WAL is open.

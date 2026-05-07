@@ -134,6 +134,9 @@ pub struct DeltaLocation {
     /// ULID of the segment that holds both the Delta index entry and
     /// its delta blob in the segment's delta body section.
     pub segment_id: Ulid,
+    /// Index of the Delta entry within the segment's index section.
+    /// Used as the key for the local materialisation cache (`.dmat`).
+    pub entry_idx: u32,
     /// Where to find the delta blob bytes locally.
     pub body_source: DeltaBodySource,
     /// Delta options exactly as stored on disk. The reader scans them
@@ -588,6 +591,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                             entry.hash,
                             DeltaLocation {
                                 segment_id,
+                                entry_idx: raw_idx as u32,
                                 body_source: delta_body_source,
                                 options: entry.delta_options.clone(),
                             },

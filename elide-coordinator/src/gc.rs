@@ -628,6 +628,7 @@ impl HandoffCursor<'_> {
             let old_ulid_str = old_ulid.to_string();
             let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.body")));
             let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.present")));
+            let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.dmat")));
         }
 
         // Finalize: volume deletes bare `gc/<new>` inside the actor, under

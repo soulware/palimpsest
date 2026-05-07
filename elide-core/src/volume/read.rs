@@ -8,20 +8,29 @@
 //! without depending on the broader volume actor state.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
 use crate::{
-    delta_compute,
+    delta_compute, dmat,
     extentindex::{self, BodySource},
     lbamap,
     segment::{self},
 };
 
 use super::{AncestorLayer, BoxFetcher, ZERO_HASH};
+
+/// Per-volume in-memory cache of opened `.dmat` sidecars, keyed by segment
+/// ULID. Populated lazily when a Delta entry is first read for a segment.
+///
+/// `RefCell` mirrors the FileCache pattern: the read path is `&self` but we
+/// internally need `&mut Dmat` to append records.
+pub type DmatCache = RefCell<HashMap<Ulid, dmat::Dmat>>;
 
 /// Default capacity for the segment file handle LRU cache.
 const FILE_CACHE_CAPACITY: usize = 16;
@@ -176,12 +185,16 @@ impl FileCache {
 /// Unwritten blocks are returned as zeros. Written blocks are fetched extent-by-extent
 /// using `find_segment` to locate each segment file, with recently-opened file handles
 /// cached in `file_cache` (LRU) to amortize `open` syscalls across reads.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_extents(
     lba: u64,
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
+    dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
+    cache_dir: &Path,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
 ) -> io::Result<Vec<u8>> {
@@ -224,6 +237,9 @@ pub(crate) fn read_extents(
                     lba,
                     extent_index,
                     file_cache,
+                    dmat_cache,
+                    dmat_stats,
+                    cache_dir,
                     &find_segment,
                     &open_delta_body,
                     &mut out,
@@ -372,15 +388,20 @@ pub(crate) fn read_extents(
 /// delta options in order, pick the first one whose `source_hash`
 /// resolves via `extent_index.lookup` to a DATA/Inline location. No
 /// caching of decompressed output — each read decompresses fresh.
-/// Phase C accepts the decompression cost in exchange for
-/// implementation simplicity; a follow-up can add a content-hash-
-/// addressed materialisation cache if telemetry shows it matters.
+/// Materialised bytes are cached in `cache/<ULID>.dmat` after a successful
+/// decompress (see `docs/design-delta-materialisation.md`); subsequent reads
+/// of the same Delta entry skip the source-body fetch and the
+/// zstd-dict-decompress and instead read (and lz4-decompress) the cached
+/// bytes directly.
 #[allow(clippy::too_many_arguments)]
 fn try_read_delta_extent(
     er: &lbamap::ExtentRead,
     lba: u64,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
+    dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
+    cache_dir: &Path,
     find_segment: &dyn Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: &dyn Fn(Ulid) -> io::Result<fs::File>,
     out: &mut [u8],
@@ -391,8 +412,25 @@ fn try_read_delta_extent(
         return Ok(false);
     };
     let delta_segment_id = delta_loc.segment_id;
+    let delta_entry_idx = delta_loc.entry_idx;
     let delta_body_source = delta_loc.body_source;
     let options = delta_loc.options.clone();
+
+    dmat_stats.record_lookup();
+
+    // dmat hit path: materialised bytes are already on disk for this
+    // (segment, entry_idx). Read + lz4-decompress, copy out, return.
+    if let Some(materialised) = dmat_lookup(
+        dmat_cache,
+        dmat_stats,
+        cache_dir,
+        delta_segment_id,
+        delta_entry_idx,
+    )? {
+        dmat_stats.record_hit();
+        return copy_materialised_into(er, lba, &materialised, out).map(|()| true);
+    }
+    dmat_stats.record_miss();
 
     // Pick the first option whose source hash resolves to a DATA/Inline
     // location. This is the earliest-source preference in its simplest
@@ -508,17 +546,108 @@ fn try_read_delta_extent(
     // computed over, regardless of which LBA sub-range we want.
     let decompressed = delta_compute::apply_delta(&source_bytes, &delta_blob)?;
 
-    // Copy the requested portion into the output buffer.
+    // Cache the materialised bytes for future reads. Failure to write the
+    // cache record is not fatal — the materialisation already succeeded
+    // and can be re-derived next time.
+    if let Err(e) = dmat_writeback(
+        dmat_cache,
+        dmat_stats,
+        cache_dir,
+        delta_segment_id,
+        delta_entry_idx,
+        &decompressed,
+    ) {
+        log::warn!(
+            "dmat writeback failed for segment {delta_segment_id} entry {delta_entry_idx}: {e}"
+        );
+    }
+
+    copy_materialised_into(er, lba, &decompressed, out).map(|()| true)
+}
+
+/// Copy the LBA sub-range described by `er` out of a fully-materialised extent
+/// payload (`materialised`) into the caller's output buffer.
+fn copy_materialised_into(
+    er: &lbamap::ExtentRead,
+    lba: u64,
+    materialised: &[u8],
+    out: &mut [u8],
+) -> io::Result<()> {
     let block_count = (er.range_end - er.range_start) as usize;
     let out_start = (er.range_start - lba) as usize * 4096;
     let out_slice = &mut out[out_start..out_start + block_count * 4096];
     let src_start = er.payload_block_offset as usize * 4096;
     let src_end = src_start + block_count * 4096;
-    let src_slice = decompressed
+    let src_slice = materialised
         .get(src_start..src_end)
-        .ok_or_else(|| io::Error::other("delta decompressed payload too short"))?;
+        .ok_or_else(|| io::Error::other("delta materialised payload too short"))?;
     out_slice.copy_from_slice(src_slice);
-    Ok(true)
+    Ok(())
+}
+
+/// Look up an entry in `cache/<segment_id>.dmat`.
+///
+/// Returns `Ok(None)` if either the file doesn't exist or the entry hasn't
+/// been materialised yet. Returns `Ok(Some(bytes))` with the lz4-decompressed
+/// canonical extent bytes on a hit. Errors propagate (I/O failure).
+///
+/// Lazily opens the `Dmat` instance and inserts it into the in-memory cache
+/// on first access for a segment.
+fn dmat_lookup(
+    dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
+    cache_dir: &Path,
+    segment_id: Ulid,
+    entry_idx: u32,
+) -> io::Result<Option<Vec<u8>>> {
+    use std::collections::hash_map::Entry;
+    let mut cache = dmat_cache.borrow_mut();
+    let dmat_inst = match cache.entry(segment_id) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => {
+            let path = cache_dir.join(format!("{segment_id}.dmat"));
+            if !path.exists() {
+                return Ok(None);
+            }
+            let (d, scan) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
+            dmat_stats.record_open_scan(scan);
+            v.insert(d)
+        }
+    };
+    let Some(loc) = dmat_inst.lookup(entry_idx) else {
+        return Ok(None);
+    };
+    Ok(Some(dmat_inst.read_materialised(loc)?))
+}
+
+/// Append a materialised entry to `cache/<segment_id>.dmat`.
+///
+/// Lazily opens or creates the file on first call for a segment. Applies the
+/// shared compression-entropy gate before writing; the resulting record is
+/// flagged `FLAG_COMPRESSED` iff lz4 produced a meaningfully smaller payload.
+fn dmat_writeback(
+    dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
+    cache_dir: &Path,
+    segment_id: Ulid,
+    entry_idx: u32,
+    materialised: &[u8],
+) -> io::Result<()> {
+    use std::collections::hash_map::Entry;
+    let mut cache = dmat_cache.borrow_mut();
+    let dmat_inst = match cache.entry(segment_id) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => {
+            let path = cache_dir.join(format!("{segment_id}.dmat"));
+            let (d, scan) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
+            dmat_stats.record_open_scan(scan);
+            v.insert(d)
+        }
+    };
+    let compressed = super::maybe_compress(materialised);
+    let loc = dmat_inst.append(entry_idx, materialised, compressed.as_deref())?;
+    dmat_stats.record_write(loc.stored_length as u64);
+    Ok(())
 }
 
 /// Open `cache/<id>.delta` for reading, demand-fetching it on miss.

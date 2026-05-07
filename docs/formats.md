@@ -168,25 +168,22 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
 **S3 upload completion:**
 
 ```
-6. Read pending/<ULID>; choose S3 reduction strategy (if applicable):
-   a. Delta compression: compute delta body against ancestor segments;
-      S3 object = local file + appended delta body (header and index updated with delta offsets)
-   b. Sparse: compare extents block-by-block against ancestor; build a fresh S3 object
-      containing only changed-block extents; S3 manifest reflects the sparse LBA map
-   c. Neither: upload local file as-is. The local file is already thin:
-      DedupRef entries contribute no body bytes (stored_length=0),
-      and hash-dead DATA entries have been hole-punched in place by redact_segment.
-7. Upload S3 object
-8. Volume writes index/<ULID>.idx and cache/<ULID>.{body,present} (full body, all bits set); deletes pending/<ULID>
+6. Read pending/<ULID> and stream it byte-for-byte to S3.
+   The local file is already in its final form by the time drain runs:
+     - DedupRef and Delta entries contribute no body bytes (stored_length = 0).
+     - Hash-dead DATA entries have been hole-punched in place by redact_segment.
+     - Delta entries (and their delta body section) were written into the
+       file by either elide-import (filemap-matched, at import time) or by
+       the post-snapshot delta repack pass that the coordinator runs before
+       drain. See [design-delta-compression.md](design-delta-compression.md).
+7. Upload the file unmodified.
+8. Volume writes index/<ULID>.idx and cache/<ULID>.{body,present}
+   (full body, all bits set); deletes pending/<ULID>.
 ```
 
-The local `pending/<ulid>` file and the uploaded S3 object share the **same format-level thin layout**: `body_length` is the sum of DATA and INLINE `stored_length` only; DedupRef entries carry no body bytes anywhere. Dead-DATA body regions are hole-punched by `materialise_segment` on Linux (zero-written on other platforms) before upload. There is no "local optimisation vs S3" asymmetry — the thin layout is the only layout. See § Segment File Format — FLAG_DEDUP_REF for the invariants that make this sound.
+The local `pending/<ULID>` file and the uploaded S3 object are **byte-identical at PUT time**. There is no upload-time strategy choice and no fresh S3-side construction. All thinning happens on the local file before drain, and delta bodies are baked into the file by the producer (import or post-snapshot delta repack), not appended at upload.
 
-Under **delta compression** the S3 object is derived from the local file (body section identical, delta body appended, header/index updated). The local file can be streamed directly.
-
-Under the **sparse** strategy the S3 object diverges structurally from the local file: its index section contains entries for changed blocks only, not the original full-extent entries. The coordinator builds the S3 object fresh. H_new (the full extent hash) is not registered in the S3 extent index — only the changed block hashes are. The local segment retains H_new as a full DATA record; local reads are unaffected.
-
-The two strategies are not mutually exclusive: sparse can be applied first (skip unchanged blocks), and delta compression applied to the changed blocks that remain. See [architecture.md](architecture.md) for the trade-off comparison.
+This is the same `body_length`-is-DATA+INLINE-only thin layout described under § Segment File Format — FLAG_DEDUP_REF and FLAG_DELTA. Local and S3 agree on the bytes; the only divergence between them is that `cache/<ULID>.body` may be sparsely populated post-upload as bodies are evicted or arrive on demand-fetch.
 
 **On startup:** scan all three directories within the live node. Each maps to one recovery action:
 - `wal/` — replay (truncate partial tail if needed) and promote
@@ -199,7 +196,7 @@ Then scan ancestor nodes' `index/` directories (no `wal/` or `pending/` — they
 
 ## Segment File Format
 
-Each segment is a **single file** both locally and in S3. The same format is used throughout — the local `pending/<ULID>` file is the S3 object minus the delta body, which the coordinator appends at upload time.
+Each segment is a **single file** both locally and in S3. The same format is used throughout — the local `pending/<ULID>` file is byte-identical to the S3 object at upload time. Delta bodies, when present, are written into `pending/<ULID>` by the producer (import or post-snapshot delta repack) before drain; the coordinator's drain pass streams the file unmodified.
 
 ### File layout
 
@@ -494,8 +491,8 @@ Segments fetched from S3 are **inherently partial**: a newly-arrived segment has
 |---|---|---|
 | File count | 1 per segment | 3 per segment (`.idx`, `.body`, `.present`) |
 | Completeness | Always complete (atomic tmp→rename) | Self-written: full body; demand-fetched: populated incrementally |
-| Format | Header + index + inline + body (+ delta on S3) | `.idx`: header + index + inline; `.body`: sparse body bytes |
-| Delta section | `delta_length = 0` locally; appended by coordinator at upload | Never stored; materialised into `.body` if a delta path is taken |
+| Format | Header + index + inline + body + delta (delta written by import or post-snapshot delta repack before drain) | `.idx`: header + index + inline; `.body`: sparse body bytes; `.delta`: delta blobs |
+| Delta section | Inline at `body_section_start + body_length`; written by import / post-snapshot delta repack before drain. The local file is byte-identical to the S3 object | Promoted to a separate `cache/<ULID>.delta` file by `promote_to_cache`; same byte content as the S3 object's delta body section |
 | `body_offset` reference point | File-relative (as written) | Body-relative (0 = first byte of body section) — matches `entry.body_offset` directly |
 | Presence tracking | N/A — always 100% present | `.present` bitset; one bit per index entry |
 | Signature location | `header[32..96]` in the single file | `header[32..96]` in `.idx`; verified before any body fetch |
@@ -518,7 +515,7 @@ Each fetched extent is written at its exact `body_offset` within this file. OS h
 
 DedupRef entries contribute no bytes and no byte ranges to `.body` — they are invisible at the file level. The `.present` bit for a DedupRef index entry is always unset, but this is vestigial: the read path resolves DedupRefs through the extent index, not through the bitset.
 
-Extents materialised from a delta (delta bytes fetched, applied against a local source extent, result written) are stored at the same `body_offset` as the full-body version. From the read path's perspective, materialised delta output is identical to a directly-fetched body extent.
+FLAG_DELTA entries are not stored in `.body` at all (`stored_offset = 0`, `stored_length = 0`). Their delta blobs live in `cache/<ULID>.delta` (or in the inline section, with `FLAG_DELTA_INLINE`); each read fetches the source extent body, fetches the delta blob, and zstd-dict-decompresses on the fly. See § Segment File Format — FLAG_DELTA.
 
 **`<ulid>.present` — presence bitset**
 

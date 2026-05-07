@@ -7,6 +7,7 @@
 //! `volume/open_state.rs`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,13 +15,14 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::{
+    dmat::DmatStats,
     extentindex::{self, BodySource},
     lbamap,
 };
 
 use super::{
     AncestorLayer, BoxFetcher, FileCache, find_segment_in_dirs, open_delta_body_in_dirs,
-    read_extents,
+    read::DmatCache, read_extents,
 };
 
 /// Read-only view of a volume: rebuilds LBA map and extent index from
@@ -31,6 +33,8 @@ pub struct ReadonlyVolume {
     lbamap: lbamap::LbaMap,
     extent_index: Arc<extentindex::ExtentIndex>,
     file_cache: RefCell<FileCache>,
+    dmat_cache: DmatCache,
+    dmat_stats: Arc<DmatStats>,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -49,6 +53,8 @@ impl ReadonlyVolume {
             lbamap,
             extent_index: Arc::new(extent_index),
             file_cache: RefCell::new(FileCache::default()),
+            dmat_cache: RefCell::new(HashMap::new()),
+            dmat_stats: Arc::new(DmatStats::default()),
             fetcher: None,
         })
     }
@@ -63,12 +69,16 @@ impl ReadonlyVolume {
     /// Read `lba_count` 4KB blocks starting at `start_lba`.
     /// Unwritten blocks are returned as zeros.
     pub fn read(&self, start_lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let cache_dir = self.base_dir.join("cache");
         read_extents(
             start_lba,
             lba_count,
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
+            &self.dmat_cache,
+            &self.dmat_stats,
+            &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {
                 open_delta_body_in_dirs(
@@ -79,6 +89,11 @@ impl ReadonlyVolume {
                 )
             },
         )
+    }
+
+    /// Snapshot the dmat telemetry counters for this volume.
+    pub fn dmat_stats(&self) -> crate::dmat::DmatStatsSnapshot {
+        self.dmat_stats.snapshot()
     }
 
     fn find_segment_file(

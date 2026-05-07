@@ -131,6 +131,10 @@ enum Command {
     #[command(hide = true)]
     InspectWal { path: PathBuf },
 
+    /// Print all materialised records in a `.dmat` cache file (diagnostic)
+    #[command(hide = true)]
+    InspectDmat { path: PathBuf },
+
     /// Manage ublk devices (diagnostic, Linux-only)
     #[command(hide = true)]
     Ublk {
@@ -1124,6 +1128,10 @@ fn main() {
 
         Command::InspectWal { path } => {
             inspect_files::inspect_wal(&path).expect("inspect-wal failed");
+        }
+
+        Command::InspectDmat { path } => {
+            inspect_files::inspect_dmat(&path).expect("inspect-dmat failed");
         }
 
         Command::Ublk { command } => match command {
