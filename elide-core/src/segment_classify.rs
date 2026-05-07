@@ -159,9 +159,26 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
 
     let end_lba = entry.start_lba + entry.lba_length as u64;
     let runs = ctx.lba_map.extents_in_range(entry.start_lba, end_lba);
+    // A run "matches" the input entry when its hash matches AND its
+    // anchor agrees: the run's `payload_block_offset` for `range_start`
+    // equals the entry's offset for that LBA. Same-hash runs with
+    // different anchors (e.g. a `DedupRef` at start=25 referring to
+    // the same body as a DATA at start=24) represent different bytes
+    // for partially-overlapping LBAs, even though the composite hash
+    // is identical, so they must NOT count as matching.
+    //
+    // Concretely: at LBA L in run `r`, the lbamap says
+    // "body block P + (L - r.range_start)" where P =
+    // r.payload_block_offset. The input entry says "body block
+    // L - entry.start_lba". These agree iff
+    // (r.range_start - entry.start_lba) == r.payload_block_offset.
+    let anchor_matches = |r: &ExtentRead| -> bool {
+        let delta = r.range_start.checked_sub(entry.start_lba);
+        delta == Some(r.payload_block_offset as u64)
+    };
     let matching_blocks: u64 = runs
         .iter()
-        .filter(|r| r.hash == entry.hash)
+        .filter(|r| r.hash == entry.hash && anchor_matches(r))
         .map(|r| r.range_end - r.range_start)
         .sum();
     let total_blocks = entry.lba_length as u64;
@@ -185,8 +202,12 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
     } else {
         // Partial-LBA death. Build the live sub-run list once; per-kind
         // logic decides how the caller turns it into output records.
-        let live_runs: Arc<[ExtentRead]> =
-            runs.into_iter().filter(|r| r.hash == entry.hash).collect();
+        // Use the same anchor-aware filter so split sub-runs only
+        // include LBAs whose anchor agrees with the input entry.
+        let live_runs: Arc<[ExtentRead]> = runs
+            .into_iter()
+            .filter(|r| r.hash == entry.hash && anchor_matches(r))
+            .collect();
         match entry.kind {
             EntryKind::Data | EntryKind::Inline => EntryClassification::PartialDeath {
                 live_runs,
