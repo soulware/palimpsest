@@ -95,11 +95,21 @@ fn run(
         let cursor = Arc::clone(&cursor);
         let work = Arc::clone(&work);
         let fetcher = Arc::clone(&fetcher);
+        let extent_index = Arc::clone(&extent_index);
         let bytes_fetched = Arc::clone(&bytes_fetched);
         let segments_with_fetch = Arc::clone(&segments_with_fetch);
         if let Ok(h) = thread::Builder::new()
             .name(format!("full-warm-{w}"))
-            .spawn(move || worker(cursor, work, fetcher, bytes_fetched, segments_with_fetch))
+            .spawn(move || {
+                worker(
+                    cursor,
+                    work,
+                    fetcher,
+                    extent_index,
+                    bytes_fetched,
+                    segments_with_fetch,
+                )
+            })
         {
             handles.push(h);
         }
@@ -169,6 +179,15 @@ fn plan_segments(
             BodySource::Cached(i) => i,
             BodySource::Local => continue,
         };
+        // Inline entries carry their bytes in the segment's inline
+        // section (held in `.idx` itself), not the body section, so
+        // they need no body warming. `warm_segment_impl` already skips
+        // them via `entry.kind.is_data()`; mirror that filter here so
+        // a segment of pure inline entries doesn't get planned just
+        // to produce a no-op fetch.
+        if loc.inline_data.is_some() {
+            continue;
+        }
         let Some((owner_dir, owner_vol_id)) = owner_by_seg.get(&loc.segment_id) else {
             continue;
         };
@@ -197,6 +216,7 @@ fn worker(
     cursor: Arc<AtomicUsize>,
     work: Arc<Vec<SegmentWork>>,
     fetcher: BoxFetcher,
+    extent_index: Arc<ExtentIndex>,
     bytes_fetched: Arc<AtomicU64>,
     segments_with_fetch: Arc<AtomicUsize>,
 ) {
@@ -206,7 +226,7 @@ fn worker(
             return;
         }
         let w = &work[i];
-        match warm_one_segment(w, &*fetcher) {
+        match warm_one_segment(w, &*fetcher, &extent_index) {
             Ok(n) => {
                 if n > 0 {
                     bytes_fetched.fetch_add(n, Ordering::Relaxed);
@@ -223,6 +243,7 @@ fn worker(
 fn warm_one_segment(
     w: &SegmentWork,
     fetcher: &dyn segment::SegmentFetcher,
+    extent_index: &ExtentIndex,
 ) -> std::io::Result<u64> {
     let index_dir = w.owner_dir.join("index");
     let cache_dir = w.owner_dir.join("cache");
@@ -243,6 +264,7 @@ fn warm_one_segment(
         &cache_dir,
         layout.body_section_start,
         &w.populated_entries,
+        extent_index.segment_presence(w.seg_ulid).cloned(),
     )
 }
 
@@ -506,5 +528,96 @@ mod tests {
         assert_eq!(plan.len(), 1, "only seg_partial should remain");
         let work = plan.get(&seg_partial).expect("seg_partial present");
         assert_eq!(work.populated_entries, vec![7]);
+    }
+
+    /// Inline entries live in the segment's inline section (always on
+    /// disk via `.idx`), not the body section. They show up in the
+    /// extent index with `BodySource::Cached(idx)` so reads can find
+    /// them, but `warm_segment_impl::plan_warm_batches` filters them
+    /// out via `entry.kind.is_data()`. The planner must mirror that
+    /// filter — otherwise a segment of only inline entries gets
+    /// planned and then produces a no-op fetch ("N attempted; 0
+    /// fetched"), which is exactly the user-visible bug this guards.
+    #[test]
+    fn plan_segments_skips_inline_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&owner).unwrap();
+        let seg = Ulid::new();
+        touch_idx(&owner, seg);
+
+        let h_data = blake3::hash(b"data");
+        let h_inline = blake3::hash(b"inline");
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(0, 8, h_data);
+        lba_map.insert(8, 1, h_inline);
+
+        let mut extent_index = ExtentIndex::new();
+        extent_index.insert(
+            h_data,
+            ExtentLocation {
+                segment_id: seg,
+                body_offset: 0,
+                body_length: 4096,
+                compressed: false,
+                body_source: BodySource::Cached(0),
+                body_section_start: 0,
+                inline_data: None,
+            },
+        );
+        extent_index.insert(
+            h_inline,
+            ExtentLocation {
+                segment_id: seg,
+                body_offset: 0,
+                body_length: 7,
+                compressed: false,
+                body_source: BodySource::Cached(1),
+                body_section_start: 0,
+                inline_data: Some(b"hello!\n".as_slice().into()),
+            },
+        );
+
+        let plan = plan_segments(&[owner], &lba_map, &extent_index).unwrap();
+        let work = plan.get(&seg).expect("seg present");
+        assert_eq!(
+            work.populated_entries,
+            vec![0],
+            "inline entry 1 must not appear in the warm plan"
+        );
+    }
+
+    /// A segment whose only live entries are inline must be dropped
+    /// from the plan entirely — otherwise full-warm logs "N attempted;
+    /// 0 fetched" on every restart of a volume whose hot extents were
+    /// inlined.
+    #[test]
+    fn plan_segments_drops_segment_with_only_inline_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = tmp.path().join(Ulid::new().to_string());
+        std::fs::create_dir_all(&owner).unwrap();
+        let seg = Ulid::new();
+        touch_idx(&owner, seg);
+
+        let hash = blake3::hash(b"only-inline");
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(0, 1, hash);
+
+        let mut extent_index = ExtentIndex::new();
+        extent_index.insert(
+            hash,
+            ExtentLocation {
+                segment_id: seg,
+                body_offset: 0,
+                body_length: 5,
+                compressed: false,
+                body_source: BodySource::Cached(0),
+                body_section_start: 0,
+                inline_data: Some(b"hello".as_slice().into()),
+            },
+        );
+
+        let plan = plan_segments(&[owner], &lba_map, &extent_index).unwrap();
+        assert!(plan.is_empty(), "inline-only segment must not be planned");
     }
 }

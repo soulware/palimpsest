@@ -564,6 +564,7 @@ mod imp {
             let body_prefetch_done = crate::body_prefetch::spawn(
                 fork_dirs.clone(),
                 Arc::clone(&arc_fetcher),
+                Arc::clone(&extent_index),
                 move || fetcher_for_swap.set_store(s3_store),
             );
             crate::full_warm::spawn(

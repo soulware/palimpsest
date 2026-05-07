@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use elide_core::extentindex::ExtentIndex;
 use elide_core::segment::{self, BoxFetcher};
 use elide_peer_fetch::PrefetchHint;
 use tracing::{info, warn};
@@ -59,6 +60,7 @@ const PREFETCH_WORKERS: usize = 16;
 pub fn spawn<F>(
     fork_dirs: Vec<PathBuf>,
     fetcher: BoxFetcher,
+    extent_index: Arc<ExtentIndex>,
     on_drain: F,
 ) -> Option<thread::JoinHandle<()>>
 where
@@ -80,12 +82,12 @@ where
                 }
             }
             let _guard = DrainGuard(Some(on_drain));
-            run(fork_dirs, fetcher);
+            run(fork_dirs, fetcher, extent_index);
         })
         .ok()
 }
 
-fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
+fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher, extent_index: Arc<ExtentIndex>) {
     let hints = collect_hints(&fork_dirs);
     if hints.is_empty() {
         return;
@@ -100,9 +102,10 @@ fn run(fork_dirs: Vec<PathBuf>, fetcher: BoxFetcher) {
         let cursor = Arc::clone(&cursor);
         let hints = Arc::clone(&hints);
         let fetcher = Arc::clone(&fetcher);
+        let extent_index = Arc::clone(&extent_index);
         if let Ok(h) = thread::Builder::new()
             .name(format!("body-prefetch-{w}"))
-            .spawn(move || worker(cursor, hints, fetcher))
+            .spawn(move || worker(cursor, hints, fetcher, extent_index))
         {
             handles.push(h);
         }
@@ -157,14 +160,25 @@ struct HintEntry {
     hint_path: PathBuf,
 }
 
-fn worker(cursor: Arc<AtomicUsize>, hints: Arc<Vec<HintEntry>>, fetcher: BoxFetcher) {
+fn worker(
+    cursor: Arc<AtomicUsize>,
+    hints: Arc<Vec<HintEntry>>,
+    fetcher: BoxFetcher,
+    extent_index: Arc<ExtentIndex>,
+) {
     loop {
         let i = cursor.fetch_add(1, Ordering::Relaxed);
         if i >= hints.len() {
             return;
         }
         let h = &hints[i];
-        if let Err(e) = process_hint(&h.owner_dir, h.seg_ulid, &h.hint_path, &*fetcher) {
+        if let Err(e) = process_hint(
+            &h.owner_dir,
+            h.seg_ulid,
+            &h.hint_path,
+            &*fetcher,
+            &extent_index,
+        ) {
             info!("[body-prefetch {}] non-fatal error: {e:#}", h.seg_ulid);
         }
     }
@@ -179,6 +193,7 @@ fn process_hint(
     seg_ulid: Ulid,
     hint_path: &Path,
     fetcher: &dyn segment::SegmentFetcher,
+    extent_index: &ExtentIndex,
 ) -> std::io::Result<()> {
     let hint_bytes = std::fs::read(hint_path)?;
     let hint = PrefetchHint::from_vec(hint_bytes);
@@ -242,6 +257,7 @@ fn process_hint(
         &cache_dir,
         layout.body_section_start,
         &populated,
+        extent_index.segment_presence(seg_ulid).cloned(),
     ) {
         // Best-effort: peer 404 / S3 transient / etc. Log and move on;
         // demand-fetch will retry any unwarmed entry on first guest
@@ -378,11 +394,13 @@ mod tests {
         std::fs::write(cache.join(format!("{seg}.prefetch-hint")), &bits).unwrap();
 
         let fetcher = Arc::new(RecordingFetcher::new());
+        let extent_index = ExtentIndex::new();
         process_hint(
             &owner,
             seg,
             &cache.join(format!("{seg}.prefetch-hint")),
             &*fetcher,
+            &extent_index,
         )
         .unwrap();
 
@@ -409,7 +427,8 @@ mod tests {
         std::fs::write(&hint_path, [0xffu8; 4]).unwrap();
 
         let fetcher = Arc::new(RecordingFetcher::new());
-        process_hint(&owner, seg, &hint_path, &*fetcher).unwrap();
+        let extent_index = ExtentIndex::new();
+        process_hint(&owner, seg, &hint_path, &*fetcher, &extent_index).unwrap();
 
         // Untouched: a future run (after idx prefetch lands) can retry.
         assert!(hint_path.exists());

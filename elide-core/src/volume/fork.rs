@@ -8,7 +8,7 @@ use std::path::Path;
 
 use ulid::Ulid;
 
-use super::readonly::latest_snapshot;
+use super::ancestry::latest_snapshot;
 
 /// Create a new volume directory, branched from the latest snapshot of the source volume.
 ///
