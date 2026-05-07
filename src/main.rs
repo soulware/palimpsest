@@ -160,15 +160,17 @@ enum CoordCommand {
         config: Option<PathBuf>,
     },
 
-    /// Stop the coordinator. By default, also terminates managed volume
-    /// processes. With `--keep-volumes`, the coordinator exits but its
-    /// volume children continue running detached — used for rolling
-    /// upgrades where the coordinator is being replaced without
-    /// disturbing live volumes.
+    /// Stop the coordinator. By default, volume children continue running
+    /// detached — volumes are expensive state (mounted devices, in-flight
+    /// I/O, populated caches) and bouncing the coordinator (rolling
+    /// upgrade, panic, `systemctl restart`) should not drag the data
+    /// plane with it. With `--stop-volumes`, managed volume processes are
+    /// terminated as well; use `elide volume stop <name>` to stop a
+    /// single volume.
     Stop {
-        /// Leave volume children running (rolling-upgrade path).
+        /// Also terminate managed volume processes.
         #[arg(long)]
-        keep_volumes: bool,
+        stop_volumes: bool,
         /// Path to the coordinator config file. Used to resolve the
         /// data_dir (and thus the control socket) when `--data-dir`
         /// is not given. Falls back to `elide_data` if neither is set.
@@ -1157,13 +1159,13 @@ fn main() {
                 }
             }
             CoordCommand::Stop {
-                keep_volumes,
+                stop_volumes,
                 config,
             } => {
                 let result = resolve_coord_data_dir(cli_data_dir.as_deref(), config.as_deref())
                     .and_then(|dd| {
                         let coord = coordinator_client::Client::new(dd.join("control.sock"));
-                        coord_stop(&coord, &dd, keep_volumes)
+                        coord_stop(&coord, &dd, !stop_volumes)
                     });
                 if let Err(e) = result {
                     eprintln!("error: {e}");
@@ -1347,14 +1349,15 @@ fn coord_start(
 /// Send the `Shutdown` IPC and poll until the coordinator process actually
 /// exits (socket disappears / pidfile pid stops responding).
 ///
-/// When the coordinator is *not* running, falls back to a direct
-/// per-volume teardown: walks `<data_dir>/by_id/*/`, SIGTERMs every
-/// `volume.pid` and `import.pid` it finds, and waits for them to exit.
-/// This makes `coord stop` the universal "clean up after me" verb,
-/// covering both the dev workflow (Ctrl+C'd a foreground `coord run`,
-/// orphans left behind) and post-crash cleanup. With `--keep-volumes`
-/// the fallback is a no-op since "coordinator gone, volumes running"
-/// is already the desired state.
+/// `keep_volumes = true` (the default) is the rolling-upgrade path: the
+/// coordinator exits, its volume children continue running detached.
+/// `keep_volumes = false` (`--stop-volumes`) terminates managed volume
+/// processes as well — and when the coordinator is not running, falls
+/// back to direct per-volume teardown by walking `<data_dir>/by_id/*/`
+/// and SIGTERMing every `volume.pid` / `import.pid` it finds. The
+/// fallback covers post-crash cleanup; in the keep-volumes path it is
+/// a no-op since "coordinator gone, volumes running" is already the
+/// desired state.
 fn coord_stop(
     coord: &coordinator_client::Client,
     data_dir: &Path,

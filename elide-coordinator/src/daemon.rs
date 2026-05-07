@@ -273,7 +273,8 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // coordinator going down for any reason (panic, OOM, supervisor
     // bounce, `systemctl restart`) must not drag the data plane with
     // it. The "tear down volumes too" path is the explicit
-    // `Shutdown { keep_volumes: false }` IPC sent by `elide coord stop`.
+    // `Shutdown { keep_volumes: false }` IPC sent by
+    // `elide coord stop --stop-volumes`.
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

@@ -412,7 +412,7 @@ fn coordinator_nbd_lifecycle() {
     // explicitly leaving the supervised volume process running. The
     // "tear down volumes too" path is reachable only via the explicit
     // `Shutdown { keep_volumes: false }` IPC sent by `elide coord
-    // stop`.
+    // stop --stop-volumes`.
     unsafe {
         let rc = kill(coord.id() as i32, SIGINT);
         assert_eq!(rc, 0, "kill(SIGINT) to coordinator failed");
