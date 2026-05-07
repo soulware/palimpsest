@@ -280,9 +280,20 @@ impl ExtentIndex {
         self.segment_presence.remove(&segment_id);
     }
 
-    /// Insert or overwrite the location for `hash`.
+    /// Insert or overwrite the DATA-canonical location for `hash`. Also
+    /// clears any stale `deltas` entry for the same hash — DATA
+    /// supersedes Delta in the canonical-location ordering used by
+    /// rebuild (`insert_delta_if_absent` skips when DATA exists), and
+    /// the live insert path must enforce the same precedence so the
+    /// in-memory state matches what a fresh disk-rebuild would give.
+    /// Without this, a hash that started as a Delta entry and was
+    /// later materialised as DATA would have stale `deltas` claims
+    /// pointing at deleted segments. Caught by
+    /// `assert_extent_index_consistent` on
+    /// `gc_delta_partial_death_compaction`.
     pub fn insert(&mut self, hash: blake3::Hash, location: ExtentLocation) {
         self.inner.insert(hash, location);
+        self.deltas.remove(&hash);
     }
 
     /// Insert `location` only if `hash` is not already present.
@@ -429,6 +440,37 @@ impl ExtentIndex {
     pub fn remove(&mut self, hash: &blake3::Hash) {
         self.inner.remove(hash);
         self.deltas.remove(hash);
+    }
+
+    /// Remove the entry for `hash` from whichever map (`inner` or
+    /// `deltas`) currently owns it under `expected_segment_id`. Entries
+    /// pointing at any other segment are left alone. Returns `true` if
+    /// any removal happened.
+    ///
+    /// Use this for the apply-phase cleanup pattern "drop the body
+    /// reference for an input segment that's about to be deleted" —
+    /// `lookup`-then-`remove` only checks `inner`, so a Delta-canonical
+    /// hash is left dangling. This helper covers both maps with a single
+    /// CAS gate per map.
+    pub fn remove_owner_at(&mut self, hash: &blake3::Hash, expected_segment_id: Ulid) -> bool {
+        let mut removed = false;
+        if self
+            .inner
+            .get(hash)
+            .is_some_and(|loc| loc.segment_id == expected_segment_id)
+        {
+            self.inner.remove(hash);
+            removed = true;
+        }
+        if self
+            .deltas
+            .get(hash)
+            .is_some_and(|loc| loc.segment_id == expected_segment_id)
+        {
+            self.deltas.remove(hash);
+            removed = true;
+        }
+        removed
     }
 
     /// Compare-and-remove: drop the entry for `hash` only if the current

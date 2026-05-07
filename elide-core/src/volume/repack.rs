@@ -314,11 +314,9 @@ impl Volume {
                     if carried_hashes.contains(hash) {
                         continue;
                     }
-                    if index
-                        .lookup(hash)
-                        .is_some_and(|loc| loc.segment_id == seg.input_ulid)
-                    {
-                        index.remove(hash);
+                    // `remove_owner_at` covers both `inner` and `deltas`
+                    // — `lookup` alone misses Delta-canonical hashes.
+                    if index.remove_owner_at(hash, seg.input_ulid) {
                         stats.extents_removed += 1;
                     }
                 }
@@ -730,11 +728,9 @@ impl Volume {
                 if carried_hashes.contains(hash) {
                     continue;
                 }
-                if index
-                    .lookup(hash)
-                    .is_some_and(|loc| loc.segment_id == input.seg_ulid)
-                {
-                    index.remove(hash);
+                // `remove_owner_at` covers both `inner` and `deltas` —
+                // `lookup` alone misses Delta-canonical hashes.
+                if index.remove_owner_at(hash, input.seg_ulid) {
                     stats.extents_removed += 1;
                 }
             }

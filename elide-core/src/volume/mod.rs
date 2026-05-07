@@ -1012,10 +1012,16 @@ impl Volume {
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
         for (hash, _kind, input_ulid) in &input_old_entries {
+            // Check both `inner` and `deltas` — a Delta entry sits in
+            // `extent_index.deltas` and would be missed by `lookup` alone.
             let still_at_input = self
                 .extent_index
                 .lookup(hash)
-                .is_some_and(|loc| loc.segment_id == *input_ulid);
+                .is_some_and(|loc| loc.segment_id == *input_ulid)
+                || self
+                    .extent_index
+                    .lookup_delta(hash)
+                    .is_some_and(|loc| loc.segment_id == *input_ulid);
             if !still_at_input {
                 continue;
             }
@@ -1099,13 +1105,13 @@ impl Volume {
         }
 
         for (hash, old_ulid) in &to_remove {
-            if self
-                .extent_index
-                .lookup(hash)
-                .is_some_and(|loc| loc.segment_id == *old_ulid)
-            {
-                Arc::make_mut(&mut self.extent_index).remove(hash);
-            }
+            // `remove_owner_at` covers both `inner` and `deltas`. Plain
+            // `lookup` only checks `inner`, so a Delta-canonical hash
+            // would be left dangling — phantom entry pointing at a
+            // deleted input segment. Caught by
+            // `assert_extent_index_consistent` on
+            // `gc_delta_partial_death_compaction`.
+            Arc::make_mut(&mut self.extent_index).remove_owner_at(hash, *old_ulid);
         }
 
         let pending_dir = self.base_dir.join("pending");

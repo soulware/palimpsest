@@ -1949,7 +1949,12 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     } = materialised;
 
     // Collect body-owning entries from each input's `.idx` for the apply
-    // phase's to-remove / stale-cancel derivation.
+    // phase's to-remove / stale-cancel derivation. Includes `Delta`
+    // alongside `has_body_bytes()` (Data/Inline/Canonical*) — a Delta
+    // entry doesn't carry body *bytes* but it does claim the
+    // `extent_index.deltas` slot for its hash, and that slot needs the
+    // same to_remove cleanup as the inner-map entries when the input
+    // segment is consumed.
     let mut input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)> = Vec::new();
     for input_ulid in &inputs {
         let idx_path = index_dir.join(format!("{input_ulid}.idx"));
@@ -1960,7 +1965,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         };
         let (_, old_entries, _) = parsed;
         for e in &old_entries {
-            if e.kind.has_body_bytes() {
+            if e.kind.has_body_bytes() || e.kind == segment::EntryKind::Delta {
                 input_old_entries.push((e.hash, e.kind, *input_ulid));
             }
         }

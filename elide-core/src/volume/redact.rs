@@ -168,12 +168,9 @@ impl Volume {
 
                 let index = Arc::make_mut(&mut self.extent_index);
                 for hash in &to_remove {
-                    if index
-                        .lookup(hash)
-                        .is_some_and(|loc| loc.segment_id == input_ulid)
-                    {
-                        index.remove(hash);
-                    }
+                    // `remove_owner_at` covers both `inner` and `deltas`
+                    // — `lookup` alone misses Delta-canonical hashes.
+                    index.remove_owner_at(hash, input_ulid);
                 }
                 for e in &out_entries {
                     // DedupRef and Zero entries don't own a body. DedupRef
