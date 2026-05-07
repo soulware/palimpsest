@@ -1206,7 +1206,11 @@ impl Volume {
             .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
             .collect();
         chain.push((self.base_dir.clone(), None));
-        let mut fresh = match lbamap::rebuild_segments(&chain) {
+        // Use the unverified rebuild — the signature verify is the dominant
+        // per-segment cost and we don't need it for an in-memory consistency
+        // check (signatures were already verified at Volume::open time, and
+        // on-disk segments are immutable after creation).
+        let mut fresh = match lbamap::rebuild_segments_unverified(&chain) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("assert_lbamap_consistent[{caller}]: rebuild failed: {e}");
