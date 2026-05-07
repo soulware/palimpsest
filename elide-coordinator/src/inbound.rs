@@ -2592,6 +2592,13 @@ fn issue_credentials(
     let creds = issuer
         .issue(volume_ulid)
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
+    info!(
+        target: "creds::issuance",
+        volume_ulid = %volume_ulid,
+        peer_pid,
+        expiry_unix = creds.expiry_unix,
+        "issued S3 credentials to volume",
+    );
     Ok(StoreCredsReply {
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,

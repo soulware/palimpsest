@@ -204,6 +204,16 @@ fn spawn_volume(
     let mut cmd = Command::new(elide_coordinator::bins::elide_bin());
     cmd.arg("serve-volume").arg(fork_dir);
 
+    // Scrub the coordinator's S3 secrets from the spawned volume's env.
+    // Volumes obtain credentials over the macaroon-authenticated IPC
+    // handshake (`Register` + `Credentials`); inheriting the
+    // coordinator's unscoped key via fork() would defeat per-volume
+    // scoping the moment per-volume IAM lands, and is unnecessary
+    // today.
+    cmd.env_remove("AWS_ACCESS_KEY_ID");
+    cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+    cmd.env_remove("AWS_SESSION_TOKEN");
+
     for (k, v) in child_env {
         cmd.env(k, v);
     }

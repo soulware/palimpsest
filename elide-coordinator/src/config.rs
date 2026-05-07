@@ -191,16 +191,19 @@ impl Default for StoreSection {
 }
 
 impl StoreSection {
-    /// Env vars to export into spawned volume subprocesses so the volume's
-    /// fetcher picks up the same store config as the coordinator without
-    /// requiring the operator to also set env vars on the parent shell or
-    /// drop a `fetch.toml` into every volume directory.
+    /// Non-secret store-locator env vars to export into spawned volume
+    /// subprocesses so the volume's fetcher picks up the same store
+    /// config as the coordinator without requiring the operator to also
+    /// set env vars on the parent shell or drop a `fetch.toml` into
+    /// every volume directory.
     ///
-    /// Only the non-secret settings are exported — access keys still come
-    /// from the coordinator's own env (`AWS_ACCESS_KEY_ID` /
-    /// `AWS_SECRET_ACCESS_KEY`) and are inherited by the subprocess. Local
-    /// store mode returns an empty list; the volume's fallback to
-    /// `./elide_store` handles that case.
+    /// Secrets are not in this list — and the coordinator scrubs
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+    /// `AWS_SESSION_TOKEN` from the inherited env at spawn
+    /// (`supervisor::spawn_volume`). Volumes obtain credentials over
+    /// the macaroon-authenticated IPC handshake. Local store mode
+    /// returns an empty list; the volume's fallback to `./elide_store`
+    /// handles that case.
     pub fn child_env(&self) -> Vec<(&'static str, String)> {
         let mut env = Vec::new();
         if let Some(bucket) = &self.bucket {

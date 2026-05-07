@@ -1965,9 +1965,44 @@ fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchIn
             return Ok(inputs);
         }
     }
+    let fetch_config = elide_fetch::FetchConfig::load(fork_dir)?;
+    // Standalone fallback (no coordinator): if the resolved config is
+    // S3 mode, source credentials directly from this process's env
+    // once at startup. The volume binary itself never reads `AWS_*`
+    // anywhere else. No re-issue path — these creds live for the life
+    // of the process.
+    let creds = match fetch_config.as_ref() {
+        Some(cfg) if cfg.bucket.is_some() => Some(s3_creds_from_env()?),
+        _ => None,
+    };
     Ok(VolumeFetchInputs {
-        fetch_config: elide_fetch::FetchConfig::load(fork_dir)?,
+        fetch_config,
+        creds,
+        reissue: None,
         peer_endpoint: None,
+    })
+}
+
+/// Read S3 credentials from the volume process's own env. Used only
+/// in the standalone (no-coordinator) path of
+/// [`resolve_volume_fetch_config`]; the coordinator-spawned path
+/// receives creds over IPC and never touches env.
+fn s3_creds_from_env() -> std::io::Result<elide_fetch::S3Credentials> {
+    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
+        std::io::Error::other(
+            "S3 fetch config but AWS_ACCESS_KEY_ID is unset; \
+             set it (and AWS_SECRET_ACCESS_KEY) or run under a coordinator",
+        )
+    })?;
+    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .map_err(|_| std::io::Error::other("S3 fetch config but AWS_SECRET_ACCESS_KEY is unset"))?;
+    let session_token = std::env::var("AWS_SESSION_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    Ok(elide_fetch::S3Credentials {
+        access_key_id,
+        secret_access_key,
+        session_token,
     })
 }
 
@@ -2009,6 +2044,8 @@ fn fetch_config_via_coordinator_macaroon(
                 local_path: Some(path),
                 fetch_batch_bytes: None,
             }),
+            creds: None,
+            reissue: None,
             peer_endpoint: None,
         }));
     }
@@ -2018,18 +2055,15 @@ fn fetch_config_via_coordinator_macaroon(
         ));
     };
     let registered = coord.register_and_get_creds(volume_ulid)?;
-    // SAFETY: serve-volume startup is single-threaded at this point — no
-    // background tasks have been spawned, so there are no concurrent env
-    // readers.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", &registered.creds.access_key_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &registered.creds.secret_access_key);
-        if let Some(tok) = &registered.creds.session_token {
-            std::env::set_var("AWS_SESSION_TOKEN", tok);
-        } else {
-            std::env::remove_var("AWS_SESSION_TOKEN");
-        }
-    }
+    let creds = elide_fetch::S3Credentials {
+        access_key_id: registered.creds.access_key_id,
+        secret_access_key: registered.creds.secret_access_key,
+        session_token: registered.creds.session_token,
+    };
+    let reissue = elide::CredsReissue {
+        coordinator_socket: coord.socket_path().to_path_buf(),
+        macaroon: registered.macaroon,
+    };
     Ok(Some(VolumeFetchInputs {
         fetch_config: Some(elide_fetch::FetchConfig {
             bucket: Some(bucket),
@@ -2038,6 +2072,8 @@ fn fetch_config_via_coordinator_macaroon(
             local_path: None,
             fetch_batch_bytes: None,
         }),
+        creds: Some(creds),
+        reissue: Some(reissue),
         peer_endpoint: registered.peer_endpoint,
     }))
 }

@@ -20,6 +20,7 @@ use tracing::warn;
 
 /// Credentials issued to a volume in response to an authenticated
 /// `credentials` request.
+#[derive(Clone)]
 pub struct IssuedCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -44,7 +45,15 @@ pub trait CredentialIssuer: Send + Sync {
 /// the "S3-compatible without STS or per-key IAM" row of the design doc
 /// and is the minimum viable issuer — per-volume backends slot in behind
 /// the same trait without changing the IPC handshake.
-pub struct SharedKeyPassthrough;
+///
+/// Reads `AWS_*` from env on the first `issue()` call and caches the
+/// result. Local-store coordinators never reach this code path
+/// (volumes skip the macaroon handshake when the store config is
+/// local), so deferring the env read until first call keeps that
+/// case error-free without a separate startup-time check.
+pub struct SharedKeyPassthrough {
+    cached: OnceLock<IssuedCredentials>,
+}
 
 impl SharedKeyPassthrough {
     pub fn new_with_warning() -> Self {
@@ -52,12 +61,17 @@ impl SharedKeyPassthrough {
             "[coordinator] credential issuer: shared-key passthrough \
              (downgrade mode — same key vended to every volume; no per-volume IAM scoping)"
         );
-        Self
+        Self {
+            cached: OnceLock::new(),
+        }
     }
 }
 
 impl CredentialIssuer for SharedKeyPassthrough {
     fn issue(&self, _volume_id: &str) -> io::Result<IssuedCredentials> {
+        if let Some(c) = self.cached.get() {
+            return Ok(c.clone());
+        }
         let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
             .ok()
             .filter(|s| !s.is_empty())
@@ -69,12 +83,16 @@ impl CredentialIssuer for SharedKeyPassthrough {
         let session_token = std::env::var("AWS_SESSION_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
-        Ok(IssuedCredentials {
+        let creds = IssuedCredentials {
             access_key_id,
             secret_access_key,
             session_token,
             expiry_unix: None,
-        })
+        };
+        // Race-tolerant: if a concurrent caller already populated the
+        // cell, our value is dropped and we return theirs. Env reads
+        // are idempotent so the wasted computation is harmless.
+        Ok(self.cached.get_or_init(|| creds).clone())
     }
 }
 
