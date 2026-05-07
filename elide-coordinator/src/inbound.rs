@@ -342,7 +342,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Remove { volume, force } => {
-            let result = remove_volume(&volume, force, &ctx.data_dir);
+            let result = remove_volume(&volume, force, &ctx.data_dir).await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -980,7 +980,7 @@ async fn volume_events_typed(
 ///
 /// `force = true` skips the second check, accepting that any local-only
 /// pending segments or unflushed WAL records will be discarded.
-fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Result<(), IpcError> {
+async fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Result<(), IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return Err(IpcError::not_found(format!(
@@ -1004,14 +1004,37 @@ fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Result<(), 
         )));
     }
 
+    // Capture any bound ublk dev_id before removing the volume directory.
+    // The daemon is already stopped (STOPPED_FILE check above), so the
+    // kernel device is QUIESCED and ready for del_dev. Leaving it in
+    // place would orphan a kernel device whose stamped owner points at
+    // a now-deleted vol_dir.
+    let teardown_id: Option<i32> = bound_ublk_id(&vol_dir);
+
     import::kill_all_for_volume(&vol_dir);
 
     let _ = std::fs::remove_file(&link);
 
     std::fs::remove_dir_all(&vol_dir)
         .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
+
+    if let Some(id) = teardown_id {
+        crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
+    }
+
     info!("[inbound] removed volume {volume_name}");
     Ok(())
+}
+
+/// Read the bound ublk `dev_id` from `vol_dir/volume.toml`, if any.
+///
+/// Returns `None` when the config is missing/unreadable, has no `[ublk]`
+/// section, or the section has no `dev_id` (volume was never started, so
+/// there's no kernel device to tear down).
+fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
+    elide_core::config::VolumeConfig::read(vol_dir)
+        .ok()
+        .and_then(|cfg| cfg.ublk.and_then(|u| u.dev_id))
 }
 
 /// Returns a human-readable reason if the fork has on-disk state that
@@ -3898,4 +3921,141 @@ mod tests {
     }
 
     // skip_empty_intermediates tests now live in crate::claim::tests.
+
+    // ── bound_ublk_id / remove_volume ─────────────────────────────────────
+
+    /// Build `data_dir/{by_id/<ulid>, by_name/<name>}` for a removable
+    /// volume. Optionally writes `[ublk] dev_id` and the STOPPED_FILE
+    /// marker. Returns `(vol_dir, by_name_link)`.
+    fn setup_removable_volume(
+        data_dir: &Path,
+        name: &str,
+        vol_ulid: &str,
+        ublk_dev_id: Option<i32>,
+        stopped: bool,
+    ) -> (PathBuf, PathBuf) {
+        let vol_dir = data_dir.join("by_id").join(vol_ulid);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some(name.to_owned()),
+            size: Some(SAMPLE_SIZE),
+            nbd: None,
+            ublk: ublk_dev_id.map(|id| elide_core::config::UblkConfig { dev_id: Some(id) }),
+            lazy: None,
+        }
+        .write(&vol_dir)
+        .unwrap();
+        if stopped {
+            std::fs::write(vol_dir.join(STOPPED_FILE), "").unwrap();
+        }
+        let by_name = data_dir.join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        let link = by_name.join(name);
+        std::os::unix::fs::symlink(&vol_dir, &link).unwrap();
+        (vol_dir, link)
+    }
+
+    #[test]
+    fn bound_ublk_id_missing_config_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(bound_ublk_id(tmp.path()), None);
+    }
+
+    #[test]
+    fn bound_ublk_id_no_ublk_section_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        elide_core::config::VolumeConfig {
+            size: Some(SAMPLE_SIZE),
+            ..Default::default()
+        }
+        .write(tmp.path())
+        .unwrap();
+        assert_eq!(bound_ublk_id(tmp.path()), None);
+    }
+
+    #[test]
+    fn bound_ublk_id_section_without_dev_id_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        elide_core::config::VolumeConfig {
+            size: Some(SAMPLE_SIZE),
+            ublk: Some(elide_core::config::UblkConfig { dev_id: None }),
+            ..Default::default()
+        }
+        .write(tmp.path())
+        .unwrap();
+        assert_eq!(bound_ublk_id(tmp.path()), None);
+    }
+
+    #[test]
+    fn bound_ublk_id_returns_dev_id() {
+        let tmp = TempDir::new().unwrap();
+        elide_core::config::VolumeConfig {
+            size: Some(SAMPLE_SIZE),
+            ublk: Some(elide_core::config::UblkConfig { dev_id: Some(7) }),
+            ..Default::default()
+        }
+        .write(tmp.path())
+        .unwrap();
+        assert_eq!(bound_ublk_id(tmp.path()), Some(7));
+    }
+
+    #[tokio::test]
+    async fn remove_volume_without_ublk_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let (vol_dir, link) =
+            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAA", None, true);
+        remove_volume("vol", false, tmp.path()).await.unwrap();
+        assert!(!vol_dir.exists(), "by_id dir should be removed");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "by_name link should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_volume_with_ublk_dev_id_succeeds() {
+        // teardown_bound_device best-effort logs a warn when the kernel
+        // device doesn't exist; remove_volume must still succeed and
+        // clean up local state. Verifies the cfg is read *before*
+        // remove_dir_all runs (otherwise read would fail and we'd still
+        // be in this branch — but the dir wouldn't be gone).
+        let tmp = TempDir::new().unwrap();
+        let (vol_dir, link) = setup_removable_volume(
+            tmp.path(),
+            "vol",
+            "01JQAAAAAAAAAAAAAAAAAAAAAB",
+            Some(99),
+            true,
+        );
+        remove_volume("vol", false, tmp.path()).await.unwrap();
+        assert!(!vol_dir.exists());
+        assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_volume_rejects_running() {
+        let tmp = TempDir::new().unwrap();
+        let (vol_dir, _link) = setup_removable_volume(
+            tmp.path(),
+            "vol",
+            "01JQAAAAAAAAAAAAAAAAAAAAAC",
+            Some(5),
+            false, // no STOPPED_FILE
+        );
+        let err = remove_volume("vol", false, tmp.path())
+            .await
+            .expect_err("running volume should be rejected");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(vol_dir.exists(), "dir must be preserved on conflict");
+    }
+
+    #[tokio::test]
+    async fn remove_volume_unknown_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
+        let err = remove_volume("ghost", false, tmp.path())
+            .await
+            .expect_err("absent volume should be NotFound");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+    }
 }
