@@ -14,7 +14,7 @@
 //! Every failure path collapses to `None` — the prefetch loop falls
 //! through to S3 silently. The discovery flow adds zero new state,
 //! introduces no new artifacts, and is best-effort by design (per
-//! `docs/design-peer-segment-fetch.md` § "Discovery").
+//! `docs/notes/design-peer-segment-fetch.md` § "Discovery").
 //!
 //! Importantly, `force_released` is **not** a valid handoff signal:
 //! the emitter of a `force_released` event is the *recovering*

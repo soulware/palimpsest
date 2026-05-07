@@ -4,59 +4,26 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 
 ## Documentation
 
+Start with [docs/quickstart.md](docs/quickstart.md), then [docs/overview.md](docs/overview.md).
+
 | Document | Contents |
 |---|---|
 | [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, branch a writable replica, and serve it over NBD |
 | [docs/quickstart-data-volume.md](docs/quickstart-data-volume.md) | Create an empty data volume, mount from a Lima VM, write data, upload segments |
 | [docs/quickstart-tigris.md](docs/quickstart-tigris.md) | Run against a real S3-compatible backend (Tigris); covers AWS S3, MinIO, R2, etc. |
 | [docs/overview.md](docs/overview.md) | Problem statement, key concepts, operation modes, empirical findings |
-| [docs/findings.md](docs/findings.md) | Empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification |
 | [docs/architecture.md](docs/architecture.md) | System architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots |
-| [docs/formats.md](docs/formats.md) | WAL format, segment file format (header + index + inline + body + delta), S3 retrieval strategies |
+| [docs/formats.md](docs/formats.md) | WAL format, segment file format, S3 retrieval strategies |
 | [docs/operations.md](docs/operations.md) | GC, repacking, boot hints, filesystem metadata awareness |
+| [docs/findings.md](docs/findings.md) | Empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification |
 | [docs/testing.md](docs/testing.md) | Property-based tests: ULID monotonicity and crash-recovery oracle |
-| [docs/reference.md](docs/reference.md) | Implementation notes, open questions, and index of prior art docs |
-| [docs/reference-lsvd.md](docs/reference-lsvd.md) | lab47/lsvd design decisions and comparison to Elide |
-| [docs/reference-nydus.md](docs/reference-nydus.md) | nydus-snapshotter: lazy loading, RAFS format, NRI optimizer, boot hints |
+| [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes |
 | [docs/vm-boot.md](docs/vm-boot.md) | Booting a VM from an Elide volume with QEMU direct kernel boot |
-| [docs/design-gc-ulid-ordering.md](docs/design-gc-ulid-ordering.md) | Open design: GC ULID ordering race, single-mint invariant, proptest findings |
-| [docs/design-gc-overlap-correctness.md](docs/design-gc-overlap-correctness.md) | Design: GC skips partial-LBA-death entries to avoid shadow/loss on rebuild when multi-LBA entries have been partially overwritten |
-| [docs/design-gc-partial-death-compaction.md](docs/design-gc-partial-death-compaction.md) | Design: decouple composite body from surviving sub-runs of partial-LBA-death entries so normal GC can subsequently reclaim each piece independently |
-| [docs/design-gc-plan-handoff.md](docs/design-gc-plan-handoff.md) | Design: coordinator emits a plaintext plan; volume materialises bodies via BlockReader and signs the output — single source of truth for body resolution |
-| [docs/design-delta-compression.md](docs/design-delta-compression.md) | Design: delta compression via file-path matching, file-aware import, snapshot filemaps |
-| [docs/design-delta-materialisation.md](docs/design-delta-materialisation.md) | Proposed: local-only `cache/<ULID>.dmat` sidecar caches lz4-compressed materialised delta-entry bytes after first read; WAL-shaped append-only with hash-verified tail recovery |
-| [docs/design-replica-model.md](docs/design-replica-model.md) | Proposed: replica-based model for forks and recovery; retires `volume fork`, adds `volume materialize`, frames snapshot cadence as a retention SLA |
-| [docs/design-portable-live-volume.md](docs/design-portable-live-volume.md) | Accepted: named volumes become portable across hosts; each `volume start` is a fresh fork inheriting from the previous tail, so each ownership episode has its own ULID and signing key. The only shared mutable thing is `names/<name>` |
-| [docs/design-volume-size-ownership.md](docs/design-volume-size-ownership.md) | Implemented: `size` lives on the `names/<name>` claim record (single owner, CAS-protected, signed in event log), not on the unsigned `manifest.toml`. Ancestors carry no size; resize is a CAS + `UBLK_U_CMD_UPDATE_SIZE` (Linux 6.16+) |
-| [docs/design-manifest-toml-removal.md](docs/design-manifest-toml-removal.md) | Implemented: dropped `manifest.toml` entirely. `name` / `readonly` / `origin` were redundant with existing surfaces; OCI `source` migrated onto signed `volume.provenance` as `oci_source`. Fresh-bucket-only |
-| [docs/design-volume-event-log.md](docs/design-volume-event-log.md) | Proposed: per-name append-only event log under `events/<name>/<ulid>.toml` recording lifecycle transitions (claim, release, force-release, start/stop, fork, rename). Pointer stays canonical for "now"; log is canonical for "ever". Includes a rename design that ties two name logs together without copying history |
-| [docs/design-force-release-fencing.md](docs/design-force-release-fencing.md) | Proposed: split-brain safety for `volume release --force`. Previous owner pulls the synthesised handoff snapshot to its local snapshots dir on observing displacement; the existing snapshot-floor rule (extended to the reaper) pins B's set automatically |
-| [docs/design-consistency-surface.md](docs/design-consistency-surface.md) | Exploration: which Elide operations require strong consistency vs. which tolerate eventual; failure-mode walkthrough; sketch of a two-bucket split (small strongly-consistent coordination bucket, large eventually-consistent data bucket) |
-| [docs/portable-live-volume-plan.md](docs/portable-live-volume-plan.md) | Plan: phased implementation of portable live volumes (foundations → schema → lifecycle verbs → `release --force` recovery → CLI unification → tests/docs). Fresh-bucket-only; clean break for `volume remote` |
-| [docs/design-tigris-native.md](docs/design-tigris-native.md) | Exploration: what Elide looks like if designed Tigris-native (bucket snapshots, forks, versioning as first-class primitives) rather than as a portable S3 consumer |
-| [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes — architecture, sequencing, open work |
-| [docs/design-oci-export.md](docs/design-oci-export.md) | Exploration: squashed OCI export, dual publish via referrers, elide-snapshotter for containerd |
-| [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |
-| [docs/promote-offload-plan.md](docs/promote-offload-plan.md) | Plan: offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
-| [docs/promote-segment-offload-plan.md](docs/promote-segment-offload-plan.md) | Plan: offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
-| [docs/design-ublk-transport.md](docs/design-ublk-transport.md) | Design: ublk as preferred host-local transport alongside NBD — multi-queue async handler, USER_RECOVERY_REISSUE crash recovery, phased rollout (steps 1–3 landed, 4–5 open) |
-| [docs/design-ublk-shutdown-park.md](docs/design-ublk-shutdown-park.md) | Design (proposed): shutdown leaves ublk device QUIESCED for recovery; deletion becomes an explicit verb. Makes `stop → start` reliable while a filesystem is still mounted |
-| [docs/design-peer-segment-fetch.md](docs/design-peer-segment-fetch.md) | Exploration: opportunistic LAN peer-fetch tier in front of S3 for index/body bytes. Targets cross-host handoff (release → claim) and large-fleet image pull. URL space mirrors S3 paths; auth mirrors per-volume IAM prefix scope. |
-| [docs/peer-segment-fetch-v1-plan.md](docs/peer-segment-fetch-v1-plan.md) | Plan: v1 implementation of peer-fetch — `.idx`-only, coordinator-driven, opt-in via coordinator config. New `elide-peer-fetch` crate. Decision criteria for whether to extend to body fetch. |
 
-## Status updates
-
-Dated waypoints — each file summarises major changes, bug fixes, and
-remaining work relative to the previous status.  Latest first.
-
-| Date | Document |
-|---|---|
-| 2026-04-27 | [docs/status-2026-04-27.md](docs/status-2026-04-27.md) |
-| 2026-04-20 | [docs/status-2026-04-20.md](docs/status-2026-04-20.md) |
-| 2026-04-09 | [docs/status-2026-04-09.md](docs/status-2026-04-09.md) |
-| 2026-03-30 | [docs/status-2026-03-30.md](docs/status-2026-03-30.md) |
-
-Start with [docs/overview.md](docs/overview.md).
+`docs/notes/` holds design discussions, implementation plans, and dated status
+snapshots — a working record maintained for LLM context, not human-facing
+documentation. See [docs/notes/INDEX.md](docs/notes/INDEX.md) if you want to
+trace why a particular decision was made.
 
 ## Continuous integration
 

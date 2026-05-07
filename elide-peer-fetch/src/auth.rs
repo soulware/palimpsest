@@ -1,6 +1,6 @@
 //! Five-step verify pipeline for incoming peer-fetch requests.
 //!
-//! See `docs/design-peer-segment-fetch.md` § "Peer verification (v1)"
+//! See `docs/notes/design-peer-segment-fetch.md` § "Peer verification (v1)"
 //! for the full design. Each [`AuthError`] variant corresponds to one
 //! failed check and maps to a specific HTTP status code:
 //!

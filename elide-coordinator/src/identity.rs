@@ -9,8 +9,8 @@
 // **private** key; it is held only in memory and never written to
 // disk.
 //
-// See `docs/design-portable-live-volume.md` § "Coordinator identity"
-// and Phase 1.5 of `docs/portable-live-volume-plan.md`.
+// See `docs/notes/design-portable-live-volume.md` § "Coordinator identity"
+// and Phase 1.5 of `docs/notes/portable-live-volume-plan.md`.
 
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;

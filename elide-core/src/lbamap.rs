@@ -330,7 +330,7 @@ impl LbaMap {
     /// Used by the no-op write skip in `Volume::write`: a match means the
     /// LBA map already records our exact content at the exact range, so
     /// the write can return immediately without touching the WAL, segment
-    /// tree, or extent index. See `docs/design-noop-write-skip.md`.
+    /// tree, or extent index. See `docs/notes/design-noop-write-skip.md`.
     ///
     /// BLAKE3 length folding means a hash match would already imply a
     /// length match *for whole payloads*, but an LBA map entry may be a

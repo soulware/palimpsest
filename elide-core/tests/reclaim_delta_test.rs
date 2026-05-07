@@ -283,7 +283,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
 /// `lba_referenced_hashes` already pins H, so GC cannot drop H's body —
 /// emitting a Delta against H is a strict win (100s of bytes of delta
 /// blob versus a few KB of fresh body), same retention cost either way.
-/// See `docs/design-extent-reclamation.md § Open questions` for the
+/// See `docs/notes/design-extent-reclamation.md § Open questions` for the
 /// cost/benefit breakdown.
 ///
 /// Construction:

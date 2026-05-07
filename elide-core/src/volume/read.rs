@@ -389,7 +389,7 @@ pub(crate) fn read_extents(
 /// resolves via `extent_index.lookup` to a DATA/Inline location. No
 /// caching of decompressed output — each read decompresses fresh.
 /// Materialised bytes are cached in `cache/<ULID>.dmat` after a successful
-/// decompress (see `docs/design-delta-materialisation.md`); subsequent reads
+/// decompress (see `docs/notes/design-delta-materialisation.md`); subsequent reads
 /// of the same Delta entry skip the source-body fetch and the
 /// zstd-dict-decompress and instead read (and lz4-decompress) the cached
 /// bytes directly.

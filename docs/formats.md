@@ -175,7 +175,7 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
      - Delta entries (and their delta body section) were written into the
        file by either elide-import (filemap-matched, at import time) or by
        the post-snapshot delta repack pass that the coordinator runs before
-       drain. See [design-delta-compression.md](design-delta-compression.md).
+       drain. See [design-delta-compression.md](notes/design-delta-compression.md).
 7. Upload the file unmodified.
 8. Volume writes index/<ULID>.idx and cache/<ULID>.{body,present}
    (full body, all bits set); deletes pending/<ULID>.
@@ -417,7 +417,7 @@ Written at import, fork, and create time and uploaded with `volume.pub` so any h
 - `oci_image:` / `oci_digest:` / `oci_arch:` — present together iff this volume is an OCI-imported root. Forks of an imported volume don't inherit them.
 - `sig:` — 64-byte Ed25519 signature over the canonical signing input.
 
-`size` is **not** here — it lives on the `names/<name>` claim record (see [design-volume-size-ownership.md](design-volume-size-ownership.md)). `name` is **not** here either — `names/<name>` is the canonical name→ulid index.
+`size` is **not** here — it lives on the `names/<name>` claim record (see [design-volume-size-ownership.md](notes/design-volume-size-ownership.md)). `name` is **not** here either — `names/<name>` is the canonical name→ulid index.
 
 **Snapshot markers:**
 ```

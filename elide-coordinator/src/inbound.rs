@@ -1466,7 +1466,7 @@ pub(crate) fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
 /// skeleton under `data_dir/by_id/<vol_ulid>/`. Returns the parent ULID
 /// parsed from the (signature-verified) provenance, or `None` if this is a
 /// root volume. Ancestors carry no `volume.toml` and no size: per
-/// `docs/design-volume-size-ownership.md`, size lives only on the live
+/// `docs/notes/design-volume-size-ownership.md`, size lives only on the live
 /// `names/<name>` record.
 ///
 /// `peer` is best-effort: when `Some` and the peer's auth pipeline

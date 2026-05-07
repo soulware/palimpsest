@@ -95,7 +95,7 @@ pub struct ReclaimOutcome {
 /// Per-hash thresholds controlling which hashes the reclamation scanner
 /// proposes as worth rewriting. All defaults are placeholders pending
 /// empirical tuning on real aged volumes — see the open questions in
-/// `docs/design-extent-reclamation.md § Measurement before mechanism`.
+/// `docs/notes/design-extent-reclamation.md § Measurement before mechanism`.
 #[derive(Debug, Clone, Copy)]
 pub struct ReclaimThresholds {
     /// Minimum number of 4K blocks detectably dead inside a hash's stored

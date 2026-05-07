@@ -10,7 +10,7 @@
 // The filemap is written as a side effect of the import walk, using the
 // v2 format (`# elide-filemap v2` with per-fragment lines). This is the
 // only ext4 pass during import — there is no separate filemap
-// generation step. See docs/design-delta-compression.md.
+// generation step. See docs/notes/design-delta-compression.md.
 //
 // For each emitted extent (fragment or single block), the parent extent
 // index is consulted first: if the hash is already present in a parent

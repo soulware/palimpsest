@@ -421,6 +421,6 @@ operators race over the same name.
 - [`design-tigris-native.md`](design-tigris-native.md) — the
   Tigris-native exploration; this document is its consistency
   counterpart.
-- [`architecture.md`](architecture.md) §"S3 credential distribution
+- [`architecture.md`](../architecture.md) §"S3 credential distribution
   via macaroons" — credential issuance, which a two-bucket split
   would extend.

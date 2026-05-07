@@ -8,7 +8,7 @@
 //! flavours have distinct domain tags, distinct wire encodings, and
 //! distinct verify pipelines on the server side.
 //!
-//! See `docs/design-peer-segment-fetch.md` § "Body fetch (deferred —
+//! See `docs/notes/design-peer-segment-fetch.md` § "Body fetch (deferred —
 //! not v1)" for the v1.1 single-signer rationale.
 
 use std::time::{SystemTime, UNIX_EPOCH};

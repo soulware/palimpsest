@@ -4,7 +4,7 @@
 //! `names/<name>` and translates the underlying conditional-PUT
 //! mechanics into operator-level errors.
 //!
-//! See `docs/design-portable-live-volume.md`. Phase 2 of the rollout
+//! See `docs/notes/design-portable-live-volume.md`. Phase 2 of the rollout
 //! lands `mark_stopped` here; subsequent phases add `mark_released`
 //! (release verb) and `claim_started_from_released` (the start verb's
 //! claim path).

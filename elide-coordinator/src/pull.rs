@@ -11,7 +11,7 @@
 //     index/                   — empty, populated by `prefetch_indexes`
 //
 // Ancestors carry no `volume.toml` and no size: per
-// `docs/design-volume-size-ownership.md` size lives only on
+// `docs/notes/design-volume-size-ownership.md` size lives only on
 // `names/<name>` for the live volume, and ancestors are read-only segment
 // containers reached through a child's LBA map.
 //
@@ -21,7 +21,7 @@
 //
 // Each of the two GETs (`volume.pub`, `volume.provenance`) is tried at
 // the peer first when a [`PeerFetchContext`] is available, then falls
-// through to S3 on any peer miss. See `docs/design-peer-segment-fetch.md`
+// through to S3 on any peer miss. See `docs/notes/design-peer-segment-fetch.md`
 // § "What's served" for the wire shape.
 
 use std::path::{Path, PathBuf};

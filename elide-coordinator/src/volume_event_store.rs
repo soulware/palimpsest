@@ -5,7 +5,7 @@
 //! separate top-level prefix so the pointer key and the event
 //! prefix never collide on the same parent — `aws s3 ls names/`
 //! lists names and nothing else; `aws s3 ls events/` lists logs.
-//! See `docs/design-volume-event-log.md`.
+//! See `docs/notes/design-volume-event-log.md`.
 //!
 //! Keys: `events/<name>/<event_ulid>.toml`. Each object is written
 //! exactly once via `If-None-Match: *` — duplicate ULIDs would be

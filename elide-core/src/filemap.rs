@@ -8,7 +8,7 @@
 //
 // One row per file fragment. A contiguous file is a single row with
 // file_offset = 0. A fragmented file has multiple rows with ascending
-// file_offset. See docs/design-delta-compression.md §"Snapshot filemap".
+// file_offset. See docs/notes/design-delta-compression.md §"Snapshot filemap".
 
 use std::collections::BTreeMap;
 use std::fs;

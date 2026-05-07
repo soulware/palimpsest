@@ -5,7 +5,7 @@
 //! without aborting the test), writing a pattern, signalling the daemon,
 //! respawning, and reading the pattern back.
 //!
-//! Under shutdown-park (docs/design-ublk-shutdown-park.md) graceful
+//! Under shutdown-park (docs/notes/design-ublk-shutdown-park.md) graceful
 //! SIGTERM and SIGKILL converge on the same kernel state: the daemon
 //! exits without calling STOP_DEV, the kernel's monitor work observes
 //! the io_uring fds close, and with `UBLK_F_USER_RECOVERY` set the

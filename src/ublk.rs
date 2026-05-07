@@ -54,7 +54,7 @@
 //! Deletion is an explicit verb: `elide ublk delete <id>`, or the
 //! coordinator's startup reconciliation sweep (which deletes orphan
 //! kernel devices and clears bindings whose sysfs entry has gone, e.g.
-//! after a host reboot). See `docs/design-ublk-shutdown-park.md`.
+//! after a host reboot). See `docs/notes/design-ublk-shutdown-park.md`.
 //!
 //! **Volume ↔ device binding.** Two sources of state co-operate:
 //!   * `volume.toml` `[ublk] dev_id` — local hint, written by the
@@ -75,7 +75,7 @@
 //! present + owner verified) or ADD (no live device at the bound id).
 //!
 //! Zero-copy (`UBLK_F_AUTO_BUF_REG`) is a follow-up step. See
-//! docs/design-ublk-transport.md.
+//! docs/notes/design-ublk-transport.md.
 //!
 //! On non-Linux targets, and on Linux without the `ublk` cargo feature, this
 //! module compiles to a stub that errors when the transport is invoked.
@@ -596,7 +596,7 @@ mod imp {
         // process directly — STOP_DEV/del_dev are deliberately not used,
         // so the kernel's daemon-exit detection parks the device in
         // QUIESCED for the next serve to recover. See
-        // `docs/design-ublk-shutdown-park.md`.
+        // `docs/notes/design-ublk-shutdown-park.md`.
         let _sig_watcher = spawn_ublk_signal_watcher(client.clone(), peer_counters)?;
 
         let persisted_id = elide_core::config::VolumeConfig::bound_ublk_id(dir)
@@ -1678,7 +1678,7 @@ mod imp {
 ///
 /// Step-2b: multi-queue (up to 4) at queue_depth = 64 with an async per-tag
 /// handler and a per-queue worker pool. `dev_id = None` lets the kernel
-/// auto-allocate. See docs/design-ublk-transport.md.
+/// auto-allocate. See docs/notes/design-ublk-transport.md.
 pub fn run_volume_ublk(
     dir: &Path,
     size_bytes: u64,

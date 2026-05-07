@@ -1,8 +1,8 @@
 //! Opportunistic LAN peer-fetch tier in front of S3 for Elide segment data.
 //!
 //! v1 scope is `.idx` + `.prefetch` fetch only; peer body fetch is
-//! deferred. See `docs/design-peer-segment-fetch.md` and
-//! `docs/peer-segment-fetch-v1-plan.md` for the design and plan.
+//! deferred. See `docs/notes/design-peer-segment-fetch.md` and
+//! `docs/notes/peer-segment-fetch-v1-plan.md` for the design and plan.
 //!
 //! This crate contains:
 //!

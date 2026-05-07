@@ -55,7 +55,9 @@ These rules apply to all Rust code in this project. Follow them without needing 
 
 ## Documentation
 
-Design documentation is indexed in `README.md` and lives in `docs/`.
+Two tiers, separated by audience:
+
+**Synthesis docs at `docs/` top level — current truth, kept tight.** README links these.
 
 - `docs/overview.md` — problem statement, key concepts, operation modes, empirical findings
 - `docs/findings.md` — empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification
@@ -63,7 +65,40 @@ Design documentation is indexed in `README.md` and lives in `docs/`.
 - `docs/formats.md` — WAL format, segment file format, S3 retrieval strategies
 - `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
 - `docs/testing.md` — property-based tests: ULID monotonicity invariant, crash-recovery oracle, simulation model
-- `docs/reference.md` — lsvd reference comparison, implementation notes, open questions
+- `docs/integrations.md` — Docker, Firecracker, Cloud Hypervisor, Kubernetes integration targets
+
+**Working record at `docs/notes/` — LLM-targeted, indexed in [`docs/notes/INDEX.md`](docs/notes/INDEX.md).**
+
+- Design discussions (`design-*.md`), implementation plans (`*-plan.md`), dated status snapshots (`status-YYYY-MM-DD.md`), prior-art notes (`reference-*.md`).
+- New designs and plans go here, not at `docs/` top level. README does **not** index this directory.
+- Consult `docs/notes/INDEX.md` before proposing changes in areas that have prior design discussion.
+
+### Rules for synthesis docs
+
+These apply to `docs/architecture.md`, `docs/formats.md`, `docs/operations.md`, `docs/testing.md`, `docs/findings.md`, `docs/overview.md`, `docs/integrations.md`.
+
+**Edit, don't append.** When a PR touches a synthesis doc, the default is to edit existing prose — replace stale text, tighten, relocate detail to `docs/notes/`. Pure additions need explicit justification; the failure mode is unbounded accretion.
+
+**Detail belongs in `docs/notes/`, not in synthesis docs.** Synthesis docs explain *what* the system does and *why*, at summary level. Mechanical detail, algorithmic walkthroughs, and decision rationale belong in a `design-*.md` under `docs/notes/`. If a section is growing past summary level, move detail out and link to it.
+
+**Retire-on-land.** When a feature lands and updates a synthesis doc, the corresponding `design-*.md` gets a `landed: true` (and `landed_in: <synthesis-section>`) frontmatter line and stops being maintained. The synthesis doc is canonical; the note becomes history. Two sources of truth is the failure mode.
+
+**Soft length budgets.** Targets, not hard limits — exceeding triggers a trim or split, not a block:
+
+- `docs/architecture.md` — 800 lines
+- `docs/formats.md` — 600 lines
+- `docs/operations.md` — 500 lines
+- `docs/testing.md`, `docs/findings.md`, `docs/integrations.md`, `docs/overview.md` — 300 lines each
+
+If a doc has grown past its budget, the next PR touching it should trim or split before adding.
+
+### Rules for `docs/notes/`
+
+**One new doc per substantial PR is fine.** That's the point of the directory — keep the written record. New `design-*.md` and `*-plan.md` are encouraged for non-trivial work. Status docs (`status-YYYY-MM-DD.md`) are point-in-time snapshots: never edit one after its date; write a new one or update synthesis docs.
+
+**Frontmatter convention** (see `docs/notes/INDEX.md` for the schema). Add to new notes; existing notes will be backfilled lazily.
+
+**Don't index `docs/notes/` from `README.md`.** The directory is for Claude. Update `docs/notes/INDEX.md` when adding a new note.
 
 ## References
 

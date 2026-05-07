@@ -27,7 +27,7 @@
 // plus O(1)-per-input tombstone bookkeeping on the apply side.
 //
 // Handoff protocol (plan-based, crash-safe, filesystem-only coordination —
-// see docs/design-gc-plan-handoff.md for the full design):
+// see docs/notes/design-gc-plan-handoff.md for the full design):
 //
 //   1. Coordinator writes a plaintext plan to gc/<new-ulid>.plan via
 //      tmp+rename. The plan lists the transformation for each input's
@@ -138,7 +138,7 @@ pub struct GcStats {
     pub dead_cleaned: usize,
     /// Number of segments held back because they have at least one
     /// partially-LBA-dead body-bearing entry. See
-    /// `docs/design-gc-overlap-correctness.md`.
+    /// `docs/notes/design-gc-overlap-correctness.md`.
     pub deferred: usize,
 }
 
@@ -282,7 +282,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     // and retry next tick, when later writes may re-establish a source.
     // Data/Inline/DedupRef partial death, and Delta with at least one
     // resolvable source, are all handled in-band via `expand_partial_death`.
-    // See `docs/design-gc-partial-death-compaction.md`.
+    // See `docs/notes/design-gc-partial-death-compaction.md`.
     let (deferred, eligible_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
     let deferred_count = deferred.len();
@@ -475,7 +475,7 @@ fn select_bucket(eligible: Vec<SegmentStats>, config: &GcConfig, u_gc: Ulid) -> 
 /// `retention/<gc_output_ulid>` listing the consumed input ULIDs. The
 /// coordinator's reaper deletes those inputs from S3 after the
 /// configured retention window — see `crate::reaper` and
-/// `docs/design-replica-model.md`.
+/// `docs/notes/design-replica-model.md`.
 ///
 /// Returns the number of handoffs completed.
 pub async fn apply_done_handoffs(
@@ -607,7 +607,7 @@ impl HandoffCursor<'_> {
         // the consumed input ULIDs. The reaper deletes those inputs from
         // S3 (and the marker) once `ulid_timestamp(<gc_output_ulid>) +
         // retention_retention` has passed — giving replicas a guaranteed
-        // grace period. See `docs/design-replica-model.md`.
+        // grace period. See `docs/notes/design-replica-model.md`.
         //
         // Idempotency: the marker key is the GC output ULID, so re-running
         // this loop after a crash re-PUTs the same key with the same body.
@@ -727,7 +727,7 @@ struct SegmentStats {
     /// partial LBA death, the list of live sub-runs (filtered to `r.hash ==
     /// entry.hash`). The coordinator encodes these as `PlanOutput::Partial`
     /// runs; the volume materialises by slicing the composite body. `None`
-    /// for non-partial entries. See `docs/design-gc-partial-death-compaction.md`.
+    /// for non-partial entries. See `docs/notes/design-gc-partial-death-compaction.md`.
     partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>>,
     /// True if at least one partial-LBA-death entry in this segment cannot
     /// be expanded this pass. In the current implementation this is only
@@ -912,7 +912,7 @@ fn collect_stats(
             // because a multi-LBA entry's head, tail, or interior may have
             // been overwritten by later writes while `start_lba` is
             // unaffected (and vice versa). See
-            // `docs/design-gc-overlap-correctness.md`.
+            // `docs/notes/design-gc-overlap-correctness.md`.
             //
             // DedupRef is a thin record (`stored_length=0`, no body bytes),
             // so it contributes nothing to `physical_body_bytes` (the
@@ -1182,7 +1182,7 @@ fn collect_stats(
 /// file describing the desired output. The volume picks up the plan on its
 /// next idle tick, resolves bodies through its own ancestor-aware BlockReader,
 /// assembles and signs the output segment, and renames tmp → bare. See
-/// `docs/design-gc-plan-handoff.md`.
+/// `docs/notes/design-gc-plan-handoff.md`.
 ///
 fn compact_segments(
     candidates: Vec<SegmentStats>,

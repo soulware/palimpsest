@@ -8,7 +8,7 @@ Date: 2026-04-09 (updated 2026-04-13)
 
 ## Context
 
-Empirical measurements ([findings.md](findings.md)) show zstd-with-dictionary delta compression achieves 94% marginal S3 fetch savings between Ubuntu 22.04 point releases when the prior file version is used as the dictionary. The segment format already supports delta entries (`source_hash`, delta body section, multiple delta options per extent — see [formats.md](formats.md)). The missing piece is the pipeline that produces them.
+Empirical measurements ([findings.md](../findings.md)) show zstd-with-dictionary delta compression achieves 94% marginal S3 fetch savings between Ubuntu 22.04 point releases when the prior file version is used as the dictionary. The segment format already supports delta entries (`source_hash`, delta body section, multiple delta options per extent — see [formats.md](../formats.md)). The missing piece is the pipeline that produces them.
 
 The core problem is **source selection**: given a changed extent in a new snapshot, which extent from the prior snapshot should be the zstd dictionary?
 
@@ -150,7 +150,7 @@ No filemap. No delta. Full extents only. The read path, segment format, and GC a
 
 **Phase 1 — delta format + PoC.** Segment format v3 with delta table in the index and a coordinator-side `compute_deltas()` hooked into `drain_pending()`. Proof-of-concept that validated the end-to-end machinery; removed in Phase 3. The format itself is unchanged and still in use.
 
-**Phase 2 — `extent_index` lineage.** `elide volume import --extents-from <name>` (repeatable) contributes one or more existing volumes' extents to the new volume's hash pool, carried in the signed `volume.provenance`. Blocks whose hash already exists in any source are written as `DedupRef` during the import block loop. Delivers cross-import dedup and lays the groundwork for filemap delta. Details — eviction rule, `MAX_EXTENT_INDEX_SOURCES = 32`, OCI-layer relationship — live in [architecture.md](architecture.md).
+**Phase 2 — `extent_index` lineage.** `elide volume import --extents-from <name>` (repeatable) contributes one or more existing volumes' extents to the new volume's hash pool, carried in the signed `volume.provenance`. Blocks whose hash already exists in any source are written as `DedupRef` during the import block loop. Delivers cross-import dedup and lays the groundwork for filemap delta. Details — eviction rule, `MAX_EXTENT_INDEX_SOURCES = 32`, OCI-layer relationship — live in [architecture.md](../architecture.md).
 
 **Phase 3 — file-aware import, thin Delta, and filemap producer.** Three pieces that only make sense together, landed as one unit:
 

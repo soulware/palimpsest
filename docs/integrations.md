@@ -53,7 +53,7 @@ Two pieces of infrastructure unblock all integration targets:
 images — this is the primary use case and requires no block device integration.
 The reverse direction (publishing a volume *as* an OCI image, and a containerd
 snapshotter that preserves demand-fetch end-to-end) is captured as future
-exploration in [`design-oci-export.md`](design-oci-export.md).
+exploration in [`design-oci-export.md`](notes/design-oci-export.md).
 
 **Data volumes (current):**
 ```

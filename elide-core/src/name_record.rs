@@ -1,6 +1,6 @@
 //! `names/<name>` record format for portable live volumes.
 //!
-//! See `docs/design-portable-live-volume.md`. This record is stored at
+//! See `docs/notes/design-portable-live-volume.md`. This record is stored at
 //! `names/<name>` in the bucket and is the authoritative mapping from a
 //! human-readable volume name to the currently-active fork, the
 //! coordinator that owns it, and the lifecycle state.
@@ -50,7 +50,7 @@
 //! - `size` — logical capacity of the volume in bytes. Authoritative;
 //!   the local `volume.toml.size` is a cache hydrated from this field.
 //!   The single owner of `names/<name>` is the sole writer (resize is a
-//!   CAS-mutation here, not a fork). See `docs/design-volume-size-ownership.md`.
+//!   CAS-mutation here, not a fork). See `docs/notes/design-volume-size-ownership.md`.
 //! - `coordinator_id` — derived from the coordinator's Ed25519 public key
 //!   via `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`,
 //!   formatted as a 26-char Crockford-Base32 ULID-shape (see
@@ -246,7 +246,7 @@ pub struct NameRecord {
 
     /// Logical capacity of the volume in bytes. Authoritative; the
     /// local `volume.toml.size` is a cache hydrated from this field.
-    /// See `docs/design-volume-size-ownership.md`.
+    /// See `docs/notes/design-volume-size-ownership.md`.
     pub size: u64,
 
     /// Coordinator currently holding the name (when `state` is `Live`

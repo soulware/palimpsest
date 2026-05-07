@@ -17,7 +17,8 @@ All documentation lives in `./docs/`:
 - `docs/architecture.md` — system architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots
 - `docs/formats.md` — WAL format, segment file format, S3 retrieval strategies
 - `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
-- `docs/reference.md` — lsvd reference comparison, implementation notes, open questions
+- `docs/notes/reference.md` — lsvd reference comparison, implementation notes, open questions
+- `docs/notes/` — design records, plans, and dated status snapshots (LLM-targeted; indexed in `docs/notes/INDEX.md`)
 
 Also check `README.md` for the top-level index and `CLAUDE.md` for project conventions.
 

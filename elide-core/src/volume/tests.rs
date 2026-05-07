@@ -121,7 +121,7 @@ fn noop_skip_does_not_fire_on_fragmented_match() {
     // entry hashes the whole range — the skip cannot fire and the
     // write commits normally. (Earlier designs added a body
     // byte-compare tier to catch this; see
-    // `docs/design-noop-write-skip.md § Why no byte-compare tier`.)
+    // `docs/notes/design-noop-write-skip.md § Why no byte-compare tier`.)
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
     let a = vec![0xa1u8; 4096];
@@ -2089,7 +2089,7 @@ fn gc_handoff_applies_and_renames() {
 /// write a `gc/<new>.plan` file holding one `keep` per entry.
 ///
 /// Matches what the real coordinator emits for fully-alive inputs under
-/// the plan handoff protocol (see `docs/design-gc-plan-handoff.md`).
+/// the plan handoff protocol (see `docs/notes/design-gc-plan-handoff.md`).
 fn simulate_coord_gc_staged(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
     use crate::gc_plan::{GcPlan, PlanOutput};
     use crate::segment;

@@ -1,6 +1,6 @@
 // Coordinator startup reconciliation for ublk devices.
 //
-// Under the shutdown-park policy (docs/design-ublk-shutdown-park.md), volume
+// Under the shutdown-park policy (docs/notes/design-ublk-shutdown-park.md), volume
 // daemons no longer del_dev on shutdown — they leave the kernel device QUIESCED
 // for the next serve to recover via UBLK_F_USER_RECOVERY_REISSUE. This means
 // stale kernel devices and stale per-volume bindings (the `[ublk] dev_id`

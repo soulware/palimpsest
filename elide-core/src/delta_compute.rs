@@ -9,7 +9,7 @@
 // entry. The signer stays in the import process — no key material ever
 // leaves the volume process.
 //
-// See docs/design-delta-compression.md §"Filemap-based delta".
+// See docs/notes/design-delta-compression.md §"Filemap-based delta".
 
 use std::collections::HashMap;
 use std::fs;

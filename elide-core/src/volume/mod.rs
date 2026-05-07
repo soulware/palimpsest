@@ -6,7 +6,7 @@
 //   <base>/index/     — coordinator-written LBA index files (*.idx); permanent; never evicted
 //   <base>/cache/     — coordinator-written body cache (*.body, *.present); evictable
 //   <base>/gc/        — GC handoff files (coordinator-written `.staged`, volume-
-//                       applied bare `<ulid>`; see docs/design-gc-self-describing-handoff.md)
+//                       applied bare `<ulid>`; see docs/notes/design-gc-self-describing-handoff.md)
 //
 // Write path:
 //   1. Volume::write(lba, data) — hashes data, appends to WAL, updates LBA map
@@ -189,7 +189,7 @@ pub struct Volume {
     pub(in crate::volume) file_cache: RefCell<FileCache>,
     /// In-memory cache of opened `cache/<ULID>.dmat` sidecars. Populated
     /// lazily on first delta read for each segment; cleared on cache
-    /// eviction. See `docs/design-delta-materialisation.md`.
+    /// eviction. See `docs/notes/design-delta-materialisation.md`.
     pub(in crate::volume) dmat_cache: read::DmatCache,
     /// Telemetry counters for the dmat cache. Wrapped in `Arc` so the
     /// stats can be cloned and shared with `VolumeReader`s and IPC.
@@ -210,7 +210,7 @@ pub struct Volume {
     /// to guarantee strict ordering regardless of host clock behaviour.
     pub(in crate::volume) mint: UlidMint,
     /// Stats for the no-op write skip path (LBA-map hash compare).
-    /// See `docs/design-noop-write-skip.md`.
+    /// See `docs/notes/design-noop-write-skip.md`.
     pub(in crate::volume) noop_stats: NoopSkipStats,
     /// Shared LRU of parsed+verified segment indices. Keyed by
     /// `(path, file_len)`. Cloned into worker jobs so the actor thread
@@ -521,7 +521,7 @@ impl Volume {
     /// pay a redundant blake3 pass on the actor thread). The caller-supplied
     /// `hash` MUST be `blake3::hash(data)`.
     ///
-    /// See `docs/design-noop-write-skip.md`.
+    /// See `docs/notes/design-noop-write-skip.md`.
     pub fn write_with_hash(
         &mut self,
         lba: u64,
@@ -544,7 +544,7 @@ impl Volume {
         // collision resistance means hash equality implies byte equality,
         // so this is safe regardless of where the body lives (Local,
         // Cached present, Cached absent, or S3-only). See
-        // `docs/design-noop-write-skip.md`.
+        // `docs/notes/design-noop-write-skip.md`.
         if self.lbamap.has_full_match(lba, lba_length, &hash) {
             self.noop_stats.skipped_writes += 1;
             self.noop_stats.skipped_bytes += data.len() as u64;
@@ -710,7 +710,7 @@ impl Volume {
         }
     }
 
-    /// No-op skip counters. See `docs/design-noop-write-skip.md`.
+    /// No-op skip counters. See `docs/notes/design-noop-write-skip.md`.
     pub fn noop_stats(&self) -> NoopSkipStats {
         self.noop_stats
     }
@@ -873,7 +873,7 @@ impl Volume {
         }
 
         // Pass 2: collect `.plan` files emitted by the coordinator. See
-        // docs/design-gc-plan-handoff.md for the protocol.
+        // docs/notes/design-gc-plan-handoff.md for the protocol.
         let mut plans: Vec<(String, Ulid)> = fs::read_dir(gc_dir)?
             .filter_map(|e| {
                 let e = e.ok()?;
@@ -1760,7 +1760,7 @@ impl Volume {
 
     /// In-process checkpoint of the fork at the current point in the
     /// segment sequence. **Not** the production path — the coordinator-
-    /// driven snapshot flow (see `docs/coordinator-driven-snapshot-plan.md`)
+    /// driven snapshot flow (see `docs/notes/coordinator-driven-snapshot-plan.md`)
     /// orchestrates flush → S3 drain → signed manifest → upload.
     ///
     /// This in-process variant exists for tests and offline tooling that
@@ -1908,7 +1908,7 @@ impl Volume {
     /// enumerates its own `index/` at the moment of the call: the result is a
     /// full list of every segment ULID that belongs to this volume as of the
     /// snapshot, *not* a delta over the previous snapshot. See
-    /// `docs/coordinator-driven-snapshot-plan.md` for the rationale.
+    /// `docs/notes/coordinator-driven-snapshot-plan.md` for the rationale.
     ///
     /// The manifest is signed with the volume's private key so ancestor
     /// verification at open time can trust it via the embedded

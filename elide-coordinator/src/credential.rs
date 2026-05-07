@@ -10,7 +10,7 @@
 // and slot in behind this same trait.
 //
 // Coordinator identity (signing key + macaroon MAC root) lives in
-// `crate::identity` — see `docs/design-portable-live-volume.md`
+// `crate::identity` — see `docs/notes/design-portable-live-volume.md`
 // § "Coordinator identity".
 
 use std::io;

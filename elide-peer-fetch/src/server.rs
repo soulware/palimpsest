@@ -16,7 +16,7 @@
 //! The wire `.prefetch` resource is deliberately a different name from
 //! the on-disk `.present` file: the bytes are returned verbatim in v1
 //! but clients consume the response as advisory state, never as
-//! authoritative cache state. See `docs/design-peer-segment-fetch.md`
+//! authoritative cache state. See `docs/notes/design-peer-segment-fetch.md`
 //! § "What's served" for the rationale.
 //!
 //! For the `.manifest` route the second URL component is a *snapshot*
@@ -156,7 +156,7 @@ impl ResourceKind {
             // The on-disk `.idx` filename matches the wire suffix.
             (Self::Idx, ResourceTarget::Ulid(u)) => format!("{u}.idx"),
             // The on-disk file is `.present`; the wire calls it
-            // `.prefetch` (see docs/design-peer-segment-fetch.md).
+            // `.prefetch` (see docs/notes/design-peer-segment-fetch.md).
             (Self::Prefetch, ResourceTarget::Ulid(u)) => format!("{u}.present"),
             (Self::SnapshotManifest, ResourceTarget::Ulid(u)) => format!("{u}.manifest"),
             (Self::VolumePub, ResourceTarget::Skeleton) => "volume.pub".to_owned(),

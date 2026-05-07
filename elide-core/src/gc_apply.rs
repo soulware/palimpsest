@@ -1,6 +1,6 @@
 //! Volume-side materialisation of a coordinator-emitted [`GcPlan`].
 //!
-//! See `docs/design-gc-plan-handoff.md`.
+//! See `docs/notes/design-gc-plan-handoff.md`.
 //!
 //! The coordinator classifies inputs and writes a [`GcPlan`]; the volume
 //! reads it, resolves bodies through its own ancestor-aware / fetcher-aware

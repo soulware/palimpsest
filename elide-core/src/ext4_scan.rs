@@ -644,7 +644,7 @@ fn path_for_inode(paths_by_inode: &HashMap<u32, Vec<String>>, inode_idx: u32) ->
     // set is preserved by emitting one fragment row per (path, hash) pair —
     // see the loop below; for now we collapse to one path per inode to match
     // the existing import behaviour. Hardlink expansion is tracked as an
-    // open question in docs/design-delta-compression.md.
+    // open question in docs/notes/design-delta-compression.md.
     let paths = paths_by_inode.get(&inode_idx)?;
     paths.iter().min().cloned()
 }

@@ -34,7 +34,7 @@
 //!        (PR #254): aborts its tasks, drains, exits — leaving the
 //!        supervised volume running. The test then SIGTERMs the
 //!        orphaned volume directly. Under shutdown-park
-//!        (docs/design-ublk-shutdown-park.md) the daemon flushes and
+//!        (docs/notes/design-ublk-shutdown-park.md) the daemon flushes and
 //!        exits without calling STOP_DEV; the kernel parks the device
 //!        in QUIESCED on daemon-exit detection. Post-shutdown
 //!        invariants: the sysfs entry and the `[ublk] dev_id` field

@@ -70,7 +70,7 @@ Create a writable replica branched from the imported base:
 `--from` accepts a volume name (resolved locally or against the remote
 store), a bare volume ULID, or an explicit `<vol_ulid>/<snap_ulid>` pin.
 The explicit-pin form is forward-compatible — see
-[design-replica-model.md](design-replica-model.md).
+[design-replica-model.md](notes/design-replica-model.md).
 
 ## Serve the volume
 

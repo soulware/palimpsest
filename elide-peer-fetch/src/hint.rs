@@ -6,7 +6,7 @@
 //! wrapper hides that detail from callers — a future encoding (RLE,
 //! LBA-restricted projection, etc.) won't break call sites.
 //!
-//! See `docs/design-peer-segment-fetch.md` § "What's served" for the
+//! See `docs/notes/design-peer-segment-fetch.md` § "What's served" for the
 //! wire/file decoupling rationale.
 
 use bytes::Bytes;

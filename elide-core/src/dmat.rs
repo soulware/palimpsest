@@ -2,7 +2,7 @@
 //!
 //! Local-only sidecar that holds materialised bytes for `FLAG_DELTA` segment
 //! entries after their first read, so subsequent reads no longer pay the
-//! zstd-dict-decompress cost. See `docs/design-delta-materialisation.md`.
+//! zstd-dict-decompress cost. See `docs/notes/design-delta-materialisation.md`.
 //!
 //! File layout:
 //!

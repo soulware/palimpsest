@@ -134,7 +134,7 @@ enum SimOp {
     /// has splits. `collect_stats` must mark the segment has_partial_death
     /// and exclude it from compaction; otherwise the re-emitted claim at
     /// the GC output's higher ULID shadows or erases the overwriter on
-    /// rebuild. See docs/design-gc-overlap-correctness.md.
+    /// rebuild. See docs/notes/design-gc-overlap-correctness.md.
     MultiLbaWriteThenOverwrite {
         start_lba: u8,
         span: u8,
@@ -149,7 +149,7 @@ enum SimOp {
     /// `4 + overlap_off` then punches a hole in the DedupRef's span,
     /// creating a partial-LBA-death DedupRef.
     ///
-    /// Under step 3a of `docs/design-gc-partial-death-compaction.md`,
+    /// Under step 3a of `docs/notes/design-gc-partial-death-compaction.md`,
     /// `collect_stats` routes this into `partial_death_runs` (not the
     /// segment-level defer) and `expand_partial_death` resolves the
     /// composite body via `resolve_body_by_hash` on the DedupRef's own

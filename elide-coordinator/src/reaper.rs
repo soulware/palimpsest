@@ -6,7 +6,7 @@
 // window has elapsed.
 //
 // Marker shape and validation rules: see `crate::retention` and
-// `docs/design-replica-model.md` (Reaper / Target validation /
+// `docs/notes/design-replica-model.md` (Reaper / Target validation /
 // Cadence and dispatch).
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ use crate::retention::{parse_marker_body, parse_marker_key, segment_key_for};
 /// Cadence is `gc_config.reaper_cadence()` (= `max(retention/10, 1s)`).
 /// `retention` is read on each tick so that operator changes to the
 /// `retention_window` config apply immediately to all in-flight
-/// markers — see `docs/design-replica-model.md` (*Marker record*) for
+/// markers — see `docs/notes/design-replica-model.md` (*Marker record*) for
 /// why we derive rather than stamp.
 pub async fn run(
     store: Arc<dyn ObjectStore>,
@@ -164,7 +164,7 @@ fn ulid_creation_time(u: Ulid) -> anyhow::Result<SystemTime> {
 ///
 /// Read-only references (cheap-reference replicas of upstream volumes)
 /// have no S3 write authority; the upstream's own coordinator reaps
-/// their prefixes. See *Scope* in `docs/design-replica-model.md`.
+/// their prefixes. See *Scope* in `docs/notes/design-replica-model.md`.
 fn owned_volumes(data_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let by_id = data_dir.join("by_id");

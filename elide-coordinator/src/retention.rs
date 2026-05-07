@@ -1,6 +1,6 @@
 // Retention markers.
 //
-// See `docs/design-replica-model.md` for the surrounding design. This
+// See `docs/notes/design-replica-model.md` for the surrounding design. This
 // module defines the on-disk record and parsing primitives. The reaper
 // itself lives in `crate::reaper`.
 //

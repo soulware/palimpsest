@@ -738,7 +738,7 @@ proptest! {
                     // low ULID would be used later for an output whose
                     // content is post-`CoordGcLocal`, breaking the
                     // rebuild-ordering invariant in
-                    // docs/design-gc-ulid-ordering.md.
+                    // docs/notes/design-gc-ulid-ordering.md.
                     pending_gc = None;
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     // Core invariant: the volume mint must have advanced past the

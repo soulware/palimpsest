@@ -8,7 +8,7 @@ Date: 2026-05-06
 
 ## Context
 
-Delta entries (`FLAG_DELTA`, see [formats.md](formats.md) — *FLAG_DELTA entries (thin delta)*) carry no body bytes. Reads currently re-derive the materialised extent on every access:
+Delta entries (`FLAG_DELTA`, see [formats.md](../formats.md) — *FLAG_DELTA entries (thin delta)*) carry no body bytes. Reads currently re-derive the materialised extent on every access:
 
 1. Read the source extent body (full extent, lz4-decompressed if needed).
 2. Read the delta blob from `cache/<ULID>.delta` (or the segment's delta body section in `pending/`).
@@ -17,7 +17,7 @@ Delta entries (`FLAG_DELTA`, see [formats.md](formats.md) — *FLAG_DELTA entrie
 
 Steps 1 and 2 are I/O; step 3 is the dominant CPU cost (zstd-dict-decompress runs ~500 MB/s on extent payloads, vs lz4's ~4 GB/s for `.body` reads). Every read of the same delta-mapped LBA pays the full cost again — no caching anywhere on the path.
 
-Empirical findings ([findings.md](findings.md)) show delta compression saves ~94% of S3 storage on point-release upgrades. That same ratio implies most of an updated image's *content* is served via delta entries. Repeatedly decompressing them on every read leaves CPU and IOPS on the table.
+Empirical findings ([findings.md](../findings.md)) show delta compression saves ~94% of S3 storage on point-release upgrades. That same ratio implies most of an updated image's *content* is served via delta entries. Repeatedly decompressing them on every read leaves CPU and IOPS on the table.
 
 This document specifies a local-only sidecar — `cache/<ULID>.dmat` — that holds materialised delta-entry bytes after their first read, so subsequent reads serve from a regular file with at most an lz4 decompress.
 
@@ -37,7 +37,7 @@ This document specifies a local-only sidecar — `cache/<ULID>.dmat` — that ho
 
 ## Why not reuse `.body`?
 
-`FLAG_DELTA` entries contribute zero to `body_length` and reserve no range in `.body` (see [formats.md](formats.md) — base entries / Delta). Reusing `.body` for materialised bytes would require either (a) pre-allocating body slots for delta entries at write time, defeating the on-disk savings, or (b) appending past `body_length` with side-state recording entry → offset, which is a sidecar in everything but name. A separate file with its own discipline is simpler and keeps `.body`'s invariants (`set_len(body_length)`, exact size) intact.
+`FLAG_DELTA` entries contribute zero to `body_length` and reserve no range in `.body` (see [formats.md](../formats.md) — base entries / Delta). Reusing `.body` for materialised bytes would require either (a) pre-allocating body slots for delta entries at write time, defeating the on-disk savings, or (b) appending past `body_length` with side-state recording entry → offset, which is a sidecar in everything but name. A separate file with its own discipline is simpler and keeps `.body`'s invariants (`set_len(body_length)`, exact size) intact.
 
 ## Why not atomic-rename, like `.body`?
 
@@ -70,7 +70,7 @@ The compression algorithm and entropy gate match `.body`: lz4_flex, skip compres
 
 ### Materialise (first read of a delta entry)
 
-1. Decompress the delta as today (see [formats.md](formats.md) — Reads of a Delta-mapped LBA, steps 1–5).
+1. Decompress the delta as today (see [formats.md](../formats.md) — Reads of a Delta-mapped LBA, steps 1–5).
 2. Apply the standard entropy gate to the uncompressed bytes.
 3. Build a record: `entry_idx | flags | stored_length | data`.
 4. Append it to `cache/<ULID>.dmat`. Create the file with the magic header if absent.
