@@ -853,6 +853,15 @@ proptest! {
                             "PopulateFetched produced out-of-order ULID: {u} <= {max_before}"
                         );
                     }
+                    // `populate_cache` writes the 3-file demand-fetch format
+                    // (`.idx` + `.body` + `.present`) to disk directly, bypassing
+                    // `Volume::write` and the WAL — so `self.lbamap` doesn't
+                    // see the populated entries. Drop + reopen so `Volume::open`'s
+                    // rebuild folds them in. Without this, the next mutating op
+                    // trips the `lbamap-invariant` consistency check (disk has
+                    // entries the in-memory mirror doesn't).
+                    drop(vol);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -1118,6 +1127,10 @@ proptest! {
                     let ulid = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
                     oracle.insert(actual_lba, [effective_seed; 4096]);
+                    // `populate_cache` bypasses `Volume::write`; drop+reopen
+                    // so `self.lbamap` reflects the populated entries.
+                    drop(vol);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -1337,6 +1350,10 @@ proptest! {
                     let ulid = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
                     oracle.insert(actual_lba, [effective_seed; 4096]);
+                    // `populate_cache` bypasses `Volume::write`; drop+reopen
+                    // so `self.lbamap` reflects the populated entries.
+                    drop(vol);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];

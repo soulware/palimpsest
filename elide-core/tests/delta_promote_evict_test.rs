@@ -352,11 +352,21 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
         }
     }
 
-    // Promote the reclaim output (parent is still in pending too —
-    // promote it so its body lives at cache/<parent>.body for the
-    // post-evict read).
-    vol.promote_segment(parent_ulid).unwrap();
-    vol.promote_segment(reclaim_ulid).unwrap();
+    // Promote every pending segment in ULID-ascending order. Promoting
+    // only `reclaim_ulid` (the highest) while leaving parent / delta /
+    // any flush_wal segment in pending would flip the lbamap walk-order
+    // winner for overlapping LBAs (pending-tier always wins last on the
+    // rebuild walk; once `reclaim_ulid` crosses into committed, the
+    // remaining lower-ULID pending peers shadow it). `self.lbamap`
+    // wouldn't reflect that flip, so the next mutating op would trip
+    // the `lbamap-invariant` consistency check. Promoting in ULID order
+    // keeps the just-promoted ULID below every remaining pending ULID,
+    // so no overlapping pending peer can take over.
+    let pending_dir = vol_dir.join("pending");
+    let pending_ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
+    for u in pending_ulids {
+        vol.promote_segment(u).unwrap();
+    }
 
     let (_lbamap, ei) = vol.snapshot_maps();
     for hash in &delta_output_hashes {
