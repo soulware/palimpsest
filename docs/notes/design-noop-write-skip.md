@@ -29,6 +29,8 @@ If a future workload makes fragmented matches worth catching, reintroduce with a
 
 ## Notes
 
-- Fork layering: parent entries are flattened into `self.lbamap` at open time, so a no-op write against an inherited LBA matches unconditionally.
-- Reclamation rewrites (`design-extent-reclamation.md`) call `write_with_hash` with a precomputed hash; the same skip applies, which is correct — re-running reclamation over an already-merged range is a no-op by definition.
+- **Fork layering:** parent entries are flattened into `self.lbamap` at open time, so a no-op write against an inherited LBA matches unconditionally.
+- **Reclamation rewrites** (`design-extent-reclamation.md`) call `write_with_hash` with a precomputed hash; the same skip applies, which is correct — re-running reclamation over an already-merged range is a no-op by definition.
+- **Durability contract is unchanged.** `NBD_CMD_FLUSH` routes through `VolumeClient::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
+- **Snapshots:** a skipped write produces no local segment entry. The snapshot's view of the LBA is inherited from whatever entry already covered it — exactly right, since the content is unchanged.
 - Counters (`skipped_writes`, `skipped_bytes`) on `Volume`, exposed via `VolumeClient::noop_stats()`.

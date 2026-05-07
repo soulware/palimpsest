@@ -60,6 +60,18 @@ gc/<ulid>            ← volume applied, awaiting S3 upload
 
 Re-apply is deterministic: plan-read is pure; body resolution via `BlockReader` is pure given disk state; output segment bytes are byte-identical across runs given the same plan + disk state.
 
+## Code shape
+
+The plan-handoff landing deleted these coordinator-side helpers (all reimplementations of `BlockReader` capabilities):
+
+- `fetch_live_bodies`, `try_fetch_live_bodies_local` — body fetching.
+- `resolve_body_by_hash`, `read_extent_body`, `read_extent_body_local`, `read_extent_body_cached` — hash-based body resolution.
+- `read_delta_blob` — delta body reads.
+- `expand_partial_death` — moved to the volume, reusing `BlockReader`.
+- `generate_ephemeral_signer` + the ephemeral-key signing path — volume signs directly.
+
+Body resolution funnels through `BlockReader`: Data/Inline passthrough via `find_segment_file` + `body_seek`; DedupRef via `read_extent_body(&hash)` (ancestor-aware, decompressed); Delta via `read_extent_body(&base_hash)` + `read_delta_blob` + `apply_delta` with the volume re-picking the first resolvable `source_hash` from the entry's `delta_options` against its merged (ancestor-aware) extent index.
+
 ## Defer semantics
 
 Delta partial-death whose `source_hash`es don't resolve are deferred at materialise time, not plan-emit time: the coordinator emits a plan if at least one option resolves via its local index; the volume fails-and-removes if `BlockReader` returns `NotFound`, leaving inputs intact for the next tick. The volume's merged (ancestor-aware) extent index is a superset of the coordinator's fork-local index, so the volume always resolves when the coordinator resolves — except under concurrent churn vanishing a hash, which the retry loop handles.

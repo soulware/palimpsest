@@ -17,4 +17,16 @@ Same three-phase shape. Prep snapshots the signer `Arc` and base dir into a `Sig
 
 ## Crash semantics (already correct pre-offload)
 
-The "marker written last" rule on `snapshots/<ulid>` makes the manifest atomic from a reader's perspective. A crash between manifest rename and marker write leaves an orphan `.manifest` invisible to any reader; the next snapshot attempt overwrites via tmp+rename then writes the marker. No on-disk invariant changes under the offload.
+The "marker written last" rule on `snapshots/<ulid>` makes the manifest atomic from a reader's perspective.
+
+| Crash point | State | Recovery |
+|---|---|---|
+| Before manifest tmp-write completes | no manifest, no marker | coordinator retries; no visible partial snapshot |
+| After manifest rename, before marker | `.manifest` exists, no marker | next attempt overwrites via tmp+rename then writes marker. Without a marker no reader saw the orphan |
+| After marker, before apply | manifest + marker on disk; `has_new_segments` still true in memory | process is dying; in-memory flag is moot. Next open derives `has_new_segments` from WAL/`pending/`, not persisted |
+
+No on-disk invariant changes under the offload.
+
+## Worker concurrency
+
+The worker is FIFO single-threaded. Within one snapshot the coordinator's snapshot lock plus the FIFO guarantee that `index/` enumeration sees state exactly after the preceding `promote`s; writes during the manifest sign land on the fresh WAL opened by the prior `promote_wal` and don't appear in `index/` until a future drain. Sweep / repack / delta-repack rewrite `pending/`, not `index/`, so they don't affect the manifest's enumeration.

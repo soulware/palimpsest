@@ -57,6 +57,42 @@ Field shape is consistent: `coordinator_id` means "this record's current owner" 
 
 All transitions are conditional PUTs (`If-Match` on ETag; supported by S3, Tigris, R2, MinIO, Ceph RGW). Conditional-write atomicity on this single object is the entire ownership protocol.
 
+### Verb flows
+
+**`volume stop <name>`** (local stop, retain ownership):
+1. Refuse if a client (NBD/ublk) is connected.
+2. Existing `shutdown` RPC: WAL fsync, daemon halts.
+3. Conditional PUT to `names/<name>` flipping `state` from `live` to `stopped`. `vol_ulid`/`coordinator_id` unchanged.
+4. Local artefacts (cache, index, WAL, signing key) **stay in place** for the same coordinator's later `start`.
+
+**`volume release <name>`** (relinquish ownership):
+1. If currently `live`, do everything `stop` does first.
+2. Drain WAL: promote pending records, finish in-flight uploads.
+3. Publish a handoff snapshot covering everything published.
+4. Conditional PUT setting `state = "released"`, keeping `vol_ulid` pointing at the now-frozen fork. Owner-identity fields (`coordinator_id`, `claimed_at`, `hostname`) are **cleared**.
+5. Local `by_id/<vol_ulid>/` may be discarded (reproducible from S3) or kept as cache for fast reacquisition. **Never** keep the WAL.
+
+**`volume start <name>`** (pure local resume — never reaches into the bucket to change ownership):
+- Already `live` and ours → idempotent no-op.
+- `state=stopped`, `coordinator_id=self` → reuse the existing fork; flip `state` back to `live` via conditional PUT; restart the daemon. No new ULID, no snapshot, no fork.
+- No local state, or `state == "released"` → refuse with an error pointing at `volume claim`.
+
+**`volume claim <name>`**:
+- `state == "released"`: claim allowed for any coordinator. Two sub-cases route automatically — **in-place reclaim** when the released `vol_ulid` matches a local fork (no pull, no fork mint), **cross-coordinator claim** otherwise (pull from the released ancestor, mint a fresh ULID + keypair, create `by_id/<new_ulid>/` with provenance pointing at the previous fork's `<vol_ulid>/<handoff_snap_ulid>`, conditional PUT to `names/<name>`). Result is `Stopped`; daemon is **not** started.
+- `state == "live"` or `"stopped"` (foreign-owned): refuse unless `--force` is passed. With `--force`, the verb internally synthesises a handoff snapshot for the dead fork (same path as `release --force`) and then claims the now-Released name in one shot.
+
+### Lifecycle vs coordinator process exit
+
+| Event | `names/<name>` | WAL | Snapshot | Recovery |
+|---|---|---|---|---|
+| `volume stop` | `state=stopped`, same `coordinator_id` | fsynced, retained | no | this coordinator restarts and `start`s; others refused |
+| `volume release` | `state=released`; identity cleared | drained, then discarded | yes — handoff | any coordinator may `claim` |
+| Coordinator graceful shutdown | unchanged | fsynced, retained | no | restarts, sees own `coordinator_id`, replays WAL, resumes — `state` was never flipped |
+| Coordinator crash | unchanged | retained, possibly torn tail | no | same as graceful — restart replays WAL; unsynced tail lost (existing crash contract) |
+| `volume release --force` from elsewhere | rewritten unconditionally; `released`, identity cleared | abandoned (dead WAL unreachable) | yes — synthesised | a subsequent `claim` claims it normally; data loss boundary = "writes the dead owner accepted but never promoted to S3" |
+
+The lifecycle verbs are explicit operator intent. Coordinator process exit (graceful or crash) does **not** flip state — a coordinator coming back keeps its volumes, its WAL, and its `state=live` records.
+
 ## Readonly names
 
 A name in `state=readonly` points at immutable content (today: an imported OCI image). `coordinator_id`/`claimed_at`/`hostname` are empty — **no exclusive owner, by design**. Multiple coordinators may pull and serve the same readonly name concurrently.

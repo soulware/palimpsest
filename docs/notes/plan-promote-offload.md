@@ -25,3 +25,28 @@ Promotion now mints a **fresh** segment ULID, distinct from the WAL ULID. `gc_ch
 ## Apply-phase CAS
 
 Concurrent writes during the worker's heavy middle may supersede the entries the worker is operating on. `apply_promote` uses `ExtentIndex::replace_if_matches(hash, expected_segment_id, expected_body_offset, new_location)` so concurrent overwrites lose the CAS and survive untouched.
+
+## Code shape
+
+```rust
+pub struct PromoteJob {
+    pub segment_ulid: Ulid,               // fresh, distinct from the WAL ulid
+    pub old_wal_ulid: Ulid,
+    pub old_wal_path: PathBuf,
+    pub entries: Vec<SegmentEntry>,
+    pub pre_promote_offsets: Vec<Option<u64>>, // CAS tokens snapshotted at prep time
+    pub signer: Arc<dyn SegmentSigner>,
+    pub pending_dir: PathBuf,
+}
+
+pub struct PromoteResult {
+    pub segment_ulid: Ulid,
+    pub old_wal_ulid: Ulid,
+    pub old_wal_path: PathBuf,
+    pub body_section_start: u64,
+    pub entries: Vec<SegmentEntry>,       // stored_offset now segment-relative
+    pub pre_promote_offsets: Vec<Option<u64>>,
+}
+```
+
+Two bounded crossbeam channels connect the actor and worker: a job channel (`bounded::<WorkerJob>(4)`, ~128 MiB at 32 MiB per WAL) and a result channel. The actor's `select!` loop has three arms — `VolumeRequest`, worker results, idle tick.

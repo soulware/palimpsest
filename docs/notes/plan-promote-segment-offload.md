@@ -21,6 +21,12 @@ Source selection: `pending/<ulid>` > `gc/<ulid>` > body-exists early-return. If 
 
 Regression guards: `promote_segment_recovers_mid_apply_crash` (unit) and `HalfPromotePending` SimOp + `assert_promote_recovery` invariant in the proptest crash handler.
 
+| Crash point | State | Recovery |
+|---|---|---|
+| Before idx write | unchanged | coordinator retries promote on next tick (segment still in `pending/` or `gc/`) |
+| After idx write, before body commit | `index/<ulid>.idx` exists, `cache/<ulid>.body` missing | `extract_idx` no-ops; `promote_to_cache` writes body. Idempotent replay |
+| After body commit, before apply | `cache/<ulid>.body` + `pending/<ulid>` both exist; extent index still `Local` | coordinator retries; prep picks `pending/<ulid>` (not the body-exists early-return), worker re-parses, inner ops no-op on committed outputs, apply runs normally |
+
 ## Apply-phase CAS
 
 `WorkerResult::PromoteSegment` carries the ULID out-of-band so errors map to the right parked caller (FIFO fallback would mis-attribute under concurrent promotes). The CAS skips entries whose extent-index entry no longer points at this segment — concurrent writes between prep and apply are safe.

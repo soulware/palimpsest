@@ -85,6 +85,14 @@ These apply to `docs/architecture.md`, `docs/formats.md`, `docs/operations.md`, 
 
 **Retire-on-land.** When a feature lands and updates a synthesis doc, the corresponding `design-*.md` gets a `landed: true` (and `landed_in: <synthesis-section>`) frontmatter line and stops being maintained. The synthesis doc is canonical; the note becomes history. Two sources of truth is the failure mode.
 
+**When trimming a landed note, do not cut these categories.** They are the highest-value parts of the note for someone trying to come up to speed on the area:
+- *Crash-recovery / state-transition tables* — high information density per line; expensive to reconstruct.
+- *Call-site / file references* that anchor design assertions to specific code (`src/foo.rs:bar`).
+- *Considered-and-rejected alternatives* with the reason — evergreen reference for future readers facing the same choice.
+- *Per-verb / per-flow step lists* that map the design onto code paths.
+
+Cut more aggressively from: phase-by-phase landing logs ("PR #X did Y"), implementation-status tables for landed work, test name enumerations, multi-paragraph rationale where one paragraph would do.
+
 **Soft length budgets.** Targets, not hard limits — exceeding triggers a trim or split, not a block:
 
 - `docs/architecture.md` — 800 lines

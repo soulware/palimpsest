@@ -12,7 +12,17 @@ Pulled-ancestor skeletons drop from `volume.pub + volume.provenance + manifest.t
 
 ## Why this works
 
-`size` has the same shape as `name`: mutable, single-writer, already gated by CAS on `names/<name>`. Putting them together collapses the trust model — the holder of the claim is the sole writer of capacity, just as it is the sole writer of ownership and state. Ancestors don't need size: every consumer (`ublk`/`nbd` capacity, fork inheritance, ext4 scan, re-publish, import) operates on a live volume, never on an ancestor.
+`size` has the same shape as `name`: mutable, single-writer, already gated by CAS on `names/<name>`. Putting them together collapses the trust model — the holder of the claim is the sole writer of capacity, just as it is the sole writer of ownership and state.
+
+Ancestors don't need size. Every consumer operates on a *live* volume — the current fork being served, the source of a fork operation, or the import in progress:
+
+- `src/lib.rs` — ublk/nbd `nr_sectors`
+- `inbound.rs` — fork inheritance
+- `filemap.rs` — ext4 scan
+- `upload.rs` — re-publish
+- `import.rs` — initial write
+
+Pulled-skeleton ancestors are read-only segment containers; their data is reached through a child's LBA map, and the child's *own* size determines what the guest sees.
 
 ## Resize
 

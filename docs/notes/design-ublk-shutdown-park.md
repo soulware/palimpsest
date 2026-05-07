@@ -24,6 +24,18 @@ Deletion is explicit: `elide ublk delete <id>` for ad-hoc cleanup, and a startup
 
 `Volume::write` does not currently fsync before reply, so writes acked to the guest may not yet be on disk. The shutdown flush (`client.flush()` → `volume.wal_fsync()`) closes that window for graceful exits. SIGKILL bypasses this, matching the existing crash-recovery contract — anything not durable also wasn't acked to the kernel and gets reissued on `START_USER_RECOVERY`.
 
+## Operations ordering
+
+The third sequence — start while mounted — is the one users actually want to "just work." Pre-fix it didn't.
+
+| Sequence | Pre-fix (PR #140) | Post-fix |
+|---|---|---|
+| `umount → stop → start → mount` | clean | clean |
+| `stop → umount → start → mount` | recoverable: timeout, deferred del, fresh ADD | clean: device parked, recovery on start |
+| `stop → start → umount → mount` | broken: start fails until umount finishes del | clean: recovery succeeds while mounted |
+| `stop` then volume deleted | clean (del_dev ran during stop) | requires explicit `elide ublk delete` (or coordinator sweep) |
+| `stop` then daemon never restarted | clean (device gone) | stale device until coordinator sweep |
+
 ## Tradeoffs
 
 - Devices accumulate if a volume directory is removed out-of-band while the daemon is stopped — the coordinator's startup sweep cleans these up. `elide volume delete` is the supported path and orchestrates the sequence correctly.
