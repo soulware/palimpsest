@@ -591,7 +591,6 @@ impl Volume {
             // body bytes and no body reservation.
             self.pending_entries
                 .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
-            self.assert_lbamap_consistent("write_dedupref");
             return Ok(());
         }
 
@@ -627,7 +626,6 @@ impl Volume {
             hash, lba, lba_length, seg_flags, owned_data,
         ));
 
-        self.assert_lbamap_consistent("write");
         Ok(())
     }
 
@@ -662,7 +660,6 @@ impl Volume {
         Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH);
         self.pending_entries
             .push(segment::SegmentEntry::new_zero(start_lba, lba_count));
-        self.assert_lbamap_consistent("write_zeroes");
         Ok(())
     }
 
@@ -1188,10 +1185,17 @@ impl Volume {
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
-    /// if it diverges from `self.lbamap`. Called at the end of every method
-    /// that mutates `self.lbamap` so any drift trips at the introducing
-    /// site, not three operations later as a stale-cancel or oracle
-    /// mismatch.
+    /// if it diverges from `self.lbamap`. Called at the end of every
+    /// **structural** op (segment-shape mutations: redact apply, promote,
+    /// GC plan apply, checkpoint flush, volume open) so any drift trips at
+    /// the introducing site, not three operations later as a stale-cancel
+    /// or oracle mismatch.
+    ///
+    /// Deliberately **not** called from `write` / `write_zeroes` — those
+    /// are high-frequency incremental `lbamap.insert` updates that have
+    /// been stable for a long time, and any drift they introduced would
+    /// be caught at the next structural op anyway. Asserting on every
+    /// individual write doubles proptest runtime.
     ///
     /// Gated behind the `proptest` feature so debug builds and the regular
     /// `cargo test` suite aren't slowed by the per-op rebuild. The
