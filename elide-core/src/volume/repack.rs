@@ -276,6 +276,7 @@ impl Volume {
     ///   - If every entry was dead: the worker already deleted the
     ///     input file; nothing more to unlink.
     ///   - Evict the file-cache fd for the input ULID either way.
+    ///
     /// Then `rebuild_lbamap_from_disk` so any sub-run hashes from
     /// `Run` records introduced by the rewrite are reflected.
     pub fn apply_repack_result(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
