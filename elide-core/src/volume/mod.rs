@@ -1477,6 +1477,57 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_extent_index_consistent(&self, _caller: &'static str) {}
 
+    /// Stress-only invariant: every non-zero hash in `self.lbamap` must
+    /// be resolvable through `self.extent_index` (either as a DATA-style
+    /// owner or a Delta-canonical owner). An unresolvable hash means a
+    /// future read of that LBA would fail at the extent_index lookup —
+    /// silent data unavailability waiting to surface.
+    ///
+    /// Pure in-memory check (no disk rebuild), so cheap relative to the
+    /// other invariants — linear in lbamap entry count, two HashMap
+    /// lookups per entry. Catches the bug class "lbamap retains a hash
+    /// claim while extent_index lost the body location" — typically an
+    /// apply path that removed from extent_index without also pruning
+    /// the lbamap claim.
+    ///
+    /// `ZERO_HASH` is a sentinel meaning "this LBA reads as all zeros";
+    /// it never resolves through extent_index by design. Skipped here.
+    #[cfg(feature = "volume-invariants")]
+    pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, caller: &'static str) {
+        let mut unresolved: Vec<(u64, blake3::Hash)> = Vec::new();
+        for (lba, _len, hash, _anchor) in self.lbamap.iter_entries() {
+            if hash == ZERO_HASH {
+                continue;
+            }
+            if self.extent_index.lookup(&hash).is_some() {
+                continue;
+            }
+            if self.extent_index.lookup_delta(&hash).is_some() {
+                continue;
+            }
+            unresolved.push((lba, hash));
+            if unresolved.len() >= 8 {
+                break;
+            }
+        }
+        if !unresolved.is_empty() {
+            let mut msg = format!(
+                "lbamap-hashes-resolvable invariant violation after [{caller}]: \
+                 {} hash(es) unresolvable through extent_index",
+                unresolved.len()
+            );
+            for (lba, hash) in &unresolved {
+                msg.push_str(&format!("\n  lba={lba} hash={}", hash.to_hex()));
+            }
+            panic!("{msg}");
+        }
+    }
+
+    /// No-op stub when `volume-invariants` feature is disabled.
+    #[cfg(not(feature = "volume-invariants"))]
+    #[inline]
+    pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, _caller: &'static str) {}
+
     /// Umbrella over every `assert_*` runtime invariant. Call this at
     /// the end of each structural state-mutating method instead of the
     /// individual asserts — adding a new invariant only requires
@@ -1491,6 +1542,7 @@ impl Volume {
         self.assert_lbamap_consistent(caller);
         self.assert_pending_above_committed(caller);
         self.assert_extent_index_consistent(caller);
+        self.assert_lbamap_hashes_resolvable(caller);
     }
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,

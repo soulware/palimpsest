@@ -1909,6 +1909,15 @@ fn crash_recovery_writemulti_dedup_regression() {
     common::populate_cache(fork_dir, cache_ulid, 16, effective_seed);
     oracle.insert(16, [effective_seed; 4096]);
 
+    // populate_cache writes directly to disk; drop+reopen so both
+    // self.lbamap and self.extent_index pick up the populated entry —
+    // without this, the next mutating op trips
+    // `assert_lbamap_hashes_resolvable` (lbamap rebuilds from disk via
+    // some apply paths, but extent_index doesn't, so lbamap[16] points
+    // at a hash extent_index doesn't know about).
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
     // GcApply n=2.
     let to_delete =
         if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {

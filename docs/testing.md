@@ -149,6 +149,8 @@ Currently in the umbrella:
 
 - **`assert_extent_index_consistent`** — every hash in `self.extent_index` must point at a segment that exists somewhere on disk. Catches phantom entries (e.g. inserting `ZERO_HASH` by mistake) and entries pointing at deleted segments. Deliberately doesn't enforce specific `segment_id` agreement (in-memory and disk-rebuild legitimately diverge there because some apply paths use unconditional `insert` while rebuild uses `insert_if_absent`) and doesn't fire on "disk has more than memory" (pre-existing redact/GC-prune-ancestor behaviour, out of scope).
 
+- **`assert_lbamap_hashes_resolvable`** — every non-zero hash in `self.lbamap` must be resolvable through `self.extent_index` (either as DATA-canonical or Delta-canonical). Pure in-memory check, linear in lbamap entry count with two HashMap lookups per entry — cheap relative to the rebuild-from-disk invariants. Catches the bug class "lbamap retains a hash claim while extent_index lost the body location": a future read of that LBA would fail at the extent_index lookup, silent data unavailability waiting to surface.
+
 #### When tests trip the invariant
 
 Two recurring shapes, both test-setup artifacts that don't reflect production paths:
