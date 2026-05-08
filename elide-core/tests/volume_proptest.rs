@@ -1941,3 +1941,141 @@ fn crash_recovery_writemulti_dedup_regression() {
         );
     }
 }
+
+/// Minimal isolated reproducer (no CoordGcLocal): two pending segments
+/// — one from a prior flush, one from current WriteMulti payloads —
+/// where the first WriteMulti's middle LBAs are still live but its
+/// head LBA was overwritten by the second WriteMulti. Sweep merges
+/// both pending segments; repack on the merged output loses bytes.
+#[test]
+fn writemulti_overlap_sweep_then_repack_regression() {
+    use elide_core::volume::Volume;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fork_dir = tmp.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    let fork_dir = fork_dir.as_path();
+    let store_dir = tmp.path().join("_store");
+    common::write_test_keypair(fork_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    // Seed pending with one segment so sweep has a 2-input bucket
+    // (sweep no-ops with <2 inputs).
+    let _ = vol.write(0, &[0u8; 4096]);
+    oracle.insert(0, [0u8; 4096]);
+    vol.flush_wal().unwrap();
+
+    let write_multi = |vol: &mut Volume,
+                       oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+                       start_lba: u8,
+                       lba_count: u8,
+                       seed: u8| {
+        let mut payload = Vec::with_capacity(lba_count as usize * 4096);
+        for i in 0..lba_count {
+            payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+        }
+        let start = 40 + start_lba as u64;
+        if vol.write(start, &payload).is_ok() {
+            for i in 0..lba_count as usize {
+                let mut block = [0u8; 4096];
+                block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                oracle.insert(start + i as u64, block);
+            }
+        }
+    };
+
+    write_multi(&mut vol, &mut oracle, 3, 4, 0);
+    write_multi(&mut vol, &mut oracle, 2, 2, 0);
+
+    let _ = vol.sweep_pending();
+    let _ = vol.repack();
+
+    drop(vol);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    common::assert_promote_recovery(&mut vol, fork_dir);
+    for (&lba, expected) in &oracle {
+        let actual = vol.read(lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {lba} wrong after Crash"
+        );
+    }
+}
+
+/// Deterministic reproducer for `gc_interleaved_oracle` shrunk failure
+/// (PR #291 CI run 25563279365). LBA 45 reads back zeros after Crash.
+#[test]
+fn gc_interleaved_writemulti_overlap_regression() {
+    use elide_core::volume::Volume;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fork_dir = tmp.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    let fork_dir = fork_dir.as_path();
+    let store_dir = tmp.path().join("_store");
+    common::write_test_keypair(fork_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    // DedupWrite { lba_a: 0, lba_b: 4, seed: 0 }
+    let data = [0u8; 4096];
+    let _ = vol.write(0, &data);
+    let _ = vol.write(4, &data);
+    oracle.insert(0, data);
+    oracle.insert(4, data);
+
+    // CoordGcLocal { n: 2 }
+    common::drain_with_repack(&mut vol);
+    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let to_delete =
+        if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
+            paths
+        } else {
+            vec![]
+        };
+    let applied = vol.apply_gc_handoffs().unwrap_or(0);
+    if applied > 0 {
+        for path in &to_delete {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    let write_multi = |vol: &mut Volume,
+                       oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+                       start_lba: u8,
+                       lba_count: u8,
+                       seed: u8| {
+        let mut payload = Vec::with_capacity(lba_count as usize * 4096);
+        for i in 0..lba_count {
+            payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+        }
+        let start = 40 + start_lba as u64;
+        if vol.write(start, &payload).is_ok() {
+            for i in 0..lba_count as usize {
+                let mut block = [0u8; 4096];
+                block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                oracle.insert(start + i as u64, block);
+            }
+        }
+    };
+
+    write_multi(&mut vol, &mut oracle, 3, 4, 0);
+    write_multi(&mut vol, &mut oracle, 2, 2, 0);
+
+    let _ = vol.sweep_pending();
+    let _ = vol.repack();
+
+    drop(vol);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    common::assert_promote_recovery(&mut vol, fork_dir);
+    for (&lba, expected) in &oracle {
+        let actual = vol.read(lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {lba} wrong after Crash"
+        );
+    }
+}
