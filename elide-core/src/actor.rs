@@ -952,7 +952,7 @@ impl VolumeActor {
                     };
                     match req {
                         VolumeRequest::Write { lba, data, reply } => {
-                            let result = self.volume.write(lba, &data);
+                            let result = self.volume.write_owned(lba, data);
                             if result.is_ok() {
                                 let (lbamap, extent_index) = self.volume.snapshot_maps();
                                 self.snapshot.store(Arc::new(ReadSnapshot {
