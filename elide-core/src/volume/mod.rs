@@ -1271,7 +1271,24 @@ impl Volume {
             let disk_hash = fresh.hash_at(lba);
             let mem_claimant = self.lbamap.claimant_at(lba);
             let disk_claimant = fresh.claimant_at(lba);
-            if mem_hash != disk_hash || mem_claimant != disk_claimant {
+            // Hash mismatch is always a bug.
+            //
+            // Claimant: only flag in_memory < disk (or one Some / one
+            // None). The benign direction is in_memory > disk: GC apply
+            // mints `u_gc < u_flush` so post-checkpoint flush'd writes
+            // win on overlap; when GC consumes such a flush'd input, the
+            // in-memory claimant retains the higher `u_flush` while
+            // disk-rebuild produces `u_gc` (the consumed input is gone).
+            // Reads use hash; future structural commits' precedence is
+            // u_future > both. Catching only `in_memory < disk` still
+            // catches the bug class we care about (a path that failed
+            // to bump the in-memory claimant when disk advanced).
+            let claimant_drift = match (mem_claimant, disk_claimant) {
+                (Some(m), Some(d)) => m < d,
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
+            if mem_hash != disk_hash || claimant_drift {
                 diverging.push(Diverge {
                     lba,
                     mem_hash,
