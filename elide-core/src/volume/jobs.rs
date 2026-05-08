@@ -31,6 +31,12 @@ pub struct PromoteJob {
     /// CAS precondition tokens: the `body_offset` each Data/Inline entry
     /// had in the extent index at prep time.  `None` for DedupRef/Zero/Delta.
     pub pre_promote_offsets: Vec<Option<u64>>,
+    /// Where each body-bearing entry's bytes live in the WAL — `Some(off)`
+    /// for Data / Inline kinds, `None` otherwise. The worker reads from
+    /// the WAL via these offsets just before `write_and_commit`, so the
+    /// actor's `pending_entries` never carries body bytes between commit
+    /// and promote.
+    pub body_offsets: Vec<Option<u64>>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub pending_dir: PathBuf,
 }

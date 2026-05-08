@@ -310,6 +310,14 @@ const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
 /// metadata while keeping real data in the body section.
 const INLINE_THRESHOLD: usize = 256;
 
+/// True if a stored payload of this length would be classified as
+/// [`EntryKind::Inline`] rather than [`EntryKind::Data`]. Exposed for
+/// callers (e.g. the volume write path) that need to mirror this
+/// decision before constructing a `SegmentEntry`.
+pub fn would_be_inline(stored_length: usize) -> bool {
+    stored_length < INLINE_THRESHOLD
+}
+
 /// Compute the byte length of the base entries + delta table region.
 ///
 /// Does not include the inputs table. Total index section length is this
@@ -509,7 +517,7 @@ impl SegmentEntry {
         data: Vec<u8>,
     ) -> Self {
         let stored_length = data.len() as u32;
-        let kind = if data.len() < INLINE_THRESHOLD {
+        let kind = if would_be_inline(data.len()) {
             EntryKind::Inline
         } else {
             EntryKind::Data
@@ -523,6 +531,40 @@ impl SegmentEntry {
             stored_offset: 0, // filled by write_segment
             stored_length,
             data: Some(data),
+            delta_options: Vec::new(),
+        }
+    }
+
+    /// Create a DATA / INLINE entry whose body bytes are *not* held in
+    /// memory yet (`data: None`).
+    ///
+    /// Used by the volume write path when the body bytes have just been
+    /// appended to the WAL: the body source is recorded out-of-band
+    /// (`Volume::pending_body_offsets`) and `entry.data` is materialised
+    /// from the WAL at promote time. `stored_length` and `kind` are
+    /// derived from the original payload length — the same way
+    /// [`SegmentEntry::new_data`] would have classified the bytes.
+    pub fn new_data_no_body(
+        hash: blake3::Hash,
+        start_lba: u64,
+        lba_length: u32,
+        flags: SegmentFlags,
+        stored_length: u32,
+    ) -> Self {
+        let kind = if would_be_inline(stored_length as usize) {
+            EntryKind::Inline
+        } else {
+            EntryKind::Data
+        };
+        Self {
+            hash,
+            start_lba,
+            lba_length,
+            compressed: flags.contains(SegmentFlags::COMPRESSED),
+            kind,
+            stored_offset: 0,
+            stored_length,
+            data: None,
             delta_options: Vec::new(),
         }
     }

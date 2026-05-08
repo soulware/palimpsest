@@ -132,6 +132,35 @@ pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
 /// memory growth on large volumes.
 const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 
+/// Read body bytes for each pending entry whose body lives in the WAL,
+/// populating `entry.data` with the bytes pread'd from `wal_path`.
+///
+/// `body_offsets` is parallel to `entries`: `Some(off)` means the entry's
+/// body lives at `off..off + entry.stored_length` in the WAL file; `None`
+/// means the entry has no body bytes (DedupRef, Zero, Delta) or the body
+/// is already in `entry.data`. Used both at promote time (write_and_commit
+/// needs the body in memory to write the segment) and at recovery-time
+/// startup promote.
+pub(crate) fn materialise_pending_bodies(
+    wal_path: &Path,
+    entries: &mut [segment::SegmentEntry],
+    body_offsets: &[Option<u64>],
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    debug_assert_eq!(entries.len(), body_offsets.len());
+    if !body_offsets.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    let f = fs::File::open(wal_path)?;
+    for (entry, off) in entries.iter_mut().zip(body_offsets.iter()) {
+        let Some(off) = off else { continue };
+        let mut buf = vec![0u8; entry.stored_length as usize];
+        f.read_exact_at(&mut buf, *off)?;
+        entry.data = Some(buf);
+    }
+    Ok(())
+}
+
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedApply {
@@ -185,6 +214,14 @@ pub struct Volume {
     /// DATA and REF extents written since the last promotion; used to write
     /// the clean segment file on the next promote().
     pub(in crate::volume) pending_entries: Vec<segment::SegmentEntry>,
+    /// Parallel to `pending_entries`: where to read body bytes from at
+    /// promote time. `Some(offset)` means the body lives in the WAL at
+    /// that offset (length == `entry.stored_length`); `None` means the
+    /// entry has no body (DedupRef, Zero, Delta) or its body is
+    /// already in `entry.data`. Populated by `write_commit` and by
+    /// `recover_wal` so that body bytes never live twice (in
+    /// `pending_entries.data` *and* in the WAL/page cache).
+    pub(in crate::volume) pending_body_offsets: Vec<Option<u64>>,
     /// True if at least one segment has been committed since the last snapshot
     /// (or since open, if no snapshot has been taken this session). Used by
     /// `snapshot()` to decide whether a new marker is needed or the latest
@@ -394,15 +431,22 @@ impl Volume {
             Vec::new()
         };
         for wal_path in wal_files_to_promote {
-            let (old_wal_ulid, _valid_size, mut entries) =
-                replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
-            if entries.is_empty() {
+            let wal::WalReplay {
+                ulid: old_wal_ulid,
+                valid_size: _,
+                mut pending_entries,
+                body_offsets,
+            } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
+            if pending_entries.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
             }
+            // Materialise body bytes into entry.data — the WAL is about to
+            // be deleted, so write_and_commit needs the body in memory.
+            materialise_pending_bodies(&wal_path, &mut pending_entries, &body_offsets)?;
             // Snapshot pre-promote WAL offsets for the CAS apply, matching
             // `flush_wal_to_pending_as`.
-            let pre_promote_offsets: Vec<Option<u64>> = entries
+            let pre_promote_offsets: Vec<Option<u64>> = pending_entries
                 .iter()
                 .map(|e| match e.kind {
                     EntryKind::Data
@@ -418,10 +462,13 @@ impl Volume {
             let body_section_start = segment::write_and_commit(
                 &pending_dir,
                 segment_ulid,
-                &mut entries,
+                &mut pending_entries,
                 signer.as_ref(),
             )?;
-            for (entry, old_wal_offset) in entries.iter().zip(pre_promote_offsets.iter().copied()) {
+            for (entry, old_wal_offset) in pending_entries
+                .iter()
+                .zip(pre_promote_offsets.iter().copied())
+            {
                 match entry.kind {
                     EntryKind::Data
                     | EntryKind::Inline
@@ -454,7 +501,7 @@ impl Volume {
             }
             // Bump lbamap claimants from wal_ulid to segment_ulid;
             // mirrors the same loop in `flush_wal_to_pending_as`.
-            for entry in &entries {
+            for entry in &pending_entries {
                 if entry.kind.is_canonical_only() {
                     continue;
                 }
@@ -483,13 +530,23 @@ impl Volume {
         // When no WAL file is present on disk, leave `wal` as None; the next
         // write lazily opens a fresh WAL. This avoids creating an empty WAL
         // for read-only volumes and idle sessions that never write.
-        let (wal, pending_entries) = if let Some(path) = wal_files.into_iter().last() {
-            let (wal, ulid, path, pending_entries) =
-                recover_wal(path, &mut lbamap, &mut extent_index)?;
-            (Some(OpenWal { wal, ulid, path }), pending_entries)
-        } else {
-            (None, Vec::new())
-        };
+        let (wal, pending_entries, pending_body_offsets) =
+            if let Some(path) = wal_files.into_iter().last() {
+                let wal::RecoveredWal {
+                    wal,
+                    ulid,
+                    path,
+                    pending_entries,
+                    body_offsets,
+                } = recover_wal(path, &mut lbamap, &mut extent_index)?;
+                (
+                    Some(OpenWal { wal, ulid, path }),
+                    pending_entries,
+                    body_offsets,
+                )
+            } else {
+                (None, Vec::new(), Vec::new())
+            };
 
         let has_new_segments = !pending_entries.is_empty()
             || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
@@ -502,6 +559,7 @@ impl Volume {
             extent_index: Arc::new(extent_index),
             wal,
             pending_entries,
+            pending_body_offsets,
             has_new_segments,
             last_segment_ulid,
             file_cache: RefCell::new(FileCache::default()),
@@ -633,6 +691,7 @@ impl Volume {
             // body bytes and no body reservation.
             self.pending_entries
                 .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
+            self.pending_body_offsets.push(None);
             return Ok(());
         }
 
@@ -642,6 +701,7 @@ impl Volume {
             segment::SegmentFlags::empty()
         };
 
+        let stored_length = owned_data.len() as u32;
         let (body_offset, wal_ulid) = {
             let open = self.ensure_wal_open()?;
             let offset = open
@@ -649,6 +709,10 @@ impl Volume {
                 .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
             (offset, open.ulid)
         };
+        // The body is now durable in the WAL — drop the heap copy. The
+        // promote path will pread it back from the WAL into a fresh
+        // `entry.data` just before writing the pending segment.
+        drop(owned_data);
         Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
@@ -657,16 +721,22 @@ impl Volume {
             extentindex::ExtentLocation {
                 segment_id: wal_ulid,
                 body_offset,
-                body_length: owned_data.len() as u32,
+                body_length: stored_length,
                 compressed,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
             },
         );
-        self.pending_entries.push(segment::SegmentEntry::new_data(
-            hash, lba, lba_length, seg_flags, owned_data,
-        ));
+        self.pending_entries
+            .push(segment::SegmentEntry::new_data_no_body(
+                hash,
+                lba,
+                lba_length,
+                seg_flags,
+                stored_length,
+            ));
+        self.pending_body_offsets.push(Some(body_offset));
 
         Ok(())
     }
@@ -678,7 +748,7 @@ impl Volume {
     fn ensure_wal_open(&mut self) -> io::Result<&mut OpenWal> {
         if self.wal.is_none() {
             let ulid = self.mint.next();
-            let (wal, ulid, path, _) = create_fresh_wal(&self.base_dir.join("wal"), ulid)?;
+            let (wal, ulid, path) = create_fresh_wal(&self.base_dir.join("wal"), ulid)?;
             self.wal = Some(OpenWal { wal, ulid, path });
         }
         // ensure_wal_open just populated self.wal if it was None.
@@ -704,6 +774,7 @@ impl Volume {
         Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
         self.pending_entries
             .push(segment::SegmentEntry::new_zero(start_lba, lba_count));
+        self.pending_body_offsets.push(None);
         Ok(())
     }
 
@@ -1957,6 +2028,15 @@ impl Volume {
         // inherits the correct precondition check.
         let old_wal_ulid = open.ulid;
         let old_wal_path = open.path;
+        // Materialise body bytes from the WAL so write_and_commit can
+        // write the segment. Body bytes for Data / Inline entries written
+        // via `write_commit` live only in the WAL between commit and
+        // promote — `pending_body_offsets[i]` records the offset for each.
+        materialise_pending_bodies(
+            &old_wal_path,
+            &mut self.pending_entries,
+            &self.pending_body_offsets,
+        )?;
         let pre_promote_offsets: Vec<Option<u64>> = self
             .pending_entries
             .iter()
@@ -2068,6 +2148,7 @@ impl Volume {
             );
         }
         self.pending_entries.clear();
+        self.pending_body_offsets.clear();
         // index/<ulid>.idx is written later by the promote_segment IPC handler,
         // after the coordinator confirms S3 upload. Until then pending/<ulid>
         // is the authoritative body source for both reads and crash recovery.
@@ -2467,6 +2548,7 @@ impl Volume {
             .collect();
 
         let entries = std::mem::take(&mut self.pending_entries);
+        let body_offsets = std::mem::take(&mut self.pending_body_offsets);
         let segment_ulid = self.mint.next();
         let pending_dir = self.base_dir.join("pending");
 
@@ -2476,6 +2558,7 @@ impl Volume {
             old_wal_path,
             entries,
             pre_promote_offsets,
+            body_offsets,
             signer: Arc::clone(&self.signer),
             pending_dir,
         }))
@@ -2652,6 +2735,7 @@ impl Volume {
             .collect();
 
         let entries = std::mem::take(&mut self.pending_entries);
+        let body_offsets = std::mem::take(&mut self.pending_body_offsets);
         let pending_dir = self.base_dir.join("pending");
 
         Ok(GcCheckpointPrep {
@@ -2663,6 +2747,7 @@ impl Volume {
                 old_wal_path,
                 entries,
                 pre_promote_offsets,
+                body_offsets,
                 signer: Arc::clone(&self.signer),
                 pending_dir,
             }),

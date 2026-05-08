@@ -1975,6 +1975,15 @@ impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
 fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
     std::fs::File::open(&job.old_wal_path)?.sync_data()?;
 
+    // Body bytes for entries written via `write_commit` live only in the
+    // WAL between commit and promote. Pull them into `entry.data` from
+    // the WAL using `body_offsets` before write_and_commit reads them.
+    crate::volume::materialise_pending_bodies(
+        &job.old_wal_path,
+        &mut job.entries,
+        &job.body_offsets,
+    )?;
+
     let body_section_start = segment::write_and_commit(
         &job.pending_dir,
         job.segment_ulid,

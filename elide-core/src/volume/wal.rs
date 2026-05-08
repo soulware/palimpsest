@@ -15,9 +15,25 @@ use crate::{
 
 use super::ZERO_HASH;
 
+/// Output of [`replay_wal_records`]: the parsed records turned into
+/// pending segment entries, plus parallel `body_offsets` recording where
+/// each entry's body bytes live in the WAL file.
+///
+/// `body_offsets[i]` is `Some(off)` when `pending_entries[i]` is a
+/// body-bearing kind (Data / Inline) — the body lives at `off..off+stored_length`
+/// in the WAL — and `None` for kinds with no body (DedupRef, Zero). Data
+/// entries returned here have `entry.data: None`; the bytes are read
+/// from the WAL on promote, not held in memory.
+pub(super) struct WalReplay {
+    pub ulid: Ulid,
+    pub valid_size: u64,
+    pub pending_entries: Vec<segment::SegmentEntry>,
+    pub body_offsets: Vec<Option<u64>>,
+}
+
 /// Scan a WAL file and replay its records into `lbamap` + `extent_index`,
 /// returning the WAL ULID, the valid (non-partial) tail size, and the
-/// reconstructed pending_entries list.
+/// reconstructed pending_entries list (with parallel WAL body offsets).
 ///
 /// Shared between:
 /// - [`recover_wal`], which also reopens the file for continued appending
@@ -31,7 +47,7 @@ pub(super) fn replay_wal_records(
     path: &Path,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-) -> io::Result<(Ulid, u64, Vec<segment::SegmentEntry>)> {
+) -> io::Result<WalReplay> {
     let ulid_str = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -41,6 +57,7 @@ pub(super) fn replay_wal_records(
     let (records, valid_size) = writelog::scan(path)?;
 
     let mut pending_entries = Vec::new();
+    let mut body_offsets = Vec::new();
     for record in records {
         match record {
             writelog::LogRecord::Data {
@@ -74,9 +91,18 @@ pub(super) fn replay_wal_records(
                         inline_data: None,
                     },
                 );
-                pending_entries.push(segment::SegmentEntry::new_data(
-                    hash, start_lba, lba_length, seg_flags, data,
+                // Drop the body bytes here — they live in the WAL at
+                // `body_offset` and the promote path reads them via that
+                // sidecar offset rather than carrying them in memory.
+                drop(data);
+                pending_entries.push(segment::SegmentEntry::new_data_no_body(
+                    hash,
+                    start_lba,
+                    lba_length,
+                    seg_flags,
+                    body_length,
                 ));
+                body_offsets.push(Some(body_offset));
             }
             writelog::LogRecord::Ref {
                 hash,
@@ -90,6 +116,7 @@ pub(super) fn replay_wal_records(
                 pending_entries.push(segment::SegmentEntry::new_dedup_ref(
                     hash, start_lba, lba_length,
                 ));
+                body_offsets.push(None);
             }
             writelog::LogRecord::Zero {
                 start_lba,
@@ -97,11 +124,17 @@ pub(super) fn replay_wal_records(
             } => {
                 lbamap.insert(start_lba, lba_length, ZERO_HASH, ulid);
                 pending_entries.push(segment::SegmentEntry::new_zero(start_lba, lba_length));
+                body_offsets.push(None);
             }
         }
     }
 
-    Ok((ulid, valid_size, pending_entries))
+    Ok(WalReplay {
+        ulid,
+        valid_size,
+        pending_entries,
+        body_offsets,
+    })
 }
 
 /// Scan an existing WAL, replay its records into `lbamap`, rebuild
@@ -110,19 +143,28 @@ pub(super) fn replay_wal_records(
 /// This is the single WAL scan on startup — it both updates the LBA map
 /// (WAL is more recent than any segment) and recovers the pending_entries
 /// list needed for the next promotion.
+pub(super) struct RecoveredWal {
+    pub wal: writelog::WriteLog,
+    pub ulid: Ulid,
+    pub path: PathBuf,
+    pub pending_entries: Vec<segment::SegmentEntry>,
+    pub body_offsets: Vec<Option<u64>>,
+}
+
 pub(super) fn recover_wal(
     path: PathBuf,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-) -> io::Result<(
-    writelog::WriteLog,
-    Ulid,
-    PathBuf,
-    Vec<segment::SegmentEntry>,
-)> {
-    let (ulid, valid_size, pending_entries) = replay_wal_records(&path, lbamap, extent_index)?;
-    let wal = writelog::WriteLog::reopen(&path, valid_size)?;
-    Ok((wal, ulid, path, pending_entries))
+) -> io::Result<RecoveredWal> {
+    let replay = replay_wal_records(&path, lbamap, extent_index)?;
+    let wal = writelog::WriteLog::reopen(&path, replay.valid_size)?;
+    Ok(RecoveredWal {
+        wal,
+        ulid: replay.ulid,
+        path,
+        pending_entries: replay.pending_entries,
+        body_offsets: replay.body_offsets,
+    })
 }
 
 /// Create a new WAL file using the provided `ulid`.
@@ -132,14 +174,9 @@ pub(super) fn recover_wal(
 pub(super) fn create_fresh_wal(
     wal_dir: &Path,
     ulid: Ulid,
-) -> io::Result<(
-    writelog::WriteLog,
-    Ulid,
-    PathBuf,
-    Vec<segment::SegmentEntry>,
-)> {
+) -> io::Result<(writelog::WriteLog, Ulid, PathBuf)> {
     let path = wal_dir.join(ulid.to_string());
     let wal = writelog::WriteLog::create(&path)?;
     log::info!("new WAL {ulid}");
-    Ok((wal, ulid, path, Vec::new()))
+    Ok((wal, ulid, path))
 }
