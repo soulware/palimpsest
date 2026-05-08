@@ -127,6 +127,10 @@ impl WriteLog {
     ///
     /// Returns the byte offset of the data payload within the WAL file, for use
     /// as the temporary extent index location to enable reads before promotion.
+    ///
+    /// The header is built into a stack buffer and the body is written
+    /// alongside it via `writev`, so each call costs at most one syscall on
+    /// regular files.
     pub fn append_data(
         &mut self,
         start_lba: u64,
@@ -140,16 +144,19 @@ impl WriteLog {
             "use append_ref for dedup references"
         );
 
-        let mut header = Vec::with_capacity(32 + 10 + 5 + 1 + 5);
-        header.extend_from_slice(hash.as_bytes());
-        push_varint(&mut header, start_lba);
-        push_varint32(&mut header, lba_length);
-        header.push(flags.bits());
-        push_varint32(&mut header, data.len() as u32);
+        let mut header = [0u8; HEADER_BUF_LEN];
+        let mut hlen = 0;
+        header[..32].copy_from_slice(hash.as_bytes());
+        hlen += 32;
+        hlen += encode_varint(start_lba, &mut header[hlen..]);
+        hlen += encode_varint(lba_length as u64, &mut header[hlen..]);
+        header[hlen] = flags.bits();
+        hlen += 1;
+        hlen += encode_varint(data.len() as u64, &mut header[hlen..]);
 
-        self.write_all_bytes(&header)?;
-        let body_offset = self.size;
-        self.write_all_bytes(data)?;
+        let body_offset = self.size + hlen as u64;
+        write_all_vectored(&self.writer, &header[..hlen], data)?;
+        self.size += hlen as u64 + data.len() as u64;
         Ok(body_offset)
     }
 
@@ -163,13 +170,16 @@ impl WriteLog {
         lba_length: u32,
         hash: &blake3::Hash,
     ) -> io::Result<()> {
-        let mut rec = Vec::with_capacity(32 + 10 + 5 + 1);
-        rec.extend_from_slice(hash.as_bytes());
-        push_varint(&mut rec, start_lba);
-        push_varint32(&mut rec, lba_length);
-        rec.push(WalFlags::DEDUP_REF.bits());
+        let mut rec = [0u8; HEADER_BUF_LEN];
+        let mut rlen = 0;
+        rec[..32].copy_from_slice(hash.as_bytes());
+        rlen += 32;
+        rlen += encode_varint(start_lba, &mut rec[rlen..]);
+        rlen += encode_varint(lba_length as u64, &mut rec[rlen..]);
+        rec[rlen] = WalFlags::DEDUP_REF.bits();
+        rlen += 1;
 
-        self.write_all_bytes(&rec)
+        self.write_all_bytes(&rec[..rlen])
     }
 
     /// Append a zero-extent record. No data payload is written.
@@ -177,13 +187,15 @@ impl WriteLog {
     /// The entire LBA range will read back as zeros. A single record can cover
     /// the full volume — there is no chunking needed since there is no data body.
     pub fn append_zero(&mut self, start_lba: u64, lba_length: u32) -> io::Result<()> {
-        let mut rec = Vec::with_capacity(32 + 10 + 5 + 1);
-        rec.extend_from_slice(&[0u8; 32]); // ZERO_HASH sentinel
-        push_varint(&mut rec, start_lba);
-        push_varint32(&mut rec, lba_length);
-        rec.push(WalFlags::ZERO.bits());
+        let mut rec = [0u8; HEADER_BUF_LEN];
+        // bytes 0..32 are already zero — that's the ZERO_HASH sentinel.
+        let mut rlen = 32;
+        rlen += encode_varint(start_lba, &mut rec[rlen..]);
+        rlen += encode_varint(lba_length as u64, &mut rec[rlen..]);
+        rec[rlen] = WalFlags::ZERO.bits();
+        rlen += 1;
 
-        self.write_all_bytes(&rec)
+        self.write_all_bytes(&rec[..rlen])
     }
 
     /// Fsync the log to disk.
@@ -197,6 +209,37 @@ impl WriteLog {
         self.size += data.len() as u64;
         Ok(())
     }
+}
+
+/// Maximum encoded size of a record header.
+///
+/// 32-byte hash + u64 varint (≤10) + u32 varint (≤5) + flags (1) + u32 varint (≤5).
+/// Round up to 64 to keep the stack buffer cleanly sized.
+const HEADER_BUF_LEN: usize = 64;
+
+/// Write `head` followed by `tail` to `file` in a single `writev` call where
+/// the kernel allows it; loop on partial writes (rare for regular files).
+fn write_all_vectored(mut file: &File, head: &[u8], tail: &[u8]) -> io::Result<()> {
+    let mut head = head;
+    let mut tail = tail;
+    while !head.is_empty() || !tail.is_empty() {
+        let bufs = [io::IoSlice::new(head), io::IoSlice::new(tail)];
+        let n = file.write_vectored(&bufs)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_vectored wrote zero bytes",
+            ));
+        }
+        if n >= head.len() {
+            let rest = n - head.len();
+            head = &[];
+            tail = &tail[rest..];
+        } else {
+            head = &head[n..];
+        }
+    }
+    Ok(())
 }
 
 /// Scan an existing write log without modifying it.
@@ -384,20 +427,21 @@ fn read_varint32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
 
 // --- write varint helpers ---
 
-fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
+/// Encode `v` into the start of `out` as a u64 varint and return the number
+/// of bytes written. Caller must ensure `out` has at least 10 bytes — the
+/// max u64 varint length.
+fn encode_varint(mut v: u64, out: &mut [u8]) -> usize {
+    let mut i = 0;
     loop {
         let b = (v & 0x7f) as u8;
         v >>= 7;
         if v == 0 {
-            buf.push(b);
-            break;
+            out[i] = b;
+            return i + 1;
         }
-        buf.push(b | 0x80);
+        out[i] = b | 0x80;
+        i += 1;
     }
-}
-
-fn push_varint32(buf: &mut Vec<u8>, v: u32) {
-    push_varint(buf, v as u64);
 }
 
 // --- tests ---
