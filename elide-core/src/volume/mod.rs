@@ -1245,17 +1245,21 @@ impl Volume {
         let _ = fs::remove_file(&plan_path);
 
         // Merge the GC output into self.lbamap by per-entry conditional
-        // insert. `insert_if_newer` skips any sub-range whose existing
-        // claimant ULID is >= `new_ulid` — exactly the post-checkpoint
-        // live writes whose WAL/segment ULID is above gc_checkpoint's
-        // mint. Higher-claimant ranges are preserved; the rest take the
-        // GC output. See `docs/design-lbamap-claimant-tracking.md` and
+        // insert. `insert_consuming_inputs` skips any sub-range whose
+        // existing claimant ULID is >= `new_ulid` AND is not one of the
+        // inputs being consumed — exactly the post-checkpoint live writes
+        // whose WAL/segment ULID is above gc_checkpoint's mint. A
+        // claimant that *is* a consumed input is overridable: that
+        // segment is being torn down on disk by this apply, so its
+        // lbamap claim is stale. See `docs/design-lbamap-claimant-tracking.md`,
+        // `docs/finding-sweep-flush-claimant-bug.md`, and
         // `gc_output_loses_to_live_write_applied_after_gc`.
         //
         // Crash ordering: on a crash between rename and the in-memory
         // merge, restart's `Volume::open` rebuild walks the same on-disk
         // segments and produces the same claimant ULIDs.
         let lbamap = Arc::make_mut(&mut self.lbamap);
+        let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
         for e in &entries {
             // CanonicalData / CanonicalInline make no LBA claim — same
             // filter as `lbamap::rebuild_segments_inner`.
@@ -1265,9 +1269,22 @@ impl Volume {
             if e.kind == EntryKind::Delta {
                 let sources: Arc<[blake3::Hash]> =
                     e.delta_options.iter().map(|o| o.source_hash).collect();
-                lbamap.insert_delta_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid, sources);
+                lbamap.insert_delta_consuming_inputs(
+                    e.start_lba,
+                    e.lba_length,
+                    e.hash,
+                    new_ulid,
+                    sources,
+                    &consumed,
+                );
             } else {
-                lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid);
+                lbamap.insert_consuming_inputs(
+                    e.start_lba,
+                    e.lba_length,
+                    e.hash,
+                    new_ulid,
+                    &consumed,
+                );
             }
         }
         self.assert_volume_invariants("apply_plan_apply_result_applied");
@@ -1375,18 +1392,12 @@ impl Volume {
             let disk_hash = fresh.hash_at(lba);
             let mem_claimant = self.lbamap.claimant_at(lba);
             let disk_claimant = fresh.claimant_at(lba);
-            // Hash mismatch is always a bug.
-            //
-            // Claimant: only flag in_memory < disk (or one Some / one
-            // None). The benign direction is in_memory > disk: GC apply
-            // mints `u_gc < u_flush` so post-checkpoint flush'd writes
-            // win on overlap; when GC consumes such a flush'd input, the
-            // in-memory claimant retains the higher `u_flush` while
-            // disk-rebuild produces `u_gc` (the consumed input is gone).
-            // Reads use hash; future structural commits' precedence is
-            // u_future > both. Catching only `in_memory < disk` still
-            // catches the bug class we care about (a path that failed
-            // to bump the in-memory claimant when disk advanced).
+            // Hash mismatch is always a bug. Claimant: flag only
+            // `in_memory < disk` (or one Some / one None) — the bug
+            // class is "in-memory failed to bump when disk advanced."
+            // The reverse direction is benign in principle (reads use
+            // hash; future structural commits override via fresher
+            // ULIDs).
             let claimant_drift = match (mem_claimant, disk_claimant) {
                 (Some(m), Some(d)) => m < d,
                 (None, Some(_)) | (Some(_), None) => true,

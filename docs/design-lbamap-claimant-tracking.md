@@ -134,3 +134,25 @@ post hashes, which interacts with the existing
 `set_delta_sources_if_matches` guard. Porting it would mean replacing
 that guard with claimant-comparison semantics — possible but
 non-mechanical, deferred to a separate change.
+
+## Sweep / repack: consumed-input override
+
+`apply_sweep_result` and `apply_repack_result` cannot use
+`insert_if_newer` directly. The sweep / repack pre-mint sequence is
+`u_output_*  <  u_flush`; `prepare_*` mints both, then calls
+`flush_wal_to_pending_as(u_flush)` which bumps lbamap claimants for
+WAL-flushed entries from `wal_ulid` to `u_flush` via
+`set_claimant_if_matches`. By the time the apply phase runs,
+`u_flush` is already on lbamap entries that the apply is about to
+delete from disk — a strict-newer guard treats this as a concurrent
+writer and refuses to install the new output.
+
+`insert_consuming_inputs` / `insert_delta_consuming_inputs` solve this
+by taking the consumed-input ULID set explicitly. An existing claimant
+is treated as overridable iff it appears in that set; concurrent
+writers (claimants outside the set) still block the install as
+before. Both apply paths pass the same input-ULID set they already
+build for the extent-index CAS gate.
+
+See `docs/finding-sweep-flush-claimant-bug.md` for the bug walkthrough
+that motivated the addition.
