@@ -789,7 +789,6 @@ impl ClaimOrchestrator {
         elide_core::config::VolumeConfig {
             name: Some(self.volume.clone()),
             size: Some(size),
-            nbd: None,
             ublk: None,
             lazy: None,
         }

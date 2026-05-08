@@ -1,6 +1,6 @@
 name: ci-kernel
 
-# "Lane C" — kernel-feature integration tests that need ublk_drv / nbd.
+# "Lane C" — kernel-feature integration tests that need ublk_drv.
 # GitHub's hosted runners deny modprobe for arbitrary modules on the host
 # kernel, so we boot a nested KVM VM with an Ubuntu 24.04 cloud image and
 # run the kernel-dependent tests inside the guest.
@@ -49,14 +49,14 @@ jobs:
         id: build-tests
         run: |
           echo "::group::cargo test --no-run"
-          # --tests compiles the lib-test binary (hosts `nbd::` and `ublk::`
-          # unit tests) AND the integration tests under `tests/` (e.g.
-          # `ublk_crash`, `coordinator_nbd`). As a side-effect cargo
+          # --tests compiles the lib-test binary (hosts `ublk::` unit
+          # tests) AND the integration tests under `tests/` (e.g.
+          # `ublk_crash`, `coordinator_ublk`). As a side-effect cargo
           # also builds the `elide` bin, because the integration tests
           # reference it via CARGO_BIN_EXE_elide.
           #
           # `-p elide-coordinator` additionally builds the coordinator
-          # bin, which `coordinator_nbd` launches as a subprocess.
+          # bin, which `coordinator_ublk` launches as a subprocess.
           cargo test --no-run -p elide -p elide-coordinator --tests --features ublk --message-format=json \
             | tee build-output.json \
             | jq -r 'select(.reason == "compiler-message") | .message.rendered // empty'
@@ -64,12 +64,11 @@ jobs:
 
           LIB_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "elide" and (.target.kind | index("lib"))) | .executable' build-output.json | head -1)
           CRASH_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "ublk_crash") | .executable' build-output.json | head -1)
-          COORD_NBD_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "coordinator_nbd") | .executable' build-output.json | head -1)
           COORD_UBLK_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "coordinator_ublk") | .executable' build-output.json | head -1)
           ELIDE_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == false and .target.name == "elide" and (.target.kind | index("bin"))) | .executable' build-output.json | head -1)
           ELIDE_COORD_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == false and .target.name == "elide-coordinator" and (.target.kind | index("bin"))) | .executable' build-output.json | head -1)
 
-          for pair in "LIB_BIN=$LIB_BIN" "CRASH_BIN=$CRASH_BIN" "COORD_NBD_BIN=$COORD_NBD_BIN" "COORD_UBLK_BIN=$COORD_UBLK_BIN" "ELIDE_BIN=$ELIDE_BIN" "ELIDE_COORD_BIN=$ELIDE_COORD_BIN"; do
+          for pair in "LIB_BIN=$LIB_BIN" "CRASH_BIN=$CRASH_BIN" "COORD_UBLK_BIN=$COORD_UBLK_BIN" "ELIDE_BIN=$ELIDE_BIN" "ELIDE_COORD_BIN=$ELIDE_COORD_BIN"; do
             path="${pair#*=}"
             if [ -z "$path" ] || [ ! -x "$path" ]; then
               echo "missing artifact: $pair"
@@ -80,15 +79,13 @@ jobs:
 
           echo "host lib:         $LIB_BIN"
           echo "host crash:       $CRASH_BIN"
-          echo "host coord-nbd:   $COORD_NBD_BIN"
           echo "host coord-ublk:  $COORD_UBLK_BIN"
           echo "host elide:       $ELIDE_BIN"
           echo "host coordinator: $ELIDE_COORD_BIN"
-          ls -lh "$LIB_BIN" "$CRASH_BIN" "$COORD_NBD_BIN" "$COORD_UBLK_BIN" "$ELIDE_BIN" "$ELIDE_COORD_BIN"
+          ls -lh "$LIB_BIN" "$CRASH_BIN" "$COORD_UBLK_BIN" "$ELIDE_BIN" "$ELIDE_COORD_BIN"
 
           echo "lib_bin=$LIB_BIN" >> "$GITHUB_OUTPUT"
           echo "crash_bin=$CRASH_BIN" >> "$GITHUB_OUTPUT"
-          echo "coord_nbd_bin=$COORD_NBD_BIN" >> "$GITHUB_OUTPUT"
           echo "coord_ublk_bin=$COORD_UBLK_BIN" >> "$GITHUB_OUTPUT"
           echo "elide_bin=$ELIDE_BIN" >> "$GITHUB_OUTPUT"
           echo "elide_coord_bin=$ELIDE_COORD_BIN" >> "$GITHUB_OUTPUT"
@@ -125,8 +122,7 @@ jobs:
               ssh_authorized_keys:
                 - $(cat id_vm.pub)
           package_update: true
-          packages:
-            - nbd-client
+          packages: []
           EOF
           cat > meta-data <<EOF
           instance-id: ci-vm
@@ -188,8 +184,7 @@ jobs:
           SSH="ssh $SSH_OPTS ci@localhost"
           $SSH 'uname -r'
           $SSH 'sudo modprobe ublk_drv && ls -la /dev/ublk-control'
-          $SSH 'sudo modprobe nbd && ls -la /dev/nbd0'
-          $SSH 'lsmod | grep -E "ublk|^nbd"'
+          $SSH 'lsmod | grep ublk'
 
       - name: Guest — mount repo (9p)
         run: |
@@ -206,38 +201,26 @@ jobs:
 
           LIB_HOST="${{ steps.build-tests.outputs.lib_bin }}"
           CRASH_HOST="${{ steps.build-tests.outputs.crash_bin }}"
-          COORD_NBD_HOST="${{ steps.build-tests.outputs.coord_nbd_bin }}"
           COORD_UBLK_HOST="${{ steps.build-tests.outputs.coord_ublk_bin }}"
           ELIDE_HOST="${{ steps.build-tests.outputs.elide_bin }}"
           ELIDE_COORD_HOST="${{ steps.build-tests.outputs.elide_coord_bin }}"
           LIB_GUEST="/repo${LIB_HOST#$WS}"
           CRASH_GUEST="/repo${CRASH_HOST#$WS}"
-          COORD_NBD_GUEST="/repo${COORD_NBD_HOST#$WS}"
           COORD_UBLK_GUEST="/repo${COORD_UBLK_HOST#$WS}"
           ELIDE_GUEST="/repo${ELIDE_HOST#$WS}"
           ELIDE_COORD_GUEST="/repo${ELIDE_COORD_HOST#$WS}"
 
           echo "host lib:         $LIB_HOST         -> $LIB_GUEST"
           echo "host crash:       $CRASH_HOST       -> $CRASH_GUEST"
-          echo "host coord-nbd:   $COORD_NBD_HOST   -> $COORD_NBD_GUEST"
           echo "host coord-ublk:  $COORD_UBLK_HOST  -> $COORD_UBLK_GUEST"
           echo "host elide:       $ELIDE_HOST       -> $ELIDE_GUEST"
           echo "host coordinator: $ELIDE_COORD_HOST -> $ELIDE_COORD_GUEST"
-          for p in "$LIB_GUEST" "$CRASH_GUEST" "$COORD_NBD_GUEST" "$COORD_UBLK_GUEST" "$ELIDE_GUEST" "$ELIDE_COORD_GUEST"; do
+          for p in "$LIB_GUEST" "$CRASH_GUEST" "$COORD_UBLK_GUEST" "$ELIDE_GUEST" "$ELIDE_COORD_GUEST"; do
             $SSH "test -x $p" || { echo "binary not accessible in guest: $p"; exit 1; }
           done
 
-          echo "::group::nbd tests"
-          time $SSH "$LIB_GUEST nbd:: --nocapture"
-          echo "::endgroup::"
           echo "::group::ublk unit tests"
           time $SSH "$LIB_GUEST ublk:: --nocapture"
-          echo "::endgroup::"
-          # coordinator_nbd spawns `elide-coordinator serve` and the
-          # `elide` CLI; both must be findable via env overrides. No
-          # kernel modules or root required (unix sockets only).
-          echo "::group::coordinator integration (nbd)"
-          time $SSH "env ELIDE_BIN=$ELIDE_GUEST ELIDE_COORDINATOR_BIN=$ELIDE_COORD_GUEST $COORD_NBD_GUEST --nocapture"
           echo "::endgroup::"
           # Crash-injection tests spawn the `elide` binary, open /dev/ublk-control
           # and /dev/ublkbN, so they need root. `sudo env VAR=... cmd` reliably

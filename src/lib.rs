@@ -9,7 +9,7 @@ pub mod extents;
 pub mod full_warm;
 pub mod inspect;
 pub mod inspect_files;
-pub mod nbd;
+pub mod serve;
 pub mod ublk;
 pub mod verify;
 pub mod volume_open;

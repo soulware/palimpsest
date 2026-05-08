@@ -25,22 +25,19 @@
       #!/bin/bash
       set -eux
       apt-get update
-      apt-get install -y nbd-client linux-modules-extra-$(uname -r)
+      apt-get install -y linux-modules-extra-$(uname -r)
       # load now
-      modprobe nbd
       modprobe ublk_drv
       # load on every boot
       cat >/etc/modules-load.d/elide.conf <<EOF
-      nbd
       ublk_drv
       EOF
 
   probes:
-  - description: "nbd and ublk modules loaded"
+  - description: "ublk module loaded"
     script: |
       #!/bin/bash
       set -eux
-      lsmod | grep -q '^nbd ' || exit 1
       lsmod | grep -q '^ublk_drv ' || exit 1
-    hint: "modules failed to load — check 'limactl shell elide-dev sudo dmesg'"
+    hint: "module failed to load — check 'limactl shell elide-dev sudo dmesg'"
 

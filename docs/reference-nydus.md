@@ -118,17 +118,17 @@ For rootfs boot scenarios, Nydus's practical recommendation is to prefetch aggre
 
 | Aspect | Nydus | Elide |
 |---|---|---|
-| Domain | Container image layers | VM block device (NBD) |
+| Domain | Container image layers | VM block device (ublk) |
 | Format | RAFS (chunk-addressed FS) | Log-structured segments (block-addressed) |
 | Metadata separation | Bootstrap + data blobs | LBA map in WAL + segment data |
 | Lazy fetch | HTTP range requests per chunk | Demand-fetch from S3 (planned) |
 | Dedup | Content-addressed chunks | Content-addressed extents |
 | Snapshot model | Linear OCI layer chain | Branching tree (`children/` dir, named forks) |
-| Mount mechanism | FUSE or EROFS via `nydusd` | NBD via `nbd-server` |
+| Mount mechanism | FUSE or EROFS via `nydusd` | ublk block device |
 | Layer writability | Active snapshot = overlayfs upper | Volume is fully writable (COW on fork) |
-| Chunk granularity | 64KB–1MB configurable | 4KB blocks (NBD sector granularity) |
+| Chunk granularity | 64KB–1MB configurable | 4KB blocks |
 | Boot hints | File paths + elapsed time, embedded in bootstrap | LBA ranges, stored in volume metadata (planned) |
-| Hint collection | fanotify in container namespace | NBD read log or filesystem-level tracing (planned) |
+| Hint collection | fanotify in container namespace | block-device read log or filesystem-level tracing (planned) |
 
 The core ideas converge: both separate metadata from data, both use content addressing for dedup, both want lazy remote fetch, both have a boot-hints mechanism. The main differences are domain (filesystem vs block device) and snapshot model (linear OCI chain vs branching tree). Nydus has no concept of mutable forks or branching history.
 

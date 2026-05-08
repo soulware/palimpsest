@@ -2,14 +2,13 @@
 //! coordinator driving a supervised volume over ublk, including a
 //! coordinator restart that exercises Route::Recover.
 //!
-//! Mirrors the structure of `tests/coordinator_nbd.rs` but exercises the
-//! kernel-backed transport, and goes further: after the first coordinator
-//! exits cleanly (shutdown-park leaves the kernel device QUIESCED), a
-//! fresh coordinator is spawned against the same data_dir. Its
-//! supervisor re-adopts the existing fork; the daemon takes
-//! Route::Recover and re-attaches to the still-live `/dev/ublkb<id>`.
-//! Data written before the first shutdown reads back unchanged, and new
-//! writes through the recovered device round-trip correctly.
+//! After the first coordinator exits cleanly (shutdown-park leaves the
+//! kernel device QUIESCED), a fresh coordinator is spawned against the
+//! same data_dir. Its supervisor re-adopts the existing fork; the daemon
+//! takes Route::Recover and re-attaches to the still-live
+//! `/dev/ublkb<id>`. Data written before the first shutdown reads back
+//! unchanged, and new writes through the recovered device round-trip
+//! correctly.
 //!
 //! Covered operations (in order):
 //!

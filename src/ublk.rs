@@ -548,7 +548,7 @@ mod imp {
         // Coordinator prefetch races supervisor spawn on freshly-claimed
         // forks: ancestor `.idx` files may not yet be on disk when this
         // process starts. The retry helper absorbs the NotFound window;
-        // anything else propagates. NBD uses the same helper.
+        // anything else propagates.
         let mut volume = crate::volume_open::open_volume_with_retry(dir, by_id_dir)?;
 
         let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;

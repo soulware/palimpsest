@@ -117,7 +117,7 @@ pub enum IpcErrorKind {
     /// The named resource (volume, name, segment) doesn't exist.
     NotFound,
     /// The operation conflicts with current state — held by another
-    /// coordinator, illegal lifecycle transition, NBD client connected,
+    /// coordinator, illegal lifecycle transition, client connected,
     /// volume not stopped, etc.
     Conflict,
     /// A conditional-write CAS lost to a concurrent writer.

@@ -70,6 +70,6 @@ io-uring = { version = "0.7", optional = true }
 # libublk depends on smol = "2.0.2" directly — we match that runtime to
 # drive per-queue `LocalExecutor`s for async per-tag I/O dispatch.
 smol     = { version = "2", optional = true }
-# signalfd + pthread_sigmask for both ublk and nbd transports' dedicated
-# signal watcher threads. Linux-only: signalfd does not exist on macOS.
+# signalfd + pthread_sigmask for the volume daemon's dedicated signal
+# watcher thread. Linux-only: signalfd does not exist on macOS.
 nix      = { version = "0.31", features = ["signal"] }

@@ -1,12 +1,12 @@
 # Quickstart
 
-Import an OCI image, fork it, and serve it over NBD.
+Import an OCI image, fork it, and serve it over ublk.
 
 ## Prerequisites
 
 - Rust toolchain (`cargo`)
 - `mke2fs` from e2fsprogs (macOS: `brew install e2fsprogs`)
-- `nbd-client` for connecting a block device (Linux only; on macOS use QEMU direct kernel boot — see [vm-boot.md](vm-boot.md))
+- Linux with `CONFIG_BLK_DEV_UBLK` for the block device (on macOS use QEMU direct kernel boot — see [vm-boot.md](vm-boot.md))
 
 ## Build
 
@@ -75,31 +75,7 @@ The explicit-pin form is forward-compatible — see
 ## Serve the volume
 
 By default the coordinator runs volumes in IPC-only mode (no host-visible
-block device). Pick one of two transports — they are mutually exclusive per
-volume. See `docs/operations.md` for the full comparison and prereqs.
-
-### NBD (any host)
-
-Either pass `--nbd-port` at create time, or update the running volume:
-
-```sh
-./target/debug/elide volume update vm1 --nbd-port 10809
-# vm1: running
-```
-
-This writes a `[nbd]` section to `vm1/volume.toml` and asks the supervisor to
-restart the volume process. Connect with:
-
-```sh
-sudo nbd-client -b 4096 127.0.0.1 10809 /dev/nbd0
-sudo mount /dev/nbd0 /mnt
-```
-
-`-b 4096` sets the NBD block size to 4 KiB, matching the volume's LBA size.
-The default (512 bytes) causes every write to be smaller than one LBA block,
-which defeats compression and dedup at the block level.
-
-### ublk (Linux only, preferred for host-local)
+block device). Attach the ublk transport to expose `/dev/ublkbN`:
 
 ```sh
 sudo modprobe ublk_drv     # one-time kernel module load
@@ -107,8 +83,7 @@ sudo modprobe ublk_drv     # one-time kernel module load
 ```
 
 This writes `[ublk]` to `volume.toml`; the kernel auto-allocates a device id
-on first start (persisted in `vm1/ublk.id` for crash recovery). Pin a
-specific id with `--ublk-id N` if you need stable `/dev/ublkbN` paths. Then:
+on first start (recorded in `volume.toml` for crash recovery). Then:
 
 ```sh
 sudo mount /dev/ublkb0 /mnt

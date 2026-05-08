@@ -153,15 +153,15 @@ pub async fn finalize_gc_handoff(fork_dir: &Path, gc_ulid: Ulid) -> bool {
 /// Result of an `is_connected` query against the volume control socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectedStatus {
-    /// Socket reachable; an NBD client is currently connected.
+    /// Socket reachable; a block-device client is currently connected.
     Connected,
-    /// Socket reachable; no NBD client is connected.
+    /// Socket reachable; no client is connected.
     Disconnected,
     /// Socket unreachable (volume not running, or transient I/O failure).
     Unavailable,
 }
 
-/// Query whether an NBD client is currently connected to the volume.
+/// Query whether a block-device client is currently connected to the volume.
 pub async fn is_connected(fork_dir: &Path) -> ConnectedStatus {
     match call_typed::<ConnectedReply>(fork_dir, &VolumeRequest::Connected).await {
         Some(r) if r.connected => ConnectedStatus::Connected,

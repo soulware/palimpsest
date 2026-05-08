@@ -65,7 +65,7 @@ For DATA and REF records, the hash is computed before the dedup check and stored
 
 ### Pre-log coalescing
 
-Contiguous LBA writes are merged in memory before they reach the write log — in the NBD/ublk handler, not in the log itself. This mirrors lsvd's `pendingWrite` buffer. The coalescing window is bounded by both a block count limit (to prevent unbounded memory accumulation between fsyncs) and the fsync boundary (a guest fsync flushes any pending buffer). The write log only ever sees finalised, already-coalesced extents.
+Contiguous LBA writes are merged in memory before they reach the write log — in the ublk handler, not in the log itself. This mirrors lsvd's `pendingWrite` buffer. The coalescing window is bounded by both a block count limit (to prevent unbounded memory accumulation between fsyncs) and the fsync boundary (a guest fsync flushes any pending buffer). The write log only ever sees finalised, already-coalesced extents.
 
 ### Durability model
 
@@ -373,7 +373,7 @@ DedupRef and Delta consumers are kind-agnostic: `extent_index.lookup(hash)` reso
 | 3 delta options, 16% of extents | ~77KB | Realistic point-release update |
 | 3 delta options, all extents | ~204KB | Worst case |
 
-Inline section size depends on the inline threshold (256 bytes stored size) and extent size distribution. Only genuinely tiny compressed extents inline — mostly-zero blocks, small config files. The threshold is deliberately low: at higher thresholds (e.g. 4096), compressed 4 KiB blocks from NBD writes would all inline, bloating the `.idx` and defeating demand-fetch.
+Inline section size depends on the inline threshold (256 bytes stored size) and extent size distribution. Only genuinely tiny compressed extents inline — mostly-zero blocks, small config files. The threshold is deliberately low: at higher thresholds (e.g. 4096), compressed 4 KiB blocks from guest writes would all inline, bloating the `.idx` and defeating demand-fetch.
 
 ### S3 object layout
 

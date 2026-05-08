@@ -38,7 +38,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
-        run: "cargo test --workspace --no-fail-fast -- --skip nbd:: --skip ublk::"
+        run: "cargo test --workspace --no-fail-fast -- --skip ublk::"
 
   host-proptests:
     runs-on: ubuntu-24.04

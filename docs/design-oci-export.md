@@ -58,7 +58,7 @@ containerd
 ### Hard parts
 
 - **Snapshotter plugin is Go.** Containerd's plugin interface is Go-native. Write a thin Go shim that talks to the Elide volume daemon over a local socket rather than embedding Rust behind CGo. nydus-snapshotter is the right shape to copy.
-- **Block device scale.** NBD caps at ~16 devices by default and burns a kernel slot per running container. ublk (Linux 5.19+) is the scalable answer and is already on the integrations sequencing table for other reasons — this path would ride on top of it rather than justify it alone.
+- **Block device scale.** Each running container needs its own block device. ublk (Linux 5.19+) scales cleanly to many devices and is already the host transport.
 - **Registry publish of segments.** Needs a stable on-registry layout for the segment artifact and a defined media type. Same prerequisite as dual publish, so the two paths share it.
 - **Host-side runtime.** The volume runtime has to run as a system service on the container host, not just in dev VMs. Packaging/ops lift more than a design problem.
 

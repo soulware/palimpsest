@@ -764,25 +764,9 @@ async fn fork_create_op(
     };
 
     let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
-    if patch.no_nbd || patch.no_ublk {
-        return Err(IpcError::bad_request(
-            "no-nbd / no-ublk are not valid on fork-create",
-        ));
+    if patch.no_ublk {
+        return Err(IpcError::bad_request("no-ublk is not valid on fork-create"));
     }
-    let nbd_cfg = if let Some(socket) = patch.nbd_socket {
-        Some(elide_core::config::NbdConfig {
-            socket: Some(socket),
-            ..Default::default()
-        })
-    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
-        Some(elide_core::config::NbdConfig {
-            port: patch.nbd_port,
-            bind: patch.nbd_bind,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
     let ublk_cfg = if patch.ublk {
         Some(elide_core::config::UblkConfig::default())
     } else {
@@ -919,7 +903,6 @@ async fn fork_create_op(
     if let Err(e) = (elide_core::config::VolumeConfig {
         name: Some(new_name.to_owned()),
         size: Some(size),
-        nbd: nbd_cfg,
         ublk: ublk_cfg,
         lazy: None,
     }

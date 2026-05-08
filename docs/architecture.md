@@ -21,7 +21,7 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 **Coordinator (main process)** — spawns and supervises volume processes; owns all S3 mutations (upload, delete, segment GC rewrites); watches one or more configured volume root directories and discovers forks automatically; handles `prefetch-indexes` for forks cold-starting from S3.
 
-**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL, `pending/` promotion, and `cache/` lifecycle for that volume; holds the live LBA map in memory; demand-fetches missing extents from S3 directly using read-only credentials. Does not communicate with other volume processes directly. Communicates with the coordinator via `control.sock` (Unix domain socket; see Control Socket Protocol below). Never requires the coordinator for correct I/O.
+**Volume process** (one per volume) — owns the ublk frontend for one volume; owns the WAL, `pending/` promotion, and `cache/` lifecycle for that volume; holds the live LBA map in memory; demand-fetches missing extents from S3 directly using read-only credentials. Does not communicate with other volume processes directly. Communicates with the coordinator via `control.sock` (Unix domain socket; see Control Socket Protocol below). Never requires the coordinator for correct I/O.
 
 **S3 credential split:** the volume process requires only **read-only** S3 credentials (for demand-fetch). All S3 mutations — segment upload, segment delete, GC rewrites — are performed exclusively by the coordinator, which holds read-write credentials. This limits the blast radius if a volume host is compromised.
 
@@ -37,16 +37,16 @@ elide-core/        — shared library: segment format, WAL, LBA map, extent inde
                      Deps: blake3, zstd, ulid, nix, ed25519-dalek, rand_core.
                      No async, no network. Usable standalone.
 
-elide/             — volume process binary and user CLI: NBD server, analysis
+elide/             — volume process binary and user CLI: ublk server, analysis
                      tools (extents, inspect, ls), and volume management
                      subcommands including `volume import`. Adds:
                      clap, ext4-view, object_store, tokio (rt-multi-thread only).
                      The async runtime is used by the embedded coordinator
                      tasks (drain/GC/prefetch) hosted in `volume up` mode, by
                      CLI subcommands that hit S3 directly (pull, ls, fork-from-S3),
-                     and for SIGTERM handling. NBD I/O and the demand-fetch path
-                     are synchronous. See *Async runtime scope* for the planned
-                     direction.
+                     and for SIGTERM handling. The block-I/O frontend and the
+                     demand-fetch path are synchronous. See *Async runtime scope*
+                     for the planned direction.
 
 elide-import/      — OCI import binary: pulls public OCI images from a container
                      registry, extracts a rootfs, converts to ext4, and calls
@@ -71,15 +71,15 @@ process that serves block I/O.
 
 ### Proposed: Async runtime scope
 
-The volume process carries tokio today to satisfy `object_store`'s async trait on the demand-fetch path *and* to host the embedded coordinator tasks (drain, GC, prefetch) and CLI subcommands that hit S3. NBD I/O, the volume actor, and its worker thread are all synchronous. The target state is that the volume binary carries no async runtime at all, leaving tokio confined to the coordinator (supervision, IPC, S3 mutation) and `elide-import` (OCI registry pulls).
+The volume process carries tokio today to satisfy `object_store`'s async trait on the demand-fetch path *and* to host the embedded coordinator tasks (drain, GC, prefetch) and CLI subcommands that hit S3. The volume actor and its worker thread are synchronous. The target state is that the volume binary carries no async runtime at all, leaving tokio confined to the coordinator (supervision, IPC, S3 mutation) and `elide-import` (OCI registry pulls).
 
 Three independent changes compose to get there:
 
 1. **Sync demand-fetch.** Replace `object_store` inside `elide-fetch` with `rust-s3` (`sync` feature — uses `attohttpc`, no tokio). `elide-fetch` exposes a small sync `RangeFetcher` trait with two built-in impls (S3 via `rust-s3`, local filesystem via `std::fs`). The coordinator continues to use `object_store` for its own list/put/delete and adapts its store to `RangeFetcher` when constructing a fetcher (cheap wrapper, runs on a `spawn_blocking` thread).
-2. **Thread-bounded async in ublk queue threads.** ublk integration confines async to the per-queue event loop: one `smol::LocalExecutor` per queue thread running async per-tag tasks, with backend work offloaded to a per-queue `std::thread` worker pool. Each worker owns its own `VolumeReader` and blocks on `crossbeam-channel` into the actor exactly as the NBD path does. The async surface is local to `src/ublk.rs`; `VolumeClient`/`VolumeReader` and everything downstream stay synchronous. Completions cross from worker threads back into the queue's io_uring via an eventfd watched by the queue's own ring — see `docs/design-ublk-transport.md` for why that bridge is necessary.
+2. **Thread-bounded async in ublk queue threads.** ublk integration confines async to the per-queue event loop: one `smol::LocalExecutor` per queue thread running async per-tag tasks, with backend work offloaded to a per-queue `std::thread` worker pool. Each worker owns its own `VolumeReader` and blocks on `crossbeam-channel` into the actor. The async surface is local to `src/ublk.rs`; `VolumeClient`/`VolumeReader` and everything downstream stay synchronous. Completions cross from worker threads back into the queue's io_uring via an eventfd watched by the queue's own ring — see `docs/design-ublk-transport.md` for why that bridge is necessary.
 3. **Drop `tokio` from `elide/Cargo.toml`.** Requires (1), (2), *and* relocating the embedded coordinator-tasks loop and the CLI's S3 subcommands (`pull`, `ls`, fork-from-S3) out of the volume binary — either into `elide-coordinator` (the daemon) or behind a thin sync RPC to it.
 
-**Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping the actor and backend synchronous matches the I/O model at the actor interface (NBD and ublk both dispatch through synchronous `VolumeClient`/`VolumeReader` calls) and removes the only external dependency forcing a *global* async runtime into it. The `smol::LocalExecutor` inside each ublk queue thread is thread-local, not a runtime; it coexists fine with tokio if tokio is ever re-introduced for other reasons. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
+**Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping the actor and backend synchronous matches the I/O model at the actor interface (ublk dispatches through synchronous `VolumeClient`/`VolumeReader` calls) and removes the only external dependency forcing a *global* async runtime into it. The `smol::LocalExecutor` inside each ublk queue thread is thread-local, not a runtime; it coexists fine with tokio if tokio is ever re-introduced for other reasons. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
 
 This is a direction, not a commitment. None of the three steps are required for current functionality; they are sequenced as the volume binary's dependencies are revisited. Step (1) is in progress: `elide-fetch` is being converted to a tokio-free crate even though the volume binary continues to depend on tokio for unrelated reasons.
 
@@ -230,7 +230,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 
 ```
 VM
- │  block I/O (ublk / NBD)
+ │  block I/O (ublk)
  ▼
 Volume process  (one per volume)                        [elide_data/by_id/<ulid>/]
  │  write path: buffer → extent boundary → hash → local dedup check → WAL append
@@ -352,7 +352,7 @@ On **Ctrl-C or SIGTERM**, the coordinator:
 3. Waits briefly for all processes to exit
 4. Exits itself
 
-This gives a clean teardown: no orphaned NBD devices, no stale pid files, no lock files left behind. The user gets the behaviour they expect from a foreground process — stopping the coordinator stops everything.
+This gives a clean teardown: no stale pid files, no lock files left behind. The user gets the behaviour they expect from a foreground process — stopping the coordinator stops everything.
 
 ### Daemon mode (`elide-coordinator serve --daemon`, planned)
 
@@ -483,7 +483,7 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 **Internal (spawned by coordinator; not intended for direct use):**
 
 ```
-elide serve-volume <vol-dir> [--bind addr] [--port N] [--readonly]
+elide serve-volume <vol-dir> [--ublk] [--ublk-id <n>] [--readonly]
 ```
 
 ### `elide-coordinator` CLI commands
@@ -1084,44 +1084,17 @@ No per-thread state — the client is safe to pass into transport closures that 
 
 2. **Idle-flush tick:** the actor run loop uses `crossbeam_channel::tick(10s)` alongside the request channel. When the tick fires and the WAL is non-empty, the actor dispatches a promote the same way. This ensures data is promoted even under low or zero write load. The interval is 10 seconds (chosen for observability during development; tightening it later is a one-line change).
 
-**NBD FLUSH parking:** `VolumeRequest::Flush` fsyncs the current WAL on the actor and then, if any promote dispatched before the flush has not yet completed, parks the reply on a generation counter. The actor returns to the select loop immediately — new writes keep flowing onto the fresh WAL. When each worker `Promote` result arrives, the actor bumps `completed_gen` and resolves any parked flushes whose precondition is now satisfied. On worker error the actor performs a fallback `sync_data()` on the old WAL itself before bumping the counter, so the durability guarantee holds regardless of worker outcome. This matches the semantics of a real block device: the controller keeps accepting commands while a FLUSH is in flight; only the FLUSH caller waits.
+**FLUSH parking:** `VolumeRequest::Flush` fsyncs the current WAL on the actor and then, if any promote dispatched before the flush has not yet completed, parks the reply on a generation counter. The actor returns to the select loop immediately — new writes keep flowing onto the fresh WAL. When each worker `Promote` result arrives, the actor bumps `completed_gen` and resolves any parked flushes whose precondition is now satisfied. On worker error the actor performs a fallback `sync_data()` on the old WAL itself before bumping the counter, so the durability guarantee holds regardless of worker outcome. This matches the semantics of a real block device: the controller keeps accepting commands while a FLUSH is in flight; only the FLUSH caller waits.
 
 Background promotes that fail (I/O error, disk full) are logged and do not crash the actor — the data is safe in the WAL (fallback-fsynced by the actor on the error path). The next explicit `Flush` or threshold-triggered promote will surface the error.
 
-**Why `crossbeam-channel`:** the actor loop and NBD/ublk handlers are synchronous threads; `crossbeam-channel` is a natural fit. When ublk integration uses io_uring, ublk queue threads remain synchronous callers — they block on the `Sender` and the actor thread owns the `Receiver`. If a fully async actor is ever needed, `crossbeam-channel` bridges cleanly into async runtimes via `block_on`.
+**Why `crossbeam-channel`:** the actor loop and ublk handlers are synchronous threads; `crossbeam-channel` is a natural fit. ublk queue threads block on the `Sender` and the actor thread owns the `Receiver`. If a fully async actor is ever needed, `crossbeam-channel` bridges cleanly into async runtimes via `block_on`.
 
 **Why this enables ublk:** ublk supports multiple queues, each driven by a separate thread. Each queue thread holds a cloned `VolumeClient` and constructs its own `VolumeReader`. Reads fan out across queue threads with no contention; writes and flushes serialise through the actor. No `Mutex<Volume>` is needed anywhere.
 
-**Current state (NBD):** the NBD server already splits its per-connection threads along the new boundary: one write thread holds a `VolumeReader` (for the sub-block RMW path) and each of the read worker threads holds its own `VolumeReader`. The ublk integration uses the same pattern — one reader per queue thread.
+The ublk integration holds one `VolumeReader` per queue thread; writes and flushes serialise through the actor.
 
-**NBD protocol coverage:** the server implements the fixed newstyle handshake and the following transmission-phase commands:
-
-| Command | Code | Status | Notes |
-|---------|------|--------|-------|
-| `NBD_CMD_READ` | 0 | Implemented | demand-fetches extents on miss |
-| `NBD_CMD_WRITE` | 1 | Implemented | writes to WAL via actor |
-| `NBD_CMD_DISC` | 2 | Implemented | clean shutdown |
-| `NBD_CMD_FLUSH` | 3 | Implemented | promotes WAL to pending segment |
-| `NBD_CMD_TRIM` | 4 | Implemented | zero-extent path; see note below |
-| `NBD_CMD_WRITE_ZEROES` | 6 | Implemented | zero-extent path; same as TRIM |
-| `NBD_CMD_BLOCK_STATUS` | 7 | Not implemented | allows clients to query allocated vs sparse regions |
-| `NBD_CMD_RESIZE` | 8 | Not implemented | live resize; not needed without dynamic sizing |
-
-Transmission flags advertised in the server's handshake:
-
-| Flag | Status | Notes |
-|------|--------|-------|
-| `NBD_FLAG_HAS_FLAGS` | Advertised | always set per spec |
-| `NBD_FLAG_SEND_FLUSH` | Advertised | client may send `NBD_CMD_FLUSH` |
-| `NBD_FLAG_READ_ONLY` | Advertised (conditional) | set when `--readonly` is passed |
-| `NBD_FLAG_SEND_TRIM` | Advertised | client may send `NBD_CMD_TRIM` |
-| `NBD_FLAG_SEND_WRITE_ZEROES` | Advertised | client may send `NBD_CMD_WRITE_ZEROES` |
-| `NBD_FLAG_SEND_FUA` | Not advertised | force-unit-access per write not implemented |
-| `NBD_FLAG_CAN_MULTI_CONN` | Not advertised | single connection only |
-
-Protocol options not negotiated during the option haggling phase: `NBD_OPT_STRUCTURED_REPLY`, `NBD_OPT_STARTTLS`.
-
-**TRIM and WRITE_ZEROES — zero-extent path:** `NBD_CMD_TRIM` and `NBD_CMD_WRITE_ZEROES` are both implemented via zero extents (see [formats.md](formats.md) — *ZERO record*). When a filesystem (e.g. ext4) frees blocks, it issues TRIM; `NBD_CMD_WRITE_ZEROES` is the write-command equivalent that explicitly requires the range to read back as zeros. Both routes to the same `Volume::write_zeroes()` call, which appends a single ZERO WAL record covering the entire range and inserts a `ZERO_HASH` entry into the LBA map.
+**TRIM and WRITE_ZEROES — zero-extent path:** TRIM and WRITE_ZEROES are both implemented via zero extents (see [formats.md](formats.md) — *ZERO record*). When a filesystem (e.g. ext4) frees blocks, it issues TRIM; WRITE_ZEROES is the write-command equivalent that explicitly requires the range to read back as zeros. Both route to the same `Volume::write_zeroes()` call, which appends a single ZERO WAL record covering the entire range and inserts a `ZERO_HASH` entry into the LBA map.
 
 Zero extents have no data payload — no hashing, no compression, no body bytes. A whole-device TRIM on a 20 GB volume writes a single ~40-byte WAL record. This is a significant improvement over the earlier approach of writing actual zero-filled extents via the normal write path (which required hashing the full volume worth of zero bytes).
 
@@ -1129,7 +1102,7 @@ Zero extents in the LBA map explicitly override ancestor data: if a descendant v
 
 The read path checks `hash == ZERO_HASH` before doing any extent index lookup; if the LBA maps to ZERO_HASH, `lba_length × 4096` zero bytes are returned directly.
 
-Sub-block-aligned TRIM and WRITE_ZEROES ranges are rounded inward to fully-covered 4096-byte blocks (ext4 only operates on block boundaries in practice, so this edge case is theoretical). The `NO_HOLE` flag in `WRITE_ZEROES` requests — which asks the server not to punch a hole but to store durable zeros — is satisfied by design: zero extents are WAL-durable and read back as zeros unconditionally.
+Sub-block-aligned TRIM and WRITE_ZEROES ranges are rounded inward to fully-covered 4096-byte blocks (ext4 only operates on block boundaries in practice, so this edge case is theoretical). Zero extents are WAL-durable and read back as zeros unconditionally — equivalent to a "no hole" durable-zero write.
 
 **GC and zero extents:** zero entries have no body bytes, so they contribute 0 to a segment's stored-data size. However, they carry semantic weight: a live zero entry masks ancestor data. GC cannot use hash-based liveness for zero entries (ZERO_HASH is shared across all zero extents). Instead, a zero entry at `[X, X+N)` is live if the current LBA map maps any part of that range to ZERO_HASH; if it has been fully overwritten with real data, the zero entry is dead and is dropped during compaction. GC may also merge adjacent zero entries into a single entry to reduce index size.
 
@@ -1152,7 +1125,7 @@ The coordinator processes bare `gc/<ulid>` files at the start of each GC tick (`
 Implemented:
 
 ```
-elide serve-volume <vol-dir> [--readonly]      # serve a volume over NBD
+elide serve-volume <vol-dir> [--ublk] [--readonly]  # serve a volume as a ublk block device
 
 elide snapshot-volume <vol-dir>                # checkpoint a volume; stays live
 

@@ -207,7 +207,7 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
 
 #### `volume stop` (local stop, retain ownership) — landed
 
-- [x] Refuse if a client (NBD/ublk) is connected.
+- [x] Refuse if a client (ublk) is connected.
 - [x] Issue the existing `shutdown` RPC: WAL fsync, daemon halts.
 - [x] Conditional PUT to `names/<name>` flipping `state` from `live`
   to `stopped` via `lifecycle::mark_stopped`. `vol_ulid` and
@@ -577,11 +577,11 @@ the work fully closes:
    they refresh. Not blocking — fresh-fetch on every verification
    is correct and the cost is one small GET per `start --remote`
    against a synthesised snapshot.
-5. **~~ublk volume-open retry.~~ Done.** ublk now goes through
-   `crate::volume_open::open_volume_with_retry` like NBD. That helper
-   was also extended with a synchronous coordinator handshake
-   (`await-prefetch <vol_ulid>` IPC) so both transports block on actual
-   prefetch completion — a strong signal — instead of just retrying on
-   the symptom (NotFound during open). The retry loop is kept as a
-   second line of defence for untracked forks and filesystem-visibility
-   latency. Volume-side budget is 60s with a clear timeout error.
+5. **~~ublk volume-open retry.~~ Done.** ublk goes through
+   `crate::volume_open::open_volume_with_retry`. The helper does a
+   synchronous coordinator handshake (`await-prefetch <vol_ulid>` IPC)
+   so the transport blocks on actual prefetch completion — a strong
+   signal — instead of just retrying on the symptom (NotFound during
+   open). The retry loop is kept as a second line of defence for
+   untracked forks and filesystem-visibility latency. Volume-side
+   budget is 60s with a clear timeout error.

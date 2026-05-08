@@ -25,7 +25,7 @@ Branch: `fork-from-remote`
 ## Model
 
 - **Writable local volumes** live in `by_id/<vol_ulid>/`, symlinked from `by_name/<name>`.
-- **Pulled readonly ancestors** live in a separate tree `readonly/<vol_ulid>/`. They have `volume.pub` but no private key. They are never supervised, never serve NBD, and only exist as fork sources.
+- **Pulled readonly ancestors** live in a separate tree `readonly/<vol_ulid>/`. They have `volume.pub` but no private key. They are never supervised, never serve a block device, and only exist as fork sources.
 - Each volume (writable or readonly ancestor) keeps its own `index/` signed with its own keypair. No cross-volume `.idx` mixing.
 - Segment bodies are still demand-fetched from `elide_store/`. Only `.idx` files and skeleton metadata are materialized at pull time.
 - Addressing is explicit `<vol_ulid>/<snap_ulid>` for phase 1. Human-readable names/tags are a later layer.
@@ -48,7 +48,7 @@ Key references:
 Phases 1a–1c and 2 are implemented on this branch. Verified end-to-end
 manually: created a volume, wrote `hello world`, snapshotted, deleted
 locally, pulled the remote skeleton, forked from `<vol_ulid>/<snap_ulid>`,
-mounted the fork over NBD, and read the file back.
+mounted the fork via ublk, and read the file back.
 
 A late-stage bug was also fixed: `find_segment_in_dirs` was passing the
 child volume's `base_dir/index` as `index_dir` to the fetcher

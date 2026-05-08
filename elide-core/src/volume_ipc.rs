@@ -48,7 +48,7 @@ pub enum VolumeRequest {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         cap: Option<u32>,
     },
-    /// Report whether an NBD client is currently connected.
+    /// Report whether a block-device client is currently connected.
     Connected,
     /// Flush the WAL and exit cleanly. The supervisor decides whether to
     /// restart based on `volume.stopped` markers.

@@ -733,9 +733,9 @@ fn analyse_delta(image1: &Path, image2: &Path, level: i32) -> io::Result<()> {
     Ok(())
 }
 
-// --- located extents (for NBD read tracking) ---
+// --- located extents (for read-trace analysis) ---
 
-/// An extent with its disk byte offset, for mapping NBD reads back to extents.
+/// An extent with its disk byte offset, for mapping reads back to extents.
 pub struct LocatedExtent {
     pub start_byte: u64,
     pub byte_count: u64,

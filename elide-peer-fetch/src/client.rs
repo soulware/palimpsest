@@ -587,7 +587,7 @@ impl BodyFetchClientBuilder {
 // sandbox blocks `bind()`, so these tests fail with `EPERM` when run
 // sandboxed; running with the sandbox disabled (or in CI without the
 // sandbox) is the supported path. Same convention as the existing
-// `nbd::` / `ublk::` namespaces for kernel-dependent tests.
+// `ublk::` namespace for kernel-dependent tests.
 #[cfg(test)]
 mod tests {
     use super::*;

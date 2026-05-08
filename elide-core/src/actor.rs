@@ -1,9 +1,9 @@
 // VolumeActor + VolumeClient/VolumeReader: the intended integration pattern
-// for ublk and NBD.
+// for the ublk transport.
 //
 // VolumeActor owns a Volume exclusively and processes requests from a
 // crossbeam-channel in a dedicated thread. VolumeClient is the shareable
-// client handle — Send + Sync + Clone — held by NBD/ublk queue threads for
+// client handle — Send + Sync + Clone — held by ublk queue threads for
 // writes, flushes, and control operations. VolumeReader is a per-thread
 // handle (Send, !Sync) constructed via VolumeClient::reader(); it owns a
 // local file-descriptor cache and serves reads against the current
@@ -196,7 +196,7 @@ pub struct VolumeActor {
     promotes_in_flight: usize,
     /// Monotonic counter, incremented on every `WorkerJob::Promote`
     /// dispatch (post-write threshold, `PromoteWal`, `GcCheckpoint`).
-    /// Used together with `completed_gen` to park NBD `Flush` replies
+    /// Used together with `completed_gen` to park `Flush` replies
     /// until every promote dispatched *before* the flush has had its
     /// old-WAL fsync completed by the worker.
     promote_gen: u64,
@@ -213,7 +213,7 @@ pub struct VolumeActor {
     /// worker result; the error path re-fsyncs the popped path on the
     /// actor thread as a fallback before bumping `completed_gen`.
     inflight_old_wals: VecDeque<PathBuf>,
-    /// NBD `Flush` replies parked until `completed_gen >= needed_gen`.
+    /// `Flush` replies parked until `completed_gen >= needed_gen`.
     /// Each entry records the `promote_gen` snapshot at the time the
     /// flush arrived; as worker results come in the actor resolves any
     /// entries whose precondition now holds.
@@ -274,7 +274,7 @@ struct ParkedPromoteWal {
     reply: Sender<io::Result<()>>,
 }
 
-/// State stashed while an NBD `Flush` waits for an in-flight promote's
+/// State stashed while a `Flush` waits for an in-flight promote's
 /// old-WAL fsync to complete on the worker.  Released when
 /// `VolumeActor::completed_gen >= needed_gen`.
 struct ParkedFlush {
@@ -342,7 +342,7 @@ impl VolumeActor {
         }));
     }
 
-    /// NBD `Flush` arrives.  The current WAL has already been fsynced
+    /// `Flush` arrives.  The current WAL has already been fsynced
     /// by the caller; here we decide whether the reply can go out
     /// immediately or must wait for an in-flight promote's old-WAL
     /// fsync on the worker.
@@ -1259,7 +1259,7 @@ impl VolumeActor {
                             let ulid = result.segment_ulid;
                             self.volume.apply_promote(&result);
                             self.publish_snapshot();
-                            // Resolve parked NBD flushes only after apply + publish
+                            // Resolve parked flushes only after apply + publish
                             // so the caller observes the old WAL deleted and the
                             // new snapshot visible — not just the durability barrier.
                             self.on_promote_success();
@@ -1885,7 +1885,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
 /// new writes onto the fresh WAL while the worker makes the old one
 /// durable in parallel — matching the way a real block device keeps
 /// accepting commands while a FLUSH is in flight.  `VolumeActor::Flush`
-/// parks on a promote-generation counter so NBD FLUSH still replies
+/// parks on a promote-generation counter so FLUSH still replies
 /// only after every prior write is durable.
 /// Worker: materialise a GC plan end-to-end (read bodies, reconstruct
 /// partial-death composites, assemble + sign output segment, write

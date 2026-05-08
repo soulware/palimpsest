@@ -92,7 +92,7 @@ use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 /// WAL size (bytes) at which the log is promoted to a pending segment.
 /// This is a soft cap: a single write larger than this threshold will still
 /// succeed, producing a segment larger than intended. The block layer
-/// (NBD/ublk) enforces its own per-request maximum before reaching here.
+/// (ublk) enforces its own per-request maximum before reaching here.
 const FLUSH_THRESHOLD: u64 = 32 * 1024 * 1024;
 
 /// Entry-count cap at which the WAL is promoted, regardless of byte size.
@@ -499,7 +499,7 @@ impl Volume {
     /// Promotion to a pending segment is triggered after the write if the WAL
     /// reaches `FLUSH_THRESHOLD` (32 MiB). Because the check is post-write, a
     /// single large write may produce a segment larger than the threshold; the
-    /// block layer (NBD/ublk) is expected to enforce its own per-request cap.
+    /// block layer (ublk) is expected to enforce its own per-request cap.
     pub fn write(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
         if data.is_empty() || !data.len().is_multiple_of(4096) {
             return Err(io::Error::other(
@@ -2309,7 +2309,7 @@ impl Volume {
     }
 
     /// Flush the current WAL to a pending segment if it contains any entries.
-    /// No-op if the WAL is empty. Called by the idle-flush path in the NBD server.
+    /// No-op if the WAL is empty. Called by the idle-flush path in the daemon.
     pub fn flush_wal(&mut self) -> io::Result<()> {
         if self.pending_entries.is_empty() {
             return Ok(());
@@ -2343,8 +2343,8 @@ impl Volume {
 
     /// Fsync the WAL without promoting. No-op when no WAL is open.
     ///
-    /// Used by the actor's `Flush` handler to satisfy the NBD durability
-    /// contract without blocking on segment serialization.
+    /// Used by the actor's `Flush` handler to satisfy the block-device
+    /// durability contract without blocking on segment serialization.
     pub fn wal_fsync(&mut self) -> io::Result<()> {
         match self.wal.as_mut() {
             Some(open) => open.wal.fsync(),
@@ -2371,7 +2371,7 @@ impl Volume {
         // `execute_promote`), so that the actor returns to the select
         // loop without blocking on disk I/O.  `VolumeActor::Flush`
         // parks on the promote generation counter until the worker
-        // has completed any in-flight promote, preserving NBD FLUSH's
+        // has completed any in-flight promote, preserving FLUSH's
         // durability contract while letting the actor keep processing
         // writes in the meantime.
 

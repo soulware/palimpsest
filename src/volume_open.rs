@@ -1,4 +1,4 @@
-// Volume open helpers used by every transport (NBD, ublk, IPC-only).
+// Volume open helpers shared by the ublk transport and the IPC-only daemon.
 //
 // On a freshly-claimed fork the coordinator's prefetch task races
 // the supervisor: the volume binary may try to open the fork before

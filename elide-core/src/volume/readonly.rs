@@ -1,6 +1,6 @@
 //! Read-only volume view: rebuilds LBA map and extent index without
 //! claiming the WAL lock or replaying any in-flight writes. Used by the
-//! `--readonly` NBD serve path.
+//! `--readonly` serve path.
 //!
 //! Ancestor-chain helpers used by both readonly and writable opens live
 //! in `volume/ancestry.rs`; the shared open-time rebuild lives in
@@ -43,7 +43,7 @@ impl ReadonlyVolume {
     ///
     /// Does not create `wal/`, does not acquire an exclusive lock, and does not
     /// replay the WAL. WAL records from an active writer on the same volume will
-    /// not be visible. Intended for the `--readonly` NBD serve path.
+    /// not be visible. Intended for the `--readonly` serve path.
     pub fn open(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
         let (ancestor_layers, lbamap, extent_index) =
             super::open_state::open_read_state(fork_dir, by_id_dir)?;

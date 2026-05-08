@@ -4,7 +4,7 @@
 //   - Does not create wal/, does not acquire an exclusive lock.
 //   - Does not replay the WAL — writes that have not been flushed to pending/
 //     are invisible.
-//   - Intended for the --readonly NBD serve path where a separate writer may
+//   - Intended for the --readonly serve path where a separate writer may
 //     be active on the same fork concurrently.
 //
 // Each test opens a writable Volume, performs some operations, then opens a

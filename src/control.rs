@@ -32,16 +32,16 @@ use elide_core::volume_ipc::{
 /// connection until the listener is closed.  The socket file is removed when
 /// the thread exits.
 ///
-/// `nbd_connected` is shared with the NBD accept loop: `true` while a client
-/// is connected, `false` otherwise. IPC-only volumes pass a permanently-false
-/// flag.
+/// `client_connected` is reserved for transports that track block-device
+/// client presence: `true` while a client is connected, `false` otherwise.
+/// The current ublk transport always passes a permanently-false flag.
 ///
 /// The handle is cloned onto the server thread; the caller retains its own
 /// clone.
 pub fn start(
     fork_dir: &Path,
     handle: VolumeClient,
-    nbd_connected: Arc<AtomicBool>,
+    client_connected: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let socket_path = fork_dir.join("control.sock");
     // Remove stale socket from a previous (crashed) run.
@@ -49,7 +49,7 @@ pub fn start(
     let listener = UnixListener::bind(&socket_path)?;
     thread::Builder::new()
         .name("control-server".into())
-        .spawn(move || run(listener, socket_path, handle, nbd_connected))
+        .spawn(move || run(listener, socket_path, handle, client_connected))
         .map_err(std::io::Error::other)?;
     Ok(())
 }
@@ -58,11 +58,11 @@ fn run(
     listener: UnixListener,
     socket_path: PathBuf,
     handle: VolumeClient,
-    nbd_connected: Arc<AtomicBool>,
+    client_connected: Arc<AtomicBool>,
 ) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_connection(stream, &handle, &nbd_connected),
+            Ok(stream) => handle_connection(stream, &handle, &client_connected),
             Err(_) => break,
         }
     }
@@ -72,7 +72,7 @@ fn run(
 fn handle_connection(
     stream: std::os::unix::net::UnixStream,
     handle: &VolumeClient,
-    nbd_connected: &AtomicBool,
+    client_connected: &AtomicBool,
 ) {
     let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
@@ -119,13 +119,13 @@ fn handle_connection(
         std::process::exit(0);
     }
 
-    dispatch(request, handle, nbd_connected, &mut writer);
+    dispatch(request, handle, client_connected, &mut writer);
 }
 
 fn dispatch(
     request: VolumeRequest,
     handle: &VolumeClient,
-    nbd_connected: &AtomicBool,
+    client_connected: &AtomicBool,
     writer: &mut impl Write,
 ) {
     match request {
@@ -213,7 +213,7 @@ fn dispatch(
         }
         VolumeRequest::Reclaim { cap } => dispatch_reclaim(cap, handle, writer),
         VolumeRequest::Connected => {
-            let connected = nbd_connected.load(Ordering::Relaxed);
+            let connected = client_connected.load(Ordering::Relaxed);
             let _ = write_envelope(writer, &Envelope::ok(ConnectedReply { connected }));
         }
         VolumeRequest::Shutdown => unreachable!("shutdown is handled inline above"),

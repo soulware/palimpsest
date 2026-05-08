@@ -28,7 +28,7 @@ Correctness rests on BLAKE3 collision resistance: hash equality implies byte equ
 
 An earlier version of this design included a second tier: when the hash check missed, walk the LBA map over the incoming range, verify every overlapping extent's body was on host, and byte-compare the existing content against the incoming data. The intent was to catch fragmented matches — e.g. two adjacent 4 KiB writes whose concatenation equals an 8 KiB incoming write — for which the hash check cannot fire by construction.
 
-We removed it. The measurement that decided the question, taken with `dd if=/dev/urandom of=... bs=4M count=32` twice over a fresh ext4-on-NBD volume:
+We removed it. The measurement that decided the question, taken with `dd if=/dev/urandom of=... bs=4M count=32` twice over a fresh ext4 volume:
 
 - Tier-2 read **~690 MiB** to save **~50 MiB** of write work.
 - Almost all of those 50 MiB savings were ext4 metadata blocks (journal frames, group descriptors, unchanged bitmaps) — the hash check already caught those. Tier 2's marginal contribution on the random-data payload was ~zero.
@@ -47,7 +47,7 @@ If a future workload makes fragmented-match no-ops worth catching, reintroducing
 | Fragmented match (incoming spans many extents) | no       |
 | All-zeros write over a `ZERO_HASH` extent      | no       |
 
-The last row is a behaviour change from the two-tier design: `blake3::hash([0; N])` is not the `ZERO_HASH` sentinel, so the hash check misses and the write commits as a normal (highly compressible) DATA record. In practice this case is rare — userspace zero-fills usually arrive as `NBD_CMD_TRIM` or `NBD_CMD_WRITE_ZEROES`, both of which bypass `write` entirely via `Volume::trim` / `Volume::write_zeroes`.
+The last row is a behaviour change from the two-tier design: `blake3::hash([0; N])` is not the `ZERO_HASH` sentinel, so the hash check misses and the write commits as a normal (highly compressible) DATA record. In practice this case is rare — userspace zero-fills usually arrive as TRIM or WRITE_ZEROES, both of which bypass `write` entirely via `Volume::trim` / `Volume::write_zeroes`.
 
 ## Correctness
 
@@ -57,7 +57,7 @@ The last row is a behaviour change from the two-tier design: `blake3::hash([0; N
 
 **Snapshots.** A skipped write produces no local segment entry. The snapshot's view of that LBA is inherited from whatever existing entry already covered it — exactly right, since the content is unchanged.
 
-**Durability.** `NBD_CMD_FLUSH` routes through `VolumeClient::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
+**Durability.** A guest FLUSH routes through `VolumeClient::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
 
 **Hash collisions.** Same BLAKE3 collision-resistance assumption already baked into the existing extent-index dedup path. No new trust.
 
@@ -65,7 +65,7 @@ The last row is a behaviour change from the two-tier design: `blake3::hash([0; N
 
 ## Counters
 
-Two counters on `Volume`, exposed via `VolumeClient::noop_stats()` and printed on NBD client disconnect:
+Two counters on `Volume`, exposed via `VolumeClient::noop_stats()` and printed on client disconnect:
 
 - `skipped_writes` — `write()` calls short-circuited by the hash check.
 - `skipped_bytes` — bytes the skip avoided writing to the WAL.

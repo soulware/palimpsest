@@ -391,7 +391,7 @@ just synthesised handoff snapshots.
 
 ### `volume stop <name>` — local stop, retain ownership
 
-1. Refuse if a client (NBD/ublk) is connected.
+1. Refuse if a client (ublk) is connected.
 2. Issue the existing `shutdown` RPC: WAL fsync, daemon halts.
 3. Conditional PUT to `names/<name>` flipping `state` from `live`
    to `stopped`. `vol_ulid` and `coordinator_id` unchanged.

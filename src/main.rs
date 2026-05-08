@@ -7,8 +7,8 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, nbd, parse_size,
-    resolve_volume_dir, resolve_volume_size, ublk, validate_volume_name, verify,
+    VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, parse_size,
+    resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify,
 };
 
 /// Elide volume management and analysis tools.
@@ -34,7 +34,7 @@ enum Command {
         command: VolumeCommand,
     },
 
-    /// Serve an elide volume over NBD (spawned by coordinator; not for direct use)
+    /// Serve an elide volume over ublk (spawned by coordinator; not for direct use)
     #[command(hide = true)]
     ServeVolume {
         /// Path to the volume directory (by_id/<ulid>/)
@@ -43,29 +43,18 @@ enum Command {
         /// ignored on subsequent opens (size is stored in <vol-dir>/size).
         #[arg(long)]
         size: Option<String>,
-        /// Address to bind the NBD server (use 0.0.0.0 for VM access).
-        /// Ignored if --port is not set.
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// Port for the NBD server. If omitted, no NBD server is started
-        /// (volume runs for coordinator IPC only).
-        #[arg(long, conflicts_with_all = ["ublk", "ublk_id"])]
-        port: Option<u16>,
-        /// Unix socket path for the NBD server. Mutually exclusive with --port.
-        #[arg(long, conflicts_with_all = ["port", "ublk", "ublk_id"])]
-        socket: Option<PathBuf>,
         /// Serve as a read-only block device (auto-detected for imported bases;
         /// use this flag to explicitly serve a writable volume read-only)
         #[arg(long)]
         readonly: bool,
-        /// Serve over ublk (Linux userspace block device) instead of NBD.
-        /// Requires Linux with CONFIG_BLK_DEV_UBLK and the 'ublk' cargo
-        /// feature enabled.
-        #[arg(long, conflicts_with_all = ["port", "socket"])]
+        /// Serve over ublk. Without this flag the volume runs for coordinator
+        /// IPC only (no block device). Requires Linux with CONFIG_BLK_DEV_UBLK
+        /// and the 'ublk' cargo feature enabled.
+        #[arg(long)]
         ublk: bool,
         /// Explicit ublk device id (maps to /dev/ublkb<id>). If omitted and
         /// --ublk is passed, the kernel auto-allocates.
-        #[arg(long, conflicts_with_all = ["port", "socket"], requires = "ublk")]
+        #[arg(long, requires = "ublk")]
         ublk_id: Option<i32>,
     },
 
@@ -76,16 +65,6 @@ enum Command {
         image2: Option<String>,
         #[arg(long, default_value_t = 3)]
         level: i32,
-    },
-
-    /// Serve a raw ext4 image over NBD, tracking which blocks are read
-    #[command(hide = true)]
-    Serve {
-        image: String,
-        #[arg(long, default_value_t = 10809)]
-        port: u16,
-        #[arg(long)]
-        save_trace: Option<String>,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -297,21 +276,10 @@ enum VolumeCommand {
         /// `<vol_ulid>/<snap_ulid>`
         #[arg(long)]
         from: Option<String>,
-        /// Port for the NBD server (exposes the volume over NBD on first start)
-        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk"])]
-        nbd_port: Option<u16>,
-        /// Address to bind the NBD server (default: 127.0.0.1)
-        #[arg(long, conflicts_with_all = ["ublk"])]
-        nbd_bind: Option<String>,
-        /// Unix socket path for the NBD server. Omit the path to use the
-        /// default (nbd.sock inside the volume directory).
-        #[arg(long, conflicts_with_all = ["nbd_port", "ublk"], num_args = 0..=1, default_missing_value = "nbd.sock")]
-        nbd_socket: Option<PathBuf>,
-        /// Serve this volume over ublk (Linux userspace block device) instead
-        /// of NBD. The kernel auto-allocates a device id on first start; the
-        /// chosen id is then sticky across restarts (recorded in volume.toml).
-        /// Mutually exclusive with the --nbd-* flags.
-        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket"])]
+        /// Serve this volume over ublk on first start. The kernel
+        /// auto-allocates a device id; the chosen id is then sticky
+        /// across restarts (recorded in volume.toml).
+        #[arg(long)]
         ublk: bool,
         /// When forking: upload a new "now" snapshot marker to the remote
         /// store and branch from it, instead of relying on an existing
@@ -326,26 +294,12 @@ enum VolumeCommand {
     Update {
         /// Volume name
         name: String,
-        /// Change the NBD server port (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk", "no_ublk"])]
-        nbd_port: Option<u16>,
-        /// Change the NBD bind address (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["ublk", "no_ublk"])]
-        nbd_bind: Option<String>,
-        /// Set or change the Unix socket path for the NBD server. Omit the
-        /// path to use the default (nbd.sock inside the volume directory).
-        /// Restarts the volume process.
-        #[arg(long, conflicts_with_all = ["nbd_port", "ublk", "no_ublk"], num_args = 0..=1, default_missing_value = "nbd.sock")]
-        nbd_socket: Option<PathBuf>,
-        /// Disable NBD serving (removes the [nbd] section; restarts the volume process)
-        #[arg(long, conflicts_with_all = ["ublk", "no_ublk"])]
-        no_nbd: bool,
         /// Switch this volume to ublk transport (writes [ublk] section;
-        /// restarts the volume process). Mutually exclusive with the --nbd-* flags.
-        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd"])]
+        /// restarts the volume process).
+        #[arg(long, conflicts_with_all = ["no_ublk"])]
         ublk: bool,
         /// Disable ublk serving (removes the [ublk] section; restarts the volume process)
-        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd", "ublk"])]
+        #[arg(long, conflicts_with_all = ["ublk"])]
         no_ublk: bool,
     },
 
@@ -419,7 +373,7 @@ enum VolumeCommand {
         force: bool,
     },
 
-    /// Stop a running volume (flushes and halts the NBD server; drain/GC continue)
+    /// Stop a running volume (flushes and halts the ublk device; drain/GC continue)
     Stop {
         /// Volume name
         name: String,
@@ -645,9 +599,6 @@ fn main() {
                 name,
                 size,
                 from,
-                nbd_port,
-                nbd_bind,
-                nbd_socket,
                 ublk,
                 force_snapshot,
             } => {
@@ -656,8 +607,7 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    let flags =
-                        encode_transport_flags(nbd_port, nbd_bind, nbd_socket, false, ublk, false);
+                    let flags = encode_transport_flags(ublk, false);
                     if let Err(e) = create_fork(
                         &data_dir,
                         &name,
@@ -689,8 +639,7 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let flags =
-                        encode_transport_flags(nbd_port, nbd_bind, nbd_socket, false, ublk, false);
+                    let flags = encode_transport_flags(ublk, false);
                     let ulid = match coord.create_volume_remote(&name, bytes, &flags) {
                         Ok(u) => u,
                         Err(e) => {
@@ -707,15 +656,10 @@ fn main() {
 
             VolumeCommand::Update {
                 name,
-                nbd_port,
-                nbd_bind,
-                nbd_socket,
-                no_nbd,
                 ublk,
                 no_ublk,
             } => {
-                let flags =
-                    encode_transport_flags(nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, no_ublk);
+                let flags = encode_transport_flags(ublk, no_ublk);
                 match coord.update_volume(&name, &flags) {
                     Ok(reply) if reply.restarted => {
                         println!("volume restarting with new config")
@@ -966,9 +910,6 @@ fn main() {
         Command::ServeVolume {
             fork_dir,
             size,
-            bind,
-            port,
-            socket,
             readonly,
             ublk,
             ublk_id,
@@ -978,13 +919,13 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
-            // `volume.draining` forces IPC-only mode: skip every
-            // transport (ublk + NBD) regardless of CLI flags. The
-            // coordinator sets this marker when transparently restarting
-            // a stopped volume to drain it for `volume release`, so the
-            // brief restart window can never expose the volume to a
-            // client. The supervisor also drops the transport flags in
-            // this case; this is the second line of defence.
+            // `volume.draining` forces IPC-only mode: skip the ublk
+            // attach regardless of CLI flags. The coordinator sets this
+            // marker when transparently restarting a stopped volume to
+            // drain it for `volume release`, so the brief restart
+            // window can never expose the volume to a client. The
+            // supervisor also drops the transport flag in this case;
+            // this is the second line of defence.
             let draining = fork_dir.join("volume.draining").exists();
             if ublk && !draining {
                 if readonly {
@@ -1002,49 +943,38 @@ fn main() {
                     }
                 }
             }
-            let nbd_bind = if draining {
-                None
-            } else if let Some(path) = socket {
-                Some(nbd::NbdBind::Unix(path))
-            } else {
-                port.map(|p| nbd::NbdBind::Tcp { bind, port: p })
-            };
-            // Serve as readonly if explicitly requested or if the volume.readonly
-            // marker is present (imported bases have no private key on disk).
-            if readonly || fork_dir.join("volume.readonly").exists() {
-                nbd::run_volume_readonly(&fork_dir, size_bytes, nbd_bind, fetch_config)
-                    .expect("readonly NBD server error");
-            } else {
+            // No transport requested (or draining): IPC-only daemon.
+            // Writable volumes need the signing keypair on disk before
+            // the actor can promote segments; generate it here if the
+            // volume is fresh and not marked readonly.
+            if !readonly
+                && !fork_dir.join("volume.readonly").exists()
+                && !fork_dir.join(VOLUME_KEY_FILE).exists()
+            {
                 std::fs::create_dir_all(&fork_dir).expect("failed to create fork directory");
-                let signer = if fork_dir.join(VOLUME_KEY_FILE).exists() {
-                    elide_core::signing::read_lineage_verifying_signature(
-                        &fork_dir,
-                        VOLUME_PUB_FILE,
-                        VOLUME_PROVENANCE_FILE,
-                    )
-                    .expect("volume.provenance signature check failed");
-                    elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
-                        .expect("failed to load volume signing key")
-                } else {
-                    let key = elide_core::signing::generate_keypair(
-                        &fork_dir,
-                        VOLUME_KEY_FILE,
-                        VOLUME_PUB_FILE,
-                    )
-                    .expect("failed to generate volume keypair");
-                    elide_core::signing::write_provenance(
-                        &fork_dir,
-                        &key,
-                        VOLUME_PROVENANCE_FILE,
-                        &elide_core::signing::ProvenanceLineage::default(),
-                    )
-                    .expect("failed to write volume.provenance");
-                    elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
-                        .expect("failed to load volume signing key")
-                };
-                nbd::run_volume_signed(&fork_dir, size_bytes, nbd_bind, signer, fetch_config)
-                    .expect("volume NBD server error");
+                let key = elide_core::signing::generate_keypair(
+                    &fork_dir,
+                    VOLUME_KEY_FILE,
+                    VOLUME_PUB_FILE,
+                )
+                .expect("failed to generate volume keypair");
+                elide_core::signing::write_provenance(
+                    &fork_dir,
+                    &key,
+                    VOLUME_PROVENANCE_FILE,
+                    &elide_core::signing::ProvenanceLineage::default(),
+                )
+                .expect("failed to write volume.provenance");
             }
+            if fork_dir.join(VOLUME_KEY_FILE).exists() {
+                elide_core::signing::read_lineage_verifying_signature(
+                    &fork_dir,
+                    VOLUME_PUB_FILE,
+                    VOLUME_PROVENANCE_FILE,
+                )
+                .expect("volume.provenance signature check failed");
+            }
+            serve::run_volume_ipc_only(&fork_dir, fetch_config).expect("volume daemon error");
         }
 
         Command::Extents {
@@ -1054,14 +984,6 @@ fn main() {
         } => {
             extents::run(Path::new(&image1), image2.as_deref().map(Path::new), level)
                 .expect("extents failed");
-        }
-
-        Command::Serve {
-            image,
-            port,
-            save_trace,
-        } => {
-            nbd::run(&image, port, save_trace.as_deref()).expect("NBD server error");
         }
 
         Command::ColdBoot {
@@ -1461,7 +1383,7 @@ fn fallback_stop_volumes(data_dir: &Path) -> std::io::Result<()> {
     }
 
     // Phase 2: anything still alive after SIGTERM_GRACE gets SIGKILL.
-    // The volume's ublk/NBD signal watcher caps its own flush at 3s,
+    // The volume's ublk signal watcher caps its own flush at 3s,
     // so anything past SIGTERM_GRACE is a wedged process the operator
     // wants gone. Mirrors `systemctl stop`'s TimeoutStopSec → SIGKILL.
     for (pid, label) in &survivors {
@@ -1748,7 +1670,7 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: b
 }
 
 /// Summarise the configured block-device transport for display:
-/// `nbd <endpoint>`, `ublk <device>`, or `-` if neither is configured.
+/// `ublk <device>`, or `-` if no transport is configured.
 /// For ublk, the bound id (written back to `volume.toml` on a successful
 /// ADD) is shown; `auto` indicates a `[ublk]` section with no id yet.
 fn transport_summary(vol_dir: &Path) -> String {
@@ -1756,12 +1678,6 @@ fn transport_summary(vol_dir: &Path) -> String {
         Ok(c) => c,
         Err(_) => return "-".to_owned(),
     };
-    if let Some(nbd) = cfg.nbd.as_ref() {
-        return match nbd.endpoint(vol_dir) {
-            Some(ep) => format!("nbd {ep}"),
-            None => "nbd".to_owned(),
-        };
-    }
     if let Some(ublk) = cfg.ublk.as_ref() {
         return match ublk.dev_id {
             Some(id) => format!("ublk /dev/ublkb{id}"),
@@ -1774,27 +1690,8 @@ fn transport_summary(vol_dir: &Path) -> String {
 /// Encode the CLI's typed transport flags as the space-separated tokens
 /// understood by the coordinator's `create` / `update` IPC verbs. Order
 /// follows the IPC parser; absent options emit nothing.
-fn encode_transport_flags(
-    nbd_port: Option<u16>,
-    nbd_bind: Option<String>,
-    nbd_socket: Option<PathBuf>,
-    no_nbd: bool,
-    ublk: bool,
-    no_ublk: bool,
-) -> Vec<String> {
+fn encode_transport_flags(ublk: bool, no_ublk: bool) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(p) = nbd_port {
-        out.push(format!("nbd-port={p}"));
-    }
-    if let Some(b) = nbd_bind {
-        out.push(format!("nbd-bind={b}"));
-    }
-    if let Some(s) = nbd_socket {
-        out.push(format!("nbd-socket={}", s.display()));
-    }
-    if no_nbd {
-        out.push("no-nbd".to_owned());
-    }
     if ublk {
         out.push("ublk".to_owned());
     }

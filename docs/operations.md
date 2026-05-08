@@ -9,7 +9,7 @@ The WAL is promoted to a `pending/` segment in two ways, both handled by `Volume
 - **Size threshold (32 MB):** after every write reply, the actor checks `Volume::needs_promote()` and calls `flush_wal()` before the next queued message. The write caller already has its reply — the cost is borne by the next operation. Oversized writes succeed (soft cap).
 - **Idle flush (10s tick):** a tick runs alongside the request channel; when it fires with a non-empty WAL, `flush_wal()` is called.
 
-Both paths produce identical segments. `NBD_CMD_FLUSH` sends an explicit `Flush` message through the actor channel and blocks until it completes — neither promotion path is on the guest-fsync critical path. The idle tick is WAL-flush only; all compaction is coordinator-driven.
+Both paths produce identical segments. A guest FLUSH sends an explicit `Flush` message through the actor channel and blocks until it completes — neither promotion path is on the guest-fsync critical path. The idle tick is WAL-flush only; all compaction is coordinator-driven.
 
 ## Coordinator daemon
 
@@ -134,37 +134,15 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 
 `discover_volumes` skips ULID directories with neither `pending/` nor `index/`. Deleting both entirely hides the volume — fix with `mkdir <vol_dir>/index`.
 
-## Transports: NBD vs ublk
+## Block-device transport (ublk)
 
-A writable volume is served on exactly one host-visible transport: NBD (TCP or
-Unix socket) or ublk (Linux userspace block device). The two are mutually
-exclusive per volume — `volume.toml` containing both `[nbd]` and `[ublk]` is
-rejected at parse time.
-
-Choose by adding the corresponding section to `volume.toml`, or — easier — by
-passing the relevant flag to `volume create` / `volume update`.
-
-### NBD
-
-```toml
-[nbd]
-port = 10809          # or socket = "nbd.sock"
-bind = "127.0.0.1"
-```
-
-NBD works on Linux and macOS; ideal for guests inside a VM and for remote
-access where ublk is not an option.
-
-### ublk
+A writable volume is exposed to the host as a Linux ublk device
+(`/dev/ublkb<N>`).
 
 ```toml
 [ublk]
 # dev_id = 7          # optional; omit to let the kernel auto-allocate
 ```
-
-Linux-only. Preferred for host-local block access — 2–4× IOPS over
-`nbd-client` on loopback, lower tail latency, real `blk-mq` semantics
-(partitions, `blkdiscard`, `fstrim`, `O_DIRECT`).
 
 Prereqs:
 

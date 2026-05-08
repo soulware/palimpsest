@@ -4,7 +4,7 @@ How to boot a VM using an OCI-imported Elide volume as its root filesystem, usin
 
 ## Overview
 
-Elide volumes are raw ext4 block devices served over NBD. QEMU can boot a VM directly against one without a bootloader on the disk: you supply the kernel and initrd separately, and the kernel mounts the volume as its root. This is the same model Firecracker uses in production.
+Elide volumes are raw ext4 block devices exposed as `/dev/ublkb<N>` via the kernel ublk driver. QEMU can boot a VM directly against one without a bootloader on the disk: you supply the kernel and initrd separately, and the kernel mounts the volume as its root. This is the same model Firecracker uses in production.
 
 ## Kernel Requirements
 
@@ -35,17 +35,7 @@ The Ubuntu cloud kernel (`vmlinuz` + `initrd.img`, extractable from any Ubuntu c
 
 ## Serving the Volume
 
-```sh
-elide serve-volume /path/to/volume <fork-name>
-```
-
-For example, if you forked the volume to create a fork named `vm1`:
-
-```sh
-elide serve-volume /path/to/ubuntu-22.04 vm1
-```
-
-This starts an NBD server on `127.0.0.1:10809`. Leave it running in a separate terminal.
+Bring the volume up as a ublk block device (Linux 6.0+ with `CONFIG_BLK_DEV_UBLK`; load via `sudo modprobe ublk_drv`). The supervisor spawns `elide serve-volume --ublk` for each writable volume; once running, `/dev/ublkb<N>` is the host-visible device. Use `elide ublk list` to find the device id.
 
 ## Booting with QEMU
 
@@ -57,7 +47,7 @@ qemu-system-aarch64 \
   -kernel boot-arm64/vmlinuz \
   -initrd boot-arm64/initrd.img \
   -append "root=/dev/vda rw console=ttyAMA0 init=/sbin/init" \
-  -drive file=nbd://127.0.0.1:10809,format=raw,if=virtio \
+  -drive file=/dev/ublkb0,format=raw,if=virtio \
   -nographic
 ```
 

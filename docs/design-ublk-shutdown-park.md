@@ -47,8 +47,7 @@ handler did not.
 ## Durability on graceful shutdown
 
 `VolumeClient::write` returns OK after the actor appends to the WAL, but
-`Volume::write` does not currently fsync before reply (see
-`project_nbd_fsync_ack_ordering` audit). Writes acked to the guest may not
+`Volume::write` does not currently fsync before reply. Writes acked to the guest may not
 yet be on disk. The shutdown flush (`client.flush()` → `volume.wal_fsync()`)
 closes that window for graceful exits: any write the actor accepted before
 the flush request is durable when the flush returns. SIGKILL bypasses this,

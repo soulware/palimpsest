@@ -7,10 +7,9 @@
 //
 // Transport binding:
 //   By default no block-device transport is started (IPC-only mode). To expose
-//   a fork, add a `[nbd]` or `[ublk]` section to `volume.toml`. The supervisor
-//   reads volume.toml at spawn time and passes the matching `--port` /
-//   `--socket` (NBD) or `--ublk` / `--ublk-id` (ublk) flags. The two
-//   transports are mutually exclusive per volume.
+//   a fork, add a `[ublk]` section to `volume.toml`. The supervisor reads
+//   volume.toml at spawn time and passes the matching `--ublk` / `--ublk-id`
+//   flags.
 //
 // State files written to the fork directory:
 //   volume.pid  — PID of the running volume process; absent when not running
@@ -65,41 +64,8 @@ pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, child_env: ChildEnv
             continue;
         }
 
-        // NBD endpoint conflict: lowest ULID wins, loser is stopped.
-        match elide_core::config::find_nbd_conflict(&fork_dir, &data_dir) {
-            Ok(Some(conflict)) => {
-                // If the other volume has a lower ULID (or this is an
-                // external listener with no dir), this volume loses.
-                let dominated = conflict.dir.as_ref().is_none_or(|other_dir| {
-                    let self_name = fork_dir.file_name().and_then(|n| n.to_str());
-                    let other_name = other_dir.file_name().and_then(|n| n.to_str());
-                    match (self_name, other_name) {
-                        (Some(s), Some(o)) => s > o,
-                        _ => true,
-                    }
-                });
-                if dominated {
-                    error!(
-                        "[supervisor {label}] nbd endpoint {} conflicts with '{}'; \
-                         volume stopped (lower ULID wins)",
-                        conflict.endpoint, conflict.name,
-                    );
-                    let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
-                    break;
-                }
-                // We have the lower ULID — the other supervisor will stop
-                // itself. Proceed normally.
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("[supervisor {label}] nbd conflict check failed: {e}");
-                // Non-fatal: proceed with the spawn and let the bind fail
-                // naturally if there really is a conflict.
-            }
-        }
-
-        // ublk dev-id conflict: same lowest-ULID-wins rule, by dev_id rather
-        // than endpoint. Auto-allocated devices (dev_id absent) skip this
+        // ublk dev-id conflict: lowest-ULID-wins rule by dev_id.
+        // Auto-allocated devices (dev_id absent) skip this
         // check — the kernel resolves them at start time.
         match elide_core::config::find_ublk_conflict(&fork_dir, &data_dir) {
             Ok(Some(conflict)) => {
@@ -219,35 +185,20 @@ fn spawn_volume(
     }
 
     // `volume.draining` overrides the configured transport: spawn the
-    // daemon in IPC-only mode (no NBD listener, no ublk attach) so a
-    // coordinator-driven drain (e.g. `volume release` of a stopped
-    // volume) cannot accidentally expose the volume to external
-    // clients during the brief restart window. The marker is set by
-    // the coordinator before clearing `volume.stopped` and removed
-    // when the drain operation finishes.
+    // daemon in IPC-only mode (no ublk attach) so a coordinator-driven
+    // drain (e.g. `volume release` of a stopped volume) cannot
+    // accidentally expose the volume to external clients during the
+    // brief restart window. The marker is set by the coordinator before
+    // clearing `volume.stopped` and removed when the drain operation
+    // finishes.
     let draining = fork_dir.join("volume.draining").exists();
-    if !draining && let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) {
-        if let Some(nbd) = cfg.nbd {
-            if let Some(socket) = nbd.socket {
-                // Resolve relative paths against the volume directory so that
-                // "./nbd.sock" means <vol_dir>/nbd.sock regardless of cwd.
-                let socket = if socket.is_absolute() {
-                    socket
-                } else {
-                    fork_dir.join(socket)
-                };
-                cmd.arg("--socket").arg(socket);
-            } else if let Some(port) = nbd.port {
-                cmd.arg("--port").arg(port.to_string());
-                if let Some(bind) = nbd.bind {
-                    cmd.arg("--bind").arg(bind);
-                }
-            }
-        } else if let Some(ublk) = cfg.ublk {
-            cmd.arg("--ublk");
-            if let Some(id) = ublk.dev_id {
-                cmd.arg("--ublk-id").arg(id.to_string());
-            }
+    if !draining
+        && let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir)
+        && let Some(ublk) = cfg.ublk
+    {
+        cmd.arg("--ublk");
+        if let Some(id) = ublk.dev_id {
+            cmd.arg("--ublk-id").arg(id.to_string());
         }
     }
 
@@ -340,9 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn requires_ublk_nbd_only() {
+    fn requires_ublk_empty_config() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("volume.toml"), "[nbd]\nport = 10809\n").unwrap();
+        std::fs::write(tmp.path().join("volume.toml"), "size = 4096\n").unwrap();
         assert!(!requires_ublk(tmp.path()));
     }
 

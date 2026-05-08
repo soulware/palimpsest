@@ -15,7 +15,7 @@ layer, but they all share the same storage core.
                          │
 ┌────────────────────────▼─────────────────────────────┐
 │             Block device exposure                     │
-│             nbd (now) → ublk (target)                │
+│             ublk (/dev/ublkb<N>)                     │
 └────────────────────────┬─────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────┐
@@ -35,14 +35,10 @@ block device to a workload — over different APIs.
 
 ## Common prerequisites
 
-Two pieces of infrastructure unblock all integration targets:
-
-- **Unix socket NBD** (done) — binds an `UnixListener` instead of TCP; avoids
-  port allocation for local testing and host-side tooling (qemu-nbd, nbd-client
-  on the host). See `--nbd-socket`.
-- **ublk backend** — replaces nbd-client with a direct io_uring block device.
-  Eliminates the kernel nbd module and socket-per-I/O overhead. `/dev/ublkb0`
-  looks like a regular block device to every integration target.
+- **ublk backend** — Elide exposes each volume as a `/dev/ublkb<N>` device via
+  the kernel ublk driver (`CONFIG_BLK_DEV_UBLK`, Linux 6.0+; 6.5+ for
+  unprivileged mode). The device looks like a regular block device to every
+  integration target.
 - **Coordinator network API** — the coordinator currently speaks a Unix socket
   line protocol. A network-accessible API (HTTP/gRPC) is required for Docker
   volume plugin, Firecracker orchestration, and CSI.
@@ -57,7 +53,7 @@ exploration in [`design-oci-export.md`](design-oci-export.md).
 
 **Data volumes (current):**
 ```
-Elide (nbd/ublk) → /dev/nbd0 → mount → /mnt/vol
+Elide (ublk) → /dev/ublkb0 → mount → /mnt/vol
 docker run -v /mnt/vol:/data ...
 ```
 A bind mount from a host-mounted volume into the container. Works with any
@@ -71,31 +67,26 @@ socket). Users then do:
 docker volume create --driver elide myvolume
 docker run -v myvolume:/data ...
 ```
-Docker calls the plugin to mount/unmount; Elide handles the nbd/ublk attach and
+Docker calls the plugin to mount/unmount; Elide handles the ublk attach and
 mount internally. Requires the coordinator network API.
 
 ## Firecracker
 
 Firecracker does not expose vsock or vhost-user — it is intentionally minimal.
-All block device management is host-side. The VM never speaks NBD.
+All block device management is host-side.
 
 **Rootfs:**
 ```
-Elide NBD server  ←—— Unix socket (host-local)
-      ↓
-nbd-client (host) → /dev/nbd0
+Elide ublk → /dev/ublkb0
       ↓
 Firecracker boot drive config
       ↓
-VM boots from /dev/nbd0 as rootfs
+VM boots from /dev/ublkb0 as rootfs
 ```
-The Unix socket NBD path (`--nbd-socket`) is ideal here: no port allocation,
-host-local only. When ublk is available, `/dev/ublkb0` replaces `/dev/nbd0`
-with lower overhead.
 
 **Data volumes (hotplug):**
 ```
-Elide → nbd-client/ublk → /dev/nbd1
+Elide ublk → /dev/ublkb1
       ↓
 Firecracker PATCH /drives API
       ↓
@@ -122,7 +113,7 @@ requirements at runtime rather than having the host orchestrate everything.
 
 For basic use cases (rootfs, data volume hotplug), Cloud Hypervisor is
 effectively identical to Firecracker — virtio-blk hotplug via the management
-API, host-side nbd/ublk. Treat them the same until vhost-user is a priority.
+API, host-side ublk. Treat them the same until vhost-user is a priority.
 
 **vhost-user-blk (future):**
 
@@ -132,8 +123,7 @@ vhost-user-blk backend directly, removing the VMM from the data path:
 VM → vhost-user shared memory rings → Elide vhost-user-blk backend
 ```
 Combined with ublk on the host-storage side, this gives the shortest I/O path:
-VM shared memory → Elide → io_uring → storage. No VMM process, no kernel nbd
-module in the hot path.
+VM shared memory → Elide → io_uring → storage.
 
 This requires implementing the vhost-user-blk backend protocol in Elide — a
 meaningful piece of work, but a natural fit alongside ublk.
@@ -149,9 +139,8 @@ forking snapshots, and uploading segments to S3 for durability.
 ```
 ┌─ VM ──────────────────────────────────────────┐
 │  elide coordinator + volume serve             │
-│         ↓  unix socket NBD (now)              │
-│         ↓  ublk (target)                      │
-│  /dev/nbd0 or /dev/ublkb0                     │
+│         ↓  ublk                               │
+│  /dev/ublkb0                                  │
 │         ↓                                     │
 │  mkfs / mount → workload reads & writes       │
 │         ↓                                     │
@@ -161,23 +150,8 @@ forking snapshots, and uploading segments to S3 for durability.
 └───────────────────────────────────────────────┘
 ```
 
-**Current path (NBD unix socket):**
-```
-elide volume serve --nbd-socket ./vol/nbd.sock
-nbd-client -b 4096 -unix ./vol/nbd.sock /dev/nbd0
-mount /dev/nbd0 /mnt/data
-```
-Requires the `nbd` kernel module. Present in most general-purpose Linux
-kernels; may be absent in stripped-down microVM images.
-
-**Target path (ublk):**
-
-ublk replaces `nbd-client` with a direct io_uring block device. No kernel
-module required beyond the ublk driver (Linux 6.0+ for `CONFIG_BLK_DEV_UBLK`;
-6.5+ for unprivileged mode, which is what Elide uses). Elide spawns the ublk
-device itself; `/dev/ublkb0` appears as a regular block device. The in-VM case
-is identical to the host-side case — ublk work done for any target immediately
-benefits this one.
+Elide spawns the ublk device itself; `/dev/ublkb0` appears as a regular block
+device. The in-VM case is identical to the host-side case.
 
 **What this unlocks:**
 
@@ -195,10 +169,9 @@ benefits this one.
 
 **Constraints:**
 
-- Requires `nbd` kernel module (NBD path) or Linux 6.5+ with `CONFIG_BLK_DEV_UBLK` (ublk path, unprivileged mode).
-- `CAP_SYS_ADMIN` is needed to attach the block device (`nbd-client` or ublk).
-  This is standard for any block-device operation and is available to root
-  inside most VMs.
+- Requires Linux 6.0+ with `CONFIG_BLK_DEV_UBLK` (6.5+ for unprivileged mode).
+- `CAP_SYS_ADMIN` is needed to attach the block device. This is standard for
+  any block-device operation and is available to root inside most VMs.
 - The coordinator and volume serve run as persistent processes in the VM; a
   process supervisor (systemd, s6) is recommended for production use.
 
@@ -209,14 +182,14 @@ driver has two components:
 
 - **Controller plugin** (Deployment) — cluster-wide volume lifecycle, talks to
   the Elide coordinator network API.
-- **Node plugin** (DaemonSet) — per-node attach/mount, runs nbd/ublk locally.
+- **Node plugin** (DaemonSet) — per-node attach/mount, runs ublk locally.
 
 | CSI call | Elide action |
 |---|---|
 | `CreateVolume` | Coordinator creates a new volume |
 | `DeleteVolume` | Coordinator deletes volume |
 | `CreateSnapshot` | Coordinator creates a fork — direct mapping |
-| `NodeStageVolume` | ublk/nbd → block device → mount to staging path |
+| `NodeStageVolume` | ublk → block device → mount to staging path |
 | `NodePublishVolume` | Bind mount staging path → pod volume path |
 
 Access mode mapping:
@@ -230,17 +203,15 @@ Access mode mapping:
 Elide's fork model maps directly to CSI snapshots — `CreateSnapshot` is
 essentially free given the existing data model.
 
-The node plugin needs `CAP_SYS_ADMIN` and either the nbd kernel module or a
-Linux 6.5+ kernel with `CONFIG_BLK_DEV_UBLK` for unprivileged ublk.
+The node plugin needs `CAP_SYS_ADMIN` and a Linux 6.5+ kernel with
+`CONFIG_BLK_DEV_UBLK` for unprivileged ublk.
 
 ## Sequencing
 
 | Step | Work | Unblocks |
 |---|---|---|
-| 1 | Unix socket NBD (`--nbd-socket`) | Local testing, Firecracker rootfs without port allocation, in-VM self-contained |
-| 2 | Coordinator network API | Docker volume plugin, Firecracker orchestration, CSI |
-| 3 | ublk backend | All targets — lower latency, no nbd-client process; in-VM path: no nbd module required |
-| 4 | Firecracker integration | Firecracker rootfs + data volumes via hotplug |
-| 5 | Docker volume plugin | Docker data volumes with lifecycle management |
-| 6 | Cloud Hypervisor / vhost-user-blk | CH data volumes, shortest I/O path |
-| 7 | CSI driver | Kubernetes |
+| 1 | Coordinator network API | Docker volume plugin, Firecracker orchestration, CSI |
+| 2 | Firecracker integration | Firecracker rootfs + data volumes via hotplug |
+| 3 | Docker volume plugin | Docker data volumes with lifecycle management |
+| 4 | Cloud Hypervisor / vhost-user-blk | CH data volumes, shortest I/O path |
+| 5 | CSI driver | Kubernetes |

@@ -24,7 +24,7 @@
 
 ## Why ancestors don't need it
 
-Tracing actual size readers (`src/lib.rs:104` → ublk/nbd `nr_sectors`; `inbound.rs:2061` fork inheritance; `filemap.rs:165` ext4 scan; `upload.rs:461` re-publish; `import.rs:259` initial write), every path that consumes `size` operates on a *live* volume — the current fork being served, the source of a fork operation, or the import in progress. Ancestors are read-only segment containers; their data is reached through a child's LBA map, and the child's *own* size determines what the guest sees. There is no read path that consults an ancestor's `size`.
+Tracing actual size readers (`src/lib.rs:104` → ublk `nr_sectors`; `inbound.rs:2061` fork inheritance; `filemap.rs:165` ext4 scan; `upload.rs:461` re-publish; `import.rs:259` initial write), every path that consumes `size` operates on a *live* volume — the current fork being served, the source of a fork operation, or the import in progress. Ancestors are read-only segment containers; their data is reached through a child's LBA map, and the child's *own* size determines what the guest sees. There is no read path that consults an ancestor's `size`.
 
 So ancestors simply stop carrying it. Pulled skeletons drop from `volume.pub + volume.provenance + manifest.toml` to `volume.pub + volume.provenance`. The peer-fetch trust gap closes (every skeleton file is now either signed or a public key), and the bootstrap pull is one fewer S3 GET per ancestor.
 
@@ -36,8 +36,6 @@ Resize becomes a metadata operation against the claim record, not a fork:
 2. CAS on `names/<name>` bumps `size`; emits a signed `Resized { new_size }` entry in `events/<name>/`.
 3. Coordinator (or volume process) calls `UBLK_U_CMD_UPDATE_SIZE` (Linux 6.16+) on the running ublk device — `set_capacity_and_notify()` updates the gendisk capacity live, no I/O interruption.
 4. Local `volume.toml.size` cache is updated.
-
-NBD has no equivalent live-update; resize against an NBD-served volume requires reconnect (acceptable: NBD is the simpler-deployment transport, not the primary one).
 
 ## What happens to `manifest.toml`
 

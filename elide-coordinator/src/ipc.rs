@@ -121,8 +121,7 @@ pub enum Request {
 
     // ── Iteration 3: creation + readonly ─────────────────────────────
     /// Mint a fresh writable volume. `flags` is the same transport-flag
-    /// list the CLI accepts on the command line (`nbd-port=N`,
-    /// `nbd-bind=…`, `ublk`, `ublk-id=N`, `nbd-socket=…`).
+    /// list the CLI accepts on the command line (`ublk`, `no-ublk`).
     Create {
         volume: String,
         size_bytes: u64,
@@ -813,7 +812,7 @@ mod tests {
                 name: "parent".to_owned(),
             },
             force_snapshot: true,
-            flags: vec!["nbd-port=10809".to_owned()],
+            flags: vec!["ublk".to_owned()],
         };
         let s = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&s).unwrap();

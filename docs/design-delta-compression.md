@@ -20,7 +20,7 @@ This requires:
 
 Both are produced at import time by parsing the ext4 image before writing segments.
 
-NBD live writes cannot meet these preconditions — every write lands as a fragmented 4 KiB block, and the drain-time coordinator has no LBA → path information. NBD-written volumes therefore get delta compression via the post-snapshot delta repack path (Phase 5), which runs before drain on pending segments above the latest snapshot floor and consults the prior sealed snapshot's LBA map directly — no filemap needed for Tier 1. A filemap-driven Tier 2 for LBAs that shifted between snapshots is scoped but deferred.
+Live writes cannot meet these preconditions — every write lands as a fragmented 4 KiB block, and the drain-time coordinator has no LBA → path information. Live-written volumes therefore get delta compression via the post-snapshot delta repack path (Phase 5), which runs before drain on pending segments above the latest snapshot floor and consults the prior sealed snapshot's LBA map directly — no filemap needed for Tier 1. A filemap-driven Tier 2 for LBAs that shifted between snapshots is scoped but deferred.
 
 ## Filemap format
 
@@ -170,9 +170,9 @@ Operators wanting delta compression on a `volume import --extents-from <source>`
 
 Imports continue to write the importing volume's own filemap inline in `elide-core/src/import.rs`; that path is fast because the import already has ext4 layout in hand.
 
-Scope is deliberately narrow: **filemap only, no coalescing of NBD-fragmented extents into file-sized extents.** The filemap records paths and fragment layouts exactly as the existing DATA entries describe them. Non-ext4 volumes and parse failures skip cleanly. Output uses write-tmp, fsync, upload, rename — the filesystem is the queue, and restart recovery re-uploads any leftover `.tmp`.
+Scope is deliberately narrow: **filemap only, no coalescing of fragmented extents into file-sized extents.** The filemap records paths and fragment layouts exactly as the existing DATA entries describe them. Non-ext4 volumes and parse failures skip cleanly. Output uses write-tmp, fsync, upload, rename — the filesystem is the queue, and restart recovery re-uploads any leftover `.tmp`.
 
-Extends filemap coverage to NBD-written volumes. Does not itself compress anything — the drain-time upload stage has no LBA → path mapping, and by the time Phase 4 runs, the segments are already sealed. Phase 5 picks up the delta opportunity.
+Extends filemap coverage to live-written volumes. Does not itself compress anything — the drain-time upload stage has no LBA → path mapping, and by the time Phase 4 runs, the segments are already sealed. Phase 5 picks up the delta opportunity.
 
 One small exception lands as a side-effect: after Phase 4, a new import using `--extents-from <writable-volume>` can use the writable volume's snapshot filemap as a delta source. The import walks ext4 directly (target-side knowledge), Phase 4 has already generated the source filemap (source-side knowledge), and the Phase 3 producer works unchanged. Source files appearing as a single filemap row (contiguous) participate; fragmented sources are skipped.
 

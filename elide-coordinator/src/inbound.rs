@@ -1068,17 +1068,12 @@ fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
 /// the consumer (different rules for create vs update).
 #[derive(Default)]
 pub(crate) struct TransportPatch {
-    pub(crate) nbd_port: Option<u16>,
-    pub(crate) nbd_bind: Option<String>,
-    pub(crate) nbd_socket: Option<std::path::PathBuf>,
-    pub(crate) no_nbd: bool,
     pub(crate) ublk: bool,
     pub(crate) no_ublk: bool,
 }
 
-/// Parse a flat space-separated flag list. Recognised tokens:
-///   nbd-port=<u16>, nbd-bind=<addr>, nbd-socket=<path>, no-nbd,
-///   ublk, no-ublk
+/// Parse a flat space-separated flag list. Recognised tokens: `ublk`,
+/// `no-ublk`.
 ///
 /// Unknown tokens produce an error so silent typos don't get accepted.
 /// There is no `ublk-id=<n>` token: the kernel auto-allocates on first
@@ -1094,12 +1089,6 @@ pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String
             None => (tok, None),
         };
         match (key, val) {
-            ("nbd-port", Some(v)) => {
-                patch.nbd_port = Some(v.parse().map_err(|e| format!("bad nbd-port {v:?}: {e}"))?);
-            }
-            ("nbd-bind", Some(v)) => patch.nbd_bind = Some(v.to_owned()),
-            ("nbd-socket", Some(v)) => patch.nbd_socket = Some(v.into()),
-            ("no-nbd", None) => patch.no_nbd = true,
             ("ublk", None) => patch.ublk = true,
             ("no-ublk", None) => patch.no_ublk = true,
             _ => return Err(format!("unknown flag: {tok}")),
@@ -1143,33 +1132,12 @@ async fn create_volume_op(
     }
 
     let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
-    if patch.no_nbd || patch.no_ublk {
+    if patch.no_ublk {
         return Err(IpcError::bad_request(
-            "no-nbd / no-ublk are not valid on create (volume starts without transport)",
-        ));
-    }
-    if (patch.nbd_port.is_some() || patch.nbd_bind.is_some() || patch.nbd_socket.is_some())
-        && patch.ublk
-    {
-        return Err(IpcError::bad_request(
-            "nbd-* flags are mutually exclusive with ublk",
+            "no-ublk is not valid on create (volume starts without transport)",
         ));
     }
 
-    let nbd_cfg = if let Some(socket) = patch.nbd_socket {
-        Some(elide_core::config::NbdConfig {
-            socket: Some(socket),
-            ..Default::default()
-        })
-    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
-        Some(elide_core::config::NbdConfig {
-            port: patch.nbd_port,
-            bind: patch.nbd_bind,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
     let ublk_cfg = if patch.ublk {
         Some(elide_core::config::UblkConfig::default())
     } else {
@@ -1305,7 +1273,6 @@ async fn create_volume_op(
         elide_core::config::VolumeConfig {
             name: Some(name.to_owned()),
             size: Some(size_bytes),
-            nbd: nbd_cfg,
             ublk: ublk_cfg,
             lazy: None,
         }
@@ -1359,29 +1326,6 @@ async fn update_volume_op(
     // tear the kernel device down after the new config takes effect.
     let prev_bound_id = cfg.ublk.as_ref().and_then(|u| u.dev_id);
 
-    // Mirror the CLI's apply order: nbd flags first, then ublk. The setters
-    // clear the opposite transport so the two sections remain mutually
-    // exclusive.
-    if patch.no_nbd {
-        cfg.nbd = None;
-    } else if let Some(socket) = patch.nbd_socket {
-        cfg.nbd = Some(elide_core::config::NbdConfig {
-            socket: Some(socket),
-            ..Default::default()
-        });
-        cfg.ublk = None;
-    } else if patch.nbd_port.is_some() || patch.nbd_bind.is_some() {
-        let existing = cfg.nbd.get_or_insert_with(Default::default);
-        if let Some(port) = patch.nbd_port {
-            existing.port = Some(port);
-            existing.socket = None;
-        }
-        if let Some(bind) = patch.nbd_bind {
-            existing.bind = Some(bind);
-        }
-        cfg.ublk = None;
-    }
-
     if patch.no_ublk {
         cfg.ublk = None;
     } else if patch.ublk {
@@ -1391,7 +1335,6 @@ async fn update_volume_op(
         // the next serve).
         if cfg.ublk.is_none() {
             cfg.ublk = Some(elide_core::config::UblkConfig::default());
-            cfg.nbd = None;
         }
     }
 
@@ -1626,13 +1569,14 @@ async fn stop_volume_op(
 
     let readonly = vol_dir.join("volume.readonly").exists();
 
-    // Refuse to stop while an NBD client is connected. ublk volumes have
-    // no NBD client and `is_connected` returns Disconnected.
+    // Refuse to stop while a block-device client is connected. The ublk
+    // transport always reports `Disconnected` today, so this is a future
+    // hook rather than an active gate.
     if elide_coordinator::control::is_connected(&vol_dir).await
         == elide_coordinator::control::ConnectedStatus::Connected
     {
         return Err(IpcError::conflict(
-            "nbd client is connected; disconnect it first",
+            "client is connected; disconnect it first",
         ));
     }
 
@@ -1984,7 +1928,7 @@ async fn force_release_volume_op(
 /// `volume start` it. Composes the existing snapshot path:
 ///
 /// 1. Refuse if the volume is readonly (no exclusive owner to release)
-///    or an NBD client is connected (must disconnect cleanly first).
+///    or a block-device client is connected (must disconnect cleanly first).
 /// 2. If the volume is `stopped`, transparently bring it back up
 ///    (clear the marker, notify the supervisor, wait for
 ///    `control.sock`) — the drain step needs a running daemon.
@@ -2156,7 +2100,7 @@ async fn release_volume_op(
         == elide_coordinator::control::ConnectedStatus::Connected
     {
         return Err(IpcError::conflict(
-            "nbd client is connected; disconnect it first",
+            "client is connected; disconnect it first",
         ));
     }
 
@@ -2449,17 +2393,6 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
         Err(LifecycleError::Store(e)) => {
             warn!("[inbound] start {volume_name}: failed to update names/<name>: {e}");
         }
-    }
-
-    match elide_core::config::find_nbd_conflict(&vol_dir, data_dir) {
-        Ok(Some(conflict)) => {
-            return Err(IpcError::conflict(format!(
-                "nbd endpoint {} conflicts with volume '{}'",
-                conflict.endpoint, conflict.name,
-            )));
-        }
-        Ok(None) => {}
-        Err(e) => return Err(IpcError::internal(format!("nbd conflict check: {e}"))),
     }
 
     std::fs::remove_file(vol_dir.join(STOPPED_FILE))
@@ -2904,17 +2837,7 @@ mod tests {
     #[test]
     fn parse_flags_empty() {
         let p = parse_transport_flags("").unwrap();
-        assert!(p.nbd_port.is_none());
-        assert!(p.nbd_bind.is_none());
-        assert!(p.nbd_socket.is_none());
-        assert!(!p.no_nbd && !p.ublk && !p.no_ublk);
-    }
-
-    #[test]
-    fn parse_flags_nbd() {
-        let p = parse_transport_flags("nbd-port=10809 nbd-bind=0.0.0.0").unwrap();
-        assert_eq!(p.nbd_port, Some(10809));
-        assert_eq!(p.nbd_bind.as_deref(), Some("0.0.0.0"));
+        assert!(!p.ublk && !p.no_ublk);
     }
 
     #[test]
@@ -2938,20 +2861,18 @@ mod tests {
 
     #[test]
     fn parse_flags_clearing() {
-        let p = parse_transport_flags("no-nbd no-ublk").unwrap();
-        assert!(p.no_nbd);
+        let p = parse_transport_flags("no-ublk").unwrap();
         assert!(p.no_ublk);
     }
 
     #[test]
     fn parse_flags_unknown_rejected() {
-        assert!(parse_transport_flags("nbd-port=80 unknown=1").is_err());
+        assert!(parse_transport_flags("ublk unknown=1").is_err());
         assert!(parse_transport_flags("not-a-flag").is_err());
     }
 
     #[test]
     fn parse_flags_bad_value() {
-        assert!(parse_transport_flags("nbd-port=not-a-number").is_err());
         assert!(parse_transport_flags("ublk-id=").is_err());
     }
 
@@ -3946,7 +3867,6 @@ mod tests {
         elide_core::config::VolumeConfig {
             name: Some(name.to_owned()),
             size: Some(SAMPLE_SIZE),
-            nbd: None,
             ublk: ublk_dev_id.map(|id| elide_core::config::UblkConfig { dev_id: Some(id) }),
             lazy: None,
         }

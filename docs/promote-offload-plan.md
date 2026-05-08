@@ -16,7 +16,7 @@ The same offload path is used by `gc_checkpoint`, which previously synchronously
 
 `flush_wal()` historically conflated two operations with different purposes:
 
-- **Flush** = `wal.fsync()`. Durability barrier. The WAL is the durability boundary — after fsync, data survives a crash. This is what `NBD_CMD_FLUSH` requires.
+- **Flush** = `wal.fsync()`. Durability barrier. The WAL is the durability boundary — after fsync, data survives a crash. This is what a guest FLUSH requires.
 - **Promote** = serialize WAL entries into a `pending/<ulid>` segment, update the extent index to segment-relative offsets, delete the old WAL, open a fresh WAL. Housekeeping for the segment lifecycle.
 
 The offload separates these. `VolumeRequest::Flush` is a WAL fsync of the current WAL plus (if a promote is in flight) a park on the promote generation counter. No segment I/O, no *actor* blocking on the worker — the FLUSH caller waits, but new writes queued on the channel are still served onto the fresh WAL. Promotion itself is triggered independently by the threshold check (`needs_promote()`) and the idle tick, dispatched asynchronously to the flusher thread, and the *old* WAL's `fsync()` runs as the first step of the worker job rather than on the actor.
@@ -125,7 +125,7 @@ When a promote completes, the actor walks both structures and resolves any reply
 
 The actor sends the job to the flusher channel, increments `promotes_in_flight`, bumps `promote_gen`, pushes `old_wal_path` onto `inflight_old_wals`, and returns to the select loop. If `needs_promote()` fires again before the first promote completes, the actor preps and dispatches another job — multiple promotes can be queued on the flusher channel.
 
-**The old WAL's `fsync()` no longer runs on the actor.** It is now the first step of the worker's `execute_promote` below. This matches the way a real block device keeps accepting commands while a FLUSH is in flight at the controller: the volume actor keeps processing writes onto the fresh WAL while the worker makes the old one durable in parallel. NBD `Flush` parks on `promote_gen` / `completed_gen` so the client still sees a strict durability barrier (see *Flush parking* below).
+**The old WAL's `fsync()` no longer runs on the actor.** It is now the first step of the worker's `execute_promote` below. This matches the way a real block device keeps accepting commands while a FLUSH is in flight at the controller: the volume actor keeps processing writes onto the fresh WAL while the worker makes the old one durable in parallel. `Flush` parks on `promote_gen` / `completed_gen` so the client still sees a strict durability barrier (see *Flush parking* below).
 
 #### Flusher: heavy middle
 
@@ -150,7 +150,7 @@ The actor sends the job to the flusher channel, increments `promotes_in_flight`,
 3. `publish_snapshot()` — bumps `flush_gen`. Readers loading the new snapshot see segment-relative offsets pointing at `pending/<segment_ulid>`.
 4. Resolve any parked operations waiting for this segment ULID (see Parking structures above).
 
-#### Actor: NBD `Flush` parking
+#### Actor: `Flush` parking
 
 `VolumeRequest::Flush` is split into two phases on the actor:
 
@@ -159,7 +159,7 @@ The actor sends the job to the flusher channel, increments `promotes_in_flight`,
 
 Every `WorkerResult::Promote` (success or error) bumps `completed_gen` and runs `resolve_parked_flushes`, which drains any entry whose `needed_gen <= completed_gen` and sends `Ok` (or the error from the fallback fsync on the error path). On shutdown, `shutdown_worker` drains the worker results the same way, so parked flushes resolve as long as their promote has a result to report; any flushes still parked after the channel closes have their reply senders dropped (caller sees `RecvError`).
 
-This preserves NBD's FLUSH contract — every write ack'd before the flush is durable by the time the flush reply arrives — without blocking the actor on disk I/O. The analogy is a real block device: the controller keeps accepting commands while a FLUSH is in flight; only the caller of FLUSH waits.
+This preserves the FLUSH contract — every write ack'd before the flush is durable by the time the flush reply arrives — without blocking the actor on disk I/O. The analogy is a real block device: the controller keeps accepting commands while a FLUSH is in flight; only the caller of FLUSH waits.
 
 ### Sequencing: `PromoteWal` (explicit promote)
 
@@ -319,7 +319,7 @@ Under sustained write load, the flusher queue depth is bounded by `write_through
 If the flusher reports an error:
 
 - The old WAL is still on disk and still referenced by extent index entries at WAL-relative offsets. Reads against the old hashes continue to work — the WAL file is still reachable at its path.
-- The actor performs a fallback `sync_data()` on the old WAL on the error path before bumping `completed_gen`, so any parked NBD `Flush` waiting on this promote's generation still receives a correct durability guarantee — either `Ok` (fallback fsync succeeded; the worker's attempt may or may not have landed, but the actor's did) or `Err` (fallback fsync also failed; caller must retry).
+- The actor performs a fallback `sync_data()` on the old WAL on the error path before bumping `completed_gen`, so any parked `Flush` waiting on this promote's generation still receives a correct durability guarantee — either `Ok` (fallback fsync succeeded; the worker's attempt may or may not have landed, but the actor's did) or `Err` (fallback fsync also failed; caller must retry).
 - The pending segment is either absent, a stale `.tmp` (swept on startup), or renamed. A renamed segment at a fresh ULID with no extent index references is a wasted segment that sweep will clean up.
 - `pending_entries` for the batch have been moved into the job and are gone from memory.
 - Writes continue on the current active WAL.
@@ -339,7 +339,7 @@ For the GC checkpoint case, if the flusher channel is closed during dispatch, th
 7. **Unit test: PromoteWal reply after flusher completes.** Verifying that a `PromoteWal` request is parked and resolved once the flusher finishes. **No test yet.**
 8. **Bench: write tail latency under sustained load.** Compare p99 write latency with and without the offload under a workload that triggers promote every 8 MiB. **Not yet implemented.**
 9. **Bench: GC latency impact on writes.** With the coordinator running GC every 60 s, measure per-write p99 during a 10-minute sustained write workload. **Not yet implemented.**
-10. **Manual: large mkfs on NBD.** The `mkfs.ext4` path is a natural stress test — the write pattern triggers multiple promotes back-to-back. **Run manually during development; no automated harness.**
+10. **Manual: large mkfs.** The `mkfs.ext4` path is a natural stress test — the write pattern triggers multiple promotes back-to-back. **Run manually during development; no automated harness.**
 
 ## Landing sequence
 

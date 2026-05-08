@@ -6,7 +6,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 
 | Document | Contents |
 |---|---|
-| [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, branch a writable replica, and serve it over NBD |
+| [docs/quickstart.md](docs/quickstart.md) | Import an OCI image, branch a writable replica, and serve it over ublk |
 | [docs/quickstart-data-volume.md](docs/quickstart-data-volume.md) | Create an empty data volume, mount from a Lima VM, write data, upload segments |
 | [docs/quickstart-tigris.md](docs/quickstart-tigris.md) | Run against a real S3-compatible backend (Tigris); covers AWS S3, MinIO, R2, etc. |
 | [docs/overview.md](docs/overview.md) | Problem statement, key concepts, operation modes, empirical findings |
@@ -39,7 +39,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |
 | [docs/promote-offload-plan.md](docs/promote-offload-plan.md) | Plan: offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
 | [docs/promote-segment-offload-plan.md](docs/promote-segment-offload-plan.md) | Plan: offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
-| [docs/design-ublk-transport.md](docs/design-ublk-transport.md) | Design: ublk as preferred host-local transport alongside NBD — multi-queue async handler, USER_RECOVERY_REISSUE crash recovery, phased rollout (steps 1–3 landed, 4–5 open) |
+| [docs/design-ublk-transport.md](docs/design-ublk-transport.md) | Design: ublk as the host-local transport — multi-queue async handler, USER_RECOVERY_REISSUE crash recovery |
 | [docs/design-ublk-shutdown-park.md](docs/design-ublk-shutdown-park.md) | Design (proposed): shutdown leaves ublk device QUIESCED for recovery; deletion becomes an explicit verb. Makes `stop → start` reliable while a filesystem is still mounted |
 | [docs/design-peer-segment-fetch.md](docs/design-peer-segment-fetch.md) | Exploration: opportunistic LAN peer-fetch tier in front of S3 for index/body bytes. Targets cross-host handoff (release → claim) and large-fleet image pull. URL space mirrors S3 paths; auth mirrors per-volume IAM prefix scope. |
 | [docs/peer-segment-fetch-v1-plan.md](docs/peer-segment-fetch-v1-plan.md) | Plan: v1 implementation of peer-fetch — `.idx`-only, coordinator-driven, opt-in via coordinator config. New `elide-peer-fetch` crate. Decision criteria for whether to extend to body fetch. |
@@ -63,6 +63,6 @@ Start with [docs/overview.md](docs/overview.md).
 Two lanes run unconditionally on every pull request and every push to `main`:
 
 - `ci` — build, clippy, and userspace tests.
-- `ci-kernel` — kernel-dependent features (`ublk::`, `nbd::`) exercised inside
+- `ci-kernel` — kernel-dependent features (`ublk::`) exercised inside
   a nested KVM VM on the GitHub runner. Host builds the test binary; the guest
   runs it via a 9p share. Blocking, not advisory.
