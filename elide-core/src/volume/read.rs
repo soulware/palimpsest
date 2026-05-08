@@ -184,15 +184,17 @@ impl FileCache {
     }
 }
 
-/// Read `lba_count` 4KB blocks starting at `lba` from the given LBA map and extent index.
+/// Read 4 KiB blocks starting at `lba` into the caller-supplied `out` buffer.
 ///
-/// Unwritten blocks are returned as zeros. Written blocks are fetched extent-by-extent
-/// using `find_segment` to locate each segment file, with recently-opened file handles
-/// cached in `file_cache` (LRU) to amortize `open` syscalls across reads.
+/// `out.len()` must be a multiple of 4096; it determines how many blocks are
+/// read. The caller's buffer is treated as uninitialised — every byte is
+/// written before return: data extents are read from segment files; gaps
+/// between extents (unwritten LBAs) and `ZERO_HASH` extents are explicitly
+/// zero-filled.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_extents(
     lba: u64,
-    lba_count: u32,
+    out: &mut [u8],
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
@@ -201,13 +203,31 @@ pub(crate) fn read_extents(
     cache_dir: &Path,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
 
-    let mut out = vec![0u8; lba_count as usize * 4096];
-    for er in lbamap.extents_in_range(lba, lba + lba_count as u64) {
-        // Zero extents: output buffer is already zeroed; nothing to fetch.
+    debug_assert!(
+        out.len().is_multiple_of(4096),
+        "read buffer must be a multiple of 4096 bytes"
+    );
+    let lba_count = (out.len() / 4096) as u32;
+    let end_lba = lba + lba_count as u64;
+    let mut cursor = lba;
+    for er in lbamap.extents_in_range(lba, end_lba) {
+        // Fill any gap between the previous extent and this one with zeros —
+        // unwritten LBAs read back as zero by block-device convention.
+        if er.range_start > cursor {
+            let gap_start = (cursor - lba) as usize * 4096;
+            let gap_end = (er.range_start - lba) as usize * 4096;
+            out[gap_start..gap_end].fill(0);
+        }
+        cursor = er.range_end;
+
+        // Zero extents: write zeros for the covered range, no body to fetch.
         if er.hash == ZERO_HASH {
+            let s = (er.range_start - lba) as usize * 4096;
+            let e = (er.range_end - lba) as usize * 4096;
+            out[s..e].fill(0);
             continue;
         }
 
@@ -246,7 +266,7 @@ pub(crate) fn read_extents(
                     cache_dir,
                     &find_segment,
                     &open_delta_body,
-                    &mut out,
+                    out,
                 )? {
                     continue;
                 }
@@ -374,7 +394,12 @@ pub(crate) fn read_extents(
             }
         }
     }
-    Ok(out)
+    // Trailing gap after the last extent.
+    if cursor < end_lba {
+        let gap_start = (cursor - lba) as usize * 4096;
+        out[gap_start..].fill(0);
+    }
+    Ok(())
 }
 
 /// Try to materialise a Delta extent for the range covered by `er`,

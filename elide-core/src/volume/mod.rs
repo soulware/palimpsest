@@ -693,17 +693,18 @@ impl Volume {
         self.write_zeroes(start_lba, lba_count)
     }
 
-    /// Read `lba_count` blocks (4096 bytes each) starting at `lba`.
+    /// Read 4 KiB blocks starting at `lba` into the caller-supplied `buf`.
     ///
+    /// `buf.len()` must be a multiple of 4096; it determines the block count.
     /// Blocks that have never been written are returned as zeros (the
     /// block-device convention for unwritten regions). Written blocks are
     /// fetched extent-by-extent: one file open and one read (or decompress)
     /// per extent, regardless of how many blocks within the extent are needed.
-    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+    pub fn read_into(&self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
         let cache_dir = self.base_dir.join("cache");
         read_extents(
             lba,
-            lba_count,
+            buf,
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
@@ -720,6 +721,16 @@ impl Volume {
                 )
             },
         )
+    }
+
+    /// Allocating convenience wrapper around [`Volume::read_into`].
+    ///
+    /// The hot read path (ublk dispatch) calls `read_into` directly with the
+    /// kernel's IO buffer; this allocating form is used by tests and the CLI.
+    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; lba_count as usize * 4096];
+        self.read_into(lba, &mut buf)?;
+        Ok(buf)
     }
 
     /// Snapshot the dmat telemetry counters for this volume.

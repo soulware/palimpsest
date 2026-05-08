@@ -1786,12 +1786,13 @@ impl VolumeClient {
 }
 
 impl VolumeReader {
-    /// Read `lba_count` blocks starting at `lba`.
+    /// Read 4 KiB blocks starting at `lba` into the caller-supplied `buf`.
     ///
-    /// Resolved entirely on the calling thread using the current `ReadSnapshot`
-    /// — no channel round-trip. Reflects all writes that have returned `Ok`,
-    /// including those not yet flushed to disk (read-your-writes guarantee).
-    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+    /// `buf.len()` must be a multiple of 4096. Resolved entirely on the
+    /// calling thread using the current `ReadSnapshot` — no channel
+    /// round-trip. Reflects all writes that have returned `Ok`, including
+    /// those not yet flushed to disk (read-your-writes guarantee).
+    pub fn read_into(&self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
         // Load the snapshot first. flush_gen is embedded in the snapshot so
         // the generation and the extent index offsets are always consistent —
         // a single ArcSwap::load() gives both atomically with no window.
@@ -1806,7 +1807,7 @@ impl VolumeReader {
         let cache_dir = config.base_dir.join("cache");
         read_extents(
             lba,
-            lba_count,
+            buf,
             &snap.lbamap,
             extent_index,
             &self.file_cache,
@@ -1833,6 +1834,16 @@ impl VolumeReader {
                 )
             },
         )
+    }
+
+    /// Allocating convenience wrapper around [`VolumeReader::read_into`].
+    ///
+    /// The hot read path (ublk dispatch) calls `read_into` directly with the
+    /// kernel's IO buffer; this allocating form is used by tests.
+    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; lba_count as usize * 4096];
+        self.read_into(lba, &mut buf)?;
+        Ok(buf)
     }
 
     /// Snapshot the dmat telemetry counters for this reader.
