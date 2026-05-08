@@ -88,6 +88,27 @@ A bucket with exactly one fully-live small input would be a no-op
 rewrite; the bucketer drops it the same way today's sweep skips
 single-segment buckets.
 
+### Why `segs.len() + 1` output ULIDs
+
+Bin-packing is at most N→N: every input is placed in exactly one
+bucket, and we never split an input across buckets. The worst case
+(every input becomes a solo bucket) gives exactly N output segments,
+not more.
+
+The +1 covers the WAL-flush peer. `prepare_repack` mints output ULIDs
+*before* it flushes the open WAL into `pending/<u_flush>`, because the
+ordering invariant `u_repack_i < u_flush < next WAL ULID` requires
+output ULIDs to sort below `u_flush` — which means they must be minted
+first. The flush may then add one new pending file, and that file can
+itself be eligible for repack (e.g. a WAL containing multiple writes
+to the same LBA produces a flushed segment with hash-dead bodies).
+Pre-mint upper bound: `pre_flush_segs + 1`.
+
+The actor is single-threaded between prep and the worker run, so no
+new pending segments can appear; N+1 is a tight bound, not a guess.
+ULID minting advances a `u128` counter — unused ULIDs cost nothing
+beyond a `Vec` slot.
+
 There is **no separate "filler" rule**. Today's sweep needs one
 because its selection is narrow (`live_bytes ≤ 16 MiB` only) — the
 filler grabs one larger eligible segment to top up otherwise-underfilled
