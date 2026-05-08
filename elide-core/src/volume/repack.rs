@@ -233,12 +233,14 @@ impl Volume {
         }
         let floor = latest_snapshot(&self.base_dir)?;
 
-        // Pre-mint output ULIDs (one per current pending segment) +
-        // u_flush. Actor is single-threaded; no new pending segments
-        // can appear between prep and worker run, so this is an upper
-        // bound on what the worker consumes.
-        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(segs.len());
-        for _ in 0..segs.len() {
+        // Pre-mint output ULIDs (one per current pending segment plus
+        // one for the WAL-flush peer that prepare creates next) and
+        // u_flush. The WAL-flush peer can itself be hash-dead-bearing
+        // — multiple writes to the same LBA inside one open WAL leave
+        // the earlier hashes dead in the flushed segment — so the
+        // worker may need to rewrite it too.
+        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(segs.len() + 1);
+        for _ in 0..segs.len() + 1 {
             output_ulids.push(self.mint.next());
         }
         let u_flush = self.mint.next();
