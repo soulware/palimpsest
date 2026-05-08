@@ -488,8 +488,10 @@ impl Volume {
     /// re-points them at the freshly-minted output ULID. Concurrent
     /// writers that re-pointed a hash at a newer segment win — the
     /// rewritten body simply becomes unreferenced until the next pass.
-    /// Then evicts the input's fd cache, unlinks the input pending
-    /// file, and rebuilds lbamap from disk.
+    /// Updates each lbamap entry's claimant ULID in place to the new
+    /// output ULID (the rewrite preserves start_lba/lba_length/hash;
+    /// only storage representation changes), evicts the input's fd
+    /// cache, and unlinks the input pending file.
     pub fn apply_delta_repack_result(
         &mut self,
         result: DeltaRepackResult,
@@ -499,7 +501,6 @@ impl Volume {
             segments,
         } = result;
         let pending_dir = self.base_dir.join("pending");
-        let any_changes = !segments.is_empty();
 
         for seg in segments {
             let DeltaRepackedSegment {
@@ -517,6 +518,7 @@ impl Volume {
 
             let entries_len = entries.len();
             let ei = Arc::make_mut(&mut self.extent_index);
+            let lm = Arc::make_mut(&mut self.lbamap);
             for (raw_idx, item) in entries.iter().enumerate() {
                 let post = &item.post;
                 match (item.pre_kind, post.kind) {
@@ -535,6 +537,12 @@ impl Volume {
                                 inline_data: None,
                             },
                         );
+                        lm.set_claimant_if_matches(
+                            post.start_lba,
+                            post.lba_length,
+                            post.hash,
+                            new_ulid,
+                        );
                     }
                     (EntryKind::Inline, EntryKind::Inline) => {
                         ei.replace_if_matches(
@@ -550,6 +558,12 @@ impl Volume {
                                 body_section_start: new_bss,
                                 inline_data: post.data.clone().map(Vec::into_boxed_slice),
                             },
+                        );
+                        lm.set_claimant_if_matches(
+                            post.start_lba,
+                            post.lba_length,
+                            post.hash,
+                            new_ulid,
                         );
                     }
                     (EntryKind::Data, EntryKind::Delta) => {
@@ -568,10 +582,12 @@ impl Volume {
                         );
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
-                        Arc::make_mut(&mut self.lbamap).set_delta_sources_if_matches(
+                        lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
+                        lm.set_claimant_if_matches(
                             post.start_lba,
+                            post.lba_length,
                             post.hash,
-                            sources,
+                            new_ulid,
                         );
                     }
                     (EntryKind::Delta, EntryKind::Delta) => {
@@ -589,13 +605,26 @@ impl Volume {
                         );
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
-                        Arc::make_mut(&mut self.lbamap).set_delta_sources_if_matches(
+                        lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
+                        lm.set_claimant_if_matches(
                             post.start_lba,
+                            post.lba_length,
                             post.hash,
-                            sources,
+                            new_ulid,
                         );
                     }
-                    (EntryKind::DedupRef, _) | (EntryKind::Zero, _) => {}
+                    (EntryKind::DedupRef, EntryKind::DedupRef)
+                    | (EntryKind::Zero, EntryKind::Zero) => {
+                        // No body / extent_index update; LBA range and
+                        // hash unchanged. Bring the lbamap claimant
+                        // into agreement with the new on-disk segment.
+                        lm.set_claimant_if_matches(
+                            post.start_lba,
+                            post.lba_length,
+                            post.hash,
+                            new_ulid,
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -625,10 +654,7 @@ impl Volume {
             stats.delta_body_bytes += seg_stats.delta_body_bytes;
         }
 
-        if any_changes {
-            segment::fsync_dir(&pending_dir)?;
-            self.rebuild_lbamap_from_disk()?;
-        }
+        segment::fsync_dir(&pending_dir)?;
 
         Ok(stats)
     }

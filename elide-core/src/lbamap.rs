@@ -372,6 +372,55 @@ impl LbaMap {
         true
     }
 
+    /// Promote the claimant ULID to `new_claimant` for every lbamap
+    /// entry whose hash equals `expected_hash` and whose key falls in
+    /// `[start_lba, start_lba + lba_length)`, including a predecessor
+    /// whose tail extends into the range. Only entries with current
+    /// claimant strictly less than `new_claimant` are updated. Returns
+    /// the number of entries promoted.
+    ///
+    /// Used by in-place segment rewrites and WAL→segment flushes where
+    /// the segment file (and thus the canonical claimant) moves to a
+    /// fresh ULID but the lbamap entries' LBA ranges and hashes are
+    /// unchanged. Range-walking is required because a concurrent
+    /// overwrite can split the original entry — the surviving tail or
+    /// head ends up keyed at an LBA other than the entry's
+    /// `start_lba`. The hash-match filter still rejects sub-runs
+    /// claimed by a different hash (e.g. the overwriter's). The
+    /// strict inequality guard prevents downgrading a higher-ULID
+    /// writer's idempotent RMW that landed mid-flight.
+    pub fn set_claimant_if_matches(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        expected_hash: blake3::Hash,
+        new_claimant: Ulid,
+    ) -> u32 {
+        let end = start_lba + lba_length as u64;
+        let mut updated = 0u32;
+
+        // Predecessor whose tail extends into the range.
+        if let Some((&pred_start, pred)) = self.inner.range_mut(..start_lba).next_back() {
+            let pred_end = pred_start + pred.lba_length as u64;
+            if pred_end > start_lba
+                && pred.hash == expected_hash
+                && pred.claimant_ulid < new_claimant
+            {
+                pred.claimant_ulid = new_claimant;
+                updated += 1;
+            }
+        }
+
+        for (_, entry) in self.inner.range_mut(start_lba..end) {
+            if entry.hash == expected_hash && entry.claimant_ulid < new_claimant {
+                entry.claimant_ulid = new_claimant;
+                updated += 1;
+            }
+        }
+
+        updated
+    }
+
     /// Iterate over all extents that overlap `[start_lba, end_lba)`, in ascending LBA order.
     ///
     /// Each entry describes the portion of the extent that falls within the requested range:
@@ -545,6 +594,19 @@ impl LbaMap {
             && lba < start + entry.lba_length as u64
         {
             return Some(entry.hash);
+        }
+        None
+    }
+
+    /// Return the claimant ULID of the entry covering `lba`, if any.
+    /// Used by `assert_lbamap_consistent` to verify the in-memory
+    /// claimant matches the one a from-disk rebuild would produce.
+    #[cfg(feature = "volume-invariants")]
+    pub fn claimant_at(&self, lba: u64) -> Option<Ulid> {
+        if let Some((&start, entry)) = self.inner.range(..=lba).next_back()
+            && lba < start + entry.lba_length as u64
+        {
+            return Some(entry.claimant_ulid);
         }
         None
     }

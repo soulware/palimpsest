@@ -439,6 +439,24 @@ impl Volume {
                     },
                 );
             }
+            // Bump lbamap claimants from wal_ulid to segment_ulid;
+            // mirrors the same loop in `flush_wal_to_pending_as`.
+            for entry in &entries {
+                if entry.kind.is_canonical_only() {
+                    continue;
+                }
+                let claim_hash = if entry.kind == EntryKind::Zero {
+                    ZERO_HASH
+                } else {
+                    entry.hash
+                };
+                lbamap.set_claimant_if_matches(
+                    entry.start_lba,
+                    entry.lba_length,
+                    claim_hash,
+                    segment_ulid,
+                );
+            }
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers this recovery-promoted segment.
             if last_segment_ulid < Some(segment_ulid) {
@@ -1153,65 +1171,6 @@ impl Volume {
         Ok(StagedApply::Applied)
     }
 
-    /// Rebuild `self.lbamap` from disk (segments across fork + ancestors)
-    /// and replay the current WAL tail on top, mirroring the initial
-    /// construction in `Volume::open`. Used by the GC apply path on both
-    /// the stale-cancel and commit branches to keep the in-memory view
-    /// from drifting relative to on-disk state.
-    pub(in crate::volume) fn rebuild_lbamap_from_disk(&mut self) -> io::Result<()> {
-        let mut chain: Vec<(PathBuf, Option<String>)> = self
-            .ancestor_layers
-            .iter()
-            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
-            .collect();
-        chain.push((self.base_dir.clone(), None));
-        let mut fresh = lbamap::rebuild_segments(&chain)?;
-        let wal_dir = self.base_dir.join("wal");
-        if let Ok(entries) = fs::read_dir(&wal_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                let Some(wal_ulid) = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok())
-                else {
-                    continue;
-                };
-                let Ok((records, _)) = writelog::scan_readonly(&path) else {
-                    continue;
-                };
-                for record in records {
-                    match record {
-                        writelog::LogRecord::Data {
-                            hash,
-                            start_lba,
-                            lba_length,
-                            ..
-                        }
-                        | writelog::LogRecord::Ref {
-                            hash,
-                            start_lba,
-                            lba_length,
-                        } => {
-                            fresh.insert(start_lba, lba_length, hash, wal_ulid);
-                        }
-                        writelog::LogRecord::Zero {
-                            start_lba,
-                            lba_length,
-                        } => {
-                            fresh.insert(start_lba, lba_length, ZERO_HASH, wal_ulid);
-                        }
-                    }
-                }
-            }
-        }
-        self.lbamap = Arc::new(fresh);
-        Ok(())
-    }
-
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
     /// if it diverges from `self.lbamap`. Called at the end of every
     /// **structural** op (segment-shape mutations: redact apply, promote,
@@ -1292,7 +1251,14 @@ impl Volume {
             }
         }
 
-        let mut diverging: Vec<(u64, Option<blake3::Hash>, Option<blake3::Hash>)> = Vec::new();
+        struct Diverge {
+            lba: u64,
+            mem_hash: Option<blake3::Hash>,
+            disk_hash: Option<blake3::Hash>,
+            mem_claimant: Option<Ulid>,
+            disk_claimant: Option<Ulid>,
+        }
+        let mut diverging: Vec<Diverge> = Vec::new();
         let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for (lba, _, _, _) in self.lbamap.iter_entries() {
             all_lbas.insert(lba);
@@ -1301,10 +1267,18 @@ impl Volume {
             all_lbas.insert(lba);
         }
         for lba in all_lbas {
-            let mem = self.lbamap.hash_at(lba);
-            let disk = fresh.hash_at(lba);
-            if mem != disk {
-                diverging.push((lba, mem, disk));
+            let mem_hash = self.lbamap.hash_at(lba);
+            let disk_hash = fresh.hash_at(lba);
+            let mem_claimant = self.lbamap.claimant_at(lba);
+            let disk_claimant = fresh.claimant_at(lba);
+            if mem_hash != disk_hash || mem_claimant != disk_claimant {
+                diverging.push(Diverge {
+                    lba,
+                    mem_hash,
+                    disk_hash,
+                    mem_claimant,
+                    disk_claimant,
+                });
                 if diverging.len() >= 8 {
                     break;
                 }
@@ -1315,11 +1289,14 @@ impl Volume {
                 "lbamap drift after [{caller}]: {} LBA(s) diverge",
                 diverging.len()
             );
-            for (lba, mem, disk) in &diverging {
+            for d in &diverging {
                 msg.push_str(&format!(
-                    "\n  lba={lba} in_memory={:?} disk_rebuild={:?}",
-                    mem.map(|h| h.to_hex().to_string()),
-                    disk.map(|h| h.to_hex().to_string()),
+                    "\n  lba={} in_memory=({:?}, {:?}) disk_rebuild=({:?}, {:?})",
+                    d.lba,
+                    d.mem_hash.map(|h| h.to_hex().to_string()),
+                    d.mem_claimant.map(|u| u.to_string()),
+                    d.disk_hash.map(|h| h.to_hex().to_string()),
+                    d.disk_claimant.map(|u| u.to_string()),
                 ));
             }
             panic!("{msg}");
@@ -1994,6 +1971,32 @@ impl Volume {
                 },
             );
         }
+        // Bump lbamap claimants from wal_ulid to segment_ulid for every
+        // entry that still represents this WAL's claim — every
+        // non-canonical pending entry, including DedupRef and Zero
+        // (which have no extent_index entry but do hold an lbamap
+        // claim). The strict-newer guard inside `set_claimant_if_matches`
+        // skips entries a concurrent writer has already re-claimed at
+        // a higher ULID.
+        {
+            let lbamap = Arc::make_mut(&mut self.lbamap);
+            for entry in &self.pending_entries {
+                if entry.kind.is_canonical_only() {
+                    continue;
+                }
+                let claim_hash = if entry.kind == EntryKind::Zero {
+                    ZERO_HASH
+                } else {
+                    entry.hash
+                };
+                lbamap.set_claimant_if_matches(
+                    entry.start_lba,
+                    entry.lba_length,
+                    claim_hash,
+                    segment_ulid,
+                );
+            }
+        }
         {
             let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
                 (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
@@ -2475,6 +2478,28 @@ impl Volume {
                     inline_data: idata,
                 },
             );
+        }
+
+        // Bump lbamap claimants from wal_ulid to segment_ulid; mirrors
+        // the same loop in `flush_wal_to_pending_as`.
+        {
+            let lbamap = Arc::make_mut(&mut self.lbamap);
+            for entry in &result.entries {
+                if entry.kind.is_canonical_only() {
+                    continue;
+                }
+                let claim_hash = if entry.kind == EntryKind::Zero {
+                    ZERO_HASH
+                } else {
+                    entry.hash
+                };
+                lbamap.set_claimant_if_matches(
+                    entry.start_lba,
+                    entry.lba_length,
+                    claim_hash,
+                    result.segment_ulid,
+                );
+            }
         }
 
         // Log entry counts.
