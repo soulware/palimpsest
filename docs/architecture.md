@@ -424,7 +424,7 @@ Error `kind` is one of: `not-found`, `conflict`, `precondition-failed`, `bad-req
 | `delta-repack` | — | `{stats: DeltaRepackStats}` |
 | `gc-checkpoint` | — | `{gc_ulid: Ulid}` |
 | `apply-gc-handoffs` | — | `{processed: u32}` |
-| `redact` | `{segment_ulid: Ulid}` | `null` |
+| `redact` | `{segment_ulid: Ulid}` | `{current_ulid: Ulid}` |
 | `snapshot-manifest` | `{snap_ulid: Ulid}` | `null` |
 | `promote` | `{segment_ulid: Ulid}` | `null` |
 | `finalize-gc-handoff` | `{gc_ulid: Ulid}` | `null` |
@@ -928,7 +928,7 @@ Dedup scope is **all volumes on the local host**. The extent index covers the cu
 
 **DedupRef entries are format-level thin.** When dedup fires, a REF record is written to the WAL with no body bytes. On promotion to a segment, the DedupRef index entry stores `stored_offset = 0` and `stored_length = 0` — it reserves no body space at all. The segment header's `body_length` is the sum of `stored_length` over DATA and INLINE entries only; DedupRef entries contribute zero. This layout is **unified across `pending/`, `cache/`, and S3**: the same segment bytes, the same body size, the same index entry semantics everywhere. There is no "local-disk vs S3" asymmetry; thin DedupRef delivers S3 storage savings directly, without a materialisation or compaction step.
 
-- **WAL / `pending/`:** DedupRef entries are index-only. No body bytes, no body reservation, no sparse hole. Hash-dead DATA entries (LBA overwritten + hash no longer referenced by any live LBA in the volume) are hole-punched in place on `pending/<ULID>` by `redact_segment` at upload time, so deleted data does not leave the host. DedupRef entries are not touched by redact — they contribute no body bytes to begin with. Redact changes no offsets, no lengths, no signature, no file size; only the physical storage of dead DATA regions is freed.
+- **WAL / `pending/`:** DedupRef entries are index-only. No body bytes, no body reservation, no sparse hole. Hash-dead DATA entries (LBA overwritten + hash no longer referenced by any live LBA in the volume) are dropped by `redact_segment` at upload time — the input is rewritten under a freshly-minted `u_redact < u_flush` with the dead bodies omitted, and the original `pending/<input_ulid>` is unlinked on apply. The coordinator uses the returned `u_redact` (or the unchanged input ULID on a no-op) for the subsequent upload + promote. DedupRef entries are not touched by redact — they contribute no body bytes to begin with.
 - **S3:** the uploaded object is the local `pending/<ULID>` file as-is. `body_length` is already the thin sum; the S3 object is proportionally smaller than it would be with DedupRef reservation. DedupRef cold reads issue a byte-range GET against the **canonical** segment identified by the extent index, not the referring one.
 - **`cache/` (local):** the three-file cache format (`.idx` + `.body` + `.present`) inherits the same thin layout. The `.body` file is sized to `body_length` — no DedupRef holes. The `.present` bitset has DedupRef bits unset (their body bytes are served from the canonical segment, not from this cache body).
 - **Read path (local and cache miss):** the read path resolves the hash through the extent index to `(canonical_segment, body_offset, body_length)` and reads or fetches from the canonical segment. The DedupRef entry's own `stored_offset`/`stored_length` are never consulted — the read path goes through `extent_index.lookup(hash)`, which only returns canonical DATA locations.

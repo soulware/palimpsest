@@ -139,11 +139,11 @@ Still direct-call (low win or out-of-scope for this pass):
 
 - `Volume::apply_gc_handoffs` post-write re-parse of the tmp file (file just written; no prior parse to hit)
 - `Volume::delete_cached_inputs` scan of `gc/<ulid>` (rare)
-- `Volume::redact_segment` (rare, in-place)
+- `Volume::redact_segment` (rare)
 - `delta_compute::maybe_rewrite_segment` (runs in `elide-import` one-shot, not in the actor path)
 - `extentindex`/`lbamap` rebuild paths (boot-time; cache is empty then)
 
-Cache invalidation is file-length-based: tmp+rename rewrites change the entry count → the index section length → the file length, so a stale entry naturally misses. `redact_segment` punches body holes but preserves the index section and file length, so a cache hit returns the same parsed index. Cross-fork correctness is guarded by the verifying-key hash on each cached entry.
+Cache invalidation is file-length-based: tmp+rename rewrites change the entry count → the index section length → the file length, so a stale entry naturally misses. `redact_segment` rewrites under a fresh `u_redact` and unlinks the input on apply, so the new file gets its own cache entry and no aliasing arises. Cross-fork correctness is guarded by the verifying-key hash on each cached entry.
 
 ## Sequencing
 
