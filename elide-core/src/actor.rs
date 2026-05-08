@@ -3228,11 +3228,10 @@ fn read_full_extent_body(
         ))
     })?;
     let seek = layout.body_seek(loc);
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(&path)?;
-    f.seek(SeekFrom::Start(seek))?;
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, seek)?;
     if loc.compressed {
         lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
     } else {
@@ -3250,7 +3249,7 @@ fn read_delta_blob(
     option: &segment::DeltaOption,
     search_dirs: &[PathBuf],
 ) -> io::Result<Option<Vec<u8>>> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
     match loc.body_source {
         crate::extentindex::DeltaBodySource::Full {
             body_section_start,
@@ -3266,11 +3265,10 @@ fn read_delta_blob(
             let Some((path, _layout)) = found else {
                 return Ok(None);
             };
-            let mut f = std::fs::File::open(&path)?;
+            let f = std::fs::File::open(&path)?;
             let seek = body_section_start + body_length + option.delta_offset;
-            f.seek(SeekFrom::Start(seek))?;
             let mut buf = vec![0u8; option.delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, seek)?;
             Ok(Some(buf))
         }
         crate::extentindex::DeltaBodySource::Cached => {
@@ -3278,10 +3276,9 @@ fn read_delta_blob(
             for dir in search_dirs {
                 let delta_path = dir.join("cache").join(format!("{sid}.delta"));
                 if delta_path.exists() {
-                    let mut f = std::fs::File::open(&delta_path)?;
-                    f.seek(SeekFrom::Start(option.delta_offset))?;
+                    let f = std::fs::File::open(&delta_path)?;
                     let mut buf = vec![0u8; option.delta_length as usize];
-                    f.read_exact(&mut buf)?;
+                    f.read_exact_at(&mut buf, option.delta_offset)?;
                     return Ok(Some(buf));
                 }
             }

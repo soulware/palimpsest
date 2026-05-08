@@ -16,7 +16,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use ulid::Ulid;
@@ -624,10 +625,9 @@ fn resolve_body_by_hash_decompressed(
         ctx.resolver
             .find_segment(loc.segment_id, loc.body_section_start, loc.body_source)?;
     let seek = layout.body_section_file_offset(loc.body_section_start) + loc.body_offset;
-    let mut f = fs::File::open(&path)?;
-    f.seek(SeekFrom::Start(seek))?;
+    let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, seek)?;
     decompress_if_needed(&buf, loc.compressed)
 }
 
@@ -665,10 +665,9 @@ fn read_input_extent_stored_bytes(
         BodySource::Cached(entry_idx),
     )?;
     let seek = layout.body_section_file_offset(state.body_section_start) + entry.stored_offset;
-    let mut f = fs::File::open(&path)?;
-    f.seek(SeekFrom::Start(seek))?;
+    let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; entry.stored_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, seek)?;
     Ok(buf)
 }
 
@@ -718,19 +717,17 @@ fn read_input_delta_blob(
                 .body_section_file_offset(state.body_section_start)
                 + state.body_length
                 + delta_offset;
-            let mut f = fs::File::open(&path)?;
-            f.seek(SeekFrom::Start(seek))?;
+            let f = fs::File::open(&path)?;
             let mut buf = vec![0u8; delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, seek)?;
             Ok(buf)
         }
         Some((_, SegmentBodyLayout::BodyOnly)) | None => {
             // Delta lives in a sibling `cache/<id>.delta` file (or is
             // demand-fetched by the resolver on miss).
-            let mut f = resolver.open_delta_body(input_ulid)?;
-            f.seek(SeekFrom::Start(delta_offset))?;
+            let f = resolver.open_delta_body(input_ulid)?;
             let mut buf = vec![0u8; delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, delta_offset)?;
             Ok(buf)
         }
     }

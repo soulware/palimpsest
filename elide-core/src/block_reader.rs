@@ -13,7 +13,8 @@
 //   existed at snapshot time, with no WAL replay and no `pending/` state.
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use ext4_view::Ext4Read;
@@ -292,19 +293,17 @@ impl BlockReader {
 
         let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let seek = layout.body_seek(loc);
-        let mut f = fs::File::open(path)?;
+        let f = fs::File::open(path)?;
         let mut block = [0u8; 4096];
         if loc.compressed {
-            f.seek(SeekFrom::Start(seek))?;
             let mut buf = vec![0u8; loc.body_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, seek)?;
             let decompressed =
                 lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?;
             let src = block_offset as usize * 4096;
             block.copy_from_slice(&decompressed[src..src + 4096]);
         } else {
-            f.seek(SeekFrom::Start(seek + block_offset as u64 * 4096))?;
-            f.read_exact(&mut block)?;
+            f.read_exact_at(&mut block, seek + block_offset as u64 * 4096)?;
         }
         Ok(block)
     }
@@ -384,10 +383,9 @@ impl BlockReader {
             }
             DeltaBodySource::Cached => (self.find_delta_body(segment_id)?, 0u64),
         };
-        let mut f = fs::File::open(path)?;
-        f.seek(SeekFrom::Start(base + delta_offset))?;
+        let f = fs::File::open(path)?;
         let mut buf = vec![0u8; delta_length as usize];
-        f.read_exact(&mut buf)?;
+        f.read_exact_at(&mut buf, base + delta_offset)?;
         Ok(buf)
     }
 
@@ -478,10 +476,9 @@ impl BlockReader {
         }
         self.ensure_extent_present(loc)?;
         let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
-        let mut f = fs::File::open(path)?;
-        f.seek(SeekFrom::Start(layout.body_seek(loc)))?;
+        let f = fs::File::open(path)?;
         let mut buf = vec![0u8; loc.body_length as usize];
-        f.read_exact(&mut buf)?;
+        f.read_exact_at(&mut buf, layout.body_seek(loc))?;
         if loc.compressed {
             lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
         } else {

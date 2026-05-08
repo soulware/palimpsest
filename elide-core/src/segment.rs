@@ -882,7 +882,8 @@ pub fn rewrite_with_deltas(
     delta_body: &[u8],
     signer: &dyn SegmentSigner,
 ) -> io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
 
     // Read source header to get section sizes.
     let mut src = fs::File::open(src_path)?;
@@ -959,9 +960,8 @@ pub fn rewrite_with_deltas(
 
     // Read inline + body from source (verbatim copy).
     let inline_body_len = src_inline_length as u64 + src_body_length;
-    src.seek(SeekFrom::Start(HEADER_LEN + src_index_length as u64))?;
     let mut inline_body = vec![0u8; inline_body_len as usize];
-    src.read_exact(&mut inline_body)?;
+    src.read_exact_at(&mut inline_body, HEADER_LEN + src_index_length as u64)?;
 
     // Write destination file.
     let dst = OpenOptions::new()
@@ -1213,10 +1213,10 @@ fn read_segment_header(path: &Path) -> io::Result<(u64, Vec<u8>, u32, [u8; HEADE
 /// Works for both full segment files and `.idx` files (which include the
 /// inline section: header + index + inline).
 pub fn read_inline_section(path: &Path) -> io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(path)?;
+    use std::os::unix::fs::FileExt;
+    let f = fs::File::open(path)?;
     let mut raw = [0u8; HEADER_LEN as usize];
-    f.read_exact(&mut raw)?;
+    f.read_exact_at(&mut raw, 0)?;
     let h = SegmentHeader::read_from_bytes(&raw)
         .map_err(|_| io::Error::other("segment header size mismatch"))?;
     let index_length = h.index_length.get();
@@ -1225,9 +1225,8 @@ pub fn read_inline_section(path: &Path) -> io::Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     let inline_start = HEADER_LEN + index_length as u64;
-    f.seek(SeekFrom::Start(inline_start))?;
     let mut buf = vec![0u8; inline_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, inline_start)?;
     Ok(buf)
 }
 
@@ -1236,15 +1235,14 @@ pub fn read_inline_section(path: &Path) -> io::Result<Vec<u8>> {
 /// Returns an empty `Vec` when `delta_length == 0`. Reads `delta_length`
 /// bytes starting at `body_section_start + body_length`.
 pub fn read_delta_body_section(path: &Path) -> io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
     let layout = read_segment_layout(path)?;
     if layout.delta_length == 0 {
         return Ok(Vec::new());
     }
-    let mut f = fs::File::open(path)?;
-    f.seek(SeekFrom::Start(layout.delta_body_offset()))?;
+    let f = fs::File::open(path)?;
     let mut buf = vec![0u8; layout.delta_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, layout.delta_body_offset())?;
     Ok(buf)
 }
 
@@ -1507,21 +1505,20 @@ pub fn read_body_section_bodies(
     body_section_start: u64,
     entries: &mut [SegmentEntry],
 ) -> io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
     if !entries
         .iter()
         .any(|e| e.kind.is_data() && e.stored_length > 0)
     {
         return Ok(());
     }
-    let mut f = fs::File::open(path)?;
+    let f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
         if entry.stored_length == 0 || !entry.kind.is_data() {
             continue;
         }
-        f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
         let mut buf = vec![0u8; entry.stored_length as usize];
-        f.read_exact(&mut buf)?;
+        f.read_exact_at(&mut buf, body_section_start + entry.stored_offset)?;
         entry.data = Some(buf);
     }
     Ok(())

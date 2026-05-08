@@ -13,7 +13,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
@@ -419,10 +420,9 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
         return Ok(Vec::new());
     }
     let inline_start = layout.body_section_start - inline_length;
-    let mut f = fs::File::open(seg_path)?;
-    f.seek(SeekFrom::Start(inline_start))?;
+    let f = fs::File::open(seg_path)?;
     let mut buf = vec![0u8; inline_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, inline_start)?;
     Ok(buf)
 }
 
@@ -450,10 +450,9 @@ fn read_source_extent(source_dir: &Path, loc: &ExtentLocation) -> io::Result<Vec
                 source_dir.display()
             ))
         })?;
-    let mut f = fs::File::open(&path)?;
-    f.seek(SeekFrom::Start(layout.body_seek(loc)))?;
+    let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, layout.body_seek(loc))?;
     Ok(buf)
 }
 
