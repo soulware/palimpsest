@@ -39,13 +39,6 @@ pub async fn promote_wal(fork_dir: &Path) -> bool {
     call_unit(fork_dir, &VolumeRequest::PromoteWal).await
 }
 
-/// Sweep small pending segments.  Returns compaction stats on success.
-/// Returns `None` and logs a warning if the socket is absent or the call fails.
-pub async fn sweep_pending(fork_dir: &Path) -> Option<CompactionStats> {
-    let reply: CompactionReply = call_typed(fork_dir, &VolumeRequest::SweepPending).await?;
-    Some(reply.stats)
-}
-
 /// Rewrite every pending segment with any hash-dead body bytes.
 /// Returns compaction stats on success.
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
@@ -258,7 +251,6 @@ fn verb_label(request: &VolumeRequest) -> &'static str {
     match request {
         VolumeRequest::Flush => "flush",
         VolumeRequest::PromoteWal => "promote-wal",
-        VolumeRequest::SweepPending => "sweep-pending",
         VolumeRequest::Repack => "repack",
         VolumeRequest::DeltaRepack => "delta-repack",
         VolumeRequest::GcCheckpoint => "gc-checkpoint",

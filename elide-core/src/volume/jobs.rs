@@ -15,7 +15,7 @@ use crate::{extentindex, rewrite_plan, segment, segment_cache};
 
 use super::{
     AncestorLayer, BoxFetcher, DeltaRepackJob, DeltaRepackResult, ReclaimJob, ReclaimResult,
-    RepackJob, RepackResult, StagedApply, SweepJob, SweepResult,
+    RepackJob, RepackResult, StagedApply,
 };
 
 /// Data needed by the worker thread to write a pending segment.
@@ -236,7 +236,6 @@ pub enum WorkerJob {
     Promote(PromoteJob),
     GcPlan(GcPlanApplyJob),
     PromoteSegment(PromoteSegmentJob),
-    Sweep(SweepJob),
     Repack(RepackJob),
     DeltaRepack(DeltaRepackJob),
     SignSnapshotManifest(SignSnapshotManifestJob),
@@ -256,7 +255,6 @@ pub enum WorkerResult {
         ulid: Ulid,
         result: io::Result<PromoteSegmentResult>,
     },
-    Sweep(io::Result<SweepResult>),
     Repack(io::Result<RepackResult>),
     DeltaRepack(io::Result<DeltaRepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),

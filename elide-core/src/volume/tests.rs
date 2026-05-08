@@ -1241,12 +1241,12 @@ fn repack_preserves_body_for_lba_dead_but_hash_alive_entry() {
     let other: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
     vol.write(0, &other).unwrap();
 
-    repack_for_input(&mut vol, &base, seg_ulid);
+    let new_ulid = repack_for_input(&mut vol, &base, seg_ulid);
 
     // Verify the DATA entry at LBA 0 still has real body bytes (not zeros)
-    // in the in-place pending file.
+    // in the rewritten output (or the in-place file when repack was a no-op).
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let seg_path = base.join("pending").join(seg_ulid.to_string());
+    let seg_path = base.join("pending").join(new_ulid.to_string());
     let (bss, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     let data_entry = entries

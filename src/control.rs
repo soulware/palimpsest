@@ -131,17 +131,6 @@ fn dispatch(
     match request {
         VolumeRequest::Flush => write_unit(writer, handle.flush()),
         VolumeRequest::PromoteWal => write_unit(writer, handle.promote_wal()),
-        VolumeRequest::SweepPending => match handle.sweep_pending() {
-            Ok(stats) => {
-                let _ = write_envelope(writer, &Envelope::ok(CompactionReply { stats }));
-            }
-            Err(e) => {
-                let _ = write_envelope::<CompactionReply>(
-                    writer,
-                    &Envelope::err(IpcError::internal(e.to_string())),
-                );
-            }
-        },
         VolumeRequest::Repack => match handle.repack() {
             Ok(stats) => {
                 let _ = write_envelope(writer, &Envelope::ok(CompactionReply { stats }));

@@ -1739,9 +1739,7 @@ mod tests {
             }
         }
         ulids.sort();
-        let _ = vol.repack().unwrap();
-        let post_repack = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
-        for ulid in &post_repack {
+        for ulid in &ulids {
             vol.promote_segment(*ulid).unwrap();
         }
 
@@ -1863,9 +1861,7 @@ mod tests {
             }
         }
         ulids.sort();
-        let _ = vol.repack().unwrap();
-        let post_repack = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
-        for ulid in &post_repack {
+        for ulid in &ulids {
             vol.promote_segment(*ulid).unwrap();
         }
         let s1_ulid = ulids[0].to_string();
@@ -1988,9 +1984,7 @@ mod tests {
             }
         }
         ulids.sort();
-        let _ = vol.repack().unwrap();
-        let post_repack = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
-        for ulid in &post_repack {
+        for ulid in &ulids {
             vol.promote_segment(*ulid).unwrap();
         }
         let s1_ulid = ulids[0].to_string();
@@ -2045,6 +2039,13 @@ mod tests {
     }
 
     /// Helper: drain pending/ into index/+cache/ in ULID order, return the sorted ULIDs.
+    /// Promote each pending segment to index/ without running repack.
+    /// Tests in this module construct specific segment shapes and
+    /// inspect them with `collect_stats`; the unified repack would
+    /// bin-pack those shapes into different forms before they reach
+    /// index/, which would invalidate the per-segment assertions.
+    /// Production drain calls repack — this helper is intentionally
+    /// narrower for collect_stats unit tests.
     fn drain_pending(
         fork_dir: &std::path::Path,
         vol: &mut elide_core::volume::Volume,
@@ -2062,9 +2063,7 @@ mod tests {
             }
         }
         ulids.sort();
-        let _ = vol.repack().unwrap();
-        let post_repack = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
-        for ulid in &post_repack {
+        for ulid in &ulids {
             vol.promote_segment(*ulid).unwrap();
         }
         ulids

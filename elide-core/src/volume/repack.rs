@@ -45,59 +45,6 @@ pub struct DeltaRepackStats {
     pub delta_body_bytes: u64,
 }
 
-/// Data needed by the worker to compact small pending segments in
-/// `pending/`. Produced by [`super::Volume::prepare_sweep`] on the actor
-/// thread after pre-minting `output_ulid` (= `u_sweep`, with
-/// `u_sweep < u_flush`) and flushing the WAL into `pending/<u_flush>`
-/// so that the rewrite output sorts below every future WAL flush.
-///
-/// Snapshots of `lbamap` and `extent_index` capture the volume state
-/// the worker classifies and materialises against. Concurrent writes
-/// after prep don't perturb the snapshot; apply re-derives index
-/// updates against the live state with a per-input CAS gate so the
-/// worker's stale view degrades gracefully.
-pub struct SweepJob {
-    pub output_ulid: Ulid,
-    pub base_dir: PathBuf,
-    pub pending_dir: PathBuf,
-    pub floor: Option<Ulid>,
-    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
-    pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
-    pub ancestor_layers: Vec<super::AncestorLayer>,
-    pub fetcher: Option<segment::BoxFetcher>,
-    pub signer: Arc<dyn segment::SegmentSigner>,
-    pub verifying_key: ed25519_dalek::VerifyingKey,
-    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
-}
-
-/// Result of a [`SweepJob`]. Consumed by [`super::Volume::apply_sweep_result`]
-/// on the actor thread.
-///
-/// `new_ulid` is `Some(output_ulid)` when at least one entry was
-/// carried into the rewrite output; `None` indicates the worker
-/// declined to merge (insufficient candidates, or every selected input
-/// classified as fully dead with nothing to write). In either case
-/// `inputs` lists the segments the worker selected, paired with each
-/// segment's owned-body hashes for the apply-phase to-remove
-/// derivation, and `input_paths` lists the files to unlink.
-pub struct SweepResult {
-    pub stats: CompactionStats,
-    pub new_ulid: Option<Ulid>,
-    pub new_body_section_start: u64,
-    pub out_entries: Vec<segment::SegmentEntry>,
-    pub inputs: Vec<SweptInput>,
-}
-
-/// One selected input from a sweep run. `owned_hashes` is the set of
-/// body-bearing entry hashes from this input segment — used by apply
-/// to derive the to-remove set (`owned_hashes` minus the carried set
-/// from `out_entries`, gated by per-input CAS).
-pub struct SweptInput {
-    pub seg_ulid: Ulid,
-    pub seg_path: PathBuf,
-    pub owned_hashes: Vec<blake3::Hash>,
-}
-
 /// Data needed by the worker to repack sparse segments in `pending/`.
 /// Produced by [`super::Volume::prepare_repack`] on the actor thread.
 ///
@@ -119,25 +66,30 @@ pub struct RepackJob {
     pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
 }
 
-/// Per-segment payload from a [`RepackJob`]. One of these is produced
-/// for every input segment the worker repacked or deleted.
+/// One bucket from a repack run. A bucket pairs N input segments (1
+/// for solo rewrites, ≥2 for bin-packed merges) with a single rewrite
+/// output, or with `output = None` when every input classified
+/// fully dead and the worker deleted them outright.
 ///
-/// `output` is `None` when every entry classified as fully dead and the
-/// worker deleted the file outright — apply still removes any
-/// owned-body hashes from the extent index. When `Some`, the worker
-/// has materialised a fresh segment under `new_ulid` and written it to
-/// `pending/<new_ulid>`; apply CAS-updates the extent index against
-/// the per-input gate (`current loc.segment_id == input_ulid`) and
-/// unlinks the old `pending/<input_ulid>`.
-pub struct RepackedSegment {
-    pub input_ulid: Ulid,
-    pub input_path: PathBuf,
-    pub owned_hashes: Vec<blake3::Hash>,
+/// Apply (a) derives the per-input "to remove from extent_index" set
+/// as `owned_hashes - carried_hashes(output)` and CAS-removes against
+/// the per-input gate (`current loc.segment_id == input_ulid`), then
+/// (b) inserts the carried entries under the same gate against the
+/// new output ULID, and (c) unlinks each input file.
+pub struct RepackedBucket {
+    pub inputs: Vec<RepackedInput>,
     pub output: Option<RepackedOutput>,
     pub bytes_freed: u64,
 }
 
-/// Materialised rewrite output for a single repacked input.
+/// One selected input contributing to a [`RepackedBucket`].
+pub struct RepackedInput {
+    pub input_ulid: Ulid,
+    pub input_path: PathBuf,
+    pub owned_hashes: Vec<blake3::Hash>,
+}
+
+/// Materialised rewrite output for a repack bucket.
 pub struct RepackedOutput {
     pub new_ulid: Ulid,
     pub new_body_section_start: u64,
@@ -148,7 +100,7 @@ pub struct RepackedOutput {
 /// on the actor thread.
 pub struct RepackResult {
     pub stats: CompactionStats,
-    pub segments: Vec<RepackedSegment>,
+    pub buckets: Vec<RepackedBucket>,
 }
 
 /// Data needed by the worker to rewrite post-snapshot pending segments
@@ -195,7 +147,7 @@ pub struct DeltaRepackResult {
 impl Volume {
     /// Rewrite every pending segment with at least one hash-dead body
     /// entry under a freshly-minted ULID; delete all-dead segments
-    /// outright. Skips fully-live segments — sweep bin-packs those.
+    /// outright. Skips fully-live segments larger than the small threshold
     /// Guarantees deleted data does not leave the host.
     ///
     /// Synchronous wrapper around [`Self::prepare_repack`] +
@@ -282,15 +234,12 @@ impl Volume {
     /// concurrent live writes have higher claimant ULIDs and are
     /// preserved on overlapping LBAs.
     pub fn apply_repack_result(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
-        let RepackResult {
-            mut stats,
-            segments,
-        } = result;
+        let RepackResult { mut stats, buckets } = result;
 
         let pending_dir = self.base_dir.join("pending");
 
-        for seg in &segments {
-            let carried_hashes: std::collections::HashSet<blake3::Hash> = seg
+        for bucket in &buckets {
+            let carried_hashes: std::collections::HashSet<blake3::Hash> = bucket
                 .output
                 .as_ref()
                 .map(|o| {
@@ -302,30 +251,39 @@ impl Volume {
                 })
                 .unwrap_or_default();
 
+            let bucket_input_ulids: std::collections::HashSet<Ulid> =
+                bucket.inputs.iter().map(|i| i.input_ulid).collect();
+
             {
                 let index = Arc::make_mut(&mut self.extent_index);
-                for hash in &seg.owned_hashes {
-                    if carried_hashes.contains(hash) {
-                        continue;
-                    }
-                    // `remove_owner_at` covers both `inner` and `deltas`
-                    // — `lookup` alone misses Delta-canonical hashes.
-                    if index.remove_owner_at(hash, seg.input_ulid) {
-                        stats.extents_removed += 1;
+
+                // Per-input CAS-remove for hashes the bucket's output
+                // didn't carry — gated on the specific input's ULID so
+                // a concurrent writer that re-pointed the hash wins.
+                for input in &bucket.inputs {
+                    for hash in &input.owned_hashes {
+                        if carried_hashes.contains(hash) {
+                            continue;
+                        }
+                        // `remove_owner_at` covers both `inner` and `deltas`.
+                        if index.remove_owner_at(hash, input.input_ulid) {
+                            stats.extents_removed += 1;
+                        }
                     }
                 }
 
-                if let Some(out) = &seg.output {
+                // Insert carried entries against the new bucket output,
+                // gated on the current owner being any of the bucket's
+                // inputs.
+                if let Some(out) = &bucket.output {
                     for e in &out.out_entries {
-                        // DedupRef and Zero entries don't own a body — same
-                        // filter pattern as the redact / GC apply paths.
                         if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
                             continue;
                         }
                         let current = index.lookup(&e.hash);
                         let should_update = match current {
                             None => true,
-                            Some(loc) => loc.segment_id == seg.input_ulid,
+                            Some(loc) => bucket_input_ulids.contains(&loc.segment_id),
                         };
                         if !should_update {
                             continue;
@@ -351,15 +309,13 @@ impl Volume {
                 }
             }
 
-            if let Some(out) = &seg.output {
+            if let Some(out) = &bucket.output {
                 if self.last_segment_ulid < Some(out.new_ulid) {
                     self.last_segment_ulid = Some(out.new_ulid);
                 }
                 self.has_new_segments = true;
 
                 let lbamap = Arc::make_mut(&mut self.lbamap);
-                let consumed: std::collections::HashSet<Ulid> =
-                    std::iter::once(seg.input_ulid).collect();
                 for e in &out.out_entries {
                     if e.kind.is_canonical_only() {
                         continue;
@@ -373,7 +329,7 @@ impl Volume {
                             e.hash,
                             out.new_ulid,
                             sources,
-                            &consumed,
+                            &bucket_input_ulids,
                         );
                     } else {
                         lbamap.insert_consuming_inputs(
@@ -381,23 +337,28 @@ impl Volume {
                             e.lba_length,
                             e.hash,
                             out.new_ulid,
-                            &consumed,
+                            &bucket_input_ulids,
                         );
                     }
                 }
             }
 
-            self.evict_cached_segment(seg.input_ulid);
+            // Per-input bookkeeping: evict cache fd; unlink the input
+            // file if the worker wrote a fresh output (when output is
+            // None the worker already deleted the input).
+            for input in &bucket.inputs {
+                self.evict_cached_segment(input.input_ulid);
 
-            if seg.output.is_some() {
-                match fs::remove_file(&seg.input_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+                if bucket.output.is_some() {
+                    match fs::remove_file(&input.input_path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 
-            stats.bytes_freed += seg.bytes_freed;
+            stats.bytes_freed += bucket.bytes_freed;
         }
 
         segment::fsync_dir(&pending_dir)?;
@@ -659,208 +620,6 @@ impl Volume {
 
         Ok(stats)
     }
-
-    /// Compact `pending/` segments opportunistically, before upload.
-    ///
-    /// Scans every segment in `pending/`. A segment is a candidate if:
-    /// - it has at least one dead extent (an LBA since overwritten), or
-    /// - its file size is below [`COMPACT_SMALL_THRESHOLD`] (8 MiB).
-    ///
-    /// All candidates are merged: their live extents are collected, written into
-    /// one or more new `pending/<ulid>` segments (split at [`FLUSH_THRESHOLD`]),
-    /// the extent index is updated, and the originals are deleted.
-    ///
-    /// Segments at or below the latest snapshot ULID are frozen and skipped.
-    /// Returns immediately (no-op) if there are no candidates.
-    ///
-    /// Synchronous wrapper around the offloadable prep / execute / apply
-    /// trio. The actor uses [`Self::prepare_sweep`] +
-    /// [`crate::actor::execute_sweep`] + [`Self::apply_sweep_result`]
-    /// directly so that the worker thread runs the heavy middle phase off
-    /// the request channel; this wrapper exists for tests and any
-    /// remaining inline callers.
-    pub fn sweep_pending(&mut self) -> io::Result<CompactionStats> {
-        let Some(job) = self.prepare_sweep()? else {
-            return Ok(CompactionStats::default());
-        };
-        let result = crate::actor::execute_sweep(job)?;
-        self.apply_sweep_result(result)
-    }
-
-    /// Prep phase of `sweep_pending` — runs on the actor thread.
-    ///
-    /// Pre-mints `u_sweep < u_flush` and flushes any open WAL to
-    /// `pending/<u_flush>`. The output ULID `u_sweep` is below every
-    /// future WAL ULID so subsequent flushes win over the merged
-    /// segment on rebuild — preserves the `max(pending) < running_WAL`
-    /// invariant. Snapshots `lbamap`/`extent_index`/`ancestor_layers`/
-    /// `fetcher` for the worker's classifier and body resolver.
-    ///
-    /// Returns `None` when `pending/` is missing or has no segments —
-    /// the dispatch is skipped without burning a flush.
-    ///
-    /// All actual segment reads, classification, plan materialisation,
-    /// and the rewrite happen in [`crate::actor::execute_sweep`]. The
-    /// apply phase [`Self::apply_sweep_result`] does the per-input CAS
-    /// extent-index updates and input deletion.
-    pub fn prepare_sweep(&mut self) -> io::Result<Option<SweepJob>> {
-        let pending_dir = self.base_dir.join("pending");
-        let segs = match segment::collect_segment_files(&pending_dir) {
-            Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if segs.is_empty() {
-            return Ok(None);
-        }
-        let floor = latest_snapshot(&self.base_dir)?;
-
-        let u_sweep = self.mint.next();
-        let u_flush = self.mint.next();
-        self.flush_wal_to_pending_as(u_flush)?;
-
-        Ok(Some(SweepJob {
-            output_ulid: u_sweep,
-            base_dir: self.base_dir.clone(),
-            pending_dir,
-            floor,
-            lbamap_snapshot: Arc::clone(&self.lbamap),
-            extent_index_snapshot: Arc::clone(&self.extent_index),
-            ancestor_layers: self.ancestor_layers.clone(),
-            fetcher: self.fetcher.clone(),
-            signer: Arc::clone(&self.signer),
-            verifying_key: self.verifying_key,
-            segment_cache: Arc::clone(&self.segment_cache),
-        }))
-    }
-
-    /// Apply phase of `sweep_pending` — runs on the actor thread after
-    /// the worker returns.
-    ///
-    /// Walks the worker's output entries and inserts them into the
-    /// extent index gated by a per-input CAS check
-    /// (`current loc.segment_id ∈ inputs ∪ {None}`) — concurrent writes
-    /// during the worker phase that re-pointed a hash at a newer
-    /// segment win, leaving the swept body unreferenced until the next
-    /// pass picks it up.
-    ///
-    /// Derives `to_remove` from each input's owned hashes minus the
-    /// carried set, removes them from the extent index under the same
-    /// per-input CAS gate, evicts each input's cached fd, unlinks the
-    /// input pending files, and merges the output entries into
-    /// `lbamap` via `insert_if_newer` keyed on `new_ulid`. Concurrent
-    /// post-prep live writes have higher claimant ULIDs (`u_sweep` is
-    /// minted before `u_flush`) and are preserved on overlapping LBAs.
-    pub fn apply_sweep_result(&mut self, result: SweepResult) -> io::Result<CompactionStats> {
-        let SweepResult {
-            mut stats,
-            new_ulid,
-            new_body_section_start,
-            out_entries,
-            inputs,
-        } = result;
-
-        let input_ulids: std::collections::HashSet<Ulid> =
-            inputs.iter().map(|i| i.seg_ulid).collect();
-        let carried_hashes: std::collections::HashSet<blake3::Hash> = out_entries
-            .iter()
-            .filter(|e| e.kind != EntryKind::DedupRef)
-            .map(|e| e.hash)
-            .collect();
-
-        let index = Arc::make_mut(&mut self.extent_index);
-
-        for input in &inputs {
-            for hash in &input.owned_hashes {
-                if carried_hashes.contains(hash) {
-                    continue;
-                }
-                // `remove_owner_at` covers both `inner` and `deltas` —
-                // `lookup` alone misses Delta-canonical hashes.
-                if index.remove_owner_at(hash, input.seg_ulid) {
-                    stats.extents_removed += 1;
-                }
-            }
-        }
-
-        if let Some(new_ulid) = new_ulid {
-            for e in &out_entries {
-                // DedupRef and Zero entries don't own a body — same filter
-                // pattern as the redact / GC / sweep apply paths.
-                if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
-                    continue;
-                }
-                let current = index.lookup(&e.hash);
-                let should_update = match current {
-                    None => true,
-                    Some(loc) => input_ulids.contains(&loc.segment_id),
-                };
-                if !should_update {
-                    continue;
-                }
-                let inline_data = if e.kind.is_inline() {
-                    e.data.clone().map(Vec::into_boxed_slice)
-                } else {
-                    None
-                };
-                index.insert(
-                    e.hash,
-                    extentindex::ExtentLocation {
-                        segment_id: new_ulid,
-                        body_offset: e.stored_offset,
-                        body_length: e.stored_length,
-                        compressed: e.compressed,
-                        body_source: BodySource::Local,
-                        body_section_start: new_body_section_start,
-                        inline_data,
-                    },
-                );
-            }
-            if self.last_segment_ulid < Some(new_ulid) {
-                self.last_segment_ulid = Some(new_ulid);
-            }
-            self.has_new_segments = true;
-
-            let lbamap = Arc::make_mut(&mut self.lbamap);
-            for e in &out_entries {
-                if e.kind.is_canonical_only() {
-                    continue;
-                }
-                if e.kind == EntryKind::Delta {
-                    let sources: Arc<[blake3::Hash]> =
-                        e.delta_options.iter().map(|o| o.source_hash).collect();
-                    lbamap.insert_delta_consuming_inputs(
-                        e.start_lba,
-                        e.lba_length,
-                        e.hash,
-                        new_ulid,
-                        sources,
-                        &input_ulids,
-                    );
-                } else {
-                    lbamap.insert_consuming_inputs(
-                        e.start_lba,
-                        e.lba_length,
-                        e.hash,
-                        new_ulid,
-                        &input_ulids,
-                    );
-                }
-            }
-        }
-
-        for input in &inputs {
-            self.evict_cached_segment(input.seg_ulid);
-            match fs::remove_file(&input.seg_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        segment::fsync_dir(&self.base_dir.join("pending"))?;
-
-        Ok(stats)
-    }
 }
 
 #[cfg(test)]
@@ -909,12 +668,14 @@ mod tests {
         vol.write(0, &replacement).unwrap();
         vol.promote_for_test().unwrap();
 
-        // Two segments: first is 100% dead, second is live.
+        // Two segments: first is 100% dead, second is live small.
+        // The unified pass packs both into one bucket.
         let stats = vol.repack().unwrap();
         assert_eq!(
-            stats.segments_compacted, 1,
-            "first segment should be compacted"
+            stats.segments_compacted, 2,
+            "both inputs go into the packed bucket"
         );
+        assert_eq!(stats.new_segments, 1, "single packed output");
         assert!(stats.bytes_freed > 0);
         assert_eq!(stats.extents_removed, 1);
 
@@ -959,9 +720,11 @@ mod tests {
         vol.write(0, &vec![0x33u8; 4096]).unwrap(); // overwrites LBA 0
         vol.promote_for_test().unwrap();
 
-        // First segment has a hash-dead entry — repack rewrites it.
+        // First segment has a hash-dead entry; second is small and live.
+        // The unified pass packs both into one bucket.
         let stats = vol.repack().unwrap();
-        assert_eq!(stats.segments_compacted, 1);
+        assert_eq!(stats.segments_compacted, 2);
+        assert_eq!(stats.new_segments, 1);
         assert!(stats.bytes_freed > 0);
 
         // Both LBAs read back correctly.
@@ -1019,11 +782,12 @@ mod tests {
         vol.write(1, &vec![0x44u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        // One pre-snapshot dead segment (frozen) + one post-snapshot dead segment (eligible).
+        // Pre-snapshot dead segment is frozen; the two post-snapshot segments
+        // (one dead, one live small) pack into one bucket.
         let stats = vol.repack().unwrap();
         assert_eq!(
-            stats.segments_compacted, 1,
-            "exactly the post-snapshot dead segment should be compacted"
+            stats.segments_compacted, 2,
+            "both post-snapshot segments are packed; pre-snapshot is frozen"
         );
 
         // Both LBAs read back correctly.
@@ -1063,33 +827,12 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    // --- sweep_pending tests ---
+    // --- packing-specific tests ---
 
     #[test]
-    fn sweep_pending_noop_when_all_live() {
-        // Single pending segment with no dead extents: sweep_pending must not
-        // rewrite it. Rewriting a single all-live small segment is a no-op that
-        // only wastes IO — merging only makes sense when >=2 segments combine or
-        // dead space is reclaimed.
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        vol.write(0, &vec![0x11u8; 4096]).unwrap();
-        vol.write(1, &vec![0x22u8; 4096]).unwrap();
-        vol.promote_for_test().unwrap();
-
-        let stats = vol.sweep_pending().unwrap();
-        assert_eq!(stats.segments_compacted, 0);
-        assert_eq!(stats.new_segments, 0);
-        assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
-        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn sweep_pending_removes_dead_extents() {
+    fn repack_removes_dead_extents() {
         // Write LBA 0, promote, overwrite LBA 0, promote.
-        // sweep_pending should remove the dead extent from the first segment.
+        // repack should remove the dead extent from the first segment.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1098,7 +841,7 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.sweep_pending().unwrap();
+        let stats = vol.repack().unwrap();
         assert!(stats.segments_compacted >= 1);
         assert!(stats.bytes_freed > 0);
         assert_eq!(stats.extents_removed, 1);
@@ -1110,9 +853,9 @@ mod tests {
     }
 
     #[test]
-    fn sweep_pending_only_scans_pending_not_uploaded() {
+    fn repack_only_scans_pending_not_uploaded() {
         // Upload a segment (simulate coordinator promoting pending → cache/).
-        // sweep_pending must not touch uploaded segments.
+        // repack must not touch uploaded segments.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1126,11 +869,11 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.sweep_pending().unwrap();
-        // The old dead extent is in cache/ — sweep_pending doesn't touch it.
+        let stats = vol.repack().unwrap();
+        // The old dead extent is in cache/ — repack doesn't touch it.
         assert_eq!(stats.extents_removed, 0);
         // The new pending segment is small and all-live: single segment, no
-        // dead extents, so sweep_pending correctly leaves it alone.
+        // dead extents, so repack correctly leaves it alone.
         assert_eq!(stats.segments_compacted, 0);
 
         // Data still reads correctly.
@@ -1140,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_pending_respects_snapshot_floor() {
+    fn repack_respects_snapshot_floor() {
         // Segments at or below the snapshot ULID must not be touched.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
@@ -1154,7 +897,7 @@ mod tests {
         vol.snapshot().unwrap();
 
         // The two pre-snapshot segments are now frozen.
-        let stats = vol.sweep_pending().unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "pre-snapshot segments must not be touched"
@@ -1166,10 +909,10 @@ mod tests {
     }
 
     #[test]
-    fn sweep_pending_multi_block_inplace_overwrite_same_wal() {
+    fn repack_multi_block_inplace_overwrite_same_wal() {
         // Regression: two multi-block DATA writes at the same LBA range in the
         // same WAL flush. Both land as DATA entries (different hashes) in one
-        // pending segment. sweep_pending then partitions entries into live/dead,
+        // pending segment. repack then partitions entries into live/dead,
         // rewrites the segment, and updates the extent index — the surviving
         // live entry must read back correctly from the rewritten segment.
         let base = keyed_temp_dir();
@@ -1187,23 +930,23 @@ mod tests {
         assert_eq!(
             vol.read(24, 8).unwrap(),
             payload_b,
-            "pre-sweep read must return the second write"
+            "pre-repack read must return the second write"
         );
 
-        vol.sweep_pending().unwrap();
+        vol.repack().unwrap();
         assert_eq!(
             vol.read(24, 8).unwrap(),
             payload_b,
-            "post-sweep read must still return the second write"
+            "post-repack read must still return the second write"
         );
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn sweep_pending_merges_multiple_small_segments() {
+    fn repack_merges_multiple_small_segments() {
         // Three separate promotes → three small pending segments.
-        // sweep_pending should merge them into one.
+        // repack should merge them into one.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1214,7 +957,7 @@ mod tests {
         vol.write(2, &vec![0xccu8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.sweep_pending().unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(stats.segments_compacted, 3);
         assert_eq!(stats.new_segments, 1);
 
@@ -1250,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_pending_packs_small_with_filler() {
+    fn repack_packs_small_with_filler() {
         // One small (~4 KiB live) + one large filler (~17 MiB live).
         // Tier 1 picks up the small; tier 2 sees ~32 MiB - 4 KiB headroom
         // and pulls in the 17 MiB filler. Output is one ~17 MiB segment.
@@ -1260,11 +1003,11 @@ mod tests {
         // Small segment: 1 block.
         promote_segment_with_blocks(&mut vol, 0, 1, 1);
         // Filler: 17 MiB live (4352 blocks of 4 KiB).
-        // Above the 16 MiB SWEEP_SMALL_THRESHOLD so it's filler material,
+        // Above the 16 MiB REPACK_SMALL_THRESHOLD so it's filler material,
         // not a small. Must fit in the 32 MiB budget after the small.
         promote_segment_with_blocks(&mut vol, 1, 4352, 2);
 
-        let stats = vol.sweep_pending().unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 2,
             "tier 2 must pull the filler in alongside the small"
@@ -1283,13 +1026,13 @@ mod tests {
     }
 
     #[test]
-    fn sweep_pending_respects_entry_cap() {
+    fn repack_respects_entry_cap() {
         // Three pending segments, each carrying 4096 DedupRef entries
         // (live_bytes = 0 — DedupRef has no body cost) plus one tiny
         // DATA segment, total 12_289 entries. Without an entry cap,
         // tier-1 packing would admit all three (byte budget never bites
         // on 0-live_bytes inputs) and produce a 12_289-entry output —
-        // far past the WAL's flush cap. With SWEEP_ENTRY_CAP = 8192,
+        // far past the WAL's flush cap. With REPACK_ENTRY_CAP = 8192,
         // tier 1 admits exactly two of the dedup segments (8192 entries)
         // and stops; the third dedup segment and the lone DATA are left
         // for a later pass.
@@ -1318,29 +1061,32 @@ mod tests {
         }
         vol.promote_for_test().unwrap();
 
-        let stats = vol.sweep_pending().unwrap();
+        let stats = vol.repack().unwrap();
+        // Anchor (1 entry) + first dedup (4096 entries) fill bucket[0]
+        // (4097 entries; the next 4096 wouldn't fit). Buckets[1] takes
+        // the remaining two dedup segments (4096 + 4096 = 8192). All
+        // four inputs are processed in this pass; the entry cap forces
+        // two output buckets rather than leaving a segment behind.
         assert_eq!(
-            stats.segments_compacted, 2,
-            "sweep must stop at SWEEP_ENTRY_CAP — exactly two of the \
-             three dedup segments fit (8192 entries), the third is left \
-             for a later pass"
+            stats.segments_compacted, 4,
+            "all four candidates are bucketed (entry cap forces two outputs)"
         );
-        assert_eq!(stats.new_segments, 1);
+        assert_eq!(stats.new_segments, 2);
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn sweep_pending_skips_lone_filler() {
+    fn repack_skips_lone_filler() {
         // A single filler (~17 MiB live, no small to pair with) must
-        // not be rewritten — sweep is for packing, not for moving large
+        // not be rewritten — repack does not pack across the small threshold
         // segments around. Repack is what handles single-segment cleanup.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         promote_segment_with_blocks(&mut vol, 0, 4352, 1);
 
-        let stats = vol.sweep_pending().unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.new_segments, 0);
 

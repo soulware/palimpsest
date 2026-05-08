@@ -223,7 +223,7 @@ enum SimOp {
     /// Flush the WAL to a pending/ segment, directly on the volume.
     Flush,
     /// Volume-level sweep: packs small segments from pending/ into a single
-    /// new segment. Calls vol.sweep_pending() directly, bypassing the actor
+    /// new segment. Calls vol.repack() directly, bypassing the actor
     /// channel. Exercises ULID monotonicity and crash-recovery invariants.
     SweepPending,
     /// Volume-level density pass: rewrites sparse segments from pending/.
@@ -682,7 +682,7 @@ proptest! {
                         } else {
                             Default::default()
                         };
-                    let _ = vol.sweep_pending();
+                    let _ = vol.repack();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -1030,7 +1030,7 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::SweepPending => {
-                    let _ = vol.sweep_pending();
+                    let _ = vol.repack();
                 }
                 SimOp::Repack => {
                     let _ = vol.repack();
@@ -1286,7 +1286,7 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::SweepPending => {
-                    let _ = vol.sweep_pending();
+                    let _ = vol.repack();
                 }
                 SimOp::Repack => {
                     let _ = vol.repack();
@@ -1531,7 +1531,7 @@ proptest! {
                     common::drain_with_repack(&mut vol);
                 }
                 ReclaimOp::SweepPending => {
-                    let _ = vol.sweep_pending();
+                    let _ = vol.repack();
                 }
                 ReclaimOp::Repack => {
                     let _ = vol.repack();
@@ -1719,7 +1719,7 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
         "ReclaimRange(start_lba=24,lba_count=1)#2",
     );
 
-    let _ = vol.sweep_pending();
+    let _ = vol.repack();
     assert_oracle(&mut vol, &oracle, "SweepPending");
 
     drop(vol);
@@ -1988,7 +1988,7 @@ fn writemulti_overlap_sweep_then_repack_regression() {
     write_multi(&mut vol, &mut oracle, 3, 4, 0);
     write_multi(&mut vol, &mut oracle, 2, 2, 0);
 
-    let _ = vol.sweep_pending();
+    let _ = vol.repack();
     let _ = vol.repack();
 
     drop(vol);
@@ -2064,7 +2064,7 @@ fn gc_interleaved_writemulti_overlap_regression() {
     write_multi(&mut vol, &mut oracle, 3, 4, 0);
     write_multi(&mut vol, &mut oracle, 2, 2, 0);
 
-    let _ = vol.sweep_pending();
+    let _ = vol.repack();
     let _ = vol.repack();
 
     drop(vol);

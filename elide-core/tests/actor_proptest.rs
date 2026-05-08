@@ -211,7 +211,7 @@ proptest! {
                     }
                 }
                 ActorOp::SweepPending => {
-                    let _ = handle.sweep_pending();
+                    let _ = handle.repack();
                     // Old pending/ files are deleted; if publish_snapshot() did
                     // not bump flush_gen, handles reuse stale fds and get ENOENT.
                     for (&lba, expected) in &oracle {
@@ -549,7 +549,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     //   has the same entry count and similar inline-body sizes as the
     //   old pending/u_flush_b, so the file length is unchanged — which
     //   matters for the SegmentIndexCache key below.
-    handle.sweep_pending().unwrap();
+    handle.repack().unwrap();
 
     // Step 8: DrainLocal — promotes remaining pending → index/. This is
     //   where the old bug surfaced: execute_promote_segment consults the

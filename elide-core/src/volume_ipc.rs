@@ -23,9 +23,8 @@ pub enum VolumeRequest {
     Flush,
     /// Promote the WAL to a `pending/` segment, blocking until it's on disk.
     PromoteWal,
-    /// Compact small pending segments using default thresholds.
-    SweepPending,
-    /// Rewrite every pending segment with any hash-dead body bytes.
+    /// Rewrite every pending segment with any hash-dead body bytes;
+    /// bin-pack small segments into denser outputs at the same time.
     Repack,
     /// Rewrite post-snapshot pending segments as zstd-dictionary deltas.
     DeltaRepack,
@@ -52,7 +51,7 @@ pub enum VolumeRequest {
     Shutdown,
 }
 
-/// Reply for [`VolumeRequest::SweepPending`] / [`VolumeRequest::Repack`].
+/// Reply for [`VolumeRequest::Repack`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CompactionReply {
     pub stats: CompactionStats,

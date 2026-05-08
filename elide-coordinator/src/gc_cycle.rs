@@ -152,15 +152,6 @@ impl GcCycleOrchestrator {
         let volume_id = &self.volume_id;
         control::promote_wal(&self.fork_dir).await;
 
-        if let Some(s) = control::sweep_pending(&self.fork_dir).await
-            && s.segments_compacted > 0
-        {
-            info!(
-                "[drain {volume_id}] sweep: {} segment(s), ~{} bytes freed",
-                s.segments_compacted, s.bytes_freed
-            );
-        }
-
         if let Some(s) = control::repack(&self.fork_dir).await
             && s.segments_compacted > 0
         {
