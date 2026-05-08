@@ -57,7 +57,7 @@ Any CLI operation that mutates a live volume's directory must go through coordin
 
 Segments accumulate in `pending/` after WAL promotion. The coordinator's per-fork drain loop runs these steps sequentially on each tick:
 
-1. **Flush WAL** via `flush` IPC
+1. **Promote WAL** via `promote-wal` IPC — moves any open WAL records into a `pending/<ulid>` segment so they're visible to compaction and upload. Distinct from the `flush` IPC verb, which is `fdatasync` only and does not promote. An idle volume's writes wouldn't otherwise reach `pending/` until the 32 MiB size threshold or the 10 s idle tick fires; sweep and repack early-return when `pending/` is empty.
 2. **Sweep** via `sweep_pending` IPC (merges small `pending/` segments)
 3. **Repack** via `repack` IPC (rewrites every `pending/` segment with any hash-dead body; deleted data does not reach S3)
 4. **Upload** — PUT each `pending/` file, send `promote <ulid>` IPC on success; the volume writes `index/<ulid>.idx` + `cache/<ulid>.body` + `cache/<ulid>.present` and removes `pending/<ulid>`.
