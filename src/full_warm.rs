@@ -300,8 +300,8 @@ mod tests {
         let hash_c = blake3::hash(b"c");
 
         let mut lba_map = LbaMap::new();
-        lba_map.insert(0, 8, hash_a);
-        lba_map.insert(8, 8, hash_b);
+        lba_map.insert(0, 8, hash_a, Ulid::nil());
+        lba_map.insert(8, 8, hash_b, Ulid::nil());
 
         let mut extent_index = ExtentIndex::new();
         extent_index.insert(
@@ -360,8 +360,8 @@ mod tests {
         // Same hash referenced by two different LBA ranges (dedup).
         let hash = blake3::hash(b"shared");
         let mut lba_map = LbaMap::new();
-        lba_map.insert(0, 8, hash);
-        lba_map.insert(8, 8, hash);
+        lba_map.insert(0, 8, hash, Ulid::nil());
+        lba_map.insert(8, 8, hash, Ulid::nil());
 
         let mut extent_index = ExtentIndex::new();
         extent_index.insert(
@@ -394,7 +394,7 @@ mod tests {
         let phantom_seg = Ulid::new();
         let hash = blake3::hash(b"x");
         let mut lba_map = LbaMap::new();
-        lba_map.insert(0, 8, hash);
+        lba_map.insert(0, 8, hash, Ulid::nil());
         let mut extent_index = ExtentIndex::new();
         extent_index.insert(
             hash,
@@ -428,9 +428,9 @@ mod tests {
         // come out sorted so plan_warm_batches can coalesce body-adjacent
         // runs.
         let mut lba_map = LbaMap::new();
-        lba_map.insert(16, 8, h2);
-        lba_map.insert(0, 8, h0);
-        lba_map.insert(8, 8, h1);
+        lba_map.insert(16, 8, h2, Ulid::nil());
+        lba_map.insert(0, 8, h0, Ulid::nil());
+        lba_map.insert(8, 8, h1, Ulid::nil());
 
         let mut extent_index = ExtentIndex::new();
         for (h, idx) in [(h0, 5u32), (h1, 1), (h2, 9)] {
@@ -471,9 +471,9 @@ mod tests {
         let h_partial_todo = blake3::hash(b"partial-todo");
 
         let mut lba_map = LbaMap::new();
-        lba_map.insert(0, 8, h_full);
-        lba_map.insert(8, 8, h_partial_done);
-        lba_map.insert(16, 8, h_partial_todo);
+        lba_map.insert(0, 8, h_full, Ulid::nil());
+        lba_map.insert(8, 8, h_partial_done, Ulid::nil());
+        lba_map.insert(16, 8, h_partial_todo, Ulid::nil());
 
         let mut extent_index = ExtentIndex::new();
         extent_index.insert(
@@ -549,8 +549,8 @@ mod tests {
         let h_data = blake3::hash(b"data");
         let h_inline = blake3::hash(b"inline");
         let mut lba_map = LbaMap::new();
-        lba_map.insert(0, 8, h_data);
-        lba_map.insert(8, 1, h_inline);
+        lba_map.insert(0, 8, h_data, Ulid::nil());
+        lba_map.insert(8, 1, h_inline, Ulid::nil());
 
         let mut extent_index = ExtentIndex::new();
         extent_index.insert(
@@ -601,7 +601,7 @@ mod tests {
 
         let hash = blake3::hash(b"only-inline");
         let mut lba_map = LbaMap::new();
-        lba_map.insert(0, 1, hash);
+        lba_map.insert(0, 1, hash, Ulid::nil());
 
         let mut extent_index = ExtentIndex::new();
         extent_index.insert(

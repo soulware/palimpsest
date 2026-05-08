@@ -403,7 +403,12 @@ impl Volume {
             let entry = &re.entry;
             match entry.kind {
                 EntryKind::Data => {
-                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    lbamap.insert(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        result.segment_ulid,
+                    );
                     extent_index.insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -418,7 +423,12 @@ impl Volume {
                     );
                 }
                 EntryKind::Inline => {
-                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    lbamap.insert(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        result.segment_ulid,
+                    );
                     extent_index.insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -435,7 +445,12 @@ impl Volume {
                 EntryKind::DedupRef => {
                     // Canonical body already indexed — nothing to insert
                     // in extent_index; lbamap just claims the LBA run.
-                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    lbamap.insert(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        result.segment_ulid,
+                    );
                 }
                 EntryKind::Delta => {
                     // Thin Delta: claim the LBA run with its source
@@ -450,6 +465,7 @@ impl Volume {
                         entry.start_lba,
                         entry.lba_length,
                         entry.hash,
+                        result.segment_ulid,
                         source_hashes,
                     );
                     extent_index.insert_delta_if_absent(

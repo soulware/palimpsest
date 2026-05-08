@@ -226,20 +226,36 @@ impl Volume {
                     input_ulid,
                 )?;
 
-                // Rebuild self.lbamap from disk. Per-entry incremental
-                // `lbamap.insert` would be cheaper but is incorrect for
-                // the same reason as the GC apply path: redact's output
-                // `u_redact` is minted at prep time, so any live write
-                // landing during the redact window has a higher ULID and
-                // should win for overlapping LBAs. Walk-order rebuild
-                // respects ULID precedence; unconditional insert would
-                // clobber the live write's hash. See the comment in
-                // `apply_plan_apply_result` (applied branch) for details.
+                // Merge the redact output into self.lbamap by per-entry
+                // conditional insert. `insert_if_newer` skips any
+                // sub-range whose existing claimant ULID is >= `new_ulid`
+                // — that's any post-prep live write, since `u_redact`
+                // was minted before the redact window. See
+                // `docs/design-lbamap-claimant-tracking.md` and the
+                // mirror block in `apply_plan_apply_result`.
                 //
-                // Crash ordering: on a crash between unlink and rebuild,
-                // restart's `Volume::open` runs a full rebuild — same
-                // end state.
-                self.rebuild_lbamap_from_disk()?;
+                // Crash ordering: on a crash between unlink and merge,
+                // restart's `Volume::open` rebuild walks the same
+                // on-disk segments and produces the same claimant ULIDs.
+                let lbamap = Arc::make_mut(&mut self.lbamap);
+                for e in &out_entries {
+                    if e.kind.is_canonical_only() {
+                        continue;
+                    }
+                    if e.kind == EntryKind::Delta {
+                        let sources: Arc<[blake3::Hash]> =
+                            e.delta_options.iter().map(|o| o.source_hash).collect();
+                        lbamap.insert_delta_if_newer(
+                            e.start_lba,
+                            e.lba_length,
+                            e.hash,
+                            new_ulid,
+                            sources,
+                        );
+                    } else {
+                        lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid);
+                    }
+                }
 
                 log::info!(
                     "redact {input_ulid} -> {new_ulid}: \

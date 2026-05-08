@@ -581,10 +581,12 @@ impl Volume {
         // instead of a DATA record. No body bytes in the WAL — reads resolve
         // through the extent index to the canonical segment's body.
         if self.extent_index.lookup(&hash).is_some() {
-            self.ensure_wal_open()?
-                .wal
-                .append_ref(lba, lba_length, &hash)?;
-            Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
+            let wal_ulid = {
+                let open = self.ensure_wal_open()?;
+                open.wal.append_ref(lba, lba_length, &hash)?;
+                open.ulid
+            };
+            Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
             // Do NOT update extent_index — the canonical entry already points
             // to the segment with the body bytes. DedupRef entries carry no
             // body bytes and no body reservation.
@@ -606,7 +608,7 @@ impl Volume {
                 .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
             (offset, open.ulid)
         };
-        Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
+        Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
         Arc::make_mut(&mut self.extent_index).insert(
@@ -653,10 +655,12 @@ impl Volume {
     /// LBA map masks any data at those LBAs in ancestor segments, unlike an
     /// unwritten LBA range which falls through to the ancestor.
     pub fn write_zeroes(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
-        self.ensure_wal_open()?
-            .wal
-            .append_zero(start_lba, lba_count)?;
-        Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH);
+        let wal_ulid = {
+            let open = self.ensure_wal_open()?;
+            open.wal.append_zero(start_lba, lba_count)?;
+            open.ulid
+        };
+        Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
         self.pending_entries
             .push(segment::SegmentEntry::new_zero(start_lba, lba_count));
         Ok(())
@@ -1050,19 +1054,12 @@ impl Volume {
             );
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
-            // Defence-in-depth: refresh `self.lbamap` from disk before
-            // returning, so any incremental drift can't pin the in-memory
-            // view to a stale state and infinite-cancel on the next pass.
-            //
-            // Post-#276 the originally-described scenario ("another GC
-            // output committed `disk[L] = H_new` while our snapshot still
-            // has `self.lbamap[L] = H_old`") is structurally less likely:
-            // GC passes are serial per volume, drain ordering is enforced,
-            // and `assert_lbamap_consistent` (under the `lbamap-invariant`
-            // feature) catches drift sources in stress runs. This rebuild
-            // remains as a production safety net since invariants don't
-            // run there.
-            self.rebuild_lbamap_from_disk()?;
+            // No rebuild: cancel means no segment was committed and no
+            // lbamap mutation happened. Pre-claimant-tracking we kept a
+            // defence-in-depth rebuild here against incremental drift,
+            // but every lbamap mutation now records its claimant ULID
+            // and the stress invariant `assert_lbamap_consistent`
+            // catches divergence at the introducing site.
             self.assert_volume_invariants("apply_plan_apply_result_cancelled");
             return Ok(StagedApply::Cancelled);
         }
@@ -1125,28 +1122,32 @@ impl Volume {
         fs::rename(&tmp_path, &bare_path)?;
         let _ = fs::remove_file(&plan_path);
 
-        // Rebuild self.lbamap from disk so the in-memory view reflects the
-        // post-commit state, including the sub-run hashes the output segment
-        // just introduced. Without this step a partial-death sub-run leaves
-        // the old composite hash stale in the in-memory lbamap, which then
-        // trips the stale-liveness check on the next GC pass (the input
-        // entry's "still live" status is evaluated against a hash no longer
-        // backed by any on-disk writer), cancelling apply and stalling GC.
+        // Merge the GC output into self.lbamap by per-entry conditional
+        // insert. `insert_if_newer` skips any sub-range whose existing
+        // claimant ULID is >= `new_ulid` — exactly the post-checkpoint
+        // live writes whose WAL/segment ULID is above gc_checkpoint's
+        // mint. Higher-claimant ranges are preserved; the rest take the
+        // GC output. See `docs/design-lbamap-claimant-tracking.md` and
+        // `gc_output_loses_to_live_write_applied_after_gc`.
         //
-        // Per-entry incremental updates (`lbamap.insert` per output entry)
-        // are tempting as an optimisation but **incorrect**: GC's output
-        // ULID `u_gc` was minted at gc_checkpoint time, so post-checkpoint
-        // live writes have higher ULIDs. The walk-order rebuild respects
-        // ULID precedence and lets the live writer win for any overlap;
-        // unconditional `lbamap.insert` would override the live writer's
-        // hash with `u_gc`'s stale claim. The full rebuild is the only
-        // way to compute walk-order winners without lbamap tracking
-        // segment_id per entry. See `gc_output_loses_to_live_write_applied_after_gc`
-        // for the regression scenario.
-        //
-        // Crash ordering: on a crash between rename and rebuild, restart
-        // re-runs `Volume::open`'s rebuild which produces the same result.
-        self.rebuild_lbamap_from_disk()?;
+        // Crash ordering: on a crash between rename and the in-memory
+        // merge, restart's `Volume::open` rebuild walks the same on-disk
+        // segments and produces the same claimant ULIDs.
+        let lbamap = Arc::make_mut(&mut self.lbamap);
+        for e in &entries {
+            // CanonicalData / CanonicalInline make no LBA claim — same
+            // filter as `lbamap::rebuild_segments_inner`.
+            if e.kind.is_canonical_only() {
+                continue;
+            }
+            if e.kind == EntryKind::Delta {
+                let sources: Arc<[blake3::Hash]> =
+                    e.delta_options.iter().map(|o| o.source_hash).collect();
+                lbamap.insert_delta_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid, sources);
+            } else {
+                lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid);
+            }
+        }
         self.assert_volume_invariants("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
@@ -1172,6 +1173,13 @@ impl Volume {
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
+                let Some(wal_ulid) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| Ulid::from_string(s).ok())
+                else {
+                    continue;
+                };
                 let Ok((records, _)) = writelog::scan_readonly(&path) else {
                     continue;
                 };
@@ -1188,13 +1196,13 @@ impl Volume {
                             start_lba,
                             lba_length,
                         } => {
-                            fresh.insert(start_lba, lba_length, hash);
+                            fresh.insert(start_lba, lba_length, hash, wal_ulid);
                         }
                         writelog::LogRecord::Zero {
                             start_lba,
                             lba_length,
                         } => {
-                            fresh.insert(start_lba, lba_length, ZERO_HASH);
+                            fresh.insert(start_lba, lba_length, ZERO_HASH, wal_ulid);
                         }
                     }
                 }
@@ -1248,6 +1256,13 @@ impl Volume {
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
+                let Some(wal_ulid) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| Ulid::from_string(s).ok())
+                else {
+                    continue;
+                };
                 let Ok((records, _)) = writelog::scan_readonly(&path) else {
                     continue;
                 };
@@ -1264,13 +1279,13 @@ impl Volume {
                             start_lba,
                             lba_length,
                         } => {
-                            fresh.insert(start_lba, lba_length, hash);
+                            fresh.insert(start_lba, lba_length, hash, wal_ulid);
                         }
                         writelog::LogRecord::Zero {
                             start_lba,
                             lba_length,
                         } => {
-                            fresh.insert(start_lba, lba_length, ZERO_HASH);
+                            fresh.insert(start_lba, lba_length, ZERO_HASH, wal_ulid);
                         }
                     }
                 }

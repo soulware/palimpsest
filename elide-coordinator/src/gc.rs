@@ -1278,6 +1278,13 @@ fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
+        let Some(wal_ulid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| ulid::Ulid::from_string(s).ok())
+        else {
+            continue;
+        };
         let (records, _complete) = match elide_core::writelog::scan_readonly(&path) {
             Ok(r) => r,
             Err(e) => {
@@ -1298,13 +1305,18 @@ fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
                     start_lba,
                     lba_length,
                 } => {
-                    lbamap.insert(start_lba, lba_length, hash);
+                    lbamap.insert(start_lba, lba_length, hash, wal_ulid);
                 }
                 elide_core::writelog::LogRecord::Zero {
                     start_lba,
                     lba_length,
                 } => {
-                    lbamap.insert(start_lba, lba_length, elide_core::volume::ZERO_HASH);
+                    lbamap.insert(
+                        start_lba,
+                        lba_length,
+                        elide_core::volume::ZERO_HASH,
+                        wal_ulid,
+                    );
                 }
             }
         }

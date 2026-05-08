@@ -89,7 +89,7 @@ impl BlockReader {
                         body_offset,
                         data,
                     } => {
-                        lbamap.insert(start_lba, lba_length, hash);
+                        lbamap.insert(start_lba, lba_length, hash, ulid);
                         extent_index.insert(
                             hash,
                             extentindex::ExtentLocation {
@@ -108,13 +108,13 @@ impl BlockReader {
                         start_lba,
                         lba_length,
                     } => {
-                        lbamap.insert(start_lba, lba_length, hash);
+                        lbamap.insert(start_lba, lba_length, hash, ulid);
                     }
                     writelog::LogRecord::Zero {
                         start_lba,
                         lba_length,
                     } => {
-                        lbamap.insert(start_lba, lba_length, crate::volume::ZERO_HASH);
+                        lbamap.insert(start_lba, lba_length, crate::volume::ZERO_HASH, ulid);
                     }
                 }
             }
@@ -614,9 +614,15 @@ fn apply_snapshot_layer(
                 if entry.kind == EntryKind::Delta {
                     let sources: std::sync::Arc<[blake3::Hash]> =
                         entry.delta_options.iter().map(|o| o.source_hash).collect();
-                    lbamap.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
+                    lbamap.insert_delta(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        *seg,
+                        sources,
+                    );
                 } else {
-                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash, *seg);
                 }
             }
 
