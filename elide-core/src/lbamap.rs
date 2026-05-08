@@ -188,7 +188,7 @@ impl LbaMap {
         hash: blake3::Hash,
         claimant: Ulid,
     ) {
-        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, None);
+        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, None, None);
     }
 
     /// Delta variant of [`insert_if_newer`]; same conditional-by-claimant
@@ -201,7 +201,62 @@ impl LbaMap {
         claimant: Ulid,
         source_hashes: Arc<[blake3::Hash]>,
     ) {
-        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, Some(source_hashes));
+        self.insert_inner_if_newer(
+            start_lba,
+            lba_length,
+            hash,
+            claimant,
+            Some(source_hashes),
+            None,
+        );
+    }
+
+    /// Like [`insert_if_newer`] but treats existing entries whose claimant
+    /// is in `consumed_inputs` as overridable. Intended for sweep / repack
+    /// apply paths that consume input segments and bin-pack their bodies
+    /// under a fresh output ULID `< u_flush`: the prior `flush_wal_to_pending_as`
+    /// already bumped lbamap claimants on the WAL-flushed entries to
+    /// `u_flush`, which is *higher* than the new output ULID even though it
+    /// names a segment the apply is about to delete. Without this override,
+    /// the strict-newer guard would treat a consumed-input claimant as a
+    /// concurrent writer's claim and refuse to install the new output.
+    /// See `docs/finding-sweep-flush-claimant-bug.md`.
+    pub fn insert_consuming_inputs(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        claimant: Ulid,
+        consumed_inputs: &HashSet<Ulid>,
+    ) {
+        self.insert_inner_if_newer(
+            start_lba,
+            lba_length,
+            hash,
+            claimant,
+            None,
+            Some(consumed_inputs),
+        );
+    }
+
+    /// Delta variant of [`insert_consuming_inputs`].
+    pub fn insert_delta_consuming_inputs(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        claimant: Ulid,
+        source_hashes: Arc<[blake3::Hash]>,
+        consumed_inputs: &HashSet<Ulid>,
+    ) {
+        self.insert_inner_if_newer(
+            start_lba,
+            lba_length,
+            hash,
+            claimant,
+            Some(source_hashes),
+            Some(consumed_inputs),
+        );
     }
 
     fn insert_inner_if_newer(
@@ -211,24 +266,30 @@ impl LbaMap {
         hash: blake3::Hash,
         claimant: Ulid,
         sources: Option<Arc<[blake3::Hash]>>,
+        consumed_inputs: Option<&HashSet<Ulid>>,
     ) {
         let new_end = start_lba + lba_length as u64;
+        // An existing entry blocks the install iff its claimant is >= ours
+        // AND that claimant is not one of the inputs the caller is consuming.
+        let blocks = |existing: Ulid| -> bool {
+            existing >= claimant && !consumed_inputs.is_some_and(|set| set.contains(&existing))
+        };
 
         // Sub-ranges of [start_lba, new_end) covered by an existing entry
-        // whose claimant is >= ours — those we must leave untouched. The
+        // whose claimant blocks ours — those we must leave untouched. The
         // BTreeMap's no-overlap invariant means these are emitted in
         // ascending order and never overlap each other.
         let mut blocked: Vec<(u64, u64)> = Vec::new();
 
         if let Some((&pred_start, &pred)) = self.inner.range(..start_lba).next_back() {
             let pred_end = pred_start + pred.lba_length as u64;
-            if pred_end > start_lba && pred.claimant_ulid >= claimant {
+            if pred_end > start_lba && blocks(pred.claimant_ulid) {
                 blocked.push((start_lba, pred_end.min(new_end)));
             }
         }
 
         for (&k, e) in self.inner.range(start_lba..new_end) {
-            if e.claimant_ulid >= claimant {
+            if blocks(e.claimant_ulid) {
                 let k_end = k + e.lba_length as u64;
                 blocked.push((k, k_end.min(new_end)));
             }
@@ -1261,6 +1322,53 @@ mod tests {
         assert_eq!(map.lookup(4), Some((h(2), 0)));
         assert_eq!(map.lookup(7), Some((h(2), 3)));
         assert_eq!(map.lookup(8), Some((h(1), 8)));
+    }
+
+    #[test]
+    fn insert_consuming_inputs_overrides_consumed_higher_claimant() {
+        // Sweep scenario: existing claimant u(9) is one of the inputs
+        // sweep is consuming; new claimant u(5) is sweep's output ULID
+        // (mint order: u_sweep=5, u_flush=9). Install must succeed
+        // because u(9) names a segment sweep is about to delete.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(9));
+        let consumed: HashSet<Ulid> = std::iter::once(u(9)).collect();
+        map.insert_consuming_inputs(0, 4, h(2), u(5), &consumed);
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+    }
+
+    #[test]
+    fn insert_consuming_inputs_preserves_concurrent_higher_claimant() {
+        // Existing claimant u(9) is NOT in the consumed set — it's a
+        // concurrent writer. Strict-newer guard still applies; sweep's
+        // output at u(5) must not clobber it.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(9));
+        let consumed: HashSet<Ulid> = std::iter::once(u(7)).collect();
+        map.insert_consuming_inputs(0, 4, h(2), u(5), &consumed);
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+    }
+
+    #[test]
+    fn insert_consuming_inputs_splits_around_concurrent_overlap() {
+        // Mix: middle [4, 6) is held by a concurrent writer at u(20);
+        // surrounding range was claimed by a consumed input at u(9).
+        // Sweep's output at u(5) installs head and tail, leaves middle.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(9));
+        map.insert(4, 2, h(9), u(20));
+        map.insert(6, 4, h(1), u(9));
+        let consumed: HashSet<Ulid> = std::iter::once(u(9)).collect();
+        map.insert_consuming_inputs(0, 10, h(2), u(5), &consumed);
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+        assert_eq!(map.lookup(3), Some((h(2), 3)));
+        assert_eq!(map.lookup(4), Some((h(9), 0)));
+        assert_eq!(map.lookup(5), Some((h(9), 1)));
+        // Tail gap [6, 10) is installed as a fresh entry with
+        // payload_block_offset = 0, mirroring the existing
+        // insert_if_newer_splits_around_higher_claimant_in_middle test.
+        assert_eq!(map.lookup(6), Some((h(2), 0)));
+        assert_eq!(map.lookup(9), Some((h(2), 3)));
     }
 
     // --- extents_in_range tests ---

@@ -358,6 +358,8 @@ impl Volume {
                 self.has_new_segments = true;
 
                 let lbamap = Arc::make_mut(&mut self.lbamap);
+                let consumed: std::collections::HashSet<Ulid> =
+                    std::iter::once(seg.input_ulid).collect();
                 for e in &out.out_entries {
                     if e.kind.is_canonical_only() {
                         continue;
@@ -365,15 +367,22 @@ impl Volume {
                     if e.kind == EntryKind::Delta {
                         let sources: Arc<[blake3::Hash]> =
                             e.delta_options.iter().map(|o| o.source_hash).collect();
-                        lbamap.insert_delta_if_newer(
+                        lbamap.insert_delta_consuming_inputs(
                             e.start_lba,
                             e.lba_length,
                             e.hash,
                             out.new_ulid,
                             sources,
+                            &consumed,
                         );
                     } else {
-                        lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, out.new_ulid);
+                        lbamap.insert_consuming_inputs(
+                            e.start_lba,
+                            e.lba_length,
+                            e.hash,
+                            out.new_ulid,
+                            &consumed,
+                        );
                     }
                 }
             }
@@ -820,15 +829,22 @@ impl Volume {
                 if e.kind == EntryKind::Delta {
                     let sources: Arc<[blake3::Hash]> =
                         e.delta_options.iter().map(|o| o.source_hash).collect();
-                    lbamap.insert_delta_if_newer(
+                    lbamap.insert_delta_consuming_inputs(
                         e.start_lba,
                         e.lba_length,
                         e.hash,
                         new_ulid,
                         sources,
+                        &input_ulids,
                     );
                 } else {
-                    lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid);
+                    lbamap.insert_consuming_inputs(
+                        e.start_lba,
+                        e.lba_length,
+                        e.hash,
+                        new_ulid,
+                        &input_ulids,
+                    );
                 }
             }
         }
