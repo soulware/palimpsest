@@ -575,12 +575,7 @@ impl VolumeActor {
     /// inside `prepare_plan_apply`, so the batch continues with the next.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) -> HandoffDispatch {
         while let Some((plan_path, new_ulid)) = parked.remaining.pop() {
-            let job = match self
-                .volume
-                .lock()
-                .unwrap()
-                .prepare_plan_apply(plan_path, new_ulid)
-            {
+            let job = match self.lock_volume().prepare_plan_apply(plan_path, new_ulid) {
                 Ok(Some(job)) => job,
                 Ok(None) => continue,
                 Err(e) => {
@@ -697,12 +692,7 @@ impl VolumeActor {
         lba_length: u32,
         reply: Sender<io::Result<ReclaimOutcome>>,
     ) {
-        let job = match self
-            .volume
-            .lock()
-            .unwrap()
-            .prepare_reclaim(start_lba, lba_length)
-        {
+        let job = match self.lock_volume().prepare_reclaim(start_lba, lba_length) {
             Ok(j) => j,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -736,11 +726,7 @@ impl VolumeActor {
     /// [`crate::volume::SignSnapshotManifestResult`] arrives and the
     /// `has_new_segments` flag is flipped on the actor.
     fn start_sign_snapshot_manifest(&mut self, snap_ulid: Ulid, reply: Sender<io::Result<()>>) {
-        let job = self
-            .volume
-            .lock()
-            .unwrap()
-            .prepare_sign_snapshot_manifest(snap_ulid);
+        let job = self.lock_volume().prepare_sign_snapshot_manifest(snap_ulid);
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::SignSnapshotManifest(job)) {
                 warn!("worker channel closed during sign_snapshot_manifest: {e}");
@@ -855,10 +841,7 @@ impl VolumeActor {
                     let reply = self.parked_sign_snapshot_manifest.take();
                     let outcome = match result {
                         Ok(r) => {
-                            self.volume
-                                .lock()
-                                .unwrap()
-                                .apply_sign_snapshot_manifest_result(r);
+                            self.lock_volume().apply_sign_snapshot_manifest_result(r);
                             Ok(())
                         }
                         Err(e) => {
