@@ -34,7 +34,7 @@ single bucketing strategy can pack this case.
 
 ## Proposal
 
-One pass — call it **compact** — that:
+Broaden `repack` to absorb sweep:
 
 1. Selects every pending segment whose classification produces a
    non-trivial output (i.e. anything other than every entry classifying
@@ -48,7 +48,7 @@ One pass — call it **compact** — that:
 4. Applies all outputs through the same incremental
    `insert_if_newer`/`replace_if_matches` path that repack already uses.
 
-The drain loop becomes `flush → compact → upload → gc` — one IPC where
+The drain loop becomes `flush → repack → upload → gc` — one IPC where
 there are two today.
 
 ## Algorithm
@@ -56,23 +56,23 @@ there are two today.
 Proposed prep+execute on the actor/worker:
 
 ```
-prepare_compact:
+prepare_repack:
   segs     = collect_segment_files(pending_dir)
   if segs.is_empty(): return None
   output_ulids = [mint.next() for _ in 0..segs.len() + 1]   # +1 for u_flush peer
   u_flush      = mint.next()
   flush_wal_to_pending_as(u_flush)
-  return CompactJob { output_ulids, u_flush, snapshots… }
+  return RepackJob { output_ulids, u_flush, snapshots… }
 
-execute_compact:
+execute_repack:
   classify every input against the snapshots
-  skip inputs whose classification is all-FullyLive and live_bytes > SWEEP_SMALL_THRESHOLD
-  bucket the rest:
-    1. small set := { c | live_bytes ≤ SWEEP_SMALL_THRESHOLD }
-       sort by live_bytes ascending; greedy-fill buckets up to
-       (SWEEP_TARGET_LIVE bytes, SWEEP_ENTRY_CAP entries)
-    2. solo set := the remainder (large with non-trivial classification)
-       each becomes its own single-input bucket
+  skip inputs that are fully live AND larger than SWEEP_SMALL_THRESHOLD
+    (no dead to drop, no peer to combine with)
+  bin-pack the rest into 32 MiB live / 8192-entry buckets:
+    sort candidates by live_bytes (first-fit-decreasing)
+    for each candidate:
+      place in the first existing bucket with enough remaining budget
+      else start a new bucket
   assign output_ulids[i] to bucket i
   materialise each bucket via materialise_plan
 ```
@@ -81,11 +81,21 @@ Skip rule details:
 - `live_bytes == total_bytes` AND `live_bytes > SWEEP_SMALL_THRESHOLD`
   → skip (no dead to drop, no peer to combine with).
 - `live_bytes == total_bytes` AND `live_bytes ≤ SWEEP_SMALL_THRESHOLD`
-  → eligible for the small set (today's sweep behaviour).
+  → eligible (today's sweep behaviour).
 - `live_bytes < total_bytes` → eligible regardless of size.
 
-A single-segment small bucket reduces to a no-op rewrite (today's
-sweep skips it explicitly). Same exit condition in unified.
+A bucket with exactly one fully-live small input would be a no-op
+rewrite; the bucketer drops it the same way today's sweep skips
+single-segment buckets.
+
+There is **no separate "filler" rule**. Today's sweep needs one
+because its selection is narrow (`live_bytes ≤ 16 MiB` only) — the
+filler grabs one larger eligible segment to top up otherwise-underfilled
+outputs. In the unified pass every dead-bearing segment is already in
+the candidate set, so plain best-fit bin-packing covers all the cases:
+- Multiple smalls → one packed bucket
+- One mid-sized → its own solo bucket
+- Small + mid-sized that fit together → one packed bucket
 
 ## Apply path
 
@@ -95,7 +105,7 @@ Today:
 - `apply_repack_result` consumes `Vec<RepackedSegment>` (many outputs,
   one input each).
 
-Proposed: keep repack's shape — `Vec<CompactedBucket>` where each
+Proposed: keep repack's shape — `Vec<RepackedBucket>` where each
 bucket carries its own output ULID, output entries, and the list of
 input segments it consumed. Sweep's single-output shape becomes the
 1-element case of this.
@@ -114,11 +124,11 @@ CAS gating that sweep and repack use today carries over unchanged.
 - The coordinator's `sweep_pending` IPC client + drain-step 2 call
 
 What replaces them:
-- `prepare_compact` / `execute_compact` / `apply_compact_result`
-  (probably built by extending `repack` rather than as new files)
-- `Volume::compact_pending` synchronous wrapper for tests
-- `VolumeRequest::Compact` IPC (renamed from Repack, or kept as Repack
-  with broader semantics — open question)
+- Broadened `prepare_repack` / `execute_repack` / `apply_repack_result`
+  with the bucketer absorbing sweep's selection + packing.
+- `Volume::repack` keeps its current signature; semantics broaden.
+- `VolumeRequest::Repack` keeps its name and shape (no payload, returns
+  `CompactionStats`).
 
 ## Tradeoffs
 
@@ -136,33 +146,23 @@ What replaces them:
   large/dense as filler if it fits). Unified bucketer also has to
   handle "large with dead → solo bucket."
 
-## Open questions
+## Decisions
 
-1. **Naming.** Keep `repack` as the broader name, or rename to `compact`?
-   - `repack` already in use across CLI, IPC, docs.
-   - `compact` aligns with the verb the docs use for the umbrella
-     ("pending compaction").
-   - Could keep `repack` and just broaden it; rename is a separate concern.
+- **Naming**: keep `repack`. Already in use across CLI, IPC, docs;
+  the broader semantics fit cleanly without a rename.
+- **WAL-flush peer ULID count**: pre-mint `segs.len() + 1`, same
+  pattern that landed in #287's follow-up fix. ULID minting is cheap.
+- **Coordinator drain order**:
+  `flush → repack → upload → gc`. The explicit `flush` IPC stays
+  separate from `repack`'s internal flush — `flush` runs on its own
+  cadence and covers the readonly-volume case where `repack` is
+  skipped.
 
-2. **Sweep's filler rule.** Today sweep takes one filler from the
-   `live_bytes > 16 MiB` set if budget remains. Should unified preserve
-   that? It's a small win on packing density that comes nearly for
-   free.
+## Open
 
-3. **WAL flush peer ULID count.** PR-side fix already pre-mints
-   `segs.len() + 1` for the WAL-flush peer. Same story here.
-
-4. **Coordinator drain order.** Currently
-   `flush → sweep → repack → upload → gc`. Becomes
-   `flush → compact → upload → gc`. Verify that the `flush` IPC step
-   is still needed given that `prepare_compact` flushes the WAL itself
-   (it is — the explicit `flush` IPC is independent of compaction; it
-   covers the readonly-volume case where sweep/repack are skipped).
-
-5. **Per-bucket parallelism.** Out of scope for this proposal but
-   worth a note: with N independent output buckets the worker could
-   materialise them in parallel. Today sweep is single-output so the
-   question doesn't arise; unified makes it natural.
+- **Per-bucket parallelism**. With N independent output buckets the
+  worker could materialise them in parallel. Out of scope for this
+  proposal; revisit once the unification lands.
 
 ## Out of scope
 
@@ -177,14 +177,12 @@ What replaces them:
 Approximate, for sizing:
 - Delete `prepare_sweep` / `execute_sweep` / `apply_sweep_result`
   and the `Sweep*` types: ~600 lines.
-- Add bucketing branch to `execute_repack` (or rename to
-  `execute_compact`): ~150 lines.
+- Add bucketing branch to `execute_repack`: ~150 lines.
 - Update coordinator drain loop to drop the `sweep_pending` IPC call:
   ~10 lines.
 - Update tests: replace `vol.sweep_pending()` calls with
-  `vol.compact_pending()` (or `vol.repack()` if we keep the name);
-  test fixtures stay essentially unchanged because both passes
-  already produce the same shape on disk.
+  `vol.repack()`. Test fixtures stay essentially unchanged because both
+  passes already produce the same shape on disk.
 - Doc updates across architecture.md, formats.md, operations.md.
 
 Net likely negative — sweep's selection + bucketing logic is the
