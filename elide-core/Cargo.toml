@@ -73,3 +73,7 @@ required-features = ["proptest"]
 [[bench]]
 name = "compression"
 harness = false
+
+[[bench]]
+name = "blake3_hash_lookup"
+harness = false
