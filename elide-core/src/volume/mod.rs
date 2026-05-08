@@ -335,9 +335,9 @@ impl Volume {
                 last_segment_ulid = Some(ulid);
             }
         }
-        // A volume-applied GC output (bare `gc/<ulid>`) has ULID =
-        // max(inputs).increment(), which may be the highest known ULID —
-        // include it so the mint floor is correct.
+        // A volume-applied GC output (bare `gc/<ulid>`) carries a ULID
+        // minted by the volume's own `UlidMint` via `gc_checkpoint` —
+        // include it so the mint floor advances past it on restart.
         for p in segment::collect_gc_applied_segment_files(base_dir)? {
             if let Some(ulid) = p
                 .file_name()
