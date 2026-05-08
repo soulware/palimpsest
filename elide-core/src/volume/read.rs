@@ -32,6 +32,28 @@ use super::{AncestorLayer, BoxFetcher, ZERO_HASH};
 /// internally need `&mut Dmat` to append records.
 pub type DmatCache = RefCell<HashMap<Ulid, dmat::Dmat>>;
 
+/// Per-thread scratch buffers for compressed-extent reads.
+///
+/// `compressed` holds the raw compressed bytes pread'd from the segment file;
+/// `decompressed` holds the lz4 output when the caller wants a sub-range of
+/// the extent (the fast path decompresses straight into the caller buffer
+/// and never touches `decompressed`). Both Vecs grow to the high-water-mark
+/// of any read served by this thread and stay there — extent sizes are
+/// bounded by the 16 MiB segment cap, so total per-thread overhead is small.
+struct ReadScratch {
+    compressed: Vec<u8>,
+    decompressed: Vec<u8>,
+}
+
+thread_local! {
+    static READ_SCRATCH: RefCell<ReadScratch> = const {
+        RefCell::new(ReadScratch {
+            compressed: Vec::new(),
+            decompressed: Vec::new(),
+        })
+    };
+}
+
 /// Default capacity for the segment file handle LRU cache.
 const FILE_CACHE_CAPACITY: usize = 16;
 
@@ -343,33 +365,65 @@ pub(crate) fn read_extents(
         let out_slice = &mut out[out_start..out_start + block_count * 4096];
 
         if compressed {
-            let mut compressed_buf = vec![0u8; body_length as usize];
-            f.read_exact_at(&mut compressed_buf, file_body_offset)?;
-            let decompressed =
-                lz4_flex::decompress_size_prepended(&compressed_buf).map_err(|e| {
+            let src_start = er.payload_block_offset as usize * 4096;
+            let src_end = src_start + block_count * 4096;
+            READ_SCRATCH.with(|s| -> io::Result<()> {
+                let mut s = s.borrow_mut();
+                let s = &mut *s;
+
+                // Read compressed bytes into the TLS scratch.
+                s.compressed.resize(body_length as usize, 0);
+                f.read_exact_at(&mut s.compressed, file_body_offset)?;
+
+                // Parse the 4-byte LE size prefix that compress_prepend_size emits.
+                if s.compressed.len() < 4 {
+                    return Err(io::Error::other("compressed payload missing size prefix"));
+                }
+                let decompressed_size =
+                    u32::from_le_bytes(s.compressed[..4].try_into().expect("4-byte slice"))
+                        as usize;
+                let payload = &s.compressed[4..];
+
+                // Fast path: caller wants the entire decompressed payload —
+                // decompress straight into the caller's buffer.
+                if src_start == 0
+                    && src_end == decompressed_size
+                    && out_slice.len() == decompressed_size
+                {
+                    lz4_flex::decompress_into(payload, out_slice).map_err(|e| {
+                        log::error!(
+                            "lz4 decompression failed: lba={lba} segment={segment_id} \
+                             layout={layout:?} bss={body_section_start} \
+                             body_offset={body_offset} body_length={body_length} \
+                             body_source={body_source:?} file_body_offset={file_body_offset} \
+                             first_bytes={:?} err={e}",
+                            &s.compressed[..s.compressed.len().min(16)],
+                        );
+                        io::Error::other(e)
+                    })?;
+                    return Ok(());
+                }
+
+                // Slow path: caller wants a sub-range — decompress into the
+                // TLS scratch, then copy the requested slice into `out`.
+                s.decompressed.resize(decompressed_size, 0);
+                lz4_flex::decompress_into(payload, &mut s.decompressed).map_err(|e| {
                     log::error!(
-                        "lz4 decompression failed: lba={} segment={} layout={:?} \
-                     bss={} body_offset={} body_length={} body_source={:?} \
-                     file_body_offset={} first_bytes={:?} err={}",
-                        lba,
-                        segment_id,
-                        layout,
-                        body_section_start,
-                        body_offset,
-                        body_length,
-                        body_source,
-                        file_body_offset,
-                        &compressed_buf[..compressed_buf.len().min(16)],
-                        e,
+                        "lz4 decompression failed: lba={lba} segment={segment_id} \
+                         layout={layout:?} bss={body_section_start} \
+                         body_offset={body_offset} body_length={body_length} \
+                         body_source={body_source:?} file_body_offset={file_body_offset} \
+                         first_bytes={:?} err={e}",
+                        &s.compressed[..s.compressed.len().min(16)],
                     );
                     io::Error::other(e)
                 })?;
-            let src_start = er.payload_block_offset as usize * 4096;
-            let src_end = src_start + block_count * 4096;
-            let src_slice = decompressed.get(src_start..src_end).ok_or_else(|| {
-                io::Error::other("corrupt segment: decompressed payload too short")
+                let src_slice = s.decompressed.get(src_start..src_end).ok_or_else(|| {
+                    io::Error::other("corrupt segment: decompressed payload too short")
+                })?;
+                out_slice.copy_from_slice(src_slice);
+                Ok(())
             })?;
-            out_slice.copy_from_slice(src_slice);
         } else {
             let read_at = file_body_offset + er.payload_block_offset as u64 * 4096;
             if let Err(e) = f.read_exact_at(out_slice, read_at) {
