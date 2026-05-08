@@ -453,6 +453,13 @@ pub fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut lbamap::LbaMap) {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
+        let Some(wal_ulid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| ulid::Ulid::from_string(s).ok())
+        else {
+            continue;
+        };
         let Ok((records, _)) = writelog::scan_readonly(&path) else {
             continue;
         };
@@ -469,13 +476,13 @@ pub fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut lbamap::LbaMap) {
                     start_lba,
                     lba_length,
                 } => {
-                    lbamap.insert(start_lba, lba_length, hash);
+                    lbamap.insert(start_lba, lba_length, hash, wal_ulid);
                 }
                 writelog::LogRecord::Zero {
                     start_lba,
                     lba_length,
                 } => {
-                    lbamap.insert(start_lba, lba_length, ZERO_HASH);
+                    lbamap.insert(start_lba, lba_length, ZERO_HASH, wal_ulid);
                 }
             }
         }

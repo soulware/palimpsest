@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use log::warn;
+use ulid::Ulid;
 
 use crate::segment;
 use crate::signing;
@@ -55,6 +56,14 @@ struct MapEntry {
     /// e.g. if `[0, 100) → H` is split by a write to `[30, 50)`, the
     /// resulting tail `[50, 100) → H` has `payload_block_offset = 50`.
     payload_block_offset: u32,
+    /// ULID of the segment (or WAL) that staked this LBA claim. Distinct
+    /// from `extent_index[hash].segment_id` (the body owner): a DedupRef
+    /// in segment `u_dr` claims its LBA range under `u_dr` even though
+    /// the body lives in some earlier `u_owner`. Used by `insert_if_newer`
+    /// to let structural-commit outputs (GC / redact / repack) merge into
+    /// the live lbamap without clobbering concurrent live writes whose
+    /// ULID is higher. See `docs/design-lbamap-claimant-tracking.md`.
+    claimant_ulid: Ulid,
 }
 
 /// The live in-memory LBA map.
@@ -143,11 +152,12 @@ impl LbaMap {
     /// Insert an extent `[start_lba, start_lba + lba_length)` → `hash`,
     /// trimming or splitting any existing entries it overlaps.
     ///
-    /// Called after every successful [`crate::segment::promote`] and during
-    /// startup rebuild. New entries always have `payload_block_offset = 0`;
+    /// `claimant` is the ULID of the segment (or open WAL) that's making
+    /// the claim. New entries always have `payload_block_offset = 0`;
     /// non-zero offsets arise only in the split/tail entries created internally.
-    pub fn insert(&mut self, start_lba: u64, lba_length: u32, hash: blake3::Hash) {
-        self.insert_inner(start_lba, lba_length, hash, None);
+    /// Splits propagate the original entry's claimant unchanged.
+    pub fn insert(&mut self, start_lba: u64, lba_length: u32, hash: blake3::Hash, claimant: Ulid) {
+        self.insert_inner(start_lba, lba_length, hash, claimant, None);
     }
 
     /// Insert a Delta extent. Same as [`insert`] but attaches `source_hashes`
@@ -158,9 +168,86 @@ impl LbaMap {
         start_lba: u64,
         lba_length: u32,
         hash: blake3::Hash,
+        claimant: Ulid,
         source_hashes: Arc<[blake3::Hash]>,
     ) {
-        self.insert_inner(start_lba, lba_length, hash, Some(source_hashes));
+        self.insert_inner(start_lba, lba_length, hash, claimant, Some(source_hashes));
+    }
+
+    /// Insert only on sub-ranges where no overlapping current entry has a
+    /// claimant `>=` ours; leave higher-claimant overlaps untouched. Used by
+    /// structural-commit apply paths (GC / redact / repack) to merge their
+    /// output into the live lbamap without clobbering concurrent live
+    /// writes whose ULID is higher than the structural op's `new_ulid`. See
+    /// `docs/design-lbamap-claimant-tracking.md` and
+    /// `gc_output_loses_to_live_write_applied_after_gc`.
+    pub fn insert_if_newer(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        claimant: Ulid,
+    ) {
+        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, None);
+    }
+
+    /// Delta variant of [`insert_if_newer`]; same conditional-by-claimant
+    /// semantics with delta sources attached on the sub-ranges we install.
+    pub fn insert_delta_if_newer(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        claimant: Ulid,
+        source_hashes: Arc<[blake3::Hash]>,
+    ) {
+        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, Some(source_hashes));
+    }
+
+    fn insert_inner_if_newer(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        claimant: Ulid,
+        sources: Option<Arc<[blake3::Hash]>>,
+    ) {
+        let new_end = start_lba + lba_length as u64;
+
+        // Sub-ranges of [start_lba, new_end) covered by an existing entry
+        // whose claimant is >= ours — those we must leave untouched. The
+        // BTreeMap's no-overlap invariant means these are emitted in
+        // ascending order and never overlap each other.
+        let mut blocked: Vec<(u64, u64)> = Vec::new();
+
+        if let Some((&pred_start, &pred)) = self.inner.range(..start_lba).next_back() {
+            let pred_end = pred_start + pred.lba_length as u64;
+            if pred_end > start_lba && pred.claimant_ulid >= claimant {
+                blocked.push((start_lba, pred_end.min(new_end)));
+            }
+        }
+
+        for (&k, e) in self.inner.range(start_lba..new_end) {
+            if e.claimant_ulid >= claimant {
+                let k_end = k + e.lba_length as u64;
+                blocked.push((k, k_end.min(new_end)));
+            }
+        }
+
+        // Install on each gap between blocked regions; insert_inner handles
+        // trimming any non-blocked overlaps inside the gap.
+        let mut cursor = start_lba;
+        for (b_start, b_end) in blocked {
+            if cursor < b_start {
+                let gap_len = (b_start - cursor) as u32;
+                self.insert_inner(cursor, gap_len, hash, claimant, sources.clone());
+            }
+            cursor = cursor.max(b_end);
+        }
+        if cursor < new_end {
+            let gap_len = (new_end - cursor) as u32;
+            self.insert_inner(cursor, gap_len, hash, claimant, sources);
+        }
     }
 
     fn insert_inner(
@@ -168,6 +255,7 @@ impl LbaMap {
         start_lba: u64,
         lba_length: u32,
         hash: blake3::Hash,
+        claimant: Ulid,
         sources: Option<Arc<[blake3::Hash]>>,
     ) {
         let new_end = start_lba + lba_length as u64;
@@ -186,6 +274,7 @@ impl LbaMap {
                         lba_length: (start_lba - pred_start) as u32,
                         hash: pred.hash,
                         payload_block_offset: pred.payload_block_offset,
+                        claimant_ulid: pred.claimant_ulid,
                     },
                     pred_sources.clone(),
                 );
@@ -199,6 +288,7 @@ impl LbaMap {
                             hash: pred.hash,
                             payload_block_offset: pred.payload_block_offset
                                 + (new_end - pred_start) as u32,
+                            claimant_ulid: pred.claimant_ulid,
                         },
                         pred_sources,
                     );
@@ -230,6 +320,7 @@ impl LbaMap {
                         lba_length: (entry_end - new_end) as u32,
                         hash: e.hash,
                         payload_block_offset: e.payload_block_offset + (new_end - key) as u32,
+                        claimant_ulid: e.claimant_ulid,
                     },
                     e_sources,
                 );
@@ -242,6 +333,7 @@ impl LbaMap {
                 lba_length,
                 hash,
                 payload_block_offset: 0,
+                claimant_ulid: claimant,
             },
             sources,
         );
@@ -558,9 +650,15 @@ fn rebuild_segments_inner(
                 if entry.kind == segment::EntryKind::Delta {
                     let sources: Arc<[blake3::Hash]> =
                         entry.delta_options.iter().map(|o| o.source_hash).collect();
-                    map.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
+                    map.insert_delta(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        sref.ulid,
+                        sources,
+                    );
                 } else {
-                    map.insert(entry.start_lba, entry.lba_length, entry.hash);
+                    map.insert(entry.start_lba, entry.lba_length, entry.hash, sref.ulid);
                 }
             }
         }
@@ -590,6 +688,13 @@ mod tests {
         blake3::hash(&[b; 32])
     }
 
+    /// Deterministic ULID derived from a single byte; ordering matches the
+    /// byte ordering. Used for tests that don't care which segment claims
+    /// what, only that `insert` accepts a claimant.
+    fn u(b: u8) -> Ulid {
+        Ulid::from_parts(b as u64, 0)
+    }
+
     /// Write `volume.pub` into `dir` and return the signer.
     fn write_test_pub(dir: &std::path::Path) -> std::sync::Arc<dyn segment::SegmentSigner> {
         let (signer, vk) = signing::generate_ephemeral_signer();
@@ -611,7 +716,7 @@ mod tests {
     #[test]
     fn insert_and_lookup_exact() {
         let mut map = LbaMap::new();
-        map.insert(10, 5, h(1));
+        map.insert(10, 5, h(1), u(1));
         // First block of extent — offset 0.
         assert_eq!(map.lookup(10), Some((h(1), 0)));
         // Middle block — offset 2.
@@ -623,7 +728,7 @@ mod tests {
     #[test]
     fn lookup_miss_outside_extent() {
         let mut map = LbaMap::new();
-        map.insert(10, 5, h(1)); // covers [10, 15)
+        map.insert(10, 5, h(1), u(1)); // covers [10, 15)
         assert!(map.lookup(9).is_none());
         assert!(map.lookup(15).is_none());
         assert!(map.lookup(100).is_none());
@@ -632,8 +737,8 @@ mod tests {
     #[test]
     fn lookup_miss_in_gap() {
         let mut map = LbaMap::new();
-        map.insert(0, 5, h(1)); // [0, 5)
-        map.insert(10, 5, h(2)); // [10, 15)
+        map.insert(0, 5, h(1), u(1)); // [0, 5)
+        map.insert(10, 5, h(2), u(2)); // [10, 15)
         assert!(map.lookup(5).is_none());
         assert!(map.lookup(7).is_none());
         assert!(map.lookup(9).is_none());
@@ -642,8 +747,8 @@ mod tests {
     #[test]
     fn insert_overwrites_exact_range() {
         let mut map = LbaMap::new();
-        map.insert(0, 10, h(1));
-        map.insert(0, 10, h(2));
+        map.insert(0, 10, h(1), u(1));
+        map.insert(0, 10, h(2), u(2));
         assert_eq!(map.len(), 1);
         assert_eq!(map.lookup(0), Some((h(2), 0)));
         assert_eq!(map.lookup(9), Some((h(2), 9)));
@@ -654,8 +759,8 @@ mod tests {
         // [0, 20) → A; then insert [10, 30) → B.
         // Expected: [0, 10) → A, [10, 30) → B.
         let mut map = LbaMap::new();
-        map.insert(0, 20, h(1));
-        map.insert(10, 20, h(2));
+        map.insert(0, 20, h(1), u(1));
+        map.insert(10, 20, h(2), u(2));
         assert_eq!(map.len(), 2);
         assert_eq!(map.lookup(5), Some((h(1), 5)));
         assert_eq!(map.lookup(9), Some((h(1), 9)));
@@ -668,8 +773,8 @@ mod tests {
         // [0, 100) → A; then insert [30, 20) → B (range [30, 50)).
         // Expected: [0, 30) → A, [30, 50) → B, [50, 100) → A.
         let mut map = LbaMap::new();
-        map.insert(0, 100, h(1));
-        map.insert(30, 20, h(2));
+        map.insert(0, 100, h(1), u(1));
+        map.insert(30, 20, h(2), u(2));
         assert_eq!(map.len(), 3);
         assert_eq!(map.lookup(0), Some((h(1), 0)));
         assert_eq!(map.lookup(29), Some((h(1), 29)));
@@ -683,10 +788,10 @@ mod tests {
     fn insert_removes_fully_covered_entries() {
         // Three adjacent entries; overwrite the middle two.
         let mut map = LbaMap::new();
-        map.insert(0, 10, h(1)); // [0, 10)
-        map.insert(10, 10, h(2)); // [10, 20)
-        map.insert(20, 10, h(3)); // [20, 30)
-        map.insert(8, 15, h(4)); // [8, 23) — covers parts of all three
+        map.insert(0, 10, h(1), u(1)); // [0, 10)
+        map.insert(10, 10, h(2), u(2)); // [10, 20)
+        map.insert(20, 10, h(3), u(3)); // [20, 30)
+        map.insert(8, 15, h(4), u(4)); // [8, 23) — covers parts of all three
         // Expected: [0, 8) → A, [8, 23) → D, [23, 30) → C.
         assert_eq!(map.len(), 3);
         assert_eq!(map.lookup(7), Some((h(1), 7)));
@@ -703,8 +808,8 @@ mod tests {
         // Expected: [30, 70) → B, [70, 100) → A.
         // (Nothing before 30 to worry about.)
         let mut map = LbaMap::new();
-        map.insert(50, 50, h(1)); // [50, 100)
-        map.insert(30, 40, h(2)); // [30, 70)
+        map.insert(50, 50, h(1), u(1)); // [50, 100)
+        map.insert(30, 40, h(2), u(2)); // [30, 70)
         assert_eq!(map.len(), 2);
         assert_eq!(map.lookup(30), Some((h(2), 0)));
         assert_eq!(map.lookup(69), Some((h(2), 39)));
@@ -906,11 +1011,11 @@ mod tests {
     fn delta_source_removed_when_lba_overwritten() {
         let mut map = LbaMap::new();
         let src = h(11);
-        map.insert_delta(0, 4, h(1), Arc::from([src]));
+        map.insert_delta(0, 4, h(1), u(1), Arc::from([src]));
         assert!(map.lba_referenced_hashes().contains(&src));
 
         // Overwrite the entire Delta range with a plain Data write.
-        map.insert(0, 4, h(2));
+        map.insert(0, 4, h(2), u(2));
         let referenced = map.lba_referenced_hashes();
         assert!(
             !referenced.contains(&src),
@@ -923,21 +1028,21 @@ mod tests {
         let mut map = LbaMap::new();
         let src = h(11);
         // Delta at [0, 10) with source src.
-        map.insert_delta(0, 10, h(1), Arc::from([src]));
+        map.insert_delta(0, 10, h(1), u(1), Arc::from([src]));
         // Hole-punch in the middle: splits into [0, 3) and [5, 10), both still Delta.
-        map.insert(3, 2, h(2));
+        map.insert(3, 2, h(2), u(2));
         assert!(
             map.lba_referenced_hashes().contains(&src),
             "source must stay live while any split of the Delta remains"
         );
         // Overwrite the first half.
-        map.insert(0, 3, h(3));
+        map.insert(0, 3, h(3), u(3));
         assert!(
             map.lba_referenced_hashes().contains(&src),
             "source must stay live while the other split remains"
         );
         // Overwrite the second half.
-        map.insert(5, 5, h(4));
+        map.insert(5, 5, h(4), u(4));
         assert!(
             !map.lba_referenced_hashes().contains(&src),
             "source must drop once all splits are gone"
@@ -949,18 +1054,18 @@ mod tests {
         let mut map = LbaMap::new();
         let src = h(11);
         // Two independent Delta LBAs share the same source.
-        map.insert_delta(0, 1, h(1), Arc::from([src]));
-        map.insert_delta(100, 1, h(2), Arc::from([src]));
+        map.insert_delta(0, 1, h(1), u(1), Arc::from([src]));
+        map.insert_delta(100, 1, h(2), u(2), Arc::from([src]));
 
         assert!(map.lba_referenced_hashes().contains(&src));
         // Overwrite the first Delta — source should remain live (refcount 1).
-        map.insert(0, 1, h(3));
+        map.insert(0, 1, h(3), u(3));
         assert!(
             map.lba_referenced_hashes().contains(&src),
             "source alive while another Delta still references it"
         );
         // Overwrite the second — refcount hits zero.
-        map.insert(100, 1, h(4));
+        map.insert(100, 1, h(4), u(4));
         assert!(!map.lba_referenced_hashes().contains(&src));
     }
 
@@ -972,7 +1077,7 @@ mod tests {
         let new_src = h(13);
 
         // Start with a plain Data entry — no delta sources.
-        map.insert(0, 1, content);
+        map.insert(0, 1, content, u(0));
         assert!(!map.lba_referenced_hashes().contains(&old_src));
 
         // Attach an initial source.
@@ -993,15 +1098,102 @@ mod tests {
         let other = h(2);
         let src = h(11);
 
-        map.insert(0, 1, content);
+        map.insert(0, 1, content, u(0));
         // Concurrent overwrite changed the hash.
-        map.insert(0, 1, other);
+        map.insert(0, 1, other, u(1));
 
         assert!(
             !map.set_delta_sources_if_matches(0, content, Arc::from([src])),
             "must reject when LBA hash no longer matches"
         );
         assert!(!map.lba_referenced_hashes().contains(&src));
+    }
+
+    // --- insert_if_newer tests ---
+
+    #[test]
+    fn insert_if_newer_installs_into_empty_map() {
+        let mut map = LbaMap::new();
+        map.insert_if_newer(0, 4, h(1), u(5));
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.lookup(3), Some((h(1), 3)));
+    }
+
+    #[test]
+    fn insert_if_newer_overrides_lower_claimant() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(2));
+        map.insert_if_newer(0, 4, h(2), u(5));
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+    }
+
+    #[test]
+    fn insert_if_newer_preserves_higher_claimant() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(9));
+        map.insert_if_newer(0, 4, h(2), u(5));
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+    }
+
+    #[test]
+    fn insert_if_newer_preserves_equal_claimant() {
+        // Idempotency: replaying the same structural commit's output
+        // shouldn't overwrite itself with stale split offsets.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(5));
+        map.insert_if_newer(0, 4, h(2), u(5));
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+    }
+
+    #[test]
+    fn insert_if_newer_splits_around_higher_claimant_in_middle() {
+        // Existing claim of [4, 6) at higher claimant; structural commit
+        // wants to install [0, 10) → h(2) at lower claimant. Head and
+        // tail get installed; middle is preserved.
+        let mut map = LbaMap::new();
+        map.insert(4, 2, h(9), u(9));
+        map.insert_if_newer(0, 10, h(2), u(5));
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+        assert_eq!(map.lookup(3), Some((h(2), 3)));
+        assert_eq!(map.lookup(4), Some((h(9), 0)));
+        assert_eq!(map.lookup(5), Some((h(9), 1)));
+        assert_eq!(map.lookup(6), Some((h(2), 0)));
+        assert_eq!(map.lookup(9), Some((h(2), 3)));
+    }
+
+    #[test]
+    fn insert_if_newer_blocked_by_overlapping_predecessor() {
+        // Predecessor [0, 8) at higher claimant overlaps [4, 12); only
+        // [8, 12) should be installed.
+        let mut map = LbaMap::new();
+        map.insert(0, 8, h(9), u(9));
+        map.insert_if_newer(4, 8, h(2), u(5));
+        assert_eq!(map.lookup(4), Some((h(9), 4)));
+        assert_eq!(map.lookup(7), Some((h(9), 7)));
+        assert_eq!(map.lookup(8), Some((h(2), 0)));
+        assert_eq!(map.lookup(11), Some((h(2), 3)));
+    }
+
+    #[test]
+    fn insert_if_newer_skips_when_predecessor_covers_entire_range() {
+        let mut map = LbaMap::new();
+        map.insert(0, 100, h(9), u(9));
+        map.insert_if_newer(20, 30, h(2), u(5));
+        assert_eq!(map.lookup(20), Some((h(9), 20)));
+        assert_eq!(map.lookup(49), Some((h(9), 49)));
+    }
+
+    #[test]
+    fn insert_if_newer_trims_lower_claimant_predecessor() {
+        // Lower-claimant predecessor [0, 10) gets trimmed by the new
+        // [4, 8) claim at higher claimant — same as `insert` semantics.
+        let mut map = LbaMap::new();
+        map.insert(0, 10, h(1), u(2));
+        map.insert_if_newer(4, 4, h(2), u(5));
+        assert_eq!(map.lookup(3), Some((h(1), 3)));
+        assert_eq!(map.lookup(4), Some((h(2), 0)));
+        assert_eq!(map.lookup(7), Some((h(2), 3)));
+        assert_eq!(map.lookup(8), Some((h(1), 8)));
     }
 
     // --- extents_in_range tests ---
@@ -1015,7 +1207,7 @@ mod tests {
     #[test]
     fn extents_in_range_single_extent_fully_inside() {
         let mut map = LbaMap::new();
-        map.insert(5, 3, h(1)); // [5, 8)
+        map.insert(5, 3, h(1), u(1)); // [5, 8)
         let result = map.extents_in_range(0, 10);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, h(1));
@@ -1027,7 +1219,7 @@ mod tests {
     #[test]
     fn extents_in_range_predecessor_extends_into_range() {
         let mut map = LbaMap::new();
-        map.insert(0, 10, h(1)); // [0, 10)
+        map.insert(0, 10, h(1), u(1)); // [0, 10)
         // Request [5, 15) — predecessor starts before range but extends in.
         let result = map.extents_in_range(5, 15);
         assert_eq!(result.len(), 1);
@@ -1039,9 +1231,9 @@ mod tests {
     #[test]
     fn extents_in_range_multiple_extents() {
         let mut map = LbaMap::new();
-        map.insert(0, 4, h(1)); // [0, 4)
-        map.insert(4, 4, h(2)); // [4, 8)
-        map.insert(8, 4, h(3)); // [8, 12)
+        map.insert(0, 4, h(1), u(1)); // [0, 4)
+        map.insert(4, 4, h(2), u(2)); // [4, 8)
+        map.insert(8, 4, h(3), u(3)); // [8, 12)
         let result = map.extents_in_range(2, 10);
         assert_eq!(result.len(), 3);
         // First: predecessor [0,4) clipped to [2,4)
@@ -1061,8 +1253,8 @@ mod tests {
     #[test]
     fn extents_in_range_gap_between_extents() {
         let mut map = LbaMap::new();
-        map.insert(0, 2, h(1)); // [0, 2)
-        map.insert(5, 2, h(2)); // [5, 7) — gap at [2, 5)
+        map.insert(0, 2, h(1), u(1)); // [0, 2)
+        map.insert(5, 2, h(2), u(2)); // [5, 7) — gap at [2, 5)
         let result = map.extents_in_range(0, 7);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].range_start, 0);
@@ -1074,8 +1266,8 @@ mod tests {
     #[test]
     fn extents_in_range_extent_ends_exactly_at_range_start() {
         let mut map = LbaMap::new();
-        map.insert(0, 5, h(1)); // [0, 5) — ends exactly at range start
-        map.insert(5, 5, h(2)); // [5, 10)
+        map.insert(0, 5, h(1), u(1)); // [0, 5) — ends exactly at range start
+        map.insert(5, 5, h(2), u(2)); // [5, 10)
         let result = map.extents_in_range(5, 10);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, h(2));
@@ -1087,8 +1279,8 @@ mod tests {
         // extents_in_range over [5, 8) should return the tail clipped, with
         // payload_block_offset = 4 + (5 - 4) = 5.
         let mut map = LbaMap::new();
-        map.insert(0, 10, h(1));
-        map.insert(3, 1, h(2)); // splits [0,10) into [0,3), [3,4), [4,10) with offset=4
+        map.insert(0, 10, h(1), u(1));
+        map.insert(3, 1, h(2), u(2)); // splits [0,10) into [0,3), [3,4), [4,10) with offset=4
         let result = map.extents_in_range(5, 8);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, h(1));

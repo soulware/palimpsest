@@ -1,4 +1,4 @@
-# LBA map claimant tracking (proposal)
+# LBA map claimant tracking
 
 ## Summary
 
@@ -113,12 +113,22 @@ existing memory footprint.
 
 ## Status
 
-Out of scope today. PR #277 documents the current rebuild call sites
-inline; this doc captures the structural change that would unlock
-removing them. Pick up when one of:
+Implemented. `MapEntry` now carries `claimant_ulid`. New
+`LbaMap::insert_if_newer` / `insert_delta_if_newer` install only on
+sub-ranges where no overlapping current entry has a claimant `>=` the
+caller's, splitting the incoming range around higher-claimant overlaps.
 
-- A profile shows the per-commit rebuild as a hot spot.
-- Another invariant or feature wants per-LBA claimant ULIDs (e.g. some
-  reclaim heuristics may benefit).
-- We add another rebuild site and decide we'd rather spend the effort
-  here than continue paying it.
+Three apply paths previously calling `rebuild_lbamap_from_disk()` now
+use the incremental merge:
+
+- `apply_plan_apply_result` (applied) — GC commit.
+- `apply_redact_result` (rewritten) — redact commit.
+- `apply_plan_apply_result` (cancelled) — defence-in-depth rebuild
+  removed; cancel performs no lbamap mutation, and the stress
+  invariant `assert_lbamap_consistent` catches divergence at the
+  introducing site.
+
+Repack apply paths (`apply_repack_result`, delta-repack apply,
+`apply_sweep_result`) still rebuild from disk — out of scope for this
+change but the same `insert_if_newer` mechanism applies if a future
+profile flags them.

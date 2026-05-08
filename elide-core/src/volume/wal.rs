@@ -60,7 +60,7 @@ pub(super) fn replay_wal_records(
                 } else {
                     segment::SegmentFlags::empty()
                 };
-                lbamap.insert(start_lba, lba_length, hash);
+                lbamap.insert(start_lba, lba_length, hash, ulid);
                 // Temporary WAL offset — updated to segment offset on promotion.
                 extent_index.insert(
                     hash,
@@ -83,7 +83,7 @@ pub(super) fn replay_wal_records(
                 start_lba,
                 lba_length,
             } => {
-                lbamap.insert(start_lba, lba_length, hash);
+                lbamap.insert(start_lba, lba_length, hash, ulid);
                 // REF: no body bytes, no body reservation, no extent_index
                 // update. The canonical entry is populated from whichever
                 // segment holds the DATA for this hash.
@@ -95,7 +95,7 @@ pub(super) fn replay_wal_records(
                 start_lba,
                 lba_length,
             } => {
-                lbamap.insert(start_lba, lba_length, ZERO_HASH);
+                lbamap.insert(start_lba, lba_length, ZERO_HASH, ulid);
                 pending_entries.push(segment::SegmentEntry::new_zero(start_lba, lba_length));
             }
         }
