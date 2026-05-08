@@ -1448,17 +1448,13 @@ enum ListFilter {
 use elide_coordinator::volume_state::{VolumeLifecycle, VolumeMode};
 
 /// Cell value for the STATE column in `elide volume list`. Wraps the
-/// coordinator-derived `VolumeLifecycle` with two CLI-only sentinels:
+/// disk-derived `VolumeLifecycle` with a CLI-only sentinel:
 ///
 /// - `Ancestor` — pulled ancestor volume that has no `by_name/` entry
 ///   and is never supervised. Lifecycle classification doesn't apply.
-/// - `CoordinatorDown` — coordinator IPC is unreachable, so on-disk
-///   markers may not reflect what the supervisor would do. Render
-///   `-` rather than guessing.
 enum CliVolumeState {
     Lifecycle(VolumeLifecycle),
     Ancestor,
-    CoordinatorDown,
 }
 
 impl CliVolumeState {
@@ -1466,7 +1462,6 @@ impl CliVolumeState {
         match self {
             Self::Lifecycle(l) => l.label(),
             Self::Ancestor => "ancestor",
-            Self::CoordinatorDown => "-",
         }
     }
 }
@@ -1519,7 +1514,7 @@ fn list_volumes(
                 if !include {
                     continue;
                 }
-                rows.push(volume_row(name, &vol_dir, is_readonly, coordinator_up));
+                rows.push(volume_row(name, &vol_dir, is_readonly));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1548,7 +1543,7 @@ fn list_volumes(
                     if !vol_dir.join("volume.readonly").exists() {
                         continue;
                     }
-                    rows.push(volume_row("-".to_owned(), &vol_dir, true, coordinator_up));
+                    rows.push(volume_row("-".to_owned(), &vol_dir, true));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1615,7 +1610,7 @@ fn list_volumes(
 /// Gather per-volume display state: lifecycle, transport summary, and pid.
 ///
 /// State labels mirror the coordinator's IPC `volume_status`
-/// (`elide-coordinator/src/inbound.rs`) when the coordinator is reachable:
+/// (`elide-coordinator/src/inbound.rs`):
 ///
 /// - `running`          — `volume.pid` present and the process is alive.
 /// - `importing`        — an import lock is held.
@@ -1623,13 +1618,12 @@ fn list_volumes(
 ///   auto-start this volume.
 /// - `stopped`          — neither a live pid nor a manual-stop marker.
 ///
-/// When `coordinator_up` is false, lifecycle inference from on-disk markers is
-/// suppressed and STATE/PID render as `-`. The volume's behaviour without a
-/// running coordinator is "paused pending coordinator restart" regardless of
-/// which marker happens to be on disk, so collapsing to `-` plus a footer line
-/// (printed by the caller) keeps the table honest. Transport stays populated
-/// — it reflects static config, not lifecycle.
-fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: bool) -> VolumeRow {
+/// All of these derive from on-disk markers plus a `kill(pid, 0)` liveness
+/// check, so the row renders the same whether or not the coordinator IPC is
+/// reachable. The caller prints a footer when the coordinator is down so
+/// operators know auto-supervision is paused, but the visible state of each
+/// volume (live pid, manual-stop, importing) is a fact about disk regardless.
+fn volume_row(name: String, vol_dir: &Path, is_readonly: bool) -> VolumeRow {
     let transport = transport_summary(vol_dir);
     let ulid = vol_dir
         .file_name()
@@ -1647,8 +1641,6 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: b
     // lifecycle from markers that don't apply.
     let state = if name == "-" && is_readonly {
         CliVolumeState::Ancestor
-    } else if !coordinator_up {
-        CliVolumeState::CoordinatorDown
     } else {
         CliVolumeState::Lifecycle(VolumeLifecycle::from_dir(vol_dir))
     };
@@ -1657,7 +1649,7 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: b
             .pid()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_owned()),
-        _ => "-".to_owned(),
+        CliVolumeState::Ancestor => "-".to_owned(),
     };
     VolumeRow {
         name,
