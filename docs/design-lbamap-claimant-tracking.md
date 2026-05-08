@@ -8,7 +8,7 @@ Today the LBA map is a `LBA → hash` map. This proposal adds a per-entry
 The new field doesn't change *what* a read returns (the hash already
 identifies the body via `extent_index`); it changes *how cheaply* the
 in-memory lbamap can be kept in sync with disk after a structural op
-(GC apply, redact apply, repack apply, …).
+(GC apply, repack apply, …).
 
 ## What we'd gain
 
@@ -16,7 +16,6 @@ Three concrete sites in `elide-core/src/volume/` currently call
 `rebuild_lbamap_from_disk()` after a structural commit:
 
 - `apply_plan_apply_result` (applied branch) — after a GC commit.
-- `apply_redact_result` (rewritten branch) — after a redact commit.
 - `apply_plan_apply_result` (cancelled branch) — defence-in-depth.
 
 Each rebuild walks every segment file in the fork (and ancestor chain),
@@ -118,11 +117,10 @@ Implemented. `MapEntry` now carries `claimant_ulid`. New
 sub-ranges where no overlapping current entry has a claimant `>=` the
 caller's, splitting the incoming range around higher-claimant overlaps.
 
-Five apply paths previously calling `rebuild_lbamap_from_disk()` now
+Four apply paths previously calling `rebuild_lbamap_from_disk()` now
 use the incremental merge:
 
 - `apply_plan_apply_result` (applied) — GC commit.
-- `apply_redact_result` (rewritten) — redact commit.
 - `apply_plan_apply_result` (cancelled) — defence-in-depth rebuild
   removed; cancel performs no lbamap mutation, and the stress
   invariant `assert_lbamap_consistent` catches divergence at the

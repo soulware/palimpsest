@@ -31,7 +31,7 @@ drain_interval = "5s"
 scan_interval  = "30s"
 
 [gc]
-density_threshold = 0.70             # repack rewrites segments below this density
+density_threshold = 0.70             # coordinator GC reclaims S3 segments below this density
 interval          = "10s"
 retention_window  = "10m"            # how long GC inputs stay in S3 before reaping
 ```
@@ -59,7 +59,7 @@ Segments accumulate in `pending/` after WAL promotion. The coordinator's per-for
 
 1. **Flush WAL** via `flush` IPC
 2. **Sweep** via `sweep_pending` IPC (merges small `pending/` segments)
-3. **Repack** via `repack` IPC (compacts sparse `pending/` segments)
+3. **Repack** via `repack` IPC (rewrites every `pending/` segment with any hash-dead body; deleted data does not reach S3)
 4. **Upload** — PUT each `pending/` file, send `promote <ulid>` IPC on success; the volume writes `index/<ulid>.idx` + `cache/<ulid>.body` + `cache/<ulid>.present` and removes `pending/<ulid>`.
 5. **GC** — rate-limited to `gc_interval` (default 10s); see below.
 

@@ -116,11 +116,11 @@ When the write log reaches the 32MB threshold (or on an explicit flush), the bac
 
 **Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes the raw extent data bytes (no headers) to a clean body section. DATA records contribute body bytes; DedupRef and ZERO records contribute no bytes and reserve no body space (`stored_offset = 0`, `stored_length = 0`). All segments — freshly promoted or GC-repacked — have the same uniform 64-byte index entry format.
 
-**`redact_segment` (rewrite under a fresh ULID, dropping dead DATA bodies).** Before the coordinator reads a `pending/<ULID>` segment for S3 upload, it calls `redact_segment(ulid)` IPC on the volume. The volume rewrites the input segment under a freshly-minted `u_redact` and unlinks the old `pending/<input_ulid>` on apply. Hash-dead means: the LBA no longer maps to this hash, and no other live LBA anywhere in the volume references this hash. DedupRef entries are not touched: the thin format carries no DedupRef body bytes in the first place. The reply (`RedactReply.current_ulid`) is `u_redact` when at least one entry was dropped, or the original `input_ulid` when redact was a no-op (no rewrite, no new file). Callers must use the returned ULID for the subsequent `promote` and any upload. The operation is idempotent — re-running redact on a segment with no hash-dead entries returns the same `current_ulid`.
+**Hash-dead bodies are dropped by repack before upload.** A DATA entry is *hash-dead* when its LBA no longer maps to the hash and no other live LBA anywhere in the volume references it — the body bytes can never be read again, but they would still be uploaded as part of the segment unless dropped first. Repack rewrites every pending segment with at least one hash-dead body under a freshly-minted output ULID (with `u_repack < u_flush`) and unlinks the original `pending/<input_ulid>` on apply. DedupRef entries are not touched: the thin format carries no DedupRef body bytes. Repack is idempotent — re-running it on a segment with no hash-dead bodies is a no-op.
 
-Redact uses the same checkpoint pattern as GC, sweep, and repack: pre-mint `u_redact < u_flush`, flush any open WAL into `pending/<u_flush>`, then run the rewrite. The `u_redact < u_flush` ordering keeps the rewrite below every future WAL ULID so concurrent writes always win on rebuild. Rewriting under a new ULID (rather than mutating in place) avoids path-aliasing a concurrent reader's pre-redact snapshot — the old file stays readable until apply unlinks it.
+Repack uses the same checkpoint pattern as GC and sweep: pre-mint `u_repack_i < u_flush`, flush any open WAL into `pending/<u_flush>`, then run the rewrite. The pre-mint ordering keeps every output below every future WAL ULID so concurrent writes always win on rebuild. Rewriting under a new ULID (rather than mutating in place) avoids path-aliasing a concurrent reader's pre-rewrite snapshot — the old file stays readable until apply unlinks it.
 
-The name `redact` reflects the intent: the sole purpose of this step is to ensure deleted data never leaves the host via S3 upload. Deferring it to upload time (rather than doing it at overwrite time) lets multiple dead hashes accumulate in a single `redact` pass and avoids coupling the write path to hash-liveness bookkeeping.
+Deferring dead-body removal to drain time (rather than doing it at overwrite time) lets multiple dead hashes accumulate in a single repack pass and avoids coupling the write path to hash-liveness bookkeeping.
 
 **WAL-to-segment flag translation:** WAL and segment index use different bit values for `FLAG_COMPRESSED` and `FLAG_DEDUP_REF` (see the WAL flag namespace note above). `recover_wal` translates WAL flags to segment flags before constructing `SegmentEntry` values — never copy a WAL `flags` byte directly into a segment index entry.
 
@@ -173,9 +173,9 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
 6. Read pending/<ULID> and stream it byte-for-byte to S3.
    The local file is already in its final form by the time drain runs:
      - DedupRef and Delta entries contribute no body bytes (stored_length = 0).
-     - Hash-dead DATA entries have been dropped by redact_segment, which
-       rewrote the segment under a fresh `u_redact` (or returned the input
-       ULID unchanged if there was nothing to drop).
+     - Hash-dead DATA entries have been dropped by repack — segments
+       with any hash-dead body have been rewritten under a fresh
+       `u_repack < u_flush`.
      - Delta entries (and their delta body section) were written into the
        file by either elide-import (filemap-matched, at import time) or by
        the post-snapshot delta repack pass that the coordinator runs before
@@ -310,7 +310,7 @@ This layout is **unified across `pending/`, `cache/`, and S3**. The local `pendi
 
 Reads of a DedupRef-mapped LBA go through the extent index: `extent_index.lookup(hash)` returns the canonical DATA location, and the read is served from there. The DedupRef entry's own offset and length fields are never consulted by the read path. This holds for local reads, cache reads, and cold-path demand-fetches against S3.
 
-Hash-dead DATA entries (LBA overwritten and hash no longer referenced by any live LBA in the volume) are dropped by `redact_segment` just before upload — the segment is rewritten under a freshly-minted `u_redact < u_flush` with the dead bodies omitted, and the original `pending/<input_ulid>` is unlinked on apply. Deleted data is therefore never transmitted to S3. DedupRef entries are skipped by redact — they contribute zero body bytes in the thin format and there is nothing to drop.
+Hash-dead DATA entries (LBA overwritten and hash no longer referenced by any live LBA in the volume) are dropped by repack before upload — the segment is rewritten under a freshly-minted `u_repack < u_flush` with the dead bodies omitted, and the original `pending/<input_ulid>` is unlinked on apply. Deleted data is therefore never transmitted to S3. DedupRef entries are skipped by repack — they contribute zero body bytes in the thin format.
 
 **Two invariants make thin DedupRef sound:**
 

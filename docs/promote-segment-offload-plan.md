@@ -8,7 +8,7 @@ Move the heavy middle of `Volume::promote_segment` — file I/O and signature ve
 
 Folded into the same landing: collapse the current **triple re-parse** of the segment index inside one call down to a single parse.
 
-**Non-goals.** Changing the IPC protocol. Changing the on-disk lifecycle of `pending/` / `gc/` / `cache/` / `index/`. Running multiple promotes in parallel on a pool. Offloading `redact_segment` (which runs on the actor just before upload; separate concern).
+**Non-goals.** Changing the IPC protocol. Changing the on-disk lifecycle of `pending/` / `gc/` / `cache/` / `index/`. Running multiple promotes in parallel on a pool.
 
 ## Current flow
 

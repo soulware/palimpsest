@@ -139,7 +139,7 @@ Call at the **end** of every method that may mutate the asserted state, on every
 
 #### Active invariants
 
-Call sites use the umbrella `Volume::assert_volume_invariants(caller)` rather than the individual asserts; adding a new invariant is a single edit there and every existing call site picks it up. Called from structural ops only — `Volume::open`, `gc_checkpoint_for_test`, `apply_redact_result`, `apply_plan_apply_result`, `apply_promote_segment_result`. **Not** called from `write` / `write_zeroes` (high-frequency incremental updates whose drift would still be caught at the next structural op).
+Call sites use the umbrella `Volume::assert_volume_invariants(caller)` rather than the individual asserts; adding a new invariant is a single edit there and every existing call site picks it up. Called from structural ops only — `Volume::open`, `gc_checkpoint_for_test`, `apply_repack_result`, `apply_plan_apply_result`, `apply_promote_segment_result`. **Not** called from `write` / `write_zeroes` (high-frequency incremental updates whose drift would still be caught at the next structural op).
 
 Currently in the umbrella:
 
@@ -147,7 +147,7 @@ Currently in the umbrella:
 
 - **`assert_pending_above_committed`** — `max(committed_ulid) < min(pending_ulid)`. Structural form of the drain-ordering invariant `discover_fork_segments` walks under (committed first, then pending; pending wins last). Catches drain-ordering regressions before they surface as lbamap drift.
 
-- **`assert_extent_index_consistent`** — every hash in `self.extent_index` must point at a segment that exists somewhere on disk. Catches phantom entries (e.g. inserting `ZERO_HASH` by mistake) and entries pointing at deleted segments. Deliberately doesn't enforce specific `segment_id` agreement (in-memory and disk-rebuild legitimately diverge there because some apply paths use unconditional `insert` while rebuild uses `insert_if_absent`) and doesn't fire on "disk has more than memory" (pre-existing redact/GC-prune-ancestor behaviour, out of scope).
+- **`assert_extent_index_consistent`** — every hash in `self.extent_index` must point at a segment that exists somewhere on disk. Catches phantom entries (e.g. inserting `ZERO_HASH` by mistake) and entries pointing at deleted segments. Deliberately doesn't enforce specific `segment_id` agreement (in-memory and disk-rebuild legitimately diverge there because some apply paths use unconditional `insert` while rebuild uses `insert_if_absent`) and doesn't fire on "disk has more than memory" (pre-existing repack/GC-prune-ancestor behaviour, out of scope).
 
 - **`assert_lbamap_hashes_resolvable`** — every non-zero hash in `self.lbamap` must be resolvable through `self.extent_index` (either as DATA-canonical or Delta-canonical). Pure in-memory check, linear in lbamap entry count with two HashMap lookups per entry — cheap relative to the rebuild-from-disk invariants. Catches the bug class "lbamap retains a hash claim while extent_index lost the body location": a future read of that LBA would fail at the extent_index lookup, silent data unavailability waiting to surface.
 

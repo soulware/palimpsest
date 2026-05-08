@@ -93,7 +93,7 @@ Per-segment rewrite: each eligible segment is rewritten in place, reusing its ow
 
 Unlike sweep, each segment produces its own output; the result carries a `Vec<RepackedSegment>` with per-segment CAS payloads. Apply walks that list serially — no per-segment parallelism is attempted yet; that's the delta_repack concern (step 3c / 6c).
 
-`Volume::repack(&mut self, min_live_ratio)` is preserved as a thin synchronous wrapper (`prepare_repack` + `execute_repack` + `apply_repack_result`) so existing tests still compile against the same signature; the actor uses the offload path directly with a `parked_repack` slot that rejects concurrent requests.
+`Volume::repack(&mut self)` is preserved as a thin synchronous wrapper (`prepare_repack` + `execute_repack` + `apply_repack_result`) so tests can drive the trio in one call; the actor uses the offload path directly with a `parked_repack` slot that rejects concurrent requests.
 
 ### 3c. `delta_repack_post_snapshot` *(LANDED)*
 
@@ -139,11 +139,10 @@ Still direct-call (low win or out-of-scope for this pass):
 
 - `Volume::apply_gc_handoffs` post-write re-parse of the tmp file (file just written; no prior parse to hit)
 - `Volume::delete_cached_inputs` scan of `gc/<ulid>` (rare)
-- `Volume::redact_segment` (rare)
 - `delta_compute::maybe_rewrite_segment` (runs in `elide-import` one-shot, not in the actor path)
 - `extentindex`/`lbamap` rebuild paths (boot-time; cache is empty then)
 
-Cache invalidation is file-length-based: tmp+rename rewrites change the entry count → the index section length → the file length, so a stale entry naturally misses. `redact_segment` rewrites under a fresh `u_redact` and unlinks the input on apply, so the new file gets its own cache entry and no aliasing arises. Cross-fork correctness is guarded by the verifying-key hash on each cached entry.
+Cache invalidation is file-length-based: tmp+rename rewrites change the entry count → the index section length → the file length, so a stale entry naturally misses. Cross-fork correctness is guarded by the verifying-key hash on each cached entry.
 
 ## Sequencing
 
