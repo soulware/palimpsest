@@ -485,7 +485,7 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
 
 /// Same as [`rebuild_segments`] but skips ed25519 signature verification.
 ///
-/// Used only by the `--features lbamap-invariant` runtime invariants
+/// Used only by the `--features volume-invariants` runtime invariants
 /// (`Volume::assert_*_consistent`) — they need to compare in-memory state
 /// against the on-disk projection on every mutating op, and the signature
 /// check dominates the cost (~50 µs per segment). The signatures are
@@ -493,7 +493,7 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
 /// that, so re-verifying on every consistency check is paranoid overhead.
 ///
 /// **Do not use for production rebuild paths** — they must verify.
-#[cfg(feature = "lbamap-invariant")]
+#[cfg(feature = "volume-invariants")]
 pub fn rebuild_segments_unverified(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaMap> {
     rebuild_segments_inner(layers, false)
 }

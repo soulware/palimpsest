@@ -485,8 +485,7 @@ impl Volume {
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
         };
-        ret.assert_lbamap_consistent("Volume::open");
-        ret.assert_pending_above_committed("Volume::open");
+        ret.assert_volume_invariants("Volume::open");
         Ok(ret)
     }
 
@@ -737,8 +736,7 @@ impl Volume {
         // Flush the current WAL to pending/ under u_flush. If the WAL is
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
-        self.assert_lbamap_consistent("gc_checkpoint_for_test");
-        self.assert_pending_above_committed("gc_checkpoint_for_test");
+        self.assert_volume_invariants("gc_checkpoint_for_test");
         Ok(u_gc)
     }
 
@@ -1014,10 +1012,16 @@ impl Volume {
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
         for (hash, _kind, input_ulid) in &input_old_entries {
+            // Check both `inner` and `deltas` — a Delta entry sits in
+            // `extent_index.deltas` and would be missed by `lookup` alone.
             let still_at_input = self
                 .extent_index
                 .lookup(hash)
-                .is_some_and(|loc| loc.segment_id == *input_ulid);
+                .is_some_and(|loc| loc.segment_id == *input_ulid)
+                || self
+                    .extent_index
+                    .lookup_delta(hash)
+                    .is_some_and(|loc| loc.segment_id == *input_ulid);
             if !still_at_input {
                 continue;
             }
@@ -1059,13 +1063,14 @@ impl Volume {
             // remains as a production safety net since invariants don't
             // run there.
             self.rebuild_lbamap_from_disk()?;
-            self.assert_lbamap_consistent("apply_plan_apply_result_cancelled");
-            self.assert_pending_above_committed("apply_plan_apply_result_cancelled");
+            self.assert_volume_invariants("apply_plan_apply_result_cancelled");
             return Ok(StagedApply::Cancelled);
         }
 
         for (i, e) in entries.iter().enumerate() {
-            if e.kind == EntryKind::DedupRef {
+            // DedupRef and Zero entries don't own a body — see redact.rs
+            // for the same filter and reasoning.
+            if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
                 continue;
             }
             let current = self.extent_index.lookup(&e.hash);
@@ -1102,13 +1107,13 @@ impl Volume {
         }
 
         for (hash, old_ulid) in &to_remove {
-            if self
-                .extent_index
-                .lookup(hash)
-                .is_some_and(|loc| loc.segment_id == *old_ulid)
-            {
-                Arc::make_mut(&mut self.extent_index).remove(hash);
-            }
+            // `remove_owner_at` covers both `inner` and `deltas`. Plain
+            // `lookup` only checks `inner`, so a Delta-canonical hash
+            // would be left dangling — phantom entry pointing at a
+            // deleted input segment. Caught by
+            // `assert_extent_index_consistent` on
+            // `gc_delta_partial_death_compaction`.
+            Arc::make_mut(&mut self.extent_index).remove_owner_at(hash, *old_ulid);
         }
 
         let pending_dir = self.base_dir.join("pending");
@@ -1142,8 +1147,7 @@ impl Volume {
         // Crash ordering: on a crash between rename and rebuild, restart
         // re-runs `Volume::open`'s rebuild which produces the same result.
         self.rebuild_lbamap_from_disk()?;
-        self.assert_lbamap_consistent("apply_plan_apply_result_applied");
-        self.assert_pending_above_committed("apply_plan_apply_result_applied");
+        self.assert_volume_invariants("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
     }
@@ -1218,7 +1222,7 @@ impl Volume {
     /// `gc_proptest` runs already enable this feature; running with
     /// `--features proptest` is what catches drift bugs of the class fixed
     /// by sorting drain loops by ULID ascending.
-    #[cfg(feature = "lbamap-invariant")]
+    #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
@@ -1307,8 +1311,8 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `lbamap-invariant` feature is disabled.
-    #[cfg(not(feature = "lbamap-invariant"))]
+    /// No-op stub when `volume-invariants` feature is disabled.
+    #[cfg(not(feature = "volume-invariants"))]
     #[inline]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
@@ -1328,9 +1332,9 @@ impl Volume {
     /// lbamap drift); this assert catches it structurally before any drift
     /// surfaces, with a clearer panic message.
     ///
-    /// Same `lbamap-invariant` feature gate so the perf cost only applies
+    /// Same `volume-invariants` feature gate so the perf cost only applies
     /// to coordinator-layer stress runs.
-    #[cfg(feature = "lbamap-invariant")]
+    #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_pending_above_committed(&self, caller: &'static str) {
         let pending_dir = self.base_dir.join("pending");
         let pending_ulids = match segment::read_ulid_dir_sorted(&pending_dir) {
@@ -1380,10 +1384,127 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `lbamap-invariant` feature is disabled.
-    #[cfg(not(feature = "lbamap-invariant"))]
+    /// No-op stub when `volume-invariants` feature is disabled.
+    #[cfg(not(feature = "volume-invariants"))]
     #[inline]
     pub(in crate::volume) fn assert_pending_above_committed(&self, _caller: &'static str) {}
+
+    /// Stress-only invariant: every hash in `self.extent_index` must
+    /// point at a segment that exists somewhere on disk (in-memory may
+    /// disagree with the rebuild on *which* specific segment owns the
+    /// hash — see below — but at least one valid owner must exist).
+    ///
+    /// Catches the bug class "phantom or stale entry in extent_index":
+    /// - **Phantom**: an entry whose hash isn't owned by any on-disk
+    ///   segment (e.g. inserting a `ZERO_HASH` sentinel into
+    ///   extent_index by mistake). Reads through this hash fail.
+    /// - **Stale**: an entry pointing at a deleted segment (the segment
+    ///   file was unlinked but extent_index wasn't updated). Reads fail
+    ///   on file-not-found.
+    ///
+    /// **Deliberately does NOT enforce specific segment_id agreement**
+    /// between in-memory and disk-rebuild. The two representations
+    /// legitimately diverge on which segment is named as the owner:
+    /// - `extentindex::rebuild` walks segments in ULID-ascending order
+    ///   and uses `insert_if_absent` (lowest-ULID-wins).
+    /// - Several apply paths (reclaim, write-then-flush) use
+    ///   unconditional `insert` and override with the newer ULID.
+    ///
+    /// Both representations are valid for read correctness — the body
+    /// is identical across all segments claiming the hash, so any
+    /// segment containing it can serve the read. The lowest-vs-newest
+    /// distinction matters for downstream invariants (canonicality,
+    /// dedup) but not for this check.
+    ///
+    /// **Also does NOT enforce "disk has more than memory" symmetry**.
+    /// After a redact / GC apply prunes a hash from in-memory because
+    /// the local segment owned it, an ancestor segment may still own
+    /// the hash on disk — leaving in-memory with no entry while disk
+    /// does. Reading that hash would then miss the dedup opportunity
+    /// and store a duplicate, but doesn't fail outright. Pre-existing
+    /// behaviour; out of scope for this invariant.
+    ///
+    /// Both DATA-canonical (`inner`) and Delta-canonical (`deltas`)
+    /// hashes are checked.
+    #[cfg(feature = "volume-invariants")]
+    pub(in crate::volume) fn assert_extent_index_consistent(&self, caller: &'static str) {
+        let mut chain: Vec<(PathBuf, Option<String>)> = self
+            .ancestor_layers
+            .iter()
+            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+            .collect();
+        chain.push((self.base_dir.clone(), None));
+        let (disk_inner, disk_deltas) = match extentindex::rebuild_owners_unverified(&chain) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("assert_extent_index_consistent[{caller}]: rebuild failed: {e}");
+                return;
+            }
+        };
+
+        let mut diverging: Vec<String> = Vec::new();
+
+        // For each in-memory hash, just assert that disk owns it
+        // somewhere. See docstring for why we don't compare specific
+        // segment_ids.
+        for (hash, loc) in self.extent_index.iter() {
+            if diverging.len() >= 8 {
+                break;
+            }
+            if !disk_inner.contains_key(hash) {
+                diverging.push(format!(
+                    "  hash={} in_memory_seg={} disk_seg=None (phantom inner)",
+                    hash.to_hex(),
+                    loc.segment_id,
+                ));
+            }
+        }
+        for (hash, loc) in self.extent_index.deltas_iter() {
+            if diverging.len() >= 8 {
+                break;
+            }
+            if !disk_deltas.contains_key(hash) {
+                diverging.push(format!(
+                    "  hash={} in_memory_delta_seg={} disk_delta_seg=None (phantom delta)",
+                    hash.to_hex(),
+                    loc.segment_id,
+                ));
+            }
+        }
+
+        if !diverging.is_empty() {
+            let mut msg = format!(
+                "extent_index drift after [{caller}]: {} hash(es) diverge",
+                diverging.len()
+            );
+            for line in &diverging {
+                msg.push('\n');
+                msg.push_str(line);
+            }
+            panic!("{msg}");
+        }
+    }
+
+    /// No-op stub when `volume-invariants` feature is disabled.
+    #[cfg(not(feature = "volume-invariants"))]
+    #[inline]
+    pub(in crate::volume) fn assert_extent_index_consistent(&self, _caller: &'static str) {}
+
+    /// Umbrella over every `assert_*` runtime invariant. Call this at
+    /// the end of each structural state-mutating method instead of the
+    /// individual asserts — adding a new invariant only requires
+    /// extending this function, and every existing call site picks it
+    /// up automatically.
+    ///
+    /// All members are gated behind the `volume-invariants` feature
+    /// individually; this umbrella is unconditional and compiles to a
+    /// chain of (mostly) no-op stubs when the feature is disabled.
+    #[inline]
+    pub(in crate::volume) fn assert_volume_invariants(&self, caller: &'static str) {
+        self.assert_lbamap_consistent(caller);
+        self.assert_pending_above_committed(caller);
+        self.assert_extent_index_consistent(caller);
+    }
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,
     /// execute, and apply inline on the current thread. Used by tests and
@@ -1518,8 +1639,7 @@ impl Volume {
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
-            self.assert_lbamap_consistent("apply_promote_segment_result_tombstone");
-            self.assert_pending_above_committed("apply_promote_segment_result_tombstone");
+            self.assert_volume_invariants("apply_promote_segment_result_tombstone");
             return Ok(());
         }
 
@@ -1620,8 +1740,7 @@ impl Volume {
         } else {
             "apply_promote_segment_result_gc_carried"
         };
-        self.assert_lbamap_consistent(caller);
-        self.assert_pending_above_committed(caller);
+        self.assert_volume_invariants(caller);
         Ok(())
     }
 

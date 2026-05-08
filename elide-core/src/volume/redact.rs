@@ -146,8 +146,7 @@ impl Volume {
     pub fn apply_redact_result(&mut self, result: RedactResult) -> io::Result<Ulid> {
         match result {
             RedactResult::NoOp { input_ulid } => {
-                self.assert_lbamap_consistent("apply_redact_result_noop");
-                self.assert_pending_above_committed("apply_redact_result_noop");
+                self.assert_volume_invariants("apply_redact_result_noop");
                 Ok(input_ulid)
             }
             RedactResult::Rewritten {
@@ -169,15 +168,18 @@ impl Volume {
 
                 let index = Arc::make_mut(&mut self.extent_index);
                 for hash in &to_remove {
-                    if index
-                        .lookup(hash)
-                        .is_some_and(|loc| loc.segment_id == input_ulid)
-                    {
-                        index.remove(hash);
-                    }
+                    // `remove_owner_at` covers both `inner` and `deltas`
+                    // — `lookup` alone misses Delta-canonical hashes.
+                    index.remove_owner_at(hash, input_ulid);
                 }
                 for e in &out_entries {
-                    if e.kind == EntryKind::DedupRef {
+                    // DedupRef and Zero entries don't own a body. DedupRef
+                    // points at another segment's body; Zero is a sentinel
+                    // (ZERO_HASH) with no body bytes. Inserting either into
+                    // extent_index would create a phantom owner — caught by
+                    // `assert_extent_index_consistent` (the rebuild walk
+                    // skips both kinds, so disk_owners doesn't list them).
+                    if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
                         continue;
                     }
                     let current = index.lookup(&e.hash);
@@ -245,8 +247,7 @@ impl Volume {
                     out_entries.len(),
                     to_remove.len(),
                 );
-                self.assert_lbamap_consistent("apply_redact_result_rewritten");
-                self.assert_pending_above_committed("apply_redact_result_rewritten");
+                self.assert_volume_invariants("apply_redact_result_rewritten");
                 Ok(new_ulid)
             }
         }

@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc e791d23f36bb77a227aaca0b16e3042bc53b15ab757a0f871b53d4df8870fdf4 # shrinks to pre_ops = [Write { lba: 0, seed: 0 }], post_ops = [BaseWrite { lba: 0, seed: 0 }]
 cc ddb13348769236ccc48fd94887d6fff764cafeaba0f5d8610b82c3b30a4c3657 # shrinks to pre_ops = [Write { lba: 5, seed: 0 }, Flush, Write { lba: 5, seed: 1 }, Flush, Drain], post_ops = [BaseWrite { lba: 0, seed: 0 }]
+cc 991d32e3c4998c6058578421975ccce8ad8a5e45916baa2582ad35a4ef1f5a14 # shrinks to pre_ops = [Write { lba: 0, seed: 0 }], post_ops = [BaseWrite { lba: 0, seed: 1 }, ChildWrite { lba: 0, seed: 1 }, ChildFlush, ChildDrain]

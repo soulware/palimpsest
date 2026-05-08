@@ -883,7 +883,7 @@ proptest! {
                     // `Volume::write` and the WAL — so `self.lbamap` doesn't
                     // see the populated entries. Drop + reopen so `Volume::open`'s
                     // rebuild folds them in. Without this, the next mutating op
-                    // trips the `lbamap-invariant` consistency check (disk has
+                    // trips the `volume-invariants` consistency check (disk has
                     // entries the in-memory mirror doesn't).
                     drop(vol);
                     vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);

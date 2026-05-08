@@ -34,13 +34,19 @@ zstd           = "0.13"
 #   cargo test -p elide-core --features proptest --test volume_proptest
 proptest = []
 
-# Stress-only invariant: the volume-layer `assert_*_consistent` runtime
-# checks (lbamap drift detection, etc.). Separate from `proptest` so the
-# elide-core proptest suites — which are fast and don't exercise the
-# coordinator-layer paths these invariants protect — aren't slowed down.
-# Enabled transitively by `elide-coordinator/proptest` so the gc_proptest
-# suite (which DOES exercise those paths) gets the invariants.
-lbamap-invariant = []
+# Stress-only runtime invariants on volume in-memory state. Each
+# `assert_*_consistent` rebuilds a structure from disk and panics on
+# divergence with a labelled message identifying the calling method —
+# turns drift bugs into clean panics at the introducing call site rather
+# than obscure stale-cancel / oracle-mismatch symptoms downstream.
+#
+# Separate from `proptest` so the elide-core proptest suites — which are
+# fast and don't exercise the coordinator-layer paths these invariants
+# protect — aren't slowed down. Enabled transitively by
+# `elide-coordinator/proptest` so the gc_proptest suite (which DOES
+# exercise those paths) gets the invariants. See `docs/testing.md` for
+# the wiring rationale.
+volume-invariants = []
 
 [dev-dependencies]
 criterion  = { version = "0.5", features = ["html_reports"] }

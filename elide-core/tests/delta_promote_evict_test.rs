@@ -359,7 +359,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     // rebuild walk; once `reclaim_ulid` crosses into committed, the
     // remaining lower-ULID pending peers shadow it). `self.lbamap`
     // wouldn't reflect that flip, so the next mutating op would trip
-    // the `lbamap-invariant` consistency check. Promoting in ULID order
+    // the `volume-invariants` consistency check. Promoting in ULID order
     // keeps the just-promoted ULID below every remaining pending ULID,
     // so no overlapping pending peer can take over.
     let pending_dir = vol_dir.join("pending");

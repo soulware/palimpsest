@@ -280,9 +280,20 @@ impl ExtentIndex {
         self.segment_presence.remove(&segment_id);
     }
 
-    /// Insert or overwrite the location for `hash`.
+    /// Insert or overwrite the DATA-canonical location for `hash`. Also
+    /// clears any stale `deltas` entry for the same hash — DATA
+    /// supersedes Delta in the canonical-location ordering used by
+    /// rebuild (`insert_delta_if_absent` skips when DATA exists), and
+    /// the live insert path must enforce the same precedence so the
+    /// in-memory state matches what a fresh disk-rebuild would give.
+    /// Without this, a hash that started as a Delta entry and was
+    /// later materialised as DATA would have stale `deltas` claims
+    /// pointing at deleted segments. Caught by
+    /// `assert_extent_index_consistent` on
+    /// `gc_delta_partial_death_compaction`.
     pub fn insert(&mut self, hash: blake3::Hash, location: ExtentLocation) {
         self.inner.insert(hash, location);
+        self.deltas.remove(&hash);
     }
 
     /// Insert `location` only if `hash` is not already present.
@@ -431,6 +442,37 @@ impl ExtentIndex {
         self.deltas.remove(hash);
     }
 
+    /// Remove the entry for `hash` from whichever map (`inner` or
+    /// `deltas`) currently owns it under `expected_segment_id`. Entries
+    /// pointing at any other segment are left alone. Returns `true` if
+    /// any removal happened.
+    ///
+    /// Use this for the apply-phase cleanup pattern "drop the body
+    /// reference for an input segment that's about to be deleted" —
+    /// `lookup`-then-`remove` only checks `inner`, so a Delta-canonical
+    /// hash is left dangling. This helper covers both maps with a single
+    /// CAS gate per map.
+    pub fn remove_owner_at(&mut self, hash: &blake3::Hash, expected_segment_id: Ulid) -> bool {
+        let mut removed = false;
+        if self
+            .inner
+            .get(hash)
+            .is_some_and(|loc| loc.segment_id == expected_segment_id)
+        {
+            self.inner.remove(hash);
+            removed = true;
+        }
+        if self
+            .deltas
+            .get(hash)
+            .is_some_and(|loc| loc.segment_id == expected_segment_id)
+        {
+            self.deltas.remove(hash);
+            removed = true;
+        }
+        removed
+    }
+
     /// Compare-and-remove: drop the entry for `hash` only if the current
     /// location matches `(expected_segment_id, expected_body_offset)`.
     /// Returns `true` if the removal happened, `false` if the precondition
@@ -472,6 +514,12 @@ impl ExtentIndex {
     /// Iterate `(hash, location)` pairs. Ordering is unspecified.
     pub fn iter(&self) -> impl Iterator<Item = (&blake3::Hash, &ExtentLocation)> {
         self.inner.iter()
+    }
+
+    /// Iterate `(hash, delta_location)` pairs for thin Delta entries.
+    /// Ordering is unspecified.
+    pub fn deltas_iter(&self) -> impl Iterator<Item = (&blake3::Hash, &DeltaLocation)> {
+        self.deltas.iter()
     }
 }
 
@@ -666,6 +714,102 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     }
 
     Ok(index)
+}
+
+/// Rebuild just the hash → owning-segment-ULID mapping from disk,
+/// without signature verification, inline data, presence bitmaps, or
+/// any of the BodySource detail.
+///
+/// Used only by the `--features volume-invariants` runtime drift check
+/// (`Volume::assert_extent_index_consistent`). The full
+/// [`rebuild`] does much more work per segment and verifies signatures —
+/// neither is needed for an in-memory consistency check (signatures
+/// were already verified at `Volume::open` time, and we only care
+/// whether `self.extent_index[hash].segment_id` matches what the
+/// rebuild walk would assign).
+///
+/// Returns two maps mirroring the structure of [`ExtentIndex`]:
+/// - `inner_owners`: hash → owning segment ULID for body-owning entries
+///   (DATA, Inline, Canonical*).
+/// - `delta_owners`: hash → owning segment ULID for thin Delta entries
+///   that didn't already get a body owner from an earlier-walked segment
+///   (matches `insert_delta_if_absent`'s skip-if-DATA-exists rule).
+///
+/// Walk order matches [`rebuild`]: committed (gc ∪ index) sorted by
+/// ULID, then pending sorted by ULID, with `insert_if_absent` semantics
+/// (lowest-ULID-wins).
+///
+/// **Do not use for production rebuild paths** — they need the full
+/// machinery.
+#[cfg(feature = "volume-invariants")]
+pub fn rebuild_owners_unverified(
+    forks: &[(PathBuf, Option<String>)],
+) -> io::Result<(HashMap<blake3::Hash, Ulid>, HashMap<blake3::Hash, Ulid>)> {
+    let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
+    let mut delta_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
+
+    for (fork_dir, branch_ulid) in forks {
+        let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
+        for sref in &segments {
+            let parsed = match segment::read_segment_index(&sref.path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let (_bss, entries, _inputs) = parsed;
+            for entry in entries {
+                match entry.kind {
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {
+                        inner_owners.entry(entry.hash).or_insert(sref.ulid);
+                    }
+                    EntryKind::Delta => {
+                        // Mirror `insert_delta_if_absent`: skip if a DATA
+                        // entry already claims this hash.
+                        if !inner_owners.contains_key(&entry.hash) {
+                            delta_owners.entry(entry.hash).or_insert(sref.ulid);
+                        }
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero => {
+                        // No body ownership.
+                    }
+                }
+            }
+        }
+
+        // Walk WAL files too. `replay_wal_records` inserts each WAL Data
+        // record into the live extent_index with the WAL's ULID as
+        // segment_id; without this, every Data record in the open WAL
+        // would show as "in_memory has inner; disk doesn't" (where
+        // "disk" was being interpreted as just segment files).
+        let wal_dir = fork_dir.join("wal");
+        if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Ok(wal_ulid) = Ulid::from_string(name) else {
+                    continue;
+                };
+                let Ok((records, _complete)) = crate::writelog::scan_readonly(&path) else {
+                    continue;
+                };
+                for record in records {
+                    if let crate::writelog::LogRecord::Data { hash, .. } = record {
+                        inner_owners.entry(hash).or_insert(wal_ulid);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((inner_owners, delta_owners))
 }
 
 // --- tests ---
