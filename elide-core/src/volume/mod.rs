@@ -25,6 +25,7 @@
 //   replays entries into the LBA map, extent index, and pending_entries.
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fs;
 use std::io;
@@ -101,6 +102,22 @@ const FLUSH_ENTRY_THRESHOLD: usize = 8192;
 /// `body_length` as a `u32`, so payloads must fit in 4 GiB. We cap at
 /// `u32::MAX` rounded down to a 4 KiB boundary.
 const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
+
+/// Reject zero-length, non-block-aligned, and oversize writes early so the
+/// rest of the write path can assume a sane payload.
+fn validate_write_size(data: &[u8]) -> io::Result<()> {
+    if data.is_empty() || !data.len().is_multiple_of(4096) {
+        return Err(io::Error::other(
+            "data length must be a non-zero multiple of 4096",
+        ));
+    }
+    if data.len() > MAX_WRITE_SIZE {
+        return Err(io::Error::other(
+            "data length exceeds maximum write size (4 GiB − 4 KiB)",
+        ));
+    }
+    Ok(())
+}
 
 /// Sentinel hash used in the LBA map and segment entries to represent an
 /// explicitly-zeroed LBA range. All-zero bytes cannot be a valid BLAKE3 output
@@ -515,18 +532,24 @@ impl Volume {
     /// single large write may produce a segment larger than the threshold; the
     /// block layer (ublk) is expected to enforce its own per-request cap.
     pub fn write(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
-        if data.is_empty() || !data.len().is_multiple_of(4096) {
-            return Err(io::Error::other(
-                "data length must be a non-zero multiple of 4096",
-            ));
-        }
-        if data.len() > MAX_WRITE_SIZE {
-            return Err(io::Error::other(
-                "data length exceeds maximum write size (4 GiB − 4 KiB)",
-            ));
-        }
-        let hash = blake3::hash(data);
-        self.write_with_hash(lba, data, hash).map(|_| ())
+        self.write_inner(lba, Cow::Borrowed(data)).map(|_| ())
+    }
+
+    /// `write` variant that takes ownership of `data`.
+    ///
+    /// The actor hot path receives a `Vec<u8>` over the request channel
+    /// (the kernel IO buffer was copied into a `Vec` at the channel
+    /// boundary); calling this method instead of [`Volume::write`] hands
+    /// that `Vec` straight to `pending_entries`, removing one
+    /// full-payload memcpy per uncompressed write.
+    pub fn write_owned(&mut self, lba: u64, data: Vec<u8>) -> io::Result<()> {
+        self.write_inner(lba, Cow::Owned(data)).map(|_| ())
+    }
+
+    fn write_inner(&mut self, lba: u64, data: Cow<'_, [u8]>) -> io::Result<bool> {
+        validate_write_size(&data)?;
+        let hash = blake3::hash(&data);
+        self.write_with_hash_inner(lba, data, hash)
     }
 
     /// Like `write`, but with a caller-supplied hash. Returns `Ok(true)` if
@@ -545,16 +568,16 @@ impl Volume {
         data: &[u8],
         hash: blake3::Hash,
     ) -> io::Result<bool> {
-        if data.is_empty() || !data.len().is_multiple_of(4096) {
-            return Err(io::Error::other(
-                "data length must be a non-zero multiple of 4096",
-            ));
-        }
-        if data.len() > MAX_WRITE_SIZE {
-            return Err(io::Error::other(
-                "data length exceeds maximum write size (4 GiB − 4 KiB)",
-            ));
-        }
+        self.write_with_hash_inner(lba, Cow::Borrowed(data), hash)
+    }
+
+    fn write_with_hash_inner(
+        &mut self,
+        lba: u64,
+        data: Cow<'_, [u8]>,
+        hash: blake3::Hash,
+    ) -> io::Result<bool> {
+        validate_write_size(&data)?;
         let lba_length = (data.len() / 4096) as u32;
 
         // No-op skip — pure LBA map lookup, zero body I/O. BLAKE3
@@ -578,12 +601,16 @@ impl Volume {
         &mut self,
         lba: u64,
         lba_length: u32,
-        data: &[u8],
+        data: Cow<'_, [u8]>,
         hash: blake3::Hash,
     ) -> io::Result<()> {
-        let compressed_data = maybe_compress(data);
+        let compressed_data = maybe_compress(&data);
         let compressed = compressed_data.is_some();
-        let owned_data: Vec<u8> = compressed_data.unwrap_or_else(|| data.to_vec());
+        // Compressed: take the lz4 output (always owned).
+        // Uncompressed: hand the caller's Cow straight through —
+        // `into_owned` is a move when we received `Cow::Owned`, and falls
+        // back to `to_vec` only when we were given a borrow.
+        let owned_data: Vec<u8> = compressed_data.unwrap_or_else(|| data.into_owned());
         let wal_flags = if compressed {
             writelog::WalFlags::COMPRESSED
         } else {
