@@ -95,17 +95,21 @@ impl FileCache {
 
     /// Look up a cached file handle by segment id.
     /// On hit, sets the referenced bit and returns the layout and file handle.
+    ///
+    /// Returns a shared `&File` because the read path uses positional
+    /// (`pread`) reads, which don't touch the file cursor. Holding `&mut`
+    /// here would force serialization that the syscall doesn't require.
     pub(in crate::volume) fn get(
         &mut self,
         segment_id: Ulid,
-    ) -> Option<(SegmentLayout, &mut fs::File)> {
+    ) -> Option<(SegmentLayout, &fs::File)> {
         let slot = self
             .slots
             .iter_mut()
             .flatten()
             .find(|s| s.segment_id == segment_id)?;
         slot.referenced = true;
-        Some((slot.layout, &mut slot.file))
+        Some((slot.layout, &slot.file))
     }
 
     /// Insert a file handle. If the segment is already cached, replaces it
@@ -180,15 +184,17 @@ impl FileCache {
     }
 }
 
-/// Read `lba_count` 4KB blocks starting at `lba` from the given LBA map and extent index.
+/// Read 4 KiB blocks starting at `lba` into the caller-supplied `out` buffer.
 ///
-/// Unwritten blocks are returned as zeros. Written blocks are fetched extent-by-extent
-/// using `find_segment` to locate each segment file, with recently-opened file handles
-/// cached in `file_cache` (LRU) to amortize `open` syscalls across reads.
+/// `out.len()` must be a multiple of 4096; it determines how many blocks are
+/// read. The caller's buffer is treated as uninitialised — every byte is
+/// written before return: data extents are read from segment files; gaps
+/// between extents (unwritten LBAs) and `ZERO_HASH` extents are explicitly
+/// zero-filled.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_extents(
     lba: u64,
-    lba_count: u32,
+    out: &mut [u8],
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
@@ -197,13 +203,31 @@ pub(crate) fn read_extents(
     cache_dir: &Path,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
-) -> io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
 
-    let mut out = vec![0u8; lba_count as usize * 4096];
-    for er in lbamap.extents_in_range(lba, lba + lba_count as u64) {
-        // Zero extents: output buffer is already zeroed; nothing to fetch.
+    debug_assert!(
+        out.len().is_multiple_of(4096),
+        "read buffer must be a multiple of 4096 bytes"
+    );
+    let lba_count = (out.len() / 4096) as u32;
+    let end_lba = lba + lba_count as u64;
+    let mut cursor = lba;
+    for er in lbamap.extents_in_range(lba, end_lba) {
+        // Fill any gap between the previous extent and this one with zeros —
+        // unwritten LBAs read back as zero by block-device convention.
+        if er.range_start > cursor {
+            let gap_start = (cursor - lba) as usize * 4096;
+            let gap_end = (er.range_start - lba) as usize * 4096;
+            out[gap_start..gap_end].fill(0);
+        }
+        cursor = er.range_end;
+
+        // Zero extents: write zeros for the covered range, no body to fetch.
         if er.hash == ZERO_HASH {
+            let s = (er.range_start - lba) as usize * 4096;
+            let e = (er.range_end - lba) as usize * 4096;
+            out[s..e].fill(0);
             continue;
         }
 
@@ -242,7 +266,7 @@ pub(crate) fn read_extents(
                     cache_dir,
                     &find_segment,
                     &open_delta_body,
-                    &mut out,
+                    out,
                 )? {
                     continue;
                 }
@@ -319,9 +343,8 @@ pub(crate) fn read_extents(
         let out_slice = &mut out[out_start..out_start + block_count * 4096];
 
         if compressed {
-            f.seek(SeekFrom::Start(file_body_offset))?;
             let mut compressed_buf = vec![0u8; body_length as usize];
-            f.read_exact(&mut compressed_buf)?;
+            f.read_exact_at(&mut compressed_buf, file_body_offset)?;
             let decompressed =
                 lz4_flex::decompress_size_prepended(&compressed_buf).map_err(|e| {
                     log::error!(
@@ -348,10 +371,8 @@ pub(crate) fn read_extents(
             })?;
             out_slice.copy_from_slice(src_slice);
         } else {
-            f.seek(SeekFrom::Start(
-                file_body_offset + er.payload_block_offset as u64 * 4096,
-            ))?;
-            if let Err(e) = f.read_exact(out_slice) {
+            let read_at = file_body_offset + er.payload_block_offset as u64 * 4096;
+            if let Err(e) = f.read_exact_at(out_slice, read_at) {
                 let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
                 log::error!(
                     "read_extents failed: lba={} segment={} layout={:?} \
@@ -373,7 +394,12 @@ pub(crate) fn read_extents(
             }
         }
     }
-    Ok(out)
+    // Trailing gap after the last extent.
+    if cursor < end_lba {
+        let gap_start = (cursor - lba) as usize * 4096;
+        out[gap_start..].fill(0);
+    }
+    Ok(())
 }
 
 /// Try to materialise a Delta extent for the range covered by `er`,
@@ -406,7 +432,7 @@ fn try_read_delta_extent(
     open_delta_body: &dyn Fn(Ulid) -> io::Result<fs::File>,
     out: &mut [u8],
 ) -> io::Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
 
     let Some(delta_loc) = extent_index.lookup_delta(&er.hash) else {
         return Ok(false);
@@ -486,9 +512,8 @@ fn try_read_delta_extent(
             SegmentLayout::BodyOnly => source_loc.body_offset,
             SegmentLayout::Full => source_loc.body_section_start + source_loc.body_offset,
         };
-        f.seek(SeekFrom::Start(file_body_offset))?;
         let mut buf = vec![0u8; source_loc.body_length as usize];
-        f.read_exact(&mut buf)?;
+        f.read_exact_at(&mut buf, file_body_offset)?;
         if source_loc.compressed {
             lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?
         } else {
@@ -519,11 +544,8 @@ fn try_read_delta_extent(
             let (_layout, f) = cache
                 .get(delta_segment_id)
                 .expect("delta segment just inserted or found");
-            f.seek(SeekFrom::Start(
-                delta_bss + delta_body_length + opt.delta_offset,
-            ))?;
             let mut buf = vec![0u8; opt.delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, delta_bss + delta_body_length + opt.delta_offset)?;
             buf
         }
         extentindex::DeltaBodySource::Cached => {
@@ -533,10 +555,9 @@ fn try_read_delta_extent(
             // distinct file from the segment body, and delta reads
             // are rare enough that caching the FD would complicate
             // eviction for little benefit.
-            let mut f = open_delta_body(delta_segment_id)?;
-            f.seek(SeekFrom::Start(opt.delta_offset))?;
+            let f = open_delta_body(delta_segment_id)?;
             let mut buf = vec![0u8; opt.delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, opt.delta_offset)?;
             buf
         }
     };

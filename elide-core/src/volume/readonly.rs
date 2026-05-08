@@ -66,13 +66,14 @@ impl ReadonlyVolume {
         Arc::clone(&self.extent_index)
     }
 
-    /// Read `lba_count` 4KB blocks starting at `start_lba`.
-    /// Unwritten blocks are returned as zeros.
-    pub fn read(&self, start_lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+    /// Read 4 KiB blocks starting at `start_lba` into the caller-supplied `buf`.
+    /// `buf.len()` must be a multiple of 4096. Unwritten blocks are returned
+    /// as zeros.
+    pub fn read_into(&self, start_lba: u64, buf: &mut [u8]) -> io::Result<()> {
         let cache_dir = self.base_dir.join("cache");
         read_extents(
             start_lba,
-            lba_count,
+            buf,
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
@@ -89,6 +90,13 @@ impl ReadonlyVolume {
                 )
             },
         )
+    }
+
+    /// Allocating convenience wrapper around [`ReadonlyVolume::read_into`].
+    pub fn read(&self, start_lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; lba_count as usize * 4096];
+        self.read_into(start_lba, &mut buf)?;
+        Ok(buf)
     }
 
     /// Snapshot the dmat telemetry counters for this volume.

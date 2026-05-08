@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -228,10 +229,9 @@ impl Dmat {
 
     /// Read materialised bytes for a previously located record, decompressing
     /// if needed.
-    pub fn read_materialised(&mut self, loc: DmatLocation) -> io::Result<Vec<u8>> {
+    pub fn read_materialised(&self, loc: DmatLocation) -> io::Result<Vec<u8>> {
         let mut stored = vec![0u8; loc.stored_length as usize];
-        self.file.seek(SeekFrom::Start(loc.data_offset))?;
-        self.file.read_exact(&mut stored)?;
+        self.file.read_exact_at(&mut stored, loc.data_offset)?;
         if loc.flags.contains(DmatFlags::COMPRESSED) {
             lz4_flex::decompress_size_prepended(&stored).map_err(io::Error::other)
         } else {
@@ -503,8 +503,7 @@ mod tests {
         assert_eq!(dmat.len(), 3);
         for (idx, expected) in [(1u32, b"alpha".as_ref()), (2, b"beta"), (3, b"gamma")] {
             let loc = dmat.lookup(idx).unwrap();
-            let mut dmat_mut = Dmat::open_or_create(&path, |_, _| true).unwrap().0;
-            assert_eq!(dmat_mut.read_materialised(loc).unwrap(), expected);
+            assert_eq!(dmat.read_materialised(loc).unwrap(), expected);
         }
     }
 

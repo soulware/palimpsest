@@ -1031,17 +1031,16 @@ mod imp {
         let lba_count = (length / BLOCK) as u32;
 
         match op {
-            UBLK_IO_OP_READ => match reader.read(start_lba, lba_count) {
-                Ok(data) => {
-                    let len = data.len().min(length as usize);
-                    buf[..len].copy_from_slice(&data[..len]);
-                    len as i32
+            UBLK_IO_OP_READ => {
+                let dst = &mut buf[..length as usize];
+                match reader.read_into(start_lba, dst) {
+                    Ok(()) => length as i32,
+                    Err(e) => {
+                        tracing::error!("[ublk read error offset={offset} len={length}: {e}]");
+                        -libc::EIO
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("[ublk read error offset={offset} len={length}: {e}]");
-                    -libc::EIO
-                }
-            },
+            }
             UBLK_IO_OP_WRITE => {
                 let data = buf[..length as usize].to_vec();
                 match reader.write(start_lba, data) {

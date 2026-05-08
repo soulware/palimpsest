@@ -1667,12 +1667,13 @@ impl VolumeClient {
 }
 
 impl VolumeReader {
-    /// Read `lba_count` blocks starting at `lba`.
+    /// Read 4 KiB blocks starting at `lba` into the caller-supplied `buf`.
     ///
-    /// Resolved entirely on the calling thread using the current `ReadSnapshot`
-    /// — no channel round-trip. Reflects all writes that have returned `Ok`,
-    /// including those not yet flushed to disk (read-your-writes guarantee).
-    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+    /// `buf.len()` must be a multiple of 4096. Resolved entirely on the
+    /// calling thread using the current `ReadSnapshot` — no channel
+    /// round-trip. Reflects all writes that have returned `Ok`, including
+    /// those not yet flushed to disk (read-your-writes guarantee).
+    pub fn read_into(&self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
         // Load the snapshot first. flush_gen is embedded in the snapshot so
         // the generation and the extent index offsets are always consistent —
         // a single ArcSwap::load() gives both atomically with no window.
@@ -1687,7 +1688,7 @@ impl VolumeReader {
         let cache_dir = config.base_dir.join("cache");
         read_extents(
             lba,
-            lba_count,
+            buf,
             &snap.lbamap,
             extent_index,
             &self.file_cache,
@@ -1714,6 +1715,16 @@ impl VolumeReader {
                 )
             },
         )
+    }
+
+    /// Allocating convenience wrapper around [`VolumeReader::read_into`].
+    ///
+    /// The hot read path (ublk dispatch) calls `read_into` directly with the
+    /// kernel's IO buffer; this allocating form is used by tests.
+    pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; lba_count as usize * 4096];
+        self.read_into(lba, &mut buf)?;
+        Ok(buf)
     }
 
     /// Snapshot the dmat telemetry counters for this reader.
@@ -3109,11 +3120,10 @@ fn read_full_extent_body(
         ))
     })?;
     let seek = layout.body_seek(loc);
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(&path)?;
-    f.seek(SeekFrom::Start(seek))?;
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact(&mut buf)?;
+    f.read_exact_at(&mut buf, seek)?;
     if loc.compressed {
         lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
     } else {
@@ -3131,7 +3141,7 @@ fn read_delta_blob(
     option: &segment::DeltaOption,
     search_dirs: &[PathBuf],
 ) -> io::Result<Option<Vec<u8>>> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
     match loc.body_source {
         crate::extentindex::DeltaBodySource::Full {
             body_section_start,
@@ -3147,11 +3157,10 @@ fn read_delta_blob(
             let Some((path, _layout)) = found else {
                 return Ok(None);
             };
-            let mut f = std::fs::File::open(&path)?;
+            let f = std::fs::File::open(&path)?;
             let seek = body_section_start + body_length + option.delta_offset;
-            f.seek(SeekFrom::Start(seek))?;
             let mut buf = vec![0u8; option.delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, seek)?;
             Ok(Some(buf))
         }
         crate::extentindex::DeltaBodySource::Cached => {
@@ -3159,10 +3168,9 @@ fn read_delta_blob(
             for dir in search_dirs {
                 let delta_path = dir.join("cache").join(format!("{sid}.delta"));
                 if delta_path.exists() {
-                    let mut f = std::fs::File::open(&delta_path)?;
-                    f.seek(SeekFrom::Start(option.delta_offset))?;
+                    let f = std::fs::File::open(&delta_path)?;
                     let mut buf = vec![0u8; option.delta_length as usize];
-                    f.read_exact(&mut buf)?;
+                    f.read_exact_at(&mut buf, option.delta_offset)?;
                     return Ok(Some(buf));
                 }
             }
