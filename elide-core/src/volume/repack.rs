@@ -284,8 +284,11 @@ impl Volume {
     ///     input file; nothing more to unlink.
     ///   - Evict the file-cache fd for the input ULID either way.
     ///
-    /// Then `rebuild_lbamap_from_disk` so any sub-run hashes from
-    /// `Run` records introduced by the rewrite are reflected.
+    /// Then merges each segment's output entries into `self.lbamap`
+    /// via `insert_if_newer` keyed on `out.new_ulid`. Sub-run hashes
+    /// from `Run` records get installed as they appear in the output;
+    /// concurrent live writes have higher claimant ULIDs and are
+    /// preserved on overlapping LBAs.
     pub fn apply_repack_result(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
         let RepackResult {
             mut stats,
@@ -293,7 +296,6 @@ impl Volume {
         } = result;
 
         let pending_dir = self.base_dir.join("pending");
-        let mut any_changes = false;
 
         for seg in &segments {
             let carried_hashes: std::collections::HashSet<blake3::Hash> = seg
@@ -362,6 +364,26 @@ impl Volume {
                     self.last_segment_ulid = Some(out.new_ulid);
                 }
                 self.has_new_segments = true;
+
+                let lbamap = Arc::make_mut(&mut self.lbamap);
+                for e in &out.out_entries {
+                    if e.kind.is_canonical_only() {
+                        continue;
+                    }
+                    if e.kind == EntryKind::Delta {
+                        let sources: Arc<[blake3::Hash]> =
+                            e.delta_options.iter().map(|o| o.source_hash).collect();
+                        lbamap.insert_delta_if_newer(
+                            e.start_lba,
+                            e.lba_length,
+                            e.hash,
+                            out.new_ulid,
+                            sources,
+                        );
+                    } else {
+                        lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, out.new_ulid);
+                    }
+                }
             }
 
             self.evict_cached_segment(seg.input_ulid);
@@ -375,13 +397,9 @@ impl Volume {
             }
 
             stats.bytes_freed += seg.bytes_freed;
-            any_changes = true;
         }
 
-        if any_changes {
-            segment::fsync_dir(&pending_dir)?;
-            self.rebuild_lbamap_from_disk()?;
-        }
+        segment::fsync_dir(&pending_dir)?;
 
         Ok(stats)
     }
@@ -702,8 +720,10 @@ impl Volume {
     /// Derives `to_remove` from each input's owned hashes minus the
     /// carried set, removes them from the extent index under the same
     /// per-input CAS gate, evicts each input's cached fd, unlinks the
-    /// input pending files, and rebuilds `lbamap` from disk so any
-    /// sub-run hashes from `Run` records are reflected.
+    /// input pending files, and merges the output entries into
+    /// `lbamap` via `insert_if_newer` keyed on `new_ulid`. Concurrent
+    /// post-prep live writes have higher claimant ULIDs (`u_sweep` is
+    /// minted before `u_flush`) and are preserved on overlapping LBAs.
     pub fn apply_sweep_result(&mut self, result: SweepResult) -> io::Result<CompactionStats> {
         let SweepResult {
             mut stats,
@@ -773,6 +793,26 @@ impl Volume {
                 self.last_segment_ulid = Some(new_ulid);
             }
             self.has_new_segments = true;
+
+            let lbamap = Arc::make_mut(&mut self.lbamap);
+            for e in &out_entries {
+                if e.kind.is_canonical_only() {
+                    continue;
+                }
+                if e.kind == EntryKind::Delta {
+                    let sources: Arc<[blake3::Hash]> =
+                        e.delta_options.iter().map(|o| o.source_hash).collect();
+                    lbamap.insert_delta_if_newer(
+                        e.start_lba,
+                        e.lba_length,
+                        e.hash,
+                        new_ulid,
+                        sources,
+                    );
+                } else {
+                    lbamap.insert_if_newer(e.start_lba, e.lba_length, e.hash, new_ulid);
+                }
+            }
         }
 
         for input in &inputs {
@@ -783,13 +823,7 @@ impl Volume {
                 Err(e) => return Err(e),
             }
         }
-        if !inputs.is_empty() {
-            segment::fsync_dir(&self.base_dir.join("pending"))?;
-        }
-
-        if new_ulid.is_some() || !inputs.is_empty() {
-            self.rebuild_lbamap_from_disk()?;
-        }
+        segment::fsync_dir(&self.base_dir.join("pending"))?;
 
         Ok(stats)
     }

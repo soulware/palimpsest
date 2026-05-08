@@ -118,7 +118,7 @@ Implemented. `MapEntry` now carries `claimant_ulid`. New
 sub-ranges where no overlapping current entry has a claimant `>=` the
 caller's, splitting the incoming range around higher-claimant overlaps.
 
-Three apply paths previously calling `rebuild_lbamap_from_disk()` now
+Five apply paths previously calling `rebuild_lbamap_from_disk()` now
 use the incremental merge:
 
 - `apply_plan_apply_result` (applied) — GC commit.
@@ -127,8 +127,12 @@ use the incremental merge:
   removed; cancel performs no lbamap mutation, and the stress
   invariant `assert_lbamap_consistent` catches divergence at the
   introducing site.
+- `apply_sweep_result` — pending-segment compaction commit.
+- `apply_repack_result` — per-segment repack commit.
 
-Repack apply paths (`apply_repack_result`, delta-repack apply,
-`apply_sweep_result`) still rebuild from disk — out of scope for this
-change but the same `insert_if_newer` mechanism applies if a future
-profile flags them.
+`delta_repack` apply still rebuilds from disk: it converts entries
+in-place and may split a single entry into sub-runs with different
+post hashes, which interacts with the existing
+`set_delta_sources_if_matches` guard. Porting it would mean replacing
+that guard with claimant-comparison semantics — possible but
+non-mechanical, deferred to a separate change.
