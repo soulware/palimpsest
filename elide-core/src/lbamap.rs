@@ -17,11 +17,12 @@
 // lives in the separate extent index. This means GC repacking never touches the
 // LBA map.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use imbl::{HashMap as ImHashMap, OrdMap};
 use log::warn;
 use ulid::Ulid;
 
@@ -90,24 +91,24 @@ struct MapEntry {
 /// never reports stale sources.
 #[derive(Clone)]
 pub struct LbaMap {
-    inner: BTreeMap<u64, MapEntry>,
+    inner: OrdMap<u64, MapEntry>,
     /// Source hashes attached to each live Delta LBA entry. A key here
     /// always corresponds to a key in `inner` whose origin was a Delta
     /// segment entry; splits of a Delta LBA range share the same `Arc`.
-    delta_sources_by_lba: BTreeMap<u64, Arc<[blake3::Hash]>>,
+    delta_sources_by_lba: OrdMap<u64, Arc<[blake3::Hash]>>,
     /// Refcounts for delta source hashes. Invariant: for every `h` in any
     /// `delta_sources_by_lba[k]`, `delta_source_counts[h]` exists and
     /// equals the number of keys in `delta_sources_by_lba` whose value
     /// contains `h`. Zero-count entries are removed eagerly.
-    delta_source_counts: HashMap<blake3::Hash, u32>,
+    delta_source_counts: ImHashMap<blake3::Hash, u32>,
 }
 
 impl LbaMap {
     pub fn new() -> Self {
         Self {
-            inner: BTreeMap::new(),
-            delta_sources_by_lba: BTreeMap::new(),
-            delta_source_counts: HashMap::new(),
+            inner: OrdMap::new(),
+            delta_sources_by_lba: OrdMap::new(),
+            delta_source_counts: ImHashMap::new(),
         }
     }
 
@@ -458,27 +459,34 @@ impl LbaMap {
         new_claimant: Ulid,
     ) -> u32 {
         let end = start_lba + lba_length as u64;
-        let mut updated = 0u32;
 
-        // Predecessor whose tail extends into the range.
-        if let Some((&pred_start, pred)) = self.inner.range_mut(..start_lba).next_back() {
+        // imbl::OrdMap has no range_mut; collect matching keys first, then
+        // promote each via get_mut. Two-pass cost is O(matches * log N),
+        // dominated by the path-clone get_mut already pays per call.
+        let mut keys: Vec<u64> = Vec::new();
+
+        if let Some((&pred_start, pred)) = self.inner.range(..start_lba).next_back() {
             let pred_end = pred_start + pred.lba_length as u64;
             if pred_end > start_lba
                 && pred.hash == expected_hash
                 && pred.claimant_ulid < new_claimant
             {
-                pred.claimant_ulid = new_claimant;
-                updated += 1;
+                keys.push(pred_start);
             }
         }
 
-        for (_, entry) in self.inner.range_mut(start_lba..end) {
+        for (&k, entry) in self.inner.range(start_lba..end) {
             if entry.hash == expected_hash && entry.claimant_ulid < new_claimant {
-                entry.claimant_ulid = new_claimant;
-                updated += 1;
+                keys.push(k);
             }
         }
 
+        let updated = keys.len() as u32;
+        for k in keys {
+            if let Some(entry) = self.inner.get_mut(&k) {
+                entry.claimant_ulid = new_claimant;
+            }
+        }
         updated
     }
 
