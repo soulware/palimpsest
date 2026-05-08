@@ -62,9 +62,7 @@ pub use ancestry::{
 };
 pub(crate) use compress::maybe_compress;
 #[cfg(test)]
-pub(in crate::volume) use compress::{
-    ENTROPY_THRESHOLD, MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_RATIO_NUM, shannon_entropy,
-};
+pub(in crate::volume) use compress::{MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_RATIO_NUM};
 pub use fork::{fork_volume, fork_volume_at, fork_volume_at_with_manifest_key};
 use jobs::GcCheckpointUlids;
 pub use jobs::{

@@ -168,14 +168,14 @@ fn write_sets_needs_promote_after_threshold() {
     let mut vol = Volume::open(&base, &base).unwrap();
 
     // Write 33 × 1 MiB of incompressible data to exceed FLUSH_THRESHOLD (32 MiB).
-    // Each block uses a unique byte value so entropy is high and compression is skipped.
+    // blake3 XOF yields bytes with no pattern lz4 can exploit, so the WAL
+    // grows by the full payload size on each write.
     let mut block = vec![0u8; 1024 * 1024];
     for i in 0u64..33 {
-        // Fill with a pattern that defeats compression: vary every byte.
-        let fill = (i & 0xFF) as u8;
-        for (j, b) in block.iter_mut().enumerate() {
-            *b = fill ^ (j as u8).wrapping_mul(0x6D).wrapping_add(0x4F);
-        }
+        blake3::Hasher::new()
+            .update(&i.to_le_bytes())
+            .finalize_xof()
+            .fill(&mut block);
         vol.write(i * 256, &block).unwrap();
     }
 
@@ -780,31 +780,23 @@ fn recovery_removes_tmp_orphans() {
 
 // --- compression helper unit tests ---
 
-/// Build a 4096-byte block where every byte is distinct (entropy = 8 bits/byte).
-/// The LCG multiplier 109 (0x6D) is odd so it is coprime to 256, giving a
-/// bijection on [0, 255] — each value appears exactly 16 times in 4096 bytes.
+/// Build a 4096-byte pseudo-random block deterministic in `seed`.
+///
+/// Output is a blake3 XOF stream — the bytes have no exploitable pattern
+/// for lz4, so `maybe_compress` will fail the 1.5× ratio gate and the
+/// volume will store them raw.
 fn high_entropy_block(seed: u8) -> Vec<u8> {
-    (0..4096u16)
-        .map(|i| (i as u8).wrapping_mul(0x6D).wrapping_add(seed))
-        .collect()
+    let mut out = vec![0u8; 4096];
+    blake3::Hasher::new()
+        .update(&[seed])
+        .finalize_xof()
+        .fill(&mut out);
+    out
 }
 
 #[test]
-fn shannon_entropy_all_same_byte() {
-    assert_eq!(shannon_entropy(&vec![0x42u8; 4096]), 0.0);
-}
-
-#[test]
-fn shannon_entropy_uniform_is_8_bits() {
-    // 256 distinct values each appearing 16 times → exactly 8 bits/byte.
-    let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
-    let e = shannon_entropy(&data);
-    assert!((e - 8.0).abs() < 0.01, "expected ~8.0, got {e}");
-}
-
-#[test]
-fn maybe_compress_compresses_low_entropy() {
-    // All-zeros: entropy = 0, compresses to almost nothing.
+fn maybe_compress_compresses_compressible_data() {
+    // All-zeros compresses to almost nothing.
     let data = vec![0u8; 4096];
     let compressed = maybe_compress(&data).expect("expected compression to succeed");
     // Must achieve at least 1.5× ratio.
@@ -812,9 +804,9 @@ fn maybe_compress_compresses_low_entropy() {
 }
 
 #[test]
-fn maybe_compress_skips_high_entropy() {
+fn maybe_compress_skips_incompressible_data() {
+    // High-entropy permutation: lz4 cannot compress it below the 1.5× ratio.
     let data = high_entropy_block(0);
-    assert!(shannon_entropy(&data) > ENTROPY_THRESHOLD);
     assert!(maybe_compress(&data).is_none());
 }
 
@@ -828,7 +820,7 @@ fn read_incompressible_data() {
 
     let payload = high_entropy_block(0x5A);
     assert!(
-        shannon_entropy(&payload) > ENTROPY_THRESHOLD,
+        maybe_compress(&payload).is_none(),
         "test data must be incompressible"
     );
 

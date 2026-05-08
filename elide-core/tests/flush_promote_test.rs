@@ -29,10 +29,10 @@ fn open_actor(dir: &Path) -> (elide_core::actor::VolumeClient, thread::JoinHandl
 
 fn incompressible_block(i: u64) -> Vec<u8> {
     let mut b = vec![0u8; 1024 * 1024];
-    let fill = (i & 0xFF) as u8;
-    for (j, x) in b.iter_mut().enumerate() {
-        *x = fill ^ (j as u8).wrapping_mul(0x6D).wrapping_add(0x4F);
-    }
+    blake3::Hasher::new()
+        .update(&i.to_le_bytes())
+        .finalize_xof()
+        .fill(&mut b);
     b
 }
 
