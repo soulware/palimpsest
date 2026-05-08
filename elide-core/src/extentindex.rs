@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use log::warn;
 use ulid::Ulid;
 
+use crate::blake3_id_hasher::Blake3HashMap;
 use crate::segment::{self, EntryKind};
 use crate::signing;
 
@@ -243,11 +244,14 @@ impl std::fmt::Debug for SegmentPresence {
 /// In-memory index mapping content hash to segment location.
 #[derive(Clone)]
 pub struct ExtentIndex {
-    inner: HashMap<blake3::Hash, ExtentLocation>,
+    /// Hot-path lookup: keyed by `blake3::Hash` and hashed via the
+    /// identity hasher in [`crate::blake3_id_hasher`] so the per-extent
+    /// read lookup doesn't pay SipHash on already-uniform 32-byte keys.
+    inner: Blake3HashMap<ExtentLocation>,
     /// Thin Delta entries, keyed by the Delta's content hash (the
     /// hash of the bytes *after* decompression). Separate from
     /// `inner` so the hot-path DATA lookup stays untouched.
-    deltas: HashMap<blake3::Hash, DeltaLocation>,
+    deltas: Blake3HashMap<DeltaLocation>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -259,8 +263,8 @@ pub struct ExtentIndex {
 impl ExtentIndex {
     pub fn new() -> Self {
         Self {
-            inner: HashMap::new(),
-            deltas: HashMap::new(),
+            inner: Blake3HashMap::default(),
+            deltas: Blake3HashMap::default(),
             segment_presence: HashMap::new(),
         }
     }
