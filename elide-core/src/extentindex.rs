@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use log::warn;
 use ulid::Ulid;
 
-use crate::blake3_id_hasher::Blake3HashMap;
+use crate::blake3_id_hasher::Blake3HamtMap;
 use crate::segment::{self, EntryKind};
 use crate::signing;
 
@@ -247,11 +247,11 @@ pub struct ExtentIndex {
     /// Hot-path lookup: keyed by `blake3::Hash` and hashed via the
     /// identity hasher in [`crate::blake3_id_hasher`] so the per-extent
     /// read lookup doesn't pay SipHash on already-uniform 32-byte keys.
-    inner: Blake3HashMap<ExtentLocation>,
+    inner: Blake3HamtMap<ExtentLocation>,
     /// Thin Delta entries, keyed by the Delta's content hash (the
     /// hash of the bytes *after* decompression). Separate from
     /// `inner` so the hot-path DATA lookup stays untouched.
-    deltas: Blake3HashMap<DeltaLocation>,
+    deltas: Blake3HamtMap<DeltaLocation>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -263,8 +263,8 @@ pub struct ExtentIndex {
 impl ExtentIndex {
     pub fn new() -> Self {
         Self {
-            inner: Blake3HashMap::default(),
-            deltas: Blake3HashMap::default(),
+            inner: Blake3HamtMap::default(),
+            deltas: Blake3HamtMap::default(),
             segment_presence: HashMap::new(),
         }
     }
@@ -303,7 +303,7 @@ impl ExtentIndex {
     /// Insert `location` only if `hash` is not already present.
     /// Returns `true` if the entry was inserted, `false` if it already existed.
     pub fn insert_if_absent(&mut self, hash: blake3::Hash, location: ExtentLocation) -> bool {
-        use std::collections::hash_map::Entry;
+        use imbl::hashmap::Entry;
         match self.inner.entry(hash) {
             Entry::Vacant(v) => {
                 v.insert(location);
@@ -355,7 +355,7 @@ impl ExtentIndex {
         if self.inner.contains_key(&hash) {
             return false;
         }
-        use std::collections::hash_map::Entry;
+        use imbl::hashmap::Entry;
         match self.deltas.entry(hash) {
             Entry::Vacant(v) => {
                 v.insert(location);

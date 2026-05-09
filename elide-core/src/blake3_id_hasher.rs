@@ -18,6 +18,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
+use imbl::GenericHashMap;
+use imbl::shared_ptr::DefaultSharedPtr;
+
 #[derive(Default)]
 pub struct Blake3IdHasher(u64);
 
@@ -50,6 +53,18 @@ pub type Blake3HashMap<V> = HashMap<blake3::Hash, V, Blake3IdBuildHasher>;
 
 /// `HashSet` of `blake3::Hash` with identity-style hashing.
 pub type Blake3HashSet = HashSet<blake3::Hash, Blake3IdBuildHasher>;
+
+/// Persistent (HAMT) map with the same key + hasher as `Blake3HashMap`.
+///
+/// `imbl::GenericHashMap` is structurally shared — `Clone` (and therefore
+/// `Arc::make_mut` on a wrapping `Arc`) is path-copy at O(log n) instead
+/// of the O(n) deep clone `std::HashMap` does.  Used by `ExtentIndex`
+/// so the per-write `Arc::make_mut` triggered by `ArcSwap` republishing
+/// stays bounded as the index grows.
+///
+/// See `elide-core/benches/extent_index_clone.rs` for the measurement
+/// that motivates the choice.
+pub type Blake3HamtMap<V> = GenericHashMap<blake3::Hash, V, Blake3IdBuildHasher, DefaultSharedPtr>;
 
 #[cfg(test)]
 mod tests {
