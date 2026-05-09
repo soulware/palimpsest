@@ -46,6 +46,8 @@ use ulid::Ulid;
 
 use elide_core::segment::{self, SegmentFetcher};
 
+pub mod full_warm;
+
 // --- config ---
 
 /// Default maximum bytes per coalesced fetch batch (256 KiB).

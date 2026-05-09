@@ -44,6 +44,20 @@ pub const RELEASED_FILE: &str = "volume.released";
 /// aligned with the other `volume.<state>` lifecycle markers.
 pub const IMPORTING_FILE: &str = "volume.importing";
 
+/// Fetched marker. Written by the coordinator after a `volume fetch`
+/// run completes successfully. Indicates this host holds a local copy
+/// of a foreign volume that has *not* been claimed locally — the
+/// owner's bucket-side state machine is untouched. Body is a small
+/// TOML record (`basis_snapshot`, `owner_coordinator_id`,
+/// `fetched_at`); see [`FetchedRecord`].
+///
+/// Lifetime: from worker exit on a successful fetch until either
+///   - `volume remove` (manual cleanup), or
+///   - `volume claim` of the foreign name (the local copy transitions
+///     to a readonly ancestor of the freshly-minted claim fork; the
+///     marker is cleared by the claim path).
+pub const FETCHED_FILE: &str = "volume.fetched";
+
 /// Read/write mode for a volume. Readonly is set on imported OCI
 /// volumes; everything else is read/write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,11 +88,17 @@ impl std::fmt::Display for VolumeMode {
 /// Local lifecycle of a volume, derived from on-disk markers.
 ///
 /// Order of precedence in [`VolumeLifecycle::from_dir`]:
-///   1. `volume.released` exists → `Released { handoff_snapshot }`
-///   2. `volume.stopped` exists → `StoppedManual`
-///   3. `volume.importing` exists → `Importing { import_ulid }`
-///   4. `volume.pid` names a live process → `Running { pid }`
-///   5. otherwise → `Stopped`
+///   1. `volume.fetched` exists → `Fetched { basis_snapshot }`
+///   2. `volume.released` exists → `Released { handoff_snapshot }`
+///   3. `volume.stopped` exists → `StoppedManual`
+///   4. `volume.importing` exists → `Importing { import_ulid }`
+///   5. `volume.pid` names a live process → `Running { pid }`
+///   6. otherwise → `Stopped`
+///
+/// `Fetched` is a purely-local state, orthogonal to the bucket-side
+/// `names/<name>` record (which still reflects the owner's view —
+/// `Live`, `Stopped`, or `Released` from their perspective). It says
+/// only "this host has a warm cache of a foreign volume."
 ///
 /// `Released` is a CLI-display variant. The bucket's `names/<name>`
 /// record is authoritative for claim state; the local marker only
@@ -97,6 +117,11 @@ pub enum VolumeLifecycle {
     /// from the marker body (best-effort; empty when absent or
     /// unparsable).
     Released { handoff_snapshot: String },
+    /// `volume.fetched` marker is present; this host holds a foreign
+    /// volume's bytes against the named basis snapshot but has not
+    /// claimed the name. The basis snapshot ULID is read from the
+    /// marker body.
+    Fetched { basis_snapshot: String },
     /// `volume.stopped` marker is present; supervisor will not relaunch.
     StoppedManual,
     /// Daemon is not running and no manual-stop marker is present.
@@ -110,6 +135,11 @@ impl VolumeLifecycle {
     /// in the CLI's list path. Errors reading any file collapse to
     /// the next-precedence variant rather than surfacing.
     pub fn from_dir(vol_dir: &Path) -> Self {
+        if let Some(record) = FetchedRecord::read(vol_dir) {
+            return Self::Fetched {
+                basis_snapshot: record.basis_snapshot,
+            };
+        }
         let released = vol_dir.join(RELEASED_FILE);
         if released.exists() {
             let handoff_snapshot = std::fs::read_to_string(&released)
@@ -147,6 +177,7 @@ impl VolumeLifecycle {
             Self::Running { .. } => "running",
             Self::Importing { .. } => "importing",
             Self::Released { .. } => "released",
+            Self::Fetched { .. } => "fetched",
             Self::StoppedManual => "stopped (manual)",
             Self::Stopped => "stopped",
         }
@@ -162,6 +193,9 @@ impl VolumeLifecycle {
             Self::Released { handoff_snapshot } if !handoff_snapshot.is_empty() => {
                 format!("released {handoff_snapshot}")
             }
+            Self::Fetched { basis_snapshot } if !basis_snapshot.is_empty() => {
+                format!("fetched {basis_snapshot}")
+            }
             other => other.label().to_owned(),
         }
     }
@@ -172,6 +206,65 @@ impl VolumeLifecycle {
             Self::Running { pid } => Some(*pid),
             _ => None,
         }
+    }
+}
+
+/// Contents of a `volume.fetched` marker. Written by the coordinator
+/// after a successful `volume fetch` worker exit; cleared by either
+/// `volume remove` or the claim path's transition into ancestor-of-
+/// fork shape.
+///
+/// Format on disk is TOML so the file is inspectable with `cat`:
+///
+/// ```toml
+/// basis_snapshot = "01J7…"
+/// owner_coordinator_id = "01J7…"
+/// fetched_at = "2026-05-09T14:23:51Z"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchedRecord {
+    /// Owner-signed snapshot ULID this fetch was warmed against.
+    pub basis_snapshot: String,
+    /// Coordinator id that signed `basis_snapshot`'s manifest at the
+    /// time of fetch — pulled from the manifest's recovery metadata if
+    /// the basis is a synthesised handoff snapshot, otherwise empty.
+    /// Advisory; the volume's own `volume.pub` is the verifying key
+    /// for ordinary basis snapshots.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_coordinator_id: String,
+    /// Wall-clock time the fetch worker exited cleanly (RFC3339).
+    pub fetched_at: String,
+}
+
+impl FetchedRecord {
+    /// Read and parse `<vol_dir>/volume.fetched`. Returns `None` if the
+    /// marker is absent or unparseable; treat unparseable as absent so
+    /// a hand-edited file doesn't pin the volume to a broken state.
+    pub fn read(vol_dir: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(vol_dir.join(FETCHED_FILE)).ok()?;
+        toml::from_str::<Self>(&content).ok()
+    }
+
+    /// Write `<vol_dir>/volume.fetched` atomically. The marker is small
+    /// (sub-1 KiB) so we don't bother with a tmp+rename dance —
+    /// presence is what matters for the lifecycle classifier; the body
+    /// is advisory.
+    pub fn write(&self, vol_dir: &Path) -> std::io::Result<()> {
+        let s = toml::to_string(self)
+            .map_err(|e| std::io::Error::other(format!("serialise volume.fetched: {e}")))?;
+        std::fs::write(vol_dir.join(FETCHED_FILE), s)
+    }
+}
+
+/// Remove `volume.fetched` if present; missing-file is not an error.
+/// Called by the claim path after the foreign by_id directory becomes
+/// a readonly ancestor of a freshly-minted owned fork, and by
+/// `volume remove`.
+pub fn clear_fetched_marker(vol_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(vol_dir.join(FETCHED_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -246,6 +339,72 @@ mod tests {
             }
             other => panic!("expected Released, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fetched_marker_classifies_as_fetched() {
+        let d = TempDir::new().unwrap();
+        let rec = FetchedRecord {
+            basis_snapshot: "01J0000000000000000000000V".to_owned(),
+            owner_coordinator_id: "01J7".to_owned(),
+            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
+        };
+        rec.write(d.path()).unwrap();
+        match VolumeLifecycle::from_dir(d.path()) {
+            VolumeLifecycle::Fetched { basis_snapshot } => {
+                assert_eq!(basis_snapshot, "01J0000000000000000000000V");
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetched_marker_takes_precedence_over_other_markers() {
+        let d = TempDir::new().unwrap();
+        FetchedRecord {
+            basis_snapshot: "01J9".to_owned(),
+            owner_coordinator_id: String::new(),
+            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
+        }
+        .write(d.path())
+        .unwrap();
+        std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
+        std::fs::write(d.path().join(IMPORTING_FILE), "01J7").unwrap();
+        std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
+        match VolumeLifecycle::from_dir(d.path()) {
+            VolumeLifecycle::Fetched { basis_snapshot } => {
+                assert_eq!(basis_snapshot, "01J9");
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetched_record_round_trip_through_disk() {
+        let d = TempDir::new().unwrap();
+        let original = FetchedRecord {
+            basis_snapshot: "01J0000000000000000000000V".to_owned(),
+            owner_coordinator_id: "01J7000000000000000000000W".to_owned(),
+            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
+        };
+        original.write(d.path()).unwrap();
+        let parsed = FetchedRecord::read(d.path()).unwrap();
+        assert_eq!(parsed, original);
+        clear_fetched_marker(d.path()).unwrap();
+        assert!(FetchedRecord::read(d.path()).is_none());
+        // Idempotent when already cleared.
+        clear_fetched_marker(d.path()).unwrap();
+    }
+
+    #[test]
+    fn fetched_marker_garbage_body_treated_as_absent() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join(FETCHED_FILE), "not toml at all =").unwrap();
+        // Unparseable -> classifier falls through to next-precedence rule.
+        assert_eq!(
+            VolumeLifecycle::from_dir(d.path()),
+            VolumeLifecycle::Stopped
+        );
     }
 
     #[test]

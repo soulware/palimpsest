@@ -698,6 +698,50 @@ async fn list_supersessions(store: &Arc<dyn ObjectStore>, volume_id: &str) -> Ha
 /// parents) are signed under the recovering coordinator's
 /// attestation key, recorded in the requesting child's provenance
 /// via `ParentRef::manifest_pubkey`.
+/// Public entry point for pulling every segment `.idx` referenced by
+/// a volume's basis snapshot manifest into `<fork_dir>/index/`. Used
+/// by the `volume fetch` orchestration to warm a foreign volume
+/// without going through the full prefetch pipeline (which is
+/// peer-tier-aware and tied to the claim path).
+///
+/// The manifest itself must already be present at
+/// `<fork_dir>/snapshots/<snap_ulid>.manifest` and signed under
+/// `verifying_key`. The caller is responsible for fetching + writing
+/// the manifest before calling this. Idx files already on disk are
+/// skipped; missing ones are fetched from S3 directly (no peer tier)
+/// and verified before write.
+///
+/// Returns the number of `.idx` files fetched + written by this call.
+pub async fn pull_indexes_for_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    fork_dir: &Path,
+    volume_id: &str,
+    snap_ulid: Ulid,
+    verifying_key: &VerifyingKey,
+) -> Result<usize> {
+    let mut result = PrefetchResult::default();
+    let to_fetch = manifest_driven_fetch_set(
+        fork_dir,
+        volume_id,
+        &snap_ulid.to_string(),
+        verifying_key,
+        &mut result,
+    )?;
+    let n = to_fetch.len();
+    let vol_ulid = Ulid::from_string(volume_id).ok();
+    fetch_idx_set(
+        store,
+        fork_dir,
+        verifying_key,
+        None,
+        vol_ulid,
+        to_fetch,
+        &mut result,
+    )
+    .await;
+    Ok(n)
+}
+
 fn manifest_driven_fetch_set(
     fork_dir: &Path,
     volume_id: &str,

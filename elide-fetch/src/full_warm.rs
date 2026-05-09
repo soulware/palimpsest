@@ -66,6 +66,19 @@ pub fn spawn(
         });
 }
 
+/// Blocking variant of [`spawn`]: runs the warm pool on the current
+/// thread, joining all worker threads before returning. Used by the
+/// `elide fetch-volume` worker, where the process should exit only
+/// after the warm pass has actually completed.
+pub fn run_blocking(
+    fork_dirs: Vec<PathBuf>,
+    lba_map: Arc<LbaMap>,
+    extent_index: Arc<ExtentIndex>,
+    fetcher: BoxFetcher,
+) {
+    run(fork_dirs, lba_map, extent_index, fetcher);
+}
+
 fn run(
     fork_dirs: Vec<PathBuf>,
     lba_map: Arc<LbaMap>,

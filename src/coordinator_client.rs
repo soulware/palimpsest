@@ -16,11 +16,12 @@ use elide_coordinator::ipc::{Envelope, IpcError, Request};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
-    ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, ForkAttachEvent, ForkSource,
-    ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcErrorKind, RegisterReply, ReleaseReply, ResolveHandoffKeyReply, SignatureStatus,
-    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
-    VolumeEventEntry, VolumeEventsReply,
+    ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, FetchAttachEvent, FetchStartReply,
+    FetchStatusReply, ForkAttachEvent, ForkSource, ForkStartReply, GenerateFilemapReply,
+    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind, RegisterReply,
+    ReleaseReply, ResolveHandoffKeyReply, SignatureStatus, SnapshotReply, StatusRemoteReply,
+    StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventEntry,
+    VolumeEventsReply,
 };
 pub use elide_peer_fetch::PeerEndpoint;
 
@@ -371,6 +372,70 @@ impl Client {
                     writeln!(out, "{content}")?;
                 }
                 Ok(ImportAttachEvent::Done) => return Ok(()),
+                Err(e) => return Err(io::Error::other(e)),
+            }
+        }
+    }
+
+    /// Ask the coordinator to start a `volume fetch` job that warms a
+    /// foreign volume's local cache against its most recent owner-
+    /// signed snapshot. Returns immediately with the resolved
+    /// `vol_ulid`, `basis_snapshot`, and a `fetch_ulid` for the job.
+    /// Subsequent progress is observed via [`Self::fetch_attach_by_name`]
+    /// or [`Self::fetch_status_by_name`].
+    pub fn fetch_start(&self, name: &str) -> io::Result<FetchStartReply> {
+        self.call_typed(&Request::FetchStart {
+            volume: name.to_owned(),
+        })?
+        .map_err(io::Error::other)
+    }
+
+    /// Poll the state of an in-flight fetch job by volume name.
+    pub fn fetch_status_by_name(&self, name: &str) -> io::Result<FetchStatusReply> {
+        self.call_typed(&Request::FetchStatus {
+            volume: name.to_owned(),
+        })?
+        .map_err(io::Error::other)
+    }
+
+    /// Stream fetch progress lines to `out` until the job terminates.
+    ///
+    /// Mirrors [`Self::import_attach_by_name`]: reads typed
+    /// [`FetchAttachEvent`] envelopes until a terminal `Done` (success)
+    /// or an `Envelope::Err` (failure).
+    pub fn fetch_attach_by_name(&self, name: &str, out: &mut dyn Write) -> io::Result<()> {
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
+            io::Error::other(format!(
+                "coordinator not running ({}): {e}",
+                self.socket_path.display()
+            ))
+        })?;
+        let request = Request::FetchAttach {
+            volume: name.to_owned(),
+        };
+        let line = serde_json::to_string(&request)
+            .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
+        writeln!(stream, "{line}")?;
+        stream.flush()?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+
+        let mut reader = io::BufReader::new(stream);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = reader.read_line(&mut buf)?;
+            if n == 0 {
+                return Err(io::Error::other(
+                    "fetch stream closed before terminal event",
+                ));
+            }
+            let env: Envelope<FetchAttachEvent> = serde_json::from_str(buf.trim())
+                .map_err(|e| io::Error::other(format!("parse fetch event: {e}")))?;
+            match env.into_result() {
+                Ok(FetchAttachEvent::Line { content }) => {
+                    writeln!(out, "{content}")?;
+                }
+                Ok(FetchAttachEvent::Done) => return Ok(()),
                 Err(e) => return Err(io::Error::other(e)),
             }
         }

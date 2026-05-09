@@ -12,6 +12,7 @@
 mod claim;
 mod credential;
 mod daemon;
+mod fetch;
 mod fork;
 mod import;
 mod inbound;

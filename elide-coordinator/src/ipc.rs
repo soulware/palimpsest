@@ -152,6 +152,21 @@ pub enum Request {
     /// `Envelope::Err`.
     ImportAttach { volume: String },
 
+    /// Spawn a `volume fetch` job for `volume` (a foreign name in the
+    /// bucket). The coordinator resolves the name, pulls the ancestor
+    /// skeleton chain, fetches and verifies the basis snapshot
+    /// manifest + every `.idx` it references, then spawns
+    /// `elide fetch-volume` to warm the bodies. Fails if the remote
+    /// has no snapshot. Returns immediately with the fetch ULID;
+    /// progress is streamed via [`Request::FetchAttach`].
+    FetchStart { volume: String },
+    /// Poll the state of an in-flight fetch by volume name.
+    FetchStatus { volume: String },
+    /// Stream an in-flight fetch's progress events. Server replies
+    /// with a sequence of [`Envelope<FetchAttachEvent>`] messages
+    /// terminating in `Done` (success) or `Envelope::Err` (failure).
+    FetchAttach { volume: String },
+
     // ── Iteration 4: maintenance ─────────────────────────────────────
     /// Coordinator-orchestrated snapshot of a running volume: flush
     /// WAL → drain pending → sign manifest → upload. Returns the
@@ -419,6 +434,43 @@ pub enum ImportAttachEvent {
     /// One line of import output.
     Line { content: String },
     /// Import completed successfully — last message in the stream.
+    Done,
+}
+
+/// Reply for [`Request::FetchStart`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FetchStartReply {
+    pub fetch_ulid: Ulid,
+    /// The basis snapshot the fetch is warming against. Echoed so the
+    /// CLI can show "fetching against snap 01J…" without a follow-up
+    /// IPC.
+    pub basis_snapshot: Ulid,
+    /// Volume ULID resolved from the bucket name. Echoed so subsequent
+    /// `FetchAttach` / `FetchStatus` clients can correlate with on-disk
+    /// state without re-resolving the name.
+    pub vol_ulid: Ulid,
+}
+
+/// Reply for [`Request::FetchStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum FetchStatusReply {
+    /// Fetch is in progress.
+    Running,
+    /// Fetch completed successfully and `volume.fetched` was written.
+    Done,
+}
+
+/// Streaming event for [`Request::FetchAttach`]. Mirrors
+/// [`ImportAttachEvent`] in shape: `Line` events carry one progress
+/// line (e.g. "pulling ancestor 01J7…", "warming 42 segment(s)") and
+/// `Done` is the terminal success marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FetchAttachEvent {
+    /// One line of fetch progress output.
+    Line { content: String },
+    /// Fetch completed successfully — last message in the stream.
     Done,
 }
 

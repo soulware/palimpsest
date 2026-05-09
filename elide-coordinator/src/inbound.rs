@@ -63,6 +63,7 @@ pub struct IpcContext {
     pub data_dir: Arc<PathBuf>,
     pub registry: ImportRegistry,
     pub fork_registry: ForkRegistry,
+    pub fetch_registry: crate::fetch::FetchRegistry,
     pub claim_registry: ClaimRegistry,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
@@ -126,6 +127,15 @@ impl IpcContext {
         crate::import::ImportContext {
             core: self.core(),
             registry: self.registry.clone(),
+        }
+    }
+
+    /// Construct a [`crate::fetch::FetchContext`] — the hot core plus
+    /// the fetch registry.
+    pub(crate) fn for_fetch(&self) -> crate::fetch::FetchContext {
+        crate::fetch::FetchContext {
+            core: self.core(),
+            registry: self.fetch_registry.clone(),
         }
     }
 }
@@ -406,6 +416,19 @@ async fn dispatch_json(
         }
         Request::ClaimAttach { volume } => {
             stream_claim_by_name(&volume, writer, &ctx.claim_registry).await;
+        }
+        Request::FetchStart { volume } => {
+            let result = crate::fetch::start_fetch(volume, ctx.for_fetch()).await;
+            let env: Envelope<elide_coordinator::ipc::FetchStartReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::FetchStatus { volume } => {
+            let result = fetch_status_by_name(&volume, &ctx.fetch_registry);
+            let env: Envelope<elide_coordinator::ipc::FetchStatusReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::FetchAttach { volume } => {
+            stream_fetch_by_name(&volume, writer, &ctx.fetch_registry).await;
         }
         Request::Shutdown { keep_volumes } => {
             // Reply ok first, then trigger the signal: the daemon's
@@ -2543,6 +2566,76 @@ fn issue_credentials(
 /// Stream buffered and live fork events to `writer` as a sequence of
 /// [`Envelope<ForkAttachEvent>`] messages, terminating with either
 /// `ForkAttachEvent::Done` (success) or `Envelope::Err` (failure).
+fn fetch_status_by_name(
+    volume: &str,
+    registry: &crate::fetch::FetchRegistry,
+) -> Result<elide_coordinator::ipc::FetchStatusReply, IpcError> {
+    let job = {
+        let reg = registry.lock().expect("fetch registry poisoned");
+        reg.get(volume).cloned()
+    };
+    let Some(job) = job else {
+        return Err(IpcError::not_found(format!(
+            "no active fetch for: {volume}"
+        )));
+    };
+    match job.state() {
+        crate::fetch::FetchJobState::Running => {
+            Ok(elide_coordinator::ipc::FetchStatusReply::Running)
+        }
+        crate::fetch::FetchJobState::Done => Ok(elide_coordinator::ipc::FetchStatusReply::Done),
+        crate::fetch::FetchJobState::Failed(err) => Err(err),
+    }
+}
+
+async fn stream_fetch_by_name(
+    volume: &str,
+    writer: &mut OwnedWriteHalf,
+    registry: &crate::fetch::FetchRegistry,
+) {
+    use elide_coordinator::ipc::FetchAttachEvent;
+    async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
+        let env: Envelope<FetchAttachEvent> = Envelope::err(error);
+        let _ = ipc::write_message(writer, &env).await;
+    }
+
+    let job = {
+        let reg = registry.lock().expect("fetch registry poisoned");
+        reg.get(volume).cloned()
+    };
+    let Some(job) = job else {
+        write_err(
+            writer,
+            IpcError::not_found(format!("no active fetch for: {volume}")),
+        )
+        .await;
+        return;
+    };
+
+    let mut offset = 0;
+    loop {
+        let events = job.read_from(offset);
+        for event in &events {
+            let env: Envelope<FetchAttachEvent> = Envelope::ok(event.clone());
+            if ipc::write_message(writer, &env).await.is_err() {
+                return;
+            }
+        }
+        offset += events.len();
+
+        match job.state() {
+            crate::fetch::FetchJobState::Done => return,
+            crate::fetch::FetchJobState::Failed(err) => {
+                write_err(writer, err).await;
+                return;
+            }
+            crate::fetch::FetchJobState::Running => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 async fn stream_fork_by_name(new_name: &str, writer: &mut OwnedWriteHalf, registry: &ForkRegistry) {
     async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
         let env: Envelope<ForkAttachEvent> = Envelope::err(error);
@@ -3420,6 +3513,7 @@ mod tests {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
+            fetch_registry: crate::fetch::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),

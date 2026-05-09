@@ -567,7 +567,7 @@ mod imp {
                 Arc::clone(&extent_index),
                 move || fetcher_for_swap.set_store(s3_store),
             );
-            crate::full_warm::spawn(
+            elide_fetch::full_warm::spawn(
                 dir.to_path_buf(),
                 fork_dirs,
                 lba_map,
