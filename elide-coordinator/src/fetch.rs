@@ -124,7 +124,7 @@ pub(crate) async fn start_fetch(
     // so we can fail fast (NotFound on either) without registering a
     // doomed-to-fail job. The actual body-warm work runs detached.
     let store = ctx.core.stores.coordinator_wide();
-    let vol_ulid = resolve_name(&volume_name, &store).await?;
+    let (vol_ulid, size_bytes) = resolve_name(&volume_name, &store).await?;
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &store).await? {
         Some(u) => u,
         None => {
@@ -152,6 +152,7 @@ pub(crate) async fn start_fetch(
             volume_name_clone.clone(),
             vol_ulid,
             basis_snapshot,
+            size_bytes,
             ctx,
             job_clone.clone(),
         )
@@ -182,6 +183,7 @@ async fn run_orchestrator(
     volume_name: String,
     vol_ulid: Ulid,
     basis_snapshot: Ulid,
+    size_bytes: u64,
     ctx: FetchContext,
     job: Arc<FetchJob>,
 ) -> Result<(), IpcError> {
@@ -222,20 +224,37 @@ async fn run_orchestrator(
         "pulled {n_idx} idx file(s) for snapshot {basis_snapshot}"
     ));
 
-    // Stage 4. Plant the by_name symlink so the fetched volume is
+    // Stage 4. Write the local `volume.toml`. Size lives on the
+    // bucket-side `names/<name>` claim record (the owner is the
+    // single source of truth — see `design-volume-size-ownership`),
+    // not in the per-fork dir; ancestors carry no size. We snapshot
+    // the size at fetch time so consumers like `volume create --from`
+    // (which reads `volume.toml.size` from the source dir to
+    // initialise the new fork's size) work without a bucket
+    // round-trip. Refresh-fetch overwrites this if the owner has
+    // since resized.
+    let cfg = elide_core::config::VolumeConfig {
+        name: Some(volume_name.clone()),
+        size: Some(size_bytes),
+        ..Default::default()
+    };
+    cfg.write(&fork_dir)
+        .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
+
+    // Stage 5. Plant the by_name symlink so the fetched volume is
     // discoverable mid-warm via `volume list`. Skipped if a symlink
     // already exists pointing at this vol_ulid; an existing symlink
     // pointing elsewhere is an error (caller should `volume remove`
     // first).
     plant_by_name_symlink(&volume_name, vol_ulid, &data_dir, &job)?;
 
-    // Stage 5. Spawn `elide fetch-volume <fork_dir>` and wait. The
+    // Stage 6. Spawn `elide fetch-volume <fork_dir>` and wait. The
     // worker opens the readonly volume, runs full_warm to
     // completion, and exits.
     job.line("warming bodies (full-warm)");
     spawn_fetch_worker(&fork_dir, &volume_name, Arc::clone(&job)).await?;
 
-    // Stage 6. On clean exit, write the `volume.fetched` marker. Only
+    // Stage 7. On clean exit, write the `volume.fetched` marker. Only
     // here, after every prior step succeeded, does the volume
     // formally enter the `Fetched` lifecycle state.
     write_fetched_marker(&fork_dir, basis_snapshot, &ctx)?;
@@ -249,9 +268,12 @@ async fn run_orchestrator(
 
 // ── Stage helpers ────────────────────────────────────────────────────────────
 
-async fn resolve_name(volume_name: &str, store: &Arc<dyn ObjectStore>) -> Result<Ulid, IpcError> {
+async fn resolve_name(
+    volume_name: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(Ulid, u64), IpcError> {
     match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => Ok(rec.vol_ulid),
+        Ok(Some((rec, _))) => Ok((rec.vol_ulid, rec.size)),
         Ok(None) => Err(IpcError::not_found(format!(
             "volume '{volume_name}' not found in store"
         ))),
