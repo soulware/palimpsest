@@ -2508,6 +2508,7 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
         base_dir,
         pending_dir,
         snap_ulid,
+        ceiling,
         output_ulids,
         signer,
         verifying_key,
@@ -2542,6 +2543,14 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
         // Skip segments at or below the latest snapshot — they are
         // snapshot-frozen and must not be rewritten.
         if seg_id <= snap_ulid {
+            continue;
+        }
+        // Skip segments minted after prep — rewriting one under a
+        // pre-minted output ULID (which sorts below `ceiling`) would
+        // let apply delete the input file while leaving the lbamap
+        // claimant pointing at the deleted ULID. Same shape of
+        // protection as `execute_repack`'s ceiling filter.
+        if seg_id > ceiling {
             continue;
         }
 

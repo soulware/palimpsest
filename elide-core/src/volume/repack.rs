@@ -122,10 +122,22 @@ pub struct RepackResult {
 /// The worker constructs a snapshot-pinned `BlockReader` from
 /// `base_dir` + `snap_ulid` — kept off the actor so the manifest /
 /// provenance / extent-index rebuild runs on the worker thread.
+///
+/// `ceiling` is the WAL-flush ULID minted at prep time: every output
+/// ULID is below it, so any pending segment with a strictly greater
+/// ULID was minted after prep (e.g. by a `prepare_promote` racing under
+/// the dropped lock). The worker skips such segments — without this,
+/// rewriting a post-prep segment under one of the lower pre-minted
+/// output ULIDs would let `apply_delta_repack_result` delete the input
+/// file while leaving the lbamap claimant pointing at the deleted ULID
+/// (the strict-newer `set_claimant_if_matches` guard refuses to
+/// downgrade), drifting the in-memory state out of agreement with the
+/// on-disk projection. Mirrors the `ceiling` filter on `RepackJob`.
 pub struct DeltaRepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
     pub snap_ulid: Ulid,
+    pub ceiling: Ulid,
     /// Pre-minted output ULIDs (one per post-snapshot pending segment
     /// at prep time, monotonically increasing, all below the next WAL
     /// ULID). Worker assigns them in input-ULID order and only
@@ -445,6 +457,7 @@ impl Volume {
             base_dir: self.base_dir.clone(),
             pending_dir,
             snap_ulid,
+            ceiling: u_flush,
             output_ulids,
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
@@ -1431,6 +1444,91 @@ mod tests {
                 100 + i,
             );
         }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn lock_drop_delta_repack_skips_post_prep_segment() {
+        // Mirrors the repack ceiling filter for `execute_delta_repack`.
+        // Without the filter, a pending segment minted after
+        // `prepare_delta_repack` returns (here: by an explicit
+        // `flush_wal` standing in for a `prepare_promote` racing under
+        // the dropped lock) would be picked up by the worker as a
+        // candidate, rewritten under a pre-minted output ULID that
+        // sorts *below* the input's ULID, then have its file unlinked
+        // by `apply_delta_repack_result` — leaving lbamap claimants
+        // pointing at the deleted ULID (the strict-newer guard refuses
+        // to downgrade).
+        //
+        // Test asserts the post-prep segment's pending file is still
+        // present after apply, AND its writes still read back
+        // correctly across a reopen.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // High-entropy so payloads aren't inlined.
+        let payload_a: Vec<u8> = (0..4096usize).map(|i| (i * 7 + 13) as u8).collect();
+        let payload_b: Vec<u8> = (0..4096usize).map(|i| (i * 11 + 3) as u8).collect();
+
+        // Pre-snapshot: write A at lba 100, promote, snapshot.
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        let _snap = vol.snapshot().unwrap();
+
+        // Post-snapshot: write at a different lba so there's *something*
+        // to scan in delta_repack.  The exact entry shape doesn't
+        // matter for this test — what matters is that the post-prep
+        // segment is filtered out before the worker considers it.
+        vol.write(200, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol
+            .prepare_delta_repack()
+            .unwrap()
+            .expect("delta repack job");
+
+        // Lock-drop window: a direct write at a fresh lba, flushed into
+        // a pending segment with ULID strictly greater than `ceiling`.
+        vol.write(300, &payload_b).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Snapshot the pending dir state *before* execute, so we can
+        // identify the post-prep segment later.
+        let pending_dir = base.join("pending");
+        let pre_apply_pending: std::collections::BTreeSet<String> = fs::read_dir(&pending_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+
+        let result = crate::actor::execute_delta_repack(job).unwrap();
+        vol.apply_delta_repack_result(result).unwrap();
+
+        // The post-prep flushed segment must still be in pending/.
+        // (It is the highest-ULID entry in `pending/` post-flush.)
+        let post_apply_pending: std::collections::BTreeSet<String> = fs::read_dir(&pending_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let post_prep_seg = pre_apply_pending
+            .iter()
+            .max()
+            .expect("pending should not be empty pre-apply");
+        assert!(
+            post_apply_pending.contains(post_prep_seg),
+            "post-prep segment {post_prep_seg} must survive delta_repack apply"
+        );
+
+        // Reads still work in-memory and across reopen.
+        assert_eq!(vol.read(100, 1).unwrap(), payload_a);
+        assert_eq!(vol.read(200, 1).unwrap(), payload_a);
+        assert_eq!(vol.read(300, 1).unwrap(), payload_b);
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        assert_eq!(vol2.read(100, 1).unwrap(), payload_a);
+        assert_eq!(vol2.read(200, 1).unwrap(), payload_a);
+        assert_eq!(vol2.read(300, 1).unwrap(), payload_b);
 
         fs::remove_dir_all(base).unwrap();
     }
