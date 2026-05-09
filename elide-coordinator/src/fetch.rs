@@ -144,9 +144,6 @@ pub(crate) async fn start_fetch(
     }
 
     let fetch_ulid = Ulid::new();
-    job.line(format!(
-        "fetching {volume_name} (vol {vol_ulid}) against snapshot {basis_snapshot}"
-    ));
 
     let job_clone = Arc::clone(&job);
     let volume_name_clone = volume_name.clone();
