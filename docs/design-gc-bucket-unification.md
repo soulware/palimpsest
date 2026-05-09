@@ -80,7 +80,8 @@ Replace the tier model with one bin-pack:
    - sparse (`density < density_threshold && dead_lba_bytes > 0 &&
      has_data_content`),
    excluding snapshot-floor and partial-LBA-death-Delta deferred
-   segments (no change here).
+   segments (no change here), then **filter to cache-resident
+   candidates** (see below).
 2. **Bin-pack** candidates into output buckets sized to
    `SWEEP_LIVE_CAP` (32 MiB live) and `SWEEP_ENTRY_CAP` (8192 entries).
    First-fit-decreasing on `live_lba_bytes`. Tombstones fold into the
@@ -97,9 +98,42 @@ Replace the tier model with one bin-pack:
 5. **Emit** one `gc/<u_bucket_i>.plan` per filled bucket via tmp+rename.
 
 Per-tick reclamation throughput becomes
-`max_buckets_per_tick × SWEEP_LIVE_CAP`. With the default of `1` the
-behaviour is identical to today; raising it is a deliberate tuning
-decision.
+`max_buckets_per_tick × SWEEP_LIVE_CAP` of cache-resident input,
+bounded above by what's actually local on the volume. Raising the
+cap is a deliberate tuning decision; lowering candidate residency
+self-throttles GC without operator action.
+
+### Cache-residency candidate filter
+
+A candidate is eligible only when its body is fully resolvable
+without an S3 GET — i.e. `cache/<ulid>.body` exists *and* every live
+entry's bit is set in `cache/<ulid>.present`. The same check the
+pre-plan-handoff `fetch_live_bodies` performed, applied at selection
+time instead of fetch time.
+
+This makes GC throughput track cache residency rather than total
+segment count, which has three useful properties:
+
+- **Lazy volumes still GC.** Volumes that never fully prefetch (e.g.
+  `lazy` config) keep reclaiming their own writes. Locally-authored
+  segments are fully cache-resident at promote time (`promote_segment`
+  copies the body from `pending/` and sets every `present` bit), so
+  every recently-written-then-partially-overwritten segment is an
+  eligible candidate even on a volume whose ancestor cache is cold.
+- **Cold-restart doesn't burst S3 GETs.** After coordinator restart
+  or claim handoff, prefetch warms `.idx` synchronously but warms
+  bodies lazily (peer hints + demand-fetch). The candidate filter
+  defers GC of cold-cache segments to whenever they actually get
+  read, instead of paying the GET cost just so GC can rewrite them.
+- **No over-fetching for GC's sake.** If a segment is dead or sparse
+  but not in cache, it costs less to leave it on S3 (paid once, in
+  retention) than to fetch it locally only to rewrite and re-upload.
+  The retention-window economics already amortise the leak.
+
+Partial cache hits (some entries present, others not) count as
+**not resident**: the bin-packer wouldn't know which subset to admit
+without separate per-entry accounting, and the simpler all-or-nothing
+rule is safe (it just defers, never corrupts).
 
 ## Algorithm
 
@@ -221,12 +255,6 @@ packing.
 - Per-bucket PUT to S3 for each emitted output. Modest — bounded by
   `max_buckets × SWEEP_LIVE_CAP` of compressed live bytes — but real,
   and not amortised the way local rewrites are on pending.
-- Body reads are cache-first via `BlockReader`. The cache-miss path
-  still issues S3 GETs (per-extent range or per-segment full body via
-  the demand-fetcher), so a tick that touches many cold inputs is
-  paying GET cost for the missing entries. Worth measuring before
-  raising the cap dramatically; `cache/<ulid>.present` coverage of the
-  candidate set is the relevant signal.
 - Retention peak grows linearly with bucket count. Operators raising
   `max_buckets_per_tick` need to consider
   `live_data + post_compaction_outputs + (C × T)` from
@@ -237,6 +265,12 @@ packing.
   could drop its density gate, GC cannot, because rewriting a dense
   large segment with no dead bytes still costs a PUT and a retention
   slot for no reclamation.
+- Cache-resident-only selection means a sparse-but-cold segment
+  doesn't get reclaimed until something else (read, eviction, retention
+  reaper) touches it. This is a deliberate tradeoff — GET-then-PUT
+  for GC's sake is worse than paying retention for a known-dead
+  segment — but it does mean reclamation isn't strictly monotone in
+  wall-clock time for cold inputs.
 
 ## Decisions
 
@@ -260,6 +294,11 @@ packing.
 - **Plan filenames stay `gc/<ulid>.plan`.** No protocol change to the
   filename or file content; the only difference is "more than one of
   these can appear per tick."
+- **Cache-residency filter is mandatory, not opt-in.** GC never issues
+  S3 GETs purely to enable a rewrite. A sparse-but-cold input waits
+  for organic warming (read, peer-fetch hint) or retention. This
+  matches the lazy-volume design — laziness must extend to GC for it
+  to mean anything.
 
 ## Open
 
