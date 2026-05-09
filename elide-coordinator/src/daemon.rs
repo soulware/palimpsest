@@ -68,6 +68,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // threading from `daemon::run`.
     elide_coordinator::config::set_store_config(config.store.clone());
     let socket_path = config.resolved_socket_path();
+    elide_coordinator::config::set_coordinator_socket_path(socket_path.clone());
     let data_dir = Arc::new(config.data_dir.clone());
     let child_env: supervisor::ChildEnv = {
         let mut env = config.store.child_env();

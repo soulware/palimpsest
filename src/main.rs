@@ -1031,9 +1031,7 @@ fn main() {
         }
 
         Command::FetchVolume { fork_dir } => {
-            let fetch_config = resolve_volume_fetch_config(&fork_dir)
-                .expect("failed to load fetch config for fetch worker");
-            if let Err(e) = elide::fetch_volume::run(&fork_dir, fetch_config) {
+            if let Err(e) = elide::fetch_volume::run(&fork_dir) {
                 eprintln!("fetch worker error: {e}");
                 std::process::exit(1);
             }

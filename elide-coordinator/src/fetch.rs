@@ -406,10 +406,36 @@ async fn spawn_fetch_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Coordinator-spawned subprocess inherits ELIDE_COORDINATOR_SOCKET
-    // from the parent's env (set by `daemon::run` so every spawned
-    // child can call back over the macaroon-authenticated IPC for
-    // store config + creds). No explicit propagation needed.
+    // Hand the worker the IPC socket path so it can call
+    // `GetStoreConfig` (unauth) for the bucket / endpoint / region
+    // (or local_path). The coordinator daemon installs the path
+    // during `daemon::run`; the supervisor's volume-daemon
+    // spawn-path sets this via `child_env`, but our orchestrator
+    // doesn't go through the supervisor and the coordinator
+    // process's own env is unset.
+    if let Some(sock) = elide_coordinator::config::coordinator_socket_path() {
+        cmd.env("ELIDE_COORDINATOR_SOCKET", sock);
+    }
+
+    // Hand the worker S3 credentials via env. The fetch worker
+    // doesn't go through the volume-daemon macaroon handshake (which
+    // is PID-bound to a `volume.pid` file the worker doesn't own);
+    // its trust derives from being coordinator-spawned. We pull
+    // creds from the configured `CredentialIssuer`. Local-store
+    // mode short-circuits since the worker doesn't need creds for
+    // `LocalRangeFetcher`.
+    if elide_coordinator::config::store_config().bucket.is_some() {
+        let issuer = crate::credential::credential_issuer();
+        let vol_ulid_str = fork_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let creds = issuer
+            .issue(vol_ulid_str)
+            .map_err(|e| IpcError::internal(format!("issuing creds for fetch worker: {e}")))?;
+        cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+        cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+        if let Some(tok) = &creds.session_token {
+            cmd.env("AWS_SESSION_TOKEN", tok);
+        }
+    }
 
     #[cfg(unix)]
     unsafe {

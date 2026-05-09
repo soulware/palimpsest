@@ -359,6 +359,27 @@ pub fn store_config() -> &'static StoreSection {
         .expect("store_config not set before IPC dispatch")
 }
 
+/// Process-global coordinator IPC socket path. Set once by
+/// `daemon::run` so coordinator-spawned subprocesses (currently the
+/// `elide fetch-volume` worker) can be handed the right
+/// `ELIDE_COORDINATOR_SOCKET` value at spawn time. Mirrors the
+/// `STORE_CONFIG` pattern: `Box::leak`'d for cheap reads and so
+/// callers don't need to thread the path through.
+static COORDINATOR_SOCKET_PATH: OnceLock<&'static std::path::Path> = OnceLock::new();
+
+/// Install the coordinator IPC socket path. Called once by
+/// `daemon::run` before any subprocess is spawned.
+pub fn set_coordinator_socket_path(path: std::path::PathBuf) {
+    let _ = COORDINATOR_SOCKET_PATH.set(Box::leak(path.into_boxed_path()));
+}
+
+/// Read the coordinator IPC socket path. Returns `None` when
+/// `set_coordinator_socket_path` has not been called (e.g. unit
+/// tests that exercise IPC handlers without a full `daemon::run`).
+pub fn coordinator_socket_path() -> Option<&'static std::path::Path> {
+    COORDINATOR_SOCKET_PATH.get().copied()
+}
+
 #[derive(Deserialize)]
 pub struct SupervisorConfig {
     /// How often each fork is checked for pending segments to upload.
