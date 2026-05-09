@@ -25,11 +25,11 @@ const EXTENT_ENTRY_SIZE: usize = 12;
 // --- byte helpers ---
 
 fn u16le(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+    u16::from_le_bytes([data[off], data[off + 1]])
 }
 
 fn u32le(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
 
 fn hilo64(hi: u32, lo: u32) -> u64 {
