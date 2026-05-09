@@ -28,6 +28,13 @@ This shape has the same problems #297 fixed for pending:
   (default 10 s) and reclaims at most one 32 MiB live bucket per tick.
   A volume with many small dead-bearing segments takes many ticks to
   drain even though all the work could pack into independent buckets.
+  The historical reason for the per-tick cap was that body fetch
+  happened on the coordinator and was assumed to be S3 GETs. Under
+  plan-handoff (#…) the volume materialises bodies via `BlockReader`,
+  which is **cache-first** — a hit on `cache/<ulid>.body` (gated on
+  `cache/<ulid>.present` bits) skips S3 entirely. Self-written and
+  recently-demand-fetched segments are the common cache-hit case, so
+  the assumed cost model is now too pessimistic.
 - **Dense-mid-sized-with-dead is invisible.** A segment with
   `live_lba_bytes > 16 MiB` AND `density ≥ density_threshold` AND some
   dead bytes is neither small nor a sparse-large filler candidate, so
@@ -81,8 +88,9 @@ Replace the tier model with one bin-pack:
    exactly one input that is not tombstone-bearing and not sparse is
    a no-op rewrite and is dropped (the existing skip-check rule).
 3. **Cap** the number of buckets per tick at `max_buckets_per_tick`
-   (new config knob, default `1` for behaviour parity, raise to e.g.
-   `4` for production). Excess candidates wait for the next tick.
+   (new config knob, default `4`; the cache-first body resolver makes
+   the multi-bucket case cheap for the common workload). Excess
+   candidates wait for the next tick.
 4. **Mint** `max_buckets_per_tick + 1` ULIDs at `gc_checkpoint`: one
    per potential bucket, plus `u_flush` (kept above all bucket ULIDs).
    Unused ULIDs cost nothing; the mint is a `u128` counter.
@@ -185,8 +193,11 @@ pub struct GcConfig {
     pub retention_window: Duration,
     /// Maximum number of output buckets emitted per GC tick. Raising
     /// this multiplies the per-tick rewrite throughput by the same
-    /// factor. Defaults to 1 for parity with the pre-unification
-    /// selector.
+    /// factor and, more importantly, the retention-window peak by the
+    /// same factor. Default 4: the body resolver is cache-first under
+    /// plan-handoff, so multi-bucket ticks are cheap for the common
+    /// (recently-written) workload, and 4 lets a small-segment backlog
+    /// drain in one tick without inflating retention peak unduly.
     #[serde(default = "default_max_buckets_per_tick")]
     pub max_buckets_per_tick: usize,
 }
@@ -207,16 +218,25 @@ packing.
 - One selection rule, easier to reason about and test.
 
 **Con**
-- Per-tick rewrite cost is paid in S3 GET/PUT, not local FS IO. The
-  cap is meaningful here in a way it wasn't on the pending side; the
-  default-1 stance respects that.
-- Retention peak grows linearly with bucket count. Operators
-  raising `max_buckets_per_tick` need to consider
+- Per-bucket PUT to S3 for each emitted output. Modest — bounded by
+  `max_buckets × SWEEP_LIVE_CAP` of compressed live bytes — but real,
+  and not amortised the way local rewrites are on pending.
+- Body reads are cache-first via `BlockReader`. The cache-miss path
+  still issues S3 GETs (per-extent range or per-segment full body via
+  the demand-fetcher), so a tick that touches many cold inputs is
+  paying GET cost for the missing entries. Worth measuring before
+  raising the cap dramatically; `cache/<ulid>.present` coverage of the
+  candidate set is the relevant signal.
+- Retention peak grows linearly with bucket count. Operators raising
+  `max_buckets_per_tick` need to consider
   `live_data + post_compaction_outputs + (C × T)` from
-  `docs/operations.md:210` accordingly.
+  `docs/operations.md:210` accordingly. This is the strongest reason
+  to keep the cap configurable rather than unbounded.
 - Bin-packing logic is one branch deeper than the pending case
   because GC also has to honour `density_threshold` (kept) — pending
-  could drop its density gate, GC cannot.
+  could drop its density gate, GC cannot, because rewriting a dense
+  large segment with no dead bytes still costs a PUT and a retention
+  slot for no reclamation.
 
 ## Decisions
 
@@ -228,8 +248,13 @@ packing.
   must justify itself (≥1 tombstone, ≥1 sparse, or ≥2 inputs). Today's
   pass-level check carries over per-bucket; a tick that produces zero
   worthwhile buckets emits nothing.
-- **`max_buckets_per_tick` default 1.** Behaviour-preserving rollout.
-  Operators can raise it after measuring retention-peak headroom.
+- **`max_buckets_per_tick` default 4.** The body resolver is
+  cache-first under plan-handoff, so the original "one bucket per
+  tick" rate-limit (which assumed coordinator-side S3 GETs) is no
+  longer the binding constraint for the common workload. Default of
+  4 lets a backlog of small dead-bearing segments drain in one tick
+  without picking a number that pushes retention peak to 4× live data
+  by default. Operators can raise or lower from there.
 - **N+1 ULIDs at checkpoint.** `max_buckets_per_tick` bucket ULIDs +
   `u_flush`. Unused ULIDs are free.
 - **Plan filenames stay `gc/<ulid>.plan`.** No protocol change to the
