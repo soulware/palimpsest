@@ -29,22 +29,36 @@ const TAG_PID: u8 = 2;
 const TAG_NOT_AFTER: u8 = 3;
 
 const SCOPE_CREDENTIALS: u8 = 0;
+const SCOPE_FETCH_WORKER: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
+    /// Issued to a registered volume daemon. Backs the
+    /// `Request::Credentials` IPC for demand-fetch creds.
     Credentials,
+    /// Issued to a coordinator-spawned `elide fetch-volume` worker.
+    /// PID-bound to the worker via a `fetch.pid` file (not
+    /// `volume.pid`, which is reserved for the volume daemon).
+    /// Otherwise indistinguishable from a `Credentials`-scoped
+    /// macaroon at the IPC layer — both grant short-lived S3 creds
+    /// for the same volume — but separating the scope keeps a
+    /// leaked fetch macaroon from being usable as if it were a
+    /// volume-daemon credential.
+    FetchWorker,
 }
 
 impl Scope {
     fn to_byte(self) -> u8 {
         match self {
             Self::Credentials => SCOPE_CREDENTIALS,
+            Self::FetchWorker => SCOPE_FETCH_WORKER,
         }
     }
 
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             SCOPE_CREDENTIALS => Some(Self::Credentials),
+            SCOPE_FETCH_WORKER => Some(Self::FetchWorker),
             _ => None,
         }
     }

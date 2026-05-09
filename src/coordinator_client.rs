@@ -254,6 +254,48 @@ impl Client {
         Err(last_err.unwrap_or_else(|| io::Error::other("register: exhausted retries")))
     }
 
+    /// Register a coordinator-spawned `elide fetch-volume` worker
+    /// and obtain its macaroon. PID-bound to `<by_id>/<vol_ulid>/
+    /// fetch.pid` (written by the orchestrator at spawn time), with
+    /// the same not-yet-written-race retry as
+    /// [`Self::register_volume_with_retry`].
+    pub fn register_fetch_worker_with_retry(
+        &self,
+        volume_ulid: &str,
+    ) -> io::Result<RegisteredVolume> {
+        const MAX_ATTEMPTS: u32 = 10;
+        const BACKOFF_MS: u64 = 50;
+        let parsed = ulid::Ulid::from_string(volume_ulid)
+            .map_err(|e| io::Error::other(format!("invalid volume_ulid: {e}")))?;
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let result: io::Result<RegisterReply> = self
+                .call_typed(&Request::RegisterFetchWorker {
+                    volume_ulid: parsed,
+                })?
+                .map_err(io::Error::other);
+            match result {
+                Ok(reply) => {
+                    return Ok(RegisteredVolume {
+                        macaroon: reply.macaroon,
+                        peer_endpoint: reply.peer_endpoint,
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not registered") || msg.contains("does not match") {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS));
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::other("register-fetch-worker: exhausted retries")))
+    }
+
     /// Trigger an immediate fork discovery pass.
     pub fn rescan(&self) -> io::Result<()> {
         self.call_typed::<()>(&Request::Rescan)?

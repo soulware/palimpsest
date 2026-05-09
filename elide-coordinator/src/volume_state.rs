@@ -44,6 +44,14 @@ pub const RELEASED_FILE: &str = "volume.released";
 /// aligned with the other `volume.<state>` lifecycle markers.
 pub const IMPORTING_FILE: &str = "volume.importing";
 
+/// Per-fetch-worker pidfile. Written by the fetch orchestrator
+/// before it spawns `elide fetch-volume`, removed when the worker
+/// exits. Used by `Request::RegisterFetchWorker` to PID-bind the
+/// macaroon — same model as `volume.pid` for the volume daemon, but
+/// a distinct file so the lifecycle classifier doesn't see the
+/// fetch worker's PID and mis-classify the volume as `Running`.
+pub const FETCH_PID_FILE: &str = "fetch.pid";
+
 /// Fetched marker. Written by the coordinator after a `volume fetch`
 /// run completes successfully. Indicates this host holds a local copy
 /// of a foreign volume that has *not* been claimed locally — the

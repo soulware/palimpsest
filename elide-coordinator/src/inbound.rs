@@ -43,7 +43,7 @@ use elide_coordinator::ipc::{
     VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{
-    IMPORTING_FILE, PID_FILE, STOPPED_FILE, write_released_marker,
+    FETCH_PID_FILE, IMPORTING_FILE, PID_FILE, STOPPED_FILE, write_released_marker,
 };
 use elide_coordinator::{EvictRegistry, PrefetchTracker, SnapshotLockRegistry, subscribe_prefetch};
 use elide_core::process::pid_is_alive;
@@ -379,6 +379,16 @@ async fn dispatch_json(
                 reply.peer_endpoint =
                     resolve_peer_endpoint_for_volume(volume_ulid, &ctx.data_dir, &ctx.stores).await;
             }
+            let env: Envelope<RegisterReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::RegisterFetchWorker { volume_ulid } => {
+            let result = register_fetch_worker(
+                volume_ulid,
+                &ctx.data_dir,
+                peer_pid,
+                ctx.identity.macaroon_root(),
+            );
             let env: Envelope<RegisterReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -2434,24 +2444,36 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
 /// hostile caller can't tell apart "no such volume", "pid not yet recorded"
 /// (the spawn-write race), or "pid mismatch".
 fn check_peer_pid(vol_dir: &Path, peer_pid: Option<i32>) -> Result<i32, String> {
+    check_peer_pid_against(vol_dir, peer_pid, PID_FILE)
+}
+
+/// Generalized PID handshake: read `<vol_dir>/<pid_filename>`, check
+/// it parses as an integer, and verify it matches `peer_pid` (the
+/// `SO_PEERCRED` value supplied by the IPC layer). Used by
+/// [`register_volume`] (against `volume.pid`) and
+/// [`register_fetch_worker`] (against `fetch.pid`).
+fn check_peer_pid_against(
+    vol_dir: &Path,
+    peer_pid: Option<i32>,
+    pid_filename: &str,
+) -> Result<i32, String> {
     let peer_pid = peer_pid.ok_or_else(|| "err peer pid unavailable".to_string())?;
-    let pid_path = vol_dir.join(PID_FILE);
+    let pid_path = vol_dir.join(pid_filename);
     let recorded: i32 = match std::fs::read_to_string(&pid_path) {
         Ok(s) => s
             .trim()
             .parse()
-            .map_err(|_| "err volume.pid is not numeric".to_string())?,
-        // The supervisor writes volume.pid right after spawn returns. There is
-        // a brief window where a fast-starting volume can dial control.sock
-        // before the parent has written the file — the volume retries, so we
-        // simply report "not registered" and let the caller back off.
+            .map_err(|_| format!("err {pid_filename} is not numeric"))?,
+        // Brief window between spawn and parent writing the pidfile:
+        // a fast-starting child can dial the socket before the parent
+        // has written the file — caller retries on this error class.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err("err volume not registered".to_string());
         }
-        Err(e) => return Err(format!("err reading volume.pid: {e}")),
+        Err(e) => return Err(format!("err reading {pid_filename}: {e}")),
     };
     if recorded != peer_pid {
-        return Err("err peer pid does not match volume.pid".to_string());
+        return Err(format!("err peer pid does not match {pid_filename}"));
     }
     Ok(peer_pid)
 }
@@ -2467,12 +2489,44 @@ fn register_volume(
     if !vol_dir.exists() {
         return Err(IpcError::not_found("unknown volume"));
     }
-    let pid = check_peer_pid(&vol_dir, peer_pid).map_err(IpcError::forbidden)?;
+    let pid = check_peer_pid_against(&vol_dir, peer_pid, PID_FILE).map_err(IpcError::forbidden)?;
     let m = macaroon::mint(
         macaroon_root,
         vec![
             Caveat::Volume(ulid_str),
             Caveat::Scope(Scope::Credentials),
+            Caveat::Pid(pid),
+        ],
+    );
+    Ok(RegisterReply {
+        macaroon: m.encode(),
+        peer_endpoint: None,
+    })
+}
+
+/// Mint a macaroon for a coordinator-spawned `elide fetch-volume`
+/// worker. Mirrors [`register_volume`] but PID-checks against
+/// `fetch.pid` instead of `volume.pid`, and stamps the macaroon with
+/// `Scope::FetchWorker` so it can't be confused with a credentials-
+/// scoped daemon macaroon.
+fn register_fetch_worker(
+    volume_ulid: ulid::Ulid,
+    data_dir: &Path,
+    peer_pid: Option<i32>,
+    macaroon_root: &[u8; 32],
+) -> Result<RegisterReply, IpcError> {
+    let ulid_str = volume_ulid.to_string();
+    let vol_dir = data_dir.join("by_id").join(&ulid_str);
+    if !vol_dir.exists() {
+        return Err(IpcError::not_found("unknown volume"));
+    }
+    let pid =
+        check_peer_pid_against(&vol_dir, peer_pid, FETCH_PID_FILE).map_err(IpcError::forbidden)?;
+    let m = macaroon::mint(
+        macaroon_root,
+        vec![
+            Caveat::Volume(ulid_str),
+            Caveat::Scope(Scope::FetchWorker),
             Caveat::Pid(pid),
         ],
     );
@@ -2516,8 +2570,14 @@ fn issue_credentials(
         // from "tampered caveats".
         return Err(IpcError::forbidden("invalid macaroon"));
     }
-    if m.scope() != Some(Scope::Credentials) {
-        return Err(IpcError::forbidden("macaroon scope mismatch"));
+    // Both Credentials (volume daemon) and FetchWorker (fetch
+    // worker) macaroons grant the same downstream creds — they're
+    // distinguished only so that a leaked fetch macaroon can't be
+    // re-presented as a daemon credential at some future verb that
+    // checks `Scope::Credentials` specifically.
+    match m.scope() {
+        Some(Scope::Credentials) | Some(Scope::FetchWorker) => {}
+        _ => return Err(IpcError::forbidden("macaroon scope mismatch")),
     }
     let volume_ulid = m
         .volume()

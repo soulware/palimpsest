@@ -217,6 +217,15 @@ pub enum Request {
     /// coordinator refuses if the peer's PID doesn't match the
     /// volume's recorded `volume.pid`.
     Register { volume_ulid: Ulid },
+    /// Mint a per-volume macaroon for a coordinator-spawned
+    /// `elide fetch-volume` worker. PID-bound via SO_PEERCRED, but
+    /// keyed off `<by_id>/<vol_ulid>/fetch.pid` (written by the
+    /// orchestrator at spawn time) rather than `volume.pid` — the
+    /// fetch worker isn't a volume daemon, and writing `volume.pid`
+    /// would mis-classify the volume's lifecycle as `Running`. The
+    /// returned macaroon carries `Scope::FetchWorker` so it can't be
+    /// confused with a credentials-scoped daemon macaroon.
+    RegisterFetchWorker { volume_ulid: Ulid },
     /// Macaroon-authenticated short-lived credential issuance.
     /// Verifies the MAC, re-checks SO_PEERCRED matches the macaroon's
     /// `pid` caveat, then delegates to the configured

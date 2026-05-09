@@ -413,6 +413,20 @@ fn plant_by_name_symlink(
     Ok(())
 }
 
+/// RAII guard that removes `fetch.pid` from the fork dir on drop.
+/// Ensures the pidfile is always cleaned up — on success, on
+/// `IpcError`, on panic — so a stale `fetch.pid` never authorises a
+/// rogue process.
+struct FetchPidGuard {
+    path: PathBuf,
+}
+
+impl Drop for FetchPidGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 async fn spawn_fetch_worker(
     fork_dir: &Path,
     volume_name: &str,
@@ -425,35 +439,15 @@ async fn spawn_fetch_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Hand the worker the IPC socket path so it can call
-    // `GetStoreConfig` (unauth) for the bucket / endpoint / region
-    // (or local_path). The coordinator daemon installs the path
-    // during `daemon::run`; the supervisor's volume-daemon
-    // spawn-path sets this via `child_env`, but our orchestrator
-    // doesn't go through the supervisor and the coordinator
-    // process's own env is unset.
+    // Hand the worker the IPC socket path so it can call back for
+    // store config (`GetStoreConfig`) and credentials
+    // (`RegisterFetchWorker` → `Credentials`). The coordinator daemon
+    // installs the path during `daemon::run`; the supervisor's
+    // volume-daemon spawn-path sets this via `child_env`, but our
+    // orchestrator doesn't go through the supervisor and the
+    // coordinator process's own env is unset.
     if let Some(sock) = elide_coordinator::config::coordinator_socket_path() {
         cmd.env("ELIDE_COORDINATOR_SOCKET", sock);
-    }
-
-    // Hand the worker S3 credentials via env. The fetch worker
-    // doesn't go through the volume-daemon macaroon handshake (which
-    // is PID-bound to a `volume.pid` file the worker doesn't own);
-    // its trust derives from being coordinator-spawned. We pull
-    // creds from the configured `CredentialIssuer`. Local-store
-    // mode short-circuits since the worker doesn't need creds for
-    // `LocalRangeFetcher`.
-    if elide_coordinator::config::store_config().bucket.is_some() {
-        let issuer = crate::credential::credential_issuer();
-        let vol_ulid_str = fork_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let creds = issuer
-            .issue(vol_ulid_str)
-            .map_err(|e| IpcError::internal(format!("issuing creds for fetch worker: {e}")))?;
-        cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-        cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-        if let Some(tok) = &creds.session_token {
-            cmd.env("AWS_SESSION_TOKEN", tok);
-        }
     }
 
     #[cfg(unix)]
@@ -468,6 +462,27 @@ async fn spawn_fetch_worker(
     let mut child = cmd
         .spawn()
         .map_err(|e| IpcError::internal(format!("spawning elide fetch-volume worker: {e}")))?;
+
+    // Plant `fetch.pid` immediately after spawn with the worker's
+    // PID — the macaroon handshake (`Request::RegisterFetchWorker`)
+    // checks SO_PEERCRED against this file. The guard cleans up on
+    // every exit path including panic, so a leaked pidfile can
+    // never authorise a process the coordinator didn't spawn. The
+    // worker-side retry loop absorbs the brief window where the
+    // worker dials before this write lands.
+    let _pid_guard: Option<FetchPidGuard> = match child.id() {
+        Some(pid) => {
+            let pid_path = fork_dir.join(elide_coordinator::volume_state::FETCH_PID_FILE);
+            std::fs::write(&pid_path, pid.to_string())
+                .map_err(|e| IpcError::internal(format!("writing {}: {e}", pid_path.display())))?;
+            Some(FetchPidGuard { path: pid_path })
+        }
+        None => {
+            return Err(IpcError::internal(
+                "fetch worker spawned but pid is unavailable (already exited?)",
+            ));
+        }
+    };
 
     // Pipe stderr lines into the job event log so attached subscribers
     // see worker progress. The Arc<FetchJob> outlives the task: it's
