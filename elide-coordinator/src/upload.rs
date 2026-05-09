@@ -140,6 +140,8 @@ fn mark_uploaded(sentinel: &Path, content: &[u8]) -> std::io::Result<()> {
 }
 
 pub struct DrainResult {
+    /// Segments observed in `pending/` at the start of the tick.
+    pub seen: usize,
     pub uploaded: usize,
     /// Segments whose S3 PUT failed. Likely a persistent store-side issue.
     pub upload_failed: usize,
@@ -221,6 +223,7 @@ pub async fn drain_pending(
 
     let pending_snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
         .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
+    let seen = pending_snapshot.len();
     for ulid in pending_snapshot {
         let upload_name = ulid.to_string();
         let segment_path = pending_dir.join(&upload_name);
@@ -253,6 +256,7 @@ pub async fn drain_pending(
     }
 
     Ok(DrainResult {
+        seen,
         uploaded,
         upload_failed,
         promote_failed,

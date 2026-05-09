@@ -102,10 +102,7 @@ impl GcCycleOrchestrator {
         let _snap_guard = match snap_lock.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                tracing::debug!(
-                    "[coordinator] skipping tick for {}: snapshot in flight",
-                    self.fork_dir.display()
-                );
+                info!("[tick {}] skipped: snapshot lock held", self.volume_id);
                 return TickOutcome::Continue;
             }
         };
@@ -205,7 +202,13 @@ impl GcCycleOrchestrator {
         }
         let volume_id = &self.volume_id;
         match upload::drain_pending(&self.fork_dir, volume_id, &self.store).await {
-            Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
+            Ok(r) => {
+                if r.seen > 0 {
+                    info!(
+                        "[drain {volume_id}] pending={} uploaded={} upload_failed={} promote_failed={}",
+                        r.seen, r.uploaded, r.upload_failed, r.promote_failed,
+                    );
+                }
                 if r.upload_failed > 0 {
                     error!(
                         "[drain {volume_id}] {} segment(s) failed to upload to S3; \
@@ -221,13 +224,7 @@ impl GcCycleOrchestrator {
                         r.promote_failed
                     );
                 }
-                false
-            }
-            Ok(r) => {
-                if r.uploaded > 0 {
-                    info!("[drain {volume_id}] {} uploaded", r.uploaded);
-                }
-                true
+                r.upload_failed == 0 && r.promote_failed == 0
             }
             Err(e) => {
                 error!(

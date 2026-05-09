@@ -2030,12 +2030,6 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
 /// freshly-flushed segments.
 const REPACK_TARGET_LIVE: u64 = 32 * 1024 * 1024;
 
-/// Live-bytes threshold at or below which a pending segment is
-/// considered eligible for bin-packing with peers. Picked at half the
-/// target so two smalls always combine to fit and a merged output
-/// exits the small set permanently — no infinite re-pack loop.
-const REPACK_SMALL_THRESHOLD: u64 = REPACK_TARGET_LIVE / 2;
-
 /// Entry-count cap on a packed output. Mirrors the WAL's
 /// `FLUSH_ENTRY_THRESHOLD` so packed outputs sit at the same scale as
 /// freshly-flushed segments and the index region stays bounded.
@@ -2118,10 +2112,9 @@ struct RepackCandidate {
 /// fresh ULIDs close the path-aliasing race against concurrent readers,
 /// mirroring GC.
 ///
-/// A candidate is eligible if it has any hash-dead body **or** is
-/// small enough to combine with another candidate (`live_bytes ≤
-/// REPACK_SMALL_THRESHOLD`). Single-input buckets whose only input is
-/// fully live are skipped — rewriting would be a byte-identical no-op.
+/// Every non-floor pending segment becomes a candidate. Single-input
+/// buckets whose only input is fully live are skipped at materialise —
+/// rewriting would be a byte-identical no-op.
 pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
     use crate::rewrite_plan::{PlanOutput, RewritePlan};
@@ -2196,9 +2189,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .map(|e| e.stored_length as u64)
             .sum();
         let all_live = live_bytes_est == total_bytes;
-        if all_live && live_bytes_est > REPACK_SMALL_THRESHOLD {
-            continue;
-        }
 
         let classify_ctx = ClassifyCtx {
             lba_map: &lbamap_snapshot,

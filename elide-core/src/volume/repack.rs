@@ -369,6 +369,25 @@ impl Volume {
             }
 
             stats.bytes_freed += bucket.bytes_freed;
+
+            let inputs_fmt = bucket
+                .inputs
+                .iter()
+                .map(|i| i.input_ulid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            match &bucket.output {
+                Some(out) => log::info!(
+                    "repack: [{inputs_fmt}] -> {} ({} entries, {} bytes freed)",
+                    out.new_ulid,
+                    out.out_entries.len(),
+                    bucket.bytes_freed,
+                ),
+                None => log::info!(
+                    "repack: [{inputs_fmt}] -> deleted ({} bytes freed)",
+                    bucket.bytes_freed,
+                ),
+            }
         }
 
         segment::fsync_dir(&pending_dir)?;
@@ -1004,23 +1023,22 @@ mod tests {
 
     #[test]
     fn repack_packs_small_with_filler() {
-        // One small (~4 KiB live) + one large filler (~17 MiB live).
-        // Tier 1 picks up the small; tier 2 sees ~32 MiB - 4 KiB headroom
-        // and pulls in the 17 MiB filler. Output is one ~17 MiB segment.
+        // One small (~4 KiB live) + one ~17 MiB live segment.
+        // Bin-pack admits both into one bucket — 17 MiB + 4 KiB
+        // ≤ 32 MiB target.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         // Small segment: 1 block.
         promote_segment_with_blocks(&mut vol, 0, 1, 1);
-        // Filler: 17 MiB live (4352 blocks of 4 KiB).
-        // Above the 16 MiB REPACK_SMALL_THRESHOLD so it's filler material,
-        // not a small. Must fit in the 32 MiB budget after the small.
+        // 17 MiB live (4352 blocks of 4 KiB) — must fit in the 32 MiB
+        // budget alongside the small.
         promote_segment_with_blocks(&mut vol, 1, 4352, 2);
 
         let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 2,
-            "tier 2 must pull the filler in alongside the small"
+            "bin-pack must combine the small and the 17 MiB segment"
         );
         assert_eq!(stats.new_segments, 1);
 
