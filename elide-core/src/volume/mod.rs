@@ -1395,18 +1395,7 @@ impl Volume {
             let disk_hash = fresh.hash_at(lba);
             let mem_claimant = self.lbamap.claimant_at(lba);
             let disk_claimant = fresh.claimant_at(lba);
-            // Hash mismatch is always a bug. Claimant: flag only
-            // `in_memory < disk` (or one Some / one None) — the bug
-            // class is "in-memory failed to bump when disk advanced."
-            // The reverse direction is benign in principle (reads use
-            // hash; future structural commits override via fresher
-            // ULIDs).
-            let claimant_drift = match (mem_claimant, disk_claimant) {
-                (Some(m), Some(d)) => m < d,
-                (None, Some(_)) | (Some(_), None) => true,
-                (None, None) => false,
-            };
-            if mem_hash != disk_hash || claimant_drift {
+            if mem_hash != disk_hash || mem_claimant != disk_claimant {
                 diverging.push(Diverge {
                     lba,
                     mem_hash,

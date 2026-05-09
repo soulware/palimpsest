@@ -158,7 +158,7 @@ impl LbaMap {
     /// non-zero offsets arise only in the split/tail entries created internally.
     /// Splits propagate the original entry's claimant unchanged.
     pub fn insert(&mut self, start_lba: u64, lba_length: u32, hash: blake3::Hash, claimant: Ulid) {
-        self.insert_inner(start_lba, lba_length, hash, claimant, None);
+        self.insert_inner(start_lba, lba_length, 0, hash, claimant, None);
     }
 
     /// Insert a Delta extent. Same as [`insert`] but attaches `source_hashes`
@@ -172,7 +172,14 @@ impl LbaMap {
         claimant: Ulid,
         source_hashes: Arc<[blake3::Hash]>,
     ) {
-        self.insert_inner(start_lba, lba_length, hash, claimant, Some(source_hashes));
+        self.insert_inner(
+            start_lba,
+            lba_length,
+            0,
+            hash,
+            claimant,
+            Some(source_hashes),
+        );
     }
 
     /// Insert only on sub-ranges where no overlapping current entry has a
@@ -297,18 +304,26 @@ impl LbaMap {
         }
 
         // Install on each gap between blocked regions; insert_inner handles
-        // trimming any non-blocked overlaps inside the gap.
+        // trimming any non-blocked overlaps inside the gap. The caller's
+        // logical entry covers `[start_lba, new_end)` with body block 0
+        // anchored at `start_lba`, so each gap's `payload_block_offset`
+        // is its distance from `start_lba` — without this, a multi-block
+        // carry split around a blocked middle sub-run would lose the
+        // trailing gap's offset and reads at the trailing LBAs would
+        // resolve to body block 0 of the carry instead of block N.
         let mut cursor = start_lba;
         for (b_start, b_end) in blocked {
             if cursor < b_start {
                 let gap_len = (b_start - cursor) as u32;
-                self.insert_inner(cursor, gap_len, hash, claimant, sources.clone());
+                let pbo = (cursor - start_lba) as u32;
+                self.insert_inner(cursor, gap_len, pbo, hash, claimant, sources.clone());
             }
             cursor = cursor.max(b_end);
         }
         if cursor < new_end {
             let gap_len = (new_end - cursor) as u32;
-            self.insert_inner(cursor, gap_len, hash, claimant, sources);
+            let pbo = (cursor - start_lba) as u32;
+            self.insert_inner(cursor, gap_len, pbo, hash, claimant, sources);
         }
     }
 
@@ -316,6 +331,7 @@ impl LbaMap {
         &mut self,
         start_lba: u64,
         lba_length: u32,
+        payload_block_offset: u32,
         hash: blake3::Hash,
         claimant: Ulid,
         sources: Option<Arc<[blake3::Hash]>>,
@@ -394,7 +410,7 @@ impl LbaMap {
             MapEntry {
                 lba_length,
                 hash,
-                payload_block_offset: 0,
+                payload_block_offset,
                 claimant_ulid: claimant,
             },
             sources,
@@ -1286,6 +1302,11 @@ mod tests {
         // Existing claim of [4, 6) at higher claimant; structural commit
         // wants to install [0, 10) → h(2) at lower claimant. Head and
         // tail get installed; middle is preserved.
+        //
+        // The tail gap [6, 10) inherits its `payload_block_offset` from
+        // its distance to the original carry's start_lba (= 6) — without
+        // this, reads at lba 6..9 would resolve to the carry's body
+        // block 0..3 instead of block 6..9.
         let mut map = LbaMap::new();
         map.insert(4, 2, h(9), u(9));
         map.insert_if_newer(0, 10, h(2), u(5));
@@ -1293,21 +1314,24 @@ mod tests {
         assert_eq!(map.lookup(3), Some((h(2), 3)));
         assert_eq!(map.lookup(4), Some((h(9), 0)));
         assert_eq!(map.lookup(5), Some((h(9), 1)));
-        assert_eq!(map.lookup(6), Some((h(2), 0)));
-        assert_eq!(map.lookup(9), Some((h(2), 3)));
+        assert_eq!(map.lookup(6), Some((h(2), 6)));
+        assert_eq!(map.lookup(9), Some((h(2), 9)));
     }
 
     #[test]
     fn insert_if_newer_blocked_by_overlapping_predecessor() {
         // Predecessor [0, 8) at higher claimant overlaps [4, 12); only
-        // [8, 12) should be installed.
+        // [8, 12) should be installed.  The installed entry's
+        // `payload_block_offset` is its distance to the original carry's
+        // start_lba (= 4), so lba 8 resolves to body block 4 of h(2),
+        // not block 0.
         let mut map = LbaMap::new();
         map.insert(0, 8, h(9), u(9));
         map.insert_if_newer(4, 8, h(2), u(5));
         assert_eq!(map.lookup(4), Some((h(9), 4)));
         assert_eq!(map.lookup(7), Some((h(9), 7)));
-        assert_eq!(map.lookup(8), Some((h(2), 0)));
-        assert_eq!(map.lookup(11), Some((h(2), 3)));
+        assert_eq!(map.lookup(8), Some((h(2), 4)));
+        assert_eq!(map.lookup(11), Some((h(2), 7)));
     }
 
     #[test]
@@ -1362,6 +1386,9 @@ mod tests {
         // Mix: middle [4, 6) is held by a concurrent writer at u(20);
         // surrounding range was claimed by a consumed input at u(9).
         // Sweep's output at u(5) installs head and tail, leaves middle.
+        // The tail gap inherits its `payload_block_offset` from its
+        // distance to the carry's start_lba (= 6) so reads at lba 6..9
+        // resolve to body block 6..9 of h(2), not block 0..3.
         let mut map = LbaMap::new();
         map.insert(0, 4, h(1), u(9));
         map.insert(4, 2, h(9), u(20));
@@ -1372,11 +1399,8 @@ mod tests {
         assert_eq!(map.lookup(3), Some((h(2), 3)));
         assert_eq!(map.lookup(4), Some((h(9), 0)));
         assert_eq!(map.lookup(5), Some((h(9), 1)));
-        // Tail gap [6, 10) is installed as a fresh entry with
-        // payload_block_offset = 0, mirroring the existing
-        // insert_if_newer_splits_around_higher_claimant_in_middle test.
-        assert_eq!(map.lookup(6), Some((h(2), 0)));
-        assert_eq!(map.lookup(9), Some((h(2), 3)));
+        assert_eq!(map.lookup(6), Some((h(2), 6)));
+        assert_eq!(map.lookup(9), Some((h(2), 9)));
     }
 
     // --- extents_in_range tests ---

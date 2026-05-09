@@ -2131,6 +2131,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         base_dir,
         pending_dir,
         floor,
+        ceiling,
         output_ulids,
         lbamap_snapshot,
         extent_index_snapshot,
@@ -2152,6 +2153,16 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // every entry, compute live/dead/entry counts. Skip fully-live
     // segments larger than the small threshold (no rewrite, no peer to
     // pack with).
+    //
+    // Two ULID gates filter the candidate set:
+    //   - `floor` (snapshot floor) excludes segments frozen by the
+    //     latest snapshot.
+    //   - `ceiling` (= prep-time `u_flush`) excludes segments minted
+    //     after prep — those exist on disk but the prep-time
+    //     `lbamap_snapshot` knows nothing about their entries, so the
+    //     classifier would call them all dead and the apply would
+    //     delete the files plus clobber any lbamap claims they made.
+    //     See `docs/finding-cargo-build-stale-read.md`.
     let mut candidates: Vec<RepackCandidate> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
@@ -2161,6 +2172,9 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let seg_ulid =
             Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
         if floor.is_some_and(|f| seg_ulid <= f) {
+            continue;
+        }
+        if seg_ulid > ceiling {
             continue;
         }
 

@@ -52,10 +52,19 @@ pub struct DeltaRepackStats {
 /// pending segment at prep time, monotonically increasing, all below
 /// `u_flush` and the next WAL ULID). The worker assigns them in
 /// input-ULID order and only consumes as many as it actually rewrites.
+///
+/// `ceiling` is the WAL-flush ULID minted at prep time: every output
+/// ULID is below it, so any pending segment with a strictly greater ULID
+/// was minted after prep (e.g. by a `prepare_promote` racing under the
+/// dropped lock) and the prep-time `lbamap_snapshot` knows nothing
+/// about its entries. The worker skips such segments — including them
+/// as bucket inputs would let `apply_repack_result` delete them and
+/// clobber the lbamap claims they made.
 pub struct RepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
     pub floor: Option<Ulid>,
+    pub ceiling: Ulid,
     pub output_ulids: Vec<Ulid>,
     pub lbamap_snapshot: Arc<lbamap::LbaMap>,
     pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
@@ -202,6 +211,7 @@ impl Volume {
             base_dir: self.base_dir.clone(),
             pending_dir,
             floor,
+            ceiling: u_flush,
             output_ulids,
             lbamap_snapshot: Arc::clone(&self.lbamap),
             extent_index_snapshot: Arc::clone(&self.extent_index),
@@ -1089,6 +1099,338 @@ mod tests {
         let stats = vol.repack().unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.new_segments, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ----------------------------------------------------------------------
+    // Lock-drop window regression tests.
+    //
+    // PR #302 (50511cd) lets `VolumeClient::write` acquire the volume mutex
+    // from the calling thread instead of routing through the actor request
+    // channel.  That moves writes outside the actor's serialisation window:
+    // a write can land between `prepare_repack` returning and
+    // `apply_repack_result` reacquiring the lock, while the worker is
+    // classifying / materialising against a frozen snapshot.
+    //
+    // These tests exercise that window deterministically by driving the
+    // prep / execute / apply trio directly (the synchronous wrapper
+    // `Volume::repack` would close the window before the test could
+    // interpose a write).  They mirror the production sequence:
+    //
+    //   1. Set up at least one pending segment carrying a Keep entry.
+    //   2. Call `prepare_repack` — captures lbamap + extent_index snapshot,
+    //      mints u_flush + output_ulids.
+    //   3. Issue a `Volume::write` that targets one of the snapshot's
+    //      Keep entries' LBA ranges.
+    //   4. Call `execute_repack` on the captured job — classifies against
+    //      the frozen snapshot, materialises the bucket output.
+    //   5. Call `apply_repack_result` — must commit the post-prep direct
+    //      write, not roll lbamap back to the snapshot's body.
+    //
+    // See `docs/finding-cargo-build-stale-read.md`.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn lock_drop_full_overwrite_single_block() {
+        // Sanity: a single-block Keep entry, fully overwritten by a direct
+        // write during the lock-drop window.  apply_repack_result's
+        // insert_consuming_inputs blocks check should refuse to clobber
+        // the post-prep claim.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let payload_a = vec![0x11u8; 4096];
+        let payload_b = vec![0x22u8; 4096];
+        let payload_peer = vec![0x33u8; 4096];
+
+        // Pending S1: data [100+1, H_A].  Pending S2 at LBA 200 is the peer
+        // that lets the bin-pack put S1 into a non-solo bucket so the rewrite
+        // actually runs (a solo all-live bucket would be skipped).
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(200, &payload_peer).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+
+        // Lock-drop window: same LBA, different bytes → different hash.
+        vol.write(100, &payload_b).unwrap();
+
+        let result = crate::actor::execute_repack(job).unwrap();
+        vol.apply_repack_result(result).unwrap();
+
+        assert_eq!(
+            vol.read(100, 1).unwrap(),
+            payload_b,
+            "post-apply read must reflect the post-prep direct write"
+        );
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol2.read(100, 1).unwrap(),
+            payload_b,
+            "reopen rebuild must agree"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn lock_drop_full_overwrite_multi_block() {
+        // Multi-block Keep entry, fully overwritten by three single-block
+        // direct writes during the lock-drop window.  Each direct write
+        // splits the predecessor in lbamap; insert_consuming_inputs at
+        // apply time must mark every sub-range as blocked.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let payload_a: Vec<u8> = (0..3 * 4096usize).map(|i| (i * 7 + 13) as u8).collect();
+        let kernel_blocks: Vec<Vec<u8>> = (0..3)
+            .map(|n| (0..4096).map(|i| ((i + n * 1009) * 11 + 3) as u8).collect())
+            .collect();
+        let peer = vec![0xCDu8; 4096];
+
+        // Pending S1: data [100+3, H_A].
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(200, &peer).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+
+        // Lock-drop window: three single-block direct writes covering the
+        // whole [100..103) range.
+        vol.write(100, &kernel_blocks[0]).unwrap();
+        vol.write(101, &kernel_blocks[1]).unwrap();
+        vol.write(102, &kernel_blocks[2]).unwrap();
+
+        let result = crate::actor::execute_repack(job).unwrap();
+        vol.apply_repack_result(result).unwrap();
+
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            assert_eq!(
+                &vol.read(100 + i as u64, 1).unwrap(),
+                block,
+                "lba {} must reflect the post-prep direct write",
+                100 + i,
+            );
+        }
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            assert_eq!(
+                &vol2.read(100 + i as u64, 1).unwrap(),
+                block,
+                "reopen rebuild must agree at lba {}",
+                100 + i,
+            );
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn lock_drop_partial_overwrite_middle_block() {
+        // Multi-block Keep entry with a SINGLE middle block overwritten
+        // during the lock-drop window.
+        //
+        // Mirrors the cargo-build inode-table workload shape: snapshot
+        // carries a 3-block DATA at [L+3], kernel writes a single block
+        // somewhere inside.  At apply time `insert_consuming_inputs` must:
+        //   - install the bucket output's claim on the head and tail
+        //     sub-ranges with the correct payload_block_offset (0 and 2),
+        //   - leave the middle sub-range pointing at the direct write.
+        //
+        // The current `insert_inner` hard-codes payload_block_offset: 0 for
+        // every fresh insert, so a multi-block Keep that has to be split
+        // around a blocked middle sub-range loses the trailing block's
+        // offset — reads at the trailing LBA return the snapshot's first
+        // body block instead of the third.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let block_a0: Vec<u8> = (0..4096).map(|i| (i * 7 + 13) as u8).collect();
+        let block_a1: Vec<u8> = (0..4096).map(|i| (i * 11 + 3) as u8).collect();
+        let block_a2: Vec<u8> = (0..4096).map(|i| (i * 13 + 5) as u8).collect();
+        assert_ne!(block_a0, block_a1);
+        assert_ne!(block_a1, block_a2);
+        assert_ne!(block_a0, block_a2);
+        let payload_a: Vec<u8> = block_a0
+            .iter()
+            .chain(block_a1.iter())
+            .chain(block_a2.iter())
+            .copied()
+            .collect();
+        let kernel_middle: Vec<u8> = (0..4096).map(|i| (i * 17 + 23) as u8).collect();
+        let peer = vec![0xCDu8; 4096];
+
+        // Pending S1: data [100+3, H_A].
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(200, &peer).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+
+        // Lock-drop window: single-block direct write at the middle of the
+        // 3-block range.  Splits lbamap into three:
+        //   [100..101) = (H_A, S1, payload_block_offset=0)
+        //   [101..102) = (H_kernel, U_w, payload_block_offset=0)
+        //   [102..103) = (H_A, S1, payload_block_offset=2)
+        vol.write(101, &kernel_middle).unwrap();
+
+        // Pre-apply sanity: reads still walk through the live state correctly.
+        assert_eq!(vol.read(100, 1).unwrap(), block_a0, "pre-apply lba 100");
+        assert_eq!(
+            vol.read(101, 1).unwrap(),
+            kernel_middle,
+            "pre-apply lba 101"
+        );
+        assert_eq!(vol.read(102, 1).unwrap(), block_a2, "pre-apply lba 102");
+
+        let result = crate::actor::execute_repack(job).unwrap();
+        vol.apply_repack_result(result).unwrap();
+
+        // After apply, the bucket output O carries the same 3-block H_A
+        // body.  Reads must still resolve to the correct block of H_A on
+        // the head and tail, and the kernel's middle write on lba 101.
+        assert_eq!(
+            vol.read(100, 1).unwrap(),
+            block_a0,
+            "post-apply lba 100 — should be block 0 of H_A"
+        );
+        assert_eq!(
+            vol.read(101, 1).unwrap(),
+            kernel_middle,
+            "post-apply lba 101 — should be the post-prep direct write"
+        );
+        assert_eq!(
+            vol.read(102, 1).unwrap(),
+            block_a2,
+            "post-apply lba 102 — should be block 2 of H_A (NOT block 0)"
+        );
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        assert_eq!(vol2.read(100, 1).unwrap(), block_a0, "reopen lba 100");
+        assert_eq!(vol2.read(101, 1).unwrap(), kernel_middle, "reopen lba 101");
+        assert_eq!(vol2.read(102, 1).unwrap(), block_a2, "reopen lba 102");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn lock_drop_full_overwrite_then_wal_flush() {
+        // Same shape as `lock_drop_full_overwrite_multi_block` but with a
+        // WAL flush after the direct writes and before `execute_repack`.
+        // This bumps lbamap claimants for the kernel writes from the WAL
+        // ULID to a fresh pending segment ULID — exercising the
+        // claimant-bump path in `flush_wal_to_pending_as` while the
+        // worker still holds the original snapshot.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let payload_a: Vec<u8> = (0..3 * 4096usize).map(|i| (i * 7 + 13) as u8).collect();
+        let kernel_blocks: Vec<Vec<u8>> = (0..3)
+            .map(|n| (0..4096).map(|i| ((i + n * 1009) * 11 + 3) as u8).collect())
+            .collect();
+        let peer = vec![0xCDu8; 4096];
+
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(200, &peer).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            vol.write(100 + i as u64, block).unwrap();
+        }
+        // Flush the post-prep WAL into a fresh pending segment with ULID
+        // strictly greater than every output ULID.  Bumps lbamap claimants
+        // from U_w to the new segment ULID.
+        vol.flush_wal().unwrap();
+
+        let result = crate::actor::execute_repack(job).unwrap();
+        vol.apply_repack_result(result).unwrap();
+
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            assert_eq!(
+                &vol.read(100 + i as u64, 1).unwrap(),
+                block,
+                "post-apply lba {}",
+                100 + i,
+            );
+        }
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            assert_eq!(
+                &vol2.read(100 + i as u64, 1).unwrap(),
+                block,
+                "reopen lba {}",
+                100 + i,
+            );
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn lock_drop_full_overwrite_then_second_repack_pass() {
+        // After the first repack apply, the post-prep direct writes live in
+        // the running WAL (or, after a flush, in a fresh pending segment).
+        // A second repack pass should pick those up and carry them into a
+        // new bucket output.  Exercises the cross-pass interaction.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let payload_a: Vec<u8> = (0..3 * 4096usize).map(|i| (i * 7 + 13) as u8).collect();
+        let kernel_blocks: Vec<Vec<u8>> = (0..3)
+            .map(|n| (0..4096).map(|i| ((i + n * 1009) * 11 + 3) as u8).collect())
+            .collect();
+        let peer = vec![0xCDu8; 4096];
+
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(200, &peer).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            vol.write(100 + i as u64, block).unwrap();
+        }
+        let result = crate::actor::execute_repack(job).unwrap();
+        vol.apply_repack_result(result).unwrap();
+
+        // Second repack pass — now operating on the bucket output + the
+        // segment(s) carrying the kernel writes.
+        vol.flush_wal().unwrap();
+        vol.repack().unwrap();
+
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            assert_eq!(
+                &vol.read(100 + i as u64, 1).unwrap(),
+                block,
+                "after second repack, lba {}",
+                100 + i,
+            );
+        }
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        for (i, block) in kernel_blocks.iter().enumerate() {
+            assert_eq!(
+                &vol2.read(100 + i as u64, 1).unwrap(),
+                block,
+                "reopen after second repack, lba {}",
+                100 + i,
+            );
+        }
 
         fs::remove_dir_all(base).unwrap();
     }
