@@ -25,7 +25,6 @@
 //   replays entries into the LBA map, extent index, and pending_entries.
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fs;
 use std::io;
@@ -590,29 +589,16 @@ impl Volume {
     /// single large write may produce a segment larger than the threshold; the
     /// block layer (ublk) is expected to enforce its own per-request cap.
     pub fn write(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
-        self.write_inner(lba, Cow::Borrowed(data)).map(|_| ())
+        validate_write_size(data)?;
+        let hash = blake3::hash(data);
+        let compressed = maybe_compress(data);
+        self.commit_or_skip(lba, data, hash, compressed.as_deref())
+            .map(|_| ())
     }
 
-    /// `write` variant that takes ownership of `data`.
-    ///
-    /// The actor hot path receives a `Vec<u8>` over the request channel
-    /// (the kernel IO buffer was copied into a `Vec` at the channel
-    /// boundary); calling this method instead of [`Volume::write`] hands
-    /// that `Vec` straight to `pending_entries`, removing one
-    /// full-payload memcpy per uncompressed write.
-    pub fn write_owned(&mut self, lba: u64, data: Vec<u8>) -> io::Result<()> {
-        self.write_inner(lba, Cow::Owned(data)).map(|_| ())
-    }
-
-    fn write_inner(&mut self, lba: u64, data: Cow<'_, [u8]>) -> io::Result<bool> {
-        validate_write_size(&data)?;
-        let hash = blake3::hash(&data);
-        self.write_with_hash_inner(lba, data, hash)
-    }
-
-    /// Like `write`, but with a caller-supplied hash. Returns `Ok(true)` if
-    /// the write was committed to the WAL, `Ok(false)` if the no-op skip
-    /// short-circuited it.
+    /// Like [`Volume::write`], but with a caller-supplied hash. Returns
+    /// `Ok(true)` if the write was committed to the WAL, `Ok(false)` if
+    /// the no-op skip short-circuited it.
     ///
     /// Used by callers that have already hashed `data` (notably extent
     /// reclamation, which hashes off-actor in phase 2 and would otherwise
@@ -626,16 +612,41 @@ impl Volume {
         data: &[u8],
         hash: blake3::Hash,
     ) -> io::Result<bool> {
-        self.write_with_hash_inner(lba, Cow::Borrowed(data), hash)
+        validate_write_size(data)?;
+        let compressed = maybe_compress(data);
+        self.commit_or_skip(lba, data, hash, compressed.as_deref())
     }
 
-    fn write_with_hash_inner(
+    /// Like [`Volume::write`], but with the BLAKE3 hash *and* the lz4
+    /// compression decision precomputed by the caller.
+    ///
+    /// Used by [`crate::actor::VolumeClient::write`] to keep both passes
+    /// off the volume mutex so concurrent writers can hash and compress
+    /// in parallel. The caller MUST pass `blake3::hash(data)` for `hash`
+    /// and `maybe_compress(data).as_deref()` for `compressed` (i.e.
+    /// `Some(lz4_bytes)` iff compression cleared the ratio threshold,
+    /// otherwise `None`).
+    pub fn write_precomputed(
         &mut self,
         lba: u64,
-        data: Cow<'_, [u8]>,
+        data: &[u8],
         hash: blake3::Hash,
+        compressed: Option<&[u8]>,
+    ) -> io::Result<()> {
+        validate_write_size(data)?;
+        self.commit_or_skip(lba, data, hash, compressed).map(|_| ())
+    }
+
+    /// Run the no-op skip check, then dispatch to [`Self::write_commit`].
+    /// Returns `Ok(true)` if the write was committed, `Ok(false)` if it
+    /// was a no-op.
+    fn commit_or_skip(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+        hash: blake3::Hash,
+        compressed: Option<&[u8]>,
     ) -> io::Result<bool> {
-        validate_write_size(&data)?;
         let lba_length = (data.len() / 4096) as u32;
 
         // No-op skip — pure LBA map lookup, zero body I/O. BLAKE3
@@ -649,7 +660,7 @@ impl Volume {
             return Ok(false);
         }
 
-        self.write_commit(lba, lba_length, data, hash)?;
+        self.write_commit(lba, lba_length, data, hash, compressed)?;
         Ok(true)
     }
 
@@ -659,17 +670,13 @@ impl Volume {
         &mut self,
         lba: u64,
         lba_length: u32,
-        data: Cow<'_, [u8]>,
+        data: &[u8],
         hash: blake3::Hash,
+        compressed: Option<&[u8]>,
     ) -> io::Result<()> {
-        let compressed_data = maybe_compress(&data);
-        let compressed = compressed_data.is_some();
-        // Compressed: take the lz4 output (always owned).
-        // Uncompressed: hand the caller's Cow straight through —
-        // `into_owned` is a move when we received `Cow::Owned`, and falls
-        // back to `to_vec` only when we were given a borrow.
-        let owned_data: Vec<u8> = compressed_data.unwrap_or_else(|| data.into_owned());
-        let wal_flags = if compressed {
+        let bytes_to_write: &[u8] = compressed.unwrap_or(data);
+        let is_compressed = compressed.is_some();
+        let wal_flags = if is_compressed {
             writelog::WalFlags::COMPRESSED
         } else {
             writelog::WalFlags::empty()
@@ -695,24 +702,20 @@ impl Volume {
             return Ok(());
         }
 
-        let seg_flags = if compressed {
+        let seg_flags = if is_compressed {
             segment::SegmentFlags::COMPRESSED
         } else {
             segment::SegmentFlags::empty()
         };
 
-        let stored_length = owned_data.len() as u32;
+        let stored_length = bytes_to_write.len() as u32;
         let (body_offset, wal_ulid) = {
             let open = self.ensure_wal_open()?;
             let offset = open
                 .wal
-                .append_data(lba, lba_length, &hash, wal_flags, &owned_data)?;
+                .append_data(lba, lba_length, &hash, wal_flags, bytes_to_write)?;
             (offset, open.ulid)
         };
-        // The body is now durable in the WAL — drop the heap copy. The
-        // promote path will pread it back from the WAL into a fresh
-        // `entry.data` just before writing the pending segment.
-        drop(owned_data);
         Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
@@ -722,7 +725,7 @@ impl Volume {
                 segment_id: wal_ulid,
                 body_offset,
                 body_length: stored_length,
-                compressed,
+                compressed: is_compressed,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,

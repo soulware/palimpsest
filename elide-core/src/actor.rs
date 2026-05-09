@@ -1375,11 +1375,21 @@ impl VolumeClient {
     /// lock so reads see the write atomically with `flush_gen`.  If the
     /// write pushed the WAL across the promote threshold, signals the
     /// actor after releasing the lock (fire-and-forget; idempotent).
+    ///
+    /// BLAKE3 hashing and lz4 compression both run on the calling thread
+    /// *before* the lock is taken, so concurrent ublk workers can do
+    /// this CPU-bound work in parallel; only the WAL append and map
+    /// updates serialise on the volume mutex.  Trade-off: a no-op skip
+    /// or a dedup-REF write computes lz4 output it then throws away —
+    /// fine for real ublk traffic, where the kernel page cache filters
+    /// unchanged pages and dedup hits are a small fraction of writes.
     pub fn write(&self, lba: u64, data: &[u8]) -> io::Result<()> {
+        let hash = blake3::hash(data);
+        let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
         let needs_promote = {
             let mut guard = lock_volume(&volume);
-            guard.write(lba, data)?;
+            guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
             publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
             guard.needs_promote()
         };
