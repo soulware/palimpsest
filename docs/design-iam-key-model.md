@@ -57,11 +57,46 @@ The coordinator manages four classes of key, plus a transient fifth.
 
 Operator-configured, never minted by the coordinator. Holds the IAM
 management actions needed to mint and rotate every other key. Never
-used for S3 data operations. Rotated rarely, by the operator.
+held by data-plane actors. Rotated rarely, by the operator.
 
-The admin key is **root-equivalent**: with `CreateAccessKey` +
-`CreatePolicy` + `AttachUserPolicy`, it can mint a new key with any
-policy it wants. Operators must guard it accordingly.
+**Tigris admin keys are org-global root.** Tigris's IAM policy
+language [supports only `s3:*` actions][tigris-iam-actions] — there
+is no way to express a key whose IAM management rights are scoped to
+specific actions, or to a single bucket, or to a policy-name prefix.
+The only knob Tigris exposes for "this key may manage other keys" is
+the [Admin RBAC role][tigris-rbac]; the Editor and ReadOnly roles
+cannot call `iam:CreatePolicy` or `iam:AttachUserPolicy` at all. An
+Admin-roled key has unrestricted access to every bucket and every
+operation across the entire organization.
+
+The admin key is therefore *literally* root for the org, not merely
+escalation-equivalent. A leaked admin key compromises every bucket
+the org owns, not just the Elide bucket. This is a Tigris IAM
+constraint, not an Elide design choice; it goes away if Tigris adds
+`iam:*` actions to their policy language, and *Admin key containment*
+below records the workarounds available until then.
+
+[tigris-iam-actions]: https://www.tigrisdata.com/docs/iam/policies/supported-actions/
+[tigris-rbac]: https://www.tigrisdata.com/docs/concepts/authnz/#role-based-access-control-rbac
+
+**Bucket-ownership requirement.** Even an admin key must be issued
+on the account that owns the bucket. Tigris gates `iam:CreatePolicy`
+on the referenced bucket: an IAM user that is a member of the
+bucket-owning account but does not own the bucket itself gets
+`Member users are not allowed to create policies for buckets they do
+not own` and the mint fails. Member-tier keys with full S3 read/write
+are sufficient for the data plane but cannot stand in as the admin
+key.
+
+**Spatial scope: today, every coordinator process on every host.**
+The admin key is read from operator-supplied env / config at
+coordinator start and held in memory for the process lifetime, on
+every host running a coordinator. Combined with the org-global
+nature of admin, this means a single compromised host yields full
+control of every Tigris bucket the operator owns. Containment
+options are discussed in *Admin key containment* below; on Tigris
+they are the only meaningful defenses, since capability-level
+scoping is not available.
 
 ### 2. Coordinator writer key
 
@@ -120,6 +155,64 @@ key — keeping the fetch key purely for `by_id/` data so the spawned
 worker has no path to the names index or coordinator identity
 records.
 
+## Admin key containment
+
+The admin key is org-global root (see § "Admin key" — *Tigris admin
+keys are org-global root*). Capability scoping — restricting the
+key to a subset of IAM actions, or to a specific bucket — is not
+available on Tigris today. Until that changes, only two axes shrink
+the exposed surface, and both are weaker than capability scoping
+would be.
+
+**Temporal scope.** The admin key is needed only at control-plane
+events: volume create, fork, claim, delete, periodic `DateLessThan`
+refresh, and the one-time bootstrap of writer / peer-fetch keys.
+Steady-state data-plane traffic doesn't touch it. The held key could
+be loaded on demand and dropped between operations rather than held
+for the process lifetime.
+
+The win is bounded: an attacker with code execution at a minting
+moment still wins, and an attacker with a heap-dump capture still
+wins if their capture is timed against a control-plane event.
+Temporal scope mainly closes the window against passive credential
+exfiltration (logs, core dumps, accidental memory snapshots taken at
+quiet moments). Cheap to implement and orthogonal to spatial scope,
+so worth doing alongside #1 below.
+
+**Spatial scope.** Today the admin key is held in every coordinator
+process on every host. Because admin is org-global, a single
+compromised host on Tigris yields every bucket the org owns — not
+just the Elide bucket. This makes spatial scoping the only material
+containment story available. Three structural alternatives, in order
+of how much they perturb the OSS shape:
+
+- **Per-host credentialer sidecar.** Separate local process per host;
+  coordinator IPCs to it. Same per-host blast radius (admin key is
+  still on every host), but a coordinator-process compromise no
+  longer yields the admin key directly. Smaller win on Tigris than
+  it would be elsewhere — the sidecar is itself a target on every
+  host, and a host compromise still reaches it.
+- **Central credentialer service.** Admin key lives in exactly one
+  process across the fleet; coordinators request keys via
+  authenticated RPC. Cleanest containment story for multi-host
+  fleets, and the natural home for centralized macaroon issuance and
+  credential refresh. Breaks the OSS "no coordinator-to-coordinator
+  RPC" rule, so it lands on the commercial side of the open-core
+  line. On Tigris this is also the *only* way to keep org-root off
+  most hosts.
+- **Designated admin coordinators.** A subset of coordinators in the
+  fleet hold the admin key; the rest delegate. Equivalent to the
+  central credentialer dressed as a coordinator; inherits the same
+  trade-offs without simplifying anything.
+
+OSS single-host deployments accept that the admin key is org-root on
+the box, on the basis that the trust boundary is already the host
+and the operator is its own threat model. Multi-host fleets where
+not every host should be equally trusted have no honest answer
+short of the central credentialer; on Tigris this is not a
+nice-to-have but the only way to avoid replicating org-root across
+the fleet.
+
 ## Per-volume scoping for writes (rejected)
 
 A natural extension would be to mint per-volume *writer* keys for the
@@ -164,9 +257,12 @@ change.
 
 ## Identity and host locality
 
-Tigris does **not** support tagging access keys, so identity is
-encoded in policy names instead. Each coordinator-managed policy is
-named with the coordinator's identity prefix:
+Tigris does **not** support tagging access keys, and `CreateAccessKey`
+takes no name / description parameter — every Elide-minted key
+appears in the Tigris console with the same default label (the SigV4
+signing region, e.g. `us-east-1`), regardless of purpose. Identity is
+therefore encoded in *policy* names instead. Each coordinator-managed
+policy is named with the coordinator's identity prefix:
 
 ```
 elide-<coordinator-ulid>-writer
@@ -255,31 +351,24 @@ correspond to an active fetch in the registry.
 
 ### Admin key (operator-attached)
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "ElideAdminKeyManagement",
-    "Effect": "Allow",
-    "Action": [
-      "iam:CreateAccessKey",
-      "iam:DeleteAccessKey",
-      "iam:UpdateAccessKey",
-      "iam:ListAccessKeys",
-      "iam:CreatePolicy",
-      "iam:DeletePolicy",
-      "iam:GetPolicy",
-      "iam:ListPolicies",
-      "iam:AttachUserPolicy",
-      "iam:DetachUserPolicy",
-      "iam:ListUserPolicies"
-    ],
-    "Resource": "*"
-  }]
-}
-```
+The IAM actions Elide invokes through the admin key are:
 
-No S3 access. Operator attaches; coordinator never modifies.
+- `iam:CreateAccessKey`, `iam:DeleteAccessKey`, `iam:UpdateAccessKey`,
+  `iam:ListAccessKeys`
+- `iam:CreatePolicy`, `iam:DeletePolicy`, `iam:GetPolicy`,
+  `iam:ListPolicies`
+- `iam:AttachUserPolicy`, `iam:DetachUserPolicy`,
+  `iam:ListUserPolicies`
+
+On a backend whose IAM policy language can express `iam:*` actions
+(AWS, generic S3-compatible IAM with a richer action set), an admin
+key would be attached a policy granting exactly this list and
+nothing else. Tigris's IAM policy language [supports only `s3:*`
+actions][tigris-iam-actions]; on Tigris the admin key cannot be
+expressed as a scoped policy at all and is instead a global
+admin-flagged key (org-global root — see § "Admin key" — *Tigris
+admin keys are org-global root*). The list above is what the
+implementation invokes; it is not an attachable policy on Tigris.
 
 ### Coordinator writer key
 
@@ -405,10 +494,10 @@ small amount of policy size and nothing else.
   available as a hardening option for deployments with stable
   egress.
 - **Coordinator privilege ceiling.** The admin key is the only
-  privileged credential; a host running the coordinator must guard
-  it accordingly. The writer, peer-fetch, and per-volume keys are
-  individually scoped, and a leak of any one bounds the damage to
-  that key's policy.
+  privileged credential; the writer, peer-fetch, and per-volume
+  keys are individually scoped, and a leak of any one bounds the
+  damage to that key's policy. Containment of the admin key itself
+  is discussed in § "Admin key containment".
 - **Wildcard resource patterns.** Several policies above (peer-fetch
   in particular) rely on mid-resource wildcards
   (`by_id/*/volume.pub`). Verify Tigris's S3 IAM supports this
