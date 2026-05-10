@@ -34,6 +34,17 @@ enum Command {
         command: VolumeCommand,
     },
 
+    /// Fetch every live segment body for a foreign volume into the local
+    /// cache (spawned by coordinator; not for direct use). The fork
+    /// directory must already have `index/` populated by the
+    /// coordinator's manifest-driven pull; this subcommand only runs
+    /// the body-warm pass and exits.
+    #[command(hide = true)]
+    FetchVolume {
+        /// Path to the foreign volume directory (by_id/<ulid>/).
+        fork_dir: PathBuf,
+    },
+
     /// Serve an elide volume over ublk (spawned by coordinator; not for direct use)
     #[command(hide = true)]
     ServeVolume {
@@ -331,6 +342,31 @@ enum VolumeCommand {
     /// Import an OCI image into a new readonly volume (sync by default)
     Import(ImportArgs),
 
+    /// Fetch a foreign volume's bytes into the local cache without
+    /// claiming it.
+    ///
+    /// Resolves `<name>` against the bucket's `names/<name>` record,
+    /// pulls the ancestor skeleton chain, fetches and verifies the
+    /// volume's most recent owner-signed snapshot manifest, pulls
+    /// every `.idx` it references, and runs the body-warm pass to
+    /// completion. On success a `volume.fetched` marker is written —
+    /// the volume is then locally addressable via `<name>` for a
+    /// subsequent `volume claim`, but no ownership is taken.
+    ///
+    /// Fails if the remote has no published snapshot. Snapshot
+    /// cadence is the current owner's responsibility; the claim-time
+    /// gap after fetch is bounded by the time between the basis
+    /// snapshot and the eventual claim.
+    Fetch {
+        /// Volume name (resolved against bucket `names/<name>`).
+        name: String,
+        /// Return as soon as the job is registered; do not stream
+        /// progress. Use `volume fetch <name> --attach` (TODO) to
+        /// reattach later.
+        #[arg(long)]
+        detach: bool,
+    },
+
     /// Evict locally cached data so it is demand-fetched on next read
     ///
     /// Deletes cache/<ulid>.body and cache/<ulid>.present for segments where
@@ -519,7 +555,7 @@ fn main() {
     // to the operator's terminal. Every other subcommand is
     // short-lived CLI work and logs to stderr only.
     match &args.command {
-        Command::ServeVolume { fork_dir, .. } => {
+        Command::ServeVolume { fork_dir, .. } | Command::FetchVolume { fork_dir, .. } => {
             // fork_dir is `<data_dir>/by_id/<ulid>/`, so data_dir is two
             // levels up. Fall back to `data_dir` from the CLI flag if the
             // path shape is unexpected — init failure should not stop the
@@ -572,6 +608,27 @@ fn main() {
                     }
                 }
             }
+
+            VolumeCommand::Fetch { name, detach } => match coord.fetch_start(&name) {
+                Ok(reply) => {
+                    println!(
+                        "fetching {name} (vol {}) against snapshot {}",
+                        reply.vol_ulid, reply.basis_snapshot
+                    );
+                    if detach {
+                        return;
+                    }
+                    let mut stdout = std::io::stdout();
+                    if let Err(e) = coord.fetch_attach_by_name(&name, &mut stdout) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
 
             VolumeCommand::Snapshot { name } => match coord.snapshot_volume(&name) {
                 Ok(ulid) => println!("{ulid}"),
@@ -971,6 +1028,13 @@ fn main() {
                 .expect("volume.provenance signature check failed");
             }
             serve::run_volume_ipc_only(&fork_dir, fetch_config).expect("volume daemon error");
+        }
+
+        Command::FetchVolume { fork_dir } => {
+            if let Err(e) = elide::fetch_volume::run(&fork_dir) {
+                eprintln!("fetch worker error: {e}");
+                std::process::exit(1);
+            }
         }
 
         Command::Extents {

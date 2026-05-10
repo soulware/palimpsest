@@ -68,6 +68,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // threading from `daemon::run`.
     elide_coordinator::config::set_store_config(config.store.clone());
     let socket_path = config.resolved_socket_path();
+    elide_coordinator::config::set_coordinator_socket_path(socket_path.clone());
     let data_dir = Arc::new(config.data_dir.clone());
     let child_env: supervisor::ChildEnv = {
         let mut env = config.store.child_env();
@@ -195,6 +196,10 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // `claim-start` flow's foreign-content branch.
     let claim_registry = crate::claim::new_registry();
 
+    // Fetch job registry: tracks in-flight `volume fetch` jobs that
+    // warm a foreign volume's local cache without claiming the name.
+    let fetch_registry = crate::fetch::new_registry();
+
     // Per-fork eviction channel registry.
     let evict_registry: EvictRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -225,6 +230,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             data_dir: data_dir.clone(),
             registry: import_registry.clone(),
             fork_registry: fork_registry.clone(),
+            fetch_registry: fetch_registry.clone(),
             claim_registry: claim_registry.clone(),
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),

@@ -43,7 +43,7 @@ use elide_coordinator::ipc::{
     VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{
-    IMPORTING_FILE, PID_FILE, STOPPED_FILE, write_released_marker,
+    FETCH_PID_FILE, IMPORTING_FILE, PID_FILE, STOPPED_FILE, write_released_marker,
 };
 use elide_coordinator::{EvictRegistry, PrefetchTracker, SnapshotLockRegistry, subscribe_prefetch};
 use elide_core::process::pid_is_alive;
@@ -63,6 +63,7 @@ pub struct IpcContext {
     pub data_dir: Arc<PathBuf>,
     pub registry: ImportRegistry,
     pub fork_registry: ForkRegistry,
+    pub fetch_registry: crate::fetch::FetchRegistry,
     pub claim_registry: ClaimRegistry,
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
@@ -126,6 +127,15 @@ impl IpcContext {
         crate::import::ImportContext {
             core: self.core(),
             registry: self.registry.clone(),
+        }
+    }
+
+    /// Construct a [`crate::fetch::FetchContext`] — the hot core plus
+    /// the fetch registry.
+    pub(crate) fn for_fetch(&self) -> crate::fetch::FetchContext {
+        crate::fetch::FetchContext {
+            core: self.core(),
+            registry: self.fetch_registry.clone(),
         }
     }
 }
@@ -372,6 +382,16 @@ async fn dispatch_json(
             let env: Envelope<RegisterReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
+        Request::RegisterFetchWorker { volume_ulid } => {
+            let result = register_fetch_worker(
+                volume_ulid,
+                &ctx.data_dir,
+                peer_pid,
+                ctx.identity.macaroon_root(),
+            );
+            let env: Envelope<RegisterReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
         Request::Credentials { macaroon } => {
             let result = issue_credentials(
                 &macaroon,
@@ -406,6 +426,19 @@ async fn dispatch_json(
         }
         Request::ClaimAttach { volume } => {
             stream_claim_by_name(&volume, writer, &ctx.claim_registry).await;
+        }
+        Request::FetchStart { volume } => {
+            let result = crate::fetch::start_fetch(volume, ctx.for_fetch()).await;
+            let env: Envelope<elide_coordinator::ipc::FetchStartReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::FetchStatus { volume } => {
+            let result = fetch_status_by_name(&volume, &ctx.fetch_registry);
+            let env: Envelope<elide_coordinator::ipc::FetchStatusReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::FetchAttach { volume } => {
+            stream_fetch_by_name(&volume, writer, &ctx.fetch_registry).await;
         }
         Request::Shutdown { keep_volumes } => {
             // Reply ok first, then trigger the signal: the daemon's
@@ -2411,24 +2444,36 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
 /// hostile caller can't tell apart "no such volume", "pid not yet recorded"
 /// (the spawn-write race), or "pid mismatch".
 fn check_peer_pid(vol_dir: &Path, peer_pid: Option<i32>) -> Result<i32, String> {
+    check_peer_pid_against(vol_dir, peer_pid, PID_FILE)
+}
+
+/// Generalized PID handshake: read `<vol_dir>/<pid_filename>`, check
+/// it parses as an integer, and verify it matches `peer_pid` (the
+/// `SO_PEERCRED` value supplied by the IPC layer). Used by
+/// [`register_volume`] (against `volume.pid`) and
+/// [`register_fetch_worker`] (against `fetch.pid`).
+fn check_peer_pid_against(
+    vol_dir: &Path,
+    peer_pid: Option<i32>,
+    pid_filename: &str,
+) -> Result<i32, String> {
     let peer_pid = peer_pid.ok_or_else(|| "err peer pid unavailable".to_string())?;
-    let pid_path = vol_dir.join(PID_FILE);
+    let pid_path = vol_dir.join(pid_filename);
     let recorded: i32 = match std::fs::read_to_string(&pid_path) {
         Ok(s) => s
             .trim()
             .parse()
-            .map_err(|_| "err volume.pid is not numeric".to_string())?,
-        // The supervisor writes volume.pid right after spawn returns. There is
-        // a brief window where a fast-starting volume can dial control.sock
-        // before the parent has written the file — the volume retries, so we
-        // simply report "not registered" and let the caller back off.
+            .map_err(|_| format!("err {pid_filename} is not numeric"))?,
+        // Brief window between spawn and parent writing the pidfile:
+        // a fast-starting child can dial the socket before the parent
+        // has written the file — caller retries on this error class.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err("err volume not registered".to_string());
         }
-        Err(e) => return Err(format!("err reading volume.pid: {e}")),
+        Err(e) => return Err(format!("err reading {pid_filename}: {e}")),
     };
     if recorded != peer_pid {
-        return Err("err peer pid does not match volume.pid".to_string());
+        return Err(format!("err peer pid does not match {pid_filename}"));
     }
     Ok(peer_pid)
 }
@@ -2444,12 +2489,44 @@ fn register_volume(
     if !vol_dir.exists() {
         return Err(IpcError::not_found("unknown volume"));
     }
-    let pid = check_peer_pid(&vol_dir, peer_pid).map_err(IpcError::forbidden)?;
+    let pid = check_peer_pid_against(&vol_dir, peer_pid, PID_FILE).map_err(IpcError::forbidden)?;
     let m = macaroon::mint(
         macaroon_root,
         vec![
             Caveat::Volume(ulid_str),
             Caveat::Scope(Scope::Credentials),
+            Caveat::Pid(pid),
+        ],
+    );
+    Ok(RegisterReply {
+        macaroon: m.encode(),
+        peer_endpoint: None,
+    })
+}
+
+/// Mint a macaroon for a coordinator-spawned `elide fetch-volume`
+/// worker. Mirrors [`register_volume`] but PID-checks against
+/// `fetch.pid` instead of `volume.pid`, and stamps the macaroon with
+/// `Scope::FetchWorker` so it can't be confused with a credentials-
+/// scoped daemon macaroon.
+fn register_fetch_worker(
+    volume_ulid: ulid::Ulid,
+    data_dir: &Path,
+    peer_pid: Option<i32>,
+    macaroon_root: &[u8; 32],
+) -> Result<RegisterReply, IpcError> {
+    let ulid_str = volume_ulid.to_string();
+    let vol_dir = data_dir.join("by_id").join(&ulid_str);
+    if !vol_dir.exists() {
+        return Err(IpcError::not_found("unknown volume"));
+    }
+    let pid =
+        check_peer_pid_against(&vol_dir, peer_pid, FETCH_PID_FILE).map_err(IpcError::forbidden)?;
+    let m = macaroon::mint(
+        macaroon_root,
+        vec![
+            Caveat::Volume(ulid_str),
+            Caveat::Scope(Scope::FetchWorker),
             Caveat::Pid(pid),
         ],
     );
@@ -2493,8 +2570,14 @@ fn issue_credentials(
         // from "tampered caveats".
         return Err(IpcError::forbidden("invalid macaroon"));
     }
-    if m.scope() != Some(Scope::Credentials) {
-        return Err(IpcError::forbidden("macaroon scope mismatch"));
+    // Both Credentials (volume daemon) and FetchWorker (fetch
+    // worker) macaroons grant the same downstream creds — they're
+    // distinguished only so that a leaked fetch macaroon can't be
+    // re-presented as a daemon credential at some future verb that
+    // checks `Scope::Credentials` specifically.
+    match m.scope() {
+        Some(Scope::Credentials) | Some(Scope::FetchWorker) => {}
+        _ => return Err(IpcError::forbidden("macaroon scope mismatch")),
     }
     let volume_ulid = m
         .volume()
@@ -2543,6 +2626,76 @@ fn issue_credentials(
 /// Stream buffered and live fork events to `writer` as a sequence of
 /// [`Envelope<ForkAttachEvent>`] messages, terminating with either
 /// `ForkAttachEvent::Done` (success) or `Envelope::Err` (failure).
+fn fetch_status_by_name(
+    volume: &str,
+    registry: &crate::fetch::FetchRegistry,
+) -> Result<elide_coordinator::ipc::FetchStatusReply, IpcError> {
+    let job = {
+        let reg = registry.lock().expect("fetch registry poisoned");
+        reg.get(volume).cloned()
+    };
+    let Some(job) = job else {
+        return Err(IpcError::not_found(format!(
+            "no active fetch for: {volume}"
+        )));
+    };
+    match job.state() {
+        crate::fetch::FetchJobState::Running => {
+            Ok(elide_coordinator::ipc::FetchStatusReply::Running)
+        }
+        crate::fetch::FetchJobState::Done => Ok(elide_coordinator::ipc::FetchStatusReply::Done),
+        crate::fetch::FetchJobState::Failed(err) => Err(err),
+    }
+}
+
+async fn stream_fetch_by_name(
+    volume: &str,
+    writer: &mut OwnedWriteHalf,
+    registry: &crate::fetch::FetchRegistry,
+) {
+    use elide_coordinator::ipc::FetchAttachEvent;
+    async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
+        let env: Envelope<FetchAttachEvent> = Envelope::err(error);
+        let _ = ipc::write_message(writer, &env).await;
+    }
+
+    let job = {
+        let reg = registry.lock().expect("fetch registry poisoned");
+        reg.get(volume).cloned()
+    };
+    let Some(job) = job else {
+        write_err(
+            writer,
+            IpcError::not_found(format!("no active fetch for: {volume}")),
+        )
+        .await;
+        return;
+    };
+
+    let mut offset = 0;
+    loop {
+        let events = job.read_from(offset);
+        for event in &events {
+            let env: Envelope<FetchAttachEvent> = Envelope::ok(event.clone());
+            if ipc::write_message(writer, &env).await.is_err() {
+                return;
+            }
+        }
+        offset += events.len();
+
+        match job.state() {
+            crate::fetch::FetchJobState::Done => return,
+            crate::fetch::FetchJobState::Failed(err) => {
+                write_err(writer, err).await;
+                return;
+            }
+            crate::fetch::FetchJobState::Running => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 async fn stream_fork_by_name(new_name: &str, writer: &mut OwnedWriteHalf, registry: &ForkRegistry) {
     async fn write_err(writer: &mut OwnedWriteHalf, error: IpcError) {
         let env: Envelope<ForkAttachEvent> = Envelope::err(error);
@@ -3420,6 +3573,7 @@ mod tests {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
+            fetch_registry: crate::fetch::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),

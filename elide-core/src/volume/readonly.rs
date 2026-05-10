@@ -30,7 +30,7 @@ use super::{
 pub struct ReadonlyVolume {
     base_dir: PathBuf,
     ancestor_layers: Vec<AncestorLayer>,
-    lbamap: lbamap::LbaMap,
+    lbamap: Arc<lbamap::LbaMap>,
     extent_index: Arc<extentindex::ExtentIndex>,
     file_cache: RefCell<FileCache>,
     dmat_cache: DmatCache,
@@ -50,7 +50,7 @@ impl ReadonlyVolume {
         Ok(Self {
             base_dir: fork_dir.to_owned(),
             ancestor_layers,
-            lbamap,
+            lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
             file_cache: RefCell::new(FileCache::default()),
             dmat_cache: RefCell::new(HashMap::new()),
@@ -64,6 +64,13 @@ impl ReadonlyVolume {
     /// same `Arc<SegmentPresence>` reachable from the read path.
     pub fn extent_index_arc(&self) -> Arc<extentindex::ExtentIndex> {
         Arc::clone(&self.extent_index)
+    }
+
+    /// Return the LBA map and extent index as shared references. Mirrors
+    /// `Volume::snapshot_maps`; used by the fetch worker to drive
+    /// `full_warm` against a readonly view.
+    pub fn snapshot_maps(&self) -> (Arc<lbamap::LbaMap>, Arc<extentindex::ExtentIndex>) {
+        (Arc::clone(&self.lbamap), Arc::clone(&self.extent_index))
     }
 
     /// Read 4 KiB blocks starting at `start_lba` into the caller-supplied `buf`.
