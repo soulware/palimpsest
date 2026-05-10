@@ -245,6 +245,36 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
     Ok(layers)
 }
 
+/// Union of ancestor volume ULIDs whose `by_id/<ulid>/` prefix the
+/// volume's read path may visit: the fork-parent chain plus every
+/// extent-index source recursively reachable from this volume or its
+/// parents.
+///
+/// Order: deduplicated, deterministic insertion order (fork-parent
+/// chain oldest-first, then extent-index sources). Used to build the
+/// per-volume IAM read policy at fork time.
+pub fn lineage_ulids(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ulid>> {
+    use std::collections::HashSet;
+
+    let mut out: Vec<Ulid> = Vec::new();
+    let mut seen: HashSet<Ulid> = HashSet::new();
+    let push = |dir: &Path, out: &mut Vec<Ulid>, seen: &mut HashSet<Ulid>| {
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str())
+            && let Ok(u) = Ulid::from_string(name)
+            && seen.insert(u)
+        {
+            out.push(u);
+        }
+    };
+    for layer in walk_ancestors(fork_dir, by_id_dir)? {
+        push(&layer.dir, &mut out, &mut seen);
+    }
+    for layer in walk_extent_ancestors(fork_dir, by_id_dir)? {
+        push(&layer.dir, &mut out, &mut seen);
+    }
+    Ok(out)
+}
+
 /// Return the latest snapshot ULID for a fork, or `None` if no
 /// snapshots exist. Snapshots are recorded as `<ulid>.manifest` files
 /// under `fork_dir/snapshots/`; the manifest's presence is the
@@ -483,5 +513,52 @@ mod tests {
         assert_eq!(fork_chain[0].dir, p_dir);
         assert_eq!(extent_chain.len(), 1);
         assert_eq!(extent_chain[0].dir, x_dir);
+    }
+
+    // --- lineage_ulids tests ---
+
+    #[test]
+    fn lineage_ulids_root_is_empty() {
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        assert!(lineage_ulids(&vol_dir, &by_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lineage_ulids_unions_fork_and_extent_chains() {
+        // Same shape as walk_extent_ancestors_combined_with_walk_ancestors:
+        // c has parent p and extent-index source x. lineage_ulids returns
+        // both, deduplicated, fork-chain-first.
+        let by_id = temp_dir();
+        let p_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let x_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let c_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let c_dir = by_id.join(c_ulid);
+        let parent_entry = format!("{p_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let extent_entry = format!("{x_ulid}/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        write_test_provenance(&c_dir, Some(&parent_entry), &[&extent_entry]);
+
+        let chain = lineage_ulids(&c_dir, &by_id).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0], Ulid::from_string(p_ulid).unwrap());
+        assert_eq!(chain[1], Ulid::from_string(x_ulid).unwrap());
+    }
+
+    #[test]
+    fn lineage_ulids_dedupes_when_extent_source_is_also_fork_parent() {
+        // Pathological but possible: a volume's extent_index lists its
+        // own fork parent. Both walks would return P; lineage_ulids
+        // collapses to one entry.
+        let by_id = temp_dir();
+        let p_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let c_ulid = "01CCCCCCCCCCCCCCCCCCCCCCCC";
+        let c_dir = by_id.join(c_ulid);
+        let parent_entry = format!("{p_ulid}/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let extent_entry = format!("{p_ulid}/01BX5ZZKJKTSV4RRFFQ69G5FAV");
+        write_test_provenance(&c_dir, Some(&parent_entry), &[&extent_entry]);
+
+        let chain = lineage_ulids(&c_dir, &by_id).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0], Ulid::from_string(p_ulid).unwrap());
     }
 }

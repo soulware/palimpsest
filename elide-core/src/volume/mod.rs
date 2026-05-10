@@ -56,8 +56,8 @@ mod repack;
 mod wal;
 
 pub use ancestry::{
-    latest_snapshot, resolve_ancestor_dir, verify_ancestor_manifests, walk_ancestors,
-    walk_extent_ancestors,
+    latest_snapshot, lineage_ulids, resolve_ancestor_dir, verify_ancestor_manifests,
+    walk_ancestors, walk_extent_ancestors,
 };
 pub(crate) use compress::maybe_compress;
 #[cfg(test)]

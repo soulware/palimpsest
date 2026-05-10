@@ -96,6 +96,13 @@ pub struct CoordinatorConfig {
     /// off-by-default.
     #[serde(default)]
     pub peer_fetch: PeerFetchConfig,
+
+    /// IAM-managed credentials. Optional; absence keeps the shared-key
+    /// downgrade (every volume gets the coordinator's own key).
+    /// Presence enables Tigris-style per-volume IAM keys
+    /// (`docs/design-iam-key-model.md`).
+    #[serde(default)]
+    pub iam: Option<IamConfig>,
 }
 
 impl CoordinatorConfig {
@@ -514,6 +521,18 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # retention_window     = "10m"   # how long GC inputs stay in S3 before reaping
 # max_buckets_per_tick = 4       # max independent output buckets per GC tick
 
+[iam]
+# Presence of this section enables Tigris-style per-volume IAM keys
+# (docs/design-iam-key-model.md). Absence keeps the shared-key
+# downgrade where every volume gets the coordinator's own AWS_* key.
+#
+# endpoint = "https://iam.storage.dev"           # Tigris IAM endpoint
+# region   = "us-east-1"                          # SigV4 signing region
+# admin_access_key_id_env     = "ELIDE_IAM_ADMIN_ACCESS_KEY_ID"
+# admin_secret_access_key_env = "ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY"
+# ro_key_lifetime = "720h"                       # DateLessThan default
+# source_ips      = []                            # optional egress IP pins
+
 [peer_fetch]
 # Setting `port` enables peer fetch: the coordinator binds an HTTP server on
 # this port and advertises it at `coordinators/<id>/peer-endpoint.toml` for
@@ -550,6 +569,7 @@ impl Default for CoordinatorConfig {
             elide_import_bin: default_elide_import_bin(),
             gc: GcConfig::default(),
             peer_fetch: PeerFetchConfig::default(),
+            iam: None,
         }
     }
 }
@@ -578,6 +598,97 @@ pub struct PeerFetchConfig {
     /// balancer). Only relevant when `port` is set.
     #[serde(default)]
     pub host: Option<String>,
+}
+
+/// IAM-managed credentials. Enables per-volume IAM keys via the
+/// Tigris IAM API (`docs/design-iam-key-model.md`).
+///
+/// The admin key is operator-configured and never persisted on disk;
+/// `admin_access_key_id_env` / `admin_secret_access_key_env` name the
+/// env vars the coordinator reads at startup. We do NOT reuse
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for two reasons: the
+/// coordinator's own S3 client also reads those, and the IAM admin key
+/// is a *strictly stronger* credential than the S3 store key — the
+/// design treats them as separate principals.
+#[derive(Deserialize, Clone, Debug)]
+pub struct IamConfig {
+    /// Tigris IAM endpoint. Defaults to `https://iam.storage.dev`.
+    #[serde(default = "default_iam_endpoint")]
+    pub endpoint: String,
+
+    /// SigV4 signing region. Defaults to `us-east-1` (matches the
+    /// AWS-CLI default for IAM; Tigris IAM is region-agnostic).
+    #[serde(default = "default_iam_region")]
+    pub region: String,
+
+    /// Env var holding the admin access key ID. Default:
+    /// `ELIDE_IAM_ADMIN_ACCESS_KEY_ID`.
+    #[serde(default = "default_admin_key_id_env")]
+    pub admin_access_key_id_env: String,
+
+    /// Env var holding the admin secret. Default:
+    /// `ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY`.
+    #[serde(default = "default_admin_secret_env")]
+    pub admin_secret_access_key_env: String,
+
+    /// Default lifetime of per-volume RO key policies (`DateLessThan`
+    /// in the policy condition). Refreshed on a schedule before
+    /// expiry; see `docs/design-iam-key-model.md` § "Lifecycle".
+    /// Default: 30 days.
+    #[serde(default = "default_ro_key_lifetime", with = "humantime_serde")]
+    pub ro_key_lifetime: Duration,
+
+    /// Optional egress IP CIDR(s) added as an `IpAddress` condition on
+    /// per-volume RO keys (defence-in-depth). Empty = no IP pin.
+    #[serde(default)]
+    pub source_ips: Vec<String>,
+}
+
+fn default_iam_endpoint() -> String {
+    "https://iam.storage.dev".to_owned()
+}
+fn default_iam_region() -> String {
+    "us-east-1".to_owned()
+}
+fn default_admin_key_id_env() -> String {
+    "ELIDE_IAM_ADMIN_ACCESS_KEY_ID".to_owned()
+}
+fn default_admin_secret_env() -> String {
+    "ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY".to_owned()
+}
+fn default_ro_key_lifetime() -> Duration {
+    Duration::from_secs(30 * 24 * 60 * 60)
+}
+
+/// Admin credentials resolved from env at startup. Held only in
+/// memory; never written to disk.
+#[derive(Clone)]
+pub struct IamAdminCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+impl IamConfig {
+    /// Resolve the admin credentials from env. Returns an error with
+    /// the missing var name so operators can act on it directly. The
+    /// error path is the only place the env var name is exposed in
+    /// logs; the values themselves are never logged.
+    pub fn resolve_admin(&self) -> Result<IamAdminCredentials> {
+        let access_key_id = std::env::var(&self.admin_access_key_id_env)
+            .with_context(|| format!("reading {}", self.admin_access_key_id_env))?;
+        if access_key_id.is_empty() {
+            bail!("{} is set but empty", self.admin_access_key_id_env);
+        }
+        let secret_access_key = std::env::var(&self.admin_secret_access_key_env)
+            .with_context(|| format!("reading {}", self.admin_secret_access_key_env))?;
+        if secret_access_key.is_empty() {
+            bail!("{} is set but empty", self.admin_secret_access_key_env);
+        }
+        Ok(IamAdminCredentials {
+            access_key_id,
+            secret_access_key,
+        })
+    }
 }
 
 impl PeerFetchConfig {
@@ -737,6 +848,49 @@ mod tests {
 
         let no_explicit_no_hostname = PeerFetchConfig::default();
         assert_eq!(no_explicit_no_hostname.advertised_host(None), "0.0.0.0");
+    }
+
+    #[test]
+    fn iam_section_absent_by_default() {
+        let cfg = CoordinatorConfig::default();
+        assert!(cfg.iam.is_none());
+    }
+
+    #[test]
+    fn iam_section_parses_with_defaults() {
+        let toml_str = "[iam]\n";
+        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
+        let iam = cfg.iam.expect("iam present");
+        assert_eq!(iam.endpoint, "https://iam.storage.dev");
+        assert_eq!(iam.region, "us-east-1");
+        assert_eq!(iam.admin_access_key_id_env, "ELIDE_IAM_ADMIN_ACCESS_KEY_ID");
+        assert_eq!(
+            iam.admin_secret_access_key_env,
+            "ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY"
+        );
+        assert_eq!(iam.ro_key_lifetime, Duration::from_secs(30 * 24 * 60 * 60));
+        assert!(iam.source_ips.is_empty());
+    }
+
+    #[test]
+    fn iam_section_parses_overrides() {
+        let toml_str = r#"
+            [iam]
+            endpoint = "https://iam.example.test"
+            region = "eu-west-1"
+            admin_access_key_id_env = "MY_ID"
+            admin_secret_access_key_env = "MY_SECRET"
+            ro_key_lifetime = "24h"
+            source_ips = ["203.0.113.5/32"]
+        "#;
+        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
+        let iam = cfg.iam.expect("iam present");
+        assert_eq!(iam.endpoint, "https://iam.example.test");
+        assert_eq!(iam.region, "eu-west-1");
+        assert_eq!(iam.admin_access_key_id_env, "MY_ID");
+        assert_eq!(iam.admin_secret_access_key_env, "MY_SECRET");
+        assert_eq!(iam.ro_key_lifetime, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(iam.source_ips, vec!["203.0.113.5/32".to_owned()]);
     }
 
     #[test]
