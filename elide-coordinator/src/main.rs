@@ -17,6 +17,7 @@ mod fork;
 mod import;
 mod inbound;
 mod macaroon;
+mod pidfile;
 mod rescan;
 mod shutdown;
 mod supervisor;

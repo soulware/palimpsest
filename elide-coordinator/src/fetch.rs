@@ -413,20 +413,6 @@ fn plant_by_name_symlink(
     Ok(())
 }
 
-/// RAII guard that removes `fetch.pid` from the fork dir on drop.
-/// Ensures the pidfile is always cleaned up — on success, on
-/// `IpcError`, on panic — so a stale `fetch.pid` never authorises a
-/// rogue process.
-struct FetchPidGuard {
-    path: PathBuf,
-}
-
-impl Drop for FetchPidGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 async fn spawn_fetch_worker(
     fork_dir: &Path,
     volume_name: &str,
@@ -450,15 +436,12 @@ async fn spawn_fetch_worker(
         cmd.env("ELIDE_COORDINATOR_SOCKET", sock);
     }
 
-    #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(std::io::Error::from)
-        });
-    }
-
+    // Fetch worker inherits the coordinator's session/process group:
+    // a fetch is an admin task warming a cache no one is reading yet,
+    // and is expected to die with the coordinator (Ctrl-C in
+    // foreground; cgroup kill under systemd `KillMode=control-group`).
+    // Coordinator-driven shutdown still SIGTERMs explicitly via
+    // `terminate_fork_processes` for `KillMode=process` deployments.
     let mut child = cmd
         .spawn()
         .map_err(|e| IpcError::internal(format!("spawning elide fetch-volume worker: {e}")))?;
@@ -470,19 +453,12 @@ async fn spawn_fetch_worker(
     // never authorise a process the coordinator didn't spawn. The
     // worker-side retry loop absorbs the brief window where the
     // worker dials before this write lands.
-    let _pid_guard: Option<FetchPidGuard> = match child.id() {
-        Some(pid) => {
-            let pid_path = fork_dir.join(elide_coordinator::volume_state::FETCH_PID_FILE);
-            std::fs::write(&pid_path, pid.to_string())
-                .map_err(|e| IpcError::internal(format!("writing {}: {e}", pid_path.display())))?;
-            Some(FetchPidGuard { path: pid_path })
-        }
-        None => {
-            return Err(IpcError::internal(
-                "fetch worker spawned but pid is unavailable (already exited?)",
-            ));
-        }
-    };
+    let pid = child.id().ok_or_else(|| {
+        IpcError::internal("fetch worker spawned but pid is unavailable (already exited?)")
+    })?;
+    let pid_path = fork_dir.join(elide_coordinator::volume_state::FETCH_PID_FILE);
+    let _pid_guard = crate::pidfile::PidFileGuard::write(pid_path, pid)
+        .map_err(|e| IpcError::internal(format!("writing fetch.pid: {e}")))?;
 
     // Pipe stderr lines into the job event log so attached subscribers
     // see worker progress. The Arc<FetchJob> outlives the task: it's

@@ -452,13 +452,16 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             tasks.abort_all();
 
             if keep {
-                // Rolling-upgrade path: leave volume children running.
-                // They were spawned with setsid and survive coordinator
-                // exit; their pid files remain so the next coordinator
-                // instance adopts them on its first scan.
+                // Rolling-upgrade path: leave volume daemons running.
+                // Volume daemons are session-leaders (setsid) and
+                // survive coordinator exit; their pid files remain so
+                // the next coordinator instance adopts them on its
+                // first scan. Any in-flight import or fetch worker is
+                // expected to share the coordinator's session and is
+                // not retained across restart.
                 info!("[coordinator] leaving volume processes running");
             } else {
-                // SIGTERM every volume and import process across all known volumes.
+                // SIGTERM every volume, import, and fetch process across all known volumes.
                 let all_pids: Vec<u32> = known
                     .keys()
                     .flat_map(|vol_dir| import::terminate_fork_processes(vol_dir))

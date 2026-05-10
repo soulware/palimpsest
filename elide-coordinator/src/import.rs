@@ -369,19 +369,12 @@ pub async fn spawn_import(
         cmd.arg("--extent-source").arg(entry);
     }
 
-    // Place the child in a new session so it is not affected by the
-    // coordinator's lifetime. pre_exec is unsafe because the callback runs
-    // between fork() and exec() where only async-signal-safe functions may be
-    // called. setsid() is async-signal-safe.
-    #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(std::io::Error::from)
-        });
-    }
-
+    // Import inherits the coordinator's session/process group: an
+    // import is an admin task with no live consumers, and is expected
+    // to die with the coordinator (Ctrl-C in foreground; cgroup kill
+    // under systemd `KillMode=control-group`). Coordinator-driven
+    // shutdown still SIGTERMs explicitly via `terminate_fork_processes`
+    // for `KillMode=process` deployments.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -395,13 +388,16 @@ pub async fn spawn_import(
     };
 
     let pid = child.id().unwrap_or(0);
-    if let Err(e) = std::fs::write(vol_dir.join(IMPORT_PID_FILE), pid.to_string()) {
-        // Best-effort: kill the child since we won't be tracking it.
-        let _ = child.start_kill();
-        let _ = std::fs::remove_file(&symlink_path);
-        let _ = std::fs::remove_dir_all(&vol_dir);
-        return Err(e);
-    }
+    let pid_guard = match crate::pidfile::PidFileGuard::write(vol_dir.join(IMPORT_PID_FILE), pid) {
+        Ok(g) => g,
+        Err(e) => {
+            // Best-effort: kill the child since we won't be tracking it.
+            let _ = child.start_kill();
+            let _ = std::fs::remove_file(&symlink_path);
+            let _ = std::fs::remove_dir_all(&vol_dir);
+            return Err(e);
+        }
+    };
 
     let job = ImportJob::new(vol_dir.clone(), pid);
     registry
@@ -435,6 +431,11 @@ pub async fn spawn_import(
     let async_identity = identity.clone();
     let async_vol_dir = vol_dir.clone();
     tokio::spawn(async move {
+        // The pidfile guard moves into this task so it's dropped on
+        // every exit path (success, failure, panic, runtime
+        // cancellation). Removes import.pid; importing-marker cleanup
+        // stays explicit below.
+        let _pid_guard = pid_guard;
         // Stream stderr into the job's output buffer.
         if let Some(stderr) = child.stderr.take() {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
@@ -532,7 +533,6 @@ pub async fn spawn_import(
 
         job.finish(final_state);
         let _ = std::fs::remove_file(async_vol_dir.join(IMPORTING_FILE));
-        let _ = std::fs::remove_file(async_vol_dir.join(IMPORT_PID_FILE));
     });
 
     info!("[import {import_ulid}] started pid {pid} for {vol_name} from {oci_ref}");
@@ -599,69 +599,57 @@ fn cleanup_stale_lock_in(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(IMPORT_PID_FILE));
 }
 
-/// Send SIGTERM to the import process in `fork_dir`, if one is recorded.
-/// Returns true if a signal was sent.
-pub fn kill_import(fork_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(fork_dir.join(IMPORT_PID_FILE)) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return false;
-    };
-    if !is_alive(pid) {
-        return false;
-    }
-    sigterm(pid);
-    true
-}
-
-/// Send SIGTERM to the volume and import processes in `fork_dir`.
+/// Send SIGTERM to the volume, import, and fetch worker processes in
+/// `fork_dir`.
 ///
 /// Returns the PIDs that were signalled so the caller can wait for them
-/// to exit. Used for clean coordinator shutdown in foreground mode.
+/// to exit. Used for clean coordinator shutdown in foreground mode and
+/// for the `--stop-volumes` daemon-shutdown path. Volume daemons are
+/// session-leaders and only signalled here on explicit operator
+/// request; import and fetch workers share the coordinator's session
+/// and are signalled unconditionally so the coordinator does not leak
+/// admin-task processes.
 pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
     let mut pids = Vec::new();
     let label = fork_dir.display();
 
-    if let Ok(text) = std::fs::read_to_string(fork_dir.join(PID_FILE))
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && is_alive(pid)
-    {
-        sigterm(pid);
-        info!("[coordinator] SIGTERM volume pid={pid} in {label}");
-        pids.push(pid);
-    }
-
-    if let Ok(text) = std::fs::read_to_string(fork_dir.join(IMPORT_PID_FILE))
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && is_alive(pid)
-    {
-        sigterm(pid);
-        info!("[coordinator] SIGTERM import pid={pid} in {label}");
-        pids.push(pid);
+    for (filename, role) in [
+        (PID_FILE, "volume"),
+        (IMPORT_PID_FILE, "import"),
+        (elide_coordinator::volume_state::FETCH_PID_FILE, "fetch"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(fork_dir.join(filename))
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && is_alive(pid)
+        {
+            sigterm(pid);
+            info!("[coordinator] SIGTERM {role} pid={pid} in {label}");
+            pids.push(pid);
+        }
     }
 
     pids
 }
 
-/// Send SIGTERM to the volume and import processes in `vol_dir`, then wait
-/// briefly for them to exit. Used by the `delete` operation.
+/// Send SIGTERM to the volume, import, and fetch processes in
+/// `vol_dir`, then wait briefly for them to exit. Used by the `delete`
+/// operation.
 pub fn kill_all_for_volume(vol_dir: &Path) {
-    if let Ok(text) = std::fs::read_to_string(vol_dir.join(PID_FILE))
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && is_alive(pid)
-    {
-        sigterm(pid);
-        info!(
-            "[import] sent SIGTERM to volume process pid={pid} in {}",
-            vol_dir.display()
-        );
-    }
-    if kill_import(vol_dir) {
-        info!(
-            "[import] sent SIGTERM to import process in {}",
-            vol_dir.display()
-        );
+    for (filename, role) in [
+        (PID_FILE, "volume"),
+        (IMPORT_PID_FILE, "import"),
+        (elide_coordinator::volume_state::FETCH_PID_FILE, "fetch"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(vol_dir.join(filename))
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && is_alive(pid)
+        {
+            sigterm(pid);
+            info!(
+                "[import] sent SIGTERM to {role} process pid={pid} in {}",
+                vol_dir.display()
+            );
+        }
     }
 
     // Brief pause to allow processes to exit before we remove the directory.
