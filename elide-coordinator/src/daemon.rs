@@ -163,13 +163,15 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // per-volume RO keys (docs/design-iam-key-model.md). Absent
     // section keeps the shared-key downgrade — every volume gets the
     // coordinator's own AWS_* key.
-    let iam_manager: Option<std::sync::Arc<crate::iam::VolumeIamManager>> = match &config.iam {
+    let credentialer: Option<std::sync::Arc<dyn crate::credential::Credentialer>> = match &config
+        .iam
+    {
         Some(iam_cfg) => {
             let bucket = config.store.bucket.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "[iam] section requires an S3 store with `bucket` set (no IAM keys for local stores)"
-                )
-            })?;
+                    anyhow::anyhow!(
+                        "[iam] section requires an S3 store with `bucket` set (no IAM keys for local stores)"
+                    )
+                })?;
             let admin = iam_cfg.resolve_admin().with_context(
                 || "resolving IAM admin credentials from env (set via the env vars named in [iam])",
             )?;
@@ -188,13 +190,17 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 iam_cfg.source_ips.clone(),
             )
             .map_err(|e| anyhow::anyhow!("building IAM manager: {e}"))?;
-            let manager = std::sync::Arc::new(manager);
-            set_credential_issuer(crate::iam::IamCredentialIssuer::new(manager.clone()));
+            let credentialer: std::sync::Arc<dyn crate::credential::Credentialer> =
+                std::sync::Arc::new(manager);
+            set_credential_issuer(crate::iam::IamCredentialIssuer::new(
+                credentialer.clone(),
+                config.data_dir.clone(),
+            ));
             info!(
                 "[coordinator] credential issuer: per-volume Tigris IAM (endpoint {})",
                 iam_cfg.endpoint
             );
-            Some(manager)
+            Some(credentialer)
         }
         None => {
             set_credential_issuer(SharedKeyPassthrough::new_with_warning());
@@ -279,7 +285,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             prefetch_tracker: prefetch_tracker.clone(),
             stores: stores.clone(),
             identity: identity.clone(),
-            iam_manager: iam_manager.clone(),
+            credentialer: credentialer.clone(),
         };
         tasks.spawn(async move {
             inbound::serve(&socket_path, ctx).await;

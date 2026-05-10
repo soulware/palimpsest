@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::credential::{CredentialIssuer, IssuedCredentials};
+use crate::credential::{CredentialIssuer, Credentialer, IssuedCredentials};
 
 /// Non-secret per-volume IAM inventory persisted to
 /// `<data_dir>/by_id/<vol_ulid>/iam.json`. Mirrors the JSON sketch in
@@ -84,13 +84,7 @@ impl VolumeIamManager {
         })
     }
 
-    /// Provision (or return cached) per-volume RO credentials.
-    ///
-    /// On cache miss we mint a fresh access key + a `DateLessThan`
-    /// policy scoped to the volume's lineage, attach the policy, then
-    /// persist `iam.json`. The secret is held only in the in-memory
-    /// cache — design doc § "Inventory".
-    pub async fn provision(
+    async fn provision_volume_ro_inner(
         &self,
         vol_ulid: Ulid,
         ancestors: &[Ulid],
@@ -203,10 +197,7 @@ impl VolumeIamManager {
         Ok(creds)
     }
 
-    /// Tear down a volume's IAM key + policy. Best-effort: an error in
-    /// any step is logged and the next step still runs, so a partial
-    /// failure leaves as little orphan IAM state as possible.
-    pub async fn release(&self, vol_ulid: Ulid) {
+    async fn release_volume_ro_inner(&self, vol_ulid: Ulid) {
         let persisted = match read_iam_json(&self.data_dir, &vol_ulid) {
             Ok(Some(p)) => p,
             Ok(None) => return,
@@ -240,16 +231,39 @@ impl VolumeIamManager {
     }
 }
 
-/// `CredentialIssuer` impl that vends per-volume RO credentials from a
-/// [`VolumeIamManager`]. On a cache miss the underlying manager mints
-/// fresh credentials.
+#[async_trait]
+impl Credentialer for VolumeIamManager {
+    async fn provision_volume_ro(
+        &self,
+        vol_ulid: Ulid,
+        ancestors: &[Ulid],
+    ) -> io::Result<IssuedCredentials> {
+        self.provision_volume_ro_inner(vol_ulid, ancestors).await
+    }
+
+    async fn release_volume_ro(&self, vol_ulid: Ulid) {
+        self.release_volume_ro_inner(vol_ulid).await
+    }
+}
+
+/// `CredentialIssuer` impl that vends per-volume RO credentials by
+/// delegating to a [`Credentialer`]. The issuer loads the volume's
+/// ancestor chain from local provenance and passes it to the
+/// credentialer; the credentialer itself only sees ULIDs and never
+/// touches local state, so the same impl works whether the
+/// credentialer is in-process, a sidecar over UDS, or a remote
+/// service.
 pub struct IamCredentialIssuer {
-    manager: Arc<VolumeIamManager>,
+    credentialer: Arc<dyn Credentialer>,
+    data_dir: PathBuf,
 }
 
 impl IamCredentialIssuer {
-    pub fn new(manager: Arc<VolumeIamManager>) -> Self {
-        Self { manager }
+    pub fn new(credentialer: Arc<dyn Credentialer>, data_dir: PathBuf) -> Self {
+        Self {
+            credentialer,
+            data_dir,
+        }
     }
 }
 
@@ -258,11 +272,13 @@ impl CredentialIssuer for IamCredentialIssuer {
     async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials> {
         let vol_ulid = Ulid::from_string(volume_id)
             .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
-        let by_id_dir = self.manager.data_dir.join("by_id");
+        let by_id_dir = self.data_dir.join("by_id");
         let fork_dir = by_id_dir.join(vol_ulid.to_string());
         let ancestors = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)
             .map_err(|e| io::Error::other(format!("loading ancestor chain: {e}")))?;
-        self.manager.provision(vol_ulid, &ancestors).await
+        self.credentialer
+            .provision_volume_ro(vol_ulid, &ancestors)
+            .await
     }
 }
 
@@ -376,5 +392,105 @@ mod tests {
             format_unix_iso8601(1_778_371_200 + 13 * 3600 + 45 * 60 + 9),
             "2026-05-10T13:45:09Z"
         );
+    }
+
+    /// `Credentialer` stub that records every `provision_volume_ro` call
+    /// so `IamCredentialIssuer` tests can assert what (vol_ulid,
+    /// ancestors) tuple the issuer derived from local provenance.
+    #[derive(Default)]
+    struct RecordingCredentialer {
+        calls: std::sync::Mutex<Vec<(Ulid, Vec<Ulid>)>>,
+    }
+
+    #[async_trait]
+    impl Credentialer for RecordingCredentialer {
+        async fn provision_volume_ro(
+            &self,
+            vol_ulid: Ulid,
+            ancestors: &[Ulid],
+        ) -> io::Result<IssuedCredentials> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((vol_ulid, ancestors.to_vec()));
+            Ok(IssuedCredentials {
+                access_key_id: "stub".into(),
+                secret_access_key: "stub".into(),
+                session_token: None,
+                expiry_unix: Some(0),
+            })
+        }
+
+        async fn release_volume_ro(&self, _vol_ulid: Ulid) {}
+    }
+
+    #[tokio::test]
+    async fn issuer_root_volume_passes_empty_ancestors() {
+        // No volume.provenance on disk → load_lineage_or_empty returns
+        // a default lineage → walk_ancestors and walk_extent_ancestors
+        // both return empty → IamCredentialIssuer must call the
+        // credentialer with an empty ancestor slice.
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let vol_ulid = Ulid::new();
+        let vol_dir = by_id.join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+
+        let recorder = Arc::new(RecordingCredentialer::default());
+        let issuer = IamCredentialIssuer::new(recorder.clone(), tmp.path().to_path_buf());
+
+        issuer.issue(&vol_ulid.to_string()).await.unwrap();
+
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, vol_ulid);
+        assert!(
+            calls[0].1.is_empty(),
+            "root volume must yield no ancestors; got {:?}",
+            calls[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_forked_volume_passes_parent_ulid() {
+        // Child's signed provenance lists `parent_ulid` as fork parent.
+        // IamCredentialIssuer must load the chain and pass [parent_ulid]
+        // to the credentialer — this is the regression guard for the
+        // empty-ancestor bug fixed earlier in the IAM branch.
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let parent_ulid = Ulid::new();
+        let child_ulid = Ulid::new();
+        let snapshot_ulid = Ulid::new();
+        let child_dir = by_id.join(child_ulid.to_string());
+        std::fs::create_dir_all(&child_dir).unwrap();
+
+        let lineage = elide_core::signing::ProvenanceLineage {
+            parent: Some(elide_core::signing::ParentRef {
+                volume_ulid: parent_ulid.to_string(),
+                snapshot_ulid: snapshot_ulid.to_string(),
+                pubkey: [0u8; 32],
+                manifest_pubkey: None,
+            }),
+            extent_index: vec![],
+            oci_source: None,
+        };
+        elide_core::signing::setup_readonly_identity(
+            &child_dir,
+            elide_core::signing::VOLUME_PUB_FILE,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &lineage,
+        )
+        .unwrap();
+
+        let recorder = Arc::new(RecordingCredentialer::default());
+        let issuer = IamCredentialIssuer::new(recorder.clone(), tmp.path().to_path_buf());
+
+        issuer.issue(&child_ulid.to_string()).await.unwrap();
+
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, child_ulid);
+        assert_eq!(calls[0].1, vec![parent_ulid]);
     }
 }

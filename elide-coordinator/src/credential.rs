@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use tracing::warn;
+use ulid::Ulid;
 
 /// Credentials issued to a volume in response to an authenticated
 /// `credentials` request.
@@ -44,6 +45,34 @@ pub struct IssuedCredentials {
 #[async_trait]
 pub trait CredentialIssuer: Send + Sync {
     async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials>;
+}
+
+/// Lower-layer abstraction over whatever component actually mints
+/// per-volume IAM material. The in-process Tigris implementation
+/// (`crate::iam::VolumeIamManager`) talks directly to the Tigris IAM
+/// Query API; alternative implementations could speak the same trait
+/// over a Unix-domain socket to a sidecar process or over an
+/// authenticated network channel to a central credentialer service —
+/// see `docs/design-iam-key-model.md` § "Admin key containment".
+///
+/// Today the trait carries only the per-volume RO key lifecycle.
+/// Writer / peer-fetch / ephemeral fetch keys land here as those
+/// slices are wired.
+#[async_trait]
+pub trait Credentialer: Send + Sync {
+    /// Mint (or return cached) per-volume read-only credentials whose
+    /// policy grants `s3:GetObject` on `by_id/<vol_ulid>/*` plus every
+    /// ancestor prefix in `ancestors`.
+    async fn provision_volume_ro(
+        &self,
+        vol_ulid: Ulid,
+        ancestors: &[Ulid],
+    ) -> io::Result<IssuedCredentials>;
+
+    /// Tear down a volume's RO key + policy. Best-effort: a remote
+    /// implementation may log and proceed if individual IAM calls fail
+    /// rather than propagate the error.
+    async fn release_volume_ro(&self, vol_ulid: Ulid);
 }
 
 /// Returns the coordinator's own configured access key for every volume.

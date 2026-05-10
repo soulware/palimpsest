@@ -29,7 +29,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tracing::{info, warn};
 
 use crate::claim::{ClaimJobState, ClaimRegistry};
-use crate::credential::{CredentialIssuer, credential_issuer};
+use crate::credential::{CredentialIssuer, Credentialer, credential_issuer};
 use crate::fork::{ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
@@ -76,11 +76,11 @@ pub struct IpcContext {
     /// MAC root (`identity.macaroon_root()`). Arc-shared so per-
     /// connection clones stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    /// IAM manager, present only when the `[iam]` config section is set.
+    /// Credentialer, present only when the `[iam]` config section is set.
     /// Used by the volume-delete path to tear down the per-volume RO
     /// key + policy. Absent in the shared-key downgrade — that path
     /// has no IAM state to clean up.
-    pub iam_manager: Option<Arc<crate::iam::VolumeIamManager>>,
+    pub credentialer: Option<Arc<dyn Credentialer>>,
 }
 
 /// Universal coordinator state — every IPC handler and every domain
@@ -361,8 +361,8 @@ async fn dispatch_json(
             // After local removal, tear down the per-volume IAM key +
             // policy. Best-effort: any IAM error is logged inside
             // `release` and does not block the IPC reply.
-            if let (Ok(Some(vol_ulid)), Some(manager)) = (&result, ctx.iam_manager.as_ref()) {
-                manager.release(*vol_ulid).await;
+            if let (Ok(Some(vol_ulid)), Some(credentialer)) = (&result, ctx.credentialer.as_ref()) {
+                credentialer.release_volume_ro(*vol_ulid).await;
             }
             let env: Envelope<()> = result.map(|_| ()).into();
             let _ = ipc::write_message(writer, &env).await;
@@ -3612,7 +3612,7 @@ mod tests {
                 store.clone(),
             )),
             identity,
-            iam_manager: None,
+            credentialer: None,
         };
 
         let err = release_volume_op("vol", &store, &ctx)
