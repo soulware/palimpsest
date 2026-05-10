@@ -20,6 +20,7 @@ mod macaroon;
 mod pidfile;
 mod rescan;
 mod shutdown;
+mod start_remote;
 mod supervisor;
 mod ublk_sweep;
 
