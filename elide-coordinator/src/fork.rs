@@ -689,7 +689,12 @@ async fn force_snapshot_now_op(
     )
     .map_err(|e| IpcError::internal(format!("attestation keypair: {e}")))?;
 
-    // Step 5: sign + write manifest locally.
+    // Step 5: sign + write manifest locally. The ancestor dir may have
+    // been freshly minted by `pull_volume_skeleton`, which only creates
+    // `index/` — `snapshots/` doesn't exist yet on a recovery path.
+    let snapshots_dir = ancestor_dir.join("snapshots");
+    std::fs::create_dir_all(&snapshots_dir)
+        .map_err(|e| IpcError::internal(format!("creating snapshots dir: {e}")))?;
     elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments, None)
         .map_err(|e| IpcError::internal(format!("writing snapshot manifest: {e}")))?;
 
