@@ -14,6 +14,7 @@ mod credential;
 mod daemon;
 mod fetch;
 mod fork;
+mod iam;
 mod import;
 mod inbound;
 mod macaroon;

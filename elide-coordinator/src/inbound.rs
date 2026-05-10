@@ -76,6 +76,11 @@ pub struct IpcContext {
     /// MAC root (`identity.macaroon_root()`). Arc-shared so per-
     /// connection clones stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    /// IAM manager, present only when the `[iam]` config section is set.
+    /// Used by the volume-delete path to tear down the per-volume RO
+    /// key + policy. Absent in the shared-key downgrade — that path
+    /// has no IAM state to clean up.
+    pub iam_manager: Option<Arc<crate::iam::VolumeIamManager>>,
 }
 
 /// Universal coordinator state — every IPC handler and every domain
@@ -353,7 +358,13 @@ async fn dispatch_json(
         }
         Request::Remove { volume, force } => {
             let result = remove_volume(&volume, force, &ctx.data_dir).await;
-            let env: Envelope<()> = result.into();
+            // After local removal, tear down the per-volume IAM key +
+            // policy. Best-effort: any IAM error is logged inside
+            // `release` and does not block the IPC reply.
+            if let (Ok(Some(vol_ulid)), Some(manager)) = (&result, ctx.iam_manager.as_ref()) {
+                manager.release(*vol_ulid).await;
+            }
+            let env: Envelope<()> = result.map(|_| ()).into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume } => {
@@ -399,7 +410,8 @@ async fn dispatch_json(
                 peer_pid,
                 ctx.identity.macaroon_root(),
                 credential_issuer(),
-            );
+            )
+            .await;
             let env: Envelope<StoreCredsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -1013,7 +1025,11 @@ async fn volume_events_typed(
 ///
 /// `force = true` skips the second check, accepting that any local-only
 /// pending segments or unflushed WAL records will be discarded.
-async fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Result<(), IpcError> {
+async fn remove_volume(
+    volume_name: &str,
+    force: bool,
+    data_dir: &Path,
+) -> Result<Option<ulid::Ulid>, IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return Err(IpcError::not_found(format!(
@@ -1023,6 +1039,13 @@ async fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Resul
 
     let vol_dir = std::fs::canonicalize(&link)
         .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
+    // Volume directory is `by_id/<ulid>`; extract the ULID for the
+    // post-delete IAM cleanup hook. Returning it from this function
+    // keeps the dispatch site free of path-canonicalisation logic.
+    let vol_ulid = vol_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok());
 
     if !vol_dir.join(STOPPED_FILE).exists() {
         return Err(IpcError::conflict(
@@ -1056,7 +1079,7 @@ async fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> Resul
     }
 
     info!("[inbound] removed volume {volume_name}");
-    Ok(())
+    Ok(vol_ulid)
 }
 
 /// Read the bound ublk `dev_id` from `vol_dir/volume.toml`, if any.
@@ -2556,7 +2579,7 @@ async fn resolve_peer_endpoint_for_volume(
         .map(|d| d.endpoint)
 }
 
-fn issue_credentials(
+async fn issue_credentials(
     macaroon_str: &str,
     data_dir: &Path,
     peer_pid: Option<i32>,
@@ -2607,6 +2630,7 @@ fn issue_credentials(
     }
     let creds = issuer
         .issue(volume_ulid)
+        .await
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
     info!(
         target: "creds::issuance",
@@ -2792,8 +2816,9 @@ mod tests {
     use tempfile::TempDir;
 
     struct FixedIssuer;
+    #[async_trait::async_trait]
     impl CredentialIssuer for FixedIssuer {
-        fn issue(&self, _vol: &str) -> std::io::Result<IssuedCredentials> {
+        async fn issue(&self, _vol: &str) -> std::io::Result<IssuedCredentials> {
             Ok(IssuedCredentials {
                 access_key_id: "AK".into(),
                 secret_access_key: "SK".into(),
@@ -2864,8 +2889,8 @@ mod tests {
         assert!(err.message.contains("unknown volume"), "{err}");
     }
 
-    #[test]
-    fn credentials_round_trip_with_live_pid() {
+    #[tokio::test]
+    async fn credentials_round_trip_with_live_pid() {
         let tmp = TempDir::new().unwrap();
         let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         // Use our own pid so the pid_is_alive check passes inside the handler.
@@ -2881,13 +2906,14 @@ mod tests {
             &key(),
             &issuer,
         )
+        .await
         .expect("credentials should succeed");
         assert_eq!(creds.access_key_id, "AK");
         assert_eq!(creds.secret_access_key, "SK");
     }
 
-    #[test]
-    fn credentials_rejects_wrong_root_key() {
+    #[tokio::test]
+    async fn credentials_rejects_wrong_root_key() {
         let tmp = TempDir::new().unwrap();
         let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
@@ -2904,13 +2930,14 @@ mod tests {
             &other,
             &issuer,
         )
+        .await
         .expect_err("wrong root key should fail");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(err.message.contains("invalid macaroon"), "{err}");
     }
 
-    #[test]
-    fn credentials_rejects_pid_mismatch() {
+    #[tokio::test]
+    async fn credentials_rejects_pid_mismatch() {
         let tmp = TempDir::new().unwrap();
         let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
@@ -2926,6 +2953,7 @@ mod tests {
             &key(),
             &issuer,
         )
+        .await
         .expect_err("pid mismatch should fail");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(
@@ -2935,8 +2963,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn credentials_rejects_tampered_caveat() {
+    #[tokio::test]
+    async fn credentials_rejects_tampered_caveat() {
         let tmp = TempDir::new().unwrap();
         let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
@@ -2960,13 +2988,14 @@ mod tests {
         let forged = macaroon::mint(&[0u8; 32], caveats);
         let issuer = FixedIssuer;
         let err = issue_credentials(&forged.encode(), tmp.path(), Some(my_pid), &key(), &issuer)
+            .await
             .expect_err("tampered caveat should fail");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(err.message.contains("invalid macaroon"), "{err}");
     }
 
-    #[test]
-    fn credentials_rejects_expired_macaroon() {
+    #[tokio::test]
+    async fn credentials_rejects_expired_macaroon() {
         let tmp = TempDir::new().unwrap();
         let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let my_pid = std::process::id() as i32;
@@ -2982,6 +3011,7 @@ mod tests {
         );
         let issuer = FixedIssuer;
         let err = issue_credentials(&m.encode(), tmp.path(), Some(my_pid), &key(), &issuer)
+            .await
             .expect_err("expired macaroon should fail");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(err.message.contains("expired"), "{err}");
@@ -3582,6 +3612,7 @@ mod tests {
                 store.clone(),
             )),
             identity,
+            iam_manager: None,
         };
 
         let err = release_volume_op("vol", &store, &ctx)

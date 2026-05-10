@@ -16,6 +16,7 @@
 use std::io;
 use std::sync::OnceLock;
 
+use async_trait::async_trait;
 use tracing::warn;
 
 /// Credentials issued to a volume in response to an authenticated
@@ -36,8 +37,13 @@ pub struct IssuedCredentials {
 /// see only the volume ULID and the coordinator's configured store; the
 /// macaroon handshake (volume binding, PID check, MAC verify) runs
 /// upstream and is identical for every backend.
+///
+/// `issue` is async because the IAM-backed impl may need to call out to
+/// the IAM service to mint or rotate per-volume keys. The shared-key
+/// passthrough impl returns immediately from cache.
+#[async_trait]
 pub trait CredentialIssuer: Send + Sync {
-    fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials>;
+    async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials>;
 }
 
 /// Returns the coordinator's own configured access key for every volume.
@@ -67,8 +73,9 @@ impl SharedKeyPassthrough {
     }
 }
 
+#[async_trait]
 impl CredentialIssuer for SharedKeyPassthrough {
-    fn issue(&self, _volume_id: &str) -> io::Result<IssuedCredentials> {
+    async fn issue(&self, _volume_id: &str) -> io::Result<IssuedCredentials> {
         if let Some(c) = self.cached.get() {
             return Ok(c.clone());
         }

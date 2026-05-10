@@ -158,7 +158,49 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // can read it without us threading the value through. `None` when
     // peer-fetch is unconfigured.
     elide_coordinator::tasks::set_peer_fetch_handle(peer_fetch_handle);
-    set_credential_issuer(SharedKeyPassthrough::new_with_warning());
+
+    // Credential issuer: the [iam] config section enables Tigris-style
+    // per-volume RO keys (docs/design-iam-key-model.md). Absent
+    // section keeps the shared-key downgrade — every volume gets the
+    // coordinator's own AWS_* key.
+    let iam_manager: Option<std::sync::Arc<crate::iam::VolumeIamManager>> = match &config.iam {
+        Some(iam_cfg) => {
+            let bucket = config.store.bucket.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[iam] section requires an S3 store with `bucket` set (no IAM keys for local stores)"
+                )
+            })?;
+            let admin = iam_cfg.resolve_admin().with_context(
+                || "resolving IAM admin credentials from env (set via the env vars named in [iam])",
+            )?;
+            let mut tigris_cfg = elide_tigris_iam::TigrisIamConfig::tigris(
+                admin.access_key_id,
+                admin.secret_access_key,
+            );
+            tigris_cfg.endpoint = iam_cfg.endpoint.clone();
+            tigris_cfg.region = iam_cfg.region.clone();
+            let manager = crate::iam::VolumeIamManager::new(
+                tigris_cfg,
+                bucket,
+                identity.coordinator_id_str().to_owned(),
+                config.data_dir.clone(),
+                iam_cfg.ro_key_lifetime,
+                iam_cfg.source_ips.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("building IAM manager: {e}"))?;
+            let manager = std::sync::Arc::new(manager);
+            set_credential_issuer(crate::iam::IamCredentialIssuer::new(manager.clone()));
+            info!(
+                "[coordinator] credential issuer: per-volume Tigris IAM (endpoint {})",
+                iam_cfg.endpoint
+            );
+            Some(manager)
+        }
+        None => {
+            set_credential_issuer(SharedKeyPassthrough::new_with_warning());
+            None
+        }
+    };
 
     info!(
         "[coordinator] data_dir: {}; drain every {}, scan every {}; elide bin: {}",
@@ -237,6 +279,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             prefetch_tracker: prefetch_tracker.clone(),
             stores: stores.clone(),
             identity: identity.clone(),
+            iam_manager: iam_manager.clone(),
         };
         tasks.spawn(async move {
             inbound::serve(&socket_path, ctx).await;
