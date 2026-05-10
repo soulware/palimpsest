@@ -258,11 +258,11 @@ impl CredentialIssuer for IamCredentialIssuer {
     async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials> {
         let vol_ulid = Ulid::from_string(volume_id)
             .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
-        // Initial pass: ancestor_chain is empty for fresh volumes;
-        // forks pass their lineage when this is invoked from the fork
-        // path (not yet wired in the issuer call — fork support is the
-        // next slice).
-        self.manager.provision(vol_ulid, &[]).await
+        let by_id_dir = self.manager.data_dir.join("by_id");
+        let fork_dir = by_id_dir.join(vol_ulid.to_string());
+        let ancestors = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)
+            .map_err(|e| io::Error::other(format!("loading ancestor chain: {e}")))?;
+        self.manager.provision(vol_ulid, &ancestors).await
     }
 }
 
