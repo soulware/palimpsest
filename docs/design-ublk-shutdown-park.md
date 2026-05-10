@@ -78,7 +78,7 @@ Our current shutdown policy actively works against this: we use `USER_RECOVERY` 
 Separate "daemon stops" from "device is destroyed."
 
 - **Shutdown signal (SIGTERM/SIGINT/SIGHUP) leaves the device QUIESCED.** `kill_dev` (STOP_DEV) parks the device, queue threads exit, the daemon process exits, sysfs entry remains. `ublk.id` stays in place. Mount stays in place. Next serve at the same volume sees the QUIESCED device and takes the recovery path.
-- **Deletion becomes an explicit verb.** `elide ublk delete <id>` (already exists as a CLI) is the supported path. The coordinator runs a startup-time reconciliation sweep that deletes any sysfs ublk device whose `ublk.id` does not match a currently-known volume directory.
+- **Deletion becomes an explicit verb.** `elide ublk delete <id>` (already exists as a CLI) is the supported path. The coordinator runs a startup-time reconciliation sweep that deletes any sysfs ublk device *whose `target_data` stamp identifies it as belonging to this coordinator's `data_dir`* but no longer matches a known volume binding. Devices stamped for a foreign data_dir or carrying no elide stamp at all are left strictly alone.
 - **Device unbind = volume removal.** The volume itself getting deleted is the trigger for cleaning up its ublk device, not the daemon getting signaled. Deleting a volume implies stopping its daemon, then `del_dev`'ing its bound id, then removing the volume directory. The order matters and is now explicit.
 
 ### Operations ordering, restated
@@ -112,9 +112,14 @@ Recommendation: ship option 1 immediately under a clear comment ("intentional: l
 On coordinator startup, before the first scan tick:
 
 1. Enumerate `/sys/class/ublk-char/ublkc*` to get the set of live ublk dev ids.
-2. Walk `<data_dir>/by_id/*/ublk.id` to get the set of bound ids.
-3. For each live id with no matching binding: log + `del_dev`. (Same `new_simple+del_dev` pattern as the existing `ublk delete` CLI.)
-4. For each binding pointing at a non-existent live id: clear the file (the device was deleted out-of-band).
+2. For each live id, read its kernel `target_data` (libublk's `/run/ublksrvd/<id>.json`) and recover the `elide.volume_dir` ownership stamp. Drop ids that:
+   * have no `elide` stamp at all (foreign tool: libublk-loop, qemu, manual test device, unstamped legacy device), or
+   * have a stamp whose `volume_dir` is not under *this* coordinator's `<data_dir>/by_id/`.
+
+   Anything dropped here is explicitly out of scope — the sweep must never `del_dev` a device this coordinator did not create. Multiple coordinators sharing a host (test, dev, prod side-by-side) is a supported configuration: each scopes its sweep to its own data_dir.
+3. Walk `<data_dir>/by_id/*/ublk.id` to get the set of bound ids.
+4. For each *remaining* live id with no matching binding: log + `del_dev`. (Same `new_simple+del_dev` pattern as the existing `ublk delete` CLI.)
+5. For each binding pointing at a non-existent live id: clear the file (the device was deleted out-of-band).
 
 This sweep is idempotent and cheap. It runs once at coordinator startup; no need to run it on every tick.
 

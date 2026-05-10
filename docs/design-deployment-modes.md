@@ -6,7 +6,7 @@
 
 The coordinator today launches every long-running child (volume daemon, import worker, fetch worker) the same way: `Command::spawn` with `setsid`, plus a per-fork pidfile and an in-process supervisor loop. That model is uniform but blurs an important distinction:
 
-- A **volume daemon** has live consumers (a VM via ublk, an application via NBD) and must outlive a coordinator restart — bouncing the coordinator (rolling upgrade, panic, `systemctl restart`) must not drag the data plane with it.
+- A **volume daemon** has live consumers (a VM via ublk) and must outlive a coordinator restart — bouncing the coordinator (rolling upgrade, panic, `systemctl restart`) must not drag the data plane with it.
 - An **import worker** and a **fetch worker** are admin batch jobs with no live consumers. They are restartable and idempotent; tying their lifetime to the coordinator is the natural fit.
 
 The volume-survival goal also turns out to be incompatible with shipping a default systemd unit: `KillMode=control-group` (the systemd default) sweeps every PID in the unit's cgroup on stop, regardless of `setsid`. cgroup membership is independent of session/process-group, so the current `setsid` is not load-bearing under systemd.

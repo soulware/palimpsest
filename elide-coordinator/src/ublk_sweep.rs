@@ -11,12 +11,18 @@
 // `reconcile` runs once at coordinator startup and brings the two sources of
 // truth back into agreement:
 //
-//   1. Enumerate `/sys/class/ublk-char/ublkc<N>` to get the set of live ids.
-//   2. Walk `<data_dir>/by_id/*/volume.toml` for `[ublk] dev_id` values.
-//   3. Live id with no matching binding → orphan: kill_dev + del_dev via
-//      libublk on a `tokio::task::spawn_blocking` thread (bounded by a
-//      per-device timeout).
-//   4. Binding pointing at a non-existent live id → stale: clear the
+//   1. Enumerate `/sys/class/ublk-char/ublkc<N>` for live ids.
+//   2. For each live id, read libublk's `target_data` and keep only ids
+//      stamped with `elide.volume_dir` under *this* coordinator's
+//      `<data_dir>/by_id/`. Foreign-coord devices, non-elide devices
+//      (libublk-loop, qemu, manual test devices), and unstamped legacy
+//      devices are dropped from consideration here and never touched —
+//      multiple coordinators sharing a host is a supported configuration.
+//   3. Walk `<data_dir>/by_id/*/volume.toml` for `[ublk] dev_id` values.
+//   4. Remaining live id with no matching binding → orphan: kill_dev +
+//      del_dev via libublk on a `tokio::task::spawn_blocking` thread
+//      (bounded by a per-device timeout).
+//   5. Binding pointing at a non-existent live id → stale: clear the
 //      `dev_id` field (preserving the `[ublk]` section). The next serve
 //      sees no bound id + no sysfs entry and does a fresh ADD.
 //
@@ -26,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const SYSFS_UBLK_CHAR: &str = "/sys/class/ublk-char";
 
@@ -43,7 +49,7 @@ const PER_DEV_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// keep starting even if a kernel device cannot be deleted (operator can
 /// retry via `elide ublk delete --all`).
 pub async fn reconcile(data_dir: &Path) {
-    let live = match scan_sysfs() {
+    let live_all = match scan_sysfs() {
         Ok(set) => set,
         Err(e) => {
             // ENOENT is the normal case on non-Linux or hosts without the
@@ -57,6 +63,9 @@ pub async fn reconcile(data_dir: &Path) {
             return;
         }
     };
+
+    let by_id_root = data_dir.join("by_id");
+    let live = filter_owned_by(live_all, &by_id_root, read_owner_volume_dir);
 
     let bindings = scan_bindings(data_dir);
     let (orphans, stale_bindings) = diff(&live, &bindings);
@@ -81,6 +90,80 @@ pub async fn reconcile(data_dir: &Path) {
             warn!("[ublk-sweep] clear dev_id in {}: {e}", vol_dir.display());
         }
     }
+}
+
+/// Drop any live id whose `target_data` does not stamp it as owned by a
+/// volume directory under `by_id_root`. The `read_stamp` callback returns
+/// the stamped `volume_dir` if present, `None` otherwise; injected so the
+/// pure decision logic can be exercised without a kernel.
+///
+/// Skipped ids are logged at debug to make multi-coord / shared-host
+/// behaviour discoverable without spamming the normal startup log.
+fn filter_owned_by(
+    live: HashSet<i32>,
+    by_id_root: &Path,
+    read_stamp: impl Fn(i32) -> Option<PathBuf>,
+) -> HashSet<i32> {
+    let mut owned = HashSet::new();
+    for id in live {
+        match read_stamp(id) {
+            Some(stamped) if is_under(&stamped, by_id_root) => {
+                owned.insert(id);
+            }
+            Some(stamped) => {
+                debug!(
+                    "[ublk-sweep] ignoring ublk{id}: stamped for {} (not under {})",
+                    stamped.display(),
+                    by_id_root.display()
+                );
+            }
+            None => {
+                debug!("[ublk-sweep] ignoring ublk{id}: no elide owner stamp");
+            }
+        }
+    }
+    owned
+}
+
+/// True iff `volume_dir` is `by_id_root/<basename>` — a direct child of
+/// the coordinator's `by_id/` root. Avoids `Path::starts_with` matching
+/// unrelated deeper paths that happen to share a prefix string.
+fn is_under(volume_dir: &Path, by_id_root: &Path) -> bool {
+    volume_dir.parent() == Some(by_id_root)
+}
+
+/// Read libublk's `target_data` for the given device and return the
+/// `elide.volume_dir` field if present. Returns `None` for devices not
+/// stamped by elide or whose ctrl cannot be opened.
+#[cfg(target_os = "linux")]
+fn read_owner_volume_dir(id: i32) -> Option<PathBuf> {
+    let ctrl = libublk::ctrl::UblkCtrl::new_simple(id).ok()?;
+    let value = ctrl.get_target_data_from_json()?;
+    let stamp: OwnerStamp = serde_json::from_value(value).ok()?;
+    Some(PathBuf::from(stamp.elide.volume_dir))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_owner_volume_dir(_id: i32) -> Option<PathBuf> {
+    None
+}
+
+/// Deserialize-only mirror of the `target_data` payload written by the
+/// volume daemon (see `src/ublk.rs::UblkTargetData`). Kept private to
+/// the sweep so the sweep does not depend on the volume crate; the
+/// canonical writer-side definition is in the elide volume binary.
+/// Only used by the Linux ctrl reader; gated to keep the non-Linux
+/// build clean of dead-code warnings.
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+struct OwnerStamp {
+    elide: OwnerStampElide,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+struct OwnerStampElide {
+    volume_dir: String,
 }
 
 /// Scan `/sys/class/ublk-char` for `ublkc<N>` entries. Returns `NotFound` when
@@ -311,6 +394,59 @@ mod tests {
         let out = scan_bindings(tmp.path());
         assert_eq!(out.len(), 1);
         assert_eq!(out.get(&a).copied(), Some(3));
+    }
+
+    #[test]
+    fn filter_keeps_only_ids_stamped_under_data_dir() {
+        // Three live devices: one ours, one stamped for a different
+        // coordinator's data_dir, one with no elide stamp at all.
+        // The filter must keep the first and silently drop the others.
+        let by_id = PathBuf::from("/var/lib/elide/by_id");
+        let live = HashSet::from([1, 2, 3]);
+
+        let stamps: HashMap<i32, Option<PathBuf>> = HashMap::from([
+            (1, Some(PathBuf::from("/var/lib/elide/by_id/01OURS"))),
+            (2, Some(PathBuf::from("/home/dev/coord-b/by_id/01THEIRS"))),
+            (3, None),
+        ]);
+
+        let kept = filter_owned_by(live, &by_id, |id| stamps[&id].clone());
+        assert_eq!(kept, HashSet::from([1]));
+    }
+
+    #[test]
+    fn filter_rejects_paths_that_only_share_a_prefix() {
+        // /var/lib/elide-other/by_id/X starts with the string
+        // "/var/lib/elide" but is not under /var/lib/elide/by_id.
+        // is_under must use parent equality, not string prefix.
+        let by_id = PathBuf::from("/var/lib/elide/by_id");
+        let live = HashSet::from([1]);
+        let stamps: HashMap<i32, Option<PathBuf>> =
+            HashMap::from([(1, Some(PathBuf::from("/var/lib/elide-other/by_id/01OURS")))]);
+        let kept = filter_owned_by(live, &by_id, |id| stamps[&id].clone());
+        assert!(
+            kept.is_empty(),
+            "must not match a sibling data_dir whose name is a prefix"
+        );
+    }
+
+    #[test]
+    fn filter_rejects_grandchildren_of_by_id_root() {
+        // A stamp deeper than `by_id/<ulid>` is not a volume directory.
+        // Reject it so a malformed stamp can't cause cross-coord deletes.
+        let by_id = PathBuf::from("/var/lib/elide/by_id");
+        let live = HashSet::from([1]);
+        let stamps: HashMap<i32, Option<PathBuf>> =
+            HashMap::from([(1, Some(PathBuf::from("/var/lib/elide/by_id/01OURS/cache")))]);
+        let kept = filter_owned_by(live, &by_id, |id| stamps[&id].clone());
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn filter_empty_live_is_empty() {
+        let by_id = PathBuf::from("/var/lib/elide/by_id");
+        let kept = filter_owned_by(HashSet::new(), &by_id, |_| None);
+        assert!(kept.is_empty());
     }
 
     #[test]
