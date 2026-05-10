@@ -19,6 +19,7 @@ pub mod pull;
 pub mod range_fetcher;
 pub mod reaper;
 pub mod recovery;
+pub mod remote_breadcrumb;
 pub mod retention;
 pub mod stores;
 pub mod tasks;

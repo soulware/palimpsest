@@ -299,6 +299,11 @@ async fn claim_volume_bucket_op(
                             "[inbound] reclaimed {volume_name} in place (vol_ulid {})",
                             record.vol_ulid
                         );
+                        if let Err(e) =
+                            elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
+                        {
+                            warn!("[inbound] reclaim {volume_name}: clearing breadcrumb: {e}");
+                        }
                         // Best-effort: drop the display-only marker now that
                         // the bucket record is no longer Released.
                         if let Ok(vol_dir) = std::fs::canonicalize(&link)
@@ -808,6 +813,12 @@ impl ClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
         std::fs::write(new_fork.dir.join(STOPPED_FILE), "")
             .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
+
+        if let Err(e) =
+            elide_coordinator::remote_breadcrumb::remove(&self.ctx.core.data_dir, &self.volume)
+        {
+            warn!("[claim {}] clearing remote breadcrumb: {e}", self.volume);
+        }
 
         register_prefetch_or_get(&self.ctx.prefetch_tracker, new_fork.vol_ulid);
         crate::rescan::trigger();

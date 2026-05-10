@@ -1505,13 +1505,16 @@ enum ListFilter {
 use elide_coordinator::volume_state::{VolumeLifecycle, VolumeMode};
 
 /// Cell value for the STATE column in `elide volume list`. Wraps the
-/// disk-derived `VolumeLifecycle` with a CLI-only sentinel:
+/// disk-derived `VolumeLifecycle` with two CLI-only sentinels:
 ///
 /// - `Ancestor` — pulled ancestor volume that has no `by_name/` entry
 ///   and is never supervised. Lifecycle classification doesn't apply.
+/// - `Remote` — name we still own in the bucket but whose local fork
+///   was removed. Sourced from `data_dir/remote/<name>` breadcrumbs.
 enum CliVolumeState {
     Lifecycle(VolumeLifecycle),
     Ancestor,
+    Remote,
 }
 
 impl CliVolumeState {
@@ -1519,6 +1522,7 @@ impl CliVolumeState {
         match self {
             Self::Lifecycle(l) => l.label(),
             Self::Ancestor => "ancestor",
+            Self::Remote => "remote",
         }
     }
 }
@@ -1576,6 +1580,35 @@ fn list_volumes(
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
+    }
+    if !matches!(filter, ListFilter::Readonly) {
+        // Names we still own in the bucket but whose local fork was
+        // removed. Best-effort: a stale breadcrumb (peer force-released
+        // us) self-resolves on the next `start` or `claim`. Local
+        // presence wins on de-dup — names already emitted by the
+        // by_name/ walk are skipped here.
+        let seen_names: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.name.clone()).collect();
+        match elide_coordinator::remote_breadcrumb::list(data_dir) {
+            Ok(entries) => {
+                for (name, record) in entries {
+                    if seen_names.contains(&name) {
+                        continue;
+                    }
+                    rows.push(VolumeRow {
+                        name,
+                        ulid: record.volume_id.to_string(),
+                        mode: VolumeMode::Rw,
+                        state: CliVolumeState::Remote,
+                        transport: "-".to_owned(),
+                        pid: "-".to_owned(),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: reading remote breadcrumbs: {e}");
+            }
+        }
     }
     if include_ancestors && !matches!(filter, ListFilter::Writable) {
         match std::fs::read_dir(&by_id_dir) {
@@ -1706,7 +1739,7 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool) -> VolumeRow {
             .pid()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_owned()),
-        CliVolumeState::Ancestor => "-".to_owned(),
+        CliVolumeState::Ancestor | CliVolumeState::Remote => "-".to_owned(),
     };
     VolumeRow {
         name,
