@@ -24,10 +24,15 @@
 #
 # The same key pair is injected as both `AWS_*` (coordinator's S3
 # writes) and `ELIDE_IAM_ADMIN_*` (per-volume IAM mint/delete) for the
-# initial-pass IAM mode. The dev key just needs the IAM admin policy
-# from docs/design-iam-key-model.md § "Admin key" attached alongside
-# its existing S3 RW grants. A future PR will split these onto
-# separate keys.
+# initial-pass IAM mode. The dev key is currently assumed to be
+# admin-equivalent on the Tigris org so no policy attach is needed.
+#
+# TODO: revisit once the writer-key split lands. End state: a single
+# operator-supplied admin key holding only the iam:* actions in
+# docs/design-iam-key-model.md § "Admin key (operator-attached)".
+# The coordinator mints its own scoped writer key from that admin on
+# first start, after which AWS_* injection here is removed and only
+# ELIDE_IAM_ADMIN_* is passed in.
 #
 # Note on secret exposure: the resolved keys are passed to the in-VM
 # command via argv, so they appear briefly in `ps` output inside the VM.
