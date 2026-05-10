@@ -16,11 +16,19 @@
 # / `bash -lc`.
 #
 # Config via env vars (all optional):
-#   OP_AWS_ACCESS_KEY_REF  1Password reference for AWS_ACCESS_KEY_ID
-#                          (default: op://Personal/Tigris-Elide-Dev/access_key_id)
-#   OP_AWS_SECRET_KEY_REF  1Password reference for AWS_SECRET_ACCESS_KEY
-#                          (default: op://Personal/Tigris-Elide-Dev/secret_access_key)
-#   LIMA_INSTANCE          Lima VM name (default: elide-dev)
+#   OP_AWS_ACCESS_KEY_REF        1Password reference for AWS_ACCESS_KEY_ID
+#                                (default: op://Personal/Tigris-Elide-Dev/access_key_id)
+#   OP_AWS_SECRET_KEY_REF        1Password reference for AWS_SECRET_ACCESS_KEY
+#                                (default: op://Personal/Tigris-Elide-Dev/secret_access_key)
+#   OP_IAM_ADMIN_KEY_REF         1Password reference for ELIDE_IAM_ADMIN_ACCESS_KEY_ID
+#                                (default: op://Personal/Tigris-Elide-Dev/iam_admin_access_key_id)
+#   OP_IAM_ADMIN_SECRET_REF      1Password reference for ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY
+#                                (default: op://Personal/Tigris-Elide-Dev/iam_admin_secret_access_key)
+#   LIMA_INSTANCE                Lima VM name (default: elide-dev)
+#
+# The IAM admin credentials are only injected when both refs resolve;
+# missing fields are skipped silently so this script keeps working
+# against pre-IAM coordinator builds.
 #
 # Note on secret exposure: the resolved keys are passed to the in-VM
 # command via argv, so they appear briefly in `ps` output inside the VM.
@@ -29,6 +37,8 @@ set -euo pipefail
 
 : "${OP_AWS_ACCESS_KEY_REF:=op://Personal/Tigris-Elide-Dev/access_key_id}"
 : "${OP_AWS_SECRET_KEY_REF:=op://Personal/Tigris-Elide-Dev/secret_access_key}"
+: "${OP_IAM_ADMIN_KEY_REF:=op://Personal/Tigris-Elide-Dev/iam_admin_access_key_id}"
+: "${OP_IAM_ADMIN_SECRET_REF:=op://Personal/Tigris-Elide-Dev/iam_admin_secret_access_key}"
 : "${LIMA_INSTANCE:=elide-dev}"
 
 for tool in op limactl; do
@@ -45,7 +55,21 @@ fi
 AWS_ACCESS_KEY_ID="$(op read "$OP_AWS_ACCESS_KEY_REF")"
 AWS_SECRET_ACCESS_KEY="$(op read "$OP_AWS_SECRET_KEY_REF")"
 
-exec limactl shell "$LIMA_INSTANCE" \
-  env AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-      AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-      "$@"
+# IAM admin pair is optional — pre-IAM coordinator builds don't need
+# it. `op read` exits non-zero when the field is missing; tolerate that
+# without taking down the VM session.
+ELIDE_IAM_ADMIN_ACCESS_KEY_ID="$(op read "$OP_IAM_ADMIN_KEY_REF" 2>/dev/null || true)"
+ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY="$(op read "$OP_IAM_ADMIN_SECRET_REF" 2>/dev/null || true)"
+
+env_args=(
+  AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+  AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+)
+if [[ -n "$ELIDE_IAM_ADMIN_ACCESS_KEY_ID" && -n "$ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY" ]]; then
+  env_args+=(
+    ELIDE_IAM_ADMIN_ACCESS_KEY_ID="$ELIDE_IAM_ADMIN_ACCESS_KEY_ID"
+    ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY="$ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY"
+  )
+fi
+
+exec limactl shell "$LIMA_INSTANCE" env "${env_args[@]}" "$@"
