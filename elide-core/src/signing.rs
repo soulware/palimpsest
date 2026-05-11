@@ -863,14 +863,32 @@ pub fn read_snapshot_manifest(
     verifying_key: &VerifyingKey,
     snap_ulid: &ulid::Ulid,
 ) -> io::Result<SnapshotManifest> {
-    let filename = snapshot_manifest_filename(snap_ulid);
-    let path = vol_dir.join("snapshots").join(&filename);
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        io::Error::other(format!(
-            "{filename} in {} not readable: {e}",
-            vol_dir.display()
-        ))
-    })?;
+    // The filename is just addressing; the signed payload is identical
+    // for `<ulid>.manifest` and `<ulid>.auto.manifest`. Probe the
+    // stable filename first (the common case), then fall back to the
+    // auto variant — this is hit on the hydrate-from-bucket path,
+    // where the basis manifest written by `stop` is `.auto.manifest`.
+    let snap_dir = vol_dir.join("snapshots");
+    let user_filename = snapshot_manifest_filename(snap_ulid);
+    let content = match std::fs::read_to_string(snap_dir.join(&user_filename)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let auto_filename = auto_snapshot_manifest_filename(snap_ulid);
+            std::fs::read_to_string(snap_dir.join(&auto_filename)).map_err(|e2| {
+                io::Error::other(format!(
+                    "neither {user_filename} nor {auto_filename} in {} are readable \
+                     (user: {e}; auto: {e2})",
+                    vol_dir.display()
+                ))
+            })?
+        }
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "{user_filename} in {} not readable: {e}",
+                vol_dir.display()
+            )));
+        }
+    };
     read_snapshot_manifest_from_bytes(content.as_bytes(), verifying_key, snap_ulid)
 }
 
