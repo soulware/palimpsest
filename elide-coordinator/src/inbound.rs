@@ -1095,15 +1095,12 @@ async fn remove_volume(
     store: Option<&Arc<dyn ObjectStore>>,
     coord_id: Option<&str>,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
+    use elide_coordinator::volume_state::VolumeLifecycle;
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found: {volume_name}"
-        )));
-    }
-
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
+    let (vol_dir, shape) = VolumeLifecycle::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+    let vol_dir =
+        vol_dir.ok_or_else(|| IpcError::not_found(format!("volume not found: {volume_name}")))?;
     // Volume directory is `by_id/<ulid>`; extract the ULID once. Used
     // both for the `data_dir/remote/<name>` breadcrumb (when the bucket
     // says the name is still owned by us) and for the post-delete IAM
@@ -1114,7 +1111,12 @@ async fn remove_volume(
         .and_then(|s| s.to_str())
         .and_then(|s| ulid::Ulid::from_string(s).ok());
 
-    if !vol_dir.join(STOPPED_FILE).exists() {
+    // Remove requires an explicitly-stopped fork. Preserves the
+    // prior gate: only proceed when `volume.stopped` is present.
+    // Every other shape (running, importing, readonly without
+    // stopped marker, released, fetched) refuses with the existing
+    // hint pointing the operator at `volume stop` first.
+    if !matches!(shape, VolumeLifecycle::StoppedManual) {
         return Err(IpcError::conflict(
             "volume is running; stop it first with: elide volume stop <name>",
         ));
@@ -1729,11 +1731,8 @@ pub(crate) async fn await_prefetch_op(
 pub(crate) fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
     use elide_coordinator::volume_state::VolumeLifecycle;
     let link = data_dir.join("by_name").join(volume_name);
-    match std::fs::canonicalize(&link) {
-        Ok(vol_dir) => matches!(
-            VolumeLifecycle::from_dir(&vol_dir),
-            VolumeLifecycle::Running { .. }
-        ),
+    match VolumeLifecycle::resolve(&link) {
+        Ok((_, shape)) => shape.is_running(),
         Err(_) => false,
     }
 }
@@ -1747,22 +1746,34 @@ async fn stop_volume_op(
     coord_id: &str,
     hostname: Option<&str>,
 ) -> Result<(), IpcError> {
+    use elide_coordinator::volume_state::VolumeLifecycle;
     let data_dir: &Path = &core.data_dir;
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found: {volume_name}"
-        )));
-    }
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
+    let (vol_dir, shape) = VolumeLifecycle::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+    let vol_dir =
+        vol_dir.ok_or_else(|| IpcError::not_found(format!("volume not found: {volume_name}")))?;
 
-    if vol_dir.join(STOPPED_FILE).exists() {
-        // Already stopped — idempotent success.
-        return Ok(());
+    // Idempotent shapes: already stopped, or terminal-released
+    // locally. Importing has its own active subprocess to drain —
+    // refuse with a hint rather than proceeding into the snapshot
+    // path (which would error mid-flow). All other shapes proceed
+    // with drain+halt; the `readonly` flag controls whether the
+    // bucket-flip + drain steps run.
+    match &shape {
+        VolumeLifecycle::StoppedManual | VolumeLifecycle::Released { .. } => {
+            return Ok(());
+        }
+        VolumeLifecycle::Importing { import_ulid } => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is currently importing (job {import_ulid}); \
+                 wait for the import to finish or cancel it first"
+            )));
+        }
+        _ => {}
     }
 
-    let readonly = vol_dir.join("volume.readonly").exists();
+    let readonly = shape.is_readonly_local();
 
     // Refuse to stop while a block-device client is connected. The ublk
     // transport always reports `Disconnected` today, so this is a future
@@ -2253,28 +2264,35 @@ async fn release_volume_op(
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
 
+    use elide_coordinator::volume_state::VolumeLifecycle;
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        // No local fork — but a `remote/<name>` breadcrumb plus a
-        // bucket record that names us as owner is enough to release:
-        // the auto-snapshot from the preceding clean `stop` (which
-        // ran before `remove`) already covers the durable state, so
-        // there's no drain to do. Just flip the bucket to Released
-        // using that snapshot as the handoff, and clear the
-        // breadcrumb.
-        //
-        // This makes `stop → remove → release` work without forcing
-        // the operator to detour through `start → stop` first just
-        // to hand off a name they've already mentally given up.
-        return release_breadcrumb_only(volume_name, data_dir, store, identity, coord_id, started)
+    let (vol_dir, shape) = VolumeLifecycle::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+    let vol_dir = match (vol_dir, &shape) {
+        (Some(d), _) => d,
+        (None, _) => {
+            // No local fork — but a `remote/<name>` breadcrumb plus a
+            // bucket record that names us as owner is enough to release:
+            // the auto-snapshot from the preceding clean `stop` (which
+            // ran before `remove`) already covers the durable state, so
+            // there's no drain to do. Just flip the bucket to Released
+            // using that snapshot as the handoff, and clear the
+            // breadcrumb.
+            //
+            // This makes `stop → remove → release` work without forcing
+            // the operator to detour through `start → stop` first just
+            // to hand off a name they've already mentally given up.
+            return release_breadcrumb_only(
+                volume_name,
+                data_dir,
+                store,
+                identity,
+                coord_id,
+                started,
+            )
             .await;
-    }
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
-
-    if vol_dir.join("volume.readonly").exists() {
-        return Err(IpcError::conflict("volume is readonly; nothing to release"));
-    }
+        }
+    };
 
     // `release` is composed of two distinct phases: drain+publish (needs
     // a running daemon) and bucket-flip (no daemon needed). To keep the
@@ -2283,11 +2301,22 @@ async fn release_volume_op(
     // to halt it inline, and any failure between halt and bucket-flip
     // would leave the volume in a "Released-but-running" mismatch the
     // operator can't easily recover from.
-    if !vol_dir.join(STOPPED_FILE).exists() {
-        return Err(IpcError::conflict(format!(
-            "volume '{volume_name}' is running; \
-             stop it first with: elide volume stop {volume_name}"
-        )));
+    match &shape {
+        VolumeLifecycle::StoppedManual => {}
+        VolumeLifecycle::ReadonlyImported | VolumeLifecycle::Fetched { .. } => {
+            return Err(IpcError::conflict("volume is readonly; nothing to release"));
+        }
+        VolumeLifecycle::Released { .. } => {
+            return Err(IpcError::conflict(format!(
+                "name '{volume_name}' is already released"
+            )));
+        }
+        _ => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is running; \
+                 stop it first with: elide volume stop {volume_name}"
+            )));
+        }
     }
 
     // Verify ownership in S3 before doing any local state mutation.
