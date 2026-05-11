@@ -885,6 +885,46 @@ fn main() {
                 release,
                 force,
             } => {
+                // `--force` with no reachable coordinator: fall back to
+                // direct CLI mode. Read volume.pid, SIGTERM if alive,
+                // write volume.stopped marker. No bucket flip (no
+                // credentials in the CLI), no auto-snapshot publish
+                // (the daemon's the only signer). The bucket record is
+                // left as-is — typically `Live` — so cross-host
+                // recovery requires `volume release --force` from
+                // somewhere with credentials. This path exists for
+                // when the coordinator is down and the volume daemon
+                // needs to be halted urgently (e.g. a stuck drain, a
+                // host being torn down quickly).
+                //
+                // Without `--force`, an unreachable coordinator is an
+                // error — the operator should bring the coordinator
+                // back up first (cleaner stop with bucket flip and
+                // auto-snapshot).
+                if force && !coord.is_reachable() {
+                    if release {
+                        eprintln!(
+                            "error: `--release` is incompatible with coord-down `--force` \
+                             (release needs S3 credentials only the coordinator has)"
+                        );
+                        std::process::exit(1);
+                    }
+                    match volume_stop_force_direct(&data_dir, &name) {
+                        Ok(()) => {
+                            eprintln!(
+                                "warning: coordinator unreachable — halted local daemon directly; \
+                                 names/{name} in S3 is unchanged (likely still Live). Recover \
+                                 from another host via `volume release --force {name}` if needed."
+                            );
+                            println!("{name}: stopped (direct)");
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    return;
+                }
                 if let Err(e) = coord.stop_volume(&name, force) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -1394,6 +1434,62 @@ fn coord_stop(
 }
 
 /// Direct teardown of every running volume + import process under
+/// Direct-CLI equivalent of `volume stop --force <name>` when the
+/// coordinator socket is unreachable. Resolves `by_name/<name>` to the
+/// fork directory, SIGTERMs the running daemon if any, then writes
+/// `volume.stopped` so a future coordinator start respects the halt.
+/// No bucket flip and no auto-snapshot publish — the daemon is the
+/// only thing with the signing key for an auto-snapshot, and the
+/// CLI doesn't carry S3 credentials.
+///
+/// On success the caller surfaces a warning explaining that
+/// `names/<name>` in S3 is now stale: cross-host recovery requires
+/// `volume release --force` from somewhere with credentials.
+fn volume_stop_force_direct(data_dir: &Path, name: &str) -> std::io::Result<()> {
+    let link = data_dir.join("by_name").join(name);
+    if !link.exists() {
+        return Err(std::io::Error::other(format!(
+            "volume not found: {name} (no {} symlink)",
+            link.display()
+        )));
+    }
+    let vol_dir = std::fs::canonicalize(&link)
+        .map_err(|e| std::io::Error::other(format!("resolving {}: {e}", link.display())))?;
+
+    if vol_dir.join("volume.stopped").exists() {
+        // Already stopped — idempotent.
+        return Ok(());
+    }
+
+    // Read pid, SIGTERM if alive. Missing pid file is fine — daemon
+    // isn't running.
+    let pid_path = vol_dir.join("volume.pid");
+    if let Ok(text) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && elide_core::process::pid_is_alive(pid)
+        && let Ok(raw) = i32::try_from(pid)
+    {
+        // SAFETY: libc::kill takes a pid + signal; the kernel checks
+        // permission and existence. SIGTERM has no observable
+        // side-effect on this process.
+        if unsafe { libc::kill(raw, libc::SIGTERM) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // Permission-denied is the most likely failure here: the
+            // daemon was spawned under sudo and the CLI is unsudo'd.
+            return Err(std::io::Error::other(format!("SIGTERM pid {pid}: {err}")));
+        }
+    }
+
+    // Write the marker so the next coordinator start respects the
+    // stop. Best-effort: a write failure here means the daemon will
+    // be re-spawned next coordinator start, but the SIGTERM (if it
+    // succeeded) already halted the current process.
+    std::fs::write(vol_dir.join("volume.stopped"), "")
+        .map_err(|e| std::io::Error::other(format!("writing volume.stopped: {e}")))?;
+
+    Ok(())
+}
+
 /// `<data_dir>/by_id/*/` when the coordinator socket is unreachable.
 /// Reads each `volume.pid` / `import.pid`, SIGTERMs the live ones, and
 /// polls until they exit or the wait budget expires.
@@ -2195,4 +2291,73 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Build a minimal `<data_dir>/by_id/<ulid>/` skeleton plus a
+    /// `by_name/<name>` symlink. Returns the data dir and vol_dir for
+    /// the caller's assertions.
+    fn make_volume_skeleton(name: &str) -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&by_name).unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = by_id.join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(vol_dir.join("index")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            std::path::PathBuf::from(format!("../by_id/{vol_ulid}")),
+            by_name.join(name),
+        )
+        .unwrap();
+        (tmp, vol_dir)
+    }
+
+    #[test]
+    fn stop_force_direct_writes_marker_when_no_pid() {
+        let (data_dir, vol_dir) = make_volume_skeleton("vol");
+        // No volume.pid → no SIGTERM, but marker still written.
+        volume_stop_force_direct(data_dir.path(), "vol").unwrap();
+        assert!(
+            vol_dir.join("volume.stopped").exists(),
+            "marker must be written even without a running daemon"
+        );
+    }
+
+    #[test]
+    fn stop_force_direct_idempotent_when_already_stopped() {
+        let (data_dir, vol_dir) = make_volume_skeleton("vol");
+        // Pre-existing marker.
+        std::fs::write(vol_dir.join("volume.stopped"), "").unwrap();
+        // Should succeed without touching anything.
+        volume_stop_force_direct(data_dir.path(), "vol").unwrap();
+        assert!(vol_dir.join("volume.stopped").exists());
+    }
+
+    #[test]
+    fn stop_force_direct_errors_on_unknown_name() {
+        let (data_dir, _) = make_volume_skeleton("vol");
+        let err = volume_stop_force_direct(data_dir.path(), "ghost")
+            .expect_err("unknown name must error");
+        assert!(err.to_string().contains("volume not found: ghost"), "{err}");
+    }
+
+    #[test]
+    fn stop_force_direct_ignores_stale_pid_file() {
+        let (data_dir, vol_dir) = make_volume_skeleton("vol");
+        // Write a pid that's vanishingly unlikely to be alive (kernel
+        // pid_max defaults to 4194304 but reuse-after-reboot is real;
+        // use a very large value to avoid hitting an unrelated
+        // process). pid_is_alive returns false → no SIGTERM attempt.
+        std::fs::write(vol_dir.join("volume.pid"), "99999999").unwrap();
+        volume_stop_force_direct(data_dir.path(), "vol").unwrap();
+        assert!(vol_dir.join("volume.stopped").exists());
+    }
 }

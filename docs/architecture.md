@@ -380,10 +380,10 @@ These operations give explicit control over individual volumes or all volumes wh
 3. Write `<vol-dir>/volume.stopped`.
 4. Send SIGTERM to the volume process (via `volume.pid`). Supervisor sees the marker and does not restart.
 
-**Proposed: `volume stop --force <name>`** — emergency local halt. Skips the drain/snapshot work entirely. Two execution modes:
+**`volume stop --force <name>`** — emergency local halt. Skips the drain/snapshot work entirely. Two execution modes:
 
 - *Coordinator reachable* — IPC as normal; the coordinator does a best-effort bucket flip (failures degrade to a warning, do not block the halt) and writes the marker / SIGTERMs the daemon.
-- *Coordinator unreachable* — CLI direct mode: read `<vol-dir>/volume.pid`, SIGTERM if alive, write `<vol-dir>/volume.stopped`. No bucket flip happens (no credentials), so `names/<name>` is left in its prior state (typically `Live`). The CLI prints a warning surfacing this — recovery from another host requires `release --force` because the bucket says the volume is still live here.
+- *Coordinator unreachable* — CLI direct mode: detected by `Client::is_reachable()` returning false (socket file missing, ECONNREFUSED, etc.). The CLI itself resolves `by_name/<name>` to the fork dir, reads `<vol-dir>/volume.pid`, SIGTERMs if alive, writes `<vol-dir>/volume.stopped`. No bucket flip happens (the CLI carries no S3 credentials), so `names/<name>` is left in its prior state (typically `Live`). The CLI prints a warning surfacing this — recovery from another host requires `release --force` because the bucket says the volume is still live here. `--release` is rejected in this mode (release needs S3 credentials only the coordinator has).
 
 `pending/` and `wal/` may be left dirty either way; `remove --force` is the only way to discard them. The local daemon is gone but the volume has no fresh auto-snapshot. A subsequent `start` on this host resumes from local state as usual; a subsequent `start` after `remove` falls back to the latest pre-existing snapshot (or fails if there is none, the same way as today).
 
