@@ -244,7 +244,8 @@ async fn claim_volume_bucket_op(
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ClaimReply, IpcError> {
-    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
+    use elide_coordinator::bucket_position::fetch_position;
+    use elide_coordinator::role::{ObserverKind, Role};
     use elide_coordinator::volume_state::{VolumeLifecycle, clear_released_marker};
     use elide_core::name_record::NameState;
 
@@ -275,14 +276,18 @@ async fn claim_volume_bucket_op(
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
 
-    match position {
-        OwnershipPosition::Absent => Err(IpcError::not_found(format!(
+    match Role::from_position(&position) {
+        Role::None => Err(IpcError::not_found(format!(
             "name '{volume_name}' has no S3 record; nothing to claim"
         ))),
-        OwnershipPosition::Released {
-            vol_ulid: released_vol_ulid,
-            handoff_snapshot,
+        Role::Observer {
+            kind: ObserverKind::Released {
+                handoff: handoff_snapshot,
+            },
         } => {
+            let released_vol_ulid = position
+                .vol_ulid()
+                .expect("Released role implies non-Absent position");
             if local_vol_ulid != Some(released_vol_ulid) {
                 // Foreign content — CLI must orchestrate the claim.
                 return Ok(ClaimReply::MustClaimFresh {
@@ -400,7 +405,10 @@ async fn claim_volume_bucket_op(
                 )),
             }
         }
-        OwnershipPosition::OwnedByUs { vol_ulid, .. } => {
+        Role::Owner { .. } => {
+            let vol_ulid = position
+                .vol_ulid()
+                .expect("Role::Owner implies non-Absent position");
             // Idempotent: we already own this name in the bucket.
             // Reconcile the local fork to the canonical Stopped+
             // writable shape so a subsequent `volume start` works
@@ -449,12 +457,14 @@ async fn claim_volume_bucket_op(
                 }
             }
         }
-        OwnershipPosition::OwnedByOther {
-            coord_id: owner, ..
+        Role::Observer {
+            kind: ObserverKind::Foreign { coord_id: owner },
         } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is held by coordinator {owner}"
         ))),
-        OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
+        Role::Observer {
+            kind: ObserverKind::Readonly,
+        } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly (immutable handle); \
              pull it with `volume pull` to serve locally"
         ))),
