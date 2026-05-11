@@ -1229,6 +1229,124 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
+/// Post-flip best-effort housekeeping shared by `volume release`,
+/// `volume release --force`, and the breadcrumb-only release path.
+/// Each successful bucket flip (`mark_released` / `mark_released_force`
+/// returning `Updated`) wants to do the same three things in the
+/// same order:
+///
+///   1. If we have a local fork: write `volume.released` so
+///      `volume list` reflects the new state without a bucket
+///      round-trip. Failure is logged but non-fatal — the bucket
+///      record is authoritative.
+///   2. Emit a journal entry recording the transition. The event
+///      kind varies: `Released` for the normal verb,
+///      `ForceReleased` for the override path. Best-effort.
+///   3. If a remote breadcrumb existed for this name, clear it.
+///      Some paths don't have a breadcrumb to clear (the standard
+///      local-fork release); a missing breadcrumb is a no-op.
+///
+/// Allow `too_many_arguments`: every parameter here is genuine
+/// plumbing — the alternative struct-of-options just shifts the
+/// same parameter list one indirection deeper without simplifying
+/// any caller.
+#[allow(clippy::too_many_arguments)]
+async fn emit_release_aftermath(
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    volume_name: &str,
+    vol_dir_for_marker: Option<&Path>,
+    handoff_snapshot: ulid::Ulid,
+    vol_ulid: ulid::Ulid,
+    event: elide_core::volume_event::EventKind,
+    clear_breadcrumb: bool,
+    log_prefix: &str,
+) {
+    if let Some(vol_dir) = vol_dir_for_marker
+        && let Err(e) = write_released_marker(vol_dir, handoff_snapshot)
+    {
+        warn!(
+            "[{log_prefix} {volume_name}] writing volume.released \
+             marker: {e} (display-only; bucket state authoritative)"
+        );
+    }
+    elide_coordinator::volume_event_store::emit_best_effort(
+        store,
+        identity.as_ref(),
+        volume_name,
+        event,
+        vol_ulid,
+    )
+    .await;
+    if clear_breadcrumb
+        && let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
+    {
+        warn!("[{log_prefix} {volume_name}] clearing breadcrumb: {e}");
+    }
+}
+
+/// Guard run early in every `volume release` variant (local fork
+/// and breadcrumb-only): refuse on a foreign-owned name (point at
+/// `release --force`) and on an already-Released record (idempotent
+/// feedback). The error strings are operator-facing and load-bearing
+/// for discoverability — keep them verbatim.
+fn ensure_release_eligible(
+    rec: &elide_core::name_record::NameRecord,
+    volume_name: &str,
+    coord_id: &str,
+) -> Result<(), IpcError> {
+    if let Some(existing) = rec.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is owned by coordinator {existing}; \
+             run `volume release --force` to override"
+        )));
+    }
+    if rec.state == elide_core::name_record::NameState::Released {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is already released"
+        )));
+    }
+    Ok(())
+}
+
+/// User-wins-on-tie precedence for snapshot enumeration. Given a
+/// candidate `(ulid, kind)` and the current best, returns `true`
+/// when the candidate should replace it: strictly newer ULID, or
+/// same ULID with `User` kind (which beats `Auto` to handle the
+/// transient state of an in-flight auto→user promotion that crashed
+/// between PUT and DELETE).
+fn snapshot_take_new(
+    new: (ulid::Ulid, elide_core::signing::SnapshotKind),
+    current: (ulid::Ulid, elide_core::signing::SnapshotKind),
+) -> bool {
+    new.0 > current.0 || (new.0 == current.0 && new.1 == elide_core::signing::SnapshotKind::User)
+}
+
+/// Fetch `names/<name>` from the bucket, mapping the store error to
+/// the standard `IpcError::store` shape and treating `Ok(None)` via
+/// the caller-supplied closure (so each verb can phrase its
+/// `not_found` hint differently). Folds the three-arm `match` that
+/// every lifecycle-touching verb opened around the raw call.
+async fn read_name_record_required(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    not_found: impl FnOnce() -> IpcError,
+) -> Result<
+    (
+        elide_core::name_record::NameRecord,
+        object_store::UpdateVersion,
+    ),
+    IpcError,
+> {
+    let record = elide_coordinator::name_store::read_name_record(store, name)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{name}: {e}")))?;
+    record.ok_or_else(not_found)
+}
+
 fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
     let dir_has_entries = |sub: &str| {
         std::fs::read_dir(vol_dir.join(sub))
@@ -2000,29 +2118,22 @@ async fn force_release_volume_op(
     }
 
     // Read the current record to learn which dead fork to recover from.
-    let dead_vol_ulid =
-        match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-            Ok(Some((rec, _))) => {
-                use elide_core::name_record::NameState;
-                match rec.state {
-                    NameState::Live | NameState::Stopped => rec.vol_ulid,
-                    other => {
-                        return Err(IpcError::conflict(format!(
-                            "names/{volume_name} is in state {other:?}; \
-                             force-release only overrides Live or Stopped records"
-                        )));
-                    }
-                }
-            }
-            Ok(None) => {
-                return Err(IpcError::not_found(format!(
-                    "name '{volume_name}' has no S3 record"
+    let dead_vol_ulid = {
+        use elide_core::name_record::NameState;
+        let (rec, _) = read_name_record_required(store, volume_name, || {
+            IpcError::not_found(format!("name '{volume_name}' has no S3 record"))
+        })
+        .await?;
+        match rec.state {
+            NameState::Live | NameState::Stopped => rec.vol_ulid,
+            other => {
+                return Err(IpcError::conflict(format!(
+                    "names/{volume_name} is in state {other:?}; \
+                     force-release only overrides Live or Stopped records"
                 )));
             }
-            Err(e) => {
-                return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
-            }
-        };
+        }
+    };
 
     // Recovery pipeline: fetch dead fork's pubkey, then either
     // promote an existing auto-snapshot (fast path) or synthesise a
@@ -2163,38 +2274,29 @@ async fn finalize_force_release(
                 "[inbound] force-released volume {volume_name} (released fork {d}) at \
                  handoff snapshot {handoff_snapshot}",
             );
-
-            // Best-effort local display marker. force-release is also
-            // used to displace a *foreign* coordinator's record without
-            // any local fork — in that case the by_name symlink doesn't
-            // resolve and we silently skip the marker write.
-            if let Ok(vol_dir) = std::fs::canonicalize(data_dir.join("by_name").join(volume_name))
-                && let Err(e) = write_released_marker(&vol_dir, handoff_snapshot)
-            {
-                warn!(
-                    "[inbound] force-release {volume_name}: writing volume.released \
-                     marker: {e} (display-only; bucket state authoritative)"
-                );
-            }
-
-            // Best-effort journal entry recording the override.
-            elide_coordinator::volume_event_store::emit_best_effort(
+            // force-release is also used to displace a *foreign*
+            // coordinator's record without any local fork — in that
+            // case the by_name symlink doesn't resolve and we
+            // silently skip the marker write.
+            let local_vol_dir =
+                std::fs::canonicalize(data_dir.join("by_name").join(volume_name)).ok();
+            emit_release_aftermath(
+                data_dir,
                 store,
-                identity.as_ref(),
+                identity,
                 volume_name,
+                local_vol_dir.as_deref(),
+                handoff_snapshot,
+                d,
                 elide_core::volume_event::EventKind::ForceReleased {
                     handoff_snapshot,
                     displaced_coordinator_id: displaced_coordinator_id
                         .unwrap_or_else(|| "<unknown>".to_string()),
                 },
-                d,
+                true,
+                "force-release",
             )
             .await;
-
-            if let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name) {
-                warn!("[inbound] force-release {volume_name}: clearing breadcrumb: {e}");
-            }
-
             Ok(ReleaseReply { handoff_snapshot })
         }
         Ok(ForceReleaseOutcome::Absent) => {
@@ -2293,39 +2395,20 @@ async fn release_volume_op(
     // Verify ownership in S3 before doing any local state mutation.
     // Pulled ahead of the daemon restart so a "wrong owner" or
     // "already released" reply doesn't perturb the local volume.
-    use elide_core::name_record::NameState;
     let read_started = std::time::Instant::now();
-    match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => {
-            info!(
-                "[release {volume_name}] read names/<name>: state={:?} owner={:?} ({:.2?})",
-                rec.state,
-                rec.coordinator_id,
-                read_started.elapsed()
-            );
-            if let Some(existing) = rec.coordinator_id.as_deref()
-                && existing != coord_id
-            {
-                return Err(IpcError::conflict(format!(
-                    "name '{volume_name}' is owned by coordinator {existing}; \
-                     run `volume release --force` to override"
-                )));
-            }
-            if rec.state == NameState::Released {
-                return Err(IpcError::conflict(format!(
-                    "name '{volume_name}' is already released"
-                )));
-            }
-        }
-        Ok(None) => {
-            return Err(IpcError::not_found(format!(
-                "name '{volume_name}' has no S3 record; drain the volume first"
-            )));
-        }
-        Err(e) => {
-            return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
-        }
-    }
+    let (rec, _) = read_name_record_required(store, volume_name, || {
+        IpcError::not_found(format!(
+            "name '{volume_name}' has no S3 record; drain the volume first"
+        ))
+    })
+    .await?;
+    info!(
+        "[release {volume_name}] read names/<name>: state={:?} owner={:?} ({:.2?})",
+        rec.state,
+        rec.coordinator_id,
+        read_started.elapsed()
+    );
+    ensure_release_eligible(&rec, volume_name, coord_id)?;
 
     // Fast path: nothing has changed since the last published snapshot,
     // so reuse it as the handoff. The next claimant forks from it
@@ -2360,6 +2443,7 @@ async fn release_volume_op(
                     );
                     let result = perform_release_flip(
                         volume_name,
+                        data_dir,
                         &vol_dir,
                         store,
                         identity,
@@ -2378,9 +2462,15 @@ async fn release_volume_op(
                      (clean stopped volume, no daemon restart needed)",
                     cover.snap_ulid
                 );
-                let result =
-                    perform_release_flip(volume_name, &vol_dir, store, identity, cover.snap_ulid)
-                        .await;
+                let result = perform_release_flip(
+                    volume_name,
+                    data_dir,
+                    &vol_dir,
+                    store,
+                    identity,
+                    cover.snap_ulid,
+                )
+                .await;
                 info!(
                     "[release {volume_name}] complete in {:.2?}",
                     started.elapsed()
@@ -2492,7 +2582,8 @@ async fn release_volume_op(
         }
     }
 
-    let result = perform_release_flip(volume_name, &vol_dir, store, identity, snap_ulid).await;
+    let result =
+        perform_release_flip(volume_name, data_dir, &vol_dir, store, identity, snap_ulid).await;
     info!(
         "[release {volume_name}] complete in {:.2?}",
         started.elapsed()
@@ -2532,7 +2623,6 @@ async fn release_breadcrumb_only(
     started: std::time::Instant,
 ) -> Result<ReleaseReply, IpcError> {
     use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
-    use elide_core::name_record::NameState;
 
     // Breadcrumb is the local fingerprint of "we still own this
     // name remotely". Without one, this volume isn't a candidate for
@@ -2546,30 +2636,16 @@ async fn release_breadcrumb_only(
         )));
     };
 
-    let record = elide_coordinator::name_store::read_name_record(store, volume_name)
-        .await
-        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
-    let (rec, _) = record.ok_or_else(|| {
+    let (rec, _) = read_name_record_required(store, volume_name, || {
         IpcError::not_found(format!(
             "name '{volume_name}' has no S3 record despite local breadcrumb; \
              stale breadcrumb — remove `{}/remote/{volume_name}` to dismiss",
             data_dir.display()
         ))
-    })?;
+    })
+    .await?;
 
-    if let Some(existing) = rec.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is owned by coordinator {existing}; \
-             run `volume release --force` to override"
-        )));
-    }
-    if rec.state == NameState::Released {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is already released"
-        )));
-    }
+    ensure_release_eligible(&rec, volume_name, coord_id)?;
 
     // Find the latest published snapshot for this vol_ulid to use as
     // the handoff. The bucket should have an auto-snapshot from the
@@ -2585,7 +2661,7 @@ async fn release_breadcrumb_only(
             // <snap>.manifest` (not `.auto.manifest`), so an
             // unpromoted auto-snapshot would surface as a NotFound on
             // claim.
-            promote_auto_snapshot_in_store(rec.vol_ulid, snap_ulid, store).await?;
+            promote_auto_in_store(&rec.vol_ulid.to_string(), snap_ulid, store).await?;
             snap_ulid
         }
         None => synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store).await?,
@@ -2603,19 +2679,21 @@ async fn release_breadcrumb_only(
                  (breadcrumb-only, total {:.2?})",
                 started.elapsed()
             );
-            elide_coordinator::volume_event_store::emit_best_effort(
+            emit_release_aftermath(
+                data_dir,
                 store,
-                identity.as_ref(),
+                identity,
                 volume_name,
+                None,
+                snap_ulid,
+                vol_ulid,
                 elide_core::volume_event::EventKind::Released {
                     handoff_snapshot: snap_ulid,
                 },
-                vol_ulid,
+                true,
+                "release",
             )
             .await;
-            if let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name) {
-                warn!("[release {volume_name}] clearing breadcrumb: {e}");
-            }
             Ok(ReleaseReply {
                 handoff_snapshot: snap_ulid,
             })
@@ -2656,15 +2734,8 @@ async fn latest_release_handoff_snapshot(
         };
         latest = match latest {
             None => Some((u, kind)),
-            Some((cur_u, cur_k)) => {
-                let take_new =
-                    u > cur_u || (u == cur_u && kind == elide_core::signing::SnapshotKind::User);
-                if take_new {
-                    Some((u, kind))
-                } else {
-                    Some((cur_u, cur_k))
-                }
-            }
+            Some(cur) if snapshot_take_new((u, kind), cur) => Some((u, kind)),
+            cur => cur,
         };
     }
     Ok(latest)
@@ -2734,19 +2805,22 @@ async fn synthesise_empty_owner_handoff(
     Ok(snap_ulid)
 }
 
-async fn promote_auto_snapshot_in_store(
-    vol_ulid: ulid::Ulid,
+/// S3-side half of an auto→user promotion: server-side COPY of
+/// `<S>.auto.manifest` to `<S>.manifest`, then DELETE of the auto
+/// key. Best-effort on the DELETE — a leftover redundant
+/// `.auto.manifest` is benign (the reader path prefers User on a
+/// tie). Shared between the breadcrumb-only release path (S3 only)
+/// and the local fast-path release (which wraps with local file +
+/// sentinel renames).
+async fn promote_auto_in_store(
+    vol_ulid: &str,
     snap_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    let auto_key =
-        elide_coordinator::upload::auto_snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-    let user_key =
-        elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+    let auto_key = elide_coordinator::upload::auto_snapshot_manifest_key(vol_ulid, snap_ulid);
+    let user_key = elide_coordinator::upload::snapshot_manifest_key(vol_ulid, snap_ulid);
     store.copy(&auto_key, &user_key).await.map_err(|e| {
-        IpcError::store(format!(
-            "copying {auto_key} → {user_key} on breadcrumb-only release promotion: {e}"
-        ))
+        IpcError::store(format!("copying {auto_key} → {user_key} on promotion: {e}"))
     })?;
     if let Err(e) = store.delete(&auto_key).await {
         warn!("[promote-auto {snap_ulid}] deleting {auto_key}: {e}");
@@ -2756,6 +2830,7 @@ async fn promote_auto_snapshot_in_store(
 
 async fn perform_release_flip(
     volume_name: &str,
+    data_dir: &Path,
     vol_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
@@ -2776,20 +2851,22 @@ async fn perform_release_flip(
                  (flip {:.2?})",
                 flip_started.elapsed()
             );
-            if let Err(e) = write_released_marker(vol_dir, snap_ulid) {
-                warn!(
-                    "[release {volume_name}] writing volume.released marker: {e} \
-                     (display-only; bucket state authoritative)"
-                );
-            }
-            elide_coordinator::volume_event_store::emit_best_effort(
+            // No breadcrumb to clear here: this path runs when a
+            // local fork existed, which means no breadcrumb was
+            // written (`remove` is the only producer).
+            emit_release_aftermath(
+                data_dir,
                 store,
-                identity.as_ref(),
+                identity,
                 volume_name,
+                Some(vol_dir),
+                snap_ulid,
+                vol_ulid,
                 elide_core::volume_event::EventKind::Released {
                     handoff_snapshot: snap_ulid,
                 },
-                vol_ulid,
+                false,
+                "release",
             )
             .await;
             Ok(ReleaseReply {
@@ -2868,23 +2945,8 @@ async fn promote_auto_snapshot(
     snap_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    let auto_key = elide_coordinator::upload::auto_snapshot_manifest_key(volume_id, snap_ulid);
-    let user_key = elide_coordinator::upload::snapshot_manifest_key(volume_id, snap_ulid);
-
-    // 1. Server-side copy auto → user. `object_store::copy` maps to
-    //    AWS S3's CopyObject API (and equivalents on other backends);
-    //    the bytes never cross the coordinator.
-    store.copy(&auto_key, &user_key).await.map_err(|e| {
-        IpcError::store(format!("copying {auto_key} → {user_key} on promotion: {e}"))
-    })?;
-
-    // 2. Delete the auto key. Best-effort: a missing key is fine
-    //    (something else already cleaned it up); other errors leave
-    //    a redundant `.auto.manifest` next to the user one, which is
-    //    operationally benign — both verify under the volume key.
-    if let Err(e) = store.delete(&auto_key).await {
-        warn!("[promote-auto {snap_ulid}] deleting {auto_key}: {e}");
-    }
+    // 1+2. Server-side COPY + DELETE in S3 via the shared helper.
+    promote_auto_in_store(volume_id, snap_ulid, store).await?;
 
     // 3. Rename the local files. Best-effort: if the local copy was
     //    already cleaned by NotifyVolumeReady at start, the source
@@ -3000,15 +3062,8 @@ fn latest_snapshot_marker(
         };
         latest = match latest {
             None => Some((u, k)),
-            Some((cur_u, cur_k)) => {
-                let take_new =
-                    u > cur_u || (u == cur_u && k == elide_core::signing::SnapshotKind::User);
-                if take_new {
-                    Some((u, k))
-                } else {
-                    Some((cur_u, cur_k))
-                }
-            }
+            Some(cur) if snapshot_take_new((u, k), cur) => Some((u, k)),
+            cur => cur,
         };
     }
     Ok(latest)
@@ -3065,17 +3120,12 @@ async fn hydrate_or_route(
 ) -> Result<(), IpcError> {
     use elide_core::name_record::NameState;
 
-    let (record, _) = match elide_coordinator::name_store::read_name_record(store, volume_name)
-        .await
-        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?
-    {
-        Some(rec) => rec,
-        None => {
-            return Err(IpcError::not_found(format!(
-                "volume '{volume_name}' not found locally or in the bucket"
-            )));
-        }
-    };
+    let (record, _) = read_name_record_required(store, volume_name, || {
+        IpcError::not_found(format!(
+            "volume '{volume_name}' not found locally or in the bucket"
+        ))
+    })
+    .await?;
 
     let owned_by_us = record.coordinator_id.as_deref() == Some(coord_id);
     match (record.state, owned_by_us) {
