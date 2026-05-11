@@ -244,7 +244,7 @@ async fn claim_volume_bucket_op(
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ClaimReply, IpcError> {
-    use elide_coordinator::volume_state::clear_released_marker;
+    use elide_coordinator::volume_state::{VolumeLifecycle, clear_released_marker};
     use elide_core::name_record::NameState;
 
     let coord_id = identity.coordinator_id_str();
@@ -258,6 +258,18 @@ async fn claim_volume_bucket_op(
         )));
     }
 
+    // Resolve local fork once up front; used by both branches of the
+    // bucket-state dispatch below to discriminate in-place reclaim vs
+    // MustClaimFresh, and to reach the vol_dir for reconcile.
+    let (local_vol_dir, _shape) =
+        VolumeLifecycle::resolve(&data_dir.join("by_name").join(volume_name))
+            .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+    let local_vol_ulid = local_vol_dir
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(|s| Ulid::from_string(s).ok());
+
     let record_opt = elide_coordinator::name_store::read_name_record(store, volume_name)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
@@ -270,16 +282,6 @@ async fn claim_volume_bucket_op(
 
     match record.state {
         NameState::Released => {
-            // Determine whether we hold a matching local fork.
-            let link = data_dir.join("by_name").join(volume_name);
-            let local_vol_ulid = match std::fs::canonicalize(&link) {
-                Ok(p) => p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok()),
-                Err(_) => None,
-            };
-
             if local_vol_ulid == Some(record.vol_ulid) {
                 // In-place reclaim of a Released name we still hold
                 // locally. Three shapes for the matching `vol_ulid`:
@@ -298,9 +300,9 @@ async fn claim_volume_bucket_op(
                 //       `volume.key`, no shadow): reconcile refuses
                 //       with `NoKeyShadow` and we surface a hint to
                 //       fork via `volume create --from`.
-                let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
-                    IpcError::internal(format!("canonicalize {}: {e}", link.display()))
-                })?;
+                let vol_dir = local_vol_dir
+                    .clone()
+                    .expect("local_vol_ulid matched record => fork dir resolved");
                 use elide_coordinator::volume_state::{
                     ReconcileError, reconcile_owned_local_to_stopped,
                 };
@@ -415,16 +417,15 @@ async fn claim_volume_bucket_op(
                 use elide_coordinator::volume_state::{
                     ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
                 };
-                let link = data_dir.join("by_name").join(volume_name);
-                if !link.exists() {
-                    return Err(IpcError::conflict(format!(
-                        "name '{volume_name}' is owned by this coordinator but has no \
-                         local fork; use `volume start {volume_name}` to hydrate"
-                    )));
-                }
-                let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
-                    IpcError::internal(format!("canonicalize {}: {e}", link.display()))
-                })?;
+                let vol_dir = match local_vol_dir.clone() {
+                    Some(d) => d,
+                    None => {
+                        return Err(IpcError::conflict(format!(
+                            "name '{volume_name}' is owned by this coordinator but has no \
+                             local fork; use `volume start {volume_name}` to hydrate"
+                        )));
+                    }
+                };
                 match reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid) {
                     Ok(ReconcileOutcome::AlreadyStopped) => {
                         info!("[inbound] claim {volume_name}: already owned + stopped — no-op");

@@ -135,8 +135,11 @@ pub(crate) async fn start_fetch(
     // would actively contradict the writable owned state. Refuse
     // with a hint pointing at the right verb.
     if owned_by_us {
+        use elide_coordinator::volume_state::VolumeLifecycle;
         let by_name = ctx.core.data_dir.join("by_name").join(&volume_name);
-        let hint = if by_name.exists() {
+        let (local_vol_dir, _shape) = VolumeLifecycle::resolve(&by_name)
+            .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+        let hint = if local_vol_dir.is_some() {
             format!(
                 "volume '{volume_name}' is already owned by this coordinator; \
                  use `volume start {volume_name}` to bring it up, or \

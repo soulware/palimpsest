@@ -12,10 +12,11 @@
 //! we own it) and `VolumeLifecycle::Stopped` (the daemon is down on
 //! this host); the two views are intentionally orthogonal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use elide_core::process::pid_is_alive;
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// Per-volume daemon pidfile. Written by the volume process on
 /// startup; presence + liveness drives the `Running` classification.
@@ -95,26 +96,42 @@ impl std::fmt::Display for VolumeMode {
 
 /// Local lifecycle of a volume, derived from on-disk markers.
 ///
-/// Order of precedence in [`VolumeLifecycle::from_dir`]:
-///   1. `volume.fetched` exists → `Fetched { basis_snapshot }`
-///   2. `volume.released` exists → `Released { handoff_snapshot }`
-///   3. `volume.stopped` exists → `StoppedManual`
-///   4. `volume.importing` exists → `Importing { import_ulid }`
-///   5. `volume.pid` names a live process → `Running { pid }`
-///   6. otherwise → `Stopped`
+/// Single source of truth for "what shape is this fork in on disk?"
+/// — used by lifecycle verbs ([`Self::resolve`]) for dispatch and by
+/// the CLI / `volume_status` IPC ([`Self::label`], [`Self::wire_body`])
+/// for display.
 ///
-/// `Fetched` is a purely-local state, orthogonal to the bucket-side
-/// `names/<name>` record (which still reflects the owner's view —
-/// `Live`, `Stopped`, or `Released` from their perspective). It says
-/// only "this host has a warm cache of a foreign volume."
+/// Order of precedence in [`Self::from_dir`]:
+///   1. `volume.fetched`  → `Fetched { basis_snapshot }`
+///   2. `volume.released` → `Released { handoff_snapshot }`
+///   3. `volume.readonly` → `ReadonlyImported`
+///   4. `volume.stopped`  → `StoppedManual`
+///   5. `volume.importing`→ `Importing { import_ulid }`
+///   6. `volume.pid` names a live process → `Running { pid }`
+///   7. otherwise → `Stopped`
 ///
-/// `Released` is a CLI-display variant. The bucket's `names/<name>`
-/// record is authoritative for claim state; the local marker only
-/// drives table rendering so `volume list` can label a released
-/// volume without an S3 round-trip.
+/// `Absent` is produced only by [`Self::resolve`] — it represents
+/// "the `by_name/<name>` symlink canonicalised to NotFound", which
+/// `from_dir` (which takes an existing directory) cannot express.
+///
+/// `Fetched` and `ReadonlyImported` are the two readonly-flavoured
+/// variants; verbs that need a signing key refuse on either via
+/// [`Self::is_readonly_local`]. `Fetched` carries a basis snapshot
+/// (foreign-cached); `ReadonlyImported` does not (OCI base or
+/// readonly skeleton).
+///
+/// `Released` is a sticky terminal local marker. The bucket's
+/// `names/<name>` record is authoritative for claim state; the local
+/// marker drives table rendering so `volume list` can label a
+/// released volume without an S3 round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum VolumeLifecycle {
+    /// `by_name/<name>` is absent (or canonicalize returned NotFound).
+    /// Produced only by [`Self::resolve`]; verbs route to hydrate /
+    /// claim. Distinct from "stopped but never started" — there is
+    /// no fork directory at all.
+    Absent,
     /// Daemon is running with the embedded pid.
     Running { pid: u32 },
     /// Import subprocess is active. The ULID is read from the lock file.
@@ -122,14 +139,19 @@ pub enum VolumeLifecycle {
     /// `volume.released` marker is present; the bucket record is in
     /// `Released` state and a fresh claim is needed before this host
     /// can serve the volume again. The handoff snapshot ULID is read
-    /// from the marker body (best-effort; empty when absent or
-    /// unparsable).
-    Released { handoff_snapshot: String },
+    /// from the marker body (`None` when absent or unparsable).
+    Released {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_snapshot: Option<Ulid>,
+    },
     /// `volume.fetched` marker is present; this host holds a foreign
     /// volume's bytes against the named basis snapshot but has not
-    /// claimed the name. The basis snapshot ULID is read from the
-    /// marker body.
-    Fetched { basis_snapshot: String },
+    /// claimed the name.
+    Fetched { basis_snapshot: Ulid },
+    /// `volume.readonly` is present without `volume.fetched` — an
+    /// imported OCI base, or a readonly skeleton pulled by ancestor
+    /// chain-walk. No basis snapshot is associated.
+    ReadonlyImported,
     /// `volume.stopped` marker is present; supervisor will not relaunch.
     StoppedManual,
     /// Daemon is not running and no manual-stop marker is present.
@@ -139,22 +161,30 @@ pub enum VolumeLifecycle {
 impl VolumeLifecycle {
     /// Derive lifecycle from the on-disk markers in `vol_dir`.
     ///
-    /// Reads up to four small files; fast enough to call per-volume
-    /// in the CLI's list path. Errors reading any file collapse to
-    /// the next-precedence variant rather than surfacing.
+    /// Reads up to five small files; fast enough to call per-volume
+    /// in the CLI's list path. Unparseable ULID bodies (in
+    /// `volume.fetched`, `volume.released`) cause the variant to
+    /// fall through to the next-precedence classification rather
+    /// than surfacing an error — the classifier never blocks a
+    /// recovery verb.
+    ///
+    /// Never returns [`Self::Absent`] — that variant is the
+    /// `resolve()`-only signal that no fork exists at all.
     pub fn from_dir(vol_dir: &Path) -> Self {
-        if let Some(record) = FetchedRecord::read(vol_dir) {
-            return Self::Fetched {
-                basis_snapshot: record.basis_snapshot,
-            };
+        if let Some(record) = FetchedRecord::read(vol_dir)
+            && let Ok(basis_snapshot) = Ulid::from_string(&record.basis_snapshot)
+        {
+            return Self::Fetched { basis_snapshot };
         }
         let released = vol_dir.join(RELEASED_FILE);
         if released.exists() {
             let handoff_snapshot = std::fs::read_to_string(&released)
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
+                .ok()
+                .and_then(|s| Ulid::from_string(s.trim()).ok());
             return Self::Released { handoff_snapshot };
+        }
+        if vol_dir.join("volume.readonly").exists() {
+            return Self::ReadonlyImported;
         }
         if vol_dir.join(STOPPED_FILE).exists() {
             return Self::StoppedManual;
@@ -176,16 +206,34 @@ impl VolumeLifecycle {
         Self::Stopped
     }
 
-    /// Operator-facing label for table display: `"running"`,
-    /// `"importing"`, `"released"`, `"stopped (manual)"`,
-    /// `"stopped"`. Drops the pid/ulid payload — see
-    /// [`Self::wire_body`] for the IPC format.
+    /// Canonicalise `by_name_link` and classify the resulting
+    /// directory. Returns the resolved `vol_dir` alongside the
+    /// shape — `vol_dir` is `Some` exactly when the shape is not
+    /// [`Self::Absent`].
+    ///
+    /// Use this at the top of every lifecycle verb so the marker
+    /// probes happen once, in one place.
+    pub fn resolve(by_name_link: &Path) -> std::io::Result<(Option<PathBuf>, Self)> {
+        match std::fs::canonicalize(by_name_link) {
+            Ok(vol_dir) => {
+                let shape = Self::from_dir(&vol_dir);
+                Ok((Some(vol_dir), shape))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, Self::Absent)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Operator-facing label for table display. Drops the pid/ulid
+    /// payload — see [`Self::wire_body`] for the IPC format.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Absent => "absent",
             Self::Running { .. } => "running",
             Self::Importing { .. } => "importing",
             Self::Released { .. } => "released",
             Self::Fetched { .. } => "fetched",
+            Self::ReadonlyImported => "readonly",
             Self::StoppedManual => "stopped (manual)",
             Self::Stopped => "stopped",
         }
@@ -193,17 +241,17 @@ impl VolumeLifecycle {
 
     /// Body string for the `volume_status` IPC reply (without the
     /// leading `"ok "`). Identical to [`Self::label`] except
-    /// `Importing` and `Released` append their associated ULIDs so
-    /// clients can correlate with bucket state.
+    /// `Importing`, `Released`, and `Fetched` append their
+    /// associated ULIDs so clients can correlate with bucket state.
     pub fn wire_body(&self) -> String {
         match self {
-            Self::Importing { import_ulid } => format!("importing {import_ulid}"),
-            Self::Released { handoff_snapshot } if !handoff_snapshot.is_empty() => {
-                format!("released {handoff_snapshot}")
+            Self::Importing { import_ulid } if !import_ulid.is_empty() => {
+                format!("importing {import_ulid}")
             }
-            Self::Fetched { basis_snapshot } if !basis_snapshot.is_empty() => {
-                format!("fetched {basis_snapshot}")
-            }
+            Self::Released {
+                handoff_snapshot: Some(u),
+            } => format!("released {u}"),
+            Self::Fetched { basis_snapshot } => format!("fetched {basis_snapshot}"),
             other => other.label().to_owned(),
         }
     }
@@ -214,6 +262,23 @@ impl VolumeLifecycle {
             Self::Running { pid } => Some(*pid),
             _ => None,
         }
+    }
+
+    /// True when a daemon is provably alive for this fork.
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// True when the local fork's on-disk markers say "no signing
+    /// key available" — `volume.readonly` or `volume.fetched`.
+    /// Verbs that need to sign segments refuse on this.
+    pub fn is_readonly_local(&self) -> bool {
+        matches!(self, Self::ReadonlyImported | Self::Fetched { .. })
+    }
+
+    /// True only for the `resolve()`-only `Absent` variant.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
     }
 }
 
@@ -439,38 +504,43 @@ mod tests {
         let d = TempDir::new().unwrap();
         std::fs::write(d.path().join(RELEASED_FILE), "01J0000000000000000000000V").unwrap();
         match VolumeLifecycle::from_dir(d.path()) {
-            VolumeLifecycle::Released { handoff_snapshot } => {
-                assert_eq!(handoff_snapshot, "01J0000000000000000000000V");
+            VolumeLifecycle::Released {
+                handoff_snapshot: Some(u),
+            } => {
+                assert_eq!(u.to_string(), "01J0000000000000000000000V");
             }
-            other => panic!("expected Released, got {other:?}"),
+            other => panic!("expected Released with handoff, got {other:?}"),
         }
     }
 
     #[test]
     fn released_marker_takes_precedence_over_stopped_pid_and_import_lock() {
         let d = TempDir::new().unwrap();
-        std::fs::write(d.path().join(RELEASED_FILE), "01J9").unwrap();
+        let snap = ulid::Ulid::new();
+        std::fs::write(d.path().join(RELEASED_FILE), snap.to_string()).unwrap();
         std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
         std::fs::write(d.path().join(IMPORTING_FILE), "01J7").unwrap();
         std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
         match VolumeLifecycle::from_dir(d.path()) {
-            VolumeLifecycle::Released { handoff_snapshot } => {
-                assert_eq!(handoff_snapshot, "01J9");
+            VolumeLifecycle::Released {
+                handoff_snapshot: Some(u),
+            } => {
+                assert_eq!(u, snap);
             }
             other => panic!("expected Released, got {other:?}"),
         }
     }
 
     #[test]
-    fn released_marker_with_empty_body_classifies_as_released_with_empty_snapshot() {
+    fn released_marker_with_empty_body_classifies_as_released_with_no_snapshot() {
         let d = TempDir::new().unwrap();
         std::fs::write(d.path().join(RELEASED_FILE), "").unwrap();
-        match VolumeLifecycle::from_dir(d.path()) {
-            VolumeLifecycle::Released { handoff_snapshot } => {
-                assert_eq!(handoff_snapshot, "");
+        assert_eq!(
+            VolumeLifecycle::from_dir(d.path()),
+            VolumeLifecycle::Released {
+                handoff_snapshot: None
             }
-            other => panic!("expected Released, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -484,7 +554,7 @@ mod tests {
         rec.write(d.path()).unwrap();
         match VolumeLifecycle::from_dir(d.path()) {
             VolumeLifecycle::Fetched { basis_snapshot } => {
-                assert_eq!(basis_snapshot, "01J0000000000000000000000V");
+                assert_eq!(basis_snapshot.to_string(), "01J0000000000000000000000V");
             }
             other => panic!("expected Fetched, got {other:?}"),
         }
@@ -493,8 +563,9 @@ mod tests {
     #[test]
     fn fetched_marker_takes_precedence_over_other_markers() {
         let d = TempDir::new().unwrap();
+        let basis = ulid::Ulid::new();
         FetchedRecord {
-            basis_snapshot: "01J9".to_owned(),
+            basis_snapshot: basis.to_string(),
             owner_coordinator_id: String::new(),
             fetched_at: "2026-05-09T14:23:51Z".to_owned(),
         }
@@ -505,10 +576,51 @@ mod tests {
         std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
         match VolumeLifecycle::from_dir(d.path()) {
             VolumeLifecycle::Fetched { basis_snapshot } => {
-                assert_eq!(basis_snapshot, "01J9");
+                assert_eq!(basis_snapshot, basis);
             }
             other => panic!("expected Fetched, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fetched_marker_with_unparseable_basis_falls_through() {
+        // basis_snapshot is not a valid ULID — classifier falls
+        // through to the next precedence rule rather than producing
+        // a malformed Fetched variant.
+        let d = TempDir::new().unwrap();
+        FetchedRecord {
+            basis_snapshot: "not-a-ulid".to_owned(),
+            owner_coordinator_id: String::new(),
+            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
+        }
+        .write(d.path())
+        .unwrap();
+        assert_eq!(
+            VolumeLifecycle::from_dir(d.path()),
+            VolumeLifecycle::Stopped
+        );
+    }
+
+    #[test]
+    fn readonly_marker_classifies_as_readonly_imported() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("volume.readonly"), "").unwrap();
+        assert_eq!(
+            VolumeLifecycle::from_dir(d.path()),
+            VolumeLifecycle::ReadonlyImported
+        );
+    }
+
+    #[test]
+    fn readonly_marker_takes_precedence_over_stopped_and_pid() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join("volume.readonly"), "").unwrap();
+        std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
+        std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
+        assert_eq!(
+            VolumeLifecycle::from_dir(d.path()),
+            VolumeLifecycle::ReadonlyImported
+        );
     }
 
     #[test]
@@ -547,7 +659,7 @@ mod tests {
         assert_eq!(
             VolumeLifecycle::from_dir(d.path()),
             VolumeLifecycle::Released {
-                handoff_snapshot: snap.to_string()
+                handoff_snapshot: Some(snap)
             }
         );
         clear_released_marker(d.path()).unwrap();
@@ -636,6 +748,8 @@ mod tests {
 
     #[test]
     fn label_drops_payload() {
+        let snap = ulid::Ulid::new();
+        assert_eq!(VolumeLifecycle::Absent.label(), "absent");
         assert_eq!(VolumeLifecycle::Running { pid: 42 }.label(), "running");
         assert_eq!(
             VolumeLifecycle::Importing {
@@ -646,17 +760,27 @@ mod tests {
         );
         assert_eq!(VolumeLifecycle::StoppedManual.label(), "stopped (manual)");
         assert_eq!(VolumeLifecycle::Stopped.label(), "stopped");
+        assert_eq!(VolumeLifecycle::ReadonlyImported.label(), "readonly");
         assert_eq!(
             VolumeLifecycle::Released {
-                handoff_snapshot: "01J9".to_owned()
+                handoff_snapshot: Some(snap)
             }
             .label(),
             "released"
         );
+        assert_eq!(
+            VolumeLifecycle::Fetched {
+                basis_snapshot: snap
+            }
+            .label(),
+            "fetched"
+        );
     }
 
     #[test]
-    fn wire_body_includes_ulid_for_importing_only() {
+    fn wire_body_appends_ulids() {
+        let snap = ulid::Ulid::new();
+        assert_eq!(VolumeLifecycle::Absent.wire_body(), "absent");
         assert_eq!(VolumeLifecycle::Running { pid: 42 }.wire_body(), "running");
         assert_eq!(
             VolumeLifecycle::Importing {
@@ -665,29 +789,47 @@ mod tests {
             .wire_body(),
             "importing 01J0"
         );
+        // Empty importing ulid degrades to the bare label.
+        assert_eq!(
+            VolumeLifecycle::Importing {
+                import_ulid: String::new()
+            }
+            .wire_body(),
+            "importing"
+        );
         assert_eq!(
             VolumeLifecycle::StoppedManual.wire_body(),
             "stopped (manual)"
         );
         assert_eq!(VolumeLifecycle::Stopped.wire_body(), "stopped");
+        assert_eq!(VolumeLifecycle::ReadonlyImported.wire_body(), "readonly");
         assert_eq!(
             VolumeLifecycle::Released {
-                handoff_snapshot: "01J9".to_owned()
+                handoff_snapshot: Some(snap)
             }
             .wire_body(),
-            "released 01J9"
+            format!("released {snap}")
         );
         assert_eq!(
             VolumeLifecycle::Released {
-                handoff_snapshot: String::new()
+                handoff_snapshot: None
             }
             .wire_body(),
             "released"
+        );
+        assert_eq!(
+            VolumeLifecycle::Fetched {
+                basis_snapshot: snap
+            }
+            .wire_body(),
+            format!("fetched {snap}")
         );
     }
 
     #[test]
     fn pid_only_set_for_running() {
+        let snap = ulid::Ulid::new();
+        assert_eq!(VolumeLifecycle::Absent.pid(), None);
         assert_eq!(VolumeLifecycle::Running { pid: 42 }.pid(), Some(42));
         assert_eq!(
             VolumeLifecycle::Importing {
@@ -698,13 +840,55 @@ mod tests {
         );
         assert_eq!(VolumeLifecycle::StoppedManual.pid(), None);
         assert_eq!(VolumeLifecycle::Stopped.pid(), None);
+        assert_eq!(VolumeLifecycle::ReadonlyImported.pid(), None);
         assert_eq!(
             VolumeLifecycle::Released {
-                handoff_snapshot: "01J9".to_owned()
+                handoff_snapshot: Some(snap)
             }
             .pid(),
             None
         );
+    }
+
+    #[test]
+    fn resolve_returns_absent_for_missing_link() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("by_name/nope");
+        let (vol_dir, shape) = VolumeLifecycle::resolve(&missing).unwrap();
+        assert!(vol_dir.is_none());
+        assert_eq!(shape, VolumeLifecycle::Absent);
+    }
+
+    #[test]
+    fn resolve_follows_symlink_and_classifies() {
+        // by_name/<n> → ../by_id/<ulid>
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id/01J0000000000000000000000V");
+        std::fs::create_dir_all(&by_id).unwrap();
+        let by_name_dir = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_name_dir).unwrap();
+        let link = by_name_dir.join("vol");
+        std::os::unix::fs::symlink("../by_id/01J0000000000000000000000V", &link).unwrap();
+        let (vol_dir, shape) = VolumeLifecycle::resolve(&link).unwrap();
+        assert_eq!(vol_dir.unwrap(), std::fs::canonicalize(&by_id).unwrap());
+        assert_eq!(shape, VolumeLifecycle::Stopped);
+    }
+
+    #[test]
+    fn helpers_match_variants() {
+        let snap = ulid::Ulid::new();
+        assert!(VolumeLifecycle::Running { pid: 1 }.is_running());
+        assert!(!VolumeLifecycle::Stopped.is_running());
+        assert!(VolumeLifecycle::ReadonlyImported.is_readonly_local());
+        assert!(
+            VolumeLifecycle::Fetched {
+                basis_snapshot: snap
+            }
+            .is_readonly_local()
+        );
+        assert!(!VolumeLifecycle::Stopped.is_readonly_local());
+        assert!(VolumeLifecycle::Absent.is_absent());
+        assert!(!VolumeLifecycle::Stopped.is_absent());
     }
 
     #[test]
