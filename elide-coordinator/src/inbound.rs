@@ -2605,7 +2605,7 @@ async fn release_breadcrumb_only(
             // <snap>.manifest` (not `.auto.manifest`), so an
             // unpromoted auto-snapshot would surface as a NotFound on
             // claim.
-            promote_auto_snapshot_in_store(rec.vol_ulid, snap_ulid, store).await?;
+            promote_auto_in_store(&rec.vol_ulid.to_string(), snap_ulid, store).await?;
             snap_ulid
         }
         None => synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store).await?,
@@ -2747,19 +2747,22 @@ async fn synthesise_empty_owner_handoff(
     Ok(snap_ulid)
 }
 
-async fn promote_auto_snapshot_in_store(
-    vol_ulid: ulid::Ulid,
+/// S3-side half of an auto→user promotion: server-side COPY of
+/// `<S>.auto.manifest` to `<S>.manifest`, then DELETE of the auto
+/// key. Best-effort on the DELETE — a leftover redundant
+/// `.auto.manifest` is benign (the reader path prefers User on a
+/// tie). Shared between the breadcrumb-only release path (S3 only)
+/// and the local fast-path release (which wraps with local file +
+/// sentinel renames).
+async fn promote_auto_in_store(
+    vol_ulid: &str,
     snap_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    let auto_key =
-        elide_coordinator::upload::auto_snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-    let user_key =
-        elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+    let auto_key = elide_coordinator::upload::auto_snapshot_manifest_key(vol_ulid, snap_ulid);
+    let user_key = elide_coordinator::upload::snapshot_manifest_key(vol_ulid, snap_ulid);
     store.copy(&auto_key, &user_key).await.map_err(|e| {
-        IpcError::store(format!(
-            "copying {auto_key} → {user_key} on breadcrumb-only release promotion: {e}"
-        ))
+        IpcError::store(format!("copying {auto_key} → {user_key} on promotion: {e}"))
     })?;
     if let Err(e) = store.delete(&auto_key).await {
         warn!("[promote-auto {snap_ulid}] deleting {auto_key}: {e}");
@@ -2881,23 +2884,8 @@ async fn promote_auto_snapshot(
     snap_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    let auto_key = elide_coordinator::upload::auto_snapshot_manifest_key(volume_id, snap_ulid);
-    let user_key = elide_coordinator::upload::snapshot_manifest_key(volume_id, snap_ulid);
-
-    // 1. Server-side copy auto → user. `object_store::copy` maps to
-    //    AWS S3's CopyObject API (and equivalents on other backends);
-    //    the bytes never cross the coordinator.
-    store.copy(&auto_key, &user_key).await.map_err(|e| {
-        IpcError::store(format!("copying {auto_key} → {user_key} on promotion: {e}"))
-    })?;
-
-    // 2. Delete the auto key. Best-effort: a missing key is fine
-    //    (something else already cleaned it up); other errors leave
-    //    a redundant `.auto.manifest` next to the user one, which is
-    //    operationally benign — both verify under the volume key.
-    if let Err(e) = store.delete(&auto_key).await {
-        warn!("[promote-auto {snap_ulid}] deleting {auto_key}: {e}");
-    }
+    // 1+2. Server-side COPY + DELETE in S3 via the shared helper.
+    promote_auto_in_store(volume_id, snap_ulid, store).await?;
 
     // 3. Rename the local files. Best-effort: if the local copy was
     //    already cleaned by NotifyVolumeReady at start, the source
