@@ -112,6 +112,70 @@ impl PolicyDocument {
     }
 }
 
+/// Builder for the one-per-coordinator writer policy.
+///
+/// Mirrors the JSON sketch in `docs/design-iam-key-model.md` §
+/// "Coordinator writer key": Get/Put/Delete on `by_id/*` and `names/*`;
+/// Get/Put (no Delete) on `events/*` and `coordinators/*` so the
+/// append-only and immutable invariants hold at the IAM layer; bucket-
+/// wide ListBucket. No `DateLessThan` — writer-key rotation is
+/// operator-driven, not time-bounded.
+pub struct CoordinatorWriterPolicy<'a> {
+    pub bucket: &'a str,
+}
+
+impl CoordinatorWriterPolicy<'_> {
+    pub fn build(&self) -> PolicyDocument {
+        let bucket = self.bucket;
+        let by_id = format!("arn:aws:s3:::{bucket}/by_id/*");
+        let names = format!("arn:aws:s3:::{bucket}/names/*");
+        let events = format!("arn:aws:s3:::{bucket}/events/*");
+        let coords = format!("arn:aws:s3:::{bucket}/coordinators/*");
+        let bucket_arn = format!("arn:aws:s3:::{bucket}");
+
+        PolicyDocument {
+            version: "2012-10-17",
+            statement: vec![
+                Statement {
+                    sid: Some("VolumeData".to_owned()),
+                    effect: "Allow",
+                    action: vec!["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                    resource: vec![by_id],
+                    condition: None,
+                },
+                Statement {
+                    sid: Some("Names".to_owned()),
+                    effect: "Allow",
+                    action: vec!["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                    resource: vec![names],
+                    condition: None,
+                },
+                Statement {
+                    sid: Some("EventLogAppendOnly".to_owned()),
+                    effect: "Allow",
+                    action: vec!["s3:GetObject", "s3:PutObject"],
+                    resource: vec![events],
+                    condition: None,
+                },
+                Statement {
+                    sid: Some("CoordinatorIdentityImmutable".to_owned()),
+                    effect: "Allow",
+                    action: vec!["s3:GetObject", "s3:PutObject"],
+                    resource: vec![coords],
+                    condition: None,
+                },
+                Statement {
+                    sid: Some("BucketList".to_owned()),
+                    effect: "Allow",
+                    action: vec!["s3:ListBucket"],
+                    resource: vec![bucket_arn],
+                    condition: None,
+                },
+            ],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +210,53 @@ mod tests {
             "2030-01-01T00:00:00Z"
         );
         assert!(stmt["Condition"]["IpAddress"].is_null());
+    }
+
+    #[test]
+    fn writer_policy_shape() {
+        let pol = CoordinatorWriterPolicy { bucket: "b" }.build();
+        let json = pol.to_json().unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["Version"], "2012-10-17");
+        let stmts = v["Statement"].as_array().unwrap();
+        assert_eq!(stmts.len(), 5);
+
+        let sid_to_stmt: std::collections::HashMap<&str, &Value> = stmts
+            .iter()
+            .map(|s| (s["Sid"].as_str().unwrap(), s))
+            .collect();
+
+        let by_id = sid_to_stmt["VolumeData"];
+        let by_id_actions: Vec<&str> = by_id["Action"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(by_id_actions.contains(&"s3:DeleteObject"));
+        assert_eq!(by_id["Resource"][0], "arn:aws:s3:::b/by_id/*");
+
+        let events = sid_to_stmt["EventLogAppendOnly"];
+        let event_actions: Vec<&str> = events["Action"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(!event_actions.contains(&"s3:DeleteObject"));
+        assert_eq!(events["Resource"][0], "arn:aws:s3:::b/events/*");
+
+        let coords = sid_to_stmt["CoordinatorIdentityImmutable"];
+        let coord_actions: Vec<&str> = coords["Action"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(!coord_actions.contains(&"s3:DeleteObject"));
+
+        let list = sid_to_stmt["BucketList"];
+        assert_eq!(list["Resource"][0], "arn:aws:s3:::b");
     }
 
     #[test]

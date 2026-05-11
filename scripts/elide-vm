@@ -22,17 +22,11 @@
 #                          (default: op://Personal/Tigris-Elide-Dev/secret_access_key)
 #   LIMA_INSTANCE          Lima VM name (default: elide-dev)
 #
-# The same key pair is injected as both `AWS_*` (coordinator's S3
-# writes) and `ELIDE_IAM_ADMIN_*` (per-volume IAM mint/delete) for the
-# initial-pass IAM mode. The dev key is currently assumed to be
-# admin-equivalent on the Tigris org so no policy attach is needed.
-#
-# TODO: revisit once the writer-key split lands. End state: a single
-# operator-supplied admin key holding only the iam:* actions in
-# docs/design-iam-key-model.md § "Admin key (operator-attached)".
-# The coordinator mints its own scoped writer key from that admin on
-# first start, after which AWS_* injection here is removed and only
-# ELIDE_IAM_ADMIN_* is passed in.
+# The key pair is injected as `AWS_*` only. In `[iam]` mode the
+# coordinator reads `AWS_*` as the admin credential and mints its own
+# scoped writer key from it on first start; in non-IAM mode `AWS_*`
+# play their conventional role as direct S3 store credentials. The dev
+# key is currently assumed to be admin-equivalent on the Tigris org.
 #
 # Note on secret exposure: the resolved keys are passed to the in-VM
 # command via argv, so they appear briefly in `ps` output inside the VM.
@@ -60,6 +54,4 @@ AWS_SECRET_ACCESS_KEY="$(op read "$OP_AWS_SECRET_KEY_REF")"
 exec limactl shell "$LIMA_INSTANCE" \
   env AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
       AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-      ELIDE_IAM_ADMIN_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-      ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
       "$@"

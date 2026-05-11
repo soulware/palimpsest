@@ -18,7 +18,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use elide_tigris_iam::{PerVolumeReadOnlyPolicy, PolicyDocument, TigrisIamClient, TigrisIamConfig};
+use elide_tigris_iam::{
+    CoordinatorWriterPolicy, PerVolumeReadOnlyPolicy, PolicyDocument, TigrisIamClient,
+    TigrisIamConfig,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -282,6 +285,221 @@ impl CredentialIssuer for IamCredentialIssuer {
     }
 }
 
+/// Non-secret writer-key inventory persisted to
+/// `<data_dir>/coordinator/iam.json`. Mirrors the inventory shape in
+/// `docs/design-iam-key-model.md` § "Writer key metadata" — the writer
+/// secret is held in memory only and re-minted on each coordinator
+/// start.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PersistedWriterIam {
+    pub writer_access_key_id: String,
+    pub policy_name: String,
+    pub policy_arn: String,
+}
+
+const WRITER_IAM_DIR: &str = "coordinator";
+const WRITER_IAM_FILE: &str = "iam.json";
+
+/// One-per-coordinator writer-key lifecycle.
+///
+/// `ensure_writer_key` returns a usable writer triple, doing one of:
+///
+/// * **First start** (`coordinator/iam.json` absent): mint policy +
+///   key + attach via the admin client; persist metadata; return creds.
+/// * **Restart** (`coordinator/iam.json` present): the writer secret
+///   was never persisted (matches the design's RO-key convention) — so
+///   we rotate: mint a fresh access key, attach it to the existing
+///   policy, delete the old key, rewrite metadata. The policy ARN
+///   stays stable across restarts.
+///
+/// Rollback on every step mirrors `VolumeIamManager::provision_volume_ro_inner`.
+pub struct WriterKeyManager {
+    client: TigrisIamClient,
+    bucket: String,
+    coord_id: String,
+    data_dir: PathBuf,
+}
+
+impl WriterKeyManager {
+    pub fn new(
+        config: TigrisIamConfig,
+        bucket: String,
+        coord_id: String,
+        data_dir: PathBuf,
+    ) -> io::Result<Self> {
+        let client =
+            TigrisIamClient::new(config).map_err(|e| io::Error::other(format!("iam: {e}")))?;
+        Ok(Self {
+            client,
+            bucket,
+            coord_id,
+            data_dir,
+        })
+    }
+
+    pub async fn ensure_writer_key(&self) -> io::Result<IssuedCredentials> {
+        match read_writer_iam(&self.data_dir)? {
+            Some(existing) => self.rotate_writer_key(existing).await,
+            None => self.bootstrap_writer_key().await,
+        }
+    }
+
+    async fn bootstrap_writer_key(&self) -> io::Result<IssuedCredentials> {
+        let policy_name = format!("elide-{}-writer", self.coord_id);
+        let policy_doc = CoordinatorWriterPolicy {
+            bucket: &self.bucket,
+        }
+        .build();
+        let policy_json = PolicyDocument::to_json(&policy_doc)
+            .map_err(|e| io::Error::other(format!("iam policy json: {e}")))?;
+
+        let access_key = self
+            .client
+            .create_access_key()
+            .await
+            .map_err(|e| io::Error::other(format!("create_access_key (writer): {e}")))?;
+
+        let policy = match self.client.create_policy(&policy_name, &policy_json).await {
+            Ok(p) => p,
+            Err(e) => {
+                if let Err(del_err) = self
+                    .client
+                    .delete_access_key(&access_key.access_key_id)
+                    .await
+                {
+                    warn!(
+                        "[iam] rollback delete_access_key after create_policy (writer) fail: {del_err}"
+                    );
+                }
+                return Err(io::Error::other(format!("create_policy (writer): {e}")));
+            }
+        };
+
+        if let Err(e) = self
+            .client
+            .attach_user_policy(&access_key.access_key_id, &policy.policy_arn)
+            .await
+        {
+            if let Err(del_err) = self.client.delete_policy(&policy.policy_arn).await {
+                warn!("[iam] rollback delete_policy after attach (writer) fail: {del_err}");
+            }
+            if let Err(del_err) = self
+                .client
+                .delete_access_key(&access_key.access_key_id)
+                .await
+            {
+                warn!("[iam] rollback delete_access_key after attach (writer) fail: {del_err}");
+            }
+            return Err(io::Error::other(format!(
+                "attach_user_policy (writer): {e}"
+            )));
+        }
+
+        let persisted = PersistedWriterIam {
+            writer_access_key_id: access_key.access_key_id.clone(),
+            policy_name: policy.policy_name.clone(),
+            policy_arn: policy.policy_arn.clone(),
+        };
+        write_writer_iam(&self.data_dir, &persisted)?;
+        info!(
+            target: "iam::writer",
+            writer_access_key_id = %access_key.access_key_id,
+            policy_arn = %policy.policy_arn,
+            "minted coordinator writer key (first start)",
+        );
+
+        Ok(IssuedCredentials {
+            access_key_id: access_key.access_key_id,
+            secret_access_key: access_key.secret_access_key,
+            session_token: None,
+            expiry_unix: None,
+        })
+    }
+
+    async fn rotate_writer_key(
+        &self,
+        existing: PersistedWriterIam,
+    ) -> io::Result<IssuedCredentials> {
+        let new_key = self
+            .client
+            .create_access_key()
+            .await
+            .map_err(|e| io::Error::other(format!("create_access_key (writer rotate): {e}")))?;
+
+        if let Err(e) = self
+            .client
+            .attach_user_policy(&new_key.access_key_id, &existing.policy_arn)
+            .await
+        {
+            if let Err(del_err) = self.client.delete_access_key(&new_key.access_key_id).await {
+                warn!("[iam] rollback delete_access_key after rotate-attach fail: {del_err}");
+            }
+            return Err(io::Error::other(format!(
+                "attach_user_policy (writer rotate): {e}"
+            )));
+        }
+
+        if let Err(e) = self
+            .client
+            .delete_access_key(&existing.writer_access_key_id)
+            .await
+        {
+            warn!(
+                "[iam] rotate: delete old writer access key {} failed: {e}; \
+                 new key is live, old key may linger in IAM until reconciled",
+                existing.writer_access_key_id
+            );
+        }
+
+        let persisted = PersistedWriterIam {
+            writer_access_key_id: new_key.access_key_id.clone(),
+            policy_name: existing.policy_name.clone(),
+            policy_arn: existing.policy_arn.clone(),
+        };
+        write_writer_iam(&self.data_dir, &persisted)?;
+        info!(
+            target: "iam::writer",
+            writer_access_key_id = %new_key.access_key_id,
+            policy_arn = %existing.policy_arn,
+            "rotated coordinator writer key on restart",
+        );
+
+        Ok(IssuedCredentials {
+            access_key_id: new_key.access_key_id,
+            secret_access_key: new_key.secret_access_key,
+            session_token: None,
+            expiry_unix: None,
+        })
+    }
+}
+
+fn writer_iam_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(WRITER_IAM_DIR).join(WRITER_IAM_FILE)
+}
+
+fn write_writer_iam(data_dir: &Path, value: &PersistedWriterIam) -> io::Result<()> {
+    let path = writer_iam_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::other(format!("writer iam.json: {e}")))?;
+    std::fs::write(&path, body)
+}
+
+fn read_writer_iam(data_dir: &Path) -> io::Result<Option<PersistedWriterIam>> {
+    let path = writer_iam_path(data_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let value: PersistedWriterIam = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::other(format!("writer iam.json: {e}")))?;
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn iam_json_path(data_dir: &Path, vol_ulid: &Ulid) -> PathBuf {
     data_dir
         .join("by_id")
@@ -369,6 +587,26 @@ mod tests {
         assert_eq!(read.policy_arn, p.policy_arn);
         assert_eq!(read.policy_expiry_unix, p.policy_expiry_unix);
         assert_eq!(read.ancestor_chain, p.ancestor_chain);
+    }
+
+    #[test]
+    fn writer_iam_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let p = PersistedWriterIam {
+            writer_access_key_id: "tid_writer".into(),
+            policy_name: "elide-COORD-writer".into(),
+            policy_arn: "arn:aws:iam::tid:policy/elide-COORD-writer".into(),
+        };
+        write_writer_iam(tmp.path(), &p).unwrap();
+        let read = read_writer_iam(tmp.path()).unwrap().unwrap();
+        assert_eq!(read.writer_access_key_id, p.writer_access_key_id);
+        assert_eq!(read.policy_arn, p.policy_arn);
+    }
+
+    #[test]
+    fn writer_iam_read_returns_none_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_writer_iam(tmp.path()).unwrap().is_none());
     }
 
     #[test]

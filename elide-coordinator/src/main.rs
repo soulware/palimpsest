@@ -136,7 +136,47 @@ async fn run() -> Result<()> {
             std::fs::write(&pid_path, std::process::id().to_string())
                 .with_context(|| format!("writing pidfile: {}", pid_path.display()))?;
 
-            let store = config.store.build()?;
+            let store = match &config.iam {
+                Some(iam_cfg) => {
+                    let admin = iam_cfg.resolve_admin().context(
+                        "resolving IAM admin credentials from AWS_* env (set when [iam] is configured)",
+                    )?;
+                    let mut tigris_cfg = elide_tigris_iam::TigrisIamConfig::tigris(
+                        admin.access_key_id.clone(),
+                        admin.secret_access_key.clone(),
+                    );
+                    tigris_cfg.endpoint = iam_cfg.endpoint.clone();
+                    tigris_cfg.region = iam_cfg.region.clone();
+                    let bucket = config.store.bucket.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[iam] mode requires an S3 [store] section with `bucket` set; \
+                             a local store has no IAM identity to manage"
+                        )
+                    })?;
+                    let identity =
+                        elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
+                            &config.data_dir,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("loading coordinator identity for writer key: {e}")
+                        })?;
+                    let manager = iam::WriterKeyManager::new(
+                        tigris_cfg,
+                        bucket,
+                        identity.coordinator_id_str().to_owned(),
+                        config.data_dir.clone(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("building writer-key manager: {e}"))?;
+                    let writer = manager
+                        .ensure_writer_key()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("ensuring coordinator writer key: {e}"))?;
+                    config
+                        .store
+                        .build_with_creds(&writer.access_key_id, &writer.secret_access_key)?
+                }
+                None => config.store.build()?,
+            };
             tracing::info!("[coordinator] store: {}", config.store.describe());
             tracing::info!(
                 "[coordinator] store scoping: passthrough (single key for every \

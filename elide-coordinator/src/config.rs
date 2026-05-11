@@ -294,6 +294,52 @@ impl StoreSection {
         }
     }
 
+    /// Build the S3 store with an explicitly-supplied access key pair,
+    /// bypassing the `AWS_*` env vars `AmazonS3Builder::from_env`
+    /// reads. Used by the `[iam]`-mode path where the coordinator
+    /// signs S3 mutations with a minted writer key, not with env
+    /// credentials.
+    ///
+    /// Behaviour matches `build` for the local-store and default
+    /// fallback branches; only the S3 branch differs (explicit
+    /// `with_access_key_id` / `with_secret_access_key` instead of
+    /// `from_env`).
+    pub fn build_with_creds(
+        &self,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        if let Some(path) = &self.local_path {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("creating local store dir: {}", path.display()))?;
+            let local = LocalFileSystem::new_with_prefix(path).context("building local store")?;
+            return Ok(Arc::new(
+                crate::local_cond_store::ConditionalLocalStore::new(local),
+            ));
+        }
+        let Some(bucket) = &self.bucket else {
+            bail!(
+                "[iam] mode requires an S3 [store] section (bucket set); local-only stores \
+                 cannot mint a writer key"
+            );
+        };
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_access_key_id(access_key_id)
+            .with_secret_access_key(secret_access_key)
+            .with_client_options(self.client_options())
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
+        if let Some(ep) = &self.endpoint {
+            builder = builder
+                .with_endpoint(ep)
+                .with_virtual_hosted_style_request(false);
+        }
+        if let Some(region) = &self.region {
+            builder = builder.with_region(region);
+        }
+        Ok(Arc::new(builder.build().context("building S3 client")?))
+    }
+
     pub fn build(&self) -> Result<Arc<dyn ObjectStore>> {
         if let Some(path) = &self.local_path {
             std::fs::create_dir_all(path)
@@ -526,12 +572,15 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # (docs/design-iam-key-model.md). Absence keeps the shared-key
 # downgrade where every volume gets the coordinator's own AWS_* key.
 #
-# endpoint = "https://iam.storage.dev"           # Tigris IAM endpoint
-# region   = "us-east-1"                          # SigV4 signing region
-# admin_access_key_id_env     = "ELIDE_IAM_ADMIN_ACCESS_KEY_ID"
-# admin_secret_access_key_env = "ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY"
-# ro_key_lifetime = "720h"                       # DateLessThan default
-# source_ips      = []                            # optional egress IP pins
+# When [iam] is set, AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY hold the
+# IAM *admin* credential — the coordinator uses them to mint its
+# writer key on first start, then signs all S3 mutations with the
+# writer key. The admin credential is held in memory only.
+#
+# endpoint = "https://iam.storage.dev"   # Tigris IAM endpoint
+# region   = "us-east-1"                  # SigV4 signing region
+# ro_key_lifetime = "720h"                # DateLessThan default
+# source_ips      = []                    # optional egress IP pins
 
 [peer_fetch]
 # Setting `port` enables peer fetch: the coordinator binds an HTTP server on
@@ -603,13 +652,13 @@ pub struct PeerFetchConfig {
 /// IAM-managed credentials. Enables per-volume IAM keys via the
 /// Tigris IAM API (`docs/design-iam-key-model.md`).
 ///
-/// The admin key is operator-configured and never persisted on disk;
-/// `admin_access_key_id_env` / `admin_secret_access_key_env` name the
-/// env vars the coordinator reads at startup. We do NOT reuse
-/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for two reasons: the
-/// coordinator's own S3 client also reads those, and the IAM admin key
-/// is a *strictly stronger* credential than the S3 store key — the
-/// design treats them as separate principals.
+/// When `[iam]` is present, the standard `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY` env vars hold the **admin** credential —
+/// the coordinator uses them to talk to the IAM API and to bootstrap
+/// the coordinator's writer key. Subsequent S3 mutations are signed
+/// with the minted writer key, not with `AWS_*`. When `[iam]` is
+/// absent the same env vars play their conventional role: direct S3
+/// store credentials, no writer-key indirection.
 #[derive(Deserialize, Clone, Debug)]
 pub struct IamConfig {
     /// Tigris IAM endpoint. Defaults to `https://iam.storage.dev`.
@@ -620,16 +669,6 @@ pub struct IamConfig {
     /// AWS-CLI default for IAM; Tigris IAM is region-agnostic).
     #[serde(default = "default_iam_region")]
     pub region: String,
-
-    /// Env var holding the admin access key ID. Default:
-    /// `ELIDE_IAM_ADMIN_ACCESS_KEY_ID`.
-    #[serde(default = "default_admin_key_id_env")]
-    pub admin_access_key_id_env: String,
-
-    /// Env var holding the admin secret. Default:
-    /// `ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY`.
-    #[serde(default = "default_admin_secret_env")]
-    pub admin_secret_access_key_env: String,
 
     /// Default lifetime of per-volume RO key policies (`DateLessThan`
     /// in the policy condition). Refreshed on a schedule before
@@ -650,12 +689,6 @@ fn default_iam_endpoint() -> String {
 fn default_iam_region() -> String {
     "us-east-1".to_owned()
 }
-fn default_admin_key_id_env() -> String {
-    "ELIDE_IAM_ADMIN_ACCESS_KEY_ID".to_owned()
-}
-fn default_admin_secret_env() -> String {
-    "ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY".to_owned()
-}
 fn default_ro_key_lifetime() -> Duration {
     Duration::from_secs(30 * 24 * 60 * 60)
 }
@@ -669,20 +702,21 @@ pub struct IamAdminCredentials {
 }
 
 impl IamConfig {
-    /// Resolve the admin credentials from env. Returns an error with
-    /// the missing var name so operators can act on it directly. The
-    /// error path is the only place the env var name is exposed in
-    /// logs; the values themselves are never logged.
+    /// Resolve the admin credentials from the standard `AWS_*` env
+    /// vars. In `[iam]` mode these vars carry the admin credential, not
+    /// the coordinator's S3 store credential. Returns an error naming
+    /// the missing var so operators can act on it directly; the values
+    /// themselves are never logged.
     pub fn resolve_admin(&self) -> Result<IamAdminCredentials> {
-        let access_key_id = std::env::var(&self.admin_access_key_id_env)
-            .with_context(|| format!("reading {}", self.admin_access_key_id_env))?;
+        let access_key_id =
+            std::env::var("AWS_ACCESS_KEY_ID").with_context(|| "reading AWS_ACCESS_KEY_ID")?;
         if access_key_id.is_empty() {
-            bail!("{} is set but empty", self.admin_access_key_id_env);
+            bail!("AWS_ACCESS_KEY_ID is set but empty");
         }
-        let secret_access_key = std::env::var(&self.admin_secret_access_key_env)
-            .with_context(|| format!("reading {}", self.admin_secret_access_key_env))?;
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .with_context(|| "reading AWS_SECRET_ACCESS_KEY")?;
         if secret_access_key.is_empty() {
-            bail!("{} is set but empty", self.admin_secret_access_key_env);
+            bail!("AWS_SECRET_ACCESS_KEY is set but empty");
         }
         Ok(IamAdminCredentials {
             access_key_id,
@@ -863,11 +897,6 @@ mod tests {
         let iam = cfg.iam.expect("iam present");
         assert_eq!(iam.endpoint, "https://iam.storage.dev");
         assert_eq!(iam.region, "us-east-1");
-        assert_eq!(iam.admin_access_key_id_env, "ELIDE_IAM_ADMIN_ACCESS_KEY_ID");
-        assert_eq!(
-            iam.admin_secret_access_key_env,
-            "ELIDE_IAM_ADMIN_SECRET_ACCESS_KEY"
-        );
         assert_eq!(iam.ro_key_lifetime, Duration::from_secs(30 * 24 * 60 * 60));
         assert!(iam.source_ips.is_empty());
     }
@@ -878,8 +907,6 @@ mod tests {
             [iam]
             endpoint = "https://iam.example.test"
             region = "eu-west-1"
-            admin_access_key_id_env = "MY_ID"
-            admin_secret_access_key_env = "MY_SECRET"
             ro_key_lifetime = "24h"
             source_ips = ["203.0.113.5/32"]
         "#;
@@ -887,8 +914,6 @@ mod tests {
         let iam = cfg.iam.expect("iam present");
         assert_eq!(iam.endpoint, "https://iam.example.test");
         assert_eq!(iam.region, "eu-west-1");
-        assert_eq!(iam.admin_access_key_id_env, "MY_ID");
-        assert_eq!(iam.admin_secret_access_key_env, "MY_SECRET");
         assert_eq!(iam.ro_key_lifetime, Duration::from_secs(24 * 60 * 60));
         assert_eq!(iam.source_ips, vec!["203.0.113.5/32".to_owned()]);
     }

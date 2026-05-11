@@ -23,4 +23,4 @@ pub mod policy;
 
 pub use client::{TigrisIamClient, TigrisIamConfig};
 pub use error::IamError;
-pub use policy::{PerVolumeReadOnlyPolicy, PolicyDocument};
+pub use policy::{CoordinatorWriterPolicy, PerVolumeReadOnlyPolicy, PolicyDocument};
