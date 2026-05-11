@@ -1229,6 +1229,32 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
+/// Guard run early in every `volume release` variant (local fork
+/// and breadcrumb-only): refuse on a foreign-owned name (point at
+/// `release --force`) and on an already-Released record (idempotent
+/// feedback). The error strings are operator-facing and load-bearing
+/// for discoverability — keep them verbatim.
+fn ensure_release_eligible(
+    rec: &elide_core::name_record::NameRecord,
+    volume_name: &str,
+    coord_id: &str,
+) -> Result<(), IpcError> {
+    if let Some(existing) = rec.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is owned by coordinator {existing}; \
+             run `volume release --force` to override"
+        )));
+    }
+    if rec.state == elide_core::name_record::NameState::Released {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is already released"
+        )));
+    }
+    Ok(())
+}
+
 /// User-wins-on-tie precedence for snapshot enumeration. Given a
 /// candidate `(ulid, kind)` and the current best, returns `true`
 /// when the candidate should replace it: strictly newer ULID, or
@@ -2321,7 +2347,6 @@ async fn release_volume_op(
     // Verify ownership in S3 before doing any local state mutation.
     // Pulled ahead of the daemon restart so a "wrong owner" or
     // "already released" reply doesn't perturb the local volume.
-    use elide_core::name_record::NameState;
     let read_started = std::time::Instant::now();
     let (rec, _) = read_name_record_required(store, volume_name, || {
         IpcError::not_found(format!(
@@ -2335,19 +2360,7 @@ async fn release_volume_op(
         rec.coordinator_id,
         read_started.elapsed()
     );
-    if let Some(existing) = rec.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is owned by coordinator {existing}; \
-             run `volume release --force` to override"
-        )));
-    }
-    if rec.state == NameState::Released {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is already released"
-        )));
-    }
+    ensure_release_eligible(&rec, volume_name, coord_id)?;
 
     // Fast path: nothing has changed since the last published snapshot,
     // so reuse it as the handoff. The next claimant forks from it
@@ -2554,7 +2567,6 @@ async fn release_breadcrumb_only(
     started: std::time::Instant,
 ) -> Result<ReleaseReply, IpcError> {
     use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
-    use elide_core::name_record::NameState;
 
     // Breadcrumb is the local fingerprint of "we still own this
     // name remotely". Without one, this volume isn't a candidate for
@@ -2577,19 +2589,7 @@ async fn release_breadcrumb_only(
     })
     .await?;
 
-    if let Some(existing) = rec.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is owned by coordinator {existing}; \
-             run `volume release --force` to override"
-        )));
-    }
-    if rec.state == NameState::Released {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is already released"
-        )));
-    }
+    ensure_release_eligible(&rec, volume_name, coord_id)?;
 
     // Find the latest published snapshot for this vol_ulid to use as
     // the handoff. The bucket should have an auto-snapshot from the
