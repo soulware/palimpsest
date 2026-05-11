@@ -2573,24 +2573,23 @@ async fn release_breadcrumb_only(
 
     // Find the latest published snapshot for this vol_ulid to use as
     // the handoff. The bucket should have an auto-snapshot from the
-    // preceding `stop` even though the local fork is gone.
-    let (snap_ulid, snap_kind) = latest_release_handoff_snapshot(rec.vol_ulid, store)
-        .await?
-        .ok_or_else(|| {
-            IpcError::not_found(format!(
-                "name '{volume_name}' has no snapshot in the store; \
-                 cross-host recovery via `release --force` from another host"
-            ))
-        })?;
-    // If the only available basis is an auto-snapshot, promote it to
-    // a stable `<S>.manifest` in S3 before flipping the bucket.
-    // Claimants resolve the handoff key as `<vol>/snapshots/<.../>
-    // <snap>.manifest` (not `.auto.manifest`), so a Released name
-    // pointing at an unpromoted auto-snapshot would surface as a
-    // NotFound on claim.
-    if snap_kind == elide_core::signing::SnapshotKind::Auto {
-        promote_auto_snapshot_in_store(rec.vol_ulid, snap_ulid, store).await?;
-    }
+    // preceding `stop` even though the local fork is gone. If there
+    // is no snapshot at all (the volume was minted via `claim`, never
+    // started or stopped, then removed), synthesise an empty handoff
+    // signed by the volume's own key from the local shadow.
+    let snap_ulid = match latest_release_handoff_snapshot(rec.vol_ulid, store).await? {
+        Some((snap_ulid, elide_core::signing::SnapshotKind::User)) => snap_ulid,
+        Some((snap_ulid, elide_core::signing::SnapshotKind::Auto)) => {
+            // Promote auto → user in S3 before flipping. Claimants
+            // resolve the handoff key as `<vol>/snapshots/<.../>
+            // <snap>.manifest` (not `.auto.manifest`), so an
+            // unpromoted auto-snapshot would surface as a NotFound on
+            // claim.
+            promote_auto_snapshot_in_store(rec.vol_ulid, snap_ulid, store).await?;
+            snap_ulid
+        }
+        None => synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store).await?,
+    };
     info!(
         "[release {volume_name}] breadcrumb-only: handoff snapshot {snap_ulid} \
          (no local fork, no drain needed)"
@@ -2680,6 +2679,61 @@ async fn latest_release_handoff_snapshot(
 /// fast path); shared helper would be nice but the local variant
 /// also needs to rename the sentinel + manifest on disk, which
 /// doesn't apply here.
+/// Sign and publish an empty handoff manifest for an owned volume
+/// that never accumulated any segments. Reached only from the
+/// breadcrumb-only release path when `latest_release_handoff_snapshot`
+/// returns `None` — i.e. the operator did
+/// `volume claim` → `volume remove` → `volume release` without ever
+/// starting the volume, so the daemon never wrote anything and no
+/// auto-snapshot was published at stop time.
+///
+/// Signs with the volume's own key (loaded from the local
+/// `data_dir/keys/<vol_ulid>.key` shadow). The result is a normal
+/// `<S>.manifest` with zero segment ULIDs and no recovery metadata —
+/// identical shape to what `volume stop` would have published if the
+/// volume had run with no writes.
+///
+/// Refuses if no key shadow exists. That would mean we own the
+/// bucket record but the host has no record of ever minting the
+/// volume — an inconsistency the operator should resolve via
+/// `release --force` from somewhere with credentials.
+///
+/// The `snap_ulid` is freshly minted coordinator-side. This is one
+/// of the few legitimate coordinator-side ULID mints — there is no
+/// volume actor to consult (the local fork is gone), and there's no
+/// other handoff to compare against.
+async fn synthesise_empty_owner_handoff(
+    volume_name: &str,
+    data_dir: &Path,
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<ulid::Ulid, IpcError> {
+    let shadow = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
+        .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?;
+    let key_bytes = shadow.ok_or_else(|| {
+        IpcError::not_found(format!(
+            "name '{volume_name}' has no snapshot in the store and no key shadow \
+             locally — recover via `release --force` from another host"
+        ))
+    })?;
+    let (signer, _vk) = elide_core::signing::signer_from_bytes(&key_bytes)
+        .map_err(|e| IpcError::internal(format!("loading shadow signer: {e}")))?;
+
+    let snap_ulid = ulid::Ulid::new();
+    let manifest_bytes =
+        elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
+    let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+    store
+        .put(&key, manifest_bytes.into())
+        .await
+        .map_err(|e| IpcError::store(format!("publishing empty handoff manifest {key}: {e}")))?;
+    info!(
+        "[release {volume_name}] breadcrumb-only: synthesised empty handoff \
+         {snap_ulid} (signed by local key shadow)"
+    );
+    Ok(snap_ulid)
+}
+
 async fn promote_auto_snapshot_in_store(
     vol_ulid: ulid::Ulid,
     snap_ulid: ulid::Ulid,
