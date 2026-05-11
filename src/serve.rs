@@ -166,6 +166,13 @@ pub fn run_volume_ipc_only(dir: &Path, fetch_inputs: crate::VolumeFetchInputs) -
     let connected = Arc::new(AtomicBool::new(false));
     crate::control::start(dir, handle.clone(), connected)?;
 
+    // Signal the coordinator that `Volume::open` succeeded and the
+    // local fork is provably sufficient to serve. The coordinator
+    // uses this to clean up the auto-snapshot from S3 — without this
+    // signal it would otherwise wait until the next `stop` to replace
+    // it (pinning GC floor on a now-redundant basis). Fire-and-forget.
+    crate::coordinator_client::Client::notify_volume_ready_from_fork_dir(dir);
+
     let _sig_watcher = spawn_signal_watcher(handle, peer_counters)?;
 
     loop {

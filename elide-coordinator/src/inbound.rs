@@ -353,6 +353,12 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
+        Request::NotifyVolumeReady { vol_ulid } => {
+            let store = ctx.stores.coordinator_wide();
+            let result = notify_volume_ready_op(vol_ulid, &ctx.data_dir, &store).await;
+            let env: Envelope<()> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
         Request::Remove { volume, force } => {
             let store = ctx.stores.coordinator_wide();
             let result = remove_volume(
@@ -2619,24 +2625,12 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
         .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
     crate::rescan::trigger();
 
-    // Best-effort: delete any auto-snapshots left over from a preceding
-    // `stop`. The local fork is now Live again (or about to be — the
-    // supervisor picks it up on the next scan); the auto-snapshot has
-    // done its job and would otherwise pin segments out of GC reach.
-    // Failures here only mean the next stop will overwrite a stale
-    // auto-snapshot — they do not affect start correctness.
-    let vol_ulid_str = vol_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_owned);
-    if let Some(vol_ulid_str) = vol_ulid_str
-        && let Err(e) = cleanup_auto_snapshots(&vol_dir, &vol_ulid_str, &store).await
-    {
-        warn!(
-            "[inbound] start {volume_name}: failed to clean auto-snapshots: {e:#}; \
-             next stop will overwrite"
-        );
-    }
+    // Note: auto-snapshot cleanup is no longer done here. The volume
+    // binary signals readiness via `NotifyVolumeReady` once
+    // `Volume::open` succeeds, and that handler cleans up the
+    // auto-snapshot. This avoids a window where `start` returned OK
+    // but the daemon failed to open, leaving the user with the
+    // bucket-side basis already deleted and no way to recover.
 
     info!("[inbound] started volume {volume_name}");
     Ok(())
@@ -2660,6 +2654,36 @@ fn self_heal_key_shadow(
         Err(e) => return Err(e),
     };
     elide_coordinator::key_shadow::write(data_dir, vol_ulid, &bytes)
+}
+
+/// Handle the volume binary's `NotifyVolumeReady` signal: the volume
+/// has successfully opened (key loaded, WAL replayed, extent index
+/// reconstructed) and the local fork is provably sufficient to serve.
+/// The auto-snapshot from the preceding `stop` is no longer needed as
+/// a recovery basis and is cleaned up here.
+///
+/// Best-effort: a cleanup failure leaves the auto-snapshot in S3 (and
+/// pinning the GC floor) until the next `stop` overwrites it. The
+/// volume continues to serve regardless.
+async fn notify_volume_ready_op(
+    vol_ulid: ulid::Ulid,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), IpcError> {
+    let vol_ulid_str = vol_ulid.to_string();
+    let fork_dir = data_dir.join("by_id").join(&vol_ulid_str);
+    if !fork_dir.exists() {
+        return Err(IpcError::not_found(format!(
+            "fork dir for {vol_ulid_str} not present locally"
+        )));
+    }
+    if let Err(e) = cleanup_auto_snapshots(&fork_dir, &vol_ulid_str, store).await {
+        warn!(
+            "[inbound] notify-ready {vol_ulid_str}: cleanup_auto_snapshots failed: {e:#}; \
+             auto-snapshot will be overwritten by the next stop"
+        );
+    }
+    Ok(())
 }
 
 async fn cleanup_auto_snapshots(

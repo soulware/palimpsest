@@ -181,6 +181,74 @@ impl Client {
             .map_err(|e| io::Error::other(format!("await-prefetch: {e}")))
     }
 
+    /// Notify the coordinator that `Volume::open` succeeded for this
+    /// fork. The coordinator uses this signal to clean up the
+    /// auto-snapshot from S3 — the local fork is provably sufficient
+    /// to serve, so the bucket-side basis is no longer needed.
+    ///
+    /// Best-effort: callers should not block on this and should ignore
+    /// errors. A missed notification leaves the auto-snapshot in S3
+    /// until the next `volume stop` overwrites it — operationally
+    /// harmless, just a small amount of S3 storage and a GC floor
+    /// anchor at the old snapshot point.
+    pub fn notify_volume_ready(&self, vol_ulid: &str) -> io::Result<()> {
+        let parsed = ulid::Ulid::from_string(vol_ulid)
+            .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
+        let stream = UnixStream::connect(&self.socket_path).map_err(|e| {
+            io::Error::other(format!(
+                "coordinator not running ({}): {e}",
+                self.socket_path.display()
+            ))
+        })?;
+        let budget = Duration::from_secs(5);
+        stream
+            .set_read_timeout(Some(budget))
+            .map_err(|e| io::Error::other(format!("set read timeout: {e}")))?;
+        stream
+            .set_write_timeout(Some(budget))
+            .map_err(|e| io::Error::other(format!("set write timeout: {e}")))?;
+        let request = Request::NotifyVolumeReady { vol_ulid: parsed };
+        let line = serde_json::to_string(&request)
+            .map_err(|e| io::Error::other(format!("encode request: {e}")))?;
+        let mut writer = &stream;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut reader = io::BufReader::new(&stream);
+        let mut response_line = String::new();
+        let _ = reader.read_line(&mut response_line);
+        let env: Envelope<()> = serde_json::from_str(response_line.trim())
+            .map_err(|e| io::Error::other(format!("parse reply: {e}")))?;
+        env.into_result()
+            .map_err(|e| io::Error::other(format!("notify-volume-ready: {e}")))
+    }
+
+    /// Best-effort fire-and-forget variant of [`Self::notify_volume_ready`]
+    /// for use from the volume binary's serve startup path: derive the
+    /// coordinator socket from the fork directory, send the
+    /// notification, and log any failure. Never panics, never returns
+    /// — the volume serving path continues regardless.
+    pub fn notify_volume_ready_from_fork_dir(fork_dir: &Path) {
+        let Some(vol_ulid) = fork_dir.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let Some(data_dir) = fork_dir.parent().and_then(|p| p.parent()) else {
+            return;
+        };
+        let socket = data_dir.join("control.sock");
+        if !socket.exists() {
+            // No coordinator on this host — operating standalone.
+            return;
+        }
+        let client = Client::new(&socket);
+        if let Err(e) = client.notify_volume_ready(vol_ulid) {
+            tracing::warn!(
+                "[volume {vol_ulid}] notify-volume-ready to coordinator failed: {e}; \
+                 auto-snapshot cleanup deferred to next stop"
+            );
+        }
+    }
+
     /// Mint a per-volume macaroon for the spawned volume process.
     ///
     /// The coordinator authenticates the request via SO_PEERCRED on the
