@@ -2255,9 +2255,19 @@ async fn release_volume_op(
 
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found: {volume_name}"
-        )));
+        // No local fork — but a `remote/<name>` breadcrumb plus a
+        // bucket record that names us as owner is enough to release:
+        // the auto-snapshot from the preceding clean `stop` (which
+        // ran before `remove`) already covers the durable state, so
+        // there's no drain to do. Just flip the bucket to Released
+        // using that snapshot as the handoff, and clear the
+        // breadcrumb.
+        //
+        // This makes `stop → remove → release` work without forcing
+        // the operator to detour through `start → stop` first just
+        // to hand off a name they've already mentally given up.
+        return release_breadcrumb_only(volume_name, data_dir, store, identity, coord_id, started)
+            .await;
     }
     let vol_dir = std::fs::canonicalize(&link)
         .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
@@ -2495,6 +2505,255 @@ async fn release_volume_op(
 /// On success also writes `volume.released` into `vol_dir` as a
 /// best-effort display marker — the bucket record is authoritative,
 /// the local marker only drives `volume list` rendering.
+/// Breadcrumb-only release: there's no local fork, but a
+/// `data_dir/remote/<name>` breadcrumb plus a bucket record that
+/// names us as owner is enough to release. The preceding clean
+/// `stop` published an auto-snapshot that covers the durable state;
+/// use it as the handoff, flip `names/<name>` to `Released`, and
+/// clear the breadcrumb.
+///
+/// Refuses if:
+///   - The breadcrumb is absent (no record of ever owning this).
+///   - The bucket record is missing or owned by another coordinator
+///     (the cross-host case — operator must `release --force` from
+///     a host that's actually the dead owner).
+///   - The bucket record is already `Released` (idempotent failure
+///     to give better operator feedback).
+///   - No snapshot exists under `by_id/<vol_ulid>/snapshots/` (the
+///     auto-snapshot was somehow lost; cross-host recovery via
+///     `release --force` is the only remaining path, and even that
+///     would synthesise).
+async fn release_breadcrumb_only(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    coord_id: &str,
+    started: std::time::Instant,
+) -> Result<ReleaseReply, IpcError> {
+    use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
+    use elide_core::name_record::NameState;
+
+    // Breadcrumb is the local fingerprint of "we still own this
+    // name remotely". Without one, this volume isn't a candidate for
+    // breadcrumb-only release — surface the same not-found error
+    // operators expect.
+    let breadcrumb = elide_coordinator::remote_breadcrumb::read(data_dir, volume_name)
+        .map_err(|e| IpcError::internal(format!("reading breadcrumb: {e}")))?;
+    let Some(_breadcrumb) = breadcrumb else {
+        return Err(IpcError::not_found(format!(
+            "volume not found: {volume_name}"
+        )));
+    };
+
+    let record = elide_coordinator::name_store::read_name_record(store, volume_name)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+    let (rec, _) = record.ok_or_else(|| {
+        IpcError::not_found(format!(
+            "name '{volume_name}' has no S3 record despite local breadcrumb; \
+             stale breadcrumb — remove `{}/remote/{volume_name}` to dismiss",
+            data_dir.display()
+        ))
+    })?;
+
+    if let Some(existing) = rec.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is owned by coordinator {existing}; \
+             run `volume release --force` to override"
+        )));
+    }
+    if rec.state == NameState::Released {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is already released"
+        )));
+    }
+
+    // Find the latest published snapshot for this vol_ulid to use as
+    // the handoff. The bucket should have an auto-snapshot from the
+    // preceding `stop` even though the local fork is gone. If there
+    // is no snapshot at all (the volume was minted via `claim`, never
+    // started or stopped, then removed), synthesise an empty handoff
+    // signed by the volume's own key from the local shadow.
+    let snap_ulid = match latest_release_handoff_snapshot(rec.vol_ulid, store).await? {
+        Some((snap_ulid, elide_core::signing::SnapshotKind::User)) => snap_ulid,
+        Some((snap_ulid, elide_core::signing::SnapshotKind::Auto)) => {
+            // Promote auto → user in S3 before flipping. Claimants
+            // resolve the handoff key as `<vol>/snapshots/<.../>
+            // <snap>.manifest` (not `.auto.manifest`), so an
+            // unpromoted auto-snapshot would surface as a NotFound on
+            // claim.
+            promote_auto_snapshot_in_store(rec.vol_ulid, snap_ulid, store).await?;
+            snap_ulid
+        }
+        None => synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store).await?,
+    };
+    info!(
+        "[release {volume_name}] breadcrumb-only: handoff snapshot {snap_ulid} \
+         (no local fork, no drain needed)"
+    );
+
+    let outcome = lifecycle::mark_released(store, volume_name, coord_id, snap_ulid).await;
+    match outcome {
+        Ok(MarkReleasedOutcome::Updated { vol_ulid }) => {
+            info!(
+                "[release {volume_name}] released at handoff snapshot {snap_ulid} \
+                 (breadcrumb-only, total {:.2?})",
+                started.elapsed()
+            );
+            elide_coordinator::volume_event_store::emit_best_effort(
+                store,
+                identity.as_ref(),
+                volume_name,
+                elide_core::volume_event::EventKind::Released {
+                    handoff_snapshot: snap_ulid,
+                },
+                vol_ulid,
+            )
+            .await;
+            if let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name) {
+                warn!("[release {volume_name}] clearing breadcrumb: {e}");
+            }
+            Ok(ReleaseReply {
+                handoff_snapshot: snap_ulid,
+            })
+        }
+        Ok(other) => Err(IpcError::store(format!(
+            "release flip for {volume_name}: unexpected outcome {other:?}"
+        ))),
+        Err(e) => Err(IpcError::store(format!("release flip: {e}"))),
+    }
+}
+
+/// List `by_id/<vol_ulid>/snapshots/` in the bucket and return the
+/// highest ULID with its kind (User from `<u>.manifest`, Auto from
+/// `<u>.auto.manifest`). Used by breadcrumb-only release to pick
+/// the handoff snapshot and decide whether to promote it before the
+/// bucket flip. On ties (both kinds at the same ULID — a transient
+/// state from an interrupted prior promotion) User wins, matching
+/// the precedence in `latest_snapshot_marker`.
+async fn latest_release_handoff_snapshot(
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Option<(ulid::Ulid, elide_core::signing::SnapshotKind)>, IpcError> {
+    use futures::TryStreamExt;
+    use object_store::path::Path as StorePath;
+    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
+    let objects: Vec<object_store::ObjectMeta> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .map_err(|e| IpcError::store(format!("listing snapshots for {vol_ulid}: {e}")))?;
+    let mut latest: Option<(ulid::Ulid, elide_core::signing::SnapshotKind)> = None;
+    for obj in objects {
+        let Some(filename) = obj.location.filename() else {
+            continue;
+        };
+        let Some((u, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
+            continue;
+        };
+        latest = match latest {
+            None => Some((u, kind)),
+            Some((cur_u, cur_k)) => {
+                let take_new =
+                    u > cur_u || (u == cur_u && kind == elide_core::signing::SnapshotKind::User);
+                if take_new {
+                    Some((u, kind))
+                } else {
+                    Some((cur_u, cur_k))
+                }
+            }
+        };
+    }
+    Ok(latest)
+}
+
+/// Server-side promote an auto-snapshot to a stable user manifest in
+/// S3, without touching any local state. Used by breadcrumb-only
+/// release when the latest published basis is `<S>.auto.manifest` —
+/// claimants resolve the handoff via the stable filename, so the
+/// auto must be re-addressed before the bucket flip. Equivalent to
+/// the S3-side half of `promote_auto_snapshot` (used by the local
+/// fast path); shared helper would be nice but the local variant
+/// also needs to rename the sentinel + manifest on disk, which
+/// doesn't apply here.
+/// Sign and publish an empty handoff manifest for an owned volume
+/// that never accumulated any segments. Reached only from the
+/// breadcrumb-only release path when `latest_release_handoff_snapshot`
+/// returns `None` — i.e. the operator did
+/// `volume claim` → `volume remove` → `volume release` without ever
+/// starting the volume, so the daemon never wrote anything and no
+/// auto-snapshot was published at stop time.
+///
+/// Signs with the volume's own key (loaded from the local
+/// `data_dir/keys/<vol_ulid>.key` shadow). The result is a normal
+/// `<S>.manifest` with zero segment ULIDs and no recovery metadata —
+/// identical shape to what `volume stop` would have published if the
+/// volume had run with no writes.
+///
+/// Refuses if no key shadow exists. That would mean we own the
+/// bucket record but the host has no record of ever minting the
+/// volume — an inconsistency the operator should resolve via
+/// `release --force` from somewhere with credentials.
+///
+/// The `snap_ulid` is freshly minted coordinator-side. This is one
+/// of the few legitimate coordinator-side ULID mints — there is no
+/// volume actor to consult (the local fork is gone), and there's no
+/// other handoff to compare against.
+async fn synthesise_empty_owner_handoff(
+    volume_name: &str,
+    data_dir: &Path,
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<ulid::Ulid, IpcError> {
+    let shadow = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
+        .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?;
+    let key_bytes = shadow.ok_or_else(|| {
+        IpcError::not_found(format!(
+            "name '{volume_name}' has no snapshot in the store and no key shadow \
+             locally — recover via `release --force` from another host"
+        ))
+    })?;
+    let (signer, _vk) = elide_core::signing::signer_from_bytes(&key_bytes)
+        .map_err(|e| IpcError::internal(format!("loading shadow signer: {e}")))?;
+
+    let snap_ulid = ulid::Ulid::new();
+    let manifest_bytes =
+        elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
+    let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+    store
+        .put(&key, manifest_bytes.into())
+        .await
+        .map_err(|e| IpcError::store(format!("publishing empty handoff manifest {key}: {e}")))?;
+    info!(
+        "[release {volume_name}] breadcrumb-only: synthesised empty handoff \
+         {snap_ulid} (signed by local key shadow)"
+    );
+    Ok(snap_ulid)
+}
+
+async fn promote_auto_snapshot_in_store(
+    vol_ulid: ulid::Ulid,
+    snap_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), IpcError> {
+    let auto_key =
+        elide_coordinator::upload::auto_snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+    let user_key =
+        elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+    store.copy(&auto_key, &user_key).await.map_err(|e| {
+        IpcError::store(format!(
+            "copying {auto_key} → {user_key} on breadcrumb-only release promotion: {e}"
+        ))
+    })?;
+    if let Err(e) = store.delete(&auto_key).await {
+        warn!("[promote-auto {snap_ulid}] deleting {auto_key}: {e}");
+    }
+    Ok(())
+}
+
 async fn perform_release_flip(
     volume_name: &str,
     vol_dir: &Path,

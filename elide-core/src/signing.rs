@@ -148,6 +148,20 @@ pub fn generate_keypair(dir: &Path, key_file: &str, pub_file: &str) -> io::Resul
     Ok(key)
 }
 
+/// Construct an Ed25519 signer from raw 32-byte key material. Used by
+/// the coordinator's breadcrumb-only release path to load a signing
+/// key from `data_dir/keys/<vol_ulid>.key` without touching the
+/// volume's on-disk `volume.key` (the local fork has already been
+/// removed by the time release runs).
+pub fn signer_from_bytes(bytes: &[u8]) -> io::Result<(Arc<dyn SegmentSigner>, VerifyingKey)> {
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| io::Error::other("expected 32-byte Ed25519 signing key"))?;
+    let key = SigningKey::from_bytes(&arr);
+    let verifying_key = key.verifying_key();
+    Ok((Arc::new(Ed25519Signer { key }), verifying_key))
+}
+
 /// Load an Ed25519 signing key from `dir/<key_file>` and return a `SegmentSigner`.
 pub fn load_signer(dir: &Path, key_file: &str) -> io::Result<Arc<dyn SegmentSigner>> {
     let (signer, _) = load_keypair(dir, key_file)?;
