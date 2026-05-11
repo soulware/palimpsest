@@ -44,7 +44,7 @@ pointer that already exists.
 
 ```
 names/<name>                              — current state pointer (existing)
-events/<name>/<event_ulid>.toml           — append-only journal (new)
+events/<name>/<event_ulid>                — append-only journal (new)
 ```
 
 Events live under a separate top-level prefix from the pointer.
@@ -97,7 +97,7 @@ signature = "<ed25519-sig-over-canonical-form>"
   artefacts (e.g. synthesised handoff snapshots) without requiring
   a second key.
 - **`name`** duplicates the `<name>` segment of the on-disk key
-  (`events/<name>/<event_ulid>.toml`). The path is already
+  (`events/<name>/<event_ulid>`). The path is already
   authoritative for "which name does this event belong to"; the
   in-body field exists so a raw `cat` of an event file is
   self-describing, and so the signature binds the event to a

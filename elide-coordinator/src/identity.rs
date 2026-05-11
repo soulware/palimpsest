@@ -234,9 +234,14 @@ impl CoordinatorIdentity {
                 Ok(())
             }
             Err(object_store::Error::NotFound { .. }) => {
-                portable::put_if_absent(store, &key, Bytes::from(body))
-                    .await
-                    .map_err(|e| io::Error::other(format!("publish coordinator.pub: {e}")))?;
+                portable::put_if_absent_with_type(
+                    store,
+                    &key,
+                    Bytes::from(body),
+                    portable::MIME_TEXT,
+                )
+                .await
+                .map_err(|e| io::Error::other(format!("publish coordinator.pub: {e}")))?;
                 info!(
                     "[coordinator] published coordinator.pub at coordinators/{}/coordinator.pub",
                     self.coordinator_id_str

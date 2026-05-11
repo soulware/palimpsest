@@ -15,7 +15,9 @@ use tracing::debug;
 
 use elide_core::name_record::{NameRecord, ParseNameRecordError};
 
-use crate::portable::{ConditionalPutError, put_if_absent, put_with_match};
+use crate::portable::{
+    ConditionalPutError, MIME_TOML, put_if_absent_with_type, put_with_match_with_type,
+};
 
 /// Errors from `name_store` operations.
 #[derive(Debug)]
@@ -136,7 +138,7 @@ pub async fn create_name_record(
     let body = serialise(record)?;
     let key = name_key(name);
     let started = std::time::Instant::now();
-    let r = put_if_absent(store.as_ref(), &key, body).await?;
+    let r = put_if_absent_with_type(store.as_ref(), &key, body, MIME_TOML).await?;
     debug!(
         "[name_store] PUT-IF-ABSENT {key} state={:?} ({:.2?})",
         record.state,
@@ -159,7 +161,7 @@ pub async fn update_name_record(
     let body = serialise(record)?;
     let key = name_key(name);
     let started = std::time::Instant::now();
-    let r = put_with_match(store.as_ref(), &key, body, expected).await?;
+    let r = put_with_match_with_type(store.as_ref(), &key, body, expected, MIME_TOML).await?;
     debug!(
         "[name_store] PUT-IF-MATCH {key} state={:?} ({:.2?})",
         record.state,

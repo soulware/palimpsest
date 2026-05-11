@@ -36,7 +36,7 @@ The bucket has four top-level prefixes. Production users of each:
 |---|---|---|---|---|---|
 | `by_id/<vol-ulid>/` | Per-volume data: `volume.pub`, `volume.provenance`, `segments/`, `snapshots/`, `retention/` | coord (upload, identity, reaper) | coord (pull, prefetch, fork), volume process (segment fetch), peer-fetch (auth) | coord (snapshot/segment/retention enumeration) | coord (reaper) |
 | `names/<name>` | Name → vol_ulid claim records | coord (claim, fork, force-release) | coord (resolve, verify), peer-fetch (auth) | coord (`volume list --remote`) | coord (rollback) |
-| `events/<name>/<event-ulid>.toml` | Append-only per-name event journal | coord (event store, peer-discovery) | coord (event read, peer-discovery scan) | coord (event log enumeration) | **none** |
+| `events/<name>/<event-ulid>` | Append-only per-name event journal | coord (event store, peer-discovery) | coord (event read, peer-discovery scan) | coord (event log enumeration) | **none** |
 | `coordinators/<coord-ulid>/coordinator.pub` | Per-coordinator identity record | coord (identity publish, once) | coord (peer identity verify), peer-fetch (auth) | none observed | **none** |
 
 Volume processes only touch `by_id/<self>/` and `by_id/<ancestor>/`.
@@ -111,7 +111,7 @@ All coordinator-side mutations route through this key:
 - Segment upload, snapshot manifest/marker/filemap upload, retention
   marker writes (`by_id/`).
 - `names/<name>` claim, rename, force-release.
-- Event journal appends (`events/<name>/<event-ulid>.toml`).
+- Event journal appends (`events/<name>/<event-ulid>`).
 - One-time coordinator identity publish (`coordinators/<coord-ulid>/
   coordinator.pub`).
 

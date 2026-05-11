@@ -1,4 +1,4 @@
-//! `events/<name>/<event_ulid>.toml` append-only journal entry.
+//! `events/<name>/<event_ulid>` append-only journal entry.
 //!
 //! See `docs/design-volume-event-log.md`. Each event records one
 //! lifecycle transition of a named volume. The pointer at
@@ -153,7 +153,7 @@ impl EventKind {
 }
 
 /// Append-only journal entry stored at
-/// `events/<name>/<event_ulid>.toml`.
+/// `events/<name>/<event_ulid>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeEvent {
     /// Schema version. Bumped on fresh-bucket-only breaking changes.
@@ -181,7 +181,7 @@ pub struct VolumeEvent {
 
     /// The volume name this event belongs to. Duplicates the
     /// `<name>` segment of the on-disk key
-    /// (`events/<name>/<event_ulid>.toml`) so the body is
+    /// (`events/<name>/<event_ulid>`) so the body is
     /// self-describing — a `cat` of the file shows the name without
     /// needing the path. Included in the canonical signing payload
     /// so the signature binds the event to a specific name; a

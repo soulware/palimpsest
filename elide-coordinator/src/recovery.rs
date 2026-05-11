@@ -325,7 +325,14 @@ pub async fn mint_and_publish_synthesised_snapshot(
     let dead_vol_str = dead_vol_ulid.to_string();
     let key = snapshot_manifest_key(&dead_vol_str, snap_ulid);
 
-    match portable::put_if_absent(store.as_ref(), &key, Bytes::from(bytes)).await {
+    match portable::put_if_absent_with_type(
+        store.as_ref(),
+        &key,
+        Bytes::from(bytes),
+        portable::MIME_TEXT,
+    )
+    .await
+    {
         Ok(_) => Ok(PublishedSynthesisedSnapshot { snap_ulid, key }),
         Err(ConditionalPutError::PreconditionFailed) => {
             Err(PublishSnapshotError::AlreadyExists { key })

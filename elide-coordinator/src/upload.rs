@@ -42,8 +42,7 @@ use object_store::{
 };
 use ulid::Ulid;
 
-/// `Content-Type` for plain UTF-8 text files (volume.pub, provenance, manifest, etc.).
-const MIME_TEXT: &str = "text/plain; charset=utf-8";
+use crate::portable::MIME_TEXT;
 
 /// Fallback multipart part size when the daemon hasn't initialised
 /// [`PART_SIZE_BYTES`] (tests, batch tools that bypass daemon startup).

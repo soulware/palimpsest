@@ -7,7 +7,7 @@
 //! lists names and nothing else; `aws s3 ls events/` lists logs.
 //! See `docs/design-volume-event-log.md`.
 //!
-//! Keys: `events/<name>/<event_ulid>.toml`. Each object is written
+//! Keys: `events/<name>/<event_ulid>`. Each object is written
 //! exactly once via `If-None-Match: *` — duplicate ULIDs would be
 //! a programmer error, not a race.
 
@@ -33,7 +33,7 @@ use elide_core::volume_event::{EventKind, VolumeEvent};
 
 use crate::identity::{self, CoordinatorIdentity};
 use crate::ipc::{SignatureStatus, VolumeEventEntry};
-use crate::portable::{ConditionalPutError, put_if_absent};
+use crate::portable::{ConditionalPutError, MIME_TOML, put_if_absent_with_type};
 
 /// Errors from `volume_event_store` operations.
 #[derive(Debug)]
@@ -95,7 +95,7 @@ fn event_prefix(name: &str) -> StorePath {
 }
 
 fn event_key(name: &str, event_ulid: Ulid) -> StorePath {
-    StorePath::from(format!("events/{name}/{event_ulid}.toml"))
+    StorePath::from(format!("events/{name}/{event_ulid}"))
 }
 
 /// Sign `event` in place using `identity`'s coordinator key. The
@@ -108,7 +108,7 @@ fn sign_event(event: &mut VolumeEvent, identity: &CoordinatorIdentity) {
 }
 
 /// PUT a fully-formed signed event at
-/// `events/<name>/<event_ulid>.toml` using `If-None-Match: *`.
+/// `events/<name>/<event_ulid>` using `If-None-Match: *`.
 ///
 /// Refuses to write an unsigned event — the log invariant is that
 /// every event on the wire is signed, so accepting an unsigned one
@@ -126,7 +126,13 @@ pub async fn append_event(
     let body = event.to_toml().map_err(VolumeEventStoreError::Serialise)?;
     let key = event_key(name, event.event_ulid);
     let started = std::time::Instant::now();
-    let r = put_if_absent(store.as_ref(), &key, Bytes::from(body.into_bytes())).await?;
+    let r = put_if_absent_with_type(
+        store.as_ref(),
+        &key,
+        Bytes::from(body.into_bytes()),
+        MIME_TOML,
+    )
+    .await?;
     debug!(
         "[volume_event_store] PUT-IF-ABSENT {key} kind={} ({:.2?})",
         event.kind.as_str(),
@@ -138,7 +144,7 @@ pub async fn append_event(
 /// Return the highest `event_ulid` present under
 /// `events/<name>/`, or `None` if the prefix is empty.
 ///
-/// Listed objects whose filename does not parse as `<ulid>.toml`
+/// Listed objects whose filename does not parse as a `Ulid`
 /// are silently skipped — they aren't event records this code
 /// emitted, and a stray file should not block a fresh emit.
 pub async fn latest_event_ulid(
@@ -153,10 +159,7 @@ pub async fn latest_event_ulid(
         let Some(filename) = obj.location.filename() else {
             continue;
         };
-        let Some(stem) = filename.strip_suffix(".toml") else {
-            continue;
-        };
-        let Ok(ulid) = Ulid::from_string(stem) else {
+        let Ok(ulid) = Ulid::from_string(filename) else {
             continue;
         };
         if best.is_none_or(|b| ulid > b) {
@@ -238,7 +241,7 @@ pub async fn emit_event(
 /// List every event under `events/<name>/`, parsed and
 /// sorted ascending by `event_ulid`.
 ///
-/// Listed objects whose filename does not parse as `<ulid>.toml`,
+/// Listed objects whose filename does not parse as a `Ulid`,
 /// or whose body fails to parse as a [`VolumeEvent`], are dropped
 /// with a `warn!` — a corrupt file should be visible in the log
 /// but must not block the operator from inspecting the rest.
@@ -249,7 +252,7 @@ pub async fn list_events(
     let prefix = event_prefix(name);
     let objects: Vec<_> = store.list(Some(&prefix)).try_collect().await?;
 
-    // Sync filter: drop non-`<ulid>.toml` listings up front. Each
+    // Sync filter: drop non-ULID-named listings up front. Each
     // surviving entry's body GET is independent, so fetch them in
     // parallel under a small concurrency cap. Per-event errors are
     // warned and skipped (yields `None`) — matching the previous
@@ -258,8 +261,7 @@ pub async fn list_events(
         .into_iter()
         .filter_map(|obj| {
             let filename = obj.location.filename()?;
-            let stem = filename.strip_suffix(".toml")?;
-            if Ulid::from_string(stem).is_err() {
+            if Ulid::from_string(filename).is_err() {
                 return None;
             }
             Some(obj.location)
