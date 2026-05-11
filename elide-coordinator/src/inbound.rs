@@ -34,7 +34,6 @@ use crate::fork::{ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::{StoreSection, store_config};
-use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
@@ -1033,19 +1032,18 @@ async fn volume_status_remote_typed(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
 ) -> Result<StatusRemoteReply, IpcError> {
-    let record = match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => rec,
-        Ok(None) => {
-            return Err(IpcError::not_found(format!(
-                "name '{volume_name}' has no S3 record"
-            )));
-        }
-        Err(e) => {
-            return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
-        }
-    };
+    use elide_coordinator::bucket_position::fetch_position;
 
-    let eligibility = Eligibility::from_record(&record, coord_id);
+    let (position, record) = fetch_position(store, volume_name, coord_id)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+    let record = record
+        .ok_or_else(|| IpcError::not_found(format!("name '{volume_name}' has no S3 record")))?
+        .0;
+    // `position` is non-Absent here (record is Some).
+    let eligibility = position
+        .to_eligibility()
+        .expect("non-Absent position has an Eligibility");
 
     Ok(StatusRemoteReply {
         state: record.state,
@@ -3147,39 +3145,37 @@ async fn hydrate_or_route(
     coord_id: &str,
     core: &CoordinatorCore,
 ) -> Result<(), IpcError> {
-    use elide_core::name_record::NameState;
+    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
 
-    let (record, _) = read_name_record_required(store, volume_name, || {
-        IpcError::not_found(format!(
+    let (position, record) = fetch_position(store, volume_name, coord_id)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+
+    match position {
+        OwnershipPosition::Absent => Err(IpcError::not_found(format!(
             "volume '{volume_name}' not found locally or in the bucket"
-        ))
-    })
-    .await?;
-
-    let owned_by_us = record.coordinator_id.as_deref() == Some(coord_id);
-    match (record.state, owned_by_us) {
-        (NameState::Live | NameState::Stopped, true) => {
-            crate::start_remote::hydrate_remote_owned(
-                volume_name,
-                record.vol_ulid,
-                record.size,
-                store,
-                core,
-            )
-            .await
+        ))),
+        OwnershipPosition::OwnedByUs { vol_ulid, .. } => {
+            // Need `size` for the hydrate; pulled from the record we
+            // already read.
+            let size = record
+                .expect("fetch_position returned OwnedByUs => record is Some")
+                .0
+                .size;
+            crate::start_remote::hydrate_remote_owned(volume_name, vol_ulid, size, store, core)
+                .await
         }
-        (NameState::Live | NameState::Stopped, false) => {
-            let held_by = record.coordinator_id.as_deref().unwrap_or("<unknown>");
-            Err(IpcError::conflict(format!(
-                "name '{volume_name}' is held by coordinator {held_by}; \
+        OwnershipPosition::OwnedByOther {
+            coord_id: held_by, ..
+        } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is held by coordinator {held_by}; \
                  run `volume release --force` to override"
-            )))
-        }
-        (NameState::Released, _) => Err(IpcError::conflict(format!(
+        ))),
+        OwnershipPosition::Released { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is Released; \
              reclaim with: elide volume claim {volume_name}"
         ))),
-        (NameState::Readonly, _) => Err(IpcError::conflict(format!(
+        OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly; cannot start"
         ))),
     }
@@ -3769,6 +3765,7 @@ async fn stream_claim_by_name(volume: &str, writer: &mut OwnedWriteHalf, registr
 mod tests {
     use super::*;
     use crate::credential::IssuedCredentials;
+    use elide_coordinator::eligibility::Eligibility;
     use elide_coordinator::ipc::IpcErrorKind;
     use tempfile::TempDir;
 
