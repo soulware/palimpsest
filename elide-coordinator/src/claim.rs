@@ -281,55 +281,46 @@ async fn claim_volume_bucket_op(
             };
 
             if local_vol_ulid == Some(record.vol_ulid) {
-                // Gate the in-place reclaim on local writability.
-                // Three local-fork shapes for matching vol_ulid:
+                // In-place reclaim of a Released name we still hold
+                // locally. Three shapes for the matching `vol_ulid`:
                 //
                 //   (a) Original writable fork (has `volume.key`):
-                //       in-place reclaim is correct — flip the bucket
-                //       to Stopped and the operator runs `volume start`.
+                //       reconcile is a no-op on the local side; just
+                //       flip the bucket to Stopped.
                 //
-                //   (b) Fetched copy of *our own* lineage (no
-                //       `volume.key`, but a key shadow exists at
-                //       `data_dir/keys/<vol_ulid>.key` because we
-                //       originally minted this volume on this host):
-                //       restore the key from the shadow, strip the
-                //       fetched/readonly markers, then proceed as (a).
-                //       This is the "I fetched my own released volume
-                //       and want to use it again" path.
+                //   (b) Fetched copy of our own lineage (no
+                //       `volume.key`, but a key shadow exists):
+                //       reconcile restores the key and strips the
+                //       fetched/readonly markers, then the bucket
+                //       flip proceeds.
                 //
-                //   (c) Fetched copy of a *foreign* lineage (no
-                //       `volume.key`, no key shadow): can't be made
-                //       writable in place — refuse with a hint to
-                //       fork via `volume create --from`. The fetched
-                //       lineage stays usable as a parent.
+                //   (c) Fetched copy of a foreign lineage (no
+                //       `volume.key`, no shadow): reconcile refuses
+                //       with `NoKeyShadow` and we surface a hint to
+                //       fork via `volume create --from`.
                 let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
                     IpcError::internal(format!("canonicalize {}: {e}", link.display()))
                 })?;
-                let has_local_key = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE).exists();
-                let is_fetched = vol_dir
-                    .join(elide_coordinator::volume_state::FETCHED_FILE)
-                    .exists();
-                if !has_local_key {
-                    let shadow = elide_coordinator::key_shadow::read(data_dir, record.vol_ulid)
-                        .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?;
-                    if let Some(key_bytes) = shadow {
-                        // (b) — restore writability.
-                        elide_core::segment::write_file_atomic(
-                            &vol_dir.join(elide_core::signing::VOLUME_KEY_FILE),
-                            &key_bytes,
-                        )
-                        .map_err(|e| {
-                            IpcError::internal(format!("restoring volume.key from shadow: {e}"))
-                        })?;
-                        info!("[inbound] reclaim {volume_name}: restored volume.key from shadow");
-                    } else {
-                        // (c) — foreign fetched content, can't reclaim in place.
-                        return Err(IpcError::conflict(format!(
+                use elide_coordinator::volume_state::{
+                    ReconcileError, reconcile_owned_local_to_stopped,
+                };
+                if let Err(e) =
+                    reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid)
+                {
+                    return Err(match e {
+                        ReconcileError::NoKeyShadow => IpcError::conflict(format!(
                             "volume '{volume_name}' is a fetched (readonly) copy with no \
                              local signing key. To use it as a writable fork run: \
                              elide volume create --from {volume_name} <new-name>"
-                        )));
-                    }
+                        )),
+                        ReconcileError::DaemonRunning => IpcError::conflict(format!(
+                            "volume '{volume_name}' is running on this host; \
+                             stop it first with: elide volume stop {volume_name}"
+                        )),
+                        ReconcileError::Io(e) => {
+                            IpcError::internal(format!("reconciling local fork: {e}"))
+                        }
+                    });
                 }
                 use elide_coordinator::lifecycle::{
                     LifecycleError, MarkReclaimedLocalOutcome, mark_reclaimed_local,
@@ -361,27 +352,6 @@ async fn claim_volume_bucket_op(
                                 "[inbound] reclaim {volume_name}: clearing \
                                  volume.released marker: {e}"
                             );
-                        }
-                        // Strip fetched/readonly markers if we just
-                        // resurrected the key from shadow (case (b)).
-                        // Idempotent on volumes that never had them.
-                        if is_fetched {
-                            if let Err(e) =
-                                elide_coordinator::volume_state::clear_fetched_marker(&vol_dir)
-                            {
-                                warn!(
-                                    "[inbound] reclaim {volume_name}: clearing \
-                                     volume.fetched marker: {e}"
-                                );
-                            }
-                            match std::fs::remove_file(vol_dir.join("volume.readonly")) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => warn!(
-                                    "[inbound] reclaim {volume_name}: clearing \
-                                     volume.readonly marker: {e}"
-                                ),
-                            }
                         }
                         elide_coordinator::volume_event_store::emit_best_effort(
                             store,
@@ -431,10 +401,54 @@ async fn claim_volume_bucket_op(
         }
         NameState::Live | NameState::Stopped => match record.coordinator_id.as_deref() {
             Some(owner) if owner == coord_id => {
-                // Already ours — nothing to claim.
-                Err(IpcError::conflict(format!(
-                    "name '{volume_name}' is already held by this coordinator"
-                )))
+                // Idempotent: we already own this name in the bucket.
+                // Reconcile the local fork to the canonical Stopped+
+                // writable shape so a subsequent `volume start` works
+                // immediately. Handles the case where the local fork
+                // was stamped by an earlier `volume fetch`: `volume.key`
+                // missing, `volume.readonly` + `volume.fetched` present.
+                //
+                // If no local fork exists at all (e.g. post-stop+remove,
+                // breadcrumb retained), `claim` doesn't hydrate — the
+                // operator should use `volume start`, which has the
+                // full hydrate-from-bucket pipeline.
+                use elide_coordinator::volume_state::{
+                    ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
+                };
+                let link = data_dir.join("by_name").join(volume_name);
+                if !link.exists() {
+                    return Err(IpcError::conflict(format!(
+                        "name '{volume_name}' is owned by this coordinator but has no \
+                         local fork; use `volume start {volume_name}` to hydrate"
+                    )));
+                }
+                let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
+                    IpcError::internal(format!("canonicalize {}: {e}", link.display()))
+                })?;
+                match reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid) {
+                    Ok(ReconcileOutcome::AlreadyStopped) => {
+                        info!("[inbound] claim {volume_name}: already owned + stopped — no-op");
+                        Ok(ClaimReply::Reclaimed)
+                    }
+                    Ok(ReconcileOutcome::Reconciled) => {
+                        info!(
+                            "[inbound] claim {volume_name}: reconciled local fork to stopped+writable"
+                        );
+                        Ok(ClaimReply::Reclaimed)
+                    }
+                    Err(ReconcileError::NoKeyShadow) => Err(IpcError::conflict(format!(
+                        "volume '{volume_name}' is a fetched (readonly) copy with no \
+                         local signing key. To use it as a writable fork run: \
+                         elide volume create --from {volume_name} <new-name>"
+                    ))),
+                    Err(ReconcileError::DaemonRunning) => Err(IpcError::conflict(format!(
+                        "volume '{volume_name}' is running on this host; \
+                         stop it first with: elide volume stop {volume_name}"
+                    ))),
+                    Err(ReconcileError::Io(e)) => {
+                        Err(IpcError::internal(format!("reconciling local fork: {e}")))
+                    }
+                }
             }
             Some(owner) => Err(IpcError::conflict(format!(
                 "name '{volume_name}' is held by coordinator {owner}"

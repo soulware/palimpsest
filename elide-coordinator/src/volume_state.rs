@@ -296,6 +296,130 @@ pub fn clear_released_marker(vol_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Outcome categories for [`reconcile_owned_local_to_stopped`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// Local fork was already in the canonical Stopped+writable shape;
+    /// nothing was changed. Returned when `volume.key` was present,
+    /// no transient markers (`volume.fetched`/`volume.readonly`) were
+    /// stamped, and `volume.stopped` already existed.
+    AlreadyStopped,
+    /// At least one of `volume.key`, the transient markers, or
+    /// `volume.stopped` had to be written/removed to reach the
+    /// canonical shape.
+    Reconciled,
+}
+
+/// Errors returned by [`reconcile_owned_local_to_stopped`].
+#[derive(Debug)]
+pub enum ReconcileError {
+    /// `volume.key` is missing locally and no key shadow exists at
+    /// `data_dir/keys/<vol_ulid>.key`. This fork can't be made
+    /// writable in place — the caller should refuse and direct the
+    /// operator to fork via `volume create --from`.
+    NoKeyShadow,
+    /// Filesystem I/O failed mid-reconcile (e.g. permission denied
+    /// writing `volume.key` or `volume.stopped`). Local state may be
+    /// partially reconciled; idempotent retry is the recovery path.
+    Io(std::io::Error),
+    /// The volume daemon appears to be currently running (`control.sock`
+    /// is present). Reconciliation refuses rather than racing the
+    /// daemon — operator should `volume stop` first.
+    DaemonRunning,
+}
+
+impl std::fmt::Display for ReconcileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoKeyShadow => write!(
+                f,
+                "no key shadow available; foreign fetched fork cannot be made \
+                 writable in place"
+            ),
+            Self::Io(e) => write!(f, "i/o error during reconcile: {e}"),
+            Self::DaemonRunning => {
+                write!(f, "volume daemon is running; stop it before reconciling")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReconcileError {}
+
+impl From<std::io::Error> for ReconcileError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Bring an owned-by-us local fork into the canonical Stopped+
+/// writable shape. Idempotent — calling on an already-reconciled
+/// fork returns [`ReconcileOutcome::AlreadyStopped`].
+///
+/// The shape we converge on:
+///
+///   - `volume.key` present (restored from `data_dir/keys/<vol_ulid>.key`
+///     when absent).
+///   - `volume.readonly` absent.
+///   - `volume.fetched` absent.
+///   - `volume.stopped` present.
+///   - `control.sock` absent (i.e. daemon not running).
+///
+/// Used by:
+///   - `volume claim` against a `Live`/`Stopped` record owned by us
+///     (idempotent "I already own this; just make sure local is
+///     consistent").
+///   - `volume fetch` against a record owned by us (final stage:
+///     drop the foreign-fetched markers in favour of the writable
+///     Stopped shape).
+///   - `volume claim` against a `Released` record where the local
+///     fork is a fetched copy of our own lineage (the case fixed in
+///     the original key-shadow rollout).
+pub fn reconcile_owned_local_to_stopped(
+    fork_dir: &Path,
+    data_dir: &Path,
+    vol_ulid: ulid::Ulid,
+) -> Result<ReconcileOutcome, ReconcileError> {
+    if fork_dir.join("control.sock").exists() {
+        return Err(ReconcileError::DaemonRunning);
+    }
+
+    let mut changed = false;
+
+    // (1) Ensure volume.key is present.
+    let key_path = fork_dir.join(elide_core::signing::VOLUME_KEY_FILE);
+    if !key_path.exists() {
+        let shadow = crate::key_shadow::read(data_dir, vol_ulid)?;
+        let Some(key_bytes) = shadow else {
+            return Err(ReconcileError::NoKeyShadow);
+        };
+        elide_core::segment::write_file_atomic(&key_path, &key_bytes)?;
+        changed = true;
+    }
+
+    // (2) Strip transient markers.
+    for marker in ["volume.readonly", FETCHED_FILE] {
+        match std::fs::remove_file(fork_dir.join(marker)) {
+            Ok(()) => changed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ReconcileError::Io(e)),
+        }
+    }
+
+    // (3) Ensure volume.stopped is present.
+    let stopped = fork_dir.join(STOPPED_FILE);
+    if !stopped.exists() {
+        std::fs::write(&stopped, "")?;
+        changed = true;
+    }
+
+    Ok(if changed {
+        ReconcileOutcome::Reconciled
+    } else {
+        ReconcileOutcome::AlreadyStopped
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +712,110 @@ mod tests {
         assert_eq!(VolumeMode::Ro.label(), "ro");
         assert_eq!(VolumeMode::Rw.label(), "rw");
         assert_eq!(format!("{}", VolumeMode::Ro), "ro");
+    }
+
+    // ── reconcile_owned_local_to_stopped ─────────────────────────────
+
+    /// Set up a `(data_dir, vol_dir)` pair plus an optional key shadow
+    /// under `data_dir/keys/<vol_ulid>.key`. Returns the temp guard
+    /// alongside the paths so the caller can let it drop on exit.
+    fn reconcile_scaffolding(
+        with_shadow: bool,
+    ) -> (TempDir, std::path::PathBuf, std::path::PathBuf, ulid::Ulid) {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        if with_shadow {
+            crate::key_shadow::write(&data_dir, vol_ulid, &[0u8; 32]).unwrap();
+        }
+        (tmp, data_dir, vol_dir, vol_ulid)
+    }
+
+    #[test]
+    fn reconcile_no_op_when_already_stopped_writable() {
+        let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(false);
+        // Already-good shape: key present, stopped marker present, no
+        // transient markers.
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+            [0u8; 32],
+        )
+        .unwrap();
+        std::fs::write(vol_dir.join(STOPPED_FILE), "").unwrap();
+        let out = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid).unwrap();
+        assert_eq!(out, ReconcileOutcome::AlreadyStopped);
+    }
+
+    #[test]
+    fn reconcile_restores_key_from_shadow_and_strips_markers() {
+        let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(true);
+        // Fetched shape: readonly + fetched markers, no key, no stopped.
+        std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
+        std::fs::write(vol_dir.join(FETCHED_FILE), "{}").unwrap();
+        let out = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid).unwrap();
+        assert_eq!(out, ReconcileOutcome::Reconciled);
+        assert!(
+            vol_dir.join(elide_core::signing::VOLUME_KEY_FILE).exists(),
+            "key must be restored from shadow"
+        );
+        assert!(
+            !vol_dir.join("volume.readonly").exists(),
+            "readonly marker must be stripped"
+        );
+        assert!(
+            !vol_dir.join(FETCHED_FILE).exists(),
+            "fetched marker must be stripped"
+        );
+        assert!(
+            vol_dir.join(STOPPED_FILE).exists(),
+            "stopped marker must be written"
+        );
+    }
+
+    #[test]
+    fn reconcile_refuses_when_no_key_and_no_shadow() {
+        let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(false);
+        std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
+        std::fs::write(vol_dir.join(FETCHED_FILE), "{}").unwrap();
+        let err = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
+            .expect_err("foreign fetched fork must refuse");
+        assert!(matches!(err, ReconcileError::NoKeyShadow));
+        // No destructive side-effects on refusal.
+        assert!(vol_dir.join("volume.readonly").exists());
+        assert!(vol_dir.join(FETCHED_FILE).exists());
+    }
+
+    #[test]
+    fn reconcile_writes_stopped_marker_when_only_missing_part() {
+        // Volume.key is present (operator manually placed it, or this
+        // is an in-flight reconcile); only the stopped marker is missing.
+        let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(false);
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+            [0u8; 32],
+        )
+        .unwrap();
+        let out = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid).unwrap();
+        assert_eq!(out, ReconcileOutcome::Reconciled);
+        assert!(vol_dir.join(STOPPED_FILE).exists());
+    }
+
+    #[test]
+    fn reconcile_refuses_when_daemon_running() {
+        let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(false);
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+            [0u8; 32],
+        )
+        .unwrap();
+        // Simulate a running daemon by planting control.sock as a file
+        // (real socket creation would require nix unix-socket support;
+        // the helper only checks existence).
+        std::fs::write(vol_dir.join("control.sock"), "").unwrap();
+        let err = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
+            .expect_err("running daemon must refuse");
+        assert!(matches!(err, ReconcileError::DaemonRunning));
     }
 }

@@ -124,7 +124,8 @@ pub(crate) async fn start_fetch(
     // so we can fail fast (NotFound on either) without registering a
     // doomed-to-fail job. The actual body-warm work runs detached.
     let store = ctx.core.stores.coordinator_wide();
-    let (vol_ulid, size_bytes) = resolve_name(&volume_name, &store).await?;
+    let coord_id = ctx.core.identity.coordinator_id_str();
+    let (vol_ulid, size_bytes, owned_by_us) = resolve_name(&volume_name, &store, coord_id).await?;
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &store).await? {
         Some(u) => u,
         None => {
@@ -153,6 +154,7 @@ pub(crate) async fn start_fetch(
             vol_ulid,
             basis_snapshot,
             size_bytes,
+            owned_by_us,
             ctx,
             job_clone.clone(),
         )
@@ -184,6 +186,7 @@ async fn run_orchestrator(
     vol_ulid: Ulid,
     basis_snapshot: Ulid,
     size_bytes: u64,
+    owned_by_us: bool,
     ctx: FetchContext,
     job: Arc<FetchJob>,
 ) -> Result<(), IpcError> {
@@ -191,6 +194,17 @@ async fn run_orchestrator(
     let by_id_dir = data_dir.join("by_id");
     let fork_dir = by_id_dir.join(vol_ulid.to_string());
     let store = ctx.core.stores.for_volume(&vol_ulid);
+
+    // Refuse if the volume is currently running on this host. The
+    // body-warm worker opens the fork readonly and racing it against
+    // a writable daemon would expose inconsistent reads. Operator
+    // should `volume stop` first.
+    if owned_by_us && fork_dir.join("control.sock").exists() {
+        return Err(IpcError::conflict(format!(
+            "volume '{volume_name}' is running on this host; \
+             stop it first with: elide volume stop {volume_name}"
+        )));
+    }
 
     // Stage 1. Pull ancestor skeleton chain (volume.pub +
     // volume.provenance per ancestor). Stops at the first ancestor
@@ -254,14 +268,25 @@ async fn run_orchestrator(
     job.line("warming bodies (full-warm)");
     spawn_fetch_worker(&fork_dir, &volume_name, Arc::clone(&job)).await?;
 
-    // Stage 7. On clean exit, write the `volume.fetched` marker. Only
-    // here, after every prior step succeeded, does the volume
-    // formally enter the `Fetched` lifecycle state.
-    write_fetched_marker(&fork_dir, basis_snapshot, &ctx)?;
-    job.line(format!(
-        "fetched: marker written ({} = {basis_snapshot})",
-        FETCHED_FILE
-    ));
+    // Stage 7. End-state markers. Foreign volumes (someone else owns
+    // them in the bucket) enter the `Fetched` lifecycle — readonly,
+    // demand-fetched. Owned-by-us volumes are reconciled to the
+    // normal `Stopped` writable shape so `volume start` can bring
+    // the daemon up directly: restore `volume.key` from the local
+    // key shadow if absent, strip the `volume.readonly` marker that
+    // `pull_readonly_op` stamped on the leaf, and write
+    // `volume.stopped`. Without the shadow we can't make it
+    // writable — error rather than silently producing an unusable
+    // half-state.
+    if owned_by_us {
+        reconcile_owned_fetch_to_stopped(&fork_dir, &data_dir, vol_ulid, &job)?;
+    } else {
+        write_fetched_marker(&fork_dir, basis_snapshot, &ctx)?;
+        job.line(format!(
+            "fetched: marker written ({} = {basis_snapshot})",
+            FETCHED_FILE
+        ));
+    }
 
     Ok(())
 }
@@ -271,9 +296,13 @@ async fn run_orchestrator(
 async fn resolve_name(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
-) -> Result<(Ulid, u64), IpcError> {
+    coord_id: &str,
+) -> Result<(Ulid, u64, bool), IpcError> {
     match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => Ok((rec.vol_ulid, rec.size)),
+        Ok(Some((rec, _))) => {
+            let owned_by_us = rec.coordinator_id.as_deref() == Some(coord_id);
+            Ok((rec.vol_ulid, rec.size, owned_by_us))
+        }
         Ok(None) => Err(IpcError::not_found(format!(
             "volume '{volume_name}' not found in store"
         ))),
@@ -484,6 +513,44 @@ async fn spawn_fetch_worker(
         )));
     }
     Ok(())
+}
+
+/// Convert the post-warm on-disk layout for an *owned-by-us* fetch
+/// into the normal `Stopped` writable shape via
+/// `elide_coordinator::volume_state::reconcile_owned_local_to_stopped`.
+/// Idempotent: a fetch on an already-stopped owned volume becomes a
+/// no-op cleanup pass.
+fn reconcile_owned_fetch_to_stopped(
+    fork_dir: &Path,
+    data_dir: &Path,
+    vol_ulid: Ulid,
+    job: &Arc<FetchJob>,
+) -> Result<(), IpcError> {
+    use elide_coordinator::volume_state::{
+        ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
+    };
+    match reconcile_owned_local_to_stopped(fork_dir, data_dir, vol_ulid) {
+        Ok(ReconcileOutcome::AlreadyStopped) => {
+            job.line("owned: already in stopped state");
+            Ok(())
+        }
+        Ok(ReconcileOutcome::Reconciled) => {
+            job.line("owned: reconciled to stopped (rw)");
+            Ok(())
+        }
+        Err(ReconcileError::NoKeyShadow) => Err(IpcError::conflict(format!(
+            "volume {vol_ulid} is owned by this coordinator in the bucket but no key \
+             shadow exists locally — cannot make the fetched fork writable. To use \
+             the fetched data as a fork base run: \
+             elide volume create --from <name> <new-name>"
+        ))),
+        Err(ReconcileError::DaemonRunning) => Err(IpcError::conflict(format!(
+            "volume {vol_ulid} daemon is running on this host; stop it first"
+        ))),
+        Err(ReconcileError::Io(e)) => {
+            Err(IpcError::internal(format!("reconciling owned fetch: {e}")))
+        }
+    }
 }
 
 fn write_fetched_marker(
