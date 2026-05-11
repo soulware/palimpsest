@@ -15,7 +15,17 @@ use std::fmt;
 
 use bytes::Bytes;
 use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, PutMode, PutResult, UpdateVersion};
+use object_store::{
+    Attribute, AttributeValue, Attributes, ObjectStore, PutMode, PutOptions, PutResult,
+    UpdateVersion,
+};
+
+/// `Content-Type` for objects whose body is a TOML document.
+pub const MIME_TOML: &str = "application/toml; charset=utf-8";
+
+/// `Content-Type` for objects whose body is UTF-8 text but not TOML
+/// (e.g. `volume.pub`, `coordinator.pub`, custom plain-text manifests).
+pub const MIME_TEXT: &str = "text/plain; charset=utf-8";
 
 /// Derive the public coordinator identity from `coordinator.pub`.
 ///
@@ -78,6 +88,45 @@ impl From<object_store::Error> for ConditionalPutError {
     }
 }
 
+/// Build `PutOptions` carrying both a `PutMode` and a `Content-Type`
+/// attribute. Pulled out so the `_with_type` helpers share a single
+/// option-construction path.
+fn put_opts(mode: PutMode, content_type: Option<&'static str>) -> PutOptions {
+    let mut opts: PutOptions = mode.into();
+    if let Some(ct) = content_type {
+        let mut attrs = Attributes::new();
+        attrs.insert(Attribute::ContentType, AttributeValue::from(ct));
+        opts.attributes = attrs;
+    }
+    opts
+}
+
+/// Issue a `put_opts` with optional `Content-Type`. If the store
+/// rejects attribute options (`LocalFileSystem` does — tests hit this
+/// path), retry once without attributes so non-S3 backends still work.
+async fn put_opts_with_fallback(
+    store: &dyn ObjectStore,
+    key: &StorePath,
+    body: Bytes,
+    mode: PutMode,
+    content_type: Option<&'static str>,
+) -> Result<PutResult, object_store::Error> {
+    match store
+        .put_opts(
+            key,
+            body.clone().into(),
+            put_opts(mode.clone(), content_type),
+        )
+        .await
+    {
+        Ok(r) => Ok(r),
+        Err(object_store::Error::NotImplemented) if content_type.is_some() => {
+            store.put_opts(key, body.into(), put_opts(mode, None)).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Atomically write an object only if it does not already exist
 /// (`If-None-Match: *`). Returns `PreconditionFailed` if a value is
 /// already present at the key.
@@ -86,8 +135,19 @@ pub async fn put_if_absent(
     key: &StorePath,
     body: Bytes,
 ) -> Result<PutResult, ConditionalPutError> {
-    store
-        .put_opts(key, body.into(), PutMode::Create.into())
+    put_opts_with_fallback(store, key, body, PutMode::Create, None)
+        .await
+        .map_err(Into::into)
+}
+
+/// [`put_if_absent`] with `Content-Type` set on the uploaded object.
+pub async fn put_if_absent_with_type(
+    store: &dyn ObjectStore,
+    key: &StorePath,
+    body: Bytes,
+    content_type: &'static str,
+) -> Result<PutResult, ConditionalPutError> {
+    put_opts_with_fallback(store, key, body, PutMode::Create, Some(content_type))
         .await
         .map_err(Into::into)
 }
@@ -101,10 +161,28 @@ pub async fn put_with_match(
     body: Bytes,
     expected: UpdateVersion,
 ) -> Result<PutResult, ConditionalPutError> {
-    store
-        .put_opts(key, body.into(), PutMode::Update(expected).into())
+    put_opts_with_fallback(store, key, body, PutMode::Update(expected), None)
         .await
         .map_err(Into::into)
+}
+
+/// [`put_with_match`] with `Content-Type` set on the uploaded object.
+pub async fn put_with_match_with_type(
+    store: &dyn ObjectStore,
+    key: &StorePath,
+    body: Bytes,
+    expected: UpdateVersion,
+    content_type: &'static str,
+) -> Result<PutResult, ConditionalPutError> {
+    put_opts_with_fallback(
+        store,
+        key,
+        body,
+        PutMode::Update(expected),
+        Some(content_type),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 /// Capabilities of a configured object store.

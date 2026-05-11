@@ -179,8 +179,7 @@ pub async fn discover_peer_for_claim(
         .into_iter()
         .filter_map(|obj| {
             let filename = obj.location.filename()?;
-            let stem = filename.strip_suffix(".toml")?;
-            let ulid = Ulid::from_string(stem).ok()?;
+            let ulid = Ulid::from_string(filename).ok()?;
             Some((ulid, obj.location))
         })
         .collect();
@@ -323,7 +322,7 @@ mod tests {
         let oldest_ulid = "01000000000000000000000000";
         store
             .put(
-                &StorePath::from(format!("events/vol/{oldest_ulid}.toml")),
+                &StorePath::from(format!("events/vol/{oldest_ulid}")),
                 Bytes::from_static(b"this is not valid toml at all").into(),
             )
             .await
