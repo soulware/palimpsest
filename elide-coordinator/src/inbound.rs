@@ -3107,23 +3107,88 @@ async fn hydrate_or_route(
 }
 
 async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<(), IpcError> {
+    use elide_coordinator::volume_state::{LocalShape, ReadonlySource, WritableRuntime};
     let data_dir: &Path = &core.data_dir;
     let store = core.stores.coordinator_wide();
     let coord_id = core.identity.coordinator_id_str();
     let hostname = core.identity.hostname();
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        // No local fork. If the bucket says we still own this name,
-        // hydrate the metadata from S3 and continue. Bodies remain
-        // demand-fetched. Foreign-owned, released, or unknown names
-        // route to the existing claim/not-found error shapes.
-        hydrate_or_route(volume_name, &store, coord_id, core).await?;
-    }
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
 
-    if !vol_dir.join(STOPPED_FILE).exists() {
-        return Err(IpcError::conflict("volume is not stopped"));
+    // Resolve local fork state up front. `Absent` → route via the
+    // hydrate-or-claim-hint pipeline, then re-resolve to inspect the
+    // freshly-planted fork.
+    let (vol_dir, shape) = {
+        let (maybe_dir, shape) = LocalShape::resolve(&link)
+            .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+        match maybe_dir {
+            Some(dir) => (dir, shape),
+            None => {
+                hydrate_or_route(volume_name, &store, coord_id, core).await?;
+                let (dir, shape) = LocalShape::resolve(&link).map_err(|e| {
+                    IpcError::internal(format!("resolving local fork post-hydrate: {e}"))
+                })?;
+                let dir = dir.ok_or_else(|| {
+                    IpcError::internal(format!(
+                        "hydrate {volume_name}: by_name symlink still absent after hydrate"
+                    ))
+                })?;
+                (dir, shape)
+            }
+        }
+    };
+
+    // Start only proceeds against a writable fork explicitly parked
+    // by `volume.stopped`. Every other shape gets a verb-specific
+    // error so the operator hint is actionable.
+    match &shape {
+        LocalShape::Writable {
+            runtime: WritableRuntime::Stopped,
+        } => {}
+        LocalShape::Writable {
+            runtime: WritableRuntime::Running { pid },
+        } => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is already running (pid {pid})"
+            )));
+        }
+        LocalShape::Writable {
+            runtime: WritableRuntime::Importing { import_ulid },
+        } => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is currently importing (job {import_ulid})"
+            )));
+        }
+        LocalShape::Writable {
+            runtime: WritableRuntime::Inactive,
+        } => {
+            return Err(IpcError::conflict("volume is not stopped"));
+        }
+        LocalShape::Released { .. } => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is released; \
+                 reclaim with: elide volume claim {volume_name}"
+            )));
+        }
+        LocalShape::Readonly {
+            source: ReadonlySource::Imported,
+        } => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is readonly (imported base); nothing to start"
+            )));
+        }
+        LocalShape::Readonly {
+            source: ReadonlySource::Fetched { .. },
+        } => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is a fetched readonly copy; \
+                 use `volume claim {volume_name}` to take ownership first"
+            )));
+        }
+        LocalShape::Absent => {
+            return Err(IpcError::internal(format!(
+                "hydrate {volume_name}: classified Absent after successful hydrate"
+            )));
+        }
     }
 
     // Self-heal the signing-key shadow at `data_dir/keys/<vol_ulid>.key`.
