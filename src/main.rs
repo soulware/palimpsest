@@ -1028,15 +1028,7 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
-            // `volume.draining` forces IPC-only mode: skip the ublk
-            // attach regardless of CLI flags. The coordinator sets this
-            // marker when transparently restarting a stopped volume to
-            // drain it for `volume release`, so the brief restart
-            // window can never expose the volume to a client. The
-            // supervisor also drops the transport flag in this case;
-            // this is the second line of defence.
-            let draining = fork_dir.join("volume.draining").exists();
-            if ublk && !draining {
+            if ublk {
                 if readonly {
                     panic!("ublk transport does not yet support --readonly");
                 }
