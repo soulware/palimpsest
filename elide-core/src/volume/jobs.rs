@@ -231,6 +231,10 @@ pub struct SignSnapshotManifestJob {
     pub lbamap: Arc<crate::lbamap::LbaMap>,
     pub verifying_key: ed25519_dalek::VerifyingKey,
     pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
+    /// Which on-disk filename to write the signed manifest under —
+    /// `<ulid>.manifest` for `User`, `<ulid>.auto.manifest` for `Auto`.
+    /// The signed payload is identical for both.
+    pub kind: crate::signing::SnapshotKind,
 }
 
 /// Result of a [`SignSnapshotManifestJob`]. Consumed by

@@ -76,6 +76,49 @@ pub const FORCE_SNAPSHOT_PUB_FILE: &str = "force-snapshot.pub";
 /// filename, e.g. `snapshots/01ABC....manifest`.
 pub const SNAPSHOT_MANIFEST_SUFFIX: &str = ".manifest";
 
+/// Suffix for auto-snapshot manifests — the ephemeral checkpoints written
+/// by `volume stop` to give a future `start` a basis to hydrate from.
+/// The signed payload is byte-identical to a user snapshot; only the
+/// filename differs. See `docs/architecture.md` *Auto-snapshot lifecycle*.
+pub const AUTO_SNAPSHOT_MANIFEST_SUFFIX: &str = ".auto.manifest";
+
+/// Discriminates `<ulid>.manifest` (user-pinned, stable) from
+/// `<ulid>.auto.manifest` (ephemeral checkpoint owned by the stop/start
+/// lifecycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotKind {
+    User,
+    Auto,
+}
+
+impl SnapshotKind {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            SnapshotKind::User => SNAPSHOT_MANIFEST_SUFFIX,
+            SnapshotKind::Auto => AUTO_SNAPSHOT_MANIFEST_SUFFIX,
+        }
+    }
+}
+
+/// Parse a snapshot filename like `<ulid>.manifest` or `<ulid>.auto.manifest`
+/// into its `(ulid, kind)`. Returns `None` for anything that doesn't match
+/// either shape — including segments, indexes, and partial writes.
+///
+/// Auto is checked first because `.auto.manifest` also ends in `.manifest`.
+pub fn parse_snapshot_filename(name: &str) -> Option<(ulid::Ulid, SnapshotKind)> {
+    if let Some(stem) = name.strip_suffix(AUTO_SNAPSHOT_MANIFEST_SUFFIX) {
+        return ulid::Ulid::from_string(stem)
+            .ok()
+            .map(|u| (u, SnapshotKind::Auto));
+    }
+    if let Some(stem) = name.strip_suffix(SNAPSHOT_MANIFEST_SUFFIX) {
+        return ulid::Ulid::from_string(stem)
+            .ok()
+            .map(|u| (u, SnapshotKind::User));
+    }
+    None
+}
+
 // --- Ed25519Signer ---
 
 pub struct Ed25519Signer {
@@ -678,6 +721,13 @@ pub fn snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
     format!("{snap_ulid}{SNAPSHOT_MANIFEST_SUFFIX}")
 }
 
+/// Build the filename for `snap_ulid`'s auto-snapshot manifest
+/// (`<snap_ulid>.auto.manifest`) — the ephemeral checkpoint written by
+/// `volume stop`.
+pub fn auto_snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
+    format!("{snap_ulid}{AUTO_SNAPSHOT_MANIFEST_SUFFIX}")
+}
+
 /// Domain-separation prefix for the recovery-manifest signing input.
 /// Bumping the suffix (`v1`, `v2`, …) invalidates all previously signed
 /// recovery manifests; chosen explicitly rather than implicitly so the
@@ -743,6 +793,27 @@ pub fn write_snapshot_manifest(
     crate::segment::write_file_atomic(&path, &content)
 }
 
+/// Write a signed auto-snapshot manifest for `snap_ulid` at
+/// `vol_dir/snapshots/<snap_ulid>.auto.manifest`. The signed payload is
+/// byte-identical to [`write_snapshot_manifest`]; only the filename
+/// differs. Auto-snapshots are the ephemeral checkpoint variant — see
+/// `docs/architecture.md` *Auto-snapshot lifecycle*. Recovery metadata
+/// is intentionally not supported here: auto-snapshots are minted by
+/// the owning volume's own signing key during a clean stop, never by a
+/// recovering coordinator.
+pub fn write_auto_snapshot_manifest(
+    vol_dir: &Path,
+    signer: &dyn SegmentSigner,
+    snap_ulid: &ulid::Ulid,
+    segment_ulids: &[ulid::Ulid],
+) -> io::Result<()> {
+    let content = build_snapshot_manifest_bytes(signer, segment_ulids, None);
+    let path = vol_dir
+        .join("snapshots")
+        .join(auto_snapshot_manifest_filename(snap_ulid));
+    crate::segment::write_file_atomic(&path, &content)
+}
+
 /// Build the signed bytes of a snapshot manifest without writing
 /// anything to disk. Used by callers that need to publish the
 /// manifest somewhere other than a local volume directory — notably
@@ -792,14 +863,32 @@ pub fn read_snapshot_manifest(
     verifying_key: &VerifyingKey,
     snap_ulid: &ulid::Ulid,
 ) -> io::Result<SnapshotManifest> {
-    let filename = snapshot_manifest_filename(snap_ulid);
-    let path = vol_dir.join("snapshots").join(&filename);
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        io::Error::other(format!(
-            "{filename} in {} not readable: {e}",
-            vol_dir.display()
-        ))
-    })?;
+    // The filename is just addressing; the signed payload is identical
+    // for `<ulid>.manifest` and `<ulid>.auto.manifest`. Probe the
+    // stable filename first (the common case), then fall back to the
+    // auto variant — this is hit on the hydrate-from-bucket path,
+    // where the basis manifest written by `stop` is `.auto.manifest`.
+    let snap_dir = vol_dir.join("snapshots");
+    let user_filename = snapshot_manifest_filename(snap_ulid);
+    let content = match std::fs::read_to_string(snap_dir.join(&user_filename)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let auto_filename = auto_snapshot_manifest_filename(snap_ulid);
+            std::fs::read_to_string(snap_dir.join(&auto_filename)).map_err(|e2| {
+                io::Error::other(format!(
+                    "neither {user_filename} nor {auto_filename} in {} are readable \
+                     (user: {e}; auto: {e2})",
+                    vol_dir.display()
+                ))
+            })?
+        }
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "{user_filename} in {} not readable: {e}",
+                vol_dir.display()
+            )));
+        }
+    };
     read_snapshot_manifest_from_bytes(content.as_bytes(), verifying_key, snap_ulid)
 }
 
@@ -1099,6 +1188,47 @@ mod tests {
 
     fn signer_from(key: SigningKey) -> Ed25519Signer {
         Ed25519Signer { key }
+    }
+
+    #[test]
+    fn parse_snapshot_filename_user() {
+        let u = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let name = snapshot_manifest_filename(&u);
+        let (parsed, kind) = parse_snapshot_filename(&name).expect("parses");
+        assert_eq!(parsed, u);
+        assert_eq!(kind, SnapshotKind::User);
+    }
+
+    #[test]
+    fn parse_snapshot_filename_auto() {
+        let u = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let name = auto_snapshot_manifest_filename(&u);
+        let (parsed, kind) = parse_snapshot_filename(&name).expect("parses");
+        assert_eq!(parsed, u);
+        assert_eq!(kind, SnapshotKind::Auto);
+    }
+
+    #[test]
+    fn parse_snapshot_filename_rejects_bare_marker() {
+        // Historically `snapshots/<ulid>` (no extension) was the bare
+        // snapshot marker. The parser should not treat it as a
+        // manifest — only `<ulid>.manifest` and `<ulid>.auto.manifest`
+        // are accepted.
+        assert!(parse_snapshot_filename("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_none());
+    }
+
+    #[test]
+    fn parse_snapshot_filename_rejects_filemap() {
+        assert!(parse_snapshot_filename("01ARZ3NDEKTSV4RRFFQ69G5FAV.filemap").is_none());
+    }
+
+    #[test]
+    fn auto_and_user_filenames_differ() {
+        let u = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_ne!(
+            snapshot_manifest_filename(&u),
+            auto_snapshot_manifest_filename(&u)
+        );
     }
 
     /// OCI-imported root: `oci_source` survives a write/read round-trip

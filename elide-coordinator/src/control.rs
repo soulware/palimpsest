@@ -83,7 +83,29 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
 /// Sign and write a snapshot manifest plus the snapshot marker.
 /// Returns `true` on success.
 pub async fn sign_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
-    call_unit(fork_dir, &VolumeRequest::SnapshotManifest { snap_ulid }).await
+    call_unit(
+        fork_dir,
+        &VolumeRequest::SnapshotManifest {
+            snap_ulid,
+            auto: false,
+        },
+    )
+    .await
+}
+
+/// Sign and write an *auto-snapshot* manifest — the ephemeral
+/// checkpoint variant used by `volume stop`. The signed payload is
+/// identical to a user snapshot; only the filename
+/// (`<ulid>.auto.manifest`) differs. Returns `true` on success.
+pub async fn sign_auto_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
+    call_unit(
+        fork_dir,
+        &VolumeRequest::SnapshotManifest {
+            snap_ulid,
+            auto: true,
+        },
+    )
+    .await
 }
 
 /// Promote a segment to the volume's local cache after confirmed S3 upload.

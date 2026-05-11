@@ -957,12 +957,18 @@ async fn prefetch_snapshots(
     // of in-flight GETs.
     // Snapshots are recorded as `<ulid>.manifest`; everything else
     // under `snapshots/` (pre-#212 `.filemap` siblings, pre-#215
-    // bare-ULID markers) is skipped.
+    // bare-ULID markers, ephemeral `<ulid>.auto.manifest` checkpoints)
+    // is skipped — auto-snapshots are owned by the stop/start lifecycle
+    // and should not flow into a prefetching peer.
     let to_fetch: Vec<(object_store::path::Path, String)> = objects
         .into_iter()
         .filter_map(|obj| {
             let filename = obj.location.filename()?.to_owned();
-            let stem = filename.strip_suffix(".manifest")?;
+            let (stem_ulid, kind) = elide_core::signing::parse_snapshot_filename(&filename)?;
+            if kind != elide_core::signing::SnapshotKind::User {
+                return None;
+            }
+            let stem = stem_ulid.to_string();
             if let Some(branch) = branch_ulid
                 && stem != branch
             {

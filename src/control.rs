@@ -183,8 +183,13 @@ fn dispatch(
                 );
             }
         },
-        VolumeRequest::SnapshotManifest { snap_ulid } => {
-            write_unit(writer, handle.sign_snapshot_manifest(snap_ulid))
+        VolumeRequest::SnapshotManifest { snap_ulid, auto } => {
+            let kind = if auto {
+                elide_core::signing::SnapshotKind::Auto
+            } else {
+                elide_core::signing::SnapshotKind::User
+            };
+            write_unit(writer, handle.sign_snapshot_manifest_kind(snap_ulid, kind))
         }
         VolumeRequest::Promote { segment_ulid } => {
             write_unit(writer, handle.promote_segment(segment_ulid))

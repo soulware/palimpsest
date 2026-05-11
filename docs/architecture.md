@@ -374,14 +374,25 @@ Re-adoption means the supervisor task polls the existing process until it exits 
 
 These operations give explicit control over individual volumes or all volumes while the coordinator keeps running. They are the right tool for planned maintenance, controlled shutdown of a single VM, or draining a host before an upgrade.
 
-**`volume stop <name>`** — stop a single volume:
-1. Send SIGTERM to the volume process (via `volume.pid`)
-2. Write `<vol-dir>/volume.stopped`
-3. Supervisor sees the marker and does not restart
+**`volume stop <name>`** — stop a single volume (clean stop):
+1. (writable only) Flush the WAL, drain `pending/` to S3, and publish an *auto-snapshot* manifest at `by_id/<volume_ulid>/snapshots/<S>.auto.manifest` where `S = max(index/)` after the drain (or a freshly minted ULID if `index/` is empty). The manifest is signed identically to a user snapshot — only the filename differs. The auto-snapshot exists for exactly one purpose: to give a future `start` (this host, or another host via `claim`) a basis to hydrate from without requiring synthesis.
+2. (writable only) Flip `names/<name>` in the bucket to `Stopped`.
+3. Write `<vol-dir>/volume.stopped`.
+4. Send SIGTERM to the volume process (via `volume.pid`). Supervisor sees the marker and does not restart.
+
+**Proposed: `volume stop --force <name>`** — emergency local halt. Skips the drain/snapshot work entirely. Two execution modes:
+
+- *Coordinator reachable* — IPC as normal; the coordinator does a best-effort bucket flip (failures degrade to a warning, do not block the halt) and writes the marker / SIGTERMs the daemon.
+- *Coordinator unreachable* — CLI direct mode: read `<vol-dir>/volume.pid`, SIGTERM if alive, write `<vol-dir>/volume.stopped`. No bucket flip happens (no credentials), so `names/<name>` is left in its prior state (typically `Live`). The CLI prints a warning surfacing this — recovery from another host requires `release --force` because the bucket says the volume is still live here.
+
+`pending/` and `wal/` may be left dirty either way; `remove --force` is the only way to discard them. The local daemon is gone but the volume has no fresh auto-snapshot. A subsequent `start` on this host resumes from local state as usual; a subsequent `start` after `remove` falls back to the latest pre-existing snapshot (or fails if there is none, the same way as today).
+
+Use `stop --force` when the daemon is hung, the drain cannot complete, the coordinator is dead, or a host is being torn down quickly. Routine `stop` should never need it.
 
 **`volume start <name>`** — start a previously stopped volume:
-1. Remove `<vol-dir>/volume.stopped`
-2. Supervisor picks it up on the next scan and starts the process normally
+1. If `by_name/<name>` is absent, consult `names/<name>` in the bucket. If it names this coordinator as owner (`Live`/`Stopped`), hydrate the metadata from S3 — pull the skeleton ancestor chain, fetch and verify the latest snapshot manifest under `by_id/<volume_ulid>/snapshots/`, pull its indexes, write `volume.toml`, create empty `wal/`/`pending/`, write `volume.stopped`, plant the `by_name/<name>` symlink, and clear the `remote/<name>` breadcrumb. Bodies are not warmed — they remain demand-fetched. A bucket record held by another coordinator yields a `claim --force` hint; a `Released` record yields a `claim` hint; an absent record or no manifest yields `not-found`.
+2. Remove `<vol-dir>/volume.stopped`.
+3. Supervisor picks it up on the next scan and starts the process normally.
 
 **`coordinator quiesce`** — stop all running volumes:
 1. For each supervised fork: send SIGTERM, write `volume.stopped`
@@ -470,9 +481,9 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | Command | What it does |
 |---|---|
 | `elide volume status <name\|ulid>` | Is the volume process running? |
-| `elide volume stop <name\|ulid>` | Stop the volume process and set `volume.stopped` |
-| `elide volume start <name\|ulid>` | Clear `volume.stopped`; coordinator restarts the volume |
-| `elide volume remove <name\|ulid> [--force]` | Remove the local instance (by_id directory + by_name link); requires `volume.stopped` and a fully-uploaded fork unless `--force` |
+| `elide volume stop <name\|ulid> [--force]` | Clean stop: drain pending, publish an auto-snapshot, flip bucket to `Stopped`, set marker, SIGTERM. `--force` skips drain/snapshot (and falls back to direct CLI mode if the coordinator is unreachable) |
+| `elide volume start <name\|ulid>` | Clear `volume.stopped`; coordinator restarts the volume. If no local fork exists but the bucket retains ownership, hydrates metadata from S3 first. Deletes the auto-snapshot after `mark_live` |
+| `elide volume remove <name\|ulid> [--force]` | Remove the local instance (by_id directory + by_name link); requires `volume.stopped` and a fully-uploaded fork unless `--force`. If the bucket retains ownership, publishes a final snapshot and writes a `remote/<name>` breadcrumb so the name can later be resurrected via `volume start` |
 | `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import job ULID |
 | `elide volume import status <job-ulid>` | Poll import state: running / done / failed |
 | `elide volume import attach <job-ulid>` | Stream import output until completion |
@@ -732,7 +743,7 @@ The volume directory is left intact — it may contain partial segment data usef
 
 ### `volume remove`
 
-`elide volume remove <name> [--force]` removes the local instance of a volume. It is a *local* verb — bucket-side records and segments under `by_id/<volume_ulid>/` in S3 are untouched. Other coordinators can still claim the name via `volume claim`.
+`elide volume remove <name> [--force]` removes the local instance of a volume. Segments under `by_id/<volume_ulid>/` in S3 are untouched. If the bucket `names/<name>` record still names this coordinator as owner, the name is *retained* (a future `volume start <name>` resurrects it from S3 — see below). Otherwise the local instance is simply discarded and the name is available for other coordinators to claim.
 
 Preconditions:
 
@@ -742,12 +753,30 @@ Preconditions:
 
 Once the preconditions hold, the coordinator:
 
-1. Sends SIGTERM to any running import process (via `import.pid`) and removes a stale `import.lock`
-2. Removes the `by_name/<name>` symlink
-3. Removes the `by_id/<volume_ulid>/` directory tree
-4. Responds `ok`
+1. Sends SIGTERM to any running import process (via `import.pid`) and removes a stale `import.lock`.
+2. Reads `names/<name>` from the bucket. If the record is in state `Live` or `Stopped` and `coordinator_id` is ours, the name is *retained*: write a `data_dir/remote/<name>` breadcrumb capturing the `volume_ulid`. The breadcrumb makes the retained name visible in `volume list` even though the local fork is gone. The basis snapshot needed for future `start` already exists in S3 from the preceding clean `stop` (the auto-snapshot at `by_id/<volume_ulid>/snapshots/<S>.auto.manifest`) — `remove` does not produce a snapshot itself.
+3. Capture the bound ublk `dev_id` (if any) and tear down the kernel device after step 5, so the device's stamped `target_data.elide.volume_dir` no longer points at a deleted path.
+4. Remove the `by_name/<name>` symlink.
+5. Remove the `by_id/<volume_ulid>/` directory tree.
+6. Respond `ok`.
 
-After `volume remove`, the volume name is free to be reused (e.g. `volume import <name> <oci-ref>` starts fresh, or `volume claim <name>` re-binds a Released bucket-side record on this host).
+If the bucket read fails or the record does not retain ownership (no record, or state `Released`/`Readonly`, or owned by another coordinator), step 2 is skipped (breadcrumb omitted). The local instance is still removed — `remove` always tears down the local fork; the retention path is best-effort on top.
+
+**Resurrection prerequisite.** Retained-name resurrection on this host requires a basis snapshot in S3 — usually the auto-snapshot from the preceding clean `stop`. Two cases produce a retained name *without* a basis: (a) `stop --force` (skipped the snapshot) followed by `remove`, and (b) a volume that was never started, never wrote anything, and was removed. In both cases the breadcrumb is written but `start` will fail with "no published snapshot in the store" — recovery from this host is no longer possible; the name must be reclaimed via `volume claim --force` from another host (or `volume release --force` to give it up).
+
+After `volume remove` with retained ownership and a valid basis, the next `volume start <name>` on this coordinator hydrates the metadata from S3 (skeleton ancestor chain → basis manifest → indexes → `volume.toml` → `by_name` symlink → `volume.stopped`), then runs the normal start flow. Bodies remain demand-fetched — body warm is not part of resurrection. The breadcrumb is removed once hydration succeeds.
+
+Without retained ownership (or after `volume release <name>`), the name is free to be reused (e.g. `volume import <name> <oci-ref>` starts fresh, or `volume claim <name>` re-binds a Released bucket-side record on this host).
+
+### Auto-snapshot lifecycle
+
+The `<S>.auto.manifest` files written by `stop` are *checkpoints*, not stable references:
+
+- **Created** by `stop` (writable volumes only). The signed payload is identical to a user snapshot; only the filename differs.
+- **Deleted** by `start` after `mark_live` succeeds. Whether start was a local resume or a hydrate-from-bucket, the auto-snapshot has done its job once the volume is back in `Live` state and can go. Window without a published basis = the live phase, same as today.
+- **Used** by `start`'s hydrate path and by `claim` as a takeover basis. Both are recovery paths that will produce their own fresh snapshot at the next `stop`, so the ephemeral nature is fine.
+- **Not used** as a fork base. `volume create --from` and other lineage-creating verbs enumerate `by_id/<vol>/snapshots/<ulid>.manifest` only — auto-snapshots are filtered out. Tying a new lineage to ephemeral state would be a footgun.
+- **Promoted** by `volume release` (writable host giving up the name): the auto-snapshot is renamed to `<S>.manifest` (byte-identical copy + delete) before the bucket flips to `Released`, so claim-from-other-host has a stable basis to fork from. `release --force` from a recovering host does the same promotion if it finds an auto-snapshot, falling back to synthesis only if the bucket has nothing usable. (See [Disaster recovery](#disaster-recovery).)
 
 ### Output retention
 

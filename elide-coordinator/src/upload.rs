@@ -185,6 +185,18 @@ pub fn snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
     ))
 }
 
+/// Build the object store key for an auto-snapshot manifest — the
+/// ephemeral `<ulid>.auto.manifest` variant written by `volume stop`.
+///
+/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.auto.manifest`
+pub fn auto_snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
+    let dt: DateTime<Utc> = ulid.datetime().into();
+    let date = dt.format("%Y%m%d").to_string();
+    StorePath::from(format!(
+        "by_id/{volume_id}/snapshots/{date}/{ulid}.auto.manifest"
+    ))
+}
+
 /// Upload all committed segments from `pending/` to the object store, then
 /// promote each segment to the local cache.
 ///
@@ -435,20 +447,26 @@ pub async fn upload_snapshot_metadata(
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        let Some(snap_str) = name.strip_suffix(".manifest") else {
-            continue;
-        };
-        let Ok(snap_ulid) = ulid::Ulid::from_string(snap_str) else {
+        let Some((snap_ulid, kind)) = elide_core::signing::parse_snapshot_filename(name) else {
             continue;
         };
 
-        let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{snap_str}"));
+        let sentinel_label = match kind {
+            elide_core::signing::SnapshotKind::User => format!("snapshots/{snap_ulid}"),
+            elide_core::signing::SnapshotKind::Auto => format!("snapshots/{snap_ulid}.auto"),
+        };
+        let sentinel = upload_sentinel(vol_dir, &sentinel_label);
         if is_already_uploaded(&sentinel, &[]) {
             continue;
         }
 
         let manifest_path = snap_dir.join(name);
-        let key = snapshot_manifest_key(volume_id, snap_ulid);
+        let key = match kind {
+            elide_core::signing::SnapshotKind::User => snapshot_manifest_key(volume_id, snap_ulid),
+            elide_core::signing::SnapshotKind::Auto => {
+                auto_snapshot_manifest_key(volume_id, snap_ulid)
+            }
+        };
         let data = std::fs::read(&manifest_path)
             .with_context(|| format!("reading snapshot manifest: {}", manifest_path.display()))?;
         let len = data.len();
@@ -457,7 +475,7 @@ pub async fn upload_snapshot_metadata(
             Ok(()) => {
                 info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
                 if let Err(e) = mark_uploaded(&sentinel, &[]) {
-                    warn!("failed to mark snapshot {snap_str} sentinel: {e}");
+                    warn!("failed to mark snapshot {snap_ulid} sentinel: {e}");
                 }
             }
             Err(e) => warn!("snapshot manifest upload failed for {key}: {e:#}"),

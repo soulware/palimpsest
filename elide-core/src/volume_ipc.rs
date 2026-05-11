@@ -37,7 +37,16 @@ pub enum VolumeRequest {
     /// Apply staged GC handoffs into the in-memory extent index.
     ApplyGcHandoffs,
     /// Sign and write `snapshots/<snap_ulid>.manifest` plus the marker.
-    SnapshotManifest { snap_ulid: Ulid },
+    SnapshotManifest {
+        snap_ulid: Ulid,
+        /// When `true`, write to `snapshots/<snap_ulid>.auto.manifest`
+        /// instead — the ephemeral checkpoint variant used by
+        /// `volume stop`. The signed payload is identical; only the
+        /// filename differs. Defaults to `false` so existing callers
+        /// keep the user-snapshot semantics.
+        #[serde(default)]
+        auto: bool,
+    },
     /// Promote a confirmed-uploaded segment into `cache/`.
     Promote { segment_ulid: Ulid },
     /// Delete the bare `gc/<gc_ulid>` marker after a finalised handoff.

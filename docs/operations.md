@@ -189,7 +189,9 @@ Selection is purely about packing. Dead-data removal is repack's job (gated on d
 
 The 16 MiB threshold is half the 32 MiB target, so two smalls always combine to fit and the merged output exits the small set permanently — no infinite re-pack loop.
 
-Snapshot-floor segments (at or below the latest snapshot ULID) are frozen and never touched. Data written then deleted before the drain runs never hits S3 — compacting locally is much cheaper than uploading dead bytes and paying coordinator GC later.
+Snapshot-floor segments (at or below the latest snapshot ULID) are frozen and never touched. Both user snapshots (`<S>.manifest`) and auto-snapshots (`<S>.auto.manifest`) participate in the floor calculation. Auto-snapshots, however, exist only during the `Stopped` window — they are written by `volume stop` and deleted by the next `volume start` — so stop/start cycles do not progressively pin history. During the live phase the floor is determined by user snapshots only (or none); GC operates as normal. See `docs/architecture.md` *Auto-snapshot lifecycle* for the full state machine.
+
+Data written then deleted before the drain runs never hits S3 — compacting locally is much cheaper than uploading dead bytes and paying coordinator GC later.
 
 ### Scope: live leaves only
 

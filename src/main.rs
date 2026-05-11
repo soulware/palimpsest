@@ -405,7 +405,8 @@ enum VolumeCommand {
         force: bool,
     },
 
-    /// Stop a running volume (flushes and halts the ublk device; drain/GC continue)
+    /// Stop a running volume (flushes WAL, drains pending, publishes an
+    /// auto-snapshot, then halts the daemon and ublk device).
     Stop {
         /// Volume name
         name: String,
@@ -416,6 +417,12 @@ enum VolumeCommand {
         /// after `volume stop`.
         #[arg(long)]
         release: bool,
+        /// Skip the drain/auto-snapshot step. The local daemon is
+        /// halted but `pending/` and `wal/` may be left dirty, and no
+        /// fresh basis manifest is published to S3. Use only when the
+        /// drain is stuck or the host is being torn down quickly.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Start a previously stopped volume.
@@ -873,8 +880,12 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Stop { name, release } => {
-                if let Err(e) = coord.stop_volume(&name) {
+            VolumeCommand::Stop {
+                name,
+                release,
+                force,
+            } => {
+                if let Err(e) = coord.stop_volume(&name, force) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }

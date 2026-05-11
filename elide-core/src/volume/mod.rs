@@ -2346,7 +2346,19 @@ impl Volume {
     /// Ed25519 sign, manifest fsync, marker write — off the request
     /// channel. This wrapper exists for tests and any inline callers.
     pub fn sign_snapshot_manifest(&mut self, snap_ulid: Ulid) -> io::Result<()> {
-        let job = self.prepare_sign_snapshot_manifest(snap_ulid);
+        self.sign_snapshot_manifest_kind(snap_ulid, crate::signing::SnapshotKind::User)
+    }
+
+    /// As [`Self::sign_snapshot_manifest`] but explicitly chooses
+    /// between the stable user manifest (`<ulid>.manifest`) and the
+    /// ephemeral auto-snapshot variant (`<ulid>.auto.manifest`). The
+    /// signed payload is identical for both.
+    pub fn sign_snapshot_manifest_kind(
+        &mut self,
+        snap_ulid: Ulid,
+        kind: crate::signing::SnapshotKind,
+    ) -> io::Result<()> {
+        let job = self.prepare_sign_snapshot_manifest_kind(snap_ulid, kind);
         let result = crate::actor::execute_sign_snapshot_manifest(job)?;
         self.apply_sign_snapshot_manifest_result(result);
         Ok(())
@@ -2358,6 +2370,15 @@ impl Volume {
     /// extent index and lbamap snapshots to filter fully-dead segments
     /// out of the manifest — see [`crate::actor::execute_sign_snapshot_manifest`].
     pub fn prepare_sign_snapshot_manifest(&self, snap_ulid: Ulid) -> SignSnapshotManifestJob {
+        self.prepare_sign_snapshot_manifest_kind(snap_ulid, crate::signing::SnapshotKind::User)
+    }
+
+    /// Kind-explicit variant of [`Self::prepare_sign_snapshot_manifest`].
+    pub fn prepare_sign_snapshot_manifest_kind(
+        &self,
+        snap_ulid: Ulid,
+        kind: crate::signing::SnapshotKind,
+    ) -> SignSnapshotManifestJob {
         SignSnapshotManifestJob {
             snap_ulid,
             base_dir: self.base_dir.clone(),
@@ -2366,6 +2387,7 @@ impl Volume {
             lbamap: Arc::clone(&self.lbamap),
             verifying_key: self.verifying_key,
             segment_cache: Arc::clone(&self.segment_cache),
+            kind,
         }
     }
 

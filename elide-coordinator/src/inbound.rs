@@ -257,12 +257,14 @@ async fn dispatch_json(
             let env: Envelope<StatusRemoteReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Stop { volume } => {
+        Request::Stop { volume, force } => {
             // Conditional PUT on names/<volume>: coordinator-wide.
             let store = ctx.stores.coordinator_wide();
             let result = stop_volume_op(
                 &volume,
-                &ctx.data_dir,
+                force,
+                &ctx.core(),
+                &ctx.snapshot_locks,
                 &store,
                 ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
@@ -719,6 +721,27 @@ pub(crate) async fn snapshot_volume(
     core: &CoordinatorCore,
     snapshot_locks: &SnapshotLockRegistry,
 ) -> Result<SnapshotReply, IpcError> {
+    snapshot_volume_kind(
+        vol_name,
+        core,
+        snapshot_locks,
+        elide_core::signing::SnapshotKind::User,
+    )
+    .await
+}
+
+/// As [`snapshot_volume`] but lets the caller choose between the stable
+/// user manifest (`<ulid>.manifest`) and the ephemeral auto-snapshot
+/// (`<ulid>.auto.manifest`). The auto variant is what `volume stop`
+/// publishes so that a future `start` (this host or another via
+/// `claim`) has a basis to hydrate from. See `docs/architecture.md`
+/// *Auto-snapshot lifecycle*.
+pub(crate) async fn snapshot_volume_kind(
+    vol_name: &str,
+    core: &CoordinatorCore,
+    snapshot_locks: &SnapshotLockRegistry,
+    kind: elide_core::signing::SnapshotKind,
+) -> Result<SnapshotReply, IpcError> {
     let store = core.stores.coordinator_wide();
     let link = core.data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
@@ -740,17 +763,12 @@ pub(crate) async fn snapshot_volume(
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
     let _guard = lock.lock_owned().await;
 
-    // 1. Promote WAL into pending/.
     if !elide_coordinator::control::promote_wal(&fork_dir).await {
         return Err(IpcError::internal(
             "promote_wal failed or volume unreachable",
         ));
     }
 
-    // 2. Inline drain: upload every pending segment, promote each, then
-    //    upload any snapshot files already sitting under snapshots/.
-    //    We run this before sign_snapshot_manifest so that index/ is populated
-    //    with every segment up to the flush point.
     match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, &store).await {
         Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
             return Err(IpcError::store(format!(
@@ -762,58 +780,37 @@ pub(crate) async fn snapshot_volume(
         Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
     }
 
-    // 3. Drain any outstanding GC handoffs so `index/` is in a stable
-    //    post-GC state before the manifest is signed. Without this, a
-    //    volume-applied handoff (bare `gc/<ulid>`) left over from a prior
-    //    tick still references segments that `promote_segment` is about to
-    //    delete from `index/` (and from S3 via `apply_done_handoffs`). The
-    //    signed manifest would then point at segments that vanish seconds
-    //    later, and any reader — delta_repack, fork, restart — would fail
-    //    with ENOENT on the missing `.idx` file.
-    //
-    //    Safe under the snapshot lock: the tick loop's GC path
-    //    `try_lock`s the same lock and skips the tick while we hold it,
-    //    so there is no race with a concurrent apply_done_handoffs.
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
     elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, &store)
         .await
         .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
 
-    // 4. Pick snap_ulid: the max ULID in index/, or a freshly-minted
-    //    one when the volume has no segments. The volume's
-    //    `sign_snapshot_manifest` accepts either (see
-    //    `elide_core::volume::Volume::sign_snapshot_manifest` doc) —
-    //    an empty snapshot is just a signed manifest with zero
-    //    entries, valid for the claim path to fork from.
     let snap_ulid = pick_snapshot_ulid(&fork_dir)
         .map_err(|e| IpcError::internal(format!("picking snap_ulid: {e}")))?;
 
-    // 5. Tell the volume to sign and write the manifest + marker.
-    if !elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await {
+    let signed = match kind {
+        elide_core::signing::SnapshotKind::User => {
+            elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await
+        }
+        elide_core::signing::SnapshotKind::Auto => {
+            elide_coordinator::control::sign_auto_snapshot_manifest(&fork_dir, snap_ulid).await
+        }
+    };
+    if !signed {
         return Err(IpcError::internal(format!(
             "sign_snapshot_manifest {snap_ulid} failed"
         )));
     }
 
-    // Phase 4 (snapshot-time filemap generation) used to run here. It
-    // dominated `volume release` wall time on freshly-pulled volumes —
-    // ext4 layout scan with per-fragment hash lookup that demand-fetched
-    // each missing block range across the ancestor chain (~100s on a
-    // cold local fork). The filemap is strictly additive and has only
-    // one consumer: `elide volume import --extents-from`. The import
-    // path now generates the source filemap on demand if missing, so
-    // the release-time work is wasted everywhere else.
-    //
-    // Imports continue to write the importing volume's filemap inline
-    // at import time (`elide-core/src/import.rs`); that path is fast
-    // because the importer already has ext4 layout in hand.
-
-    // 5. Upload the new snapshot marker and manifest.
     elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, &volume_id, &store)
         .await
         .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
 
-    info!("[snapshot {volume_id}] committed {snap_ulid}");
+    let label = match kind {
+        elide_core::signing::SnapshotKind::User => "snapshot",
+        elide_core::signing::SnapshotKind::Auto => "auto-snapshot",
+    };
+    info!("[{label} {volume_id}] committed {snap_ulid}");
     Ok(SnapshotReply { snap_ulid })
 }
 
@@ -1671,11 +1668,14 @@ pub(crate) fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
 
 async fn stop_volume_op(
     volume_name: &str,
-    data_dir: &Path,
+    force: bool,
+    core: &CoordinatorCore,
+    snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
     hostname: Option<&str>,
 ) -> Result<(), IpcError> {
+    let data_dir: &Path = &core.data_dir;
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
         return Err(IpcError::not_found(format!(
@@ -1701,6 +1701,29 @@ async fn stop_volume_op(
         return Err(IpcError::conflict(
             "client is connected; disconnect it first",
         ));
+    }
+
+    // Clean stop on a writable volume: drain pending and publish an
+    // auto-snapshot before any state change. The auto-snapshot is what
+    // gives a future `start` (this host, or another host via `claim`)
+    // a basis to hydrate from. Skipped under `--force`.
+    if !readonly && !force {
+        match snapshot_volume_kind(
+            volume_name,
+            core,
+            snapshot_locks,
+            elide_core::signing::SnapshotKind::Auto,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(IpcError::internal(format!(
+                    "stop {volume_name}: drain/auto-snapshot failed: {e:#}; \
+                     retry, or use `stop --force` to halt without a checkpoint"
+                )));
+            }
+        }
     }
 
     // `stop` is a local-lifecycle verb: its job is to halt the daemon
@@ -2579,7 +2602,80 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
     std::fs::remove_file(vol_dir.join(STOPPED_FILE))
         .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
     crate::rescan::trigger();
+
+    // Best-effort: delete any auto-snapshots left over from a preceding
+    // `stop`. The local fork is now Live again (or about to be — the
+    // supervisor picks it up on the next scan); the auto-snapshot has
+    // done its job and would otherwise pin segments out of GC reach.
+    // Failures here only mean the next stop will overwrite a stale
+    // auto-snapshot — they do not affect start correctness.
+    let vol_ulid_str = vol_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
+    if let Some(vol_ulid_str) = vol_ulid_str
+        && let Err(e) = cleanup_auto_snapshots(&vol_dir, &vol_ulid_str, &store).await
+    {
+        warn!(
+            "[inbound] start {volume_name}: failed to clean auto-snapshots: {e:#}; \
+             next stop will overwrite"
+        );
+    }
+
     info!("[inbound] started volume {volume_name}");
+    Ok(())
+}
+
+/// Delete any auto-snapshot manifests for this volume from both the
+/// local `snapshots/` directory and the bucket. Idempotent;
+/// missing-file errors are not surfaced.
+async fn cleanup_auto_snapshots(
+    fork_dir: &Path,
+    vol_ulid_str: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), IpcError> {
+    use futures::TryStreamExt;
+
+    // 1. Local cleanup.
+    let snap_dir = fork_dir.join("snapshots");
+    if let Ok(entries) = std::fs::read_dir(&snap_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((_, kind)) = elide_core::signing::parse_snapshot_filename(name) else {
+                continue;
+            };
+            if kind == elide_core::signing::SnapshotKind::Auto {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    // 2. Bucket cleanup. List the snapshots prefix and delete any
+    //    object whose filename parses as an auto-snapshot.
+    let prefix = object_store::path::Path::from(format!("by_id/{vol_ulid_str}/snapshots/"));
+    let objects: Vec<object_store::ObjectMeta> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .map_err(|e| IpcError::store(format!("listing snapshots for cleanup: {e}")))?;
+
+    for obj in objects {
+        let Some(filename) = obj.location.filename() else {
+            continue;
+        };
+        let Some((_, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
+            continue;
+        };
+        if kind == elide_core::signing::SnapshotKind::Auto
+            && let Err(e) = store.delete(&obj.location).await
+        {
+            warn!(
+                "[inbound] failed to delete auto-snapshot {}: {e}",
+                obj.location
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3693,6 +3789,19 @@ mod tests {
     /// Build a `by_name/<vol>` symlink pointing at a fresh
     /// `by_id/<ulid>/` directory without a `volume.stopped` marker —
     /// i.e. the on-disk shape of a (notionally) running volume.
+    fn test_core(data_dir: &Path, store: &Arc<dyn ObjectStore>) -> CoordinatorCore {
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir).unwrap(),
+        );
+        CoordinatorCore {
+            data_dir: Arc::new(data_dir.to_path_buf()),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            identity,
+        }
+    }
+
     fn make_running_volume(data_dir: &Path) -> ulid::Ulid {
         let vol_ulid = ulid::Ulid::new();
         let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
@@ -3773,9 +3882,22 @@ mod tests {
         rec.handoff_snapshot = Some(ulid::Ulid::new());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        stop_volume_op("vol", data_dir.path(), &store, "coord-self", None)
-            .await
-            .expect("stop must halt locally regardless of bucket state");
+        let core = test_core(data_dir.path(), &store);
+        let snapshot_locks = SnapshotLockRegistry::default();
+        // `force = true`: this test exercises only the bucket-state
+        // handling, not the drain/snapshot path (the test fixture has
+        // no running daemon to IPC).
+        stop_volume_op(
+            "vol",
+            true,
+            &core,
+            &snapshot_locks,
+            &store,
+            "coord-self",
+            None,
+        )
+        .await
+        .expect("stop must halt locally regardless of bucket state");
 
         // Local marker now present.
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
@@ -3806,9 +3928,19 @@ mod tests {
         rec.coordinator_id = Some("coord-other".into());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        stop_volume_op("vol", data_dir.path(), &store, "coord-self", None)
-            .await
-            .expect("stop must halt locally despite foreign bucket state");
+        let core = test_core(data_dir.path(), &store);
+        let snapshot_locks = SnapshotLockRegistry::default();
+        stop_volume_op(
+            "vol",
+            true,
+            &core,
+            &snapshot_locks,
+            &store,
+            "coord-self",
+            None,
+        )
+        .await
+        .expect("stop must halt locally despite foreign bucket state");
 
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
         assert!(vol_dir.join(STOPPED_FILE).exists());

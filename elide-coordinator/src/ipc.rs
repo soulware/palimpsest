@@ -106,8 +106,17 @@ pub enum Request {
     StatusRemote { volume: String },
 
     // ── Iteration 2: lifecycle ───────────────────────────────────────
-    /// Halt the local volume daemon. Empty success reply.
-    Stop { volume: String },
+    /// Halt the local volume daemon. With default (`force = false`),
+    /// `stop` drains pending and publishes an auto-snapshot before
+    /// SIGTERM so a future `start` (this host or another via `claim`)
+    /// has a basis to hydrate from. `force = true` skips the
+    /// drain/snapshot — for emergency local halt when the drain is
+    /// stuck. Empty success reply.
+    Stop {
+        volume: String,
+        #[serde(default)]
+        force: bool,
+    },
     /// Drain WAL → publish handoff snapshot → flip `names/<name>`
     /// to Released. With `force = true`, override an unreachable
     /// foreign owner (synthesises a handoff from S3-visible segments).

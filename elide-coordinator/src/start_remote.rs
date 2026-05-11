@@ -43,8 +43,8 @@ pub(crate) async fn hydrate_remote_owned(
 
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, store).await?;
 
-    let basis_snapshot = match latest_snapshot_in_store(vol_ulid, store).await? {
-        Some(u) => u,
+    let (basis_snapshot, basis_kind) = match latest_snapshot_in_store(vol_ulid, store).await? {
+        Some(pair) => pair,
         None => {
             return Err(IpcError::not_found(format!(
                 "volume '{volume_name}' has no published snapshot in the store; \
@@ -53,7 +53,7 @@ pub(crate) async fn hydrate_remote_owned(
         }
     };
 
-    fetch_and_verify_manifest(vol_ulid, basis_snapshot, &fork_dir, store).await?;
+    fetch_and_verify_manifest(vol_ulid, basis_snapshot, basis_kind, &fork_dir, store).await?;
 
     let verifying_key =
         elide_core::signing::load_verifying_key(&fork_dir, elide_core::signing::VOLUME_PUB_FILE)
@@ -120,7 +120,7 @@ async fn pull_skeleton_chain(
 async fn latest_snapshot_in_store(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
-) -> Result<Option<Ulid>, IpcError> {
+) -> Result<Option<(Ulid, elide_core::signing::SnapshotKind)>, IpcError> {
     use futures::TryStreamExt;
     let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
     let objects: Vec<object_store::ObjectMeta> = store
@@ -129,18 +129,16 @@ async fn latest_snapshot_in_store(
         .await
         .map_err(|e| IpcError::store(format!("listing by_id/{vol_ulid}/snapshots/: {e}")))?;
 
-    let mut latest: Option<Ulid> = None;
+    let mut latest: Option<(Ulid, elide_core::signing::SnapshotKind)> = None;
     for obj in objects {
         let Some(filename) = obj.location.filename() else {
             continue;
         };
-        let Some(stem) = filename.strip_suffix(".manifest") else {
+        let Some((u, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
             continue;
         };
-        if let Ok(u) = Ulid::from_string(stem)
-            && latest.is_none_or(|cur| u > cur)
-        {
-            latest = Some(u);
+        if latest.is_none_or(|(cur, _)| u > cur) {
+            latest = Some((u, kind));
         }
     }
     Ok(latest)
@@ -149,16 +147,33 @@ async fn latest_snapshot_in_store(
 async fn fetch_and_verify_manifest(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
+    kind: elide_core::signing::SnapshotKind,
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
     let snap_dir = fork_dir.join("snapshots");
-    let filename = elide_core::signing::snapshot_manifest_filename(&snap_ulid);
+    let filename = match kind {
+        elide_core::signing::SnapshotKind::User => {
+            elide_core::signing::snapshot_manifest_filename(&snap_ulid)
+        }
+        elide_core::signing::SnapshotKind::Auto => {
+            elide_core::signing::auto_snapshot_manifest_filename(&snap_ulid)
+        }
+    };
     let local_path = snap_dir.join(&filename);
 
     if !local_path.exists() {
-        let key =
-            elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+        let key = match kind {
+            elide_core::signing::SnapshotKind::User => {
+                elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid)
+            }
+            elide_core::signing::SnapshotKind::Auto => {
+                elide_coordinator::upload::auto_snapshot_manifest_key(
+                    &vol_ulid.to_string(),
+                    snap_ulid,
+                )
+            }
+        };
         let bytes = store
             .get(&key)
             .await
@@ -178,7 +193,12 @@ async fn fetch_and_verify_manifest(
     let verifying_key =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
-    elide_core::signing::read_snapshot_manifest(fork_dir, &verifying_key, &snap_ulid)
+    // Verify against the bytes we just have on disk regardless of
+    // filename — `read_snapshot_manifest` defaults to `<ulid>.manifest`,
+    // so we read+verify from bytes for the auto variant.
+    let bytes = std::fs::read(&local_path)
+        .map_err(|e| IpcError::internal(format!("reading {filename}: {e}")))?;
+    elide_core::signing::read_snapshot_manifest_from_bytes(&bytes, &verifying_key, &snap_ulid)
         .map_err(|e| IpcError::internal(format!("verifying basis manifest {snap_ulid}: {e}")))?;
     Ok(())
 }

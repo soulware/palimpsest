@@ -145,6 +145,7 @@ pub(crate) enum VolumeRequest {
     },
     SignSnapshotManifest {
         snap_ulid: Ulid,
+        kind: crate::signing::SnapshotKind,
         reply: Sender<io::Result<()>>,
     },
     NoopStats {
@@ -744,8 +745,15 @@ impl VolumeActor {
     /// writes) to the worker.  Reply is parked until
     /// [`crate::volume::SignSnapshotManifestResult`] arrives and the
     /// `has_new_segments` flag is flipped on the actor.
-    fn start_sign_snapshot_manifest(&mut self, snap_ulid: Ulid, reply: Sender<io::Result<()>>) {
-        let job = self.lock_volume().prepare_sign_snapshot_manifest(snap_ulid);
+    fn start_sign_snapshot_manifest(
+        &mut self,
+        snap_ulid: Ulid,
+        kind: crate::signing::SnapshotKind,
+        reply: Sender<io::Result<()>>,
+    ) {
+        let job = self
+            .lock_volume()
+            .prepare_sign_snapshot_manifest_kind(snap_ulid, kind);
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::SignSnapshotManifest(job)) {
                 warn!("worker channel closed during sign_snapshot_manifest: {e}");
@@ -1041,13 +1049,17 @@ impl VolumeActor {
                         VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
                             let _ = reply.send(self.lock_volume().finalize_gc_handoff(ulid));
                         }
-                        VolumeRequest::SignSnapshotManifest { snap_ulid, reply } => {
+                        VolumeRequest::SignSnapshotManifest {
+                            snap_ulid,
+                            kind,
+                            reply,
+                        } => {
                             if self.parked_sign_snapshot_manifest.is_some() {
                                 let _ = reply.send(Err(io::Error::other(
                                     "concurrent sign_snapshot_manifest not allowed",
                                 )));
                             } else {
-                                self.start_sign_snapshot_manifest(snap_ulid, reply);
+                                self.start_sign_snapshot_manifest(snap_ulid, kind, reply);
                             }
                         }
                         VolumeRequest::NoopStats { reply } => {
@@ -1583,10 +1595,22 @@ impl VolumeClient {
     /// snapshot is read. The result is a full list of segment ULIDs
     /// belonging to this volume as of the snapshot.
     pub fn sign_snapshot_manifest(&self, snap_ulid: Ulid) -> io::Result<()> {
+        self.sign_snapshot_manifest_kind(snap_ulid, crate::signing::SnapshotKind::User)
+    }
+
+    /// Kind-explicit variant: choose between `<ulid>.manifest` (User —
+    /// the stable user/release snapshot) and `<ulid>.auto.manifest`
+    /// (Auto — the ephemeral checkpoint written by `volume stop`).
+    pub fn sign_snapshot_manifest_kind(
+        &self,
+        snap_ulid: Ulid,
+        kind: crate::signing::SnapshotKind,
+    ) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::SignSnapshotManifest {
                 snap_ulid,
+                kind,
                 reply: reply_tx,
             })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
@@ -2625,6 +2649,7 @@ pub(crate) fn execute_sign_snapshot_manifest(
         lbamap,
         verifying_key,
         segment_cache,
+        kind,
     } = job;
 
     let index_dir = base_dir.join("index");
@@ -2640,14 +2665,22 @@ pub(crate) fn execute_sign_snapshot_manifest(
     std::fs::create_dir_all(&snapshots_dir)?;
 
     // The manifest's existence under `snapshots/` is the snapshot's
-    // existence; `write_snapshot_manifest` writes atomically.
-    crate::signing::write_snapshot_manifest(
-        &base_dir,
-        signer.as_ref(),
-        &snap_ulid,
-        &seg_ulids,
-        None,
-    )?;
+    // existence; both writers go through `write_file_atomic` internally.
+    match kind {
+        crate::signing::SnapshotKind::User => crate::signing::write_snapshot_manifest(
+            &base_dir,
+            signer.as_ref(),
+            &snap_ulid,
+            &seg_ulids,
+            None,
+        )?,
+        crate::signing::SnapshotKind::Auto => crate::signing::write_auto_snapshot_manifest(
+            &base_dir,
+            signer.as_ref(),
+            &snap_ulid,
+            &seg_ulids,
+        )?,
+    };
 
     Ok(SignSnapshotManifestResult { snap_ulid })
 }

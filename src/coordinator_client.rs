@@ -574,9 +574,10 @@ impl Client {
     /// socket. Both the marker file and that socket are root-owned when
     /// the coordinator runs under sudo, so this path is what makes
     /// `volume stop` work for non-root CLI callers.
-    pub fn stop_volume(&self, name: &str) -> io::Result<()> {
+    pub fn stop_volume(&self, name: &str, force: bool) -> io::Result<()> {
         self.call_typed::<()>(&Request::Stop {
             volume: name.to_owned(),
+            force,
         })?
         .map_err(io::Error::other)
     }
