@@ -268,18 +268,18 @@ async fn claim_volume_bucket_op(
         ))
     })?;
 
+    use elide_coordinator::volume_state::LocalShape;
+    let link = data_dir.join("by_name").join(volume_name);
+    let (local_vol_dir, _local_shape) = LocalShape::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
+    let local_vol_ulid = local_vol_dir
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(|s| Ulid::from_string(s).ok());
+
     match record.state {
         NameState::Released => {
-            // Determine whether we hold a matching local fork.
-            let link = data_dir.join("by_name").join(volume_name);
-            let local_vol_ulid = match std::fs::canonicalize(&link) {
-                Ok(p) => p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok()),
-                Err(_) => None,
-            };
-
             if local_vol_ulid == Some(record.vol_ulid) {
                 // In-place reclaim of a Released name we still hold
                 // locally. Three shapes for the matching `vol_ulid`:
@@ -298,14 +298,13 @@ async fn claim_volume_bucket_op(
                 //       `volume.key`, no shadow): reconcile refuses
                 //       with `NoKeyShadow` and we surface a hint to
                 //       fork via `volume create --from`.
-                let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
-                    IpcError::internal(format!("canonicalize {}: {e}", link.display()))
-                })?;
+                let vol_dir = local_vol_dir.as_ref().expect(
+                    "local_vol_ulid was Some(vol_ulid), so local_vol_dir must also be Some",
+                );
                 use elide_coordinator::volume_state::{
                     ReconcileError, reconcile_owned_local_to_stopped,
                 };
-                if let Err(e) =
-                    reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid)
+                if let Err(e) = reconcile_owned_local_to_stopped(vol_dir, data_dir, record.vol_ulid)
                 {
                     return Err(match e {
                         ReconcileError::NoKeyShadow => IpcError::conflict(format!(
@@ -347,7 +346,7 @@ async fn claim_volume_bucket_op(
                         }
                         // Best-effort: drop the display-only marker now that
                         // the bucket record is no longer Released.
-                        if let Err(e) = clear_released_marker(&vol_dir) {
+                        if let Err(e) = clear_released_marker(vol_dir) {
                             warn!(
                                 "[inbound] reclaim {volume_name}: clearing \
                                  volume.released marker: {e}"
@@ -415,17 +414,13 @@ async fn claim_volume_bucket_op(
                 use elide_coordinator::volume_state::{
                     ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
                 };
-                let link = data_dir.join("by_name").join(volume_name);
-                if !link.exists() {
+                let Some(vol_dir) = local_vol_dir.as_ref() else {
                     return Err(IpcError::conflict(format!(
                         "name '{volume_name}' is owned by this coordinator but has no \
                          local fork; use `volume start {volume_name}` to hydrate"
                     )));
-                }
-                let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
-                    IpcError::internal(format!("canonicalize {}: {e}", link.display()))
-                })?;
-                match reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid) {
+                };
+                match reconcile_owned_local_to_stopped(vol_dir, data_dir, record.vol_ulid) {
                     Ok(ReconcileOutcome::AlreadyStopped) => {
                         info!("[inbound] claim {volume_name}: already owned + stopped — no-op");
                         Ok(ClaimReply::Reclaimed)
