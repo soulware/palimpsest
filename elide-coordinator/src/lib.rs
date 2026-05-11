@@ -23,6 +23,7 @@ pub mod reaper;
 pub mod recovery;
 pub mod remote_breadcrumb;
 pub mod retention;
+pub mod role;
 pub mod stores;
 pub mod tasks;
 pub mod upload;
