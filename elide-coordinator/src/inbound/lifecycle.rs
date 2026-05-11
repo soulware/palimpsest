@@ -1395,3 +1395,939 @@ async fn cleanup_auto_snapshots(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::*;
+    use super::*;
+    use elide_coordinator::volume_state::PID_FILE;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    // ────────────────────────────────────────────────────────────────
+    // ── force_release_volume_op ───────────────────────────────────────────
+    //
+    // Verify the inbound op composes recovery + lifecycle + name_store
+    // correctly. The lower-level helpers each have unit coverage already;
+    // these tests exercise the IPC verb's end-to-end path: read current
+    // record → fetch dead pubkey → list+verify segments → publish
+    // synthesised snapshot → unconditionally rewrite names/<name>.
+
+    use elide_coordinator::identity::CoordinatorIdentity;
+    use elide_coordinator::name_store as ns;
+    use elide_core::name_record::{NameRecord, NameState};
+    use elide_core::segment::{SegmentEntry, SegmentFlags, SegmentSigner, write_segment};
+    use elide_core::signing::generate_ephemeral_signer;
+    use object_store::PutPayload;
+    use object_store::path::Path as StorePath;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Upload a `volume.pub` for the dead fork at the canonical path.
+    async fn upload_dead_pub(
+        store: &Arc<dyn ObjectStore>,
+        vol_ulid: ulid::Ulid,
+        vk: &ed25519_dalek::VerifyingKey,
+    ) {
+        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let body = format!("{}\n", hex(&vk.to_bytes()));
+        store
+            .put(&key, PutPayload::from(body.into_bytes()))
+            .await
+            .unwrap();
+    }
+
+    /// Build a single-entry signed segment via the canonical writer and
+    /// upload it under `by_id/<vol_ulid>/segments/<seg_ulid>`.
+    async fn upload_signed_segment(
+        store: &Arc<dyn ObjectStore>,
+        vol_ulid: ulid::Ulid,
+        seg_ulid: ulid::Ulid,
+        signer: &dyn SegmentSigner,
+        body: &[u8],
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg");
+        let hash = blake3::hash(body);
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            body.to_vec(),
+        )];
+        write_segment(&path, &mut entries, signer).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let key = StorePath::from(format!("by_id/{vol_ulid}/segments/{seg_ulid}"));
+        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+    }
+
+    /// Fixture: a name in `Live` state pointing at a dead fork that has
+    /// `volume.pub` and one signed segment in S3, plus a fresh
+    /// `CoordinatorIdentity` for the recovering coordinator.
+    async fn force_release_fixture(
+        name: &str,
+    ) -> (
+        Arc<dyn ObjectStore>,
+        Arc<CoordinatorIdentity>,
+        ulid::Ulid,
+        ulid::Ulid,
+        TempDir,
+    ) {
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let dead_vol = ulid::Ulid::new();
+        let seg_ulid = ulid::Ulid::new();
+
+        let (signer, vk) = generate_ephemeral_signer();
+        upload_dead_pub(&store, dead_vol, &vk).await;
+        upload_signed_segment(&store, dead_vol, seg_ulid, signer.as_ref(), b"data").await;
+
+        // names/<name> = Live, owned by some "previous" coordinator id.
+        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
+        rec.coordinator_id = Some("dead-owner".into());
+        ns::create_name_record(&store, name, &rec).await.unwrap();
+
+        // Recovering coordinator's identity, rooted in a tempdir.
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        (store, identity, dead_vol, seg_ulid, coord_dir)
+    }
+
+    #[tokio::test]
+    async fn force_release_op_overwrites_live_to_released() {
+        let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
+
+        let reply =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect("force-release should succeed");
+        let snap_ulid = reply.handoff_snapshot;
+
+        // names/<vol> is now Released, references the dead fork.
+        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(rec.state, NameState::Released);
+        assert_eq!(rec.vol_ulid, dead_vol);
+        assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
+
+        // Synthesised manifest landed under the dead fork's snapshots/ prefix.
+        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
+        use futures::TryStreamExt;
+        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
+        assert_eq!(listed.len(), 1, "exactly one synthesised snapshot");
+        assert!(
+            listed[0]
+                .location
+                .as_ref()
+                .ends_with(&format!("{snap_ulid}.manifest")),
+            "manifest path is {}",
+            listed[0].location.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_op_refuses_already_released_record() {
+        let (store, identity, _dead, _seg, _td) = force_release_fixture("vol").await;
+
+        // Pre-flip names/<vol> to Released so the op refuses.
+        let (mut rec, v) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        rec.state = NameState::Released;
+        rec.coordinator_id = None;
+        ns::update_name_record(&store, "vol", &rec, v)
+            .await
+            .unwrap();
+
+        let err = force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+            .await
+            .expect_err("already-released record must refuse");
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
+        assert!(
+            err.message
+                .contains("force-release only overrides Live or Stopped"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_op_refuses_absent_name() {
+        let store = mem_store();
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let err =
+            force_release_volume_op("ghost", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect_err("ghost name must error");
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::NotFound);
+        assert!(err.message.contains("no S3 record"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn force_release_op_recovers_when_dead_pub_missing() {
+        // Reproduces the create-time crash window: `names/<name>` was
+        // published to S3 but the coordinator died before
+        // `volume.pub` made it to the bucket. With no `volume.pub`
+        // there is no key to verify any segment under, so the dead
+        // fork is provably empty — force-release publishes an empty
+        // synthesised handoff and flips to Released.
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let dead_vol = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
+        rec.coordinator_id = Some("dead-owner".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let reply =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect("force-release on missing-pub fork should succeed");
+        let snap_ulid = reply.handoff_snapshot;
+
+        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(rec.state, NameState::Released);
+        assert_eq!(rec.vol_ulid, dead_vol);
+        assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
+
+        // The synthesised manifest covers no segments.
+        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
+        use futures::TryStreamExt;
+        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let manifest = store
+            .get(&listed[0].location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let recovery = elide_core::signing::peek_snapshot_manifest_recovery(&manifest)
+            .unwrap()
+            .expect("synthesised handoff must carry recovery metadata");
+        assert_eq!(
+            recovery.recovering_coordinator_id,
+            identity.coordinator_id_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_op_drops_tampered_segment_but_succeeds() {
+        // A tampered segment must be dropped (signature failure) without
+        // failing the verb. The published snapshot covers only the
+        // verified segments; the operator can still recover the name.
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let dead_vol = ulid::Ulid::new();
+        let (signer, vk) = generate_ephemeral_signer();
+        upload_dead_pub(&store, dead_vol, &vk).await;
+
+        // One good segment, one tampered.
+        let good_id = ulid::Ulid::new();
+        upload_signed_segment(&store, dead_vol, good_id, signer.as_ref(), b"good").await;
+        let bad_id = ulid::Ulid::new();
+        // Build a valid segment then flip a byte inside the index section.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg");
+        let hash = blake3::hash(b"bad");
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            b"bad".to_vec(),
+        )];
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Header is 100 bytes; first index entry starts at offset 100.
+        bytes[104] ^= 0xff;
+        let bad_key = StorePath::from(format!("by_id/{dead_vol}/segments/{bad_id}"));
+        store.put(&bad_key, PutPayload::from(bytes)).await.unwrap();
+
+        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
+        rec.coordinator_id = Some("dead-owner".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let reply =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
+                .await
+                .expect("force-release with one tampered segment must still succeed");
+        let snap_str = reply.handoff_snapshot.to_string();
+
+        // Verify the synthesised manifest contains exactly one segment ULID
+        // — the good one. Read the manifest body and look for both ids.
+        use futures::TryStreamExt;
+        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
+        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
+        let entry = listed
+            .into_iter()
+            .find(|m| {
+                m.location
+                    .as_ref()
+                    .ends_with(&format!("{snap_str}.manifest"))
+            })
+            .expect("synthesised manifest exists");
+        let manifest_body = store
+            .get(&entry.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&manifest_body).unwrap();
+        assert!(
+            body_str.contains(&good_id.to_string()),
+            "good segment present"
+        );
+        assert!(
+            !body_str.contains(&bad_id.to_string()),
+            "tampered segment must not appear in manifest"
+        );
+    }
+
+    // ── release / stop preconditions ──────────────────────────────────────
+    //
+    // Two bugs surfaced by manual testing:
+    //
+    //   1. `release` accepted a running volume and tried to halt it
+    //      inline. A failure between the inline halt and the bucket
+    //      flip would strand the volume in a "Released-but-running"
+    //      state. Fix: refuse if `volume.stopped` is absent.
+    //
+    //   2. `stop` refused when the bucket said Released/
+    //      Readonly. But `stop` is a *local* lifecycle verb — its job
+    //      is to halt the daemon. The bucket update is best-effort.
+    //      A daemon left running while the bucket says Released
+    //      (e.g. because of bug 1) was unstoppable. Fix: warn-and-skip
+    //      the bucket update on InvalidTransition, halt locally
+    //      regardless.
+
+    /// Build a `by_name/<vol>` symlink pointing at a `by_id/<ulid>/`
+    /// directory in a chosen lifecycle. `pid` controls whether a live
+    /// pidfile is written (use `Some(std::process::id())` for a
+    /// genuinely-running classification under `VolumeLifecycle::from_dir`).
+    fn make_volume_with_marker(
+        data_dir: &Path,
+        marker: Option<&str>,
+        pid: Option<u32>,
+    ) -> ulid::Ulid {
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("by_name")).unwrap();
+        let link = data_dir.join("by_name").join("vol");
+        let target = std::path::PathBuf::from(format!("../by_id/{vol_ulid}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if let Some(name) = marker {
+            std::fs::write(vol_dir.join(name), "").unwrap();
+        }
+        if let Some(pid) = pid {
+            std::fs::write(vol_dir.join(PID_FILE), pid.to_string()).unwrap();
+        }
+        vol_ulid
+    }
+
+    #[test]
+    fn local_daemon_running_treats_released_marker_as_not_running() {
+        // Regression: previously the predicate checked only for the
+        // absence of `volume.stopped`, so a parked-Released fork was
+        // misclassified as running and `claim` / `release --force`
+        // wrongly refused. The supervisor parks on `volume.released`
+        // too — these forks have no daemon.
+        use elide_coordinator::volume_state::RELEASED_FILE;
+        let data_dir = TempDir::new().unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(data_dir.path().join("by_name")).unwrap();
+        let link = data_dir.path().join("by_name").join("vol");
+        let target = std::path::PathBuf::from(format!("../by_id/{vol_ulid}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::write(vol_dir.join(RELEASED_FILE), vol_ulid.to_string()).unwrap();
+
+        assert!(!local_daemon_running(data_dir.path(), "vol"));
+    }
+
+    #[test]
+    fn local_daemon_running_true_for_live_pid() {
+        let data_dir = TempDir::new().unwrap();
+        make_volume_with_marker(data_dir.path(), None, Some(std::process::id()));
+        assert!(local_daemon_running(data_dir.path(), "vol"));
+    }
+
+    #[test]
+    fn local_daemon_running_false_for_stopped_marker() {
+        let data_dir = TempDir::new().unwrap();
+        // Both a live pid AND volume.stopped: parked wins.
+        make_volume_with_marker(
+            data_dir.path(),
+            Some(STOPPED_FILE),
+            Some(std::process::id()),
+        );
+        assert!(!local_daemon_running(data_dir.path(), "vol"));
+    }
+
+    #[test]
+    fn local_daemon_running_false_for_missing_volume() {
+        let data_dir = TempDir::new().unwrap();
+        assert!(!local_daemon_running(data_dir.path(), "ghost"));
+    }
+
+    /// Build a `by_name/<vol>` symlink pointing at a fresh
+    /// `by_id/<ulid>/` directory without a `volume.stopped` marker —
+    /// i.e. the on-disk shape of a (notionally) running volume.
+    fn test_core(data_dir: &Path, store: &Arc<dyn ObjectStore>) -> CoordinatorCore {
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir).unwrap(),
+        );
+        CoordinatorCore {
+            data_dir: Arc::new(data_dir.to_path_buf()),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            identity,
+        }
+    }
+
+    fn make_running_volume(data_dir: &Path) -> ulid::Ulid {
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::create_dir_all(data_dir.join("by_name")).unwrap();
+        let link = data_dir.join("by_name").join("vol");
+        let target = std::path::PathBuf::from(format!("../by_id/{vol_ulid}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        vol_ulid
+    }
+
+    #[tokio::test]
+    async fn release_op_refuses_when_volume_is_running() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        // Running volume: by_name symlink + by_id dir, NO volume.stopped.
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir.path())
+                .unwrap(),
+        );
+
+        // names/<vol> = Live owned by us — would have been the path
+        // through the rest of release_volume_op before this fix.
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
+        rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let ctx = IpcContext {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            fetch_registry: crate::fetch::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            identity,
+            credentialer: None,
+        };
+
+        let err = release_volume_op("vol", &store, &ctx)
+            .await
+            .expect_err("running volume must refuse release");
+
+        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
+        assert!(
+            err.message.contains("running") && err.message.contains("volume stop"),
+            "expected operator to be pointed at `volume stop`, got: {}",
+            err.message
+        );
+
+        // The bucket record must be untouched — still Live.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Live);
+    }
+
+    #[tokio::test]
+    async fn stop_op_halts_locally_when_bucket_says_released() {
+        // Bug-2 reproducer: bucket is Released (e.g. from a partial
+        // earlier release), daemon is still running on this host. Stop
+        // must succeed, halting the daemon and leaving the bucket
+        // record unchanged (we don't own a Released record).
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
+        rec.state = NameState::Released;
+        rec.coordinator_id = None;
+        rec.handoff_snapshot = Some(ulid::Ulid::new());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let core = test_core(data_dir.path(), &store);
+        let snapshot_locks = SnapshotLockRegistry::default();
+        // `force = true`: this test exercises only the bucket-state
+        // handling, not the drain/snapshot path (the test fixture has
+        // no running daemon to IPC).
+        stop_volume_op(
+            "vol",
+            true,
+            &core,
+            &snapshot_locks,
+            &store,
+            "coord-self",
+            None,
+        )
+        .await
+        .expect("stop must halt locally regardless of bucket state");
+
+        // Local marker now present.
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        assert!(
+            vol_dir.join(STOPPED_FILE).exists(),
+            "volume.stopped marker should be written"
+        );
+
+        // Bucket record untouched: still Released, no coordinator_id.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Released);
+        assert!(still.coordinator_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_op_halts_locally_when_bucket_says_foreign_live() {
+        // Even split-brain bucket state must not block a local halt.
+        // If a daemon is running on our host while names/<name> is
+        // owned by another coordinator, halting our local process is
+        // the right cleanup — it doesn't affect their host. We leave
+        // the bucket record untouched.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_running_volume(data_dir.path());
+
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
+        rec.coordinator_id = Some("coord-other".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let core = test_core(data_dir.path(), &store);
+        let snapshot_locks = SnapshotLockRegistry::default();
+        stop_volume_op(
+            "vol",
+            true,
+            &core,
+            &snapshot_locks,
+            &store,
+            "coord-self",
+            None,
+        )
+        .await
+        .expect("stop must halt locally despite foreign bucket state");
+
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        assert!(vol_dir.join(STOPPED_FILE).exists());
+
+        // Bucket record untouched — still owned by the other coordinator.
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Live);
+        assert_eq!(still.coordinator_id.as_deref(), Some("coord-other"));
+    }
+
+    // ── release fast-path predicate ────────────────────────────────────
+    //
+    // `release_fast_path_handoff` decides whether a `volume release` can
+    // skip the daemon restart and reuse the previously-published
+    // snapshot. Each branch below exercises one ineligibility reason
+    // plus one happy path. Per CLAUDE.md "monotonic ULIDs in tests" we
+    // mint via `UlidMint` whenever ordering matters.
+
+    use elide_core::ulid_mint::UlidMint;
+
+    /// Set up the on-disk skeleton a clean stopped volume would have
+    /// after at least one snapshot has been published and uploaded.
+    fn fast_path_clean_volume(snap_ulid: ulid::Ulid) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        // Signed snapshot manifest (the snapshot's identity).
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap_ulid}.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
+        // Upload sentinel: volume/<id>/uploaded/snapshots/<ulid>.
+        std::fs::create_dir_all(tmp.path().join("uploaded").join("snapshots")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(snap_ulid.to_string()),
+            "",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// As `fast_path_clean_volume` but stamps an auto-snapshot
+    /// (`<ulid>.auto.manifest` + `uploaded/snapshots/<ulid>.auto`)
+    /// instead of a user one. Used to verify the fast path treats
+    /// auto-snapshots as a covering basis with promotion.
+    fn fast_path_clean_volume_auto(snap_ulid: ulid::Ulid) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap_ulid}.auto.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("uploaded").join("snapshots")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(format!("{snap_ulid}.auto")),
+            "",
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn fast_path_eligible_when_clean_with_uploaded_snapshot() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        let got = release_fast_path_handoff(tmp.path()).unwrap();
+        assert_eq!(
+            got,
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_wal_non_empty() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(
+            tmp.path().join("wal").join("01JANYSEGULID00000000000000"),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_pending_non_empty() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(tmp.path().join("pending").join("seg"), "x").unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_gc_non_empty() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(
+            tmp.path().join("gc").join("01JANYGCULID0000000000000000"),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_no_snapshot_published() {
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_snapshot_not_yet_uploaded() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        // Remove the sentinel: snapshot is signed locally but not on S3.
+        std::fs::remove_file(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(snap.to_string()),
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_ineligible_when_segment_post_dates_snapshot() {
+        let mut mint = UlidMint::new(ulid::Ulid::nil());
+        let snap = mint.next();
+        let later_segment = mint.next();
+        assert!(later_segment > snap, "UlidMint must mint monotonically");
+        let tmp = fast_path_clean_volume(snap);
+        // A new segment landed in `index/` after the last snapshot —
+        // slow path must run so the new snapshot covers it.
+        std::fs::write(
+            tmp.path()
+                .join("index")
+                .join(format!("{later_segment}.idx")),
+            "",
+        )
+        .unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_path_eligible_when_segment_predates_snapshot() {
+        let mut mint = UlidMint::new(ulid::Ulid::nil());
+        let earlier_segment = mint.next();
+        let snap = mint.next();
+        assert!(snap > earlier_segment);
+        let tmp = fast_path_clean_volume(snap);
+        // Older segment is already covered by the snapshot — fine.
+        std::fs::write(
+            tmp.path()
+                .join("index")
+                .join(format!("{earlier_segment}.idx")),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
+    }
+
+    #[test]
+    fn fast_path_picks_latest_snapshot_when_multiple_present() {
+        let mut mint = UlidMint::new(ulid::Ulid::nil());
+        let older_snap = mint.next();
+        let newer_snap = mint.next();
+        let tmp = fast_path_clean_volume(newer_snap);
+        // Older manifest + sentinel (the volume kept history).
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{older_snap}.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(older_snap.to_string()),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: newer_snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
+    }
+
+    #[test]
+    fn fast_path_ignores_non_manifest_siblings() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        // The snapshots dir has the manifest plus a `.filemap`
+        // sibling and a stale bare-ULID marker (pre-#215 layout);
+        // neither should be mistaken for an additional snapshot.
+        std::fs::write(
+            tmp.path().join("snapshots").join(format!("{snap}.filemap")),
+            "fm",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("snapshots").join(snap.to_string()), "").unwrap();
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
+    }
+
+    #[test]
+    fn fast_path_recognises_auto_snapshot_as_covering() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume_auto(snap);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::Auto,
+            }),
+            "auto-snapshot with sentinel must be eligible (release promotes it later)"
+        );
+    }
+
+    #[test]
+    fn fast_path_prefers_user_when_same_ulid_has_both_kinds() {
+        // Transient state during an in-flight auto→user promotion:
+        // both files exist for the same ULID. The latest_snapshot
+        // tiebreaker is User, so release's fast path picks up the
+        // already-stable manifest and skips the (redundant)
+        // promotion step.
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.auto.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
+        // Auto sentinel must also exist so the fast path doesn't
+        // reject on a missing sentinel.
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(format!("{snap}.auto")),
+            "",
+        )
+        .unwrap();
+        let got = release_fast_path_handoff(tmp.path()).unwrap();
+        assert_eq!(
+            got,
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User,
+            }),
+            "User wins the tiebreaker; auto sibling is the stale shard"
+        );
+    }
+
+    #[test]
+    fn fast_path_treats_missing_subdirs_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        // No wal/, pending/, gc/, index/ directories yet — a brand-new
+        // volume that just happens to have no snapshot. Should fall
+        // through cleanly to the "no snapshot" branch.
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+    }
+
+    // ── start hydrate_or_route ─────────────────────────────────────────
+
+    fn make_core(tmp: &TempDir, store: Arc<dyn ObjectStore>) -> CoordinatorCore {
+        let coord_dir = tmp.path().join("_coord");
+        std::fs::create_dir_all(&coord_dir).unwrap();
+        let identity = Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(&coord_dir).unwrap(),
+        );
+        CoordinatorCore {
+            data_dir: Arc::new(tmp.path().to_path_buf()),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(store)),
+            identity,
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_returns_not_found_when_no_record() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let err = hydrate_or_route("ghost", &store, "coord-A", &core)
+            .await
+            .expect_err("missing bucket record should be NotFound");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains("not found"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_conflicts_on_foreign_owner() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Stopped;
+        rec.coordinator_id = Some("coord-OTHER".into());
+        create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+            .await
+            .expect_err("foreign-owned record should conflict");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(
+            err.message.contains("held by coordinator coord-OTHER"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("release --force"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_routes_released_to_claim() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Released;
+        rec.coordinator_id = Some("coord-A".into());
+        create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+            .await
+            .expect_err("released record should conflict");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(err.message.contains("Released"), "{}", err.message);
+        assert!(err.message.contains("volume claim vol"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_refuses_readonly() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Readonly;
+        create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+            .await
+            .expect_err("readonly record should refuse start");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(err.message.contains("readonly"), "{}", err.message);
+    }
+}
