@@ -2334,7 +2334,6 @@ async fn release_volume_op(
 ) -> Result<ReleaseReply, IpcError> {
     let identity = &ctx.identity;
     let data_dir: &Path = &ctx.data_dir;
-    let snapshot_locks = &ctx.snapshot_locks;
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
@@ -2412,180 +2411,65 @@ async fn release_volume_op(
         format!("name '{volume_name}' has no S3 record; drain the volume first"),
     )?;
 
-    // Fast path: nothing has changed since the last published snapshot,
-    // so reuse it as the handoff. The next claimant forks from it
-    // identically to a freshly-minted one. If the covering snapshot is
-    // an `Auto` (written by the preceding `stop`), promote it to a
-    // stable user manifest first — `Released` names must point at
-    // stable bases since claim/fork lineages will be built on top.
+    // Reuse the latest published snapshot as the handoff. The next
+    // claimant forks from it identically to a freshly-minted one. If
+    // the covering snapshot is an `Auto` (written by the preceding
+    // `stop`), promote it to a stable user manifest first — `Released`
+    // names must point at stable bases since claim/fork lineages will
+    // be built on top.
+    //
+    // Refuses if the latest snapshot does not cover all durable state
+    // (WAL/pending/gc has work, or segments post-date the snapshot).
+    // The operator's recovery is `start` → `stop` (clean drain) →
+    // `release` — `release` itself is a pure bucket-flip, no daemon
+    // interaction.
     let volume_id_for_promote = elide_coordinator::upload::derive_names(&vol_dir).map_err(|e| {
         IpcError::internal(format!("[release {volume_name}] deriving volume id: {e}"))
     })?;
-    match release_fast_path_handoff(&vol_dir) {
-        Ok(Some(cover)) => {
-            if cover.kind == elide_core::signing::SnapshotKind::Auto {
-                info!(
-                    "[release {volume_name}] fast path: promoting auto-snapshot \
-                     {} → stable manifest",
-                    cover.snap_ulid
-                );
-                if let Err(e) =
-                    promote_auto_snapshot(&vol_dir, &volume_id_for_promote, cover.snap_ulid, store)
-                        .await
-                {
-                    warn!(
-                        "[release {volume_name}] auto-snapshot promotion failed ({e}); \
-                         falling back to slow path"
-                    );
-                } else {
-                    info!(
-                        "[release {volume_name}] fast path: reusing snapshot {} \
-                         (clean stopped volume, no daemon restart needed)",
-                        cover.snap_ulid
-                    );
-                    let result = perform_release_flip(
-                        volume_name,
-                        data_dir,
-                        &vol_dir,
-                        store,
-                        identity,
-                        cover.snap_ulid,
-                    )
-                    .await;
-                    info!(
-                        "[release {volume_name}] complete in {:.2?}",
-                        started.elapsed()
-                    );
-                    return result;
-                }
-            } else {
-                info!(
-                    "[release {volume_name}] fast path: reusing snapshot {} \
-                     (clean stopped volume, no daemon restart needed)",
-                    cover.snap_ulid
-                );
-                let result = perform_release_flip(
-                    volume_name,
-                    data_dir,
-                    &vol_dir,
-                    store,
-                    identity,
-                    cover.snap_ulid,
-                )
-                .await;
-                info!(
-                    "[release {volume_name}] complete in {:.2?}",
-                    started.elapsed()
-                );
-                return result;
-            }
-        }
+    let cover = match release_fast_path_handoff(&vol_dir) {
+        Ok(Some(cover)) => cover,
         Ok(None) => {
-            info!(
-                "[release {volume_name}] slow path: WAL/pending/gc has work or \
-                 segments post-date last snapshot"
-            );
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' has durable state past the last snapshot \
+                 (WAL/pending uploads not yet drained); the previous stop did not \
+                 complete a clean drain. Recover with: \
+                 `elide volume start {volume_name}` then \
+                 `elide volume stop {volume_name}`, then re-run release"
+            )));
         }
         Err(e) => {
-            warn!(
-                "[release {volume_name}] fast-path inspection failed ({e}); \
-                 falling back to slow path"
-            );
+            return Err(IpcError::internal(format!(
+                "release fast-path inspection failed: {e}"
+            )));
+        }
+    };
+    if cover.kind == elide_core::signing::SnapshotKind::Auto {
+        info!(
+            "[release {volume_name}] promoting auto-snapshot {} → stable manifest",
+            cover.snap_ulid
+        );
+        if let Err(e) =
+            promote_auto_snapshot(&vol_dir, &volume_id_for_promote, cover.snap_ulid, store).await
+        {
+            return Err(IpcError::internal(format!(
+                "promoting auto-snapshot {} for release: {e}",
+                cover.snap_ulid
+            )));
         }
     }
-
-    // ── Slow path: bring daemon up in drain mode ────────────────────
-    //
-    // The drain step needs an IPC-capable daemon, so we transparently
-    // bring the stopped volume back up in IPC-only mode here. The
-    // `volume.draining` marker tells both the supervisor and the
-    // volume binary to suppress transport setup; from a client's
-    // perspective the volume is never visibly running during release.
-    //
-    // The `_draining_guard` removes the marker when this function
-    // returns, regardless of which exit path is taken (success, early
-    // error, panic).
-    std::fs::write(vol_dir.join("volume.draining"), "")
-        .map_err(|e| IpcError::internal(format!("writing volume.draining: {e}")))?;
-    if let Err(e) = std::fs::remove_file(vol_dir.join(STOPPED_FILE)) {
-        let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
-        return Err(IpcError::internal(format!(
-            "clearing volume.stopped for release: {e}"
-        )));
-    }
-    crate::rescan::trigger();
-    let mut _draining_guard = Some(DrainingMarkerGuard::new(vol_dir.clone()));
-
-    let bringup_started = std::time::Instant::now();
-    info!("[release {volume_name}] bringing daemon up for drain");
-    if !wait_for_control_sock(&vol_dir, std::time::Duration::from_secs(30)).await {
-        return Err(IpcError::internal(format!(
-            "timed out waiting for volume '{volume_name}' to come up for release"
-        )));
-    }
     info!(
-        "[release {volume_name}] daemon ready in {:.2?}",
-        bringup_started.elapsed()
+        "[release {volume_name}] reusing snapshot {} (clean stopped volume)",
+        cover.snap_ulid
     );
-
-    if !vol_dir.join("control.sock").exists() {
-        return Err(IpcError::internal(format!(
-            "volume '{volume_name}' is not running — start it first"
-        )));
-    }
-
-    if elide_coordinator::control::is_connected(&vol_dir).await
-        == elide_coordinator::control::ConnectedStatus::Connected
-    {
-        return Err(IpcError::conflict(
-            "client is connected; disconnect it first",
-        ));
-    }
-
-    // Drain WAL → publish handoff snapshot. Empty volumes get a
-    // freshly-minted snapshot ULID; the claim path forks from a
-    // zero-entry snapshot as a fresh empty root.
-    let snap_started = std::time::Instant::now();
-    info!("[release {volume_name}] draining WAL and publishing handoff snapshot");
-    let snap_ulid = snapshot_volume(volume_name, &ctx.core(), snapshot_locks)
-        .await
-        .map_err(|e| IpcError::internal(format!("snapshot for release failed: {e}")))?
-        .snap_ulid;
-    info!(
-        "[release {volume_name}] handoff snapshot {snap_ulid} published in {:.2?}",
-        snap_started.elapsed()
-    );
-
-    // Halt the daemon. Writing the marker first prevents the supervisor
-    // from restarting it between shutdown and our final state write.
-    // From this point on the release is past the "could fail and need
-    // to leave the volume in a usable Stopped state" window — defuse
-    // the draining-marker guard so it doesn't fight the explicit
-    // halt step we're about to do.
-    if let Some(g) = _draining_guard.as_mut() {
-        g.defuse();
-    }
-    std::fs::write(vol_dir.join(STOPPED_FILE), "")
-        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
-    info!("[release {volume_name}] halting daemon");
-    {
-        use elide_coordinator::control::ShutdownOutcome;
-        match elide_coordinator::control::shutdown(&vol_dir).await {
-            ShutdownOutcome::Acknowledged => {}
-            ShutdownOutcome::Failed(msg) => {
-                let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-                return Err(IpcError::internal(format!("shutdown failed: {msg}")));
-            }
-            ShutdownOutcome::NotRunning => {
-                // Volume process wasn't running by the time we reached
-                // this step. The snapshot succeeded though, so we proceed
-                // with the state flip.
-            }
-        }
-    }
-
-    let result =
-        perform_release_flip(volume_name, data_dir, &vol_dir, store, identity, snap_ulid).await;
+    let result = perform_release_flip(
+        volume_name,
+        data_dir,
+        &vol_dir,
+        store,
+        identity,
+        cover.snap_ulid,
+    )
+    .await;
     info!(
         "[release {volume_name}] complete in {:.2?}",
         started.elapsed()
