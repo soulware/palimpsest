@@ -2811,9 +2811,9 @@ async fn perform_release_flip(
 /// before the bucket flip — auto-snapshots are not stable enough to
 /// serve as a Released-name basis without that step.
 #[derive(Debug, PartialEq, Eq)]
-struct FastPathCover {
-    snap_ulid: ulid::Ulid,
-    kind: elide_core::signing::SnapshotKind,
+pub(crate) struct FastPathCover {
+    pub(crate) snap_ulid: ulid::Ulid,
+    pub(crate) kind: elide_core::signing::SnapshotKind,
 }
 
 /// Promote `<ulid>.auto.manifest` to `<ulid>.manifest` both locally
@@ -2831,7 +2831,7 @@ struct FastPathCover {
 /// local-rename leaves stale `<ulid>.auto.manifest` on disk — since
 /// the volume is about to be released and removed locally, this is
 /// irrelevant.
-async fn promote_auto_snapshot(
+pub(crate) async fn promote_auto_snapshot(
     vol_dir: &Path,
     volume_id: &str,
     snap_ulid: ulid::Ulid,
@@ -2881,7 +2881,7 @@ async fn promote_auto_snapshot(
     Ok(())
 }
 
-fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<FastPathCover>> {
+pub(crate) fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<FastPathCover>> {
     if !dir_is_empty_or_absent(&vol_dir.join("wal"))? {
         return Ok(None);
     }

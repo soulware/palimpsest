@@ -27,8 +27,8 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::inbound::{
-    CoordinatorCore, DrainingMarkerGuard, await_prefetch_op, decode_hex32, parse_transport_flags,
-    pull_readonly_op, snapshot_volume, validate_volume_name, wait_for_control_sock,
+    CoordinatorCore, await_prefetch_op, decode_hex32, parse_transport_flags, pull_readonly_op,
+    snapshot_volume, validate_volume_name,
 };
 use elide_coordinator::ipc::{
     ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply, IpcError,
@@ -398,9 +398,22 @@ impl ForkOrchestrator {
             return Ok(());
         }
 
-        // Writable source: take an implicit snapshot. Need the source's
-        // name to drive `snapshot_volume`; for `BareUlid` we read it out
-        // of `volume.toml`.
+        // Writable source: need a snapshot covering the source's current
+        // durable state. Two paths:
+        //
+        //   - Source is stopped: the latest published snapshot must
+        //     cover everything (no work post-dating it). Reuse it as
+        //     the fork basis, promoting an Auto to a stable User
+        //     manifest first if needed (parent refs point at the
+        //     stable filename). Refuses if the previous stop was
+        //     unclean — the operator's recovery is start → stop →
+        //     refork.
+        //
+        //   - Source is live: drive a fresh snapshot via IPC through
+        //     the running daemon's actor. The daemon stays up.
+        //
+        // No transparent bring-up of a stopped source. Forking should
+        // not have the side effect of starting a daemon.
         let name = if let Some(n) = source.name.clone() {
             n
         } else {
@@ -410,59 +423,58 @@ impl ForkOrchestrator {
                 .ok_or_else(|| IpcError::internal("source volume has no name in volume.toml"))?
         };
 
-        // If the source is stopped, transparently bring its daemon up in
-        // transport-suppressed mode so we can drive the implicit snapshot.
-        // The `DrainingMarkerGuard` re-writes `volume.stopped` and shuts
-        // the daemon down on any failure path; the success path defuses
-        // the guard and halts explicitly so the volume returns to its
-        // pre-fork state.
-        let was_stopped = source_dir.join(STOPPED_FILE).exists();
-        let mut draining_guard: Option<DrainingMarkerGuard> = None;
-        if was_stopped {
-            std::fs::write(source_dir.join("volume.draining"), "")
-                .map_err(|e| IpcError::internal(format!("writing volume.draining: {e}")))?;
-            if let Err(e) = std::fs::remove_file(source_dir.join(STOPPED_FILE)) {
-                let _ = std::fs::remove_file(source_dir.join("volume.draining"));
-                return Err(IpcError::internal(format!(
-                    "clearing volume.stopped for fork drain: {e}"
-                )));
+        if source_dir.join(STOPPED_FILE).exists() {
+            // Stopped source: reuse the latest snapshot if it covers
+            // all durable state.
+            let cover = match crate::inbound::release_fast_path_handoff(&source_dir) {
+                Ok(Some(cover)) => cover,
+                Ok(None) => {
+                    return Err(IpcError::conflict(format!(
+                        "source '{name}' has durable state past the last snapshot \
+                         (WAL/pending uploads not yet drained); the previous stop \
+                         did not complete a clean drain. Recover with: \
+                         `elide volume start {name}` then `elide volume stop {name}`, \
+                         then re-run fork"
+                    )));
+                }
+                Err(e) => {
+                    return Err(IpcError::internal(format!(
+                        "fork fast-path inspection for '{name}': {e}"
+                    )));
+                }
+            };
+            if cover.kind == elide_core::signing::SnapshotKind::Auto {
+                let volume_id =
+                    elide_coordinator::upload::derive_names(&source_dir).map_err(|e| {
+                        IpcError::internal(format!("[fork {name}] deriving source volume id: {e}"))
+                    })?;
+                let store = self.ctx.core.stores.for_volume(&source_vol_ulid);
+                if let Err(e) = crate::inbound::promote_auto_snapshot(
+                    &source_dir,
+                    &volume_id,
+                    cover.snap_ulid,
+                    &store,
+                )
+                .await
+                {
+                    return Err(IpcError::internal(format!(
+                        "promoting auto-snapshot {} for fork of '{name}': {e}",
+                        cover.snap_ulid
+                    )));
+                }
             }
-            crate::rescan::trigger();
-            draining_guard = Some(DrainingMarkerGuard::new(source_dir.clone()));
-            if !wait_for_control_sock(&source_dir, std::time::Duration::from_secs(30)).await {
-                return Err(IpcError::internal(format!(
-                    "timed out waiting for source volume '{name}' to come up for fork drain"
-                )));
-            }
+            self.job.append(ForkAttachEvent::SnapshotTaken {
+                snap_ulid: cover.snap_ulid,
+            });
+            self.snap_ulid = Some(cover.snap_ulid);
+            return Ok(());
         }
 
+        // Live source: drive a fresh snapshot via the running daemon.
         let reply = snapshot_volume(&name, &self.ctx.core, &self.ctx.snapshot_locks).await?;
         self.job.append(ForkAttachEvent::SnapshotTaken {
             snap_ulid: reply.snap_ulid,
         });
-
-        // Snapshot succeeded: restore the source to `Stopped` if we
-        // brought it up. Defuse the guard so it doesn't fight the
-        // explicit halt; write the marker before shutdown so the
-        // supervisor won't respawn between exit and our final state.
-        if was_stopped {
-            if let Some(g) = draining_guard.as_mut() {
-                g.defuse();
-            }
-            std::fs::write(source_dir.join(STOPPED_FILE), "").map_err(|e| {
-                IpcError::internal(format!("restoring volume.stopped after fork drain: {e}"))
-            })?;
-            use elide_coordinator::control::ShutdownOutcome;
-            match elide_coordinator::control::shutdown(&source_dir).await {
-                ShutdownOutcome::Acknowledged | ShutdownOutcome::NotRunning => {}
-                ShutdownOutcome::Failed(msg) => {
-                    warn!(
-                        "[fork {name}] post-drain shutdown of source daemon failed: {msg}; \
-                         supervisor will respect volume.stopped marker"
-                    );
-                }
-            }
-        }
         self.snap_ulid = Some(reply.snap_ulid);
         Ok(())
     }
