@@ -1180,13 +1180,14 @@ async fn maybe_write_remote_breadcrumb(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
 ) -> Result<(), String> {
-    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
+    use elide_coordinator::bucket_position::fetch_position;
+    use elide_coordinator::role::Role;
 
     let (position, _) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| e.to_string())?;
-    let owned_state = match position {
-        OwnershipPosition::OwnedByUs { state, .. } => state,
+    let owned_state = match Role::from_position(&position) {
+        Role::Owner { state } => state,
         _ => return Ok(()),
     };
 
@@ -1283,24 +1284,30 @@ async fn emit_release_aftermath(
 /// operator-facing and load-bearing for discoverability — keep
 /// them verbatim.
 fn ensure_release_eligible(
-    position: &elide_coordinator::bucket_position::OwnershipPosition,
+    role: &elide_coordinator::role::Role,
     volume_name: &str,
     absent_msg: String,
 ) -> Result<(), IpcError> {
-    use elide_coordinator::bucket_position::OwnershipPosition;
-    match position {
-        OwnershipPosition::OwnedByUs { .. } => Ok(()),
-        OwnershipPosition::OwnedByOther { coord_id, .. } => Err(IpcError::conflict(format!(
+    use elide_coordinator::role::{ObserverKind, Role};
+    match role {
+        Role::Owner { .. } => Ok(()),
+        Role::Observer {
+            kind: ObserverKind::Foreign { coord_id },
+        } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is owned by coordinator {coord_id}; \
              run `volume release --force` to override"
         ))),
-        OwnershipPosition::Released { .. } => Err(IpcError::conflict(format!(
+        Role::Observer {
+            kind: ObserverKind::Released { .. },
+        } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is already released"
         ))),
-        OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
+        Role::Observer {
+            kind: ObserverKind::Readonly,
+        } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly; nothing to release"
         ))),
-        OwnershipPosition::Absent => Err(IpcError::not_found(absent_msg)),
+        Role::None => Err(IpcError::not_found(absent_msg)),
     }
 }
 
@@ -2098,19 +2105,26 @@ async fn force_release_volume_op(
 
     // Read the current record to learn which dead fork to recover from.
     let dead_vol_ulid = {
-        use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
+        use elide_coordinator::bucket_position::fetch_position;
+        use elide_coordinator::role::{ObserverKind, Role};
         let (position, _) = fetch_position(store, volume_name, identity.coordinator_id_str())
             .await
             .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
-        match position {
-            OwnershipPosition::OwnedByUs { vol_ulid, .. }
-            | OwnershipPosition::OwnedByOther { vol_ulid, .. } => vol_ulid,
-            OwnershipPosition::Absent => {
+        match Role::from_position(&position) {
+            Role::Owner { .. }
+            | Role::Observer {
+                kind: ObserverKind::Foreign { .. },
+            } => position
+                .vol_ulid()
+                .expect("Owner | Foreign implies non-Absent position"),
+            Role::None => {
                 return Err(IpcError::not_found(format!(
                     "name '{volume_name}' has no S3 record"
                 )));
             }
-            OwnershipPosition::Released { .. } | OwnershipPosition::Readonly { .. } => {
+            Role::Observer {
+                kind: ObserverKind::Released { .. } | ObserverKind::Readonly,
+            } => {
                 return Err(IpcError::conflict(format!(
                     "names/{volume_name} is not in a Live or Stopped state; \
                      force-release only overrides Live or Stopped records"
@@ -2397,16 +2411,18 @@ async fn release_volume_op(
     // Pulled ahead of the daemon restart so a "wrong owner" or
     // "already released" reply doesn't perturb the local volume.
     use elide_coordinator::bucket_position::fetch_position;
+    use elide_coordinator::role::Role;
     let read_started = std::time::Instant::now();
     let (position, _) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+    let role = Role::from_position(&position);
     info!(
-        "[release {volume_name}] read names/<name>: position={position:?} ({:.2?})",
+        "[release {volume_name}] read names/<name>: role={role:?} ({:.2?})",
         read_started.elapsed()
     );
     ensure_release_eligible(
-        &position,
+        &role,
         volume_name,
         format!("name '{volume_name}' has no S3 record; drain the volume first"),
     )?;
@@ -2523,11 +2539,13 @@ async fn release_breadcrumb_only(
     };
 
     use elide_coordinator::bucket_position::fetch_position;
+    use elide_coordinator::role::Role;
     let (position, fetched) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+    let role = Role::from_position(&position);
     ensure_release_eligible(
-        &position,
+        &role,
         volume_name,
         format!(
             "name '{volume_name}' has no S3 record despite local breadcrumb; \
@@ -2536,7 +2554,7 @@ async fn release_breadcrumb_only(
         ),
     )?;
     let rec = fetched
-        .expect("ensure_release_eligible(OwnedByUs) implies fetched is Some")
+        .expect("ensure_release_eligible(Owner) implies fetched is Some")
         .0;
 
     // Find the latest published snapshot for this vol_ulid to use as
@@ -3010,37 +3028,42 @@ async fn hydrate_or_route(
     coord_id: &str,
     core: &CoordinatorCore,
 ) -> Result<(), IpcError> {
-    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
+    use elide_coordinator::bucket_position::fetch_position;
+    use elide_coordinator::role::{ObserverKind, Role};
 
     let (position, record) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
 
-    match position {
-        OwnershipPosition::Absent => Err(IpcError::not_found(format!(
+    match Role::from_position(&position) {
+        Role::None => Err(IpcError::not_found(format!(
             "volume '{volume_name}' not found locally or in the bucket"
         ))),
-        OwnershipPosition::OwnedByUs { vol_ulid, .. } => {
-            // Need `size` for the hydrate; pulled from the record we
-            // already read.
-            let size = record
-                .expect("fetch_position returned OwnedByUs => record is Some")
-                .0
-                .size;
+        Role::Owner { .. } => {
+            // Need `vol_ulid` + `size` for the hydrate; pulled from the
+            // position + record we already read.
+            let vol_ulid = position
+                .vol_ulid()
+                .expect("Role::Owner implies non-Absent position");
+            let size = record.expect("Role::Owner implies record is Some").0.size;
             crate::start_remote::hydrate_remote_owned(volume_name, vol_ulid, size, store, core)
                 .await
         }
-        OwnershipPosition::OwnedByOther {
-            coord_id: held_by, ..
+        Role::Observer {
+            kind: ObserverKind::Foreign { coord_id: held_by },
         } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is held by coordinator {held_by}; \
                  run `volume release --force` to override"
         ))),
-        OwnershipPosition::Released { .. } => Err(IpcError::conflict(format!(
+        Role::Observer {
+            kind: ObserverKind::Released { .. },
+        } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is Released; \
              reclaim with: elide volume claim {volume_name}"
         ))),
-        OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
+        Role::Observer {
+            kind: ObserverKind::Readonly,
+        } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly; cannot start"
         ))),
     }
