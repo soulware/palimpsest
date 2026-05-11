@@ -588,6 +588,11 @@ mod imp {
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         crate::control::start(dir, client.clone(), Arc::clone(&connected))?;
 
+        // Signal the coordinator that `Volume::open` succeeded and the
+        // local fork is provably sufficient to serve. See the matching
+        // call in `serve::run_volume_ipc_only`.
+        crate::coordinator_client::Client::notify_volume_ready_from_fork_dir(dir);
+
         let nr_queues = pick_nr_queues();
 
         // Spawn the signal watcher before any potentially-blocking ioctl

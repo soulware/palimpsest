@@ -260,11 +260,37 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // is spawned, so the volume binary's first IPC always finds an entry).
     let prefetch_tracker: PrefetchTracker = new_prefetch_tracker();
 
-    // Maps each known volume path to its directory inode.  The inode detects
-    // delete-and-recreate: if the same path reappears with a different inode
-    // (e.g. `volume delete` followed by `volume remote pull` of the same ULID),
-    // we treat it as a new discovery and spawn fresh tasks.
-    let mut known: HashMap<PathBuf, u64> = HashMap::new();
+    // Tracks each known volume's directory inode and the abort handle
+    // for its supervisor task (when supervised). Prune drops the entry
+    // when *either* signal goes stale:
+    //
+    //   - Path no longer exists — `volume remove` tore the dir down.
+    //   - Inode changed — recreated by hydrate/import at the same path.
+    //   - Supervisor task finished — saw `fork_dir.exists() == false`
+    //     and exited, regardless of whether inode coincidentally
+    //     matches (ext4 routinely reuses freed inodes for the next
+    //     allocation, so `rm -rf` followed by `mkdir` at the same
+    //     path can produce identical inode numbers).
+    //
+    // The supervisor-handle check is what makes `volume remove`
+    // followed by `volume start` reliably re-spawn the daemon even
+    // when the kernel reuses the inode. Without it, the stale entry
+    // survives both the path check and the inode check, and the
+    // first-discovery branch is skipped — leaving the volume
+    // perpetually "stopped" despite a successful `start`.
+    //
+    // `supervised` is also retained as a bookkeeping flag for the
+    // readonly→writable transition path: a volume first seen with
+    // `volume.readonly` present (e.g. a partially-hydrated remote-
+    // owned fork) gets per-volume tasks but no supervisor; a
+    // subsequent `volume start` that strips the marker must trigger
+    // supervisor spawn on the next scan tick.
+    struct KnownVolume {
+        inode: u64,
+        supervised: bool,
+        supervisor: Option<tokio::task::AbortHandle>,
+    }
+    let mut known: HashMap<PathBuf, KnownVolume> = HashMap::new();
     // Single JoinSet for all spawned tasks (per-volume drain/GC,
     // supervisors, inbound socket, reaper). On Ctrl-C we abort_all and
     // drain so cancellation propagates while the runtime is still alive
@@ -340,7 +366,20 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         // after a `volume delete`), it will be discovered and processed again.
         // Prune volumes whose path no longer exists OR whose directory inode
         // changed (deleted and recreated at the same path with the same ULID).
-        known.retain(|p, ino| p.metadata().map(|m| m.ino() == *ino).unwrap_or(false));
+        known.retain(|p, k| {
+            // Drop on any of:
+            //   - path gone (metadata fails)
+            //   - inode changed (delete-and-recreate, distinct inode)
+            //   - supervisor exited (saw dir gone and broke out of
+            //     its loop, even if inode was coincidentally reused)
+            let path_ok = p.metadata().map(|m| m.ino() == k.inode).unwrap_or(false);
+            let supervisor_alive = k
+                .supervisor
+                .as_ref()
+                .map(|h| !h.is_finished())
+                .unwrap_or(true);
+            path_ok && supervisor_alive
+        });
 
         let volumes = discover_volumes(&data_dir);
         for vol_dir in volumes {
@@ -351,7 +390,14 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 continue;
             }
             let vol_ino = vol_dir.metadata().map(|m| m.ino()).unwrap_or(0);
-            let prev_ino = known.insert(vol_dir.clone(), vol_ino);
+            let readonly_now = vol_dir.join("volume.readonly").exists();
+            // Look up *without* inserting first — we want to preserve
+            // the existing supervisor handle on no-change ticks (the
+            // prune step already dropped stale entries whose
+            // supervisor died). Only the spawn-fresh / transition
+            // paths below mutate the entry.
+            let prev_ino = known.get(&vol_dir).map(|k| k.inode);
+            let prev_supervised = known.get(&vol_dir).map(|k| k.supervised).unwrap_or(false);
             // Two trigger conditions for spawning per-volume tasks:
             //   - first discovery (`prev_ino` is None) — may pick up a
             //     prefetch tracker entry that `fork_create_op` already
@@ -454,14 +500,46 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
                 // Readonly volumes (imported bases) have no live process —
                 // skip supervision so we don't crash-loop on serve-volume.
-                if !vol_dir.join("volume.readonly").exists() {
-                    tasks.spawn(supervisor::supervise(
-                        vol_dir,
+                let supervisor_handle = if !readonly_now {
+                    Some(tasks.spawn(supervisor::supervise(
+                        vol_dir.clone(),
                         data_dir.as_ref().clone(),
                         child_env.clone(),
-                    ));
+                    )))
+                } else {
+                    None
+                };
+                known.insert(
+                    vol_dir,
+                    KnownVolume {
+                        inode: vol_ino,
+                        supervised: !readonly_now,
+                        supervisor: supervisor_handle,
+                    },
+                );
+            } else if !prev_supervised && !readonly_now {
+                // Known volume that transitioned readonly→writable since
+                // last tick. This happens when a remote-owned fork was
+                // first discovered with `volume.readonly` still stamped
+                // (partial hydrate left over from an earlier failed
+                // start) and a later successful `volume start` stripped
+                // the marker via `hydrate_remote_owned`. Per-volume
+                // tasks were spawned at first discovery; spawn the
+                // supervisor now so the daemon actually comes up.
+                let label = volume_label(&vol_dir);
+                info!("[coordinator] supervising newly-writable volume: {label}");
+                let handle = tasks.spawn(supervisor::supervise(
+                    vol_dir.clone(),
+                    data_dir.as_ref().clone(),
+                    child_env.clone(),
+                ));
+                if let Some(k) = known.get_mut(&vol_dir) {
+                    k.supervised = true;
+                    k.supervisor = Some(handle);
                 }
             }
+            // else: same inode and already supervised — leave the
+            // entry as-is to preserve the existing supervisor handle.
         }
 
         // Reap any tasks that have exited (e.g. fork directory removed).

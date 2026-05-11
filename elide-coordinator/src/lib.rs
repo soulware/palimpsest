@@ -6,6 +6,7 @@ pub mod gc;
 pub mod gc_cycle;
 pub mod identity;
 pub mod ipc;
+pub mod key_shadow;
 pub mod lifecycle;
 pub mod local_cond_store;
 pub mod log_init;

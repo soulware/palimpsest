@@ -83,6 +83,15 @@ pub(crate) async fn hydrate_remote_owned(
     std::fs::write(fork_dir.join(STOPPED_FILE), "")
         .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
 
+    // Restore the signing key from the local shadow if one exists,
+    // and strip the `volume.readonly` marker that `pull_readonly_op`
+    // stamped onto the leaf during the skeleton chain pull. With the
+    // shadow restored, the resurrected volume is writable; without
+    // it, the leaf stays readonly because there is no key to sign
+    // future writes with.
+    let restored = restore_key_from_shadow(&core.data_dir, &fork_dir, vol_ulid)?;
+    let mode_label = if restored { "writable" } else { "readonly" };
+
     plant_by_name_symlink(volume_name, vol_ulid, &core.data_dir)?;
 
     if let Err(e) = elide_coordinator::remote_breadcrumb::remove(&core.data_dir, volume_name) {
@@ -91,10 +100,41 @@ pub(crate) async fn hydrate_remote_owned(
 
     info!(
         "[inbound] start {volume_name}: hydrated remote-owned volume \
-         (vol {vol_ulid}, basis {basis_snapshot}, {:.2?})",
+         (vol {vol_ulid}, basis {basis_snapshot}, mode={mode_label}, {:.2?})",
         started.elapsed()
     );
     Ok(())
+}
+
+/// If `data_dir/keys/<vol_ulid>.key` exists, copy it into
+/// `fork_dir/volume.key` and remove `fork_dir/volume.readonly` so the
+/// resurrected leaf is writable. Returns `true` when a shadow was
+/// found and applied, `false` when no shadow exists (leaf stays
+/// readonly — the only correct shape without a key).
+fn restore_key_from_shadow(
+    data_dir: &Path,
+    fork_dir: &Path,
+    vol_ulid: Ulid,
+) -> Result<bool, IpcError> {
+    let Some(key_bytes) = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
+        .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?
+    else {
+        return Ok(false);
+    };
+    elide_core::segment::write_file_atomic(
+        &fork_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+        &key_bytes,
+    )
+    .map_err(|e| IpcError::internal(format!("restoring volume.key: {e}")))?;
+    // Idempotent: missing-file is not an error.
+    if let Err(e) = std::fs::remove_file(fork_dir.join("volume.readonly"))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(IpcError::internal(format!(
+            "stripping volume.readonly from hydrated leaf: {e}"
+        )));
+    }
+    Ok(true)
 }
 
 /// Walk the parent chain rooted at `leaf_ulid`, calling [`pull_readonly_op`]

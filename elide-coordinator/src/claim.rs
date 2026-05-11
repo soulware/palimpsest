@@ -497,6 +497,18 @@ impl ClaimOrchestrator {
         let signing_key = generate_keypair(&new_fork_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
 
+        // Shadow the freshly-minted key under
+        // `data_dir/keys/<vol_ulid>.key` so a future
+        // `stop`→`remove`→`start` round-trip on this host preserves
+        // writability — see `elide_coordinator::key_shadow`.
+        if let Err(e) = elide_coordinator::key_shadow::write(
+            &self.ctx.core.data_dir,
+            new_vol_ulid,
+            &signing_key.to_bytes(),
+        ) {
+            warn!("[claim {new_vol_ulid_str}] writing key shadow failed: {e}");
+        }
+
         // Upload volume.pub to S3 so peer-fetch ancestry walks (which read
         // `by_id/<id>/volume.pub` to verify our parent provenance) and future
         // claimants doing release --force on a stuck fork have the file they

@@ -833,6 +833,25 @@ async fn fork_create_op(
         return Err(IpcError::internal(format!("fork failed: {e}")));
     }
 
+    // Shadow the freshly-minted `volume.key` under
+    // `data_dir/keys/<vol_ulid>.key` so a future
+    // `stop`→`remove`→`start` round-trip on this host can resurrect
+    // the fork as writable rather than degrading to read-only. The
+    // fork path generates the key inside `new_fork_dir/volume.key`;
+    // read it back and copy. Best-effort: a shadow-write failure logs
+    // but does not abort the fork — the fork is still usable, just
+    // not survivable across a remove.
+    match std::fs::read(new_fork_dir.join(elide_core::signing::VOLUME_KEY_FILE)) {
+        Ok(bytes) => {
+            if let Err(e) =
+                elide_coordinator::key_shadow::write(data_dir, new_vol_ulid_value, &bytes)
+            {
+                warn!("[fork-create {new_vol_ulid}] writing key shadow failed: {e}");
+            }
+        }
+        Err(e) => warn!("[fork-create {new_vol_ulid}] reading fresh volume.key for shadow: {e}"),
+    }
+
     // Phase 2: publish volume.pub *and* volume.provenance to S3 *before*
     // claiming the name. Both files are immutable from fork creation
     // onward and self-signed by the new fork's keypair. A SIGINT here

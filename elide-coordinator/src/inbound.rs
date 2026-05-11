@@ -358,6 +358,12 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
+        Request::NotifyVolumeReady { vol_ulid } => {
+            let store = ctx.stores.coordinator_wide();
+            let result = notify_volume_ready_op(vol_ulid, &ctx.data_dir, &store).await;
+            let env: Envelope<()> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
         Request::Remove { volume, force } => {
             let store = ctx.stores.coordinator_wide();
             let result = remove_volume(
@@ -1081,6 +1087,12 @@ async fn remove_volume(
     // Write the breadcrumb before tearing down local state. Best-effort:
     // a transient bucket-read error logs and skips rather than blocking
     // the operator's removal.
+    //
+    // The signing key shadow at `data_dir/keys/<vol_ulid>.key` was
+    // written eagerly at volume creation time (and self-heals on every
+    // `volume start`), so `remove` does not need to touch it — the
+    // shadow already exists and survives `remove_dir_all` because it
+    // lives outside `vol_dir`.
     if let (Some(store), Some(coord_id), Some(vol_ulid)) = (store, coord_id, vol_ulid)
         && let Err(e) =
             maybe_write_remote_breadcrumb(data_dir, volume_name, vol_ulid, store, coord_id).await
@@ -1294,6 +1306,12 @@ async fn create_volume_op(
             elide_core::signing::VOLUME_KEY_FILE,
             elide_core::signing::VOLUME_PUB_FILE,
         )?;
+        // Shadow the signing key under `data_dir/keys/<vol_ulid>.key`
+        // immediately. The shadow is what lets a future
+        // `stop`→`remove`→`start` round-trip preserve writability
+        // (without it, hydrate-from-bucket can only ever produce a
+        // readonly view because the private key is never uploaded).
+        elide_coordinator::key_shadow::write(data_dir, vol_ulid, &key.to_bytes())?;
         elide_core::signing::write_provenance(
             &vol_dir,
             &key,
@@ -1303,6 +1321,8 @@ async fn create_volume_op(
         Ok::<_, std::io::Error>(())
     })() {
         cleanup_local();
+        // Best-effort shadow cleanup if create rolls back partway.
+        let _ = elide_coordinator::key_shadow::remove(data_dir, vol_ulid);
         return Err(IpcError::internal(format!("create failed: {e}")));
     }
 
@@ -2571,6 +2591,20 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
         return Err(IpcError::conflict("volume is not stopped"));
     }
 
+    // Self-heal the signing-key shadow at `data_dir/keys/<vol_ulid>.key`.
+    // For volumes created after key-shadow landed, the shadow already
+    // exists from create / fork / claim time; for pre-existing volumes
+    // this is the migration path. Cheap (32-byte file write) and
+    // best-effort — failures log but don't block start.
+    if let Some(vol_ulid) = vol_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok())
+        && let Err(e) = self_heal_key_shadow(data_dir, &vol_dir, vol_ulid)
+    {
+        warn!("[inbound] start {volume_name}: self-heal key shadow: {e}");
+    }
+
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
     match mark_live(&store, volume_name, coord_id, hostname).await {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
@@ -2603,24 +2637,12 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
         .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
     crate::rescan::trigger();
 
-    // Best-effort: delete any auto-snapshots left over from a preceding
-    // `stop`. The local fork is now Live again (or about to be — the
-    // supervisor picks it up on the next scan); the auto-snapshot has
-    // done its job and would otherwise pin segments out of GC reach.
-    // Failures here only mean the next stop will overwrite a stale
-    // auto-snapshot — they do not affect start correctness.
-    let vol_ulid_str = vol_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_owned);
-    if let Some(vol_ulid_str) = vol_ulid_str
-        && let Err(e) = cleanup_auto_snapshots(&vol_dir, &vol_ulid_str, &store).await
-    {
-        warn!(
-            "[inbound] start {volume_name}: failed to clean auto-snapshots: {e:#}; \
-             next stop will overwrite"
-        );
-    }
+    // Note: auto-snapshot cleanup is no longer done here. The volume
+    // binary signals readiness via `NotifyVolumeReady` once
+    // `Volume::open` succeeds, and that handler cleans up the
+    // auto-snapshot. This avoids a window where `start` returned OK
+    // but the daemon failed to open, leaving the user with the
+    // bucket-side basis already deleted and no way to recover.
 
     info!("[inbound] started volume {volume_name}");
     Ok(())
@@ -2629,6 +2651,53 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
 /// Delete any auto-snapshot manifests for this volume from both the
 /// local `snapshots/` directory and the bucket. Idempotent;
 /// missing-file errors are not surfaced.
+/// Read `vol_dir/volume.key` if present and write it to
+/// `data_dir/keys/<vol_ulid>.key`. No-op (Ok) on volumes that have no
+/// `volume.key` — readonly forks legitimately don't have one.
+fn self_heal_key_shadow(
+    data_dir: &Path,
+    vol_dir: &Path,
+    vol_ulid: ulid::Ulid,
+) -> std::io::Result<()> {
+    let key_path = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE);
+    let bytes = match std::fs::read(&key_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    elide_coordinator::key_shadow::write(data_dir, vol_ulid, &bytes)
+}
+
+/// Handle the volume binary's `NotifyVolumeReady` signal: the volume
+/// has successfully opened (key loaded, WAL replayed, extent index
+/// reconstructed) and the local fork is provably sufficient to serve.
+/// The auto-snapshot from the preceding `stop` is no longer needed as
+/// a recovery basis and is cleaned up here.
+///
+/// Best-effort: a cleanup failure leaves the auto-snapshot in S3 (and
+/// pinning the GC floor) until the next `stop` overwrites it. The
+/// volume continues to serve regardless.
+async fn notify_volume_ready_op(
+    vol_ulid: ulid::Ulid,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), IpcError> {
+    let vol_ulid_str = vol_ulid.to_string();
+    let fork_dir = data_dir.join("by_id").join(&vol_ulid_str);
+    if !fork_dir.exists() {
+        return Err(IpcError::not_found(format!(
+            "fork dir for {vol_ulid_str} not present locally"
+        )));
+    }
+    if let Err(e) = cleanup_auto_snapshots(&fork_dir, &vol_ulid_str, store).await {
+        warn!(
+            "[inbound] notify-ready {vol_ulid_str}: cleanup_auto_snapshots failed: {e:#}; \
+             auto-snapshot will be overwritten by the next stop"
+        );
+    }
+    Ok(())
+}
+
 async fn cleanup_auto_snapshots(
     fork_dir: &Path,
     vol_ulid_str: &str,

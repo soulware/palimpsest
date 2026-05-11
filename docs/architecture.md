@@ -764,7 +764,9 @@ If the bucket read fails or the record does not retain ownership (no record, or 
 
 **Resurrection prerequisite.** Retained-name resurrection on this host requires a basis snapshot in S3 — usually the auto-snapshot from the preceding clean `stop`. Two cases produce a retained name *without* a basis: (a) `stop --force` (skipped the snapshot) followed by `remove`, and (b) a volume that was never started, never wrote anything, and was removed. In both cases the breadcrumb is written but `start` will fail with "no published snapshot in the store" — recovery from this host is no longer possible; the name must be reclaimed via `volume claim --force` from another host (or `volume release --force` to give it up).
 
-After `volume remove` with retained ownership and a valid basis, the next `volume start <name>` on this coordinator hydrates the metadata from S3 (skeleton ancestor chain → basis manifest → indexes → `volume.toml` → `by_name` symlink → `volume.stopped`), then runs the normal start flow. Bodies remain demand-fetched — body warm is not part of resurrection. The breadcrumb is removed once hydration succeeds.
+**Resurrecting writable.** S3 never holds the volume's private signing key, so a naive hydrate could only reconstruct a *readonly* view (no key → no signature → no new writes). To keep `stop`→`remove`→`start` round-tripping writably, the coordinator maintains a *signing-key shadow* under `data_dir/keys/<vol_ulid>.key`. The shadow is written eagerly at every key-generation site (`volume create`, fork creation, cross-coordinator claim) and refreshed best-effort on every `volume start` for self-heal on pre-existing volumes. `remove` does not delete the shadow — it lives outside `vol_dir` and survives `remove_dir_all`. On hydrate, `hydrate_remote_owned` copies the shadow into `vol_dir/volume.key` and strips the `volume.readonly` marker that `pull_readonly_op` stamps onto every skeleton-pulled fork. If no shadow exists (host moved, key never minted on this host), the hydrated leaf stays readonly — the only correct shape without a key.
+
+After `volume remove` with retained ownership, a valid basis, and a key shadow on this host, the next `volume start <name>` on this coordinator hydrates the metadata from S3 (skeleton ancestor chain → basis manifest → indexes → `volume.toml` → `by_name` symlink → `volume.stopped`), restores the signing key from the shadow, strips `volume.readonly` from the leaf, then runs the normal start flow. Bodies remain demand-fetched — body warm is not part of resurrection. The breadcrumb is removed once hydration succeeds.
 
 Without retained ownership (or after `volume release <name>`), the name is free to be reused (e.g. `volume import <name> <oci-ref>` starts fresh, or `volume claim <name>` re-binds a Released bucket-side record on this host).
 
@@ -777,6 +779,19 @@ The `<S>.auto.manifest` files written by `stop` are *checkpoints*, not stable re
 - **Used** by `start`'s hydrate path and by `claim` as a takeover basis. Both are recovery paths that will produce their own fresh snapshot at the next `stop`, so the ephemeral nature is fine.
 - **Not used** as a fork base. `volume create --from` and other lineage-creating verbs enumerate `by_id/<vol>/snapshots/<ulid>.manifest` only — auto-snapshots are filtered out. Tying a new lineage to ephemeral state would be a footgun.
 - **Promoted** by `volume release` (writable host giving up the name): the auto-snapshot is renamed to `<S>.manifest` (byte-identical copy + delete) before the bucket flips to `Released`, so claim-from-other-host has a stable basis to fork from. `release --force` from a recovering host does the same promotion if it finds an auto-snapshot, falling back to synthesis only if the bucket has nothing usable. (See [Disaster recovery](#disaster-recovery).)
+
+### Signing-key shadow
+
+The per-volume Ed25519 signing key (`volume.key`) is never uploaded to S3 — it lives only on the host that minted it. To keep `stop`→`remove`→`start` writability-preserving, the coordinator maintains a local shadow under `data_dir/keys/<vol_ulid>.key`.
+
+- **Written** at every key-generation site: `volume create` (root), fork creation (`fork_create_op` after `fork_volume_at*`), and cross-coordinator claim (`claim::early_rebind`). The shadow is 32 raw bytes, identical to the on-disk `volume.key`.
+- **Self-healed** on every `volume start`: a fork that has `volume.key` but no shadow gets one written. This is the migration path for volumes that pre-date this mechanism.
+- **Untouched** by `remove`: the shadow lives outside `vol_dir` and survives `remove_dir_all`.
+- **Restored** by `start`'s hydrate path: `hydrate_remote_owned` copies the shadow into `vol_dir/volume.key` and removes `volume.readonly` from the leaf, giving the resurrected volume the same writable shape the original had.
+- **Keyed by `vol_ulid`, not name.** A name can be released and re-claimed against a different lineage — the shadow must follow the lineage. Lookups during hydrate already have the `vol_ulid` in hand (from `names/<name>` or the breadcrumb), so this costs nothing.
+- **Not deleted on start.** A shadow is a permanent backup of an immutable artefact (volume keys never rotate — rotation = fork). Keeping it means a future accidental `rm -rf vol_dir` is also recoverable. Cleanup is a future operator concern (`volume purge`-style verb) when the lineage is permanently abandoned.
+
+If no shadow exists at hydrate time (host moved, or the key was minted on a different host), the leaf stays readonly — there is no correct way to "resurrect writable" without the original key.
 
 ### Output retention
 
