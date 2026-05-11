@@ -1353,23 +1353,31 @@ async fn cleanup_auto_snapshots(
 ) -> Result<(), IpcError> {
     use futures::TryStreamExt;
 
-    // 1. Local cleanup.
+    // 1. Local cleanup. Remove the `.auto.manifest` and its upload
+    //    sentinel together — leaving the sentinel behind would
+    //    convince the next drain that an unchanged-ULID auto-snapshot
+    //    is already in S3, silently skipping the re-upload.
     let snap_dir = fork_dir.join("snapshots");
+    let sentinel_dir = fork_dir.join("uploaded").join("snapshots");
     if let Ok(entries) = std::fs::read_dir(&snap_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some((_, kind)) = elide_core::signing::parse_snapshot_filename(name) else {
+            let Some((snap_ulid, kind)) = elide_core::signing::parse_snapshot_filename(name) else {
                 continue;
             };
             if kind == elide_core::signing::SnapshotKind::Auto {
                 let _ = std::fs::remove_file(entry.path());
+                let _ = std::fs::remove_file(sentinel_dir.join(format!("{snap_ulid}.auto")));
             }
         }
     }
 
     // 2. Bucket cleanup. List the snapshots prefix and delete any
-    //    object whose filename parses as an auto-snapshot.
+    //    object whose filename parses as an auto-snapshot. Also drop
+    //    any leftover local sentinel even if step 1 missed it (e.g.
+    //    hydrate pre-marked one but the manifest was never written
+    //    locally before this cleanup ran).
     let prefix = object_store::path::Path::from(format!("by_id/{vol_ulid_str}/snapshots/"));
     let objects: Vec<object_store::ObjectMeta> = store
         .list(Some(&prefix))
@@ -1381,16 +1389,17 @@ async fn cleanup_auto_snapshots(
         let Some(filename) = obj.location.filename() else {
             continue;
         };
-        let Some((_, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
+        let Some((snap_ulid, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
             continue;
         };
-        if kind == elide_core::signing::SnapshotKind::Auto
-            && let Err(e) = store.delete(&obj.location).await
-        {
-            warn!(
-                "[inbound] failed to delete auto-snapshot {}: {e}",
-                obj.location
-            );
+        if kind == elide_core::signing::SnapshotKind::Auto {
+            if let Err(e) = store.delete(&obj.location).await {
+                warn!(
+                    "[inbound] failed to delete auto-snapshot {}: {e}",
+                    obj.location
+                );
+            }
+            let _ = std::fs::remove_file(sentinel_dir.join(format!("{snap_ulid}.auto")));
         }
     }
     Ok(())
@@ -1403,6 +1412,44 @@ mod tests {
     use elide_coordinator::volume_state::PID_FILE;
     use std::path::Path;
     use tempfile::TempDir;
+
+    // ── cleanup_auto_snapshots ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cleanup_auto_snapshots_removes_local_sentinel() {
+        // Regression: cleanup must drop the `uploaded/snapshots/<snap>.auto`
+        // sentinel alongside the manifest. Leaving it behind convinced
+        // the next drain that an unchanged-ULID auto-snapshot was already
+        // in S3, silently skipping the re-upload — release then failed
+        // because the COPY source did not exist.
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let snap_ulid = ulid::Ulid::new();
+        let fork_dir = tmp.path().join("by_id").join(vol_ulid.to_string());
+
+        let snap_dir = fork_dir.join("snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let manifest_path = snap_dir.join(elide_core::signing::auto_snapshot_manifest_filename(
+            &snap_ulid,
+        ));
+        std::fs::write(&manifest_path, b"signed-bytes").unwrap();
+
+        let sentinel_dir = fork_dir.join("uploaded").join("snapshots");
+        std::fs::create_dir_all(&sentinel_dir).unwrap();
+        let sentinel_path = sentinel_dir.join(format!("{snap_ulid}.auto"));
+        std::fs::write(&sentinel_path, b"").unwrap();
+
+        cleanup_auto_snapshots(&fork_dir, &vol_ulid.to_string(), &store)
+            .await
+            .unwrap();
+
+        assert!(!manifest_path.exists(), "auto.manifest should be removed");
+        assert!(
+            !sentinel_path.exists(),
+            "upload sentinel must be removed with the manifest"
+        );
+    }
 
     // ────────────────────────────────────────────────────────────────
     // ── force_release_volume_op ───────────────────────────────────────────
