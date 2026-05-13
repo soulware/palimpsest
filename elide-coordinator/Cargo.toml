@@ -27,6 +27,7 @@ rand_core    = { version = "0.6", features = ["getrandom"] }
 object_store = { version = "0.11", features = ["aws"] }
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
+subtle       = "2"
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "signal", "process", "net", "io-util"] }
 toml         = { version = "0.8", default-features = false, features = ["parse", "display"] }
 ulid         = "1"

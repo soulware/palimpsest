@@ -64,7 +64,7 @@ use crate::claim::{ClaimJobState, ClaimRegistry};
 use crate::credential::{CredentialIssuer, Credentialer, credential_issuer};
 use crate::fork::{ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
-use crate::macaroon::{self, Caveat, Macaroon, Scope};
+use crate::macaroon::{self, Caveat, Macaroon, Scope, VerifyCtx};
 use elide_coordinator::config::{StoreSection, store_config};
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
@@ -1915,10 +1915,18 @@ fn register_volume(
     let m = macaroon::mint(
         macaroon_root,
         vec![
-            Caveat::Volume(ulid_str),
+            Caveat::Volume(ulid_str.clone()),
             Caveat::Scope(Scope::Credentials),
             Caveat::Pid(pid),
         ],
+    );
+    info!(
+        target: "creds::issuance",
+        volume_ulid = %ulid_str,
+        peer_pid = pid,
+        scope = "credentials",
+        macaroon_nonce = %m.nonce_hex(),
+        "minted macaroon for volume daemon",
     );
     Ok(RegisterReply {
         macaroon: m.encode(),
@@ -1947,10 +1955,18 @@ fn register_fetch_worker(
     let m = macaroon::mint(
         macaroon_root,
         vec![
-            Caveat::Volume(ulid_str),
+            Caveat::Volume(ulid_str.clone()),
             Caveat::Scope(Scope::FetchWorker),
             Caveat::Pid(pid),
         ],
+    );
+    info!(
+        target: "creds::issuance",
+        volume_ulid = %ulid_str,
+        peer_pid = pid,
+        scope = "fetch-worker",
+        macaroon_nonce = %m.nonce_hex(),
+        "minted macaroon for fetch worker",
     );
     Ok(RegisterReply {
         macaroon: m.encode(),
@@ -1992,49 +2008,44 @@ async fn issue_credentials(
         // from "tampered caveats".
         return Err(IpcError::forbidden("invalid macaroon"));
     }
-    // Both Credentials (volume daemon) and FetchWorker (fetch
-    // worker) macaroons grant the same downstream creds — they're
-    // distinguished only so that a leaked fetch macaroon can't be
-    // re-presented as a daemon credential at some future verb that
-    // checks `Scope::Credentials` specifically.
-    match m.scope() {
-        Some(Scope::Credentials) | Some(Scope::FetchWorker) => {}
-        _ => return Err(IpcError::forbidden("macaroon scope mismatch")),
-    }
+    let peer_pid = peer_pid.ok_or_else(|| IpcError::forbidden("peer pid unavailable"))?;
     let volume_ulid = m
         .volume()
-        .ok_or_else(|| IpcError::forbidden("macaroon missing volume caveat"))?;
-    let macaroon_pid = m
-        .pid()
-        .ok_or_else(|| IpcError::forbidden("macaroon missing pid caveat"))?;
-    let peer_pid = peer_pid.ok_or_else(|| IpcError::forbidden("peer pid unavailable"))?;
-    if peer_pid != macaroon_pid {
-        return Err(IpcError::forbidden("peer pid does not match macaroon"));
-    }
-    if let Some(not_after) = m.not_after() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now >= not_after {
-            return Err(IpcError::forbidden("macaroon expired"));
-        }
-    }
+        .ok_or_else(|| IpcError::forbidden("macaroon missing volume caveat"))?
+        .to_owned();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Credentials and FetchWorker macaroons grant the same downstream
+    // creds; the split exists so a leaked fetch macaroon can't be
+    // replayed at a future verb gated on `Scope::Credentials`.
+    macaroon::check_caveats(
+        &m,
+        &VerifyCtx {
+            volume: &volume_ulid,
+            peer_pid,
+            now_unix,
+            accepted_scopes: &[Scope::Credentials, Scope::FetchWorker],
+        },
+    )
+    .map_err(IpcError::forbidden)?;
     // Re-validate that volume.pid still matches — covers the case where the
     // original process has exited and the PID was reused.
-    let vol_dir = data_dir.join("by_id").join(volume_ulid);
+    let vol_dir = data_dir.join("by_id").join(&volume_ulid);
     check_peer_pid(&vol_dir, Some(peer_pid)).map_err(IpcError::forbidden)?;
     if !pid_is_alive(peer_pid as u32) {
         return Err(IpcError::forbidden("peer pid not alive"));
     }
     let creds = issuer
-        .issue(volume_ulid)
+        .issue(&volume_ulid)
         .await
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
     info!(
         target: "creds::issuance",
         volume_ulid = %volume_ulid,
         peer_pid,
+        macaroon_nonce = %m.nonce_hex(),
         expiry_unix = creds.expiry_unix,
         "issued S3 credentials to volume",
     );
