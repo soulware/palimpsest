@@ -1329,6 +1329,7 @@ dependencies = [
  "elide-peer-fetch",
  "ext4-view",
  "futures",
+ "humantime",
  "io-uring",
  "libc",
  "libublk",

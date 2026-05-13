@@ -133,6 +133,28 @@ enum Command {
         #[command(subcommand)]
         command: CoordCommand,
     },
+
+    /// Manage operator tokens (mint via the coordinator).
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Mint a coordinator-wide operator token via the coordinator's
+    /// IPC socket and print it to stdout. Store it at
+    /// `~/.elide/operator-token` (or pass via `--token` /
+    /// `ELIDE_OPERATOR_TOKEN`). The CLI narrows the token per use; the
+    /// minted form is not itself authorised for any verb.
+    Create {
+        /// Token lifetime. Defaults to 30 days. Accepts humantime
+        /// durations like `7d`, `12h`, `30m` — short values are
+        /// useful for tests.
+        #[arg(long, default_value = "30d")]
+        expires: humantime::Duration,
+    },
 }
 
 #[derive(Subcommand)]
@@ -403,6 +425,10 @@ enum VolumeCommand {
         /// unflushed. Use only if you don't need the local-only state.
         #[arg(long)]
         force: bool,
+        /// Operator token. Falls back to `ELIDE_OPERATOR_TOKEN`, then
+        /// to `~/.elide/operator-token`. Mint with `elide token create`.
+        #[arg(long, env = "ELIDE_OPERATOR_TOKEN", hide_env_values = true)]
+        token: Option<String>,
     },
 
     /// Stop a running volume (flushes WAL, drains pending, publishes an
@@ -873,8 +899,35 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Remove { name, force } => {
-                if let Err(e) = coord.remove_volume(&name, force) {
+            VolumeCommand::Remove { name, force, token } => {
+                let stored = match elide::operator_token::resolve(token.as_deref()) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        eprintln!(
+                            "error: {}",
+                            elide::operator_token::missing_token_hint(
+                                elide_coordinator::macaroon::OperatorOp::Remove,
+                            ),
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("error: read operator token: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let wire = match elide::operator_token::attenuate_for(
+                    &stored,
+                    elide_coordinator::macaroon::OperatorOp::Remove,
+                    &name,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("error: operator token malformed: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = coord.remove_volume(&name, force, wire) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1199,6 +1252,29 @@ fn main() {
                 let e = coord_run(cli_data_dir.as_deref(), config.as_deref());
                 eprintln!("error: {e}");
                 std::process::exit(1);
+            }
+        },
+
+        Command::Token { command } => match command {
+            TokenCommand::Create { expires } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let expires_unix = now.saturating_add(expires.as_secs());
+                match coord.mint_operator_token(expires_unix) {
+                    Ok(reply) => {
+                        println!("{}", reply.token);
+                        eprintln!(
+                            "minted operator token: nonce={} expires_unix={}",
+                            reply.nonce_hex, reply.expires_unix,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         },
     }

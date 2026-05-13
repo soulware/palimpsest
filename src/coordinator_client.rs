@@ -18,10 +18,10 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, FetchAttachEvent, FetchStartReply,
     FetchStatusReply, ForkAttachEvent, ForkSource, ForkStartReply, GenerateFilemapReply,
-    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind, RegisterReply,
-    ReleaseReply, ResolveHandoffKeyReply, SignatureStatus, SnapshotReply, StatusRemoteReply,
-    StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventEntry,
-    VolumeEventsReply,
+    ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind, MintOperatorTokenReply,
+    RegisterReply, ReleaseReply, ResolveHandoffKeyReply, SignatureStatus, SnapshotReply,
+    StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    VolumeEventEntry, VolumeEventsReply,
 };
 pub use elide_peer_fetch::PeerEndpoint;
 
@@ -629,12 +629,28 @@ impl Client {
     /// local writes have been flushed and uploaded to S3 (`pending/`
     /// and `wal/` empty). Bucket-side records and segments are
     /// untouched.
-    pub fn remove_volume(&self, name: &str, force: bool) -> io::Result<()> {
+    ///
+    /// `operator_token` is the encoded attenuated operator macaroon
+    /// (typically produced by [`crate::operator_token::attenuate_for`]).
+    /// The coordinator rejects the call with `kind = "forbidden"` if
+    /// the token is absent, malformed, or fails any caveat check —
+    /// see `docs/design-auth-model.md`.
+    pub fn remove_volume(&self, name: &str, force: bool, operator_token: String) -> io::Result<()> {
         self.call_typed::<()>(&Request::Remove {
             volume: name.to_owned(),
             force,
+            operator_token: Some(operator_token),
         })?
         .map_err(io::Error::other)
+    }
+
+    /// Mint a coordinator-wide operator token. Backs
+    /// `elide token create`. The trust floor is socket reachability;
+    /// no operator token is required to call this verb (and could not
+    /// be — there is no token to present until the first mint).
+    pub fn mint_operator_token(&self, expires_unix: u64) -> io::Result<MintOperatorTokenReply> {
+        self.call_typed::<MintOperatorTokenReply>(&Request::MintOperatorToken { expires_unix })?
+            .map_err(io::Error::other)
     }
 
     /// Stop a volume's supervised process. Coordinator writes the

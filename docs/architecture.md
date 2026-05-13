@@ -544,58 +544,9 @@ Most verbs follow the standard one-request / one-reply model. `import-attach` is
 
 **Authentication.** `register { volume_ulid }` uses SO_PEERCRED to bind the issued macaroon to the connecting volume process's PID — the coordinator refuses if the peer's PID does not match the volume's recorded `volume.pid`. `credentials { macaroon }` re-checks SO_PEERCRED against the macaroon's `pid` caveat, then delegates to the configured `CredentialIssuer`. See *S3 credential distribution via macaroons* below.
 
-The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**. See *Isolation model* below for what this does and does not enforce.
+Destructive coordinator verbs (currently `remove`) are gated by an *operator token* — a coordinator-wide macaroon minted on `elide token create` and attenuated per use by the CLI. The operator-token surface, audit-log structure, and isolation model live in [`design-auth-model.md`](design-auth-model.md); the underlying macaroon construction is shared with volume macaroons and is described under *S3 credential distribution via macaroons* below.
 
-## Proposed: Operator tokens
-
-Operator tokens are macaroons minted by the coordinator for human operators (CLI usage). They are not PID-bound — identity is carried by the token itself, enabling audit logging and attenuation.
-
-**Issuance:**
-
-```
-elide-coordinator token create [--expires 24h] [--volume <name>]
-```
-
-Prints a macaroon to stdout. The operator stores it in `~/.elide/operator-token` or passes it explicitly. The coordinator logs token creation with a unique nonce.
-
-**Caveats on an operator token:**
-
-| Caveat | Value | Purpose |
-|---|---|---|
-| `role` | `operator` | Distinguishes from volume tokens |
-| `not-after` | `<expiry>` | Required; no indefinite operator tokens |
-| `volume` | `<name>` | Optional; restrict to a specific volume |
-
-**How the CLI uses it:**
-
-The `elide` CLI locates the operator token in this order:
-1. `--token <value>` flag
-2. `ELIDE_OPERATOR_TOKEN` environment variable
-3. `~/.elide/operator-token` file
-
-It is presented with any coordinator mutation that requires one (currently: `delete`).
-
-**Attenuation:** an operator can narrow their token before sharing it — for example, scoping it to a single volume or shortening the expiry — without involving the coordinator. The coordinator verifies all caveats on receipt.
-
-**Audit log:** the coordinator logs every operator-token-authenticated operation with the token's nonce, the operation, and the timestamp. This provides a trail of who did what and when, traceable back to the `token create` event.
-
-## Proposed: Isolation model
-
-Volume processes on the same host share a uid and a filesystem. This has direct consequences for what the macaroon scheme can and cannot enforce.
-
-**What macaroons do not enforce — local filesystem:** a compromised volume process can read or corrupt any other volume's local directory directly, without touching the coordinator. Macaroons provide no protection here. Proper local isolation requires OS-level mechanisms: separate uids per volume, Linux user namespaces, or running each volume in its own container. This is a separate layer and is not addressed by the current design.
-
-**What macaroons do enforce — S3:** S3 credentials are scoped by IAM to a specific volume's prefix. This enforcement is external to Elide — AWS (or equivalent) rejects requests that exceed the credential's scope regardless of what the caller claims. The macaroon scheme ensures a volume process can only obtain credentials for its own volume. A compromised `myvm` process cannot request credentials for `othervm`, so it cannot read, write, or delete `othervm`'s S3 objects even with full local filesystem access.
-
-**What macaroons provide for coordinator operations — defense-in-depth:** requiring a volume-scoped macaroon for coordinator mutations (e.g. `delete`) raises the bar slightly over bare socket access, and provides an audit trail. It does not prevent a compromised process from achieving the same effect via direct filesystem manipulation. The value here is auditability and protocol clarity, not a hard security boundary.
-
-**Summary:**
-
-| Resource | Isolation mechanism | Enforced by |
-|---|---|---|
-| S3 data | IAM credential scoping + macaroon gating | AWS + coordinator |
-| Local filesystem | uid separation / namespacing | OS (not yet implemented) |
-| Coordinator mutations | Macaroon + audit log | Coordinator (defense-in-depth) |
+The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**.
 
 ## Proposed: S3 credential distribution via macaroons
 

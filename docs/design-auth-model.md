@@ -1,0 +1,252 @@
+# Auth model: operator tokens, isolation
+
+This doc captures the coordinator's destructive-verb auth surface in one
+place: how human operators authenticate the CLI's destructive verbs, what
+the coordinator's audit log records, and what the scheme does and does not
+enforce given the same-host trust model.
+
+The underlying macaroon construction — chained keyed-BLAKE3 MAC, per-token
+struct-level nonce, AND-of-predicates caveat evaluation — is shared with
+volume macaroons and is documented in
+[`architecture.md`](architecture.md#proposed-s3-credential-distribution-via-macaroons).
+This doc layers the operator-token-specific surface on top of that
+foundation:
+
+- **Volume macaroons** — minted on `register`, PID-bound, scope-bound. Used
+  by volume processes to request short-lived read-only S3 credentials.
+  Implemented. Construction and registration flow live in `architecture.md`.
+- **Operator tokens** — minted on `elide token create` (IPC), not
+  PID-bound, attenuated per use by the CLI to the narrowest volume/expiry
+  needed. Used to gate destructive coordinator verbs (`remove`, and later
+  `release --force`, `coord stop --stop-volumes`).
+- **Isolation model** — the surrounding context that explains what either
+  scheme can enforce on a shared-uid host.
+
+## Operator tokens
+
+Operator tokens are coordinator-wide macaroons issued to human operators.
+They gate destructive CLI verbs — currently `remove`, with
+`release --force` and `coord stop --stop-volumes` as the next likely
+additions.
+
+### Issuance
+
+```
+elide token create [--expires 30d]
+```
+
+This is an IPC verb (`Request::MintOperatorToken`) against `control.sock`.
+The coordinator mints with its in-memory root key and returns the encoded
+macaroon plus the per-token nonce (hex) and expiry; the CLI prints the
+token to stdout and logs the nonce/expiry to stderr. The operator stores
+the token at `~/.elide/operator-token` (or passes it via `--token` /
+`ELIDE_OPERATOR_TOKEN`).
+
+The mint endpoint is ungated beyond socket reachability. The trust floor
+for "can mint an operator token" is "can reach the coordinator's unix
+socket," which is the same floor as "can perform every other coordinator
+operation." There is no separate gate to add here without moving the trust
+boundary, and that move requires off-host transport, which is out of scope.
+
+`--expires` defaults to 30 days. The default is configurable down for
+tests; there is no indefinite-lifetime option.
+
+### Caveats
+
+The minted root token carries:
+
+| Caveat | Value | Purpose |
+|---|---|---|
+| `Role` | `Operator` | Distinguishes from volume tokens |
+| `NotAfter` | mint + `--expires` | Required; bounded lifetime |
+
+It does **not** carry a `Volume` or `Op` caveat — the root token is
+coordinator-wide and verb-agnostic. Volume and op scoping happen per use,
+via attenuation.
+
+Each minted token also carries a per-token 16-byte random struct-level
+nonce (generated inside `mint`; not a caveat). The nonce is mixed into the
+MAC seed so two tokens minted with identical caveats still have distinct
+MACs and gives each token a stable hex identifier for audit logging — see
+*Audit log* below.
+
+### CLI-side attenuation per use
+
+Each destructive CLI verb appends caveats before sending the token to the
+coordinator. Attenuation narrows by three axes: operation, volume, expiry.
+
+```
+stored:     Role=Operator, NotAfter=<+30d>           (nonce on the struct)
+on the wire (elide volume remove myvm):
+            Role=Operator, NotAfter=<+30d>,
+            Op=Remove, Volume=myvm, NotAfter=<now+60s>
+```
+
+The attenuation is performed entirely in the CLI — no coordinator
+round-trip — by calling `Macaroon::attenuate` three times against the
+stored token's trailing MAC. AND-of-predicates evaluation in the verifier
+means appending a *looser* `NotAfter` cannot widen authority; the original
+30-day bound is still in the chain and still checked.
+
+The wire token is therefore single-operation, single-volume,
+very-short-lived, and useless to anyone who intercepts it after the fact.
+The persistent stored token never leaves the operator's machine in
+narrowed form.
+
+### Typed operation surface
+
+The `Op` caveat is typed, not a free string. The coordinator-side enum
+enumerates every gated verb:
+
+```rust
+pub enum OperatorOp {
+    Remove,
+    // ReleaseForce, CoordStopWithVolumes, ... slot in here as
+    // new verbs become operator-gated.
+}
+```
+
+The dispatcher hands the verifier the `OperatorOp` it is about to execute
+(`verify_operator(..., OperatorOp::Remove, target_volume)`). The verifier
+requires the chain to carry the matching `Op` caveat. Unknown op-bytes on
+the wire → `OperatorReject::Malformed` (fail closed).
+
+Two consequences worth calling out:
+
+- **Exhaustiveness.** Adding a new gated verb is "add an enum variant and
+  a dispatch arm." A new verb cannot accidentally inherit authority from
+  an existing operator token, because operator tokens are minted as
+  `Op = ∅` and only the CLI's attenuation step adds the op caveat for the
+  specific verb being invoked.
+- **The op caveat must match the entry-point IPC verb,** not any
+  sub-operation a handler dispatches internally. Today every gated verb
+  is a single dispatch and this is moot, but if a future verb fans out
+  into authenticated sub-calls, the design choice is either to
+  re-attenuate per sub-call (more macaroon-like) or to document that the
+  entry-point caveat is what matters.
+
+### Verifier shape
+
+Operator tokens have no `Pid` or `Scope`, so they don't fit the volume
+`VerifyCtx` from `architecture.md`. The macaroon module exposes a
+parallel verifier:
+
+```rust
+pub struct VerifyOperatorCtx<'a> {
+    pub now_unix: u64,
+    pub op: OperatorOp,
+    pub op_volume: &'a str,
+}
+
+pub fn check_operator_caveats(
+    m: &Macaroon,
+    ctx: &VerifyOperatorCtx<'_>,
+) -> Result<(), OperatorReject> { /* AND-of-predicates over Role / Op / Volume / NotAfter */ }
+```
+
+Top-level `verify_operator` is `parse` → `verify` (MAC, shared with volume
+macaroons) → `check_operator_caveats`. Rejection reasons (`Malformed`,
+`BadMac`, `WrongRole`, `Expired`, `WrongOp`, `VolumeMismatch`,
+`MissingVolume`, `MissingOp`) are exposed as a typed `OperatorReject` enum
+so callers can log without leaking variant-level detail to the wire — the
+IPC `Err` body is the coarse string `"operator token rejected (..)"`.
+
+### Audit log
+
+The coordinator logs every operator-token event under
+`target = "operator_token::authn"`:
+
+- `event = "mint"` — on `Request::MintOperatorToken`. Fields:
+  `nonce` (the struct-level hex), `expires_unix`.
+- `event = "verify"` — on a successful gated verb. Fields:
+  `op` (`OperatorOp::as_str`), `volume`, `nonce`.
+- `event = "reject"` — on any rejection. Fields: `op`, `volume`,
+  `reason` (`OperatorReject` variant).
+
+The `nonce` field uses the same name as the volume-macaroon
+`creds::issuance` log target — one audit-id concept across both token
+kinds, so a single grep correlates mint → use without bookkeeping the two
+schemes separately.
+
+Rejection reasons are intentionally coarse on the wire — finer detail
+would help an attacker probe token state — but the full
+`OperatorReject` variant is logged locally for operator debugging.
+
+## Isolation model
+
+Volume processes on the same host share a uid and a filesystem. This has
+direct consequences for what the macaroon scheme can and cannot enforce.
+
+**What macaroons do not enforce — local filesystem.** A compromised volume
+process can read or corrupt any other volume's local directory directly,
+without touching the coordinator. Macaroons provide no protection here.
+Proper local isolation requires OS-level mechanisms: separate uids per
+volume, Linux user namespaces, or running each volume in its own
+container. This is a separate layer and is not addressed by the current
+design.
+
+**What macaroons do enforce — S3.** S3 credentials are scoped by IAM to a
+specific volume's prefix. This enforcement is external to Elide — AWS (or
+equivalent) rejects requests that exceed the credential's scope regardless
+of what the caller claims. The macaroon scheme ensures a volume process
+can only obtain credentials for its own volume. A compromised `myvm`
+process cannot request credentials for `othervm`, so it cannot read,
+write, or delete `othervm`'s S3 objects even with full local filesystem
+access.
+
+**What operator tokens provide — audit + ceremony, not access control.**
+Requiring an operator token for coordinator mutations raises the bar
+slightly over bare socket access, and provides an audit trail. It does
+not prevent a compromised local process from achieving the same effect
+via direct filesystem manipulation (`rm -rf` on the volume dir achieves
+`remove` without going through the coordinator). The value is
+auditability, forced ceremony for destructive verbs, and per-request
+attenuation — not a hard security boundary against a local attacker.
+
+**Summary:**
+
+| Resource | Isolation mechanism | Enforced by |
+|---|---|---|
+| S3 data | IAM credential scoping + macaroon gating | AWS + coordinator |
+| Local filesystem | uid separation / namespacing | OS (not yet implemented) |
+| Coordinator mutations | Operator token + audit log | Coordinator (defense-in-depth) |
+
+## Open questions
+
+- **Bootstrap.** First-ever `elide token create` against a fresh
+  coordinator has no offline escape hatch (there is no
+  `elide-coordinator token create` subcommand under this design). If the
+  coordinator socket is unreachable, there is no way to mint. Likely fine
+  — destructive verbs are coordinator-mediated anyway — but worth noting.
+- **Token rotation UX.** No `revoke` command. A leaked token is mitigated
+  by its `NotAfter` and by re-keying the root (which invalidates all
+  tokens, including volume macaroons). Whether root rotation needs a
+  dedicated verb or can stay manual is open.
+
+## Future directions
+
+These do not affect the design above; they describe extensions that slot
+in cleanly when the threat model or deployment shape warrants them.
+
+- **Third-party caveats for authentication.** The model above is
+  authorisation-only: possession of an operator token is treated as
+  operator identity. A future extension adds *third-party caveats* — a
+  caveat that says "valid only if the bearer also presents a discharge
+  macaroon from `<auth_service>` attesting predicate P." This adds a real
+  authentication step (SSO, webauthn, whatever the auth service does)
+  tied to each token use, with the discharge's lifetime acting as the
+  session length. The chained-MAC construction already accommodates this
+  — third-party caveats are just another `Caveat` variant whose body is
+  `(location_uri, caveat_id, vid_key)`. None of the existing `Op` /
+  `Volume` / `NotAfter` surface needs to change.
+- **Root key in a separate signing process.** Today the coordinator
+  holds the root key in memory. Splitting it into a standalone signing
+  service reduces blast radius (coordinator compromise can no longer
+  forge across the fleet), gives mint operations an independent audit
+  boundary, and enables TPM/HSM backing. Verify is hot — every
+  operator-token IPC and every volume `credentials` request — so the
+  likely shape is per-coordinator derived keys (signing service issues
+  an HKDF-derived sub-key the coordinator uses to verify locally) rather
+  than RPC-on-verify. Mint is rare enough to comfortably stay RPC. Worth
+  doing when there is more than one coordinator host, or when the
+  coordinator's trust level is bounded below the key's.
