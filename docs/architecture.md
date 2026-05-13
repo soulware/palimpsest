@@ -603,7 +603,13 @@ The coordinator holds the only copy of read-write S3 credentials. Volume process
 
 ### Macaroon model
 
-The coordinator holds a **root key** (32 random bytes, generated at first start, stored at `<data_dir>/coordinator.root_key` with mode 0600). It uses this to mint per-volume macaroons — keyed-BLAKE3 bearer tokens with a chain of typed caveats. Verification is stateless: the coordinator re-derives the expected MAC from the root key and the caveat chain; no token storage is needed.
+The coordinator holds a **root key** (32 random bytes, generated at first start, stored at `<data_dir>/coordinator.root_key` with mode 0600). It uses this to mint per-volume macaroons — keyed-BLAKE3 bearer tokens with a chain of typed caveats.
+
+Each token carries a **16-byte random nonce** generated at mint time, mixed into the MAC seed alongside the domain tag. Two tokens minted with identical caveats therefore have distinct MACs, and the nonce gives every token a stable hex identifier suitable for audit logging — issuance and use can be correlated by `macaroon_nonce` in the `creds::issuance` log target.
+
+The MAC is **chained**, not a one-shot signature over the whole caveat list: a domain-separated seed is keyed by the root key, then each caveat re-keys the next step with the previous step's MAC. The stored MAC is the final value. This is what makes attenuation work — a holder of the trailing MAC can extend the chain with a new caveat without knowing the root key. Removing a caveat is infeasible (it would require inverting a keyed-BLAKE3 step). Verification is stateless: the coordinator replays the chain from the root key and constant-time-compares the final MAC.
+
+In this deployment the coordinator is **both issuer and verifier** — the root key never leaves the coordinator process. Volumes hold only the bearer token. In a future scale-out deployment with a central issuer and per-host verifiers (see [`design-deployment-modes.md`](design-deployment-modes.md)), the same construction supports a real issuer/verifier split sharing the root key out-of-band.
 
 **Caveats on a volume macaroon:**
 
@@ -631,12 +637,12 @@ The supervisor writes `volume.pid` immediately after `Command::spawn()` returns,
 When the volume needs S3 credentials (at startup or before expiry):
 
 1. Volume sends `{"verb":"credentials","macaroon":"…"}` to `control.sock`
-2. Coordinator verifies the HMAC chain (proves it minted this token)
-3. Coordinator checks all caveats: volume/fork match, scope is `credentials`, `pid` matches `SO_PEERCRED` of the current connection
+2. Coordinator replays the chained MAC from the root key and constant-time-compares (proves it minted this token)
+3. Coordinator evaluates every caveat in the chain as a predicate (AND semantics): each `volume` must equal the requested volume, each `scope` must be in the accepted set, each `pid` must equal `SO_PEERCRED`, each `not-after` must lie in the future
 4. Coordinator issues short-lived read-only credentials scoped to the volume's S3 prefix — `by_id/<volume-ulid>/*` (see *Directory layout on disk and in S3* above). The issuance mechanism depends on the backend; see *Credential backends* below.
 5. Replies `{"outcome":"ok","data":{access_key, secret_key, session_token, expiry_unix}}`
 
-The PID check on every request (step 3) means the macaroon is useless even if exfiltrated — it can only be presented from the original process. The HMAC chain means no volume can forge a token for a different volume.
+The PID check on every request (step 3) means the macaroon is useless even if exfiltrated — it can only be presented from the original process. The chained MAC means no volume can forge a token for a different volume. AND-of-predicates evaluation means a holder-appended caveat can only narrow authority, never widen it: if a holder appended a looser `not-after`, the original tighter one is still in the chain and still enforced.
 
 ### Credential backends
 
@@ -666,14 +672,14 @@ No revocation list is needed. This holds as long as the coordinator runs on the 
 
 ### Attenuation
 
-Because macaroons are additive-restriction-only, the volume can narrow its token before passing it to a subprocess (e.g. a future out-of-process demand-fetch helper):
+The chained MAC lets the volume append caveats to its own token in-process — no coordinator round-trip, no root key required, only the trailing MAC the volume already holds:
 
 ```
 original:   volume=myvm, scope=credentials, pid=1234
 attenuated: volume=myvm, scope=credentials, pid=1234, not-after=<+5m>
 ```
 
-The attenuated token is derived by the volume in-process — no coordinator round-trip. The coordinator verifies all caveats including the narrowed `not-after`.
+The coordinator replays the full chain on verify and evaluates every caveat as an AND of predicates, so attenuation can only restrict authority — appending a *looser* caveat is harmless because the original tighter one is still in the chain and still checked. Appending a contradictory `volume` or `pid` makes the token unusable (safe-fail) rather than dangerous.
 
 ### Refresh and clock skew
 
@@ -689,7 +695,7 @@ In-flight fetches started under the old credentials are not cancelled on refresh
 
 ### Implementation note
 
-The caveat set is small and typed (`volume`, `scope`, `pid`, optionally `not-after`). It is implemented in `elide-coordinator/src/macaroon.rs` (~270 lines) using `blake3::keyed_hash` for the MAC; the existing `macaroon` crate on crates.io was considered but its untyped string-caveat surface is a worse fit than a typed enum here. Wire format is a single hex line over the existing IPC line protocol: `v1.<32-byte mac, hex>.<caveat blob, hex>`.
+The caveat set is small and typed (`volume`, `scope`, `pid`, optionally `not-after`). It is implemented in `elide-coordinator/src/macaroon.rs` using `blake3::keyed_hash` for each step of the chained MAC; the existing `macaroon` crate on crates.io was considered but its untyped string-caveat surface is a worse fit than a typed enum here. Wire format is a single hex line over the existing IPC line protocol: `v2.<16-byte nonce, hex>.<32-byte mac, hex>.<caveat blob, hex>`. Verification runs through `macaroon::verify` (MAC) followed by `macaroon::check_caveats` (AND-of-predicates evaluation against a `VerifyCtx`).
 
 ## Import process lifecycle
 
