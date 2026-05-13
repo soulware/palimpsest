@@ -214,11 +214,32 @@ pub enum Request {
     /// symlink + `by_id/<vol_ulid>/` directory. Bucket records are
     /// untouched. With `force = false`, refuses if `pending/` or
     /// `wal/` is non-empty.
+    ///
+    /// Gated on an attenuated operator token (see
+    /// [`Request::MintOperatorToken`] and `docs/design-auth-model.md`).
+    /// The CLI appends `Op(Remove)`, `Volume(volume)`, and a short
+    /// `NotAfter` to its stored token before sending it here. Absent
+    /// or invalid → `Envelope::Err { kind: "forbidden" }`.
     Remove {
         volume: String,
         #[serde(default)]
         force: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operator_token: Option<String>,
     },
+    /// Mint a coordinator-wide operator token. The CLI calls this when
+    /// the operator runs `elide token create`. The minted token carries
+    /// `Role::Operator` and a `NotAfter` at `expires_unix`; the
+    /// per-token random nonce lives on the macaroon struct (not as a
+    /// caveat) and is what the coordinator audit log records. The
+    /// token does *not* carry `Op` or `Volume` — the CLI narrows those
+    /// per use via attenuation before presenting the token to a gated
+    /// verb.
+    ///
+    /// Trust floor: socket reachability. Mint cannot be gated by a
+    /// token that doesn't exist yet, and on-host socket access is
+    /// already the floor for every other coordinator operation.
+    MintOperatorToken { expires_unix: u64 },
     // ── Read-only history ────────────────────────────────────────────
     /// List the per-name event log at `events/<volume>/`,
     /// verifying each entry's signature against the emitting
@@ -561,6 +582,19 @@ pub struct StoreCredsReply {
     pub session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub expiry_unix: Option<u64>,
+}
+
+/// Reply for [`Request::MintOperatorToken`]. The encoded macaroon is
+/// what the operator stores at `~/.elide/operator-token` (or passes
+/// via `--token` / `ELIDE_OPERATOR_TOKEN`). `nonce_hex` and
+/// `expires_unix` are returned alongside so the CLI can log what was
+/// just minted — useful for matching `token create` events to later
+/// `operator_token::authn` log lines.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MintOperatorTokenReply {
+    pub token: String,
+    pub nonce_hex: String,
+    pub expires_unix: u64,
 }
 
 /// Reply for [`Request::Register`]. The macaroon is base64-encoded;

@@ -22,6 +22,7 @@ elide-coordinator = { path = "elide-coordinator" }
 elide-fetch       = { path = "elide-fetch" }
 elide-peer-fetch  = { path = "elide-peer-fetch" }
 ext4-view      = { version = "0.9", features = ["std"] }
+humantime      = "2"
 libc           = "0.2"
 lz4_flex       = "0.11"
 futures        = "0.3"
