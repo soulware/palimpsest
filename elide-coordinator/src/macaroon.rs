@@ -183,7 +183,6 @@ impl Macaroon {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn scope(&self) -> Option<Scope> {
         self.caveats.iter().find_map(|c| match c {
             Caveat::Scope(s) => Some(*s),
@@ -231,7 +230,6 @@ impl Macaroon {
     /// or diagnostic output. The per-caveat enforcement in
     /// [`check_caveats`] / [`check_operator_caveats`] already rejects
     /// any expired link, so this is purely a reporting helper.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn narrowest_not_after(&self) -> Option<u64> {
         self.caveats.iter().fold(None, |acc, c| match c {
             Caveat::NotAfter(t) => Some(acc.map_or(*t, |e: u64| e.min(*t))),

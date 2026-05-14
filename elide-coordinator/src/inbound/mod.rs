@@ -2164,6 +2164,7 @@ async fn issue_credentials(
         volume_ulid = %volume_ulid,
         peer_pid,
         macaroon_nonce = %m.nonce_hex(),
+        macaroon_not_after = ?m.narrowest_not_after(),
         expiry_unix = creds.expiry_unix,
         "issued S3 credentials to volume",
     );

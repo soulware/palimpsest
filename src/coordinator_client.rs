@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use elide_coordinator::ipc::{Envelope, IpcError, Request};
+use elide_coordinator::macaroon::{Caveat, Macaroon};
 use serde::Deserialize;
 
 pub use elide_coordinator::ipc::{
@@ -38,6 +39,16 @@ pub use elide_coordinator::volume_state::VolumeLifecycle;
 /// short enough that a stalled coordinator surfaces a loud error before
 /// the supervisor's restart loop fires.
 pub const PREFETCH_AWAIT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Lifetime of the per-request macaroon presented to `Request::Credentials`.
+/// The holder of the long-lived volume-start macaroon attenuates it with
+/// a `NotAfter(now + CREDS_REQ_TTL_SECS)` before each call so that a
+/// captured request token is unusable beyond this window.
+///
+/// Sized to cover IPC + S3-issuer round-trip latency under load (small
+/// double-digit seconds) without giving a stolen token meaningful reuse
+/// time.
+pub const CREDS_REQ_TTL_SECS: u64 = 60;
 
 /// Result of [`Client::register_volume_with_retry`]: the macaroon
 /// (used by the lazy-creds wrapper to acquire S3 credentials on the
@@ -273,12 +284,21 @@ impl Client {
 
     /// Exchange a registered macaroon for short-lived S3 credentials.
     ///
+    /// The long-lived volume-start macaroon stays in this process; the
+    /// wire token is a per-request attenuation that re-pins the existing
+    /// `Scope` and appends `NotAfter(now + CREDS_REQ_TTL_SECS)`. The
+    /// re-pinned scope is largely ceremony today (the start macaroon
+    /// already carries it), but it makes the attenuation pattern
+    /// explicit and decoupled from any future broadening of the start
+    /// scope.
+    ///
     /// Coordinator re-checks SO_PEERCRED against the macaroon's `pid`
     /// caveat and the volume's recorded `volume.pid` before delegating
     /// to the configured `CredentialIssuer`.
     pub fn macaroon_credentials(&self, macaroon: &str) -> io::Result<StoreCreds> {
+        let attenuated = attenuate_for_creds_request(macaroon, now_unix())?;
         self.call_typed(&Request::Credentials {
-            macaroon: macaroon.to_owned(),
+            macaroon: attenuated,
         })?
         .map_err(io::Error::other)
     }
@@ -919,9 +939,35 @@ fn render_fork_event(event: &ForkAttachEvent) -> Option<String> {
     }
 }
 
+/// Build the per-request macaroon presented to `Request::Credentials`.
+///
+/// Parses the held start macaroon, re-pins its existing `Scope` and
+/// appends a tight `NotAfter(now + CREDS_REQ_TTL_SECS)`. Returns the
+/// encoded wire form. The original macaroon is not consumed and the
+/// chain still verifies against the coordinator's root key — appended
+/// caveats can only restrict authority.
+fn attenuate_for_creds_request(macaroon: &str, now_unix: u64) -> io::Result<String> {
+    let parsed = Macaroon::parse(macaroon)?;
+    let scope = parsed
+        .scope()
+        .ok_or_else(|| io::Error::other("creds macaroon missing scope caveat"))?;
+    let attenuated = parsed
+        .attenuate(Caveat::Scope(scope))
+        .attenuate(Caveat::NotAfter(now_unix + CREDS_REQ_TTL_SECS));
+    Ok(attenuated.encode())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use elide_coordinator::macaroon::{self, Scope};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
@@ -1179,5 +1225,94 @@ mod tests {
         server.join().unwrap();
         assert_eq!(reply.events.len(), 1);
         assert_eq!(reply.events[0].signature_status, SignatureStatus::Valid);
+    }
+
+    fn root_key() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        k
+    }
+
+    fn mint_start_macaroon(scope: Scope) -> String {
+        macaroon::mint(
+            &root_key(),
+            vec![
+                Caveat::Volume("01JQAAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+                Caveat::Scope(scope),
+                Caveat::Pid(12345),
+            ],
+        )
+        .encode()
+    }
+
+    /// Attenuation re-pins the start scope, appends `NotAfter(now+TTL)`,
+    /// and the resulting chain still verifies against the root key.
+    #[test]
+    fn attenuate_for_creds_request_appends_scope_and_not_after() {
+        let wire = mint_start_macaroon(Scope::Credentials);
+        let now = 1_750_000_000_u64;
+        let out = attenuate_for_creds_request(&wire, now).expect("attenuate");
+
+        let parsed = Macaroon::parse(&out).expect("parse attenuated");
+        assert!(
+            macaroon::verify(&root_key(), &parsed),
+            "attenuated chain must still verify against root key"
+        );
+        assert_eq!(parsed.scope(), Some(Scope::Credentials));
+        assert_eq!(parsed.narrowest_not_after(), Some(now + CREDS_REQ_TTL_SECS),);
+
+        // Caveat order: original three, then re-pinned Scope, then NotAfter.
+        let caveats = parsed.caveats();
+        assert_eq!(caveats.len(), 5);
+        assert!(matches!(caveats[3], Caveat::Scope(Scope::Credentials),));
+        assert!(matches!(caveats[4], Caveat::NotAfter(t) if t == now + CREDS_REQ_TTL_SECS));
+    }
+
+    /// Fetch-worker start macaroons get the same shape — the helper
+    /// reads the scope from the held macaroon and re-pins it.
+    #[test]
+    fn attenuate_for_creds_request_preserves_fetch_worker_scope() {
+        let wire = mint_start_macaroon(Scope::FetchWorker);
+        let out = attenuate_for_creds_request(&wire, 0).expect("attenuate");
+        let parsed = Macaroon::parse(&out).expect("parse attenuated");
+        assert_eq!(parsed.scope(), Some(Scope::FetchWorker));
+    }
+
+    /// A malformed start macaroon (no scope) is a programmer error;
+    /// surface it as `io::Error::other` rather than silently producing a
+    /// token the coordinator will reject for a less obvious reason.
+    #[test]
+    fn attenuate_for_creds_request_rejects_missing_scope() {
+        let wire = macaroon::mint(
+            &root_key(),
+            vec![
+                Caveat::Volume("01JQAAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+                Caveat::Pid(12345),
+            ],
+        )
+        .encode();
+        let err = attenuate_for_creds_request(&wire, 0).unwrap_err();
+        assert!(err.to_string().contains("scope"), "{err}");
+    }
+
+    /// Past-`NotAfter` tokens are rejected by `check_caveats`. Confirms
+    /// the attenuated tail is enforced end-to-end.
+    #[test]
+    fn attenuated_token_with_expired_not_after_is_rejected() {
+        let wire = mint_start_macaroon(Scope::Credentials);
+        let now_at_mint = 1_000_u64;
+        let out = attenuate_for_creds_request(&wire, now_at_mint).expect("attenuate");
+        let parsed = Macaroon::parse(&out).expect("parse");
+
+        let ctx = macaroon::VerifyCtx {
+            volume: "01JQAAAAAAAAAAAAAAAAAAAAAA",
+            peer_pid: 12345,
+            now_unix: now_at_mint + CREDS_REQ_TTL_SECS + 1,
+            accepted_scopes: &[Scope::Credentials, Scope::FetchWorker],
+        };
+        let err = macaroon::check_caveats(&parsed, &ctx).unwrap_err();
+        assert_eq!(err, "macaroon expired");
     }
 }
