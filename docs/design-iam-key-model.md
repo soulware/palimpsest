@@ -191,7 +191,8 @@ of how much they perturb the OSS shape:
   still on every host), but a coordinator-process compromise no
   longer yields the admin key directly. Smaller win on Tigris than
   it would be elsewhere — the sidecar is itself a target on every
-  host, and a host compromise still reaches it.
+  host, and a host compromise still reaches it. Concrete shape in
+  [`design-elide-mint.md`](design-elide-mint.md).
 - **Central credentialer service.** Admin key lives in exactly one
   process across the fleet; coordinators request keys via
   authenticated RPC. Cleanest containment story for multi-host
