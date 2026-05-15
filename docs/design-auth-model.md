@@ -17,17 +17,24 @@ foundation:
   Implemented. Construction and registration flow live in `architecture.md`.
 - **Operator tokens** — minted on `elide token create` (IPC), not
   PID-bound, attenuated per use by the CLI to the narrowest volume/expiry
-  needed. Used to gate destructive coordinator verbs (`remove`, and later
-  `release --force`, `coord stop --stop-volumes`).
+  needed. Today they gate a single proof-of-concept verb. The settled
+  direction — operator tokens authorise the coordinator's *S3 write*
+  credential acquisition, not a hand-enumerated verb list — is in
+  *Proposed: operator tokens gate S3 writes, not verbs* below.
 - **Isolation model** — the surrounding context that explains what either
   scheme can enforce on a shared-uid host.
 
 ## Operator tokens
 
 Operator tokens are coordinator-wide macaroons issued to human operators.
-They gate destructive CLI verbs — currently `remove`, with
-`release --force` and `coord stop --stop-volumes` as the next likely
-additions.
+The gating mechanism below is a **proof of concept**: it currently wires
+exactly one verb, `remove`. `remove` is a poor exemplar — it deletes only
+the local cache directory and is fully reversible by re-pulling from S3,
+so it neither loses data nor demonstrates the property the token is meant
+to enforce. The PoC should move to `claim` / `release`, which actually
+mutate shared S3 state (the `names/<name>` ownership record). The settled
+direction supersedes per-verb gating entirely — see *Proposed: operator
+tokens gate S3 writes, not verbs* below.
 
 ### Issuance
 
@@ -128,8 +135,10 @@ enumerates every gated verb:
 ```rust
 pub enum OperatorOp {
     Remove,
-    // ReleaseForce, CoordStopWithVolumes, ... slot in here as
-    // new verbs become operator-gated.
+    // PoC only. Do not add variants — the per-verb model is
+    // superseded; see *Proposed: operator tokens gate S3 writes,
+    // not verbs*. The one pre-mint change is moving the PoC hook
+    // to `claim` / `release`.
 }
 ```
 
@@ -238,6 +247,84 @@ attenuation — not a hard security boundary against a local attacker.
 | Local filesystem | uid separation / namespacing | OS (not yet implemented) |
 | Coordinator mutations | Operator token + audit log | Coordinator (defense-in-depth) |
 
+## Proposed: operator tokens gate S3 writes, not verbs
+
+**Status: proposed. Not yet implemented. The section above describes the
+current PoC; this section describes the settled direction and the one
+binding question that the [`mint`](design-mint.md) cutover must answer.**
+
+### The principle
+
+The original intent of operator tokens was never "gate destructive
+verbs." It was: **any operation that mutates S3 state must be
+authorised.** `remove` was a proof-of-concept hook, not the model. Three
+framings were considered and rejected as the organising axis:
+
+- *Destructive verbs* — `remove`'s default form is a reversible local
+  cache drop; the destructive/reversible line does not fall on verb
+  boundaries.
+- *`--force` flags* — narrows the gate to irreversibility escape
+  hatches, but says nothing about the routine S3 writes that are the
+  actual point.
+- *Ownership ops only* — closer (`claim` / `release` do write shared S3
+  state), which is why they are the right *PoC*, but still an
+  enumeration, not the principle.
+
+The principle is read-vs-write **against S3**: read paths are an
+unauthorised baseline; every S3 mutation requires operator
+authorisation.
+
+### Why this cannot be expressed today, and becomes structural under mint
+
+Today the coordinator is *both* the macaroon issuer and the holder of
+IAM admin that writes S3. Enforcing "every S3 mutation is authorised"
+in that architecture means intercepting every code path that touches the
+bucket (breadcrumb writes, snapshot uploads, `names/` flips, IAM
+teardown) and bolting a token check onto each — a leaky enumeration and
+exactly the "optional path for a correctness property" this project
+rejects. There is no chokepoint, which is why `remove` could only ever
+be a PoC.
+
+`mint` (see [`design-mint.md`](design-mint.md)) creates the chokepoint.
+Once mint is split out, the coordinator cannot write S3 with ambient
+admin creds: to mutate it must call `mint /v1/assume-role` with a
+macaroon and obtain a write-capable keypair (`coord-data`, `coord-names`,
+the Split-A writer roles). Reads need only `coord-base`, the read-only
+baseline every coordinator already holds. "Every S3 mutation is
+authorised" then holds *architecturally* — enforced by IAM at the single
+point write credentials are acquired — rather than by scattered
+in-coordinator checks.
+
+### The binding open question
+
+`design-mint.md` deliberately leaves the issuer abstract: *"mint is not
+an issuer; some other authority mints the macaroons."* The operator
+token's role reduces to one question — **what authority issues the
+coordinator's write-role macaroon, and where does the human
+authorisation enter that chain?** Three shapes are consistent with both
+docs; the choice is deferred to the mint cutover:
+
+- **(a) The operator token *is* the write-role macaroon.** `elide token
+  create` mints with `Role=coord-data|coord-names|…`; the coordinator
+  presents it to mint per write window. Reads use the coordinator's own
+  `coord-base`. Most direct reading of the principle.
+- **(b) Operator token as a third-party-caveat discharge.** Coordinator
+  self-issues a read/identity baseline; write roles additionally require
+  a discharge proving a human authorised this window. This is the
+  *third-party caveats for authentication* future direction below.
+- **(c) Two mint trust roots.** A coordinator-held root for
+  `coord-base` / identity; an operator-held root for write roles. Mint's
+  multi-root config (`design-mint.md` § *Mint configuration*) is built
+  for this.
+
+### Until then
+
+Do not extend `OperatorOp` with more verbs — wiring additional verbs
+into the PoC entrenches the per-verb model the mint cutover dissolves.
+The only PoC change worth making before mint is moving the hook from
+`remove` (misleading: local-cache-only) to `claim` / `release` (genuine
+shared-S3-state mutations).
+
 ## Open questions
 
 - **Bootstrap.** First-ever `elide token create` against a fresh
@@ -265,7 +352,9 @@ in cleanly when the threat model or deployment shape warrants them.
   session length. The chained-MAC construction already accommodates this
   — third-party caveats are just another `Caveat` variant whose body is
   `(location_uri, caveat_id, vid_key)`. None of the existing `Op` /
-  `Volume` / `NotAfter` surface needs to change.
+  `Volume` / `NotAfter` surface needs to change. This is the mechanism
+  behind option (b) in *Proposed: operator tokens gate S3 writes, not
+  verbs*.
 - **Root key in a separate signing process.** Today the coordinator
   holds the root key in memory. Splitting it into a standalone signing
   service reduces blast radius (coordinator compromise can no longer
