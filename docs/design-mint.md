@@ -324,20 +324,19 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `elide:Coord` | string (coord-ulid) | scalar | coordinator identity | Gate on all `coord-*`. Templated only in the deferred one-time-publish split. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat.elide:Volume}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
-| `elide:PeerCoord` | string (coord-ulid) | scalar | coordinator | Gate **and** template — `coordinators/{{caveat.elide:PeerCoord}}/coordinator.pub`. |
 
 Per-role gate matrix (template substitutions are listed in each role's
 definition below):
 
-| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` | `elide:Ancestors` | `elide:PeerCoord` |
-|---|---|---|---|---|---|---|
-| `coord-data` | ● | ● | ● | ● | | |
-| `coord-names` | ● | ● | ● | | | |
-| `coord-events` | ● | ● | ● | | | |
-| `coord-identity` | ● | ● | ● | | | |
-| `coord-list` | ● | ● | ● | | | |
-| `volume-ro` | ● | ● | | ● | ● | |
-| `peer-fetch` | ● | ● | | ● | | ● |
+| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` | `elide:Ancestors` |
+|---|---|---|---|---|---|
+| `coord-data` | ● | ● | ● | ● | |
+| `coord-names` | ● | ● | ● | | |
+| `coord-events` | ● | ● | ● | | |
+| `coord-identity` | ● | ● | ● | | |
+| `coord-list` | ● | ● | ● | | |
+| `volume-ro` | ● | ● | | ● | ● |
+| `peer-fetch` | ● | ● | ● | | |
 
 Non-caveat template inputs (the other two substitution classes, listed
 here so the issuer's surface is unambiguous):
@@ -356,9 +355,12 @@ Notes:
   `coord-*` policies use prefix wildcards (`names/*`, `events/*`,
   `coordinators/*`), not `{{caveat.elide:Coord}}`. It becomes a template
   variable only if the deferred one-time own-publish split lands.
-- **`peer-fetch`'s `names/*` is not caveat-bound.** Tightening it to an
-  exact ARN (open question #4) would introduce a new scalar caveat
-  (`elide:Name`) — the only addition to this table that question implies.
+- **`peer-fetch` is coordinator-wide and read-only.** It is *not* a
+  per-request, per-volume, or mint-issued-bearer role (see the role
+  definition for the history). The exposed peer-fetch verifier does not
+  know in advance which name a peer will ask about, so `names/*` is the
+  correct scope, not a caveat-bound exact ARN. `elide:PeerCoord` and the
+  per-request peer-fetch caveats were removed when Model 2 was rejected.
 
 ## Elide as customer: role inventory
 
@@ -495,31 +497,53 @@ active volume per TTL window per coordinator, gated by Tigris IAM rate
 limits (*Open questions* #9). The 24h TTL is the primary knob: longer →
 fewer mints, larger leaked-key window.
 
-### `peer-fetch`
+### `peer-fetch` (Split A — coordinator-wide, read-only)
 
-**Per-request**, minted at the time a peer-fetch request is being serviced.
-The four-key model's separate long-lived peer-fetch key is gone; this is a
-short-lived role-assumption per incoming peer-fetch RPC.
+Coordinator-wide, read-only. Held by the serving coordinator's
+LAN/internet-exposed peer-fetch HTTP service for the S3 reads its
+request-verification pipeline performs.
 
-- **Required caveats:** `elide:Volume`, `elide:PeerCoord`, `Audience=mint`,
-  `NotAfter`
-- **TTL:** short (60–300 seconds). Cached by the peer-fetch service per
-  `(Volume, PeerCoord)` pair within TTL.
-- **Policy:** exact-ARN reads of the auth artifacts needed for this specific
-  request:
+The bearer a requesting coordinator B presents to a serving coordinator
+A is the public-key `PeerFetchToken` (`design-peer-segment-fetch.md` §
+*Token shape*): Ed25519-signed with B's `coordinator.key`, verified by A
+against B's `coordinator.pub`. Mint is not in the peer verify path and
+issues no peer bearer; its only peer-fetch role is this credential.
+
+- **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter` — the
+  same coordinator-wide gate as the other `coord-*` roles.
+- **TTL:** short (1h), like the other coordinator-held roles; tighter is
+  warranted here as the exposed surface.
+- **Policy:** `s3:GetObject` only, on the two artifacts the gap-free
+  verify pipeline reads — the current-claimer check (`names/<name>`,
+  ETag-conditional per request, so the auth fence stays coincident with
+  the S3 CAS `release --force` triggers) and the requester-pubkey check
+  (`coordinators/<B>/coordinator.pub`):
 
 ```
-arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/volume.pub
-arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/volume.provenance
-arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat.elide:PeerCoord}}/coordinator.pub
-arn:aws:s3:::{{tenant.bucket}}/names/*
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AuthVerifyReadsOnly",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": [
+      "arn:aws:s3:::{{tenant.bucket}}/names/*",
+      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*/coordinator.pub"
+    ]
+  }]
+}
 ```
 
-No mid-path wildcards needed — the prior peer-fetch design's
-`by_id/*/volume.pub` is replaced by exact ARNs derived from the request's
-specific volume and peer coordinator. (See *Open questions* on whether
-`names/*` trailing wildcard is sufficient or if the specific name should be
-caveat-bound as well.)
+Read-only, no `by_id/` access — a compromised peer-fetch surface can
+neither mutate state nor drain segments (`design-iam-key-model.md` §
+*IAM-layer invariants*). It is strictly less than `coord-names` (which
+holds write on `names/*`); the split exists because the holder is the
+exposed surface.
+
+No `by_id/` read is needed because lineage is verified by the serving
+peer against its **own local** signed `volume.provenance` chain (it
+holds the chain for every fork it serves), not via S3 — see
+`design-peer-segment-fetch.md` § *Peer verification* check 4.
 
 The `ephemeral-fetch` key class from the prior model collapses into
 `volume-ro` with a shorter TTL request. Operationally distinguishable via
@@ -591,19 +615,20 @@ prematurely.
 3. **Trust root rotation.** Static trust roots fit v1, but rotation needs a
    story. Options: hot-reload on SIGHUP, dual-key acceptance during overlap,
    explicit rotation endpoint. Probably defer to v2.
-4. **`names/*` wildcard in the peer-fetch policy.** Trailing wildcard, so
-   supported by Tigris in principle. Open whether the role config should
-   bind to the specific name for tighter scoping — which would mean adding
-   an `elide:Name` scalar caveat (the only addition to the *Caveat field
-   inventory* this question implies) — or whether `names/*` is acceptable
-   given peer-fetch reads are auth-only.
-5. **Mid-path wildcard verification.** Not on the v1 critical path: after
-   the peer-fetch collapse, `coord-data` uses a single-volume *trailing*
-   wildcard (`by_id/{{caveat.elide:Volume}}/*`) and `volume-ro` uses exact
-   ancestor ARNs — neither needs mid-path `*`. It remains a constraint on
-   any *future* role wanting `by_id/*/<something>` shape. Empirical test
-   still worth running once to settle the design space, but no longer
-   blocks the current inventory.
+4. **Peer-fetch scope — settled.** `peer-fetch` is coordinator-wide,
+   read-only, `s3:GetObject` on `names/*` + `coordinators/*/
+   coordinator.pub` only. Lineage is verified by the serving peer
+   against its own *local* signed `volume.provenance`, not via S3, so it
+   is not a mint concern. The force-release fence is gap-free via the
+   per-request ETag-conditional `names/<name>` read (fence coincident
+   with the S3 CAS) — this is why the role still exists at all.
+5. **Mid-path wildcard verification.** Not on the v1 critical path:
+   `coord-data` uses a single-volume *trailing* wildcard
+   (`by_id/{{caveat.elide:Volume}}/*`), `volume-ro` uses exact ancestor
+   ARNs, and `peer-fetch` touches no `by_id/` at all — none need mid-path
+   `*`. It is only a constraint on a future role wanting
+   `by_id/*/<something>` shape. Empirical test still worth running once,
+   but does not block the current inventory.
 6. **Caveat library schema.** List-valued caveats with intersection
    semantics are required; `design-auth-model.md` documents only scalar
    caveats today. Needs extending — minor work, but the encoding needs to

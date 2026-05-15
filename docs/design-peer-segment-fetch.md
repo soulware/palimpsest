@@ -310,7 +310,7 @@ The peer's verify pipeline is five checks, each tied to a property the auth mode
 | 1 | Decode + freshness | token bytes, local clock | replay defence (±60 s window) |
 | 2 | Ed25519 signature valid against `coordinator.pub` | `coordinators/<token.coordinator_id>/coordinator.pub` from S3 | which coordinator is requesting |
 | 3 | `names/<token.volume_name>.coordinator_id == token.coordinator_id` | `names/<token.volume_name>` from S3 (ETag-conditional) | the requesting coordinator currently owns/claims this volume |
-| 4 | URL `vol_id` ∈ ancestry(`token.volume_name`) | walk `volume.provenance` chain from S3 starting at `names/<volume_name>.vol_ulid` | `vol_id` is in the requesting volume's signed lineage |
+| 4 | URL `vol_id` ∈ ancestry(`token.volume_name`) | walk the signed `volume.provenance` chain from the peer's **local** `by_id/<vol_id>/volume.{provenance,pub}` (the peer holds these for every fork it serves, pulled with the volume); fail closed if absent | `vol_id` is in the requesting volume's signed lineage |
 | 5 | `index/<ulid>.idx` (or `cache/<ulid>.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
 
 Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves).
@@ -386,30 +386,26 @@ These are not v1 features (the simple version of v1 has no rate-limit at all), b
 - **Replay window.** `issued_at` ±60 s allows replay within that window. Strictly fine for read-only requests against signed bytes (worst case: replayed token retrieves bytes the original holder was already entitled to). Could tighten with a peer-issued challenge; probably overkill for v1.
 - **Coordinator key compromise.** Anyone with `coordinator.key` can claim and operate volumes for that coordinator anyway; peer fetch does not widen this blast radius. Rotation is the same event as today.
 
-### Future: converge on the credential-service format
+### Bearer format: public-key `PeerFetchToken`
 
-The principal direction for any future evolution of the auth surface is **wire alignment with the eventual S3-cred service** (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`). When that service exists, volumes will hold a single short-lived signed credential — likely a public-key macaroon or an equivalent caveat-based format — that conveys "you may read these S3 prefixes until time T." The natural move is to use exactly the same credential as the peer-fetch bearer: one library, one verification path, one mental model.
+The `PeerFetchToken` is the long-term bearer shape, not a placeholder.
+It is public-key: Ed25519-signed with the requester's `coordinator.key`,
+verified by the serving coordinator against `coordinators/<id>/
+coordinator.pub`. The serving coordinator does not — and by design
+cannot — hold the macaroon chained-MAC root key (`design-mint.md` §
+*Trust model*), so a mint-issued symmetric macaroon cannot serve as the
+peer bearer. Mint stays out of the peer verify path; its only peer-fetch
+role is issuing the serving coordinator its read-only verifier
+credential (`design-mint.md` § *`peer-fetch`*).
 
-Concretely this means the v1 bearer-token format is **not** the long-term shape. The current token is deliberately minimal so the migration cost is bounded by the things that won't change:
-
-- **Trust root** — verification against `coordinators/<id>/coordinator.pub` from S3 is the same in either format.
-- **Lineage check** — moves from "peer walks ancestry" to "credential carries the prefix list as caveats," but the semantics are identical.
-- **Freshness** — bounded validity moves from a custom `issued_at` field to a macaroon `time < T` caveat, but both express the same thing.
-- **Token lifetime** is short (60 s), so the migration is cheap in operational terms — no on-disk persistence to deal with, no long-lived sessions to wait out. Old clients stop minting old tokens; new clients use the new format; peers accept both during a brief window.
-
-The v1 bearer token therefore exists primarily to *defer* the format choice until the credential service is being designed, when the choice can be made jointly across both surfaces. Picking a format now would commit the credential service's design too, and there's no payoff in doing that before the service's other constraints (centralised vs federated issuance, third-party caveat structure, revocation strategy) are settled.
-
-Until then, the v1 `PeerFetchToken` semantics are intentionally a strict subset of what a public-key macaroon could express:
-
-| Bearer-token field | Macaroon equivalent |
-|---|---|
-| `coordinator_id`     | identifier (issuer) |
-| `volume_name`        | first-party caveat: `volume = <name>` |
-| `issued_at`          | first-party caveat: `time < <issued_at + window>` |
-| signature            | macaroon Ed25519 root signature |
-| (peer-side ancestry) | first-party caveat list: `prefix in [...]` (carried in credential, not derived on peer) |
-
-So the v1 verification logic is the macaroon verification logic minus caveats the v1 token doesn't yet carry. The migration is "stop deriving caveats locally, start trusting them from the credential."
+Lineage is verified by the serving peer against its **own local**
+signed `volume.provenance` chain (it holds the chain for every fork it
+serves), not asserted by the requester — see *Peer verification* check
+4. Local verification fails closed: peer-fetch is optional, so a peer
+that cannot verify locally declines and the requester falls back to S3.
+The force-release fence stays gap-free via the one irreducibly-remote
+check: the peer re-reads `names/<name>` ETag-conditionally per request,
+so the auth fence remains coincident with the S3 CAS.
 
 ## Discovery: which peer to ask
 
