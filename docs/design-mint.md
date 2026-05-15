@@ -324,20 +324,19 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `elide:Coord` | string (coord-ulid) | scalar | coordinator identity | Gate on all `coord-*`. Templated only in the deferred one-time-publish split. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat.elide:Volume}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
-| `elide:PeerCoord` | string (coord-ulid) | scalar | coordinator | Gate **and** template — `coordinators/{{caveat.elide:PeerCoord}}/coordinator.pub`. |
 
 Per-role gate matrix (template substitutions are listed in each role's
 definition below):
 
-| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` | `elide:Ancestors` | `elide:PeerCoord` |
-|---|---|---|---|---|---|---|
-| `coord-data` | ● | ● | ● | ● | | |
-| `coord-names` | ● | ● | ● | | | |
-| `coord-events` | ● | ● | ● | | | |
-| `coord-identity` | ● | ● | ● | | | |
-| `coord-list` | ● | ● | ● | | | |
-| `volume-ro` | ● | ● | | ● | ● | |
-| `peer-fetch` | ● | ● | | ● | | ● |
+| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` | `elide:Ancestors` |
+|---|---|---|---|---|---|
+| `coord-data` | ● | ● | ● | ● | |
+| `coord-names` | ● | ● | ● | | |
+| `coord-events` | ● | ● | ● | | |
+| `coord-identity` | ● | ● | ● | | |
+| `coord-list` | ● | ● | ● | | |
+| `coord-base` | ● | ● | ● | | |
+| `volume-ro` | ● | ● | | ● | ● |
 
 Non-caveat template inputs (the other two substitution classes, listed
 here so the issuer's surface is unambiguous):
@@ -352,13 +351,14 @@ Notes:
 - **Exactly one list-valued field exists** (`elide:Ancestors`). Every
   other caveat is scalar. The list-valued caveat type (open question #6)
   is the only macaroon-library extension this inventory requires.
-- **`elide:Coord` gates but does not template** in the v1 roles — the
-  `coord-*` policies use prefix wildcards (`names/*`, `events/*`,
-  `coordinators/*`), not `{{caveat.elide:Coord}}`. It becomes a template
-  variable only if the deferred one-time own-publish split lands.
-- **`peer-fetch`'s `names/*` is not caveat-bound.** Tightening it to an
-  exact ARN (open question #4) would introduce a new scalar caveat
-  (`elide:Name`) — the only addition to this table that question implies.
+- **`elide:Coord` templates only in `coord-identity`**
+  (`coordinators/{{caveat.elide:Coord}}/*`, own-prefix write). Every
+  other `coord-*` role uses it as a gate only; their policies use
+  prefix wildcards (`names/*`, `coordinators/*`, `events/*`).
+- **`coord-base` is the read-only baseline every coordinator holds**, and
+  the only credential the LAN/internet-exposed peer-fetch verifier holds.
+  Coordinator-wide read of `names/*` / `coordinators/*` / `events/*`,
+  gated by `elide:Coord` like the other `coord-*` roles.
 
 ## Elide as customer: role inventory
 
@@ -373,6 +373,9 @@ The monolithic `coord-writer` is split two ways:
   assumed with an `elide:Volume` caveat and cached coordinator-side per
   vol_ulid. This reopens `design-iam-key-model.md` § *Per-volume scoping for
   writes (rejected)* — see *Why Split B is viable now* below.
+
+Orthogonally, `coord-base` is the read-only control-plane baseline every
+coordinator holds (it is not a fragment of the writer policy).
 
 ### TTL principle
 
@@ -432,31 +435,46 @@ Coordinator-wide. Event-journal appends and reads.
   enforced here at the IAM layer — no role in the inventory holds delete on
   `events/`.
 
-### `coord-identity` (Split A)
+### `coord-identity` (Split A — own-prefix only)
 
-Coordinator-wide. One-time own identity publish plus ongoing peer-pub
-verification reads.
+Writes this coordinator's own identity records: `coordinator.pub` and
+`peer-endpoint.toml`. Scoped to **its own** `coordinators/<ulid>/`
+prefix via `elide:Coord` templating — it cannot touch any other
+coordinator's records. Peer identity/endpoint *reads* are not here;
+they are covered by the read-only `coord-base` baseline.
 
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
 - **TTL:** 6h.
 - **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-  `arn:aws:s3:::{{tenant.bucket}}/coordinators/*`. Coordinator-identity
-  immutability is enforced here — no role holds delete on `coordinators/`.
-
-(The one-time own-publish write could be split into an ultra-short-TTL
-write-once role distinct from the ongoing peer-read; deferred — noted, not
-specified.)
+  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat.elide:Coord}}/*`.
+  Coordinator-identity immutability is enforced here — no role holds
+  delete on `coordinators/`. A leaked `coord-identity` key can rewrite
+  only its own coordinator's identity, not impersonate another.
 
 ### `coord-list` (Split A)
 
-Coordinator-wide bucket enumeration. `s3:ListBucket` has no `s3:prefix`
-condition on Tigris, so it is all-or-nothing and **cannot** be folded into
-per-volume `coord-data`.
+Coordinator-wide bucket enumeration: `volume list --remote` (LIST
+`names/`), snapshot enumeration when the branch point is unknown (LIST
+`by_id/<vol>/snapshots/`), event-log find-latest / peer-discovery (LIST
+`events/<name>/`).
+
+`s3:ListBucket` is irreducibly bucket-global on Tigris. AWS scopes it
+to a prefix only via the `s3:prefix` condition key; Tigris supports
+**no string condition keys** — only `IpAddress`/`NotIpAddress` and the
+`Date*` family ([Tigris IAM policy support][tigris-iam-policies]). So
+`coord-list` cannot be prefix-scoped or folded into per-volume
+`coord-data`; it is the one structurally un-scopable role. Mitigation
+is temporal only: short TTL, assumed on demand while enumerating.
 
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
 - **TTL:** 6h.
 - **Policy:** `s3:ListBucket` on `arn:aws:s3:::{{tenant.bucket}}` (bucket
   resource, no object statement).
+
+It only exposes object *keys* (ULIDs, names, coord ids), never object
+contents. Eliminating LIST dependence — `events/<name>/HEAD` pointers,
+deterministic manifest keys, a maintained `names` index — would shrink
+or remove `coord-list`; tracked as open question #12.
 
 ### `volume-ro`
 
@@ -495,31 +513,52 @@ active volume per TTL window per coordinator, gated by Tigris IAM rate
 limits (*Open questions* #9). The 24h TTL is the primary knob: longer →
 fewer mints, larger leaked-key window.
 
-### `peer-fetch`
+### `coord-base` (Split A — coordinator-wide, read-only baseline)
 
-**Per-request**, minted at the time a peer-fetch request is being serviced.
-The four-key model's separate long-lived peer-fetch key is gone; this is a
-short-lived role-assumption per incoming peer-fetch RPC.
+The baseline read-only credential every coordinator holds. Covers the
+control-plane public state a coordinator reads as a matter of course:
+name resolution and claim verification, peer-coordinator identity and
+endpoint resolution, event-log and peer-discovery reads.
 
-- **Required caveats:** `elide:Volume`, `elide:PeerCoord`, `Audience=mint`,
-  `NotAfter`
-- **TTL:** short (60–300 seconds). Cached by the peer-fetch service per
-  `(Volume, PeerCoord)` pair within TTL.
-- **Policy:** exact-ARN reads of the auth artifacts needed for this specific
-  request:
+- **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter` — the
+  same coordinator-wide gate as the other `coord-*` roles.
+- **TTL:** short (1h), like the other coordinator-held roles.
+- **Policy:** `s3:GetObject` only, on `names/*`, `coordinators/*`, and
+  `events/*`:
 
 ```
-arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/volume.pub
-arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/volume.provenance
-arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat.elide:PeerCoord}}/coordinator.pub
-arn:aws:s3:::{{tenant.bucket}}/names/*
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "ControlPlaneReadOnly",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": [
+      "arn:aws:s3:::{{tenant.bucket}}/names/*",
+      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
+      "arn:aws:s3:::{{tenant.bucket}}/events/*"
+    ]
+  }]
+}
 ```
 
-No mid-path wildcards needed — the prior peer-fetch design's
-`by_id/*/volume.pub` is replaced by exact ARNs derived from the request's
-specific volume and peer coordinator. (See *Open questions* on whether
-`names/*` trailing wildcard is sufficient or if the specific name should be
-caveat-bound as well.)
+**Invariant: `coord-base` is read-only and `by_id/`-free.** This is what
+makes it safe to be the *only* credential held by the LAN/internet-
+exposed peer-fetch HTTP verifier: a compromise of the exposed surface
+can neither mutate state nor read segment bodies
+(`design-iam-key-model.md` § *IAM-layer invariants*). The write-capable
+`coord-names` / `coord-identity` / `coord-events` roles stay separate
+and are held only by the non-exposed mutation paths. `coord-base` must
+never accrete a write action or any `by_id/` read; doing so silently
+breaks exposed-surface containment.
+
+The peer-fetch verifier needs no dedicated role and no `by_id/` access:
+it uses `coord-base` for the gap-free fence (per-request ETag-
+conditional `names/<name>` read, coincident with the `release --force`
+S3 CAS) and the requester-pubkey check (`coordinators/<B>/
+coordinator.pub`), and verifies lineage against the serving peer's
+**own local** signed `volume.provenance` chain — see
+`design-peer-segment-fetch.md` § *Peer verification* check 4.
 
 The `ephemeral-fetch` key class from the prior model collapses into
 `volume-ro` with a shorter TTL request. Operationally distinguishable via
@@ -591,19 +630,19 @@ prematurely.
 3. **Trust root rotation.** Static trust roots fit v1, but rotation needs a
    story. Options: hot-reload on SIGHUP, dual-key acceptance during overlap,
    explicit rotation endpoint. Probably defer to v2.
-4. **`names/*` wildcard in the peer-fetch policy.** Trailing wildcard, so
-   supported by Tigris in principle. Open whether the role config should
-   bind to the specific name for tighter scoping — which would mean adding
-   an `elide:Name` scalar caveat (the only addition to the *Caveat field
-   inventory* this question implies) — or whether `names/*` is acceptable
-   given peer-fetch reads are auth-only.
-5. **Mid-path wildcard verification.** Not on the v1 critical path: after
-   the peer-fetch collapse, `coord-data` uses a single-volume *trailing*
-   wildcard (`by_id/{{caveat.elide:Volume}}/*`) and `volume-ro` uses exact
-   ancestor ARNs — neither needs mid-path `*`. It remains a constraint on
-   any *future* role wanting `by_id/*/<something>` shape. Empirical test
-   still worth running once to settle the design space, but no longer
-   blocks the current inventory.
+4. **Peer-fetch scope — settled.** There is no dedicated peer-fetch
+   role; the verifier uses `coord-base` (read-only `names/*` /
+   `coordinators/*` / `events/*`). Lineage is verified by the serving
+   peer against its own *local* signed `volume.provenance`, not via S3.
+   The force-release fence is gap-free via the per-request ETag-
+   conditional `names/<name>` read (fence coincident with the S3 CAS).
+5. **Mid-path wildcard verification.** Not on the v1 critical path:
+   `coord-data` uses a single-volume *trailing* wildcard
+   (`by_id/{{caveat.elide:Volume}}/*`), `volume-ro` uses exact ancestor
+   ARNs, and `coord-base` touches no `by_id/` at all — none need mid-path
+   `*`. It is only a constraint on a future role wanting
+   `by_id/*/<something>` shape. Empirical test still worth running once,
+   but does not block the current inventory.
 6. **Caveat library schema.** List-valued caveats with intersection
    semantics are required; `design-auth-model.md` documents only scalar
    caveats today. Needs extending — minor work, but the encoding needs to
@@ -640,6 +679,14 @@ prematurely.
     stated in the role inventory but not fully specified — the exact set of
     roles a GC pass assumes, and whether the reaper's delete wants its own
     narrower role, is open.
+12. **Eliminate `coord-list`.** It is the one structurally un-scopable
+    role (Tigris `ListBucket` is bucket-global; no string conditions to
+    prefix-scope it). Replacing the LIST paths with `events/<name>/HEAD`
+    pointers, deterministic manifest keys, and a maintained `names`
+    index — ideas already floated in `design-volume-event-log.md` and
+    `design-peer-segment-fetch.md` for performance — would shrink it to
+    just `volume list --remote`, or remove it entirely. Not blocking;
+    the temporal mitigation (short TTL, on-demand) holds until then.
 
 ## Future directions
 
@@ -688,3 +735,4 @@ around:
 
 [assume-role-web-identity]: https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
 [session-tags]: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_session-tags.html
+[tigris-iam-policies]: https://www.tigrisdata.com/docs/iam/policies/

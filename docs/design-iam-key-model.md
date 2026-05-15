@@ -78,6 +78,7 @@ below records the workarounds available until then.
 
 [tigris-iam-actions]: https://www.tigrisdata.com/docs/iam/policies/supported-actions/
 [tigris-rbac]: https://www.tigrisdata.com/docs/concepts/authnz/#role-based-access-control-rbac
+[tigris-iam-policies]: https://www.tigrisdata.com/docs/iam/policies/
 
 **Bucket-ownership requirement.** Even an admin key must be issued
 on the account that owns the bucket. Tigris gates `iam:CreatePolicy`
@@ -420,9 +421,12 @@ implementation invokes; it is not an attachable policy on Tigris.
 }
 ```
 
-`s3:ListBucket` is bucket-scoped — Tigris has no `s3:prefix`
-condition, so listing is all-or-nothing. Acceptable for the writer.
-No `DateLessThan`; rotation is operator-driven.
+`s3:ListBucket` is bucket-scoped — Tigris supports **no string
+condition keys** (only `IpAddress`/`NotIpAddress` and the `Date*`
+family, [Tigris IAM policy support][tigris-iam-policies]), so the
+`s3:prefix` mechanism AWS uses to narrow listing does not exist and
+listing is all-or-nothing. Acceptable for the writer. No
+`DateLessThan`; rotation is operator-driven.
 
 ### Peer-fetch key
 
@@ -497,7 +501,10 @@ small amount of policy size and nothing else.
   on per-volume keys at scales of thousands of concurrent volumes
   per coordinator.
 - **Optional `IpAddress` condition.** Tigris IAM supports
-  `IpAddress` and `NotIpAddress` in policy conditions. Binding
+  `IpAddress` and `NotIpAddress` in policy conditions
+  ([Tigris IAM policy support][tigris-iam-policies]; the same page
+  confirms `DateLessThan` + `aws:CurrentTime`, the expiry mechanism
+  every short-lived key here relies on). Binding
   worker-class keys (RO, fetch, peer-fetch) to the host's egress IP
   gives defense-in-depth — a leaked key cannot be used off-host —
   but is brittle (NAT, IP changes, multi-homed). Off by default;
