@@ -271,6 +271,15 @@ pub enum Request {
     /// `pid` caveat, then delegates to the configured
     /// `CredentialIssuer`.
     Credentials { macaroon: String },
+    /// Mint a coordinator-signed `PeerFetchToken` claimer credential
+    /// for the requesting volume daemon. Authenticated exactly like
+    /// `Credentials` (MAC verify, volume caveat, SO_PEERCRED / pid
+    /// re-check). The volume process presents the returned token in
+    /// the `.body` peer-fetch claimer header so the serving peer can
+    /// confirm it is the volume's current claimer (steps 1–3). The
+    /// volume can already drive peer body load only for its own
+    /// lineage; this bounds that load to current claimers.
+    PeerClaimerToken { macaroon: String },
 
     // ── Consolidated fork / claim flows ──────────────────────────────
     //
@@ -582,6 +591,17 @@ pub struct StoreCredsReply {
     pub session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub expiry_unix: Option<u64>,
+}
+
+/// Reply for [`Request::PeerClaimerToken`]. `token` is a base64
+/// `elide_peer_fetch::PeerFetchToken` signed with `coordinator.key`,
+/// scoped to the volume's current name claim. `issued_at` lets the
+/// volume process schedule refresh at ≈ half the freshness window,
+/// the same cadence its body-token bearer already uses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerClaimerTokenReply {
+    pub token: String,
+    pub issued_at: u64,
 }
 
 /// Reply for [`Request::MintOperatorToken`]. The encoded macaroon is

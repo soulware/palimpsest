@@ -312,10 +312,12 @@ fn parse_segment_key(key: &str) -> Option<(Ulid, Ulid)> {
 mod tests {
     use super::*;
     use crate::auth::AuthState;
-    use crate::client::BodyTokenSigner;
+    use crate::client::ClaimerTokenProvider;
     use crate::server::{ServerContext, router};
+    use crate::token::PeerFetchToken;
     use bytes::Bytes;
     use ed25519_dalek::{Signer, SigningKey};
+    use elide_core::name_record::{NameRecord, NameState};
     use elide_core::segment::{
         SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, write_segment,
     };
@@ -337,19 +339,28 @@ mod tests {
         }
     }
 
-    /// Minimal BodyTokenSigner backed by a SigningKey.
+    /// Static [`ClaimerTokenProvider`] handing back a fixed bearer.
     #[derive(Debug)]
-    struct TestBodySigner {
-        vol_ulid: Ulid,
-        key: SigningKey,
+    struct StubClaimer(String);
+    impl ClaimerTokenProvider for StubClaimer {
+        fn claimer_bearer(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
     }
-    impl BodyTokenSigner for TestBodySigner {
-        fn vol_ulid(&self) -> Ulid {
-            self.vol_ulid
-        }
-        fn sign(&self, msg: &[u8]) -> [u8; 64] {
-            self.key.sign(msg).to_bytes()
-        }
+
+    /// The coordinator-signed `PeerFetchToken` bearer the `.body`
+    /// route now authenticates (Branch 2), scoped to the fixture's
+    /// live claim.
+    fn claimer(f: &LiveFixture) -> Arc<dyn ClaimerTokenProvider> {
+        let issued = PeerFetchToken::now_unix_seconds();
+        let payload = PeerFetchToken::signing_payload(&f.vol_name, &f.coord_id, issued);
+        let token = PeerFetchToken {
+            volume_name: f.vol_name.clone(),
+            coordinator_id: f.coord_id.clone(),
+            issued_at: issued,
+            signature: f.coord_key.sign(&payload).to_bytes(),
+        };
+        Arc::new(StubClaimer(token.encode()))
     }
 
     /// Sync `RangeFetcher` mock that records calls and returns
@@ -409,6 +420,9 @@ mod tests {
         body_payload: Vec<u8>,
         body_section_start: u64,
         data_dir: TempDir,
+        coord_key: SigningKey,
+        coord_id: String,
+        vol_name: String,
         _server: tokio::task::JoinHandle<()>,
     }
 
@@ -423,6 +437,9 @@ mod tests {
             body_payload,
             body_section_start: f.body_section_start,
             data_dir: f.data_dir,
+            coord_key: f.coord_key,
+            coord_id: f.coord_id,
+            vol_name: f.vol_name,
             _server: f._server,
         }
     }
@@ -437,6 +454,9 @@ mod tests {
         let auth = AuthState::single_store(store.clone());
         let data_dir = TempDir::new().unwrap();
         let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a".to_owned();
+        let vol_name = "myvol".to_owned();
         let vol_ulid = Ulid::new();
         let seg_ulid = Ulid::new();
 
@@ -463,6 +483,27 @@ mod tests {
             .put(
                 &StorePath::from(format!("by_id/{vol_ulid}/volume.provenance")),
                 Bytes::from(prov_bytes).into(),
+            )
+            .await
+            .unwrap();
+
+        // Branch 2: the `.body` route authenticates a coordinator
+        // `PeerFetchToken` (steps 1–4), so publish the coordinator pub
+        // (step 2) and a live `names/<vol_name>` claim (step 3).
+        store
+            .put(
+                &StorePath::from(format!("coordinators/{coord_id}/coordinator.pub")),
+                Bytes::from(pub_hex(&coord_key).into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+        let mut record = NameRecord::live_minimal(vol_ulid, 4 * 1024 * 1024 * 1024);
+        record.coordinator_id = Some(coord_id.clone());
+        record.state = NameState::Live;
+        store
+            .put(
+                &StorePath::from(format!("names/{vol_name}")),
+                Bytes::from(record.to_toml().unwrap().into_bytes()).into(),
             )
             .await
             .unwrap();
@@ -533,6 +574,9 @@ mod tests {
                 .unwrap_or_default(),
             body_section_start,
             data_dir,
+            coord_key,
+            coord_id,
+            vol_name,
             _server: server,
         }
     }
@@ -548,11 +592,7 @@ mod tests {
     #[tokio::test]
     async fn peer_hit_returns_body_bytes_and_skips_inner() {
         let f = live_fixture().await;
-        let signer = Arc::new(TestBodySigner {
-            vol_ulid: f.vol_ulid,
-            key: f.vol_key.clone(),
-        });
-        let client = BodyFetchClient::new(signer).unwrap();
+        let client = BodyFetchClient::new(claimer(&f)).unwrap();
         let inner = Arc::new(RecordingInner::new(vec![0xFFu8]));
         let fetcher = PeerRangeFetcher::new(
             inner.clone(),
@@ -601,11 +641,7 @@ mod tests {
             .join(format!("{}.body", f.seg_ulid));
         std::fs::remove_file(&body_path).unwrap();
 
-        let signer = Arc::new(TestBodySigner {
-            vol_ulid: f.vol_ulid,
-            key: f.vol_key.clone(),
-        });
-        let client = BodyFetchClient::new(signer).unwrap();
+        let client = BodyFetchClient::new(claimer(&f)).unwrap();
         let inner = Arc::new(RecordingInner::new(vec![0xCDu8]));
         let fetcher = PeerRangeFetcher::new(
             inner.clone(),
@@ -649,11 +685,7 @@ mod tests {
         let second = vec![0xBBu8; 4096];
         let f = live_fixture_with(vec![(first.clone(), true), (second.clone(), false)]).await;
 
-        let signer = Arc::new(TestBodySigner {
-            vol_ulid: f.vol_ulid,
-            key: f.vol_key.clone(),
-        });
-        let client = BodyFetchClient::new(signer).unwrap();
+        let client = BodyFetchClient::new(claimer(&f)).unwrap();
         // Inner returns 0xEE so we can distinguish its bytes from the
         // peer's bytes in the spliced result.
         let inner = Arc::new(RecordingInner::new(vec![0xEEu8]));
@@ -705,11 +737,7 @@ mod tests {
     #[tokio::test]
     async fn counters_skip_non_body_ranges() {
         let f = live_fixture().await;
-        let signer = Arc::new(TestBodySigner {
-            vol_ulid: f.vol_ulid,
-            key: f.vol_key.clone(),
-        });
-        let client = BodyFetchClient::new(signer).unwrap();
+        let client = BodyFetchClient::new(claimer(&f)).unwrap();
         let inner = Arc::new(RecordingInner::new(vec![0xAAu8]));
         let fetcher = PeerRangeFetcher::new(
             inner.clone(),
@@ -745,11 +773,7 @@ mod tests {
     #[tokio::test]
     async fn header_range_skips_peer() {
         let f = live_fixture().await;
-        let signer = Arc::new(TestBodySigner {
-            vol_ulid: f.vol_ulid,
-            key: f.vol_key.clone(),
-        });
-        let client = BodyFetchClient::new(signer).unwrap();
+        let client = BodyFetchClient::new(claimer(&f)).unwrap();
         let inner = Arc::new(RecordingInner::new(vec![0xAA]));
         let fetcher = PeerRangeFetcher::new(
             inner.clone(),
@@ -775,11 +799,7 @@ mod tests {
     #[tokio::test]
     async fn non_segment_key_passes_through() {
         let f = live_fixture().await;
-        let signer = Arc::new(TestBodySigner {
-            vol_ulid: f.vol_ulid,
-            key: f.vol_key.clone(),
-        });
-        let client = BodyFetchClient::new(signer).unwrap();
+        let client = BodyFetchClient::new(claimer(&f)).unwrap();
         let inner = Arc::new(RecordingInner::new(vec![0x55]));
         let fetcher = PeerRangeFetcher::new(
             inner.clone(),

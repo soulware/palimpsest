@@ -20,8 +20,8 @@ pub use elide_coordinator::ipc::{
     ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, FetchAttachEvent, FetchStartReply,
     FetchStatusReply, ForkAttachEvent, ForkSource, ForkStartReply, GenerateFilemapReply,
     ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind, MintOperatorTokenReply,
-    RegisterReply, ReleaseReply, ResolveHandoffKeyReply, SignatureStatus, SnapshotReply,
-    StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    PeerClaimerTokenReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply, SignatureStatus,
+    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
     VolumeEventEntry, VolumeEventsReply,
 };
 pub use elide_peer_fetch::PeerEndpoint;
@@ -298,6 +298,20 @@ impl Client {
     pub fn macaroon_credentials(&self, macaroon: &str) -> io::Result<StoreCreds> {
         let attenuated = attenuate_for_creds_request(macaroon, now_unix())?;
         self.call_typed(&Request::Credentials {
+            macaroon: attenuated,
+        })?
+        .map_err(io::Error::other)
+    }
+
+    /// Exchange the registered macaroon for a coordinator-signed
+    /// `PeerFetchToken` claimer credential. Same per-request
+    /// attenuation as [`Self::macaroon_credentials`]; the volume
+    /// presents the returned token in the `.body` peer-fetch claimer
+    /// header so the serving peer can confirm it is the volume's
+    /// current claimer.
+    pub fn peer_claimer_token(&self, macaroon: &str) -> io::Result<PeerClaimerTokenReply> {
+        let attenuated = attenuate_for_creds_request(macaroon, now_unix())?;
+        self.call_typed(&Request::PeerClaimerToken {
             macaroon: attenuated,
         })?
         .map_err(io::Error::other)

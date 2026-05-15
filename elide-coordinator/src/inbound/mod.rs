@@ -68,9 +68,9 @@ use elide_coordinator::config::{StoreSection, store_config};
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcError, MintOperatorTokenReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
-    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
-    VolumeEventsReply,
+    IpcError, MintOperatorTokenReply, PeerClaimerTokenReply, PullReadonlyReply, RegisterReply,
+    ReleaseReply, Request, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
+    StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::macaroon::{
     self, Caveat, Macaroon, OperatorOp, OperatorReject, Scope, VerifyCtx, VerifyOperatorCtx,
@@ -494,6 +494,12 @@ async fn dispatch_json(
             )
             .await;
             let env: Envelope<StoreCredsReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::PeerClaimerToken { macaroon } => {
+            let result =
+                mint_peer_claimer_token(&macaroon, &ctx.data_dir, peer_pid, &ctx.identity).await;
+            let env: Envelope<PeerClaimerTokenReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
 
@@ -2113,13 +2119,18 @@ async fn resolve_peer_endpoint_for_volume(
         .map(|d| d.endpoint)
 }
 
-async fn issue_credentials(
+/// Shared authentication preamble for the macaroon-bound volume-daemon
+/// IPC ops (`Credentials`, `PeerClaimerToken`): MAC verify, volume
+/// caveat extraction, scope + caveat checks, and a fresh SO_PEERCRED /
+/// `volume.pid` / liveness re-check. Returns the parsed macaroon (for
+/// audit-log fields) and the bound `volume_ulid`. One copy so the two
+/// ops can never drift on the security checks.
+async fn authenticate_volume_macaroon(
     macaroon_str: &str,
     data_dir: &Path,
     peer_pid: Option<i32>,
     macaroon_root: &[u8; 32],
-    issuer: &dyn CredentialIssuer,
-) -> Result<StoreCredsReply, IpcError> {
+) -> Result<(Macaroon, String), IpcError> {
     let m = Macaroon::parse(macaroon_str)
         .map_err(|e| IpcError::bad_request(format!("parse macaroon: {e}")))?;
     if !macaroon::verify(macaroon_root, &m) {
@@ -2156,6 +2167,47 @@ async fn issue_credentials(
     if !pid_is_alive(peer_pid as u32) {
         return Err(IpcError::forbidden("peer pid not alive"));
     }
+    Ok((m, volume_ulid))
+}
+
+/// Resolve a claimed volume's current name from its ULID via the
+/// authoritative local `by_name/<name>` → `by_id/<ulid>` symlinks.
+/// This is the same name the serving peer's step 3 resolves through
+/// `names/<name>`; a coordinator with no local `by_name` entry for the
+/// volume is not its current local claimer and cannot mint a passing
+/// claimer token.
+fn resolve_volume_name(data_dir: &Path, volume_ulid: &str) -> Result<String, IpcError> {
+    let by_name = data_dir.join("by_name");
+    let entries = std::fs::read_dir(&by_name)
+        .map_err(|e| IpcError::internal(format!("read by_name: {e}")))?;
+    for entry in entries.flatten() {
+        let link = entry.path();
+        if !link.is_symlink() {
+            continue;
+        }
+        let Ok(target) = std::fs::canonicalize(&link) else {
+            continue;
+        };
+        if target.file_name().and_then(|n| n.to_str()) == Some(volume_ulid)
+            && let Some(name) = entry.file_name().to_str()
+        {
+            return Ok(name.to_owned());
+        }
+    }
+    Err(IpcError::forbidden(
+        "no local name claim for volume; not the current claimer",
+    ))
+}
+
+async fn issue_credentials(
+    macaroon_str: &str,
+    data_dir: &Path,
+    peer_pid: Option<i32>,
+    macaroon_root: &[u8; 32],
+    issuer: &dyn CredentialIssuer,
+) -> Result<StoreCredsReply, IpcError> {
+    let (m, volume_ulid) =
+        authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, macaroon_root).await?;
     let creds = issuer
         .issue(&volume_ulid)
         .await
@@ -2174,6 +2226,49 @@ async fn issue_credentials(
         secret_access_key: creds.secret_access_key,
         session_token: creds.session_token,
         expiry_unix: creds.expiry_unix,
+    })
+}
+
+/// Mint a coordinator-signed `PeerFetchToken` claimer credential for
+/// the requesting volume daemon. Same authentication as
+/// `issue_credentials`; the token is scoped to the volume's current
+/// name claim and signed with `coordinator.key`, so the serving peer's
+/// steps 1–3 confirm the requester is this volume's current claimer
+/// before serving body bytes.
+async fn mint_peer_claimer_token(
+    macaroon_str: &str,
+    data_dir: &Path,
+    peer_pid: Option<i32>,
+    identity: &elide_coordinator::identity::CoordinatorIdentity,
+) -> Result<PeerClaimerTokenReply, IpcError> {
+    let (m, volume_ulid) =
+        authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, identity.macaroon_root())
+            .await?;
+    let name = resolve_volume_name(data_dir, &volume_ulid)?;
+    let coordinator_id = identity.coordinator_id_str().to_owned();
+    let issued_at = elide_peer_fetch::PeerFetchToken::now_unix_seconds();
+    let payload =
+        elide_peer_fetch::PeerFetchToken::signing_payload(&name, &coordinator_id, issued_at);
+    let signature =
+        <elide_coordinator::identity::CoordinatorIdentity as elide_peer_fetch::TokenSigner>::sign(
+            identity, &payload,
+        );
+    let token = elide_peer_fetch::PeerFetchToken {
+        volume_name: name.clone(),
+        coordinator_id,
+        issued_at,
+        signature,
+    };
+    info!(
+        target: "creds::issuance",
+        volume_ulid = %volume_ulid,
+        volume_name = %name,
+        macaroon_nonce = %m.nonce_hex(),
+        "minted peer-fetch claimer token for volume daemon",
+    );
+    Ok(PeerClaimerTokenReply {
+        token: token.encode(),
+        issued_at,
     })
 }
 
@@ -2964,6 +3059,33 @@ mod tests {
         let link = by_name.join(name);
         std::os::unix::fs::symlink(&vol_dir, &link).unwrap();
         (vol_dir, link)
+    }
+
+    #[test]
+    fn resolve_volume_name_maps_ulid_via_by_name_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let ulid = ulid::Ulid::new().to_string();
+        let vol_dir = tmp.path().join("by_id").join(&ulid);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("myvol")).unwrap();
+
+        assert_eq!(
+            resolve_volume_name(tmp.path(), &ulid).unwrap(),
+            "myvol".to_owned()
+        );
+    }
+
+    #[test]
+    fn resolve_volume_name_unclaimed_volume_is_forbidden() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
+        // by_name has no symlink pointing at this ulid → not the
+        // current local claimer → forbidden (403-class).
+        let err = resolve_volume_name(tmp.path(), &ulid::Ulid::new().to_string())
+            .expect_err("no claim → reject");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
     }
 
     #[test]

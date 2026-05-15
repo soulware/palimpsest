@@ -19,11 +19,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use elide_core::signing::VOLUME_KEY_FILE;
 use elide_fetch::{FetchConfig, LocalRangeFetcher, RangeFetcher, RemoteFetcher, S3Credentials};
-use elide_peer_fetch::{
-    BodyFetchClient, PeerEndpoint, PeerFetchCountersHandle, PeerRangeFetcher, VolumeBodySigner,
-};
+use elide_peer_fetch::{BodyFetchClient, PeerEndpoint, PeerFetchCountersHandle, PeerRangeFetcher};
 
 /// Bundle of inputs the volume daemon needs to construct its remote
 /// fetcher. `fetch_config` drives S3 / local-store access; `creds`
@@ -106,12 +103,14 @@ pub fn log_peer_fetch_counters_at_shutdown(counters: Option<&PeerFetchCountersHa
 
 /// Build the `RemoteFetcher` the volume daemon uses for demand-fetch.
 ///
-/// When `inputs.peer_endpoint` is `Some` and the fork has a local
-/// `volume.key`, the inner store is wrapped with a [`PeerRangeFetcher`]
-/// so body byte ranges consult the previous claimer's peer-fetch
-/// server before falling through to S3. Missing `volume.key` (e.g.
-/// imported readonly bases) silently runs S3-only — the body-fetch
-/// token requires the running fork's signing key.
+/// When `inputs.peer_endpoint` is `Some` and a coordinator
+/// socket + macaroon is available (`inputs.reissue`), the inner store
+/// is wrapped with a [`PeerRangeFetcher`] so body byte ranges consult
+/// the previous claimer's peer-fetch server before falling through to
+/// S3. The peer authenticates a coordinator-signed `PeerFetchToken`
+/// the volume mints lazily over that IPC; with no coordinator IPC
+/// (standalone) the volume has no identity to present and silently
+/// runs S3-only.
 ///
 /// Returns `Ok(None)` when no `FetchConfig` is available (the volume
 /// is fully local with no remote tier).
@@ -122,14 +121,24 @@ pub fn build_volume_fetcher(
     let Some(config) = inputs.fetch_config else {
         return Ok(None);
     };
+    // Captured before `inputs.reissue` is consumed by `build_s3_store`:
+    // the claimer-token provider reuses the same coordinator socket +
+    // macaroon as the S3-creds path.
+    let claimer_src = inputs
+        .reissue
+        .as_ref()
+        .map(|r| (r.coordinator_socket.clone(), r.macaroon.clone()));
     let s3_store: Arc<dyn RangeFetcher> = build_s3_store(&config, inputs.creds, inputs.reissue)?;
-    let (demand_store, peer_counters) = match inputs.peer_endpoint {
-        Some(endpoint) if fork_dir.join(VOLUME_KEY_FILE).exists() => {
-            let vol_ulid_str = elide_fetch::derive_volume_id(fork_dir)?;
-            let vol_ulid = ulid::Ulid::from_string(&vol_ulid_str)
-                .map_err(|e| io::Error::other(format!("invalid volume ulid: {e}")))?;
-            let signer = VolumeBodySigner::load(fork_dir, VOLUME_KEY_FILE, vol_ulid)?;
-            let body_client = BodyFetchClient::new(Arc::new(signer))
+    let (demand_store, peer_counters) = match (inputs.peer_endpoint, claimer_src) {
+        // Peer body fetch requires a coordinator socket + macaroon to
+        // mint the `PeerFetchToken` the peer authenticates. Without it
+        // (standalone, no coordinator IPC) the volume runs S3-only —
+        // it has no identity to present to the peer.
+        (Some(endpoint), Some((socket, macaroon))) => {
+            let provider = Arc::new(crate::creds_fetcher::LazyClaimerToken::new(
+                socket, macaroon,
+            ));
+            let body_client = BodyFetchClient::new(provider)
                 .map_err(|e| io::Error::other(format!("body fetch client: {e}")))?;
             let runtime = peer_fetch_runtime_handle()?;
             let data_dir = fork_dir

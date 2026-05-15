@@ -188,6 +188,81 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Lazy, cached source of the coordinator-signed `PeerFetchToken`
+/// claimer credential presented on `.body` peer-fetch requests.
+///
+/// Modeled on the S3-creds path: one IPC at first use, then cached and
+/// refreshed at ≈ half the token freshness window (the cadence the
+/// body-token bearer already uses), never per cache miss. A refresh
+/// failure falls back to the last good token until it would itself be
+/// stale on the peer, then returns `None` — the request proceeds with
+/// no claimer header and the peer's claimer gate fails it closed (S3
+/// fallback), same as any other peer miss.
+pub struct LazyClaimerToken {
+    socket: PathBuf,
+    macaroon: String,
+    cached: std::sync::Mutex<Option<CachedClaimer>>,
+}
+
+struct CachedClaimer {
+    token: String,
+    /// unix seconds after which we refresh proactively
+    refresh_at: u64,
+    /// unix seconds after which the token is no longer presentable
+    expires_at: u64,
+}
+
+impl LazyClaimerToken {
+    pub fn new(socket: PathBuf, macaroon: String) -> Self {
+        Self {
+            socket,
+            macaroon,
+            cached: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for LazyClaimerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyClaimerToken").finish_non_exhaustive()
+    }
+}
+
+impl elide_peer_fetch::ClaimerTokenProvider for LazyClaimerToken {
+    fn claimer_bearer(&self) -> Option<String> {
+        let now = now_unix();
+        let mut guard = self.cached.lock().ok()?;
+        if let Some(c) = guard.as_ref()
+            && now < c.refresh_at
+        {
+            return Some(c.token.clone());
+        }
+        let client = coordinator_client::Client::new(&self.socket);
+        match client.peer_claimer_token(&self.macaroon) {
+            Ok(reply) => {
+                let window = elide_peer_fetch::DEFAULT_FRESHNESS_WINDOW_SECS;
+                let token = reply.token.clone();
+                *guard = Some(CachedClaimer {
+                    token: reply.token,
+                    refresh_at: reply.issued_at + window / 2,
+                    expires_at: reply.issued_at + window,
+                });
+                Some(token)
+            }
+            Err(e) => match guard.as_ref() {
+                Some(c) if now < c.expires_at => {
+                    warn!("[claimer] refresh failed, using cached token: {e}");
+                    Some(c.token.clone())
+                }
+                _ => {
+                    warn!("[claimer] no claimer token available: {e}");
+                    None
+                }
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -324,28 +324,26 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-/// Trait implemented by anything that can sign body-fetch tokens with
-/// a volume's Ed25519 key. Volume-side equivalent of [`TokenSigner`].
-///
-/// The signer's `volume.pub` is published at
-/// `by_id/<vol_ulid>/volume.pub` (the same per-fork key the rest of
-/// the trust model uses); the peer's auth pipeline resolves it from
-/// there.
-pub trait BodyTokenSigner: Debug + Send + Sync {
-    /// The volume ULID this signer represents — i.e. the ULID under
-    /// which the matching `volume.pub` is published.
-    fn vol_ulid(&self) -> Ulid;
-
-    /// Ed25519 sign the body-fetch token's canonical signing payload.
-    fn sign(&self, msg: &[u8]) -> [u8; 64];
+/// Source of the coordinator-signed `PeerFetchToken` the volume
+/// process presents on `.body` requests. The volume has no key the
+/// peer trusts directly; its entire identity to the peer is this
+/// coordinator-vouched token (the peer verifies it exactly as it does
+/// an `.idx` request — steps 1–4, anchored at the URL's `vol_id`).
+/// Implementations cache the token and refresh it out-of-band;
+/// `claimer_bearer` returns the currently valid base64
+/// [`PeerFetchToken`], or `None` when one cannot be obtained — the
+/// request is then abandoned and the caller falls through to S3, the
+/// same outcome as any other peer miss.
+pub trait ClaimerTokenProvider: Debug + Send + Sync {
+    fn claimer_bearer(&self) -> Option<String>;
 }
 
-/// HTTP client for the volume-signed `.body` route.
+/// HTTP client for the `.body` Range route.
 ///
-/// Cheap to clone — internal state is `Arc`-wrapped. Holds a
-/// connection pool, a body-token signer, and a single cached bearer
-/// (the token has no per-request scoping; one mint covers every body
-/// request on the same volume until refresh).
+/// Cheap to clone — internal state is `Arc`-wrapped. The bearer is the
+/// coordinator-signed `PeerFetchToken` supplied by the
+/// [`ClaimerTokenProvider`]; this client neither mints nor caches it
+/// (the provider owns that lifecycle).
 #[derive(Clone)]
 pub struct BodyFetchClient {
     inner: Arc<BodyInner>,
@@ -353,34 +351,29 @@ pub struct BodyFetchClient {
 
 struct BodyInner {
     http: reqwest::Client,
-    signer: Arc<dyn BodyTokenSigner>,
+    token: Arc<dyn ClaimerTokenProvider>,
     request_timeout: Duration,
-    token_refresh_after: Duration,
-    cached: RwLock<Option<CachedToken>>,
 }
 
 impl Debug for BodyFetchClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BodyFetchClient")
-            .field("signer", &self.inner.signer)
+            .field("token", &self.inner.token)
             .field("request_timeout", &self.inner.request_timeout)
-            .field("token_refresh_after", &self.inner.token_refresh_after)
             .finish()
     }
 }
 
 impl BodyFetchClient {
-    /// Build a client with the default request timeout (5 s) and
-    /// default token refresh interval (half the freshness window).
-    pub fn new(signer: Arc<dyn BodyTokenSigner>) -> Result<Self, BuildError> {
-        Self::builder(signer).build()
+    /// Build a client with the default request timeout (5 s).
+    pub fn new(token: Arc<dyn ClaimerTokenProvider>) -> Result<Self, BuildError> {
+        Self::builder(token).build()
     }
 
-    pub fn builder(signer: Arc<dyn BodyTokenSigner>) -> BodyFetchClientBuilder {
+    pub fn builder(token: Arc<dyn ClaimerTokenProvider>) -> BodyFetchClientBuilder {
         BodyFetchClientBuilder {
-            signer,
+            token,
             request_timeout: Duration::from_secs(5),
-            token_refresh_after: Duration::from_secs(DEFAULT_FRESHNESS_WINDOW_SECS / 2),
         }
     }
 
@@ -418,9 +411,17 @@ impl BodyFetchClient {
             return Some(Bytes::new());
         }
         let url = format!("{}/v1/{}/{}.body", peer.url(), vol_id, seg_ulid);
-        let bearer = self.token_for().await;
+        let Some(bearer) = self.inner.token.claimer_bearer() else {
+            tracing::info!(
+                target = "peer-fetch::range",
+                %vol_id, %seg_ulid,
+                reason = "no_claimer_token",
+                "body peer-fetch skipped; falling through to S3"
+            );
+            return None;
+        };
         let range_end_inclusive = range_start + range_len - 1;
-        let response = match self
+        let req = self
             .inner
             .http
             .get(&url)
@@ -429,15 +430,16 @@ impl BodyFetchClient {
                 http::header::RANGE,
                 format!("bytes={}-{}", range_start, range_end_inclusive),
             )
-            .timeout(self.inner.request_timeout)
-            .send()
-            .await
-        {
+            .timeout(self.inner.request_timeout);
+        let response = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                trace!(
-                    target = "peer-fetch::client",
-                    url, error = %e, "body request failed"
+                tracing::info!(
+                    target = "peer-fetch::range",
+                    %vol_id, %seg_ulid,
+                    reason = "network",
+                    error = %e,
+                    "body peer-fetch failed; falling through to S3"
                 );
                 return None;
             }
@@ -445,11 +447,14 @@ impl BodyFetchClient {
 
         let status = response.status();
         if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-            trace!(
-                target = "peer-fetch::client",
-                url,
+            // 401 → not the current claimer; 403 → url_vol_id outside
+            // a lineage the peer serves; 404 → segment body/idx absent.
+            tracing::info!(
+                target = "peer-fetch::range",
+                %vol_id, %seg_ulid,
+                reason = "http",
                 status = status.as_u16(),
-                "body non-2xx"
+                "body peer-fetch declined; falling through to S3"
             );
             return None;
         }
@@ -470,9 +475,11 @@ impl BodyFetchClient {
                     Some(cr_end_inclusive - cr_start + 1)
                 }
                 _ => {
-                    trace!(
-                        target = "peer-fetch::client",
-                        url, "206 Content-Range invalid or non-prefix; treating as miss"
+                    tracing::info!(
+                        target = "peer-fetch::range",
+                        %vol_id, %seg_ulid,
+                        reason = "malformed_partial",
+                        "206 Content-Range invalid or non-prefix; falling through to S3"
                     );
                     return None;
                 }
@@ -484,53 +491,29 @@ impl BodyFetchClient {
         match response.bytes().await {
             Ok(b) => match expected_partial_len {
                 Some(expected) if b.len() as u64 != expected => {
-                    trace!(
-                        target = "peer-fetch::client",
-                        url,
+                    tracing::info!(
+                        target = "peer-fetch::range",
+                        %vol_id, %seg_ulid,
+                        reason = "malformed_partial",
                         body_len = b.len(),
                         expected,
-                        "206 body length disagrees with Content-Range"
+                        "206 body length disagrees with Content-Range; falling through to S3"
                     );
                     None
                 }
                 _ => Some(b),
             },
             Err(e) => {
-                trace!(
-                    target = "peer-fetch::client",
-                    url, error = %e, "read body bytes failed"
+                tracing::info!(
+                    target = "peer-fetch::range",
+                    %vol_id, %seg_ulid,
+                    reason = "network",
+                    error = %e,
+                    "reading body bytes failed; falling through to S3"
                 );
                 None
             }
         }
-    }
-
-    async fn token_for(&self) -> String {
-        if let Some(cached) = self.inner.cached.read().await.clone()
-            && Instant::now() < cached.refresh_at
-        {
-            return cached.bearer;
-        }
-        self.mint_token().await
-    }
-
-    async fn mint_token(&self) -> String {
-        let vol_ulid = self.inner.signer.vol_ulid();
-        let issued_at = crate::body_token::BodyFetchToken::now_unix_seconds();
-        let payload = crate::body_token::BodyFetchToken::signing_payload(vol_ulid, issued_at);
-        let signature = self.inner.signer.sign(&payload);
-        let token = crate::body_token::BodyFetchToken {
-            vol_ulid,
-            issued_at,
-            signature,
-        };
-        let bearer = token.encode();
-        let refresh_at = Instant::now() + self.inner.token_refresh_after;
-        *self.inner.cached.write().await = Some(CachedToken {
-            bearer: bearer.clone(),
-            refresh_at,
-        });
-        bearer
     }
 }
 
@@ -549,19 +532,13 @@ fn parse_content_range(header: &str) -> Option<(u64, u64)> {
 }
 
 pub struct BodyFetchClientBuilder {
-    signer: Arc<dyn BodyTokenSigner>,
+    token: Arc<dyn ClaimerTokenProvider>,
     request_timeout: Duration,
-    token_refresh_after: Duration,
 }
 
 impl BodyFetchClientBuilder {
     pub fn request_timeout(mut self, d: Duration) -> Self {
         self.request_timeout = d;
-        self
-    }
-
-    pub fn token_refresh_after(mut self, d: Duration) -> Self {
-        self.token_refresh_after = d;
         self
     }
 
@@ -573,10 +550,8 @@ impl BodyFetchClientBuilder {
         Ok(BodyFetchClient {
             inner: Arc::new(BodyInner {
                 http,
-                signer: self.signer,
+                token: self.token,
                 request_timeout: self.request_timeout,
-                token_refresh_after: self.token_refresh_after,
-                cached: RwLock::new(None),
             }),
         })
     }

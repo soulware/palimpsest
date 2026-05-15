@@ -19,6 +19,7 @@ use std::sync::Mutex as StdMutex;
 
 use bytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey};
+use elide_core::name_record::{NameRecord, NameState};
 use elide_core::segment::{
     SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, write_segment,
 };
@@ -26,7 +27,9 @@ use elide_core::signing::{ProvenanceLineage, write_provenance};
 use elide_fetch::RangeFetcher;
 use elide_peer_fetch::auth::AuthState;
 use elide_peer_fetch::server::{ServerContext, router};
-use elide_peer_fetch::{BodyFetchClient, BodyTokenSigner, PeerEndpoint, PeerRangeFetcher};
+use elide_peer_fetch::{
+    BodyFetchClient, ClaimerTokenProvider, PeerEndpoint, PeerFetchToken, PeerRangeFetcher,
+};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
@@ -191,21 +194,60 @@ impl SegmentSigner for TestSegSigner {
     }
 }
 
-/// `BodyTokenSigner` impl over a raw `SigningKey`. Allows constructing
-/// a body token whose `vol_ulid` is independent of the URL vol_id —
-/// needed for the lineage-rejection negative case.
+/// Static [`ClaimerTokenProvider`]: hands back a pre-signed
+/// `PeerFetchToken` bearer (or `None` to model "no token available").
 #[derive(Debug)]
-struct TestBodySigner {
-    vol_ulid: Ulid,
-    key: SigningKey,
+struct StubClaimer(Option<String>);
+impl ClaimerTokenProvider for StubClaimer {
+    fn claimer_bearer(&self) -> Option<String> {
+        self.0.clone()
+    }
 }
-impl BodyTokenSigner for TestBodySigner {
-    fn vol_ulid(&self) -> Ulid {
-        self.vol_ulid
+
+/// Sign a `PeerFetchToken` with `coord_key` over its canonical payload
+/// — the coordinator-minted credential the volume presents on `.body`.
+fn sign_peer_token(volume_name: &str, coordinator_id: &str, coord_key: &SigningKey) -> String {
+    let issued_at = PeerFetchToken::now_unix_seconds();
+    let payload = PeerFetchToken::signing_payload(volume_name, coordinator_id, issued_at);
+    PeerFetchToken {
+        volume_name: volume_name.to_owned(),
+        coordinator_id: coordinator_id.to_owned(),
+        issued_at,
+        signature: coord_key.sign(&payload).to_bytes(),
     }
-    fn sign(&self, msg: &[u8]) -> [u8; 64] {
-        self.key.sign(msg).to_bytes()
-    }
+    .encode()
+}
+
+/// Publish `coordinators/<id>/coordinator.pub` (step 2 trust anchor).
+async fn publish_coordinator(store: &Arc<dyn ObjectStore>, coord_id: &str, key: &SigningKey) {
+    store
+        .put(
+            &StorePath::from(format!("coordinators/{coord_id}/coordinator.pub")),
+            Bytes::from(pub_hex(key).into_bytes()).into(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Publish a live `names/<name>` claimed by `coord_id` (step 3).
+async fn publish_name(store: &Arc<dyn ObjectStore>, name: &str, vol_ulid: Ulid, coord_id: &str) {
+    let mut record = NameRecord::live_minimal(vol_ulid, 4 * 1024 * 1024 * 1024);
+    record.coordinator_id = Some(coord_id.to_owned());
+    record.state = NameState::Live;
+    store
+        .put(
+            &StorePath::from(format!("names/{name}")),
+            Bytes::from(record.to_toml().unwrap().into_bytes()).into(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Build a `BodyFetchClient` whose claimer token authorises `name`
+/// (published live for `coord_id`/`coord_key`).
+fn claimer_client(name: &str, coord_id: &str, coord_key: &SigningKey) -> BodyFetchClient {
+    let bearer = sign_peer_token(name, coord_id, coord_key);
+    BodyFetchClient::new(Arc::new(StubClaimer(Some(bearer)))).unwrap()
 }
 
 /// Hex-encoded volume.pub line as the peer-fetch routes expect.
@@ -269,13 +311,12 @@ async fn cross_host_full_body_hit() {
     let (seg_ulid, _body_section_start) =
         mk_segment(data_dir.path(), &v, vec![(payload.clone(), true)]);
     mirror_volume_local(data_dir.path(), &v);
+    let coord_key = SigningKey::generate(&mut OsRng);
+    publish_coordinator(&store, "coord-a", &coord_key).await;
+    publish_name(&store, "myvol", v.ulid, "coord-a").await;
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
-    let signer = Arc::new(TestBodySigner {
-        vol_ulid: v.ulid,
-        key: v.key.clone(),
-    });
-    let client = BodyFetchClient::new(signer).unwrap();
+    let client = claimer_client("myvol", "coord-a", &coord_key);
 
     let bytes = client
         .fetch_body_range(&peer_a.endpoint, v.ulid, seg_ulid, 0, payload.len() as u64)
@@ -305,13 +346,12 @@ async fn cross_host_partial_coverage_splice() {
         vec![(first.clone(), true), (second.clone(), false)],
     );
     mirror_volume_local(data_dir.path(), &v);
+    let coord_key = SigningKey::generate(&mut OsRng);
+    publish_coordinator(&store, "coord-a", &coord_key).await;
+    publish_name(&store, "myvol", v.ulid, "coord-a").await;
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
-    let signer = Arc::new(TestBodySigner {
-        vol_ulid: v.ulid,
-        key: v.key.clone(),
-    });
-    let client = BodyFetchClient::new(signer).unwrap();
+    let client = claimer_client("myvol", "coord-a", &coord_key);
     // 0xEE distinguishes the inner-store remainder bytes from the
     // peer-served prefix in the spliced result.
     let inner = Arc::new(RecordingInner::new(vec![0xEEu8]));
@@ -361,13 +401,12 @@ async fn peer_404_when_segment_missing() {
     // decline.
     let data_dir = TempDir::new().unwrap();
     mirror_volume_local(data_dir.path(), &v);
+    let coord_key = SigningKey::generate(&mut OsRng);
+    publish_coordinator(&store, "coord-a", &coord_key).await;
+    publish_name(&store, "myvol", v.ulid, "coord-a").await;
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
-    let signer = Arc::new(TestBodySigner {
-        vol_ulid: v.ulid,
-        key: v.key.clone(),
-    });
-    let client = BodyFetchClient::new(signer).unwrap();
+    let client = claimer_client("myvol", "coord-a", &coord_key);
 
     let made_up_seg = Ulid::new();
     let result = client
@@ -379,61 +418,61 @@ async fn peer_404_when_segment_missing() {
     );
 }
 
-/// Two-coordinator + two-volume: peer A serves segment data for volume
-/// V. A *different* volume W (valid `volume.key`, no lineage relation
-/// to V) signs a body token and requests V's segment.
-///
-/// Post `url_vol_id` re-anchor (PR #361), this **succeeds**: the
-/// volume-key signature proves W holds a valid key, and step 4 is
-/// anchored at `url_vol_id` (V — which the peer serves locally), so the
-/// chain walks and authorises. The old `token.vol_ulid` anchor rejected
-/// this only as a side effect of the availability bug (W's provenance
-/// not on the peer's local disk — same reason the legitimate claimant
-/// was wrongly rejected). Per docs/design-peer-segment-fetch.md §"Step
-/// 4 anchor", the lineage gate is intent-scoping, not confidentiality:
-/// W's coordinator can already `GET by_id/V/...` straight from S3, so
-/// the peer adds no boundary here.
-///
-/// The genuine load gate for `.body` — "requester is a current
-/// claimer" — is the proposed body-token claimer gate (steps 2–3 port;
-/// see §"Body-token claimer gate (proposed, v1.x)"). Until that lands,
-/// `.body` has no claimer gate; this test asserts the interim reality
-/// and is the regression anchor to flip when the gate is implemented.
-// TODO(claimer-gate): once the body-token claimer gate lands, W has no
-// live `names/<name>` claim binding its coordinator to any served
-// volume, so this must again be rejected — at step 3 (401), not the
-// old lineage 403. Re-assert rejection then.
+/// Claimer gate: a coordinator that is *not* the current claimer
+/// cannot pull body bytes, even with a structurally valid,
+/// correctly-signed `PeerFetchToken`. Peer A serves V's segment;
+/// `names/myvol` is claimed by `coord-a`. `coord-b` (its
+/// `coordinator.pub` is published, so step 2 passes) signs a token for
+/// `myvol` — step 3 sees `names/myvol.coordinator_id == coord-a`,
+/// rejects as `NotCurrentClaimer` (401), and the client falls through
+/// to S3 (`None`). This is the load gate that bounds peer body fetch
+/// to current claimers; the bytes themselves are not confidential
+/// (any bucket coordinator can `GET` them from S3 directly).
 #[tokio::test]
-async fn unrelated_volume_key_fetches_served_segment_no_claimer_gate_yet() {
+async fn body_rejected_when_not_current_claimer() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let v = mk_volume(&store).await;
-    let w = mk_volume(&store).await;
 
     let payload = vec![0xCDu8; 4096];
     let data_dir = TempDir::new().unwrap();
     let (seg_ulid, _) = mk_segment(data_dir.path(), &v, vec![(payload.clone(), true)]);
-    // Only V is served locally; W's provenance is never mirrored here.
+    mirror_volume_local(data_dir.path(), &v);
+
+    let coord_a_key = SigningKey::generate(&mut OsRng);
+    let coord_b_key = SigningKey::generate(&mut OsRng);
+    publish_coordinator(&store, "coord-a", &coord_a_key).await;
+    publish_coordinator(&store, "coord-b", &coord_b_key).await;
+    // The volume is claimed by coord-a.
+    publish_name(&store, "myvol", v.ulid, "coord-a").await;
+    let peer_a = spawn_peer(store.clone(), data_dir).await;
+
+    // coord-b signs a well-formed token for myvol but does not claim it.
+    let client = claimer_client("myvol", "coord-b", &coord_b_key);
+    let result = client
+        .fetch_body_range(&peer_a.endpoint, v.ulid, seg_ulid, 0, 4096)
+        .await;
+    assert!(
+        result.is_none(),
+        "a non-current-claimer coordinator must be rejected (step 3 → 401 → S3 fallback)"
+    );
+}
+
+/// With no claimer token at all, the client never sends a request and
+/// the caller falls straight through to S3.
+#[tokio::test]
+async fn body_no_claimer_token_falls_through() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let v = mk_volume(&store).await;
+
+    let payload = vec![0x11u8; 4096];
+    let data_dir = TempDir::new().unwrap();
+    let (seg_ulid, _) = mk_segment(data_dir.path(), &v, vec![(payload, true)]);
     mirror_volume_local(data_dir.path(), &v);
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
-    // Sign with W's key, request V's segment. Signature verifies under
-    // by_id/W/volume.pub (shared store); step 4 walks ancestry(V) — the
-    // served URL vol_id — which succeeds, so the request authorises.
-    let w_signer = Arc::new(TestBodySigner {
-        vol_ulid: w.ulid,
-        key: w.key.clone(),
-    });
-    let client = BodyFetchClient::new(w_signer).unwrap();
-
-    let bytes = client
+    let client = BodyFetchClient::new(Arc::new(StubClaimer(None))).unwrap();
+    let result = client
         .fetch_body_range(&peer_a.endpoint, v.ulid, seg_ulid, 0, 4096)
-        .await
-        .expect(
-            "re-anchor authorises any valid volume key for a served segment (no claimer gate yet)",
-        );
-    assert_eq!(
-        &bytes[..],
-        payload.as_slice(),
-        "served segment body returned in full"
-    );
+        .await;
+    assert!(result.is_none(), "no token → no peer request → S3 fallback");
 }

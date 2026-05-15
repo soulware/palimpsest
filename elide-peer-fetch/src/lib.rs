@@ -36,18 +36,15 @@
 
 pub mod ancestry;
 pub mod auth;
-pub mod body_token;
 pub mod client;
 pub mod endpoint;
 pub mod hint;
 pub mod range_fetcher;
 pub mod server;
 pub mod token;
-pub mod volume_signer;
 
-pub use body_token::{BODY_DOMAIN_TAG, BodyFetchToken};
 pub use client::{
-    BodyFetchClient, BodyTokenSigner, BuildError, PeerFetchClient, PeerFetchClientBuilder,
+    BodyFetchClient, BuildError, ClaimerTokenProvider, PeerFetchClient, PeerFetchClientBuilder,
     TokenSigner,
 };
 pub use endpoint::{EndpointParseError, PeerEndpoint};
@@ -56,4 +53,3 @@ pub use range_fetcher::{PeerFetchCounters, PeerFetchCountersHandle, PeerRangeFet
 pub use token::{
     DEFAULT_FRESHNESS_WINDOW_SECS, DOMAIN_TAG, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };
-pub use volume_signer::VolumeBodySigner;

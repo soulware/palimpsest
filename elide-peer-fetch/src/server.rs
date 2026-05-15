@@ -350,9 +350,13 @@ async fn handle_segment_inner(
 
 /// Handle a `GET /v1/<vol_id>/<seg_ulid>.body` request.
 ///
-/// Auth: volume-signed bearer token verified against
-/// `by_id/<token.vol_ulid>/volume.pub` plus a lineage check that
-/// `<vol_id>` is in the signing volume's signed ancestry.
+/// Auth: identical to the `.idx` route. `Authorization` carries the
+/// coordinator-signed `PeerFetchToken`, verified `LineageGated`
+/// (steps 1–4, lineage anchored at `<vol_id>`). The volume has no key
+/// the peer trusts directly; its identity is fully delegated through
+/// its coordinator's signature + the `names/<name>` current-claimer
+/// check, which also bounds peer body load to current claimers.
+/// Missing or invalid → the client falls through to S3.
 ///
 /// Coverage:
 /// - Every overlapping Data entry present → `200 OK`, full body
@@ -380,8 +384,13 @@ async fn handle_body(
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let bearer = parse_bearer(bearer_header).map_err(RouteError::Auth)?;
+    // Same verification as the `.idx` route: the coordinator-signed
+    // `PeerFetchToken`, `LineageGated` (steps 1–4, lineage anchored at
+    // `vol_id`). Step 3 (`names/<name>` current-claimer) is what bounds
+    // peer body load to current claimers; step 4 fail-closes for any
+    // `vol_id` the peer doesn't serve. Step 5 is the local-stat below.
     ctx.auth
-        .verify_body_token(bearer, vol_id)
+        .verify(bearer, vol_id, crate::auth::RouteAuthMode::LineageGated)
         .await
         .map_err(RouteError::Auth)?;
 
@@ -1078,7 +1087,6 @@ mod tests {
 
     // --- .body route tests ---
 
-    use crate::body_token::BodyFetchToken;
     use elide_core::segment::{
         SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, set_present_bit, write_segment,
     };
@@ -1147,80 +1155,23 @@ mod tests {
         std::fs::write(&idx_path, &seg_bytes[..body_section_start]).unwrap();
     }
 
-    fn sign_body_token(vol_ulid: Ulid, key: &SigningKey) -> BodyFetchToken {
-        let issued = BodyFetchToken::now_unix_seconds();
-        let payload = BodyFetchToken::signing_payload(vol_ulid, issued);
-        let sig = key.sign(&payload).to_bytes();
-        BodyFetchToken {
-            vol_ulid,
-            issued_at: issued,
-            signature: sig,
-        }
-    }
-
-    fn body_bearer(token: &BodyFetchToken) -> String {
+    /// Branch 2: the `.body` route authenticates the same
+    /// coordinator-signed `PeerFetchToken` as `.idx`, so the body
+    /// tests reuse the coordinator-token [`fixture`] and mint the
+    /// bearer with [`sign_token`] over the fixture's current claim.
+    fn body_bearer(f: &Fixture) -> String {
+        let token = sign_token(
+            &f.vol_name,
+            &f.coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &f.coord_key,
+        );
         format!("Bearer {}", token.encode())
-    }
-
-    /// Volume-side fixture: in-memory store, tmp data_dir, one
-    /// volume's `volume.pub` published, the volume's signing key
-    /// retained for token minting. No coordinator/name records — body
-    /// auth doesn't need them.
-    struct BodyFixture {
-        router: Router,
-        data_dir: TempDir,
-        vol_key: SigningKey,
-        vol_ulid: Ulid,
-    }
-
-    async fn body_fixture() -> BodyFixture {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::single_store(store.clone());
-        let data_dir = TempDir::new().unwrap();
-        let vol_key = SigningKey::generate(&mut OsRng);
-        let vol_ulid = Ulid::new();
-
-        // Publish volume.pub + provenance under by_id/<vol_ulid>/.
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("volume.pub"), pub_hex(&vol_key)).unwrap();
-        write_provenance(
-            tmp.path(),
-            &vol_key,
-            "volume.provenance",
-            &ProvenanceLineage::default(),
-        )
-        .unwrap();
-        let pub_bytes = std::fs::read(tmp.path().join("volume.pub")).unwrap();
-        let prov_bytes = std::fs::read(tmp.path().join("volume.provenance")).unwrap();
-        store
-            .put(
-                &StorePath::from(format!("by_id/{vol_ulid}/volume.pub")),
-                Bytes::from(pub_bytes).into(),
-            )
-            .await
-            .unwrap();
-        store
-            .put(
-                &StorePath::from(format!("by_id/{vol_ulid}/volume.provenance")),
-                Bytes::from(prov_bytes).into(),
-            )
-            .await
-            .unwrap();
-
-        let ctx = ServerContext::new(auth, data_dir.path().to_owned());
-        let router = router(ctx);
-
-        BodyFixture {
-            router,
-            data_dir,
-            vol_key,
-            vol_ulid,
-        }
     }
 
     #[tokio::test]
     async fn body_happy_path_returns_extent_bytes() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let payload = vec![0xABu8; 4096];
         let hash = blake3::hash(&payload);
@@ -1230,13 +1181,12 @@ mod tests {
             f.vol_ulid,
             seg_ulid,
             vec![entry],
-            &f.vol_key,
+            &f.coord_key,
         );
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .header(http::header::RANGE, "bytes=0-4095")
             .body(Body::empty())
             .unwrap();
@@ -1248,7 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_missing_range_header_is_416() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let payload = vec![0u8; 4096];
         let hash = blake3::hash(&payload);
@@ -1258,13 +1208,12 @@ mod tests {
             f.vol_ulid,
             seg_ulid,
             vec![entry],
-            &f.vol_key,
+            &f.coord_key,
         );
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .body(Body::empty())
             .unwrap();
         let (status, _) = run(&f.router, req).await;
@@ -1273,7 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_malformed_range_is_416() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let payload = vec![0u8; 4096];
         let hash = blake3::hash(&payload);
@@ -1283,10 +1232,9 @@ mod tests {
             f.vol_ulid,
             seg_ulid,
             vec![entry],
-            &f.vol_key,
+            &f.coord_key,
         );
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         for bad in [
             "garbage",
             "bytes=0",
@@ -1297,7 +1245,7 @@ mod tests {
         ] {
             let req = Request::builder()
                 .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-                .header(http::header::AUTHORIZATION, body_bearer(&token))
+                .header(http::header::AUTHORIZATION, body_bearer(&f))
                 .header(http::header::RANGE, bad)
                 .body(Body::empty())
                 .unwrap();
@@ -1312,13 +1260,12 @@ mod tests {
 
     #[tokio::test]
     async fn body_missing_local_file_returns_404() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new(); // no files written
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .header(http::header::RANGE, "bytes=0-99")
             .body(Body::empty())
             .unwrap();
@@ -1331,7 +1278,7 @@ mod tests {
     /// falls through to S3.
     #[tokio::test]
     async fn body_present_bit_unset_returns_404() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let payload = vec![0xCDu8; 4096];
         let hash = blake3::hash(&payload);
@@ -1343,7 +1290,7 @@ mod tests {
             f.vol_ulid,
             seg_ulid,
             vec![entry],
-            &f.vol_key,
+            &f.coord_key,
         );
         // Truncate .present to all-zero bits.
         let present_path = f
@@ -1355,10 +1302,9 @@ mod tests {
             .join(format!("{seg_ulid}.present"));
         std::fs::write(&present_path, [0u8; 1]).unwrap();
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .header(http::header::RANGE, "bytes=0-4095")
             .body(Body::empty())
             .unwrap();
@@ -1368,7 +1314,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_missing_authorization_is_401() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
@@ -1381,13 +1327,12 @@ mod tests {
 
     #[tokio::test]
     async fn body_outside_lineage_is_403() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let unrelated = Ulid::new();
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", unrelated, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .header(http::header::RANGE, "bytes=0-99")
             .body(Body::empty())
             .unwrap();
@@ -1402,7 +1347,7 @@ mod tests {
     /// with an S3 fetch for the remainder.
     #[tokio::test]
     async fn body_partial_coverage_returns_206_with_content_range() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let first = vec![0xAAu8; 4096];
         let second = vec![0xBBu8; 4096];
@@ -1416,7 +1361,13 @@ mod tests {
             ),
             SegmentEntry::new_data(blake3::hash(&second), 1, 1, SegmentFlags::empty(), second),
         ];
-        write_segment_files(f.data_dir.path(), f.vol_ulid, seg_ulid, entries, &f.vol_key);
+        write_segment_files(
+            f.data_dir.path(),
+            f.vol_ulid,
+            seg_ulid,
+            entries,
+            &f.coord_key,
+        );
         // Clear bit 1 (the second Data entry) while keeping bit 0
         // (the first) set. With two entries the bitmap is one byte.
         let present_path = f
@@ -1428,10 +1379,9 @@ mod tests {
             .join(format!("{seg_ulid}.present"));
         std::fs::write(&present_path, [0b0000_0001u8]).unwrap();
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .header(http::header::RANGE, "bytes=0-8191")
             .body(Body::empty())
             .unwrap();
@@ -1451,7 +1401,7 @@ mod tests {
     /// emit a 206 with zero bytes.
     #[tokio::test]
     async fn body_first_entry_missing_returns_404_not_empty_206() {
-        let f = body_fixture().await;
+        let f = fixture().await;
         let seg_ulid = Ulid::new();
         let first = vec![0xAAu8; 4096];
         let second = vec![0xBBu8; 4096];
@@ -1459,7 +1409,13 @@ mod tests {
             SegmentEntry::new_data(blake3::hash(&first), 0, 1, SegmentFlags::empty(), first),
             SegmentEntry::new_data(blake3::hash(&second), 1, 1, SegmentFlags::empty(), second),
         ];
-        write_segment_files(f.data_dir.path(), f.vol_ulid, seg_ulid, entries, &f.vol_key);
+        write_segment_files(
+            f.data_dir.path(),
+            f.vol_ulid,
+            seg_ulid,
+            entries,
+            &f.coord_key,
+        );
         // Clear bit 0 (first entry); keep bit 1 (second entry) set.
         // The client can't use a 206 starting after a hole — fall
         // through to S3 cleanly.
@@ -1472,42 +1428,13 @@ mod tests {
             .join(format!("{seg_ulid}.present"));
         std::fs::write(&present_path, [0b0000_0010u8]).unwrap();
 
-        let token = sign_body_token(f.vol_ulid, &f.vol_key);
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(http::header::AUTHORIZATION, body_bearer(&token))
+            .header(http::header::AUTHORIZATION, body_bearer(&f))
             .header(http::header::RANGE, "bytes=0-8191")
             .body(Body::empty())
             .unwrap();
         let (status, _) = run(&f.router, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    /// A coordinator-flavour token sent at the `.body` route fails
-    /// the body-token decode (different wire shape) → 401 BadToken.
-    #[tokio::test]
-    async fn body_route_rejects_coord_token() {
-        let f = body_fixture().await;
-        // Mint a coordinator-flavour token signed by the vol_key (so
-        // it's a valid signature against *something*); the body
-        // decoder still rejects on wire shape.
-        let coord_token = sign_token(
-            "any-vol",
-            "any-coord",
-            PeerFetchToken::now_unix_seconds(),
-            &f.vol_key,
-        );
-        let seg_ulid = Ulid::new();
-        let req = Request::builder()
-            .uri(format!("/v1/{}/{}.body", f.vol_ulid, seg_ulid))
-            .header(
-                http::header::AUTHORIZATION,
-                format!("Bearer {}", coord_token.encode()),
-            )
-            .header(http::header::RANGE, "bytes=0-99")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = run(&f.router, req).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
