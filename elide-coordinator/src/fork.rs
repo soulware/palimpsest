@@ -427,8 +427,8 @@ impl ForkOrchestrator {
             // Stopped source: reuse the latest snapshot if it covers
             // all durable state.
             let cover = match crate::inbound::release_fast_path_handoff(&source_dir) {
-                Ok(Some(cover)) => cover,
-                Ok(None) => {
+                Ok(crate::inbound::FastPathDisposition::Cover(cover)) => cover,
+                Ok(_) => {
                     return Err(IpcError::conflict(format!(
                         "source '{name}' has durable state past the last snapshot \
                          (WAL/pending uploads not yet drained); the previous stop \
