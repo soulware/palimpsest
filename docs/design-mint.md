@@ -60,12 +60,15 @@ signed session token, because Tigris has no session-token endpoint).
         └───── uses returned keypair against Tigris ────────────┘
 ```
 
-The caller (e.g. an Elide coordinator) holds a macaroon issued by an authority
-the mint trusts. It calls `mint`'s HTTP API, presenting the macaroon and a role
-name. `mint` verifies the macaroon, looks up the role, renders the role's
-policy template with values drawn from macaroon caveats, calls Tigris IAM to
-mint a keypair under that policy, and returns the keypair to the caller. The
-caller then uses the keypair directly against Tigris's S3 endpoint.
+The caller (e.g. an Elide coordinator) holds a macaroon **issued by the
+mint itself** — minted once at provisioning/login, then attenuated by
+the caller per request. It calls `mint`'s HTTP API, presenting the
+(attenuated) macaroon plus any discharge macaroons and a role name.
+`mint` verifies the macaroon against its own root and any third-party
+caveats, looks up the role, renders the role's policy template with
+values drawn from macaroon caveats, calls Tigris IAM to mint a keypair
+under that policy, and returns the keypair to the caller. The caller
+then uses the keypair directly against Tigris's S3 endpoint.
 
 `mint` is **never** in the data path. It is consulted only at credential
 issuance and refresh.
@@ -80,20 +83,52 @@ mint  ↔ Tigris IAM:  admin credential (held by mint, never disclosed)
 caller ↔ Tigris S3:  the freshly-minted scoped keypair
 ```
 
-The admin credential lives and dies inside the mint process. It never reaches
-the caller. The macaroon root key lives inside the mint as well (for verifying
-caller-presented macaroons) — but mint is *not* an issuer; some other authority
-mints the macaroons, mint only verifies them.
+**mint is both issuer and verifier of the primary macaroon.** The
+symmetric macaroon root key lives and dies inside the mint and is never
+distributed: mint mints a caller's macaroon once (at provisioning /
+`elide login`), and verifies the attenuated macaroon presented on every
+`assume-role`. Issuer and verifier being the same process is what
+removes any root-distribution problem — there is no separate authority
+to share the root with, and no "configure mint to trust the
+coordinator's root" step.
+
+The caller (e.g. a coordinator) is therefore **neither a macaroon issuer
+nor a root holder**. It holds a macaroon and may only *attenuate* it
+(append narrowing caveats — `NotAfter`, a specific `elide:Volume`),
+which needs the trailing MAC, never the root. A compromised caller can
+only narrow authority it was already granted; it cannot forge authority
+for another coordinator or volume.
+
+Delegation to a *separate* authority — proving the caller's identity,
+org membership, or SSO authentication — is **not** modelled as that
+authority issuing the macaroon. It is a **third-party caveat**: mint
+stamps "valid only if discharged by `<identity authority>` attesting
+predicate P", and verifies the discharge against a key it shares with
+that authority. The identity plane (who is this caller) and the
+credential plane (what Tigris scope do they get) stay separate; the
+managed `elide login` service is a discharge authority, not an issuer.
+See *Open questions* and *Future directions*.
+
+The admin credential likewise lives and dies inside the mint process and
+never reaches the caller.
 
 ### Mint configuration
 
 Each mint instance is configured with:
 
-1. **One or more macaroon trust roots** — the symmetric keys mint will accept
-   as valid macaroon-signing authorities. Multi-root supports multiple issuers
-   federating against the same mint (out of scope for v1; v1 supports a single
-   trust root).
-2. **One Tigris admin credential** (per backend), held in memory. It is
+1. **Its own macaroon root** — the single symmetric key mint uses to
+   *both* mint and verify primary macaroons. It never leaves the
+   process and is never shared with a caller or any other authority.
+   How it is provisioned (mint-generated and persisted, vs. supplied
+   like the admin credential) is an open question; it is a secret, so
+   it is not a plaintext TOML field. (v1 is single-root; multi-root for
+   federating issuers is out of scope.)
+2. **Zero or more third-party discharge keys** — one symmetric key per
+   identity/discharge authority mint trusts to satisfy a third-party
+   caveat. Absent in the minimal self-hosted deployment (no third-party
+   caveat); present when an identity authority such as the managed
+   `elide login` service is in use.
+3. **One Tigris admin credential** (per backend), held in memory. It is
    read from the standard AWS environment variables
    (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, optionally
    `AWS_SESSION_TOKEN`) — the same convention the elide coordinator uses
@@ -101,13 +136,14 @@ Each mint instance is configured with:
    credential is a secret delivered by the environment (systemd
    `LoadCredential=`, a secrets manager); keeping it out of the TOML
    keeps secrets and role definitions on separate management planes.
-3. **A set of role definitions** — see *Role configuration* below.
-4. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
+4. **A set of role definitions** — see *Role configuration* below.
+5. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
    single-tenant per instance; multi-tenancy is a v2 question.
 
-Role definitions, trust root, audience, and tenant metadata are static
-and file-backed. The admin credential is the one input that comes from
-the environment, not the file.
+Role definitions, audience, and tenant metadata are static and
+file-backed. The macaroon root and admin credential are secrets and are
+not plaintext TOML fields — the admin credential comes from the AWS
+environment; the macaroon root's provisioning is an open question.
 
 ### Admin credential custody — deployment shapes
 
@@ -160,9 +196,12 @@ Content-Type: application/json
 
 ### Authentication
 
-The `Authorization` header carries a single macaroon, base64-encoded. The mint
-verifies its chain MAC against the configured trust root(s) (see
-`design-auth-model.md` for the construction).
+The `Authorization` header carries the primary macaroon, base64-encoded;
+any discharge macaroons for third-party caveats accompany it (bundle
+wire format per *Open questions* #15). The mint verifies the primary's
+chain MAC against its own macaroon root, and each discharge against the
+relevant third-party key (see `design-auth-model.md` for the
+construction).
 
 If verification fails — bad signature, unknown root, malformed encoding — the
 mint returns `401 Unauthorized` with no further detail (don't help an attacker
@@ -629,7 +668,7 @@ operational concern, not a mint concern.
   bucket if rate-limit pain emerges.
 - **Tigris admin credential rejected.** Mint returns `503` and logs loudly;
   manual operator intervention required to refresh the admin credential.
-- **Macaroon trust root rotation.** TBD — see *Open questions*.
+- **Macaroon-root rotation.** TBD — see *Open questions* #3 / #14.
 
 ### Cleanup
 
@@ -655,9 +694,12 @@ prematurely.
    root, admin credential, role set) or stay single-tenant with per-tenant
    deployments is open. Multi-tenant per instance is more useful for
    centralised offerings; single-tenant is structurally simpler.
-3. **Trust root rotation.** Static trust roots fit v1, but rotation needs a
-   story. Options: hot-reload on SIGHUP, dual-key acceptance during overlap,
-   explicit rotation endpoint. Probably defer to v2.
+3. **Macaroon-root rotation.** A single static mint-held root fits v1,
+   but rotation needs a story: rotating it invalidates every
+   outstanding macaroon (mint is the issuer, so a re-issue sweep is
+   possible but not free). Options: dual-key acceptance during an
+   overlap window, a re-issue-on-rotate flow. Tied to #14. Probably
+   defer to v2.
 4. **Peer-fetch scope — settled.** There is no dedicated peer-fetch
    role; the verifier uses `coord-base` (read-only `names/*` /
    `coordinators/*` / `events/*`). Lineage is verified by the serving
@@ -715,17 +757,49 @@ prematurely.
     `design-peer-segment-fetch.md` for performance — would shrink it to
     just `volume list --remote`, or remove it entirely. Not blocking;
     the temporal mitigation (short TTL, on-demand) holds until then.
+13. **Issuance surface and what authorizes it.** mint is issuer as well
+    as verifier, so it needs an issuance path — a privileged endpoint
+    or an out-of-band `mint issue --coord <id>` operator command — that
+    mints a caller's primary macaroon. Issuance is far more powerful
+    than `assume-role` (it creates authority rather than exercising it),
+    so what authorizes *issuance itself* must be pinned down: admin-only
+    local operation, an admin-scoped endpoint, and/or issuance that
+    itself binds a third-party caveat to the identity authority so a
+    bare issuance call can't hand out a coordinator token. Decide before
+    any issuance code exists.
+14. **Macaroon-root provisioning.** The root is mint-held and never
+    distributed, but how it comes to exist is unspecified: mint
+    generates it on first start and persists it (like the coordinator's
+    identity key), or it is supplied via the environment like the admin
+    credential. Generation-and-persist avoids an operator step but means
+    losing mint state invalidates every outstanding macaroon; supplied
+    means another secret to manage but survives a mint rebuild. Tied to
+    rotation (#3).
+15. **Third-party-caveat construction.** Delegation to an identity
+    authority is a third-party caveat (mint shares a symmetric key per
+    discharge authority; the caveat carries a verification key encrypted
+    to that authority; the holder presents discharge macaroons).
+    `design-auth-model.md` documents only scalar first-party caveats
+    today; the third-party construction and its discharge-bundle wire
+    format on `assume-role` need specifying. Supersedes the assumption
+    in #6 that only the list-valued first-party extension is required.
+    Whether a primary macaroon with *no* third-party caveat (operator-
+    issued, trust = possession) is the supported minimal self-hosted
+    deployment — with third-party discharge the opt-in central-service
+    upgrade — is part of this question.
 
 ## Future directions
 
 These do not affect v1 but are anticipated extensions worth designing
 around:
 
-- **Third-party caveats** (from `design-auth-model.md` § *Future
-  directions*). The mint's macaroon-verification path becomes the natural
-  place to handle discharge bundles when third-party caveats are introduced.
-  No protocol change needed beyond accepting discharge macaroons in the
-  request; the chained-MAC construction already accommodates them.
+- **Third-party caveats.** No longer purely a future direction — they
+  are the mechanism for delegation to an identity authority under the
+  issuer-and-verifier model (*Trust model*; *Open questions* #15). The
+  mint's verification path handles discharge bundles; the chained-MAC
+  construction accommodates them with no change beyond accepting
+  discharge macaroons in the request. What remains future is the
+  concrete construction and wire format, tracked as #15.
 - **Backend-agnostic roles.** The role config language doesn't assume Tigris
   specifically — it's IAM-policy-template-shaped. Other backends (native
   AWS, S3-compatibles with IAM) could be plugged in by swapping the

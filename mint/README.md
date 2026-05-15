@@ -55,6 +55,15 @@ Real Tigris IAM client, TLS, multi-root / trust-root rotation,
 multi-tenancy, `ListRoles`/`GetRole`, rate-limit smoothing, refresh
 tokens. See `docs/design-mint.md` § *Open questions*.
 
+**Issuer model:** the design now has mint as *issuer and verifier* of
+the primary macaroon (root never distributed), with delegation via
+third-party caveats — see `docs/design-mint.md` § *Trust model* and
+open questions #13–#15. The prototype predates that: it has no issuance
+path and reads a `trust_root_hex` straight from the TOML purely so the
+slice runs. That TOML root is a prototype shortcut, not the intended
+provisioning (open question #14); issuance and third-party discharge
+are unbuilt.
+
 ## Doc-reconciliation finding
 
 `docs/design-mint.md` writes namespaced caveats as the data path
