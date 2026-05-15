@@ -62,6 +62,13 @@ survive the upsert. Gated verbs resolve the token in precedence order:
 `--token`, then `ELIDE_OPERATOR_TOKEN`, then the entry whose `data-dir`
 matches the canonical data_dir the CLI used to reach the socket.
 
+`elide token list` prints one row per entry — data_dir, token nonce,
+and expiry — decoding the stored macaroon for the nonce and narrowest
+`NotAfter` without contacting any coordinator. `elide token remove
+<nonce>` deletes a single entry, selected by the nonce from that
+listing rather than by path, so a stale entry can be cleaned up after
+its coordinator's data_dir is gone.
+
 The mint endpoint is ungated beyond socket reachability. The trust floor
 for "can mint an operator token" is "can reach the coordinator's unix
 socket," which is the same floor as "can perform every other coordinator

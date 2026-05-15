@@ -143,9 +143,15 @@ pub fn store_token(data_dir: &Path, token: &str) -> io::Result<PathBuf> {
             operator_token: token.to_owned(),
         });
     }
+    write_store(&path, &store)?;
+    Ok(path)
+}
 
-    let body = toml::to_string(&store).map_err(io::Error::other)?;
-
+/// Serialise `store` to `path` atomically: parent dir created mode
+/// 0700, body written to a sibling temp file mode 0600, then renamed
+/// into place so a concurrent reader never sees a torn file.
+fn write_store(path: &Path, store: &TokenStore) -> io::Result<()> {
+    let body = toml::to_string(store).map_err(io::Error::other)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
@@ -161,8 +167,62 @@ pub fn store_token(data_dir: &Path, token: &str) -> io::Result<PathBuf> {
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, &path)?;
-    Ok(path)
+    fs::rename(&tmp, path)
+}
+
+/// One coordinator's stored token, decoded for display. `nonce_hex`
+/// and `expires_unix` are `None` if the stored macaroon fails to
+/// parse (corrupt or hand-edited entry) — the entry is still listed so
+/// it can be removed.
+pub struct StoredToken {
+    pub data_dir: String,
+    pub nonce_hex: Option<String>,
+    pub expires_unix: Option<u64>,
+}
+
+/// All stored entries, plus the file path (so callers can show where
+/// they came from). Missing file yields an empty list, not an error.
+pub fn list_tokens() -> io::Result<(PathBuf, Vec<StoredToken>)> {
+    let path = tokens_file_path()
+        .ok_or_else(|| io::Error::other("$HOME is unset; cannot locate ~/.elide/tokens.toml"))?;
+    let store = load_store(&path)?;
+    let out = store
+        .coordinator
+        .into_iter()
+        .map(|c| {
+            let parsed = Macaroon::parse(&c.operator_token).ok();
+            StoredToken {
+                data_dir: c.data_dir,
+                nonce_hex: parsed.as_ref().map(|m| m.nonce_hex()),
+                expires_unix: parsed.as_ref().and_then(|m| m.narrowest_not_after()),
+            }
+        })
+        .collect();
+    Ok((path, out))
+}
+
+/// Remove the entry whose token has the given nonce (the stable
+/// identifier shown by `list_tokens` and logged at mint). Returns the
+/// removed entry's data_dir, or `None` if no entry matched. Nonce
+/// selection is independent of the filesystem, so a stale entry whose
+/// coordinator directory is gone can still be cleaned up.
+pub fn remove_token(nonce_hex: &str) -> io::Result<Option<String>> {
+    let path = tokens_file_path()
+        .ok_or_else(|| io::Error::other("$HOME is unset; cannot locate ~/.elide/tokens.toml"))?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut store = load_store(&path)?;
+    let Some(idx) = store.coordinator.iter().position(|c| {
+        Macaroon::parse(&c.operator_token)
+            .map(|m| m.nonce_hex() == nonce_hex)
+            .unwrap_or(false)
+    }) else {
+        return Ok(None);
+    };
+    let removed = store.coordinator.remove(idx);
+    write_store(&path, &store)?;
+    Ok(Some(removed.data_dir))
 }
 
 /// Diagnostic message for the "no token" case. Shared between CLI
@@ -204,6 +264,11 @@ mod tests {
     use super::*;
     use elide_coordinator::macaroon::{VerifyOperatorCtx, mint_operator, verify_operator};
 
+    /// `cargo test` runs these in parallel by default and several
+    /// mutate process env (`TOKEN_ENV_VAR`, `HOME`). Serialise just
+    /// those so one test's `remove_var` can't clobber another's setup.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn key() -> [u8; 32] {
         [42u8; 32]
     }
@@ -243,8 +308,8 @@ mod tests {
 
     #[test]
     fn resolve_prefers_flag_over_env() {
-        // SAFETY: tests in this crate are single-threaded by default
-        // and we restore the env after.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_GUARD; env restored after.
         unsafe { env::set_var(TOKEN_ENV_VAR, "from-env") };
         let got = resolve(Some("from-flag"), Path::new(".")).unwrap();
         unsafe { env::remove_var(TOKEN_ENV_VAR) };
@@ -253,6 +318,7 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_env_when_flag_empty() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { env::set_var(TOKEN_ENV_VAR, "from-env") };
         let got = resolve(Some(""), Path::new(".")).unwrap();
         unsafe { env::remove_var(TOKEN_ENV_VAR) };
@@ -269,7 +335,8 @@ mod tests {
         fs::create_dir_all(&dd_a).unwrap();
         fs::create_dir_all(&dd_b).unwrap();
 
-        // SAFETY: single-threaded test; HOME restored at end.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_GUARD; HOME restored at end.
         let prev_home = env::var_os("HOME");
         unsafe { env::set_var("HOME", &home) };
 
@@ -296,5 +363,51 @@ mod tests {
         assert_eq!(got_a.as_deref(), Some("token-a2"));
         assert_eq!(got_b.as_deref(), Some("token-b"));
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn list_then_remove_by_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let dd_a = tmp.path().join("coord-a");
+        let dd_b = tmp.path().join("coord-b");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&dd_a).unwrap();
+        fs::create_dir_all(&dd_b).unwrap();
+
+        let mac_a = mint_operator(&key(), now() + 86_400);
+        let mac_b = mint_operator(&key(), now() + 86_400);
+        let nonce_a = mac_a.nonce_hex();
+
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_GUARD; HOME restored at end.
+        let prev_home = env::var_os("HOME");
+        unsafe { env::set_var("HOME", &home) };
+
+        store_token(&dd_a, &mac_a.encode()).unwrap();
+        store_token(&dd_b, &mac_b.encode()).unwrap();
+
+        let (_, listed) = list_tokens().unwrap();
+        let removed = remove_token(&nonce_a).unwrap();
+        let miss = remove_token("deadbeef").unwrap();
+        let (_, after) = list_tokens().unwrap();
+
+        match prev_home {
+            Some(h) => unsafe { env::set_var("HOME", h) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+
+        assert_eq!(listed.len(), 2);
+        let entry_a = listed.iter().find(|e| e.data_dir.ends_with("coord-a"));
+        assert_eq!(
+            entry_a.unwrap().nonce_hex.as_deref(),
+            Some(nonce_a.as_str())
+        );
+        assert!(entry_a.unwrap().expires_unix.is_some());
+
+        assert!(removed.unwrap().ends_with("coord-a"));
+        assert!(miss.is_none());
+        assert_eq!(after.len(), 1);
+        assert!(after[0].data_dir.ends_with("coord-b"));
     }
 }
