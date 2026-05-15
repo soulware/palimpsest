@@ -271,7 +271,7 @@ pub fn gc_fork(
     let mut total_bytes_freed = 0u64;
     let mut total_dead_cleaned = 0usize;
     let mut buckets_emitted = 0usize;
-    for (packed, u_bucket) in buckets.into_iter().zip(bucket_ulids.into_iter()) {
+    for (packed, u_bucket) in buckets.into_iter().zip(bucket_ulids) {
         compact_segments(packed.bucket, &gc_dir, u_bucket, &pass.live_hashes)
             .context("gc compaction")?;
         total_candidates += packed.candidates;
