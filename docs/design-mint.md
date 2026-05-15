@@ -309,6 +309,57 @@ invariant.
 The macaroon library must understand list-valued caveats natively; see
 `design-auth-model.md` for the encoding (TBD addition).
 
+### Caveat field inventory (Elide)
+
+The complete caveat vocabulary the Elide roles draw on. A caveat serves
+one or both of two purposes: it **gates** authorization (listed in a
+role's `required_caveats`) and/or it **feeds** the policy template
+(`{{caveat.X}}` substitution). Some only gate.
+
+| Caveat | Type | Scalar/List | Issuer | Purpose |
+|---|---|---|---|---|
+| `Audience` | string | scalar | macaroon issuer | Gate only — must equal `mint`. Cross-service replay defense. |
+| `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
+| `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
+| `elide:Coord` | string (coord-ulid) | scalar | coordinator identity | Gate on all `coord-*`. Templated only in the deferred one-time-publish split. |
+| `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat.elide:Volume}}/*`. |
+| `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
+| `elide:PeerCoord` | string (coord-ulid) | scalar | coordinator | Gate **and** template — `coordinators/{{caveat.elide:PeerCoord}}/coordinator.pub`. |
+
+Per-role gate matrix (template substitutions are listed in each role's
+definition below):
+
+| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` | `elide:Ancestors` | `elide:PeerCoord` |
+|---|---|---|---|---|---|---|
+| `coord-data` | ● | ● | ● | ● | | |
+| `coord-names` | ● | ● | ● | | | |
+| `coord-events` | ● | ● | ● | | | |
+| `coord-identity` | ● | ● | ● | | | |
+| `coord-list` | ● | ● | ● | | | |
+| `volume-ro` | ● | ● | | ● | ● | |
+| `peer-fetch` | ● | ● | | ● | | ● |
+
+Non-caveat template inputs (the other two substitution classes, listed
+here so the issuer's surface is unambiguous):
+
+- `{{tenant.X}}` — server-side config; Elide uses `tenant.bucket`. Never
+  caller-controlled.
+- `{{system.X}}` — mint-computed at issuance; Elide uses
+  `system.expiry_iso8601`.
+
+Notes:
+
+- **Exactly one list-valued field exists** (`elide:Ancestors`). Every
+  other caveat is scalar. The list-valued caveat type (open question #6)
+  is the only macaroon-library extension this inventory requires.
+- **`elide:Coord` gates but does not template** in the v1 roles — the
+  `coord-*` policies use prefix wildcards (`names/*`, `events/*`,
+  `coordinators/*`), not `{{caveat.elide:Coord}}`. It becomes a template
+  variable only if the deferred one-time own-publish split lands.
+- **`peer-fetch`'s `names/*` is not caveat-bound.** Tightening it to an
+  exact ARN (open question #4) would introduce a new scalar caveat
+  (`elide:Name`) — the only addition to this table that question implies.
+
 ## Elide as customer: role inventory
 
 Elide's existing four-key model (`design-iam-key-model.md` § *Key classes*)
