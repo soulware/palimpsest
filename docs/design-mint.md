@@ -312,27 +312,137 @@ The macaroon library must understand list-valued caveats natively; see
 ## Elide as customer: role inventory
 
 Elide's existing four-key model (`design-iam-key-model.md` § *Key classes*)
-collapses to **three roles** under this design:
+does **not** collapse to a single coordinator-wide writer under this design.
+The monolithic `coord-writer` is split two ways:
 
-### `coord-writer`
+- **By purpose** (Split A): the five-statement writer policy fragments into
+  one role per top-level prefix, since they differ sharply in cadence, blast
+  radius, and which IAM-layer invariant they must preserve.
+- **By volume** (Split B): the `by_id/` data writer becomes *per-volume*,
+  assumed with an `elide:Volume` caveat and cached coordinator-side per
+  vol_ulid. This reopens `design-iam-key-model.md` § *Per-volume scoping for
+  writes (rejected)* — see *Why Split B is viable now* below.
 
-Long-lived, one per coordinator. Granted at coordinator-register time and
-refreshed periodically.
+### TTL principle
+
+Mint does no active key deletion (§ *Cleanup*): a key lives until its
+`DateLessThan` expiry. **TTL is therefore the maximum revocation latency.**
+Two consequences shape every TTL below:
+
+- Write/delete capability earns a *tighter* TTL than read-only — a leaked
+  write key is strictly worse than a leaked read key for the same scope.
+- Coordinator-held keys can take short TTLs: the coordinator is a
+  long-running process that refreshes proactively on a timer, and writes
+  buffer in the WAL if a refresh briefly stalls. The data-plane-held
+  `volume-ro` cannot — a refresh stall there stalls guest I/O — so it trades
+  a longer revocation window for refresh robustness, justified by it being
+  the narrowest scope in the system.
+
+### `coord-data` (Split B — per-volume)
+
+Per-volume `by_id/` writer. Assumed by the coordinator the first time it
+writes a given volume within a TTL window; the returned keypair is cached
+in memory keyed by vol_ulid and re-assumed on miss/expiry. Structurally
+identical to `volume-ro` but with write actions and a single (non-ancestor)
+prefix.
+
+- **Required caveats:** `elide:Coord`, `elide:Volume`, `Audience=mint`,
+  `NotAfter`
+- **TTL:** 24h default. Not on the hot write path (cache holds the key for
+  the window; WAL absorbs a brief refresh stall), and 24h bounds the
+  write/delete revocation window on a single volume.
+- **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
+  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/*`, single
+  volume only.
+
+GC and the reaper cross volume boundaries (read ancestor/input prefixes,
+delete a consumed prefix). GC *input reads* compose by assuming `volume-ro`
+for the inputs alongside `coord-data` for the output volume rather than
+widening `coord-data`'s policy. (Reaper delete of a volume's own prefix is
+covered by `coord-data` on that volume.)
+
+### `coord-names` (Split A)
+
+Coordinator-wide. Name claim / rename / force-release / rollback.
 
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
-- **TTL:** long (days). Refresh from the coord process before expiry.
-- **Policy:** the five-statement coordinator-writer policy from
-  `design-iam-key-model.md` § *Coordinator writer key*, with `{{tenant.bucket}}`
-  substituted.
+- **TTL:** 1h. Control-plane, infrequent; refresh-on-demand is cheap.
+- **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
+  `arn:aws:s3:::{{tenant.bucket}}/names/*`.
+
+### `coord-events` (Split A)
+
+Coordinator-wide. Event-journal appends and reads.
+
+- **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
+- **TTL:** 1h.
+- **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
+  `arn:aws:s3:::{{tenant.bucket}}/events/*`. The append-only invariant is
+  enforced here at the IAM layer — no role in the inventory holds delete on
+  `events/`.
+
+### `coord-identity` (Split A)
+
+Coordinator-wide. One-time own identity publish plus ongoing peer-pub
+verification reads.
+
+- **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
+- **TTL:** 6h.
+- **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
+  `arn:aws:s3:::{{tenant.bucket}}/coordinators/*`. Coordinator-identity
+  immutability is enforced here — no role holds delete on `coordinators/`.
+
+(The one-time own-publish write could be split into an ultra-short-TTL
+write-once role distinct from the ongoing peer-read; deferred — noted, not
+specified.)
+
+### `coord-list` (Split A)
+
+Coordinator-wide bucket enumeration. `s3:ListBucket` has no `s3:prefix`
+condition on Tigris, so it is all-or-nothing and **cannot** be folded into
+per-volume `coord-data`.
+
+- **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
+- **TTL:** 6h.
+- **Policy:** `s3:ListBucket` on `arn:aws:s3:::{{tenant.bucket}}` (bucket
+  resource, no object statement).
 
 ### `volume-ro`
 
-Per-volume, refreshed as needed.
+Per-volume, held by the volume process (vended via the macaroon handshake).
+Narrowest scope in the system and the most refresh-sensitive holder.
 
 - **Required caveats:** `elide:Volume`, `elide:Ancestors`, `Audience=mint`,
   `NotAfter`
-- **TTL:** 7 days max, 1 day default.
+- **TTL:** 30 days. Long deliberately: read-only, single volume + fixed
+  ancestor list, held by long-running data-plane processes whose refresh
+  path stalls guest I/O on failure. The 30d revocation window is the
+  accepted cost of that refresh robustness, bounded by the minimal blast
+  radius (read one volume's lineage).
 - **Policy:** the per-volume RO shape, exact ARNs for self + each ancestor.
+
+### Why Split B is viable now
+
+`design-iam-key-model.md` § *Per-volume scoping for writes (rejected)*
+rejected per-volume writer keys on two grounds. The mint redesign changes
+one of them:
+
+- *Confused-deputy enforcement is "modest"* — unchanged. Volume-identity
+  correctness still lives in `volume_event_store` / claim records / the
+  directory structure; per-volume IAM is still a redundant belt.
+- *Operational cost* (N persisted policies, `ListPolicies` reconciliation,
+  orphan reaping, refresh churn) — **dissolved**. Mint keys are short-lived,
+  vended on demand, never persisted, expired by `DateLessThan`. No
+  reconciliation, no orphans.
+
+Per-volume **attribution** is obtained for free regardless of Split B —
+every `AssumeRole` already logs the `elide:Volume` caveat (§ *Audit log*).
+Split B's *additional* value over a coordinator-wide `coord-data` is
+purely per-volume IAM *enforcement* (the "modest" confused-deputy catch).
+The remaining cost is `AssumeRole` call volume: ~one mint round-trip per
+active volume per TTL window per coordinator, gated by Tigris IAM rate
+limits (*Open questions* #9). The 24h TTL is the primary knob: longer →
+fewer mints, larger leaked-key window.
 
 ### `peer-fetch`
 
@@ -495,7 +605,8 @@ around:
 - [`design-auth-model.md`](design-auth-model.md) — macaroon construction
   shared with this design.
 - [`design-iam-key-model.md`](design-iam-key-model.md) — Elide's IAM key
-  inventory; the four-key model collapses to three roles under this design.
+  inventory; the monolithic writer splits per-purpose and per-volume under
+  this design (Split A + Split B).
 - AWS STS docs: [`AssumeRoleWithWebIdentity`][assume-role-web-identity],
   [session tags][session-tags] — the closest AWS analogue for the
   identity-token-to-scoped-credential flow.
