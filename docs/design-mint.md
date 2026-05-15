@@ -93,13 +93,22 @@ Each mint instance is configured with:
    as valid macaroon-signing authorities. Multi-root supports multiple issuers
    federating against the same mint (out of scope for v1; v1 supports a single
    trust root).
-2. **One Tigris admin credential** (per backend), held in memory.
+2. **One Tigris admin credential** (per backend), held in memory. It is
+   read from the standard AWS environment variables
+   (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, optionally
+   `AWS_SESSION_TOKEN`) — the same convention the elide coordinator uses
+   for its IAM-mode admin credential — **not** from the config file. The
+   credential is a secret delivered by the environment (systemd
+   `LoadCredential=`, a secrets manager); keeping it out of the TOML
+   keeps secrets and role definitions on separate management planes.
 3. **A set of role definitions** — see *Role configuration* below.
 4. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
    single-tenant per instance; multi-tenancy is a v2 question.
 
-Configuration is static (file-backed) in v1; a config-management API is a
-future direction.
+Role definitions, trust root, audience, and tenant metadata are static
+(file-backed) in v1; a config-management API is a future direction. The
+admin credential is the one input that comes from the environment, not
+the file.
 
 ### Admin credential custody — deployment shapes
 
@@ -593,7 +602,8 @@ memory). Throughput-bounded by Tigris IAM API rate limits, not by mint
 itself.
 
 Standard production deployment: behind a TLS-terminating reverse proxy or
-serving TLS directly, with the admin credential delivered via systemd
+serving TLS directly, with the admin credential delivered into the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment via systemd
 `LoadCredential=` or equivalent secrets-management.
 
 ### Audit log

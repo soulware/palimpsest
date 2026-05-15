@@ -26,7 +26,10 @@ Authorization: Macaroon <b64>  ->  verify MAC against trust root
   question #6. Not wire-compatible with the elide v2 typed format (by
   design — this prototypes the target generalised format).
 - `config` — TOML: audience, single trust root, tenant, roles with TTL
-  bounds and policy templates. Validated on load.
+  bounds and policy templates. Validated on load. The Tigris admin
+  credential is **not** in the TOML — it is read from `AWS_ACCESS_KEY_ID`
+  / `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`), the same
+  convention as the elide coordinator.
 - `role` — required-caveat gate, `Audience`/`Role` checks, TTL clamp.
 - `template` — handlebars rendering of the IAM policy from
   `tenant.*` / `caveat.*` / `system.*`.

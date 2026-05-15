@@ -1,9 +1,12 @@
-//! Static, file-backed configuration (`docs/design-mint.md`
-//! § *Mint configuration*). v1 is single-tenant, single-trust-root.
+//! Configuration (`docs/design-mint.md` § *Mint configuration*). v1 is
+//! single-tenant, single-trust-root.
 //!
-//! The admin credential is part of this struct but in the prototype it
-//! only flows to the [`crate::iam`] minter, which is faked — no real
-//! Tigris call is made.
+//! Audience, trust root, tenant, and roles are file-backed (TOML). The
+//! Tigris admin credential is the one input that comes from the
+//! environment — `AWS_*`, resolved by [`AdminCredential::from_env`] at
+//! load — never the TOML, so secrets and role definitions stay on
+//! separate management planes. The prototype's faked minter ignores it,
+//! so it resolves to `Option`.
 
 use std::collections::BTreeMap;
 
@@ -33,8 +36,6 @@ pub struct RawConfig {
     /// hex-encoded.
     pub trust_root_hex: String,
     pub tenant: Tenant,
-    #[serde(default)]
-    pub admin: Admin,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
 }
@@ -45,14 +46,52 @@ pub struct Tenant {
     pub bucket: String,
 }
 
-/// Tigris admin credential. Optional in the prototype because the
-/// faked minter ignores it; a real deployment requires it.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Admin {
-    #[serde(default)]
+/// Tigris admin credential, read from the standard AWS environment
+/// variables — the same convention the elide coordinator uses for its
+/// IAM-mode admin credential. It is deliberately **not** in the TOML
+/// config: the credential is a secret delivered by the environment
+/// (systemd `LoadCredential=`, a secrets manager, …), never committed
+/// alongside role definitions.
+#[derive(Clone)]
+pub struct AdminCredential {
     pub access_key_id: String,
-    #[serde(default)]
     pub secret_access_key: String,
+    /// `AWS_SESSION_TOKEN` if present (STS-style temporary creds).
+    pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for AdminCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the secret — only that a credential is present.
+        f.debug_struct("AdminCredential")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl AdminCredential {
+    /// Resolve from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+    /// (+ optional `AWS_SESSION_TOKEN`). `None` if either required var
+    /// is unset or empty — the prototype's faked minter does not need
+    /// it, so absence is a warning at startup, not a hard error.
+    pub fn from_env() -> Option<Self> {
+        let access_key_id = non_empty_env("AWS_ACCESS_KEY_ID")?;
+        let secret_access_key = non_empty_env("AWS_SECRET_ACCESS_KEY")?;
+        Some(Self {
+            access_key_id,
+            secret_access_key,
+            session_token: non_empty_env("AWS_SESSION_TOKEN"),
+        })
+    }
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,7 +113,10 @@ pub struct Config {
     pub audience: String,
     pub trust_root: [u8; 32],
     pub tenant: Tenant,
-    pub admin: Admin,
+    /// Resolved from the AWS environment at load time. `None` when the
+    /// env is unset (fine for the prototype's faked minter; a real
+    /// Tigris minter must check this is `Some`).
+    pub admin: Option<AdminCredential>,
     pub roles: BTreeMap<String, Role>,
 }
 
@@ -126,7 +168,7 @@ impl Config {
             audience: raw.audience,
             trust_root,
             tenant: raw.tenant,
-            admin: raw.admin,
+            admin: AdminCredential::from_env(),
             roles,
         })
     }

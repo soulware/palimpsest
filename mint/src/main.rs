@@ -33,8 +33,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         audience = %config.audience,
         roles = config.roles.len(),
+        admin_credential = config.admin.is_some(),
         "loaded config (prototype: keypair minting is FAKED)"
     );
+    if config.admin.is_none() {
+        tracing::warn!(
+            "no Tigris admin credential in env (AWS_ACCESS_KEY_ID / \
+             AWS_SECRET_ACCESS_KEY); fine for the faked minter, but a \
+             real Tigris minter would refuse to start"
+        );
+    }
 
     let state = AppState {
         config,
