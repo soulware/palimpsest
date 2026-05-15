@@ -544,8 +544,43 @@ pub(crate) async fn release_volume_op(
         IpcError::internal(format!("[release {volume_name}] deriving volume id: {e}"))
     })?;
     let cover = match release_fast_path_handoff(&vol_dir) {
-        Ok(Some(cover)) => cover,
-        Ok(None) => {
+        Ok(FastPathDisposition::Cover(cover)) => cover,
+        Ok(FastPathDisposition::NeverRan) => {
+            // Freshly claimed/reclaimed and never started: no local
+            // snapshot or segments, but the S3 record already carries
+            // a handoff snapshot from the prior release. Reuse it —
+            // release is a pure bucket-flip here, identical to the
+            // breadcrumb-only path minus the breadcrumb. This makes
+            // `claim → release` work without a `start → stop` detour.
+            let vol_ulid = position.vol_ulid().ok_or_else(|| {
+                IpcError::internal(format!(
+                    "[release {volume_name}] OwnedByUs position has no vol_ulid"
+                ))
+            })?;
+            let snap_ulid = match latest_release_handoff_snapshot(vol_ulid, store).await? {
+                Some((s, elide_core::signing::SnapshotKind::User)) => s,
+                Some((s, elide_core::signing::SnapshotKind::Stop)) => {
+                    promote_stop_in_store(&volume_id_for_promote, s, store).await?;
+                    s
+                }
+                None => {
+                    synthesise_empty_owner_handoff(volume_name, data_dir, vol_ulid, store).await?
+                }
+            };
+            info!(
+                "[release {volume_name}] reusing S3 handoff snapshot {snap_ulid} \
+                 (clean fork, never started)"
+            );
+            let result =
+                perform_release_flip(volume_name, data_dir, &vol_dir, store, identity, snap_ulid)
+                    .await;
+            info!(
+                "[release {volume_name}] complete in {:.2?}",
+                started.elapsed()
+            );
+            return result;
+        }
+        Ok(FastPathDisposition::NeedsDrain) => {
             return Err(IpcError::conflict(format!(
                 "volume '{volume_name}' has durable state past the last snapshot \
                  (WAL/pending uploads not yet drained); the previous stop did not \
@@ -909,10 +944,11 @@ async fn perform_release_flip(
     }
 }
 
-/// Decide whether `release` can short-circuit using the volume's most
-/// recently published snapshot as the handoff point.
+/// Decide whether `release` can short-circuit using a previously
+/// published snapshot as the handoff point. See [`FastPathDisposition`]
+/// for the three outcomes.
 ///
-/// Returns `Ok(Some(ulid))` when **all** of the following hold:
+/// `Cover` requires **all** of:
 ///   - `wal/`, `pending/`, `gc/` are empty or absent (no in-flight work)
 ///   - the latest segment in `index/` does not post-date the latest
 ///     local snapshot marker (the snapshot covers everything)
@@ -920,8 +956,10 @@ async fn perform_release_flip(
 ///     marker + filemap are confirmed on S3 — without this, a future
 ///     claimant could fail to fetch the manifest)
 ///
-/// `Ok(None)` means slow path required; an `Err` is propagated to the
-/// caller as a fast-path inspection failure (also slow-path fallback).
+/// `NeverRan` is the clean-but-no-local-snapshot case (no segments
+/// either); the caller resolves the handoff from the S3 record.
+/// Everything else is `NeedsDrain`; an `Err` is propagated as a
+/// fast-path inspection failure.
 /// Result of a successful release fast-path inspection: the snapshot
 /// ULID to use as the handoff basis, plus the kind on disk. An `Auto`
 /// kind triggers the rename/copy promotion to `<ulid>.manifest`
@@ -931,6 +969,25 @@ async fn perform_release_flip(
 pub(crate) struct FastPathCover {
     pub(crate) snap_ulid: ulid::Ulid,
     pub(crate) kind: elide_core::signing::SnapshotKind,
+}
+
+/// Outcome of inspecting a stopped local fork for a fast `release`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FastPathDisposition {
+    /// Clean, with a covering local snapshot — reuse it as the handoff
+    /// (promoting a stop-snapshot to a stable manifest first if the
+    /// kind is `Stop`).
+    Cover(FastPathCover),
+    /// Clean, but the volume never wrote anything locally: `wal/`,
+    /// `pending/`, `gc/` empty, no `index/` segments, no local
+    /// snapshot marker. A freshly claimed/reclaimed fork that was
+    /// never started. The S3 record's existing handoff snapshot still
+    /// covers the (empty) durable state — `release` reuses it.
+    NeverRan,
+    /// Durable state past the last snapshot: `wal/`, `pending/` or
+    /// `gc/` has work, segments post-date the snapshot, or the
+    /// snapshot isn't confirmed on S3 yet. A real drain is required.
+    NeedsDrain,
 }
 
 /// Promote `<ulid>-stop.manifest` to `<ulid>.manifest` both locally
@@ -998,19 +1055,27 @@ pub(crate) async fn promote_stop_snapshot(
     Ok(())
 }
 
-pub(crate) fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<FastPathCover>> {
-    if !dir_is_empty_or_absent(&vol_dir.join("wal"))? {
-        return Ok(None);
-    }
-    if !dir_is_empty_or_absent(&vol_dir.join("pending"))? {
-        return Ok(None);
-    }
-    if !dir_is_empty_or_absent(&vol_dir.join("gc"))? {
-        return Ok(None);
+pub(crate) fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<FastPathDisposition> {
+    use FastPathDisposition::{Cover, NeedsDrain, NeverRan};
+
+    if !dir_is_empty_or_absent(&vol_dir.join("wal"))?
+        || !dir_is_empty_or_absent(&vol_dir.join("pending"))?
+        || !dir_is_empty_or_absent(&vol_dir.join("gc"))?
+    {
+        return Ok(NeedsDrain);
     }
 
     let Some((snap_ulid, kind)) = latest_snapshot_marker(&vol_dir.join("snapshots"))? else {
-        return Ok(None);
+        // No local snapshot. With no segments either, the fork never
+        // wrote anything — a freshly claimed/reclaimed volume that
+        // was never started. The S3 handoff still covers it. If
+        // segments exist without a covering snapshot, that's genuine
+        // undrained durable state.
+        return Ok(if latest_segment_ulid(&vol_dir.join("index"))?.is_none() {
+            NeverRan
+        } else {
+            NeedsDrain
+        });
     };
 
     // The snapshot pair (marker + .manifest / -stop.manifest) is
@@ -1027,16 +1092,16 @@ pub(crate) fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Optio
         .join("snapshots")
         .join(&sentinel_name);
     if !sentinel.exists() {
-        return Ok(None);
+        return Ok(NeedsDrain);
     }
 
     if let Some(seg) = latest_segment_ulid(&vol_dir.join("index"))?
         && seg > snap_ulid
     {
-        return Ok(None);
+        return Ok(NeedsDrain);
     }
 
-    Ok(Some(FastPathCover { snap_ulid, kind }))
+    Ok(Cover(FastPathCover { snap_ulid, kind }))
 }
 
 fn dir_is_empty_or_absent(p: &Path) -> std::io::Result<bool> {
@@ -1907,6 +1972,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_reuses_s3_handoff_for_clean_never_started_fork() {
+        // Regression (#357): `claim` then `release` with no `start`/
+        // `stop` in between. The reclaimed fork is clean and was never
+        // started — no local snapshots/ or index/ — but the S3 record
+        // still carries the handoff snapshot the fork was claimed
+        // from. Release must reuse it as a pure bucket-flip, not
+        // demand a drain.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        // Clean stopped fork: by_name symlink + by_id dir +
+        // volume.stopped, no wal/pending/gc/index/snapshots.
+        let vol_ulid = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), None);
+
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir.path())
+                .unwrap(),
+        );
+
+        // names/<vol> = Stopped owned by us (post-reclaim state).
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
+        rec.state = NameState::Stopped;
+        rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        // The handoff snapshot this fork was claimed from, already
+        // published under by_id/<vol>/snapshots/ in S3. Body content
+        // is irrelevant — only the filename is parsed.
+        let snap = ulid::Ulid::new();
+        let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap);
+        store
+            .put(&key, PutPayload::from(b"fake-signed".to_vec()))
+            .await
+            .unwrap();
+
+        let ctx = IpcContext {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            fetch_registry: crate::fetch::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            identity,
+            credentialer: None,
+        };
+
+        let reply = release_volume_op("vol", &store, &ctx)
+            .await
+            .expect("clean never-started fork must release by reusing the S3 handoff");
+
+        // The existing S3 snapshot is reused verbatim — not a freshly
+        // minted one.
+        assert_eq!(reply.handoff_snapshot, snap);
+
+        // names/<vol> flipped to Released, pinned at that snapshot.
+        let (after, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(after.state, NameState::Released);
+        assert_eq!(after.handoff_snapshot, Some(snap));
+    }
+
+    #[tokio::test]
     async fn stop_op_halts_locally_when_bucket_says_released() {
         // Bug-2 reproducer: bucket is Released (e.g. from a partial
         // earlier release), daemon is still running on this host. Stop
@@ -2065,7 +2196,7 @@ mod tests {
         let got = release_fast_path_handoff(tmp.path()).unwrap();
         assert_eq!(
             got,
-            Some(FastPathCover {
+            FastPathDisposition::Cover(FastPathCover {
                 snap_ulid: snap,
                 kind: elide_core::signing::SnapshotKind::User
             })
@@ -2081,7 +2212,10 @@ mod tests {
             "x",
         )
         .unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeedsDrain
+        );
     }
 
     #[test]
@@ -2089,7 +2223,10 @@ mod tests {
         let snap = ulid::Ulid::new();
         let tmp = fast_path_clean_volume(snap);
         std::fs::write(tmp.path().join("pending").join("seg"), "x").unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeedsDrain
+        );
     }
 
     #[test]
@@ -2101,16 +2238,41 @@ mod tests {
             "x",
         )
         .unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeedsDrain
+        );
     }
 
     #[test]
-    fn fast_path_ineligible_when_no_snapshot_published() {
+    fn fast_path_never_ran_when_no_snapshot_and_no_segments() {
+        // Clean dirs, no local snapshot, no segments — a freshly
+        // claimed/reclaimed fork that was never started. Release
+        // reuses the S3 handoff rather than demanding a drain.
         let tmp = TempDir::new().unwrap();
         for sub in ["wal", "pending", "gc", "index", "snapshots"] {
             std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
         }
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeverRan
+        );
+    }
+
+    #[test]
+    fn fast_path_needs_drain_when_segments_but_no_snapshot() {
+        // Segments exist with no covering snapshot — genuine
+        // undrained durable state, not a never-started fork.
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        let seg = ulid::Ulid::new();
+        std::fs::write(tmp.path().join("index").join(format!("{seg}.idx")), "").unwrap();
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeedsDrain
+        );
     }
 
     #[test]
@@ -2125,7 +2287,10 @@ mod tests {
                 .join(snap.to_string()),
         )
         .unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeedsDrain
+        );
     }
 
     #[test]
@@ -2144,7 +2309,10 @@ mod tests {
             "",
         )
         .unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeedsDrain
+        );
     }
 
     #[test]
@@ -2164,7 +2332,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             release_fast_path_handoff(tmp.path()).unwrap(),
-            Some(FastPathCover {
+            FastPathDisposition::Cover(FastPathCover {
                 snap_ulid: snap,
                 kind: elide_core::signing::SnapshotKind::User
             })
@@ -2195,7 +2363,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             release_fast_path_handoff(tmp.path()).unwrap(),
-            Some(FastPathCover {
+            FastPathDisposition::Cover(FastPathCover {
                 snap_ulid: newer_snap,
                 kind: elide_core::signing::SnapshotKind::User
             })
@@ -2217,7 +2385,7 @@ mod tests {
         std::fs::write(tmp.path().join("snapshots").join(snap.to_string()), "").unwrap();
         assert_eq!(
             release_fast_path_handoff(tmp.path()).unwrap(),
-            Some(FastPathCover {
+            FastPathDisposition::Cover(FastPathCover {
                 snap_ulid: snap,
                 kind: elide_core::signing::SnapshotKind::User
             })
@@ -2230,7 +2398,7 @@ mod tests {
         let tmp = fast_path_clean_volume_auto(snap);
         assert_eq!(
             release_fast_path_handoff(tmp.path()).unwrap(),
-            Some(FastPathCover {
+            FastPathDisposition::Cover(FastPathCover {
                 snap_ulid: snap,
                 kind: elide_core::signing::SnapshotKind::Stop,
             }),
@@ -2267,7 +2435,7 @@ mod tests {
         let got = release_fast_path_handoff(tmp.path()).unwrap();
         assert_eq!(
             got,
-            Some(FastPathCover {
+            FastPathDisposition::Cover(FastPathCover {
                 snap_ulid: snap,
                 kind: elide_core::signing::SnapshotKind::User,
             }),
@@ -2279,10 +2447,13 @@ mod tests {
     fn fast_path_treats_missing_subdirs_as_empty() {
         let tmp = TempDir::new().unwrap();
         // No wal/, pending/, gc/, index/ directories yet — a brand-new
-        // volume that just happens to have no snapshot. Should fall
-        // through cleanly to the "no snapshot" branch.
+        // volume that just happens to have no snapshot. Absent dirs
+        // count as empty, so this is the never-ran case.
         std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), None);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            FastPathDisposition::NeverRan
+        );
     }
 
     // ── start hydrate_or_route ─────────────────────────────────────────

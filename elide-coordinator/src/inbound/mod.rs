@@ -25,7 +25,7 @@ mod lifecycle;
 // Re-exports used by sibling modules (claim.rs, fork.rs) under the
 // previous flat `crate::inbound::*` shape.
 pub(crate) use lifecycle::{
-    local_daemon_running, promote_stop_snapshot, release_fast_path_handoff,
+    FastPathDisposition, local_daemon_running, promote_stop_snapshot, release_fast_path_handoff,
 };
 
 // Shared test fixtures used by both `mod.rs::tests` and
