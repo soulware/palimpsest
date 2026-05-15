@@ -320,6 +320,14 @@ impl AuthState {
         Self::with_freshness_window(store, lineage_store, DEFAULT_FRESHNESS_WINDOW_SECS)
     }
 
+    /// Test double: one in-memory store backs both the coord-wide (S3)
+    /// and the local-lineage roles. Production keeps them distinct —
+    /// see `daemon.rs` and `tests/two_coordinator.rs`.
+    #[cfg(test)]
+    pub(crate) fn single_store(store: Arc<dyn ObjectStore>) -> Self {
+        Self::new(store.clone(), store)
+    }
+
     pub fn with_freshness_window(
         store: Arc<dyn ObjectStore>,
         lineage_store: Arc<dyn ObjectStore>,
@@ -934,10 +942,7 @@ mod tests {
 
     fn make_state() -> (Arc<dyn ObjectStore>, AuthState) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        // Unit tests publish provenance into this one in-memory store
-        // and exercise lineage against it; the production split (S3 vs
-        // local) is covered in tests/two_coordinator.rs.
-        let auth = AuthState::new(store.clone(), store.clone());
+        let auth = AuthState::single_store(store.clone());
         (store, auth)
     }
 

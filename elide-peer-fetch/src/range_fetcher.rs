@@ -434,7 +434,7 @@ mod tests {
     /// "first entry present, second entry missing" scenarios.
     async fn live_fixture_with(entries_spec: Vec<(Vec<u8>, bool)>) -> LiveFixture {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::new(store.clone(), store.clone());
+        let auth = AuthState::single_store(store.clone());
         let data_dir = TempDir::new().unwrap();
         let vol_key = SigningKey::generate(&mut OsRng);
         let vol_ulid = Ulid::new();
