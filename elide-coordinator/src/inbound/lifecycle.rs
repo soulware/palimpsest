@@ -564,7 +564,14 @@ pub(crate) async fn release_volume_op(
                     s
                 }
                 None => {
-                    synthesise_empty_owner_handoff(volume_name, data_dir, vol_ulid, store).await?
+                    synthesise_empty_owner_handoff(
+                        volume_name,
+                        data_dir,
+                        vol_ulid,
+                        store,
+                        Some(&vol_dir),
+                    )
+                    .await?
                 }
             };
             info!(
@@ -708,7 +715,10 @@ async fn release_breadcrumb_only(
             promote_stop_in_store(&rec.vol_ulid.to_string(), snap_ulid, store).await?;
             snap_ulid
         }
-        None => synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store).await?,
+        // Breadcrumb-only: no local fork dir to materialise into.
+        None => {
+            synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store, None).await?
+        }
     };
     info!(
         "[release {volume_name}] breadcrumb-only: handoff snapshot {snap_ulid} \
@@ -795,18 +805,22 @@ async fn latest_release_handoff_snapshot(
 /// also needs to rename the sentinel + manifest on disk, which
 /// doesn't apply here.
 /// Sign and publish an empty handoff manifest for an owned volume
-/// that never accumulated any segments. Reached only from the
-/// breadcrumb-only release path when `latest_release_handoff_snapshot`
-/// returns `None` — i.e. the operator did
-/// `volume claim` → `volume remove` → `volume release` without ever
-/// starting the volume, so the daemon never wrote anything and no
-/// stop-snapshot was published at stop time.
+/// that never accumulated any segments. Reached when
+/// `latest_release_handoff_snapshot` returns `None` from either the
+/// `NeverRan` release path (a fork claimed and released without ever
+/// being started) or the breadcrumb-only path
+/// (`volume claim` → `volume remove` → `volume release`).
 ///
 /// Signs with the volume's own key (loaded from the local
 /// `data_dir/keys/<vol_ulid>.key` shadow). The result is a normal
 /// `<S>.manifest` with zero segment ULIDs and no recovery metadata —
 /// identical shape to what `volume stop` would have published if the
 /// volume had run with no writes.
+///
+/// `local_fork_dir` is `Some` only on the `NeverRan` path, where a
+/// fork dir still exists on disk; the manifest is then mirrored
+/// locally (see `materialise_handoff_locally`) so this coordinator
+/// serves it to subsequent peer claims without a peer-fetch miss.
 ///
 /// Refuses if no key shadow exists. That would mean we own the
 /// bucket record but the host has no record of ever minting the
@@ -822,6 +836,7 @@ async fn synthesise_empty_owner_handoff(
     data_dir: &Path,
     vol_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
+    local_fork_dir: Option<&Path>,
 ) -> Result<ulid::Ulid, IpcError> {
     let shadow = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
         .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?;
@@ -839,14 +854,53 @@ async fn synthesise_empty_owner_handoff(
         elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
     let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
     store
-        .put(&key, manifest_bytes.into())
+        .put(&key, manifest_bytes.clone().into())
         .await
         .map_err(|e| IpcError::store(format!("publishing empty handoff manifest {key}: {e}")))?;
     info!(
-        "[release {volume_name}] breadcrumb-only: synthesised empty handoff \
+        "[release {volume_name}] synthesised empty handoff \
          {snap_ulid} (signed by local key shadow)"
     );
+
+    // S3 is authoritative for the handoff. When a local fork dir
+    // exists (the `NeverRan` release path), also materialise the
+    // manifest + its upload sentinel on disk so this coordinator can
+    // serve it directly to subsequent peer claims instead of forcing
+    // every claimant through a peer-fetch miss + S3 round trip. The
+    // sentinel is truthful — the S3 PUT above already succeeded — so a
+    // later reclaim+release of this fork takes the `Cover` fast path.
+    // Best-effort: a write failure leaves S3 as the only copy, which
+    // is correct, just slower for peers.
+    if let Some(dir) = local_fork_dir
+        && let Err(e) = materialise_handoff_locally(dir, snap_ulid, &manifest_bytes)
+    {
+        warn!(
+            "[release {volume_name}] caching synthesised handoff {snap_ulid} \
+             locally: {e} (S3 copy is authoritative; peers will fall back to S3)"
+        );
+    }
     Ok(snap_ulid)
+}
+
+/// Write a synthesised User-kind handoff manifest and its empty upload
+/// sentinel into a local fork dir, matching the layout the drain path
+/// (`upload_snapshot_metadata`) and `release_fast_path_handoff`
+/// expect: `snapshots/<ulid>.manifest` plus `uploaded/snapshots/<ulid>`.
+fn materialise_handoff_locally(
+    vol_dir: &Path,
+    snap_ulid: ulid::Ulid,
+    manifest_bytes: &[u8],
+) -> std::io::Result<()> {
+    let snap_dir = vol_dir.join("snapshots");
+    std::fs::create_dir_all(&snap_dir)?;
+    std::fs::write(
+        snap_dir.join(elide_core::signing::snapshot_manifest_filename(&snap_ulid)),
+        manifest_bytes,
+    )?;
+    let sentinel_dir = vol_dir.join("uploaded").join("snapshots");
+    std::fs::create_dir_all(&sentinel_dir)?;
+    std::fs::write(sentinel_dir.join(snap_ulid.to_string()), [])?;
+    Ok(())
 }
 
 /// S3-side half of an auto→user promotion: server-side COPY of
@@ -2032,6 +2086,95 @@ mod tests {
         assert_eq!(reply.handoff_snapshot, snap);
 
         // names/<vol> flipped to Released, pinned at that snapshot.
+        let (after, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(after.state, NameState::Released);
+        assert_eq!(after.handoff_snapshot, Some(snap));
+    }
+
+    #[tokio::test]
+    async fn release_synthesises_and_materialises_handoff_for_never_ran_fork() {
+        // NeverRan with NO snapshot anywhere in S3 (a fork claimed and
+        // released without ever running, where even the lineage had
+        // nothing to reuse). Release synthesises an empty handoff,
+        // publishes it to S3, AND mirrors it into the local fork dir
+        // so this coordinator can serve it to subsequent peer claims
+        // without forcing a peer-fetch miss + S3 round trip.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), None);
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+
+        // Synthesis signs with the volume's key shadow.
+        let keytmp = TempDir::new().unwrap();
+        let sk = elide_core::signing::generate_keypair(keytmp.path(), "k", "p").unwrap();
+        elide_coordinator::key_shadow::write(data_dir.path(), vol_ulid, &sk.to_bytes()).unwrap();
+
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir.path())
+                .unwrap(),
+        );
+
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
+        rec.state = NameState::Stopped;
+        rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let ctx = IpcContext {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            fetch_registry: crate::fetch::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
+                store.clone(),
+            )),
+            identity,
+            credentialer: None,
+        };
+
+        let reply = release_volume_op("vol", &store, &ctx)
+            .await
+            .expect("never-ran fork with no S3 snapshot must synthesise a handoff");
+        let snap = reply.handoff_snapshot;
+
+        // Synthesised manifest is in S3 (authoritative)…
+        let s3_key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap);
+        assert!(store.get(&s3_key).await.is_ok(), "manifest must be in S3");
+
+        // …and mirrored locally with its upload sentinel.
+        let local_manifest = vol_dir
+            .join("snapshots")
+            .join(elide_core::signing::snapshot_manifest_filename(&snap));
+        let local_sentinel = vol_dir
+            .join("uploaded")
+            .join("snapshots")
+            .join(snap.to_string());
+        assert!(
+            local_manifest.is_file(),
+            "synthesised manifest must be materialised at {}",
+            local_manifest.display()
+        );
+        assert!(
+            local_sentinel.is_file(),
+            "upload sentinel must be materialised at {}",
+            local_sentinel.display()
+        );
+
+        // The local mirror is consistent enough that a subsequent
+        // reclaim+release of this fork takes the Cover fast path
+        // rather than re-synthesising or erroring.
+        assert_eq!(
+            release_fast_path_handoff(&vol_dir).unwrap(),
+            FastPathDisposition::Cover(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User,
+            })
+        );
+
         let (after, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
         assert_eq!(after.state, NameState::Released);
         assert_eq!(after.handoff_snapshot, Some(snap));
