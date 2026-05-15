@@ -106,9 +106,8 @@ Each mint instance is configured with:
    single-tenant per instance; multi-tenancy is a v2 question.
 
 Role definitions, trust root, audience, and tenant metadata are static
-(file-backed) in v1; a config-management API is a future direction. The
-admin credential is the one input that comes from the environment, not
-the file.
+and file-backed. The admin credential is the one input that comes from
+the environment, not the file.
 
 ### Admin credential custody — deployment shapes
 
