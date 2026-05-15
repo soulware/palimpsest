@@ -1,15 +1,25 @@
 //! ObjectStore-backed ancestry walker for the peer-fetch auth pipeline.
 //!
 //! Given a starting `vol_ulid`, walks the signed `volume.provenance`
-//! parent chain in S3 and returns the set of fork ULIDs that make up
-//! the volume's ancestry (including the starting volume itself).
+//! parent chain and returns the set of fork ULIDs that make up the
+//! volume's ancestry (including the starting volume itself).
+//!
+//! The store is supplied by the caller. The peer-fetch auth pipeline
+//! passes a `LocalFileSystem` rooted at the coordinator's `data_dir`,
+//! so the walk reads the peer's *own local* `by_id/<vol>/volume.
+//! {provenance,pub}` — the copies it holds for every fork it serves.
+//! Lineage is therefore established with no S3 read and no credential
+//! (docs/design-peer-segment-fetch.md § Peer verification, check 4). A
+//! fork the peer does not serve has no local provenance: the walk
+//! returns a `NotFound` error and the caller fails closed (declines;
+//! the requester falls back to S3).
 //!
 //! Trust shape mirrors the local-filesystem walker in
 //! `elide-core::signing` and the read-path walker in
 //! `elide-coordinator::prefetch`:
 //!
 //! - The starting volume's `volume.provenance` is verified against
-//!   `volume.pub` sitting in the same `by_id/<vol_ulid>/` prefix on S3.
+//!   `volume.pub` in its own `by_id/<vol_ulid>/` prefix.
 //! - Each ancestor step is verified against the `parent_pubkey`
 //!   embedded in the *child's* signed provenance — never against the
 //!   `volume.pub` sitting in the ancestor's prefix. This is the same
@@ -27,6 +37,7 @@ use std::io;
 
 use ed25519_dalek::VerifyingKey;
 use elide_core::signing::{VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, verify_lineage_with_key};
+use object_store::Error as ObjectStoreError;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
@@ -44,7 +55,7 @@ pub async fn walk_ancestry(
     let mut set = HashSet::new();
     set.insert(starting_vol_ulid);
 
-    // Trust anchor for the starting volume: its own `volume.pub` on S3.
+    // Trust anchor for the starting volume: its own local `volume.pub`.
     let mut current_ulid = starting_vol_ulid;
     let mut current_vk = load_volume_pub(store, &current_ulid).await?;
 
@@ -89,7 +100,7 @@ async fn load_volume_pub(store: &dyn ObjectStore, vol_ulid: &Ulid) -> io::Result
     let body = store
         .get(&key)
         .await
-        .map_err(|e| io::Error::other(format!("fetch {VOLUME_PUB_FILE} for {vol_ulid}: {e}")))?
+        .map_err(|e| not_found_or_other(e, format!("fetch {VOLUME_PUB_FILE} for {vol_ulid}")))?
         .bytes()
         .await
         .map_err(|e| {
@@ -124,6 +135,19 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
     }
 }
 
+/// Preserve `NotFound` through the `io::Error` boundary so the auth
+/// caller can fail closed (decline → 403) for a fork the peer doesn't
+/// serve, rather than treating an absent local chain as a 5xx fault.
+fn not_found_or_other(e: ObjectStoreError, context: String) -> io::Error {
+    match e {
+        ObjectStoreError::NotFound { .. } => io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{context}: not served locally"),
+        ),
+        other => io::Error::other(format!("{context}: {other}")),
+    }
+}
+
 async fn load_provenance(
     store: &dyn ObjectStore,
     vol_ulid: &Ulid,
@@ -134,9 +158,7 @@ async fn load_provenance(
         .get(&key)
         .await
         .map_err(|e| {
-            io::Error::other(format!(
-                "fetch {VOLUME_PROVENANCE_FILE} for {vol_ulid}: {e}"
-            ))
+            not_found_or_other(e, format!("fetch {VOLUME_PROVENANCE_FILE} for {vol_ulid}"))
         })?
         .bytes()
         .await

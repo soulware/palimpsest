@@ -664,7 +664,7 @@ mod tests {
 
     async fn start_server() -> LiveFixture {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::new(store.clone());
+        let auth = AuthState::new(store.clone(), store.clone());
         let data_dir = TempDir::new().unwrap();
 
         let coord_key = SigningKey::generate(&mut OsRng);

@@ -620,7 +620,7 @@ mod tests {
 
     async fn fixture() -> Fixture {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::new(store.clone());
+        let auth = AuthState::new(store.clone(), store.clone());
         let data_dir = TempDir::new().unwrap();
         let coord_key = SigningKey::generate(&mut OsRng);
         let vol_key = SigningKey::generate(&mut OsRng);
@@ -1175,7 +1175,7 @@ mod tests {
 
     async fn body_fixture() -> BodyFixture {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::new(store.clone());
+        let auth = AuthState::new(store.clone(), store.clone());
         let data_dir = TempDir::new().unwrap();
         let vol_key = SigningKey::generate(&mut OsRng);
         let vol_ulid = Ulid::new();

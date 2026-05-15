@@ -141,15 +141,25 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             Err(e) => return Err(anyhow::anyhow!("build peer-fetch client: {e}")),
         }
         // Server context for the inbound HTTP listener. The auth state
-        // shares the same coord-wide store handle the rest of the
-        // daemon uses (reads `coordinators/<id>/coordinator.pub`,
-        // `names/<name>`, `by_id/<vol>/volume.{pub,provenance}`); the
-        // route handler resolves files under `data_dir/by_id/...`.
+        // uses the coord-wide (S3) store for `coordinator.pub` and the
+        // ETag-conditional `names/<name>` read (steps 2–3, the gap-free
+        // force-release fence). Lineage (step 4) is verified against a
+        // separate local store rooted at `data_dir`: the peer walks the
+        // signed `by_id/<vol>/volume.{provenance,pub}` it already holds
+        // for every fork it serves — no S3 read, no credential. A fork
+        // it doesn't serve has no local chain, so the walk fails closed
+        // and the requester falls back to S3. The route handler
+        // resolves payload files under `data_dir/by_id/...` (step 5).
         let bind_addr_str = format!("{}:{}", config.peer_fetch.bind_addr(), port);
         let addr: std::net::SocketAddr = bind_addr_str
             .parse()
             .map_err(|e| anyhow::anyhow!("parsing peer-fetch bind {bind_addr_str:?}: {e}"))?;
-        let auth = elide_peer_fetch::auth::AuthState::new(coord_wide.clone());
+        let lineage_store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(data_dir.as_ref()).map_err(
+                |e| anyhow::anyhow!("peer-fetch lineage store at {:?}: {e}", data_dir.as_ref()),
+            )?,
+        );
+        let auth = elide_peer_fetch::auth::AuthState::new(coord_wide.clone(), lineage_store);
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }

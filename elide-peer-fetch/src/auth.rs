@@ -154,7 +154,16 @@ pub struct AuthState {
 }
 
 struct AuthStateInner {
+    /// Coord-wide store (S3 in production). Steps 2–3: `coordinator.pub`
+    /// and the ETag-conditional `names/<name>` read that keeps the
+    /// force-release fence gap-free.
     store: Arc<dyn ObjectStore>,
+    /// Peer-local store, rooted at `data_dir` in production. Step 4
+    /// only: the signed `volume.provenance` chain the peer holds for
+    /// every fork it serves. Never an S3 handle in production —
+    /// lineage is verified with no remote read and no credential
+    /// (docs/design-peer-segment-fetch.md § Peer verification check 4).
+    lineage_store: Arc<dyn ObjectStore>,
     pub_keys: RwLock<HashMap<String, VerifyingKey>>,
     /// Per-fork `volume.pub` cache, used by the body-token verify path
     /// (the coordinator-token path uses `pub_keys` instead). Keyed by
@@ -304,12 +313,24 @@ pub struct BodyAuthorized {
 }
 
 impl AuthState {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self::with_freshness_window(store, DEFAULT_FRESHNESS_WINDOW_SECS)
+    /// `store` is the coord-wide (S3) handle for steps 2–3.
+    /// `lineage_store` is the peer-local handle for step 4 — in
+    /// production a `LocalFileSystem` rooted at `data_dir`, never S3.
+    pub fn new(store: Arc<dyn ObjectStore>, lineage_store: Arc<dyn ObjectStore>) -> Self {
+        Self::with_freshness_window(store, lineage_store, DEFAULT_FRESHNESS_WINDOW_SECS)
     }
 
-    pub fn with_freshness_window(store: Arc<dyn ObjectStore>, freshness_window_secs: u64) -> Self {
-        Self::with_freshness_window_and_limiter(store, freshness_window_secs, Arc::new(NoRateLimit))
+    pub fn with_freshness_window(
+        store: Arc<dyn ObjectStore>,
+        lineage_store: Arc<dyn ObjectStore>,
+        freshness_window_secs: u64,
+    ) -> Self {
+        Self::with_freshness_window_and_limiter(
+            store,
+            lineage_store,
+            freshness_window_secs,
+            Arc::new(NoRateLimit),
+        )
     }
 
     /// Construct an `AuthState` with a custom rate limiter. The
@@ -318,12 +339,14 @@ impl AuthState {
     /// without touching call sites.
     pub fn with_freshness_window_and_limiter(
         store: Arc<dyn ObjectStore>,
+        lineage_store: Arc<dyn ObjectStore>,
         freshness_window_secs: u64,
         rate_limiter: Arc<dyn RateLimiter>,
     ) -> Self {
         Self {
             inner: Arc::new(AuthStateInner {
                 store,
+                lineage_store,
                 pub_keys: RwLock::new(HashMap::new()),
                 volume_pub_keys: RwLock::new(HashMap::new()),
                 ancestry_cache: RwLock::new(HashMap::new()),
@@ -750,9 +773,16 @@ impl AuthState {
         if let Some(set) = self.inner.ancestry_cache.read().await.get(&vol_ulid) {
             return Ok(set.clone());
         }
-        let set = walk_ancestry(self.inner.store.as_ref(), vol_ulid)
+        // Local-only: walk the peer's own served-fork provenance
+        // chain. A fork the peer doesn't serve has no local chain —
+        // fail closed (403; the requester falls back to S3). Genuine
+        // I/O faults stay 502.
+        let set = walk_ancestry(self.inner.lineage_store.as_ref(), vol_ulid)
             .await
-            .map_err(AuthError::Backend)?;
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => AuthError::OutsideLineage,
+                _ => AuthError::Backend(e),
+            })?;
         self.inner
             .ancestry_cache
             .write()
@@ -904,7 +934,10 @@ mod tests {
 
     fn make_state() -> (Arc<dyn ObjectStore>, AuthState) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::new(store.clone());
+        // Unit tests publish provenance into this one in-memory store
+        // and exercise lineage against it; the production split (S3 vs
+        // local) is covered in tests/two_coordinator.rs.
+        let auth = AuthState::new(store.clone(), store.clone());
         (store, auth)
     }
 
@@ -1482,6 +1515,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let auth = AuthState::with_freshness_window_and_limiter(
+            store.clone(),
             store.clone(),
             DEFAULT_FRESHNESS_WINDOW_SECS,
             Arc::new(AlwaysReject),
