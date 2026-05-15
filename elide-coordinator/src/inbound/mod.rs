@@ -2187,10 +2187,10 @@ fn resolve_volume_name(data_dir: &Path, volume_ulid: &str) -> Result<String, Ipc
         let Ok(target) = std::fs::canonicalize(&link) else {
             continue;
         };
-        if target.file_name().and_then(|n| n.to_str()) == Some(volume_ulid) {
-            if let Some(name) = entry.file_name().to_str() {
-                return Ok(name.to_owned());
-            }
+        if target.file_name().and_then(|n| n.to_str()) == Some(volume_ulid)
+            && let Some(name) = entry.file_name().to_str()
+        {
+            return Ok(name.to_owned());
         }
     }
     Err(IpcError::forbidden(
