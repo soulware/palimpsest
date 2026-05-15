@@ -585,8 +585,9 @@ pub struct StoreCredsReply {
 }
 
 /// Reply for [`Request::MintOperatorToken`]. The encoded macaroon is
-/// what the operator stores at `~/.elide/operator-token` (or passes
-/// via `--token` / `ELIDE_OPERATOR_TOKEN`). `nonce_hex` and
+/// what the CLI upserts into `~/.elide/tokens.toml` keyed by the
+/// coordinator's data_dir (or the operator passes via `--token` /
+/// `ELIDE_OPERATOR_TOKEN`). `nonce_hex` and
 /// `expires_unix` are returned alongside so the CLI can log what was
 /// just minted — useful for matching `token create` events to later
 /// `operator_token::authn` log lines.

@@ -134,7 +134,10 @@ enum Command {
         command: CoordCommand,
     },
 
-    /// Manage operator tokens (mint via the coordinator).
+    /// Mint operator tokens. Tokens are minted by the coordinator and
+    /// stored per-coordinator in `~/.elide/tokens.toml` (keyed by
+    /// data_dir), so gated verbs like `volume remove` pick them up
+    /// without `--token`.
     Token {
         #[command(subcommand)]
         command: TokenCommand,
@@ -144,16 +147,30 @@ enum Command {
 #[derive(Subcommand)]
 enum TokenCommand {
     /// Mint a coordinator-wide operator token via the coordinator's
-    /// IPC socket and print it to stdout. Store it at
-    /// `~/.elide/operator-token` (or pass via `--token` /
-    /// `ELIDE_OPERATOR_TOKEN`). The CLI narrows the token per use; the
-    /// minted form is not itself authorised for any verb.
+    /// IPC socket. Prints it to stdout and upserts it into
+    /// `~/.elide/tokens.toml` keyed by this coordinator's data_dir, so
+    /// gated verbs pick it up automatically. The CLI narrows the token
+    /// per use; the minted form is not itself authorised for any verb.
     Create {
         /// Token lifetime. Defaults to 30 days. Accepts humantime
         /// durations like `7d`, `12h`, `30m` — short values are
         /// useful for tests.
         #[arg(long, default_value = "30d")]
         expires: humantime::Duration,
+    },
+
+    /// List stored operator tokens from `~/.elide/tokens.toml`: one
+    /// row per coordinator, showing its data_dir, the token nonce, and
+    /// when it expires.
+    List,
+
+    /// Remove a stored token from `~/.elide/tokens.toml`, selected by
+    /// its nonce (as shown by `elide token list`). Independent of the
+    /// filesystem, so a stale entry can be cleaned up after its
+    /// coordinator is gone.
+    Remove {
+        /// Token nonce, copied from `elide token list`.
+        nonce: String,
     },
 }
 
@@ -426,7 +443,8 @@ enum VolumeCommand {
         #[arg(long)]
         force: bool,
         /// Operator token. Falls back to `ELIDE_OPERATOR_TOKEN`, then
-        /// to `~/.elide/operator-token`. Mint with `elide token create`.
+        /// to this coordinator's entry in `~/.elide/tokens.toml`. Mint
+        /// with `elide token create`.
         #[arg(long, env = "ELIDE_OPERATOR_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
@@ -900,7 +918,7 @@ fn main() {
             }
 
             VolumeCommand::Remove { name, force, token } => {
-                let stored = match elide::operator_token::resolve(token.as_deref()) {
+                let stored = match elide::operator_token::resolve(token.as_deref(), &data_dir) {
                     Ok(Some(t)) => t,
                     Ok(None) => {
                         eprintln!(
@@ -1265,10 +1283,21 @@ fn main() {
                 match coord.mint_operator_token(expires_unix) {
                     Ok(reply) => {
                         println!("{}", reply.token);
-                        eprintln!(
-                            "minted operator token: nonce={} expires_unix={}",
-                            reply.nonce_hex, reply.expires_unix,
-                        );
+                        match elide::operator_token::store_token(&data_dir, &reply.token) {
+                            Ok(path) => eprintln!(
+                                "minted operator token: nonce={} expires_unix={} stored={}",
+                                reply.nonce_hex,
+                                reply.expires_unix,
+                                path.display(),
+                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "minted operator token: nonce={} expires_unix={}",
+                                    reply.nonce_hex, reply.expires_unix,
+                                );
+                                eprintln!("warning: could not store token: {e}");
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -1276,6 +1305,70 @@ fn main() {
                     }
                 }
             }
+
+            TokenCommand::List => match elide::operator_token::list_tokens() {
+                Ok((path, entries)) => {
+                    if entries.is_empty() {
+                        println!("no tokens stored in {}", path.display());
+                    } else {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let dd_w = entries
+                            .iter()
+                            .map(|e| e.data_dir.len())
+                            .max()
+                            .unwrap_or(8)
+                            .max(8);
+                        println!("# {}", path.display());
+                        println!(
+                            "{:<dd_w$}  {:<32}  EXPIRES",
+                            "DATA-DIR",
+                            "NONCE",
+                            dd_w = dd_w
+                        );
+                        for e in &entries {
+                            let nonce = e.nonce_hex.as_deref().unwrap_or("<unparseable>");
+                            let expires = match e.expires_unix {
+                                Some(t) if t > now => format!(
+                                    "in {} ({t})",
+                                    humantime::format_duration(std::time::Duration::from_secs(
+                                        t - now
+                                    )),
+                                ),
+                                Some(t) => format!("EXPIRED ({t})"),
+                                None => "?".to_owned(),
+                            };
+                            println!(
+                                "{:<dd_w$}  {:<32}  {}",
+                                e.data_dir,
+                                nonce,
+                                expires,
+                                dd_w = dd_w
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
+
+            TokenCommand::Remove { nonce } => match elide::operator_token::remove_token(&nonce) {
+                Ok(Some(dd)) => {
+                    eprintln!("removed operator token nonce={nonce} (data_dir={dd})");
+                }
+                Ok(None) => {
+                    eprintln!("error: no stored token with nonce {nonce}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
         },
     }
 }

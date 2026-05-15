@@ -573,8 +573,9 @@ fn require_operator_token(
             "rejected operator request: no token presented",
         );
         return Err(Envelope::err(IpcError::forbidden(format!(
-            "{} requires an operator token; run `elide token create` and pass it via --token, \
-             ELIDE_OPERATOR_TOKEN, or ~/.elide/operator-token",
+            "{} requires an operator token; run `elide token create` (writes \
+             ~/.elide/tokens.toml for this coordinator), or pass it via --token \
+             or ELIDE_OPERATOR_TOKEN",
             op.as_str()
         ))));
     };
