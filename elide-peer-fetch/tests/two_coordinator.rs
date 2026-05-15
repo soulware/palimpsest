@@ -379,43 +379,61 @@ async fn peer_404_when_segment_missing() {
     );
 }
 
-/// Two-coordinator + two-volume negative: peer A holds segment data
-/// only for volume V. A *different* volume W is also published in the
-/// shared store but has no lineage relationship to V. A request that
-/// signs with W's key for a URL referencing V's segment must be
-/// rejected by the lineage check and surface as `None`.
+/// Two-coordinator + two-volume: peer A serves segment data for volume
+/// V. A *different* volume W (valid `volume.key`, no lineage relation
+/// to V) signs a body token and requests V's segment.
 ///
-/// Models the privilege separation guarantee: a coordinator running
-/// volume W cannot pull bytes belonging to an unrelated volume V
-/// even though both share the same bucket.
+/// Post `url_vol_id` re-anchor (PR #361), this **succeeds**: the
+/// volume-key signature proves W holds a valid key, and step 4 is
+/// anchored at `url_vol_id` (V — which the peer serves locally), so the
+/// chain walks and authorises. The old `token.vol_ulid` anchor rejected
+/// this only as a side effect of the availability bug (W's provenance
+/// not on the peer's local disk — same reason the legitimate claimant
+/// was wrongly rejected). Per docs/design-peer-segment-fetch.md §"Step
+/// 4 anchor", the lineage gate is intent-scoping, not confidentiality:
+/// W's coordinator can already `GET by_id/V/...` straight from S3, so
+/// the peer adds no boundary here.
+///
+/// The genuine load gate for `.body` — "requester is a current
+/// claimer" — is the proposed body-token claimer gate (steps 2–3 port;
+/// see §"Body-token claimer gate (proposed, v1.x)"). Until that lands,
+/// `.body` has no claimer gate; this test asserts the interim reality
+/// and is the regression anchor to flip when the gate is implemented.
+// TODO(claimer-gate): once the body-token claimer gate lands, W has no
+// live `names/<name>` claim binding its coordinator to any served
+// volume, so this must again be rejected — at step 3 (401), not the
+// old lineage 403. Re-assert rejection then.
 #[tokio::test]
-async fn unrelated_volume_token_rejected() {
+async fn unrelated_volume_key_fetches_served_segment_no_claimer_gate_yet() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let v = mk_volume(&store).await;
     let w = mk_volume(&store).await;
 
     let payload = vec![0xCDu8; 4096];
     let data_dir = TempDir::new().unwrap();
-    let (seg_ulid, _) = mk_segment(data_dir.path(), &v, vec![(payload, true)]);
+    let (seg_ulid, _) = mk_segment(data_dir.path(), &v, vec![(payload.clone(), true)]);
     // Only V is served locally; W's provenance is never mirrored here.
     mirror_volume_local(data_dir.path(), &v);
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
-    // Sign with W's key, request V's segment. Token decode + signature
-    // verify under volume.pub for W (from the shared store) succeeds,
-    // but the local lineage walk for W finds no provenance the peer
-    // serves and fails closed with OutsideLineage.
-    let bad_signer = Arc::new(TestBodySigner {
+    // Sign with W's key, request V's segment. Signature verifies under
+    // by_id/W/volume.pub (shared store); step 4 walks ancestry(V) — the
+    // served URL vol_id — which succeeds, so the request authorises.
+    let w_signer = Arc::new(TestBodySigner {
         vol_ulid: w.ulid,
         key: w.key.clone(),
     });
-    let client = BodyFetchClient::new(bad_signer).unwrap();
+    let client = BodyFetchClient::new(w_signer).unwrap();
 
-    let result = client
+    let bytes = client
         .fetch_body_range(&peer_a.endpoint, v.ulid, seg_ulid, 0, 4096)
-        .await;
-    assert!(
-        result.is_none(),
-        "lineage rejection must surface as None (route returns 4xx, client falls through)"
+        .await
+        .expect(
+            "re-anchor authorises any valid volume key for a served segment (no claimer gate yet)",
+        );
+    assert_eq!(
+        &bytes[..],
+        payload.as_slice(),
+        "served segment body returned in full"
     );
 }

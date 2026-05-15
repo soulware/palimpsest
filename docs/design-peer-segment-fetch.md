@@ -367,6 +367,107 @@ The coordinator-key model has two operational benefits over per-volume signing:
 - **No IPC for token minting.** The coordinator has its own key in memory; signing is in-process. Per-volume signing would require a coord → volume IPC round-trip per token (or per token-cache-miss).
 - **One token per coord can fan out across multiple volumes.** A single coordinator can re-use the same auth pattern to fetch indexes for any volume it claims, since the auth check is "is the requesting coord the current claimer?" — naturally true for every volume the coord owns.
 
+#### Body-token claimer gate (proposed, v1.x)
+
+> **Proposed:** add the `.idx` path's steps 2–3 *legitimate-claimer
+> gate* to the `.body` route, so peer body load is bounded to current
+> claimers — exactly as it already is for index fetch.
+>
+> ##### Why
+>
+> Anchoring `verify_body_token`'s step 4 at `url_vol_id` is correct and
+> necessary (it fixes the availability bug where every cross-coordinator
+> claim 403s its own ancestor's body and falls back to S3). But it
+> exposes a structural gap: the body path has **no steps-2–3
+> equivalent**. Its only credential is the volume-signed
+> `BodyFetchToken`, which proves "the requester holds *some* valid
+> `volume.key`" — nothing about *which* volume the requester is
+> currently entitled to run. Step 4 is intent-scoping and
+> fail-closed-for-unserved, never a load gate (per *Step 4 anchor* and
+> *Anti-abuse properties* above, the legitimate-claimer gate for `.idx`
+> is steps 2–3, not the lineage walk). So post-re-anchor, any
+> `volume.key` holder can drive arbitrary peer body load for any segment
+> the peer serves locally. The concern is **peer load / minimal serving
+> set**, not confidentiality (the bytes are S3-readable by any bucket
+> coordinator regardless). The pre-fix `token.vol_ulid` anchor was
+> *accidentally* acting as a crude load gate by rejecting everything not
+> on the peer's local disk — including the legitimate claimant, which is
+> the bug.
+>
+> ##### Shape
+>
+> The `.body` request carries **two** credentials:
+>
+> - the existing volume-signed `BodyFetchToken` — unchanged; the
+>   fork-identity / byte-access proof, signature verified against
+>   `by_id/<token.vol_ulid>/volume.pub`;
+> - the existing coordinator-signed `PeerFetchToken`
+>   (`{volume_name, coordinator_id, issued_at, sig/coordinator.key}`) —
+>   the claimer credential, **reused verbatim**, no new token type.
+>
+> The peer's `.body` pipeline becomes the `.idx` pipeline plus the
+> volume-key check: steps 1–3 on the `PeerFetchToken` (decode/freshness,
+> `coordinator.pub` signature, `names/<volume_name>.coordinator_id ==
+> coordinator_id`), the `BodyFetchToken` signature verify for fork
+> identity, step 4 lineage **anchored at `url_vol_id`** (unchanged from
+> the merged fix), step 5 local `.body`/`.idx` exists. The 401/403/404
+> mapping is unchanged. This is the realisation of option A — "literally
+> the audited `.idx` pipeline" — without minting a new combined token:
+> the claimer proof is the same `PeerFetchToken` the coordinator already
+> signs in-process.
+>
+> ##### No per-read or per-cache-miss IPC
+>
+> `.body` fetches only occur on a demand-fetch cache miss or the
+> one-shot prefetch warm; a cache hit never touches the peer. The
+> `PeerFetchToken` claimer credential is coordinator-minted and scoped
+> to `(volume_name, coordinator_id)` with a freshness window — a coarse,
+> cacheable grant, **not** per-`(seg, range)`. The volume process
+> acquires it once (lazily, on first body fetch) and caches it on the
+> same lazy-cache + idle-drop lifecycle it already uses for S3
+> credentials (`creds_fetcher::LazyCredsFetcher` / `CoordinatorIssuer`
+> over the coordinator socket). Refresh is wall-clock driven at
+> ≈ freshness-window/2 (the cadence `BodyFetchClient` already uses for
+> the volume-key bearer), independent of cache-miss count. Between
+> refreshes every body request is pure in-process `volume.key` signing +
+> cached-bearer reuse, as today. Net cost: one amortised IPC per
+> freshness window on the same channel the volume already polls for S3
+> creds — no new hot-path cost, no new IPC mechanism.
+>
+> ##### What it restores
+>
+> Thundering-herd containment for `.body` (only a current claimer can
+> drive peer body load — steps 2–3), and `coordinator_id` back on every
+> body request so the existing rate-limit / blacklist attribution covers
+> `.body` exactly as `.idx`. The availability fix (the `url_vol_id`
+> anchor) is untouched; no confidentiality property is claimed or
+> needed.
+>
+> ##### Doc deltas this would settle
+>
+> - *Token shape* (the "fetching process signs with `volume.key`"
+>   paragraph): the body path signs with `volume.key` for fork identity
+>   **and** presents the coordinator-signed `PeerFetchToken` as the
+>   claimer credential.
+> - The verify table gains a `.body` row/note: steps 1–3 on the
+>   `PeerFetchToken`, plus `BodyFetchToken` signature, plus step 4 at
+>   `url_vol_id`.
+> - *Anti-abuse properties* "thundering-herd containment" becomes true
+>   for `.body`, not just `.idx`.
+> - `unrelated_volume_token_rejected` is reframed: volume W is rejected
+>   at step 3 (no live `names/<name>` claim binding W's coordinator to
+>   any volume the peer serves) — a 401 claimer-gate failure, not the
+>   old lineage 403. The "valid `volume.key` for an unrelated served
+>   segment" case is no longer rejected on confidentiality grounds; it
+>   never had to be.
+>
+> ##### Sequencing
+>
+> Rides on top of the merged `url_vol_id` re-anchor (PR #361). The
+> `peer_miss` observability differentiation layers on once
+> `verify_body_token` returns a distinct "not current claimer"
+> rejection, so the INFO log can name it.
+
 #### Caching profile
 
 Each check has its own staleness shape, and v1 ships with all three caches active:
