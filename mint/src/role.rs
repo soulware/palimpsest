@@ -1,0 +1,196 @@
+//! Role gating and TTL computation (`docs/design-mint.md`
+//! § *Role configuration*, § *TTL bounds*).
+//!
+//! Given a *verified* macaroon's caveats, a requested role, and a
+//! requested TTL, decide whether the role may be assumed and for how
+//! long. This module does **not** verify the MAC — that already
+//! happened — it only evaluates caveat *values*.
+
+use crate::caveat::EffectiveCaveats;
+use crate::config::{Config, Role};
+
+const AUDIENCE_CAVEAT: &str = "Audience";
+const NOT_AFTER_CAVEAT: &str = "NotAfter";
+const ROLE_CAVEAT: &str = "Role";
+
+/// Why an assume-role request was refused. Mapped to coarse HTTP
+/// statuses by the caller; never surfaced verbatim to the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Denied {
+    /// Role name not in mint config.
+    UnknownRole,
+    /// `Audience` caveat missing or != configured audience.
+    WrongAudience,
+    /// A `Role` caveat is present and does not permit this role.
+    RoleNotPermitted,
+    /// A caveat named in the role's `required_caveats` is absent.
+    MissingRequiredCaveat(String),
+    /// Macaroon carries no usable `NotAfter`, or it is already past.
+    Expired,
+    /// Requested TTL below the role's `min_ttl_seconds`.
+    TtlTooShort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Granted {
+    pub role: Role,
+    /// Effective lifetime in seconds after clamping.
+    pub ttl_seconds: u64,
+}
+
+/// Evaluate an assume-role request against config.
+///
+/// `requested_ttl` is the caller's `ttl_seconds` body field (already
+/// defaulted to the role's `default_ttl_seconds` by the caller if the
+/// field was absent). `now_unix` is the current time.
+pub fn authorize(
+    cfg: &Config,
+    caveats: &[crate::caveat::Caveat],
+    requested_role: &str,
+    requested_ttl: u64,
+    now_unix: u64,
+) -> Result<Granted, Denied> {
+    let role = cfg
+        .roles
+        .get(requested_role)
+        .ok_or(Denied::UnknownRole)?
+        .clone();
+
+    let eff = EffectiveCaveats::new(caveats);
+
+    // Audience: cross-service replay defence. Every Audience caveat must
+    // resolve to the configured name.
+    match eff.scalar(AUDIENCE_CAVEAT) {
+        Some(a) if a == cfg.audience => {}
+        _ => return Err(Denied::WrongAudience),
+    }
+
+    // Optional Role caveat restricts which roles are assumable. Accept
+    // either a scalar (single role) or a list (subset).
+    if eff.contains(ROLE_CAVEAT) {
+        let permitted = if let Some(s) = eff.scalar(ROLE_CAVEAT) {
+            s == requested_role
+        } else if let Some(list) = eff.list(ROLE_CAVEAT) {
+            list.iter().any(|r| r == requested_role)
+        } else {
+            false
+        };
+        if !permitted {
+            return Err(Denied::RoleNotPermitted);
+        }
+    }
+
+    // Required caveats: presence-only gate.
+    for req in &role.required_caveats {
+        if !eff.contains(req) {
+            return Err(Denied::MissingRequiredCaveat(req.clone()));
+        }
+    }
+
+    // TTL: granted = min(requested_or_default, role.max, NotAfter - now).
+    let not_after = eff.not_after(NOT_AFTER_CAVEAT).ok_or(Denied::Expired)?;
+    let remaining = not_after.checked_sub(now_unix).ok_or(Denied::Expired)?;
+    if remaining == 0 {
+        return Err(Denied::Expired);
+    }
+    if requested_ttl < role.min_ttl_seconds {
+        return Err(Denied::TtlTooShort);
+    }
+    let ttl_seconds = requested_ttl.min(role.max_ttl_seconds).min(remaining);
+
+    Ok(Granted { role, ttl_seconds })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caveat::Caveat;
+    use crate::config::Config;
+
+    fn cfg() -> Config {
+        Config::from_toml_str(
+            r#"
+audience = "mint"
+trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+[tenant]
+bucket = "b"
+[[role]]
+name = "volume-ro"
+required_caveats = ["elide:Volume", "Audience", "NotAfter"]
+min_ttl_seconds = 60
+max_ttl_seconds = 1000
+default_ttl_seconds = 800
+policy = "{}"
+"#,
+        )
+        .expect("cfg")
+    }
+
+    fn good_caveats(not_after: u64) -> Vec<Caveat> {
+        vec![
+            Caveat::scalar("Audience", "mint"),
+            Caveat::scalar("elide:Volume", "01ARZ"),
+            Caveat::scalar("NotAfter", not_after.to_string()),
+        ]
+    }
+
+    #[test]
+    fn happy_path_clamps_to_max() {
+        let g = authorize(&cfg(), &good_caveats(1_000_000), "volume-ro", 5000, 1000).unwrap();
+        assert_eq!(g.ttl_seconds, 1000); // role max
+    }
+
+    #[test]
+    fn ttl_capped_by_not_after() {
+        let g = authorize(&cfg(), &good_caveats(1300), "volume-ro", 900, 1000).unwrap();
+        assert_eq!(g.ttl_seconds, 300); // not_after - now
+    }
+
+    #[test]
+    fn wrong_audience_denied() {
+        let mut cv = good_caveats(1_000_000);
+        cv[0] = Caveat::scalar("Audience", "other");
+        assert_eq!(
+            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            Err(Denied::WrongAudience)
+        );
+    }
+
+    #[test]
+    fn missing_required_caveat_denied() {
+        let cv = vec![
+            Caveat::scalar("Audience", "mint"),
+            Caveat::scalar("NotAfter", "1000000"),
+        ];
+        assert_eq!(
+            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            Err(Denied::MissingRequiredCaveat("elide:Volume".into()))
+        );
+    }
+
+    #[test]
+    fn expired_macaroon_denied() {
+        assert_eq!(
+            authorize(&cfg(), &good_caveats(500), "volume-ro", 800, 1000),
+            Err(Denied::Expired)
+        );
+    }
+
+    #[test]
+    fn unknown_role_denied() {
+        assert_eq!(
+            authorize(&cfg(), &good_caveats(1_000_000), "nope", 800, 1000),
+            Err(Denied::UnknownRole)
+        );
+    }
+
+    #[test]
+    fn role_caveat_restricts() {
+        let mut cv = good_caveats(1_000_000);
+        cv.push(Caveat::scalar("Role", "coord-names"));
+        assert_eq!(
+            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            Err(Denied::RoleNotPermitted)
+        );
+    }
+}

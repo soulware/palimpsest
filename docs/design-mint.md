@@ -211,8 +211,8 @@ policy = """
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.Volume}}/*"
-      {{#each caveat.Ancestors}},
+      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "Volume"}}/*"
+      {{#each (caveat "Ancestors")}},
       "arn:aws:s3:::{{tenant.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
@@ -230,18 +230,35 @@ The mint substitutes three classes of variable in the policy template at
 issuance time:
 
 - `{{tenant.X}}` — values from the mint's tenant configuration (bucket name,
-  etc.). Server-side, never caller-controlled.
-- `{{caveat.X}}` — values from the verified macaroon's caveats. Scalar
-  caveats render directly; list-valued caveats are iterated with the
-  `{{#each ...}}{{/each}}` construct.
-- `{{system.X}}` — values computed by the mint at request time. v1 set:
-  `system.expiry_iso8601` (the issued credential's expiry, derived from the
-  requested or default TTL).
+  etc.), as a plain path. Server-side, never caller-controlled.
+- `{{caveat "X"}}` — the verified macaroon's caveat named `X`, resolved
+  through a built-in `caveat` lookup helper that takes the caveat name as
+  a string argument. Scalar caveats render directly
+  (`{{caveat "elide:Volume"}}`); list-valued caveats are iterated as a
+  subexpression (`{{#each (caveat "elide:Ancestors")}}…{{/each}}`). The
+  helper form (not a `{{caveat.X}}` path) is required because namespaced
+  caveat names contain `:`, which is not a legal template path segment;
+  it also keeps the caveat surface to a single named lookup rather than
+  arbitrary data-graph traversal.
+- `{{system.X}}` — values computed by the mint at request time, as a plain
+  path. v1 set: `system.expiry_iso8601` (the issued credential's expiry,
+  derived from the requested or default TTL).
 
-The mint **does not** ship a general-purpose policy DSL. Conditional blocks,
-arithmetic, value transformations, and dynamic resource construction beyond
-straight substitution are deliberately out of scope. Roles requiring more
-expressive policies should be split into multiple roles.
+The `caveat` helper resolves names against the **effective** caveat set,
+not the raw chain: list-valued caveats are intersected across every
+occurrence, repeated scalars must agree, and a self-contradictory scalar
+resolves to absent. A reference to a caveat the macaroon does not carry
+(or one that is unsatisfiable) is a hard render failure — the request is
+refused, never minted with a missing substitution. The minted policy
+therefore reflects exactly the authority the gate evaluated.
+
+The mint **does not** ship a general-purpose policy DSL. The entire
+template surface is `{{tenant.*}}` / `{{system.*}}` plain paths, the
+`caveat` lookup helper, and `{{#each}}` over a list caveat. Conditional
+blocks, arithmetic, value transformations, and dynamic resource
+construction beyond straight substitution are deliberately out of scope.
+Roles requiring more expressive policies should be split into multiple
+roles.
 
 ### Required caveats
 
@@ -297,7 +314,9 @@ to indicate their issuer or domain:
 - `elide:Coord`
 
 This avoids collisions between issuers. Role templates reference caveats by
-their full namespaced name: `{{caveat.elide:Volume}}`.
+their full namespaced name through the `caveat` helper:
+`{{caveat "elide:Volume"}}`. The string-argument form is what makes the
+`:` separator usable in a template at all.
 
 ### List-valued caveats with intersection semantics
 
@@ -314,7 +333,7 @@ The macaroon library must understand list-valued caveats natively; see
 The complete caveat vocabulary the Elide roles draw on. A caveat serves
 one or both of two purposes: it **gates** authorization (listed in a
 role's `required_caveats`) and/or it **feeds** the policy template
-(`{{caveat.X}}` substitution). Some only gate.
+(`{{caveat "X"}}` substitution). Some only gate.
 
 | Caveat | Type | Scalar/List | Issuer | Purpose |
 |---|---|---|---|---|
@@ -322,7 +341,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
 | `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
 | `elide:Coord` | string (coord-ulid) | scalar | coordinator identity | Gate on all `coord-*`. Templated only in the deferred one-time-publish split. |
-| `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat.elide:Volume}}/*`. |
+| `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
 
 Per-role gate matrix (template substitutions are listed in each role's
@@ -352,7 +371,7 @@ Notes:
   other caveat is scalar. The list-valued caveat type (open question #6)
   is the only macaroon-library extension this inventory requires.
 - **`elide:Coord` templates only in `coord-identity`**
-  (`coordinators/{{caveat.elide:Coord}}/*`, own-prefix write). Every
+  (`coordinators/{{caveat "elide:Coord"}}/*`, own-prefix write). Every
   other `coord-*` role uses it as a gate only; their policies use
   prefix wildcards (`names/*`, `coordinators/*`, `events/*`).
 - **`coord-base` is the read-only baseline every coordinator holds**, and
@@ -406,7 +425,7 @@ prefix.
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/*`, single
+  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*`, single
   volume only.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
@@ -446,7 +465,7 @@ they are covered by the read-only `coord-base` baseline.
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
 - **TTL:** 6h.
 - **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat.elide:Coord}}/*`.
+  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat "elide:Coord"}}/*`.
   Coordinator-identity immutability is enforced here — no role holds
   delete on `coordinators/`. A leaked `coord-identity` key can rewrite
   only its own coordinator's identity, not impersonate another.
@@ -638,7 +657,7 @@ prematurely.
    conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `coord-data` uses a single-volume *trailing* wildcard
-   (`by_id/{{caveat.elide:Volume}}/*`), `volume-ro` uses exact ancestor
+   (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses exact ancestor
    ARNs, and `coord-base` touches no `by_id/` at all — none need mid-path
    `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,

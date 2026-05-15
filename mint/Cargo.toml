@@ -1,0 +1,28 @@
+[package]
+name = "mint"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Macaroon-authenticated scoped-credential vending for Tigris (prototype). Standalone-OSS-to-be; lives in the elide repo during the design phase."
+
+[dependencies]
+async-trait        = "0.1"
+axum               = "0.7"
+base64             = "0.22"
+blake3             = "1"
+chrono             = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+handlebars         = "6"
+rand_core          = { version = "0.6", features = ["getrandom"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+subtle             = "2"
+thiserror          = "1"
+tokio              = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+toml               = { version = "0.8", default-features = false, features = ["parse"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid               = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+tower = { version = "0.5", features = ["util"] }
