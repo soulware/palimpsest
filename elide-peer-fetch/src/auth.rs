@@ -154,7 +154,16 @@ pub struct AuthState {
 }
 
 struct AuthStateInner {
+    /// Coord-wide store (S3 in production). Steps 2–3: `coordinator.pub`
+    /// and the ETag-conditional `names/<name>` read that keeps the
+    /// force-release fence gap-free.
     store: Arc<dyn ObjectStore>,
+    /// Peer-local store, rooted at `data_dir` in production. Step 4
+    /// only: the signed `volume.provenance` chain the peer holds for
+    /// every fork it serves. Never an S3 handle in production —
+    /// lineage is verified with no remote read and no credential
+    /// (docs/design-peer-segment-fetch.md § Peer verification check 4).
+    lineage_store: Arc<dyn ObjectStore>,
     pub_keys: RwLock<HashMap<String, VerifyingKey>>,
     /// Per-fork `volume.pub` cache, used by the body-token verify path
     /// (the coordinator-token path uses `pub_keys` instead). Keyed by
@@ -304,12 +313,32 @@ pub struct BodyAuthorized {
 }
 
 impl AuthState {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self::with_freshness_window(store, DEFAULT_FRESHNESS_WINDOW_SECS)
+    /// `store` is the coord-wide (S3) handle for steps 2–3.
+    /// `lineage_store` is the peer-local handle for step 4 — in
+    /// production a `LocalFileSystem` rooted at `data_dir`, never S3.
+    pub fn new(store: Arc<dyn ObjectStore>, lineage_store: Arc<dyn ObjectStore>) -> Self {
+        Self::with_freshness_window(store, lineage_store, DEFAULT_FRESHNESS_WINDOW_SECS)
     }
 
-    pub fn with_freshness_window(store: Arc<dyn ObjectStore>, freshness_window_secs: u64) -> Self {
-        Self::with_freshness_window_and_limiter(store, freshness_window_secs, Arc::new(NoRateLimit))
+    /// Test double: one in-memory store backs both the coord-wide (S3)
+    /// and the local-lineage roles. Production keeps them distinct —
+    /// see `daemon.rs` and `tests/two_coordinator.rs`.
+    #[cfg(test)]
+    pub(crate) fn single_store(store: Arc<dyn ObjectStore>) -> Self {
+        Self::new(store.clone(), store)
+    }
+
+    pub fn with_freshness_window(
+        store: Arc<dyn ObjectStore>,
+        lineage_store: Arc<dyn ObjectStore>,
+        freshness_window_secs: u64,
+    ) -> Self {
+        Self::with_freshness_window_and_limiter(
+            store,
+            lineage_store,
+            freshness_window_secs,
+            Arc::new(NoRateLimit),
+        )
     }
 
     /// Construct an `AuthState` with a custom rate limiter. The
@@ -318,12 +347,14 @@ impl AuthState {
     /// without touching call sites.
     pub fn with_freshness_window_and_limiter(
         store: Arc<dyn ObjectStore>,
+        lineage_store: Arc<dyn ObjectStore>,
         freshness_window_secs: u64,
         rate_limiter: Arc<dyn RateLimiter>,
     ) -> Self {
         Self {
             inner: Arc::new(AuthStateInner {
                 store,
+                lineage_store,
                 pub_keys: RwLock::new(HashMap::new()),
                 volume_pub_keys: RwLock::new(HashMap::new()),
                 ancestry_cache: RwLock::new(HashMap::new()),
@@ -422,8 +453,15 @@ impl AuthState {
         }
 
         // Step 4: lineage — `LineageGated` only. Skeletons skip this.
+        // Anchored at the URL's `vol_id`, not the name record's: the
+        // claimant rebinds `names/<name>` to its new fork before the
+        // payload fetch, and that fork's provenance is never on the
+        // serving peer's local disk. The gate is "this peer holds a
+        // self-consistent signed chain rooted at `url_vol_id`" — the
+        // walk fails closed (`OutsideLineage`) for any fork it doesn't
+        // serve. See docs/design-peer-segment-fetch.md.
         if matches!(mode, RouteAuthMode::LineageGated) {
-            let ancestry = self.ancestry(name_record.vol_ulid).await?;
+            let ancestry = self.ancestry(url_vol_id).await?;
             if !ancestry.contains(&url_vol_id) {
                 return Err(AuthError::OutsideLineage);
             }
@@ -750,9 +788,16 @@ impl AuthState {
         if let Some(set) = self.inner.ancestry_cache.read().await.get(&vol_ulid) {
             return Ok(set.clone());
         }
-        let set = walk_ancestry(self.inner.store.as_ref(), vol_ulid)
+        // Local-only: walk the peer's own served-fork provenance
+        // chain. A fork the peer doesn't serve has no local chain —
+        // fail closed (403; the requester falls back to S3). Genuine
+        // I/O faults stay 502.
+        let set = walk_ancestry(self.inner.lineage_store.as_ref(), vol_ulid)
             .await
-            .map_err(AuthError::Backend)?;
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => AuthError::OutsideLineage,
+                _ => AuthError::Backend(e),
+            })?;
         self.inner
             .ancestry_cache
             .write()
@@ -904,7 +949,7 @@ mod tests {
 
     fn make_state() -> (Arc<dyn ObjectStore>, AuthState) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let auth = AuthState::new(store.clone());
+        let auth = AuthState::single_store(store.clone());
         (store, auth)
     }
 
@@ -1144,6 +1189,50 @@ mod tests {
             .expect_err("not in lineage");
         assert!(matches!(err, AuthError::OutsideLineage));
         assert_eq!(err.status_code(), 403);
+    }
+
+    /// Handoff regression: the claimant rebinds `names/<name>` to its
+    /// new fork before the payload fetch, so `name_record.vol_ulid` is
+    /// a child fork whose provenance is never on the serving peer's
+    /// local store. Step 4 must anchor at the URL's `vol_id` (the
+    /// parent fork the peer actually serves), not the name record —
+    /// otherwise every first claim 403s and falls back to S3. See
+    /// docs/design-peer-segment-fetch.md.
+    #[tokio::test]
+    async fn lineage_anchored_at_url_vol_id_not_name_record() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let parent_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        // The parent fork the releasing peer serves locally.
+        let parent_ulid = Ulid::new();
+        // The claimant's rebound fork — provenance never published
+        // anywhere the serving peer can see (S3-only in production).
+        let rebound_child_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), parent_ulid, &parent_key, None).await;
+        // Name record points at the child; the child has no provenance.
+        publish_live_name(store.as_ref(), vol_name, rebound_child_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // Anchored at the name record (child) this would 403 — the
+        // child's provenance is unwalkable. Anchored at `url_vol_id`
+        // (the served parent) it authorises.
+        let result = auth
+            .verify(&bearer, parent_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect("parent fork is locally served and self-consistent");
+        assert_eq!(result.vol_id, parent_ulid);
+        assert_eq!(result.coordinator_id, coord_id);
     }
 
     #[tokio::test]
@@ -1482,6 +1571,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let auth = AuthState::with_freshness_window_and_limiter(
+            store.clone(),
             store.clone(),
             DEFAULT_FRESHNESS_WINDOW_SECS,
             Arc::new(AlwaysReject),

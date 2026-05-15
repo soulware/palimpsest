@@ -143,8 +143,30 @@ struct TestPeer {
     _data_dir: TempDir,
 }
 
+/// Mirror a volume's signed `volume.{pub,provenance}` into a peer's
+/// local `data_dir`. The auth pipeline verifies lineage (step 4)
+/// against the peer's *own local* chain, not S3 — the peer holds the
+/// provenance for every fork it serves. Without this the lineage walk
+/// fails closed (`NotFound` → `OutsideLineage`).
+fn mirror_volume_local(data_dir: &std::path::Path, vol: &TestVolume) {
+    let by_id = data_dir.join("by_id").join(vol.ulid.to_string());
+    std::fs::create_dir_all(&by_id).unwrap();
+    std::fs::write(by_id.join("volume.pub"), pub_hex(&vol.key)).unwrap();
+    write_provenance(
+        &by_id,
+        &vol.key,
+        "volume.provenance",
+        &ProvenanceLineage::default(),
+    )
+    .unwrap();
+}
+
 async fn spawn_peer(store: Arc<dyn ObjectStore>, data_dir: TempDir) -> TestPeer {
-    let auth = AuthState::new(store);
+    // Step 4 (lineage) walks the peer's local store; steps 2–3 still
+    // use the shared (S3-modelling) store.
+    let lineage_store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(data_dir.path()).unwrap());
+    let auth = AuthState::new(store, lineage_store);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();
     let ctx = ServerContext::new(auth, data_dir.path().to_owned());
@@ -246,6 +268,7 @@ async fn cross_host_full_body_hit() {
     let data_dir = TempDir::new().unwrap();
     let (seg_ulid, _body_section_start) =
         mk_segment(data_dir.path(), &v, vec![(payload.clone(), true)]);
+    mirror_volume_local(data_dir.path(), &v);
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
     let signer = Arc::new(TestBodySigner {
@@ -281,6 +304,7 @@ async fn cross_host_partial_coverage_splice() {
         &v,
         vec![(first.clone(), true), (second.clone(), false)],
     );
+    mirror_volume_local(data_dir.path(), &v);
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
     let signer = Arc::new(TestBodySigner {
@@ -331,8 +355,12 @@ async fn peer_404_when_segment_missing() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let v = mk_volume(&store).await;
 
-    // No mk_segment call: data_dir is empty for this volume.
+    // No mk_segment call: no segment files for this volume. The peer
+    // still serves V (its provenance is mirrored locally), so auth
+    // passes and the miss surfaces as a clean 404 — not a lineage
+    // decline.
     let data_dir = TempDir::new().unwrap();
+    mirror_volume_local(data_dir.path(), &v);
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
     let signer = Arc::new(TestBodySigner {
@@ -369,11 +397,14 @@ async fn unrelated_volume_token_rejected() {
     let payload = vec![0xCDu8; 4096];
     let data_dir = TempDir::new().unwrap();
     let (seg_ulid, _) = mk_segment(data_dir.path(), &v, vec![(payload, true)]);
+    // Only V is served locally; W's provenance is never mirrored here.
+    mirror_volume_local(data_dir.path(), &v);
     let peer_a = spawn_peer(store.clone(), data_dir).await;
 
     // Sign with W's key, request V's segment. Token decode + signature
-    // verify under volume.pub for W succeeds, but the lineage walk
-    // (W's ancestry doesn't contain V) rejects with OutsideLineage.
+    // verify under volume.pub for W (from the shared store) succeeds,
+    // but the local lineage walk for W finds no provenance the peer
+    // serves and fails closed with OutsideLineage.
     let bad_signer = Arc::new(TestBodySigner {
         vol_ulid: w.ulid,
         key: w.key.clone(),
