@@ -38,9 +38,29 @@ elide token create [--expires 30d]
 This is an IPC verb (`Request::MintOperatorToken`) against `control.sock`.
 The coordinator mints with its in-memory root key and returns the encoded
 macaroon plus the per-token nonce (hex) and expiry; the CLI prints the
-token to stdout and logs the nonce/expiry to stderr. The operator stores
-the token at `~/.elide/operator-token` (or passes it via `--token` /
-`ELIDE_OPERATOR_TOKEN`).
+token to stdout, upserts it into `~/.elide/tokens.toml`, and logs the
+nonce/expiry plus the file path to stderr.
+
+`~/.elide/tokens.toml` is a per-user file (mode 0600 under `$HOME`) with
+one entry per coordinator, keyed by that coordinator's canonical
+data_dir:
+
+```toml
+[[coordinator]]
+data-dir = "/srv/elide-a"
+operator-token = "MDAxMG..."
+
+[[coordinator]]
+data-dir = "/home/op/elide_data"
+operator-token = "MDAxNm..."
+```
+
+Keeping the trust boundary per-user while keying by data_dir lets
+several coordinators run on one host without sharing a token. `token
+create` rewrites only the addressed coordinator's entry; the others
+survive the upsert. Gated verbs resolve the token in precedence order:
+`--token`, then `ELIDE_OPERATOR_TOKEN`, then the entry whose `data-dir`
+matches the canonical data_dir the CLI used to reach the socket.
 
 The mint endpoint is ungated beyond socket reachability. The trust floor
 for "can mint an operator token" is "can reach the coordinator's unix

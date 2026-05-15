@@ -144,10 +144,10 @@ enum Command {
 #[derive(Subcommand)]
 enum TokenCommand {
     /// Mint a coordinator-wide operator token via the coordinator's
-    /// IPC socket and print it to stdout. Store it at
-    /// `~/.elide/operator-token` (or pass via `--token` /
-    /// `ELIDE_OPERATOR_TOKEN`). The CLI narrows the token per use; the
-    /// minted form is not itself authorised for any verb.
+    /// IPC socket. Prints it to stdout and upserts it into
+    /// `~/.elide/tokens.toml` keyed by this coordinator's data_dir, so
+    /// gated verbs pick it up automatically. The CLI narrows the token
+    /// per use; the minted form is not itself authorised for any verb.
     Create {
         /// Token lifetime. Defaults to 30 days. Accepts humantime
         /// durations like `7d`, `12h`, `30m` — short values are
@@ -426,7 +426,8 @@ enum VolumeCommand {
         #[arg(long)]
         force: bool,
         /// Operator token. Falls back to `ELIDE_OPERATOR_TOKEN`, then
-        /// to `~/.elide/operator-token`. Mint with `elide token create`.
+        /// to this coordinator's entry in `~/.elide/tokens.toml`. Mint
+        /// with `elide token create`.
         #[arg(long, env = "ELIDE_OPERATOR_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
@@ -900,7 +901,7 @@ fn main() {
             }
 
             VolumeCommand::Remove { name, force, token } => {
-                let stored = match elide::operator_token::resolve(token.as_deref()) {
+                let stored = match elide::operator_token::resolve(token.as_deref(), &data_dir) {
                     Ok(Some(t)) => t,
                     Ok(None) => {
                         eprintln!(
@@ -1265,10 +1266,21 @@ fn main() {
                 match coord.mint_operator_token(expires_unix) {
                     Ok(reply) => {
                         println!("{}", reply.token);
-                        eprintln!(
-                            "minted operator token: nonce={} expires_unix={}",
-                            reply.nonce_hex, reply.expires_unix,
-                        );
+                        match elide::operator_token::store_token(&data_dir, &reply.token) {
+                            Ok(path) => eprintln!(
+                                "minted operator token: nonce={} expires_unix={} stored={}",
+                                reply.nonce_hex,
+                                reply.expires_unix,
+                                path.display(),
+                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "minted operator token: nonce={} expires_unix={}",
+                                    reply.nonce_hex, reply.expires_unix,
+                                );
+                                eprintln!("warning: could not store token: {e}");
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
