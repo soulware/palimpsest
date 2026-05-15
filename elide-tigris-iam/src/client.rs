@@ -403,16 +403,12 @@ fn extract_first_text(xml: &str, local_name: &str) -> Option<String> {
     let mut text_accum = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                if e.name().as_ref() == local_name.as_bytes() {
-                    in_tag = true;
-                    text_accum.clear();
-                }
+            Ok(Event::Start(e)) if e.name().as_ref() == local_name.as_bytes() => {
+                in_tag = true;
+                text_accum.clear();
             }
-            Ok(Event::End(e)) => {
-                if e.name().as_ref() == local_name.as_bytes() && in_tag {
-                    return Some(text_accum.clone());
-                }
+            Ok(Event::End(e)) if in_tag && e.name().as_ref() == local_name.as_bytes() => {
+                return Some(text_accum.clone());
             }
             Ok(Event::Text(t)) if in_tag => {
                 let bytes: &[u8] = t.as_ref();

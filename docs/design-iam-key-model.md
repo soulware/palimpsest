@@ -213,7 +213,17 @@ short of the central credentialer; on Tigris this is not a
 nice-to-have but the only way to avoid replicating org-root across
 the fleet.
 
-## Per-volume scoping for writes (rejected)
+## Per-volume scoping for writes (rejected — reversed under mint)
+
+> **Superseded.** This rejection has been reversed under
+> [`design-mint.md`](design-mint.md) § *Elide as customer: role
+> inventory* (Split B). The operational objection below — persisted
+> per-volume policies, `ListPolicies` reconciliation, orphan reaping —
+> is dissolved by mint's on-demand, short-lived, non-persisted keys.
+> The confused-deputy argument below still holds but is no longer
+> disqualifying given the dissolved cost. The text below is retained
+> as the original reasoning; read it as historical context, not the
+> current decision.
 
 A natural extension would be to mint per-volume *writer* keys for the
 coordinator's own use — one per volume, scoped to that volume's
