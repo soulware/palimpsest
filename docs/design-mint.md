@@ -200,13 +200,23 @@ against the sealed key. The persisted file alone is therefore inert:
 the secret stays the one identity key the coordinator already protects
 (name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
 registry — the pairing rides the token. Enrollment is a one-time
-exchange: the coordinator presents an enrollment token carrying a
-third-party caveat (discharged by the identity authority — `elide
-login`, or operator-mediated) and a `NotAfter`, and proves possession
-of `coordinator.key`. mint verifies the discharge, the PoP, and the
-`elide:Coord` binding, then **re-mints from its root** a primary
-stripped of the third-party caveat and `NotAfter` (Fly.io's
-service-token pattern — only the root holder can re-mint). **The
+exchange. The enrollment token is itself `elide:Coord`- and
+`elide:CoordKey`-bound: `elide login` issues it for one specific
+coordinator (parameterised by that coordinator's `coordinator.pub`),
+carrying `elide:Coord` + `elide:CoordKey` + a third-party caveat
+(discharged by the identity authority, or operator-mediated) + a
+`NotAfter`. The coordinator presents it and proves possession of
+`coordinator.key`. mint verifies the discharge, the PoP against the
+token's `elide:CoordKey`, and the `elide:Coord` binding, then **re-mints
+from its root** a primary carrying the *same* `elide:Coord` +
+`elide:CoordKey`, stripped of the third-party caveat and `NotAfter`
+(Fly.io's service-token pattern — only the root holder can re-mint).
+`elide:CoordKey` is the through-line in both tokens; the exchange does
+not bind a key, it removes the identity/expiry scaffolding around a
+binding that was already there. A stolen enrollment token is therefore
+inert the same way the primary is — it can only re-enrol the one
+coordinator whose private key the thief does not hold (idempotent), not
+stand up a rogue coordinator. **The
 primary does not expire**: once PoP-bound, a primary `NotAfter` is
 security-neutral — a file-only leak is already inert and a
 `coordinator.key` compromise renews regardless — so there is no
@@ -858,20 +868,19 @@ prematurely.
     `design-peer-segment-fetch.md` for performance — would shrink it to
     just `volume list --remote`, or remove it entirely. Not blocking;
     the temporal mitigation (short TTL, on-demand) holds until then.
-13. **Enrollment exchange.** The primary is minted once, by an
-    enrollment exchange: the coordinator presents an enrollment token
-    (third-party caveat discharged by the identity authority + a
-    `NotAfter`) and proves possession of `coordinator.key`; mint
-    verifies the discharge, the PoP, and the `elide:Coord` binding, then
-    re-mints from its root a stripped, non-expiring primary (see
-    *Coordinator bootstrap*). The PoP binding, the re-mint, and
-    non-expiry are decided. Open: the enrollment surface — a privileged
-    endpoint vs. an out-of-band `mint issue --coord <id>` operator
-    command — and, in the minimal deployment with no identity authority,
-    what stands in for the discharge (admin-only local operation). mint
-    **must** fix `elide:Coord` to the authenticated identity; a caller
-    never supplies it, since a self-chosen value would cross into
-    another coordinator's prefix. Decide before any issuance code exists.
+13. **Enrollment surface.** The exchange itself is decided (see
+    *Coordinator bootstrap*): the enrollment token is `elide:Coord`- and
+    `elide:CoordKey`-bound, mint verifies discharge + PoP + binding and
+    re-mints a stripped, non-expiring primary. Open: the transport — a
+    privileged endpoint vs. an out-of-band `mint issue --coord <id>`
+    operator command — and, in the minimal deployment with no identity
+    authority, what stands in for the discharge (admin-only local
+    operation). Also open: the pubkey-first ordering this implies —
+    `elide login` is parameterised by `coordinator.pub`, so the
+    coordinator's identity must exist before the enrollment token is
+    minted (generate identity → present pubkey to `elide login` →
+    coord-bound enrollment token → exchange). Decide before any issuance
+    code exists.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
