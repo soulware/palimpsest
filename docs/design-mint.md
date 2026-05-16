@@ -243,8 +243,10 @@ security-neutral — a file-only leak is already inert and a
 re-issuance cadence. The one thing expiry would force, periodic
 identity-authority re-attestation, is a deployment concern (#15). The
 identity key is not rotated: a new key is a new coordinator — new
-`coord-ulid`, new enrollment, new primary. Enrollment-exchange surface
-(#13) and the PoP wire detail (#16) are open.
+`coord-ulid`, new enrollment, new primary. The enrollment-exchange
+surface is decided for the self-hosted deployment — operator command
+`mint enroll-token` and `POST /v1/enroll` (#13); the identity-authority
+transport remains open under #13/#15.
 
 Refresh cadences, distinct, in increasing trust cost:
 
@@ -293,6 +295,36 @@ Content-Type: application/json
   "expiration": "2026-05-15T14:30:00Z"
 }
 ```
+
+The enrollment exchange (*Coordinator bootstrap*; #13) is a second
+endpoint, called once at provisioning rather than per request:
+
+```
+POST /v1/enroll
+Host: <mint-instance>
+Authorization: Macaroon <base64 enrollment token>
+X-Mint-Coord-Pop: <base64 Ed25519 signature>
+Content-Type: application/json
+
+{ "ts": 1747000000 }
+```
+
+Response — the re-minted, non-expiring primary:
+
+```
+200 OK
+Content-Type: application/json
+
+{ "primary": "<base64-encoded macaroon>" }
+```
+
+The presented token **must** be `elide:CoordKey`-bound (a bearer
+enrollment token is refused — a captured copy would otherwise enrol)
+and carry an unexpired `NotAfter`; the primary it returns carries the
+same `Audience` + `elide:Coord` + `elide:CoordKey` with `NotAfter`
+stripped. Same opaque-`401` model as `assume-role`. The operator side
+that issues the token is the command `mint enroll-token <config>
+--coord <ulid> --coord-pub ed25519:<b64> [--ttl <secs>]`.
 
 ### Authentication
 
@@ -955,19 +987,23 @@ prematurely.
     `design-peer-segment-fetch.md` for performance — would shrink it to
     just `volume list --remote`, or remove it entirely. Not blocking;
     the temporal mitigation (short TTL, on-demand) holds until then.
-13. **Enrollment surface.** The exchange itself is decided (see
-    *Coordinator bootstrap*): the enrollment token is `elide:Coord`- and
-    `elide:CoordKey`-bound, mint verifies discharge + PoP + binding and
-    re-mints a stripped, non-expiring primary. Open: the transport — a
-    privileged endpoint vs. an out-of-band `mint issue --coord <id>`
-    operator command — and, in the minimal deployment with no identity
-    authority, what stands in for the discharge (admin-only local
-    operation). Also open: the pubkey-first ordering this implies —
-    `elide coord register` is parameterised by `coordinator.pub`, so the
-    coordinator's identity must exist before the enrollment token is
-    minted (generate identity → `elide coord register`, login redirect
-    discharges the third-party caveat → coord-bound enrollment token →
-    exchange). Decide before any issuance code exists.
+13. **Enrollment surface.** Resolved for the minimal self-hosted
+    deployment (no identity authority; third-party caveats deferred,
+    #15): enrollment-token mint is the operator command
+    `mint enroll-token <config> --coord <ulid> --coord-pub ed25519:<b64>
+    [--ttl]` (admin-local, holds the root, emits a base64 token); the
+    exchange is `POST /v1/enroll` (token in `Authorization: Macaroon`,
+    `elide:CoordKey` PoP over the request body, same opaque-401 model as
+    `assume-role`). The operator command **is** the discharge stand-in —
+    the admin-local "vouch for coordinator X" act that an
+    identity-authority third-party-caveat discharge would otherwise
+    perform. A privileged token-mint endpoint was rejected: it would
+    need its own auth bootstrap (chicken/egg) for no gain over an
+    admin-local command. Still open, and only relevant once #15 lands:
+    the identity-authority transport (login-redirect discharge) and the
+    pubkey-first ordering through `elide coord register` (parameterised
+    by `coordinator.pub`, so the coordinator's identity exists before
+    the enrollment token is minted).
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's

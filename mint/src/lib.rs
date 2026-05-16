@@ -18,6 +18,7 @@ pub mod caveat;
 pub mod config;
 pub mod http;
 pub mod iam;
+pub mod issuance;
 pub mod macaroon;
 pub mod pop;
 pub mod role;

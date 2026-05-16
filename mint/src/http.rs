@@ -1,7 +1,8 @@
 //! HTTP surface (`docs/design-mint.md` § *Protocol*).
 //!
 //! ```text
-//! POST /v1/assume-role   Authorization: Macaroon <b64>
+//! POST /v1/assume-role   Authorization: Macaroon <b64>   (per request)
+//! POST /v1/enroll        Authorization: Macaroon <b64>   (once at provisioning)
 //! GET  /healthz
 //! ```
 //!
@@ -27,10 +28,12 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::audit::{AuditEntry, AuditLog, sanitise_caveats};
+use crate::caveat::EffectiveCaveats;
 use crate::config::Config;
 use crate::iam::KeypairMinter;
+use crate::issuance::{self, NOT_AFTER_CAVEAT};
 use crate::macaroon::Macaroon;
-use crate::pop;
+use crate::pop::{self, PopOutcome};
 use crate::role::{self, Denied};
 use crate::template::render_policy;
 
@@ -45,6 +48,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/assume-role", post(assume_role))
+        .route("/v1/enroll", post(enroll))
         .with_state(state)
 }
 
@@ -279,6 +283,114 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
                 resp.headers_mut().insert("retry-after", v);
             }
             resp
+        }
+    }
+}
+
+/// `POST /v1/enroll` — the enrollment exchange (`docs/design-mint.md`
+/// § *Coordinator bootstrap*). The coordinator presents an
+/// operator-issued enrollment token (expiring, key-bound) and proves
+/// possession of `coordinator.key`; mint re-mints from its root a
+/// non-expiring **primary** carrying the same `elide:Coord` +
+/// `elide:CoordKey`, `NotAfter` stripped.
+///
+/// Same opaque model as `assume-role`: every authentication failure is
+/// a detail-free `401`. Distinct from `assume-role` in two ways — the
+/// presented token **must** be key-bound (a bearer enrollment token
+/// would let any captor enrol), and it **must** carry an unexpired
+/// `NotAfter` (an enrollment token that never expires defeats the point
+/// of the one-time exchange).
+async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let caller = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let audit = |entry: AuditEntry| state.audit.record(&entry);
+    let now = Utc::now();
+    let now_unix = now.timestamp().max(0) as u64;
+
+    let unauthorized = |request_id: &str| {
+        respond(
+            request_id,
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "unauthorized"}),
+        )
+    };
+
+    let base_entry =
+        |outcome: &str, nonce: Option<String>, caveats: &[crate::caveat::Caveat]| AuditEntry {
+            timestamp: now.to_rfc3339(),
+            request_id: request_id.clone(),
+            caller_address: caller.clone(),
+            macaroon_nonce: nonce,
+            macaroon_caveats: sanitise_caveats(caveats),
+            role: String::new(),
+            granted_ttl_seconds: None,
+            outcome: format!("enroll:{outcome}"),
+            tigris_access_key_id: None,
+        };
+
+    // --- Authentication: any failure is an opaque 401. ---
+    let Some(token) = extract_macaroon(&headers) else {
+        audit(base_entry("denied:unauthenticated", None, &[]));
+        return unauthorized(&request_id);
+    };
+    if !token.verify(&state.config.trust_root) {
+        audit(base_entry("denied:bad_mac", None, &[]));
+        return unauthorized(&request_id);
+    }
+    let caveats = token.caveats().to_vec();
+    let nonce_hex = token.nonce_hex();
+
+    // --- Holder-of-key PoP. Unlike assume-role, NotKeyBound is a
+    // refusal here: an enrollment token must be key-bound or a captured
+    // copy enrols a coordinator the captor doesn't own. ---
+    let pop_proof = match headers
+        .get("x-mint-coord-pop")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(sig) => match pop::Proof::from_b64(sig) {
+            Ok(p) => Some(p),
+            Err(_) => {
+                audit(base_entry("denied:pop", Some(nonce_hex), &caveats));
+                return unauthorized(&request_id);
+            }
+        },
+        None => None,
+    };
+    match pop::check(&caveats, token.tail(), &body, pop_proof, now_unix) {
+        Ok(PopOutcome::Verified) => {}
+        Ok(PopOutcome::NotKeyBound) | Err(_) => {
+            audit(base_entry("denied:pop", Some(nonce_hex), &caveats));
+            return unauthorized(&request_id);
+        }
+    }
+
+    // --- Enrollment-token expiry. The token must carry an unexpired
+    // NotAfter; the primary it mints will have none. ---
+    match EffectiveCaveats::new(&caveats).not_after(NOT_AFTER_CAVEAT) {
+        Some(exp) if exp > now_unix => {}
+        _ => {
+            audit(base_entry("denied:expired", Some(nonce_hex), &caveats));
+            return unauthorized(&request_id);
+        }
+    }
+
+    // --- Re-mint the primary from the root. ---
+    match issuance::remint_primary(&state.config.trust_root, &state.config.audience, &token) {
+        Ok(primary) => {
+            audit(base_entry("granted", Some(nonce_hex), &caveats));
+            respond(
+                &request_id,
+                StatusCode::OK,
+                json!({ "primary": primary.encode() }),
+            )
+        }
+        Err(_) => {
+            audit(base_entry("denied:issuance", Some(nonce_hex), &caveats));
+            unauthorized(&request_id)
         }
     }
 }

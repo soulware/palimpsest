@@ -170,6 +170,18 @@ pub fn coord_key_value(seed: &[u8; 32]) -> String {
     format!("{ED25519_PREFIX}{}", BASE64.encode(vk.to_bytes()))
 }
 
+/// Validate an `elide:CoordKey` caveat value (`ed25519:<base64 pubkey>`)
+/// is well-formed *and* a usable Ed25519 verifying key. The issuance
+/// path uses this to reject a malformed operator-supplied `--coord-pub`
+/// at enrollment-token mint time rather than letting it fail opaquely
+/// at the coordinator's first `assume-role`.
+pub fn validate_coord_key(value: &str) -> Result<(), PopReject> {
+    let raw = parse_coord_key(value)?;
+    VerifyingKey::from_bytes(&raw)
+        .map(|_| ())
+        .map_err(|_| PopReject::BadKey)
+}
+
 /// Reference client signature: sign `digest(tail, body)` with the
 /// coordinator key seed, returning the `X-Mint-Coord-Pop` header value.
 /// The caller must have already embedded the freshness `ts` field in
