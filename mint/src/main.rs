@@ -1,13 +1,14 @@
 //! mint entry point.
 //!
 //! ```text
-//! mint serve <config.toml> [bind-addr]            # default bind 127.0.0.1:8085
+//! mint serve <config.toml> [bind-addr] [--tigris]  # default bind 127.0.0.1:8085
 //! mint enroll-token <config.toml> --coord <ulid> --coord-pub ed25519:<b64> [--ttl <secs>]
 //! ```
 //!
-//! `serve` runs the verification/vending HTTP surface. The prototype
-//! always wires the faked keypair minter — swapping in a real
-//! `TigrisMinter` is the single change to go live (see `iam.rs`).
+//! `serve` runs the verification/vending HTTP surface. Without
+//! `--tigris` it wires the faked keypair minter (no live account
+//! needed). With `--tigris` it wires the real Tigris IAM minter and
+//! requires a Tigris admin credential in the environment.
 //!
 //! `enroll-token` is the operator side of issuance (`docs/design-mint.md`
 //! § *Coordinator bootstrap*): it holds the mint root (from the config
@@ -25,8 +26,9 @@ use chrono::Utc;
 use mint::audit::AuditLog;
 use mint::config::Config;
 use mint::http::{AppState, router};
-use mint::iam::FakeMinter;
+use mint::iam::{FakeMinter, KeypairMinter};
 use mint::issuance::mint_enrollment_token;
+use mint::tigris::TigrisMinter;
 
 /// Default enrollment-token lifetime: a provisioning window, not a
 /// session. One-time and key-bound, so an unused leak is inert; this
@@ -34,7 +36,7 @@ use mint::issuance::mint_enrollment_token;
 const DEFAULT_ENROLL_TTL_SECONDS: u64 = 3600;
 
 const USAGE: &str = "usage:\n  \
-    mint serve <config.toml> [bind-addr]\n  \
+    mint serve <config.toml> [bind-addr] [--tigris]\n  \
     mint enroll-token <config.toml> --coord <ulid> --coord-pub ed25519:<b64> [--ttl <secs>]";
 
 #[tokio::main]
@@ -55,31 +57,48 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let mut a = args.into_iter();
-    let config_path = a.next().ok_or(USAGE)?;
-    let bind: SocketAddr = a
+    let mut tigris = false;
+    let mut positional = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--tigris" => tigris = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown flag {other}\n{USAGE}").into());
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let mut p = positional.into_iter();
+    let config_path = p.next().ok_or(USAGE)?;
+    let bind: SocketAddr = p
         .next()
         .unwrap_or_else(|| "127.0.0.1:8085".into())
         .parse()?;
 
     let config = Arc::new(Config::load(std::path::Path::new(&config_path))?);
+
+    // Pick the minter before binding so a misconfigured --tigris fails
+    // fast rather than at the first request.
+    let minter: Arc<dyn KeypairMinter> = if tigris {
+        let admin = config.admin.as_ref().ok_or(
+            "--tigris requires a Tigris admin credential in the environment \
+             (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
+        )?;
+        Arc::new(TigrisMinter::new(admin)?)
+    } else {
+        Arc::new(FakeMinter::new())
+    };
     tracing::info!(
         audience = %config.audience,
         roles = config.roles.len(),
         admin_credential = config.admin.is_some(),
-        "loaded config (prototype: keypair minting is FAKED)"
+        minter = if tigris { "tigris" } else { "FAKED" },
+        "loaded config"
     );
-    if config.admin.is_none() {
-        tracing::warn!(
-            "no Tigris admin credential in env (AWS_ACCESS_KEY_ID / \
-             AWS_SECRET_ACCESS_KEY); fine for the faked minter, but a \
-             real Tigris minter would refuse to start"
-        );
-    }
 
     let state = AppState {
         config,
-        minter: Arc::new(FakeMinter::new()),
+        minter,
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
     };
 

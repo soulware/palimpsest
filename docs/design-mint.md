@@ -871,6 +871,17 @@ serving TLS directly, with the admin credential delivered into the
 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment via systemd
 `LoadCredential=` or equivalent secrets-management.
 
+The Tigris IAM client is the AWS IAM Query API at
+`https://iam.storage.dev` (SigV4-signed form POSTs, XML responses) —
+the `CreateAccessKey` → `CreatePolicy` → `AttachUserPolicy` sequence,
+and nothing else (no delete/list: expiry is the policy `DateLessThan`,
+§ *Cleanup*). It is selected by `mint serve … --tigris` (which requires
+the admin credential and otherwise fails fast at startup); without the
+flag a faked minter runs for local/test use. `MINT_IAM_ENDPOINT`
+overrides the endpoint for staging. The client is ported into the mint
+binary rather than shared with the coordinator's `elide-tigris-iam` so
+mint carries no `elide-*` dependency.
+
 ### Audit log
 
 Every `AssumeRole` call produces an audit entry. Minimal field set:
