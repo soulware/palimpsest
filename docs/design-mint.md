@@ -212,13 +212,12 @@ Refresh cadences, distinct, in increasing trust cost:
 
 - **Tigris keypair** — re-call `assume-role` with the held macaroon
   (*Open questions* #8).
-- **`volume-ro` attenuation** — coordinator-local, near-free: the
-  coordinator re-attenuates off its primary and re-hands to the volume.
-  No mint or issuance round trip. Per fetch episode for non-lazy
-  volumes; on a longer timer for lazy ones. Bounded by the primary's
-  `NotAfter` — a lazy `volume-ro` cannot outlive the primary it chains
-  from, so primary rotation must re-hand fresh attenuations to live
-  lazy volumes (the only case where this coupling bites).
+- **Volume Tigris keypair** — the coordinator attenuates its primary
+  into `volume-ro` and calls `assume-role`, then vends the resulting
+  keypair to the volume over the local handshake. On demand per fetch
+  episode for non-lazy volumes; kept warm and refreshed proactively for
+  lazy ones (the `coord-data` cache pattern). The volume holds no
+  macaroon, so nothing here couples to the primary's `NotAfter`.
 - **Primary macaroon** — re-issued before its `NotAfter`. Authenticated
   by proof-of-possession of the coordinator's identity key, so refresh
   is in-band/automatic; only the *first* acquisition is out-of-band
@@ -531,10 +530,12 @@ Two consequences shape every TTL below:
   write key is strictly worse than a leaked read key for the same scope.
 - Coordinator-held keys can take short TTLs: the coordinator is a
   long-running process that refreshes proactively on a timer, and writes
-  buffer in the WAL if a refresh briefly stalls. The data-plane-held
-  `volume-ro` cannot — a refresh stall there stalls guest I/O — so it trades
-  a longer revocation window for refresh robustness, justified by it being
-  the narrowest scope in the system.
+  buffer in the WAL if a refresh briefly stalls. `volume-ro` is also
+  coordinator-assumed (the volume holds only the resulting Tigris
+  keypair); for a lazy volume the coordinator keeps that keypair warm so
+  a cache-miss demand-fetch never waits on `assume-role`. The wider
+  read-only window is justified by it being the narrowest scope in the
+  system.
 
 ### `coord-data` (Split B — per-volume)
 
@@ -622,27 +623,32 @@ or remove `coord-list`; tracked as open question #12.
 
 ### `volume-ro`
 
-Per-volume read of one volume's lineage, vended to the volume process via
-the macaroon handshake. Used only when the volume reads S3 itself:
-hydration, or the S3 fallback when peer-fetch is unavailable. Peer-fetch
-proper does not use it — that path is the Ed25519 `PeerFetchToken`
-against a peer's local bytes (`design-peer-segment-fetch.md`).
+Per-volume read of one volume's lineage. **Assumed by the coordinator**,
+not the volume: the coordinator attenuates its primary (`elide:Volume`,
+`elide:Ancestors`, `NotAfter`), calls `assume-role` with its
+`coordinator.key` PoP, and vends the resulting **Tigris keypair** to the
+volume process over the local handshake. The volume holds only that
+keypair — it never holds a macaroon and never calls mint, so the
+coordinator is the only principal that authenticates to mint. Used only
+when the volume reads S3 itself: hydration, or the S3 fallback when
+peer-fetch is unavailable. Peer-fetch proper does not use it — that path
+is the Ed25519 `PeerFetchToken` against a peer's local bytes
+(`design-peer-segment-fetch.md`).
 
 - **Required caveats:** `elide:Volume`, `elide:Ancestors`, `Audience=mint`,
   `NotAfter`
-- **TTL — split by volume mode:**
-  - *Non-lazy (default):* short-lived, vended on demand. A hydrated
+- **Keypair freshness — split by volume mode:**
+  - *Non-lazy (default):* the coordinator assumes on demand. A hydrated
     volume serves from local cache and touches S3 only in bounded fetch
     episodes; a refresh stall there does not stall guest I/O, so the
-    coordinator re-attenuates a fresh `volume-ro` off its primary per
-    episode (local, free). Minutes-to-hours, not days — no long-lived
-    attenuation outstanding for a primary rotation to cap.
-  - *Lazy:* longer-lived. Cache-miss demand-fetch is synchronous to
-    guest I/O, so this holder is refresh-sensitive and trades a wider
-    revocation window for refresh robustness, bounded by the minimal
-    blast radius (read one volume's lineage). Hours-to-days, tuned to
-    the demand-fetch profile and capped by the primary's `NotAfter`
-    (see *Coordinator bootstrap*).
+    coordinator assumes a fresh keypair per episode (one local
+    attenuation + one `assume-role`).
+  - *Lazy:* cache-miss demand-fetch is synchronous to guest I/O, so the
+    coordinator keeps a warm keypair cached per `vol_ulid` and refreshes
+    it proactively (the `coord-data` cache pattern), handing the volume a
+    still-valid keypair off the hot path. Revocation window is the
+    keypair `DateLessThan`, bounded by the minimal blast radius (read one
+    volume's lineage).
 - **Policy:** the per-volume RO shape, exact ARNs for self + each ancestor.
 
 ### Why Split B is viable now
