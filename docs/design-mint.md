@@ -188,10 +188,19 @@ restarts. Per request — and per managed volume — it appends further
 narrowing caveats (`elide:Volume`, a tighter `NotAfter`) before calling
 `assume-role`; the stored macaroon is never sent unattenuated.
 
-Issuance is triggered either out of band (an operator runs `mint issue`
-and places the result in `data_dir`) or by coordinator self-enrolment
-against a mint issuance endpoint gated by an identity authority through
-a third-party caveat — see *Open questions* #13.
+The primary is **bound to the coordinator's Ed25519 identity** by a
+proof-of-possession caveat: `assume-role` honours it only when the
+request is freshly signed by `coordinator.key`. The persisted file
+alone is therefore inert — the secret stays the one identity key the
+coordinator already protects (name-claims, provenance, peer-fetch); no
+new secret at rest. Enrollment is a one-time, out-of-band registration
+of `coordinator.pub ↔ coord-ulid` with mint (operator action, or
+attested by the identity authority); being a public key it leaks
+nothing if observed. Re-issuance before `NotAfter` is then in-band and
+automatic, authenticated by the same proof of possession. The identity
+key is not rotated: a new key is a new coordinator — new `coord-ulid`,
+new enrollment, new primary. Issuance/registration surface is *Open
+questions* #13.
 
 Refresh cadences, distinct, in increasing trust cost:
 
@@ -835,17 +844,17 @@ prematurely.
     mints a caller's primary macaroon. Issuance is far more powerful
     than `assume-role` (it creates authority rather than exercising it),
     so what authorizes *issuance itself* must be pinned down: admin-only
-    local operation, an admin-scoped endpoint, and/or issuance that
-    itself binds a third-party caveat to the identity authority so a
-    bare issuance call can't hand out a coordinator token. Also open:
-    whether issuance binds the macaroon to the coordinator's existing
-    Ed25519 identity (a proof-of-possession caveat) so the stored file
-    is not a bare bearer token. The issuance path **must** fix the
-    `elide:Coord` caveat to the authenticated coordinator identity (it
-    defines the primary macaroon — see *Coordinator bootstrap*); a
-    caller never supplies or appends it, since a self-chosen value would
-    cross into another coordinator's prefix. Decide before any issuance
-    code exists.
+    local operation, an admin-scoped endpoint, and/or issuance gated by
+    the identity authority so a bare issuance call can't hand out a
+    coordinator token. The issuance path **must** fix the `elide:Coord`
+    caveat to the authenticated coordinator identity (it defines the
+    primary macaroon — see *Coordinator bootstrap*); a caller never
+    supplies or appends it, since a self-chosen value would cross into
+    another coordinator's prefix. The primary is key-bound, not a bearer
+    (decided — see *Coordinator bootstrap*): enrollment registers
+    `coordinator.pub ↔ coord-ulid` with mint, so what is open is the
+    registration/issuance surface and what authorizes a registration,
+    not the binding. Decide before any issuance code exists.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
