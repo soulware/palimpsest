@@ -85,9 +85,9 @@ caller ↔ Tigris S3:  the freshly-minted scoped keypair
 
 **mint is both issuer and verifier of the primary macaroon.** The
 symmetric macaroon root key lives and dies inside the mint and is never
-distributed: mint mints a caller's macaroon once (at provisioning /
-`elide login`), and verifies the attenuated macaroon presented on every
-`assume-role`. Issuer and verifier being the same process is what
+distributed: mint mints a caller's macaroon once (at coordinator
+registration — `elide coord register`), and verifies the attenuated
+macaroon presented on every `assume-role`. Issuer and verifier being the same process is what
 removes any root-distribution problem — there is no separate authority
 to share the root with, and no "configure mint to trust the
 coordinator's root" step.
@@ -106,7 +106,8 @@ stamps "valid only if discharged by `<identity authority>` attesting
 predicate P", and verifies the discharge against a key it shares with
 that authority. The identity plane (who is this caller) and the
 credential plane (what Tigris scope do they get) stay separate; the
-managed `elide login` service is a discharge authority, not an issuer.
+managed login service discharges the caveat (a discharge authority, not
+an issuer — the "login" is that discharge, not the registration verb).
 See *Open questions* and *Future directions*.
 
 The admin credential likewise lives and dies inside the mint process and
@@ -126,8 +127,8 @@ Each mint instance is configured with:
 2. **Zero or more third-party discharge keys** — one symmetric key per
    identity/discharge authority mint trusts to satisfy a third-party
    caveat. Absent in the minimal self-hosted deployment (no third-party
-   caveat); present when an identity authority such as the managed
-   `elide login` service is in use.
+   caveat); present when an identity authority such as the managed login
+   service is in use.
 3. **One Tigris admin credential** (per backend), held in memory. It is
    read from the standard AWS environment variables
    (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, optionally
@@ -200,12 +201,11 @@ against the sealed key. The persisted file alone is therefore inert:
 the secret stays the one identity key the coordinator already protects
 (name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
 registry — the pairing rides the token. Enrollment is a one-time
-exchange. The enrollment token is itself `elide:Coord`- and
-`elide:CoordKey`-bound: `elide login` issues it for one specific
-coordinator (parameterised by that coordinator's `coordinator.pub`),
-carrying `elide:Coord` + `elide:CoordKey` + a third-party caveat
-(discharged by the identity authority, or operator-mediated) + a
-`NotAfter`. The coordinator presents it and proves possession of
+exchange. `elide coord register` obtains an enrollment token for one
+specific coordinator (parameterised by that coordinator's
+`coordinator.pub`), carrying `elide:Coord` + `elide:CoordKey` + a
+third-party caveat (discharged via a login redirect to the identity
+authority, or operator-mediated) + a `NotAfter`. The coordinator presents it and proves possession of
 `coordinator.key`. mint verifies the discharge, the PoP against the
 token's `elide:CoordKey`, and the `elide:Coord` binding, then **re-mints
 from its root** a primary carrying the *same* `elide:Coord` +
@@ -876,11 +876,11 @@ prematurely.
     operator command — and, in the minimal deployment with no identity
     authority, what stands in for the discharge (admin-only local
     operation). Also open: the pubkey-first ordering this implies —
-    `elide login` is parameterised by `coordinator.pub`, so the
+    `elide coord register` is parameterised by `coordinator.pub`, so the
     coordinator's identity must exist before the enrollment token is
-    minted (generate identity → present pubkey to `elide login` →
-    coord-bound enrollment token → exchange). Decide before any issuance
-    code exists.
+    minted (generate identity → `elide coord register`, login redirect
+    discharges the third-party caveat → coord-bound enrollment token →
+    exchange). Decide before any issuance code exists.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
