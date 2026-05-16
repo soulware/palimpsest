@@ -189,18 +189,24 @@ narrowing caveats (`elide:Volume`, a tighter `NotAfter`) before calling
 `assume-role`; the stored macaroon is never sent unattenuated.
 
 The primary is **bound to the coordinator's Ed25519 identity** by a
-proof-of-possession caveat: `assume-role` honours it only when the
-request is freshly signed by `coordinator.key`. The persisted file
-alone is therefore inert — the secret stays the one identity key the
-coordinator already protects (name-claims, provenance, peer-fetch); no
-new secret at rest. Enrollment is a one-time, out-of-band registration
-of `coordinator.pub ↔ coord-ulid` with mint (operator action, or
-attested by the identity authority); being a public key it leaks
-nothing if observed. Re-issuance before `NotAfter` is then in-band and
-automatic, authenticated by the same proof of possession. The identity
-key is not rotated: a new key is a new coordinator — new `coord-ulid`,
-new enrollment, new primary. Issuance/registration surface is *Open
-questions* #13.
+first-party proof-of-possession caveat. At issuance mint seals
+`elide:CoordKey=ed25519:<coordinator.pub>` into the primary alongside
+`elide:Coord`, under the same chain MAC. `assume-role` honours the
+macaroon only when the request carries a fresh Ed25519 signature, by
+`coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
+unix-seconds)` — the tail binds the proof to this exact
+role/volume/`NotAfter`, the timestamp (±skew) bounds replay — verified
+against the sealed key. The persisted file alone is therefore inert:
+the secret stays the one identity key the coordinator already protects
+(name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
+registry — the pairing rides the token. Enrollment is a one-time,
+out-of-band registration of `coordinator.pub ↔ coord-ulid` with mint
+(operator action, or attested by the identity authority); being a
+public key it leaks nothing if observed. Re-issuance before `NotAfter`
+is then in-band and automatic, authenticated by the same proof of
+possession. The identity key is not rotated: a new key is a new
+coordinator — new `coord-ulid`, new enrollment, new primary.
+Registration surface (#13) and the PoP wire detail (#16) are open.
 
 Refresh cadences, distinct, in increasing trust cost:
 
@@ -458,6 +464,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
 | `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
 | `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
+| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key`, verified against this key. Makes the primary key-bound, not a bearer. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
 
@@ -484,9 +491,10 @@ here so the issuer's surface is unambiguous):
 
 Notes:
 
-- **Exactly one list-valued field exists** (`elide:Ancestors`). Every
-  other caveat is scalar. The list-valued caveat type (open question #6)
-  is the only macaroon-library extension this inventory requires.
+- **Exactly one list-valued field exists** (`elide:Ancestors`); every
+  other caveat is scalar. Two macaroon-library extensions this inventory
+  requires: the list-valued caveat type (#6) and the first-party
+  holder-of-key caveat for `elide:CoordKey` (#16).
 - **`elide:Coord` templates only in `coord-identity`**
   (`coordinators/{{caveat "elide:Coord"}}/*`, own-prefix write). Every
   other `coord-*` role uses it as a gate only; their policies use
@@ -875,6 +883,14 @@ prematurely.
     issued, trust = possession) is the supported minimal self-hosted
     deployment — with third-party discharge the opt-in central-service
     upgrade — is part of this question.
+16. **PoP caveat wire detail.** `elide:CoordKey` is decided (first-party
+    holder-of-key; primary is key-bound, not a bearer — see *Coordinator
+    bootstrap*). What remains: the request-side proof format on
+    `assume-role` (header name, signature encoding) and the freshness
+    anchor — signing `BLAKE3(presented-macaroon-tail ‖ unix-seconds)`
+    with a ±skew window vs. a mint-issued nonce. Tail-binding to pin the
+    proof to the exact request is fixed; the freshness mechanism is the
+    live choice.
 
 ## Future directions
 
