@@ -60,12 +60,15 @@ signed session token, because Tigris has no session-token endpoint).
         └───── uses returned keypair against Tigris ────────────┘
 ```
 
-The caller (e.g. an Elide coordinator) holds a macaroon issued by an authority
-the mint trusts. It calls `mint`'s HTTP API, presenting the macaroon and a role
-name. `mint` verifies the macaroon, looks up the role, renders the role's
-policy template with values drawn from macaroon caveats, calls Tigris IAM to
-mint a keypair under that policy, and returns the keypair to the caller. The
-caller then uses the keypair directly against Tigris's S3 endpoint.
+The caller (e.g. an Elide coordinator) holds a macaroon **issued by the
+mint itself** — minted once at provisioning/login, then attenuated by
+the caller per request. It calls `mint`'s HTTP API, presenting the
+(attenuated) macaroon plus any discharge macaroons and a role name.
+`mint` verifies the macaroon against its own root and any third-party
+caveats, looks up the role, renders the role's policy template with
+values drawn from macaroon caveats, calls Tigris IAM to mint a keypair
+under that policy, and returns the keypair to the caller. The caller
+then uses the keypair directly against Tigris's S3 endpoint.
 
 `mint` is **never** in the data path. It is consulted only at credential
 issuance and refresh.
@@ -80,26 +83,68 @@ mint  ↔ Tigris IAM:  admin credential (held by mint, never disclosed)
 caller ↔ Tigris S3:  the freshly-minted scoped keypair
 ```
 
-The admin credential lives and dies inside the mint process. It never reaches
-the caller. The macaroon root key lives inside the mint as well (for verifying
-caller-presented macaroons) — but mint is *not* an issuer; some other authority
-mints the macaroons, mint only verifies them.
+**mint is both issuer and verifier of the primary macaroon.** The
+symmetric macaroon root key lives and dies inside the mint and is never
+distributed: mint mints a caller's macaroon once (at coordinator
+registration — `elide coord register`), and verifies the attenuated
+macaroon presented on every `assume-role`. Issuer and verifier being the same process is what
+removes any root-distribution problem — there is no separate authority
+to share the root with, and no "configure mint to trust the
+coordinator's root" step.
+
+The caller (e.g. a coordinator) is therefore **neither a macaroon issuer
+nor a root holder**. It holds a macaroon and may only *attenuate* it
+(append narrowing caveats — `NotAfter`, a specific `elide:Volume`),
+which needs the trailing MAC, never the root. A compromised caller can
+only narrow authority it was already granted; it cannot forge authority
+for another coordinator or volume.
+
+Delegation to a *separate* authority — proving the caller's identity,
+org membership, or SSO authentication — is **not** modelled as that
+authority issuing the macaroon. It is a **third-party caveat**: mint
+stamps "valid only if discharged by `<identity authority>` attesting
+predicate P", and verifies the discharge against a key it shares with
+that authority. The identity plane (who is this caller) and the
+credential plane (what Tigris scope do they get) stay separate; the
+managed login service discharges the caveat (a discharge authority, not
+an issuer — the "login" is that discharge, not the registration verb).
+See *Open questions* and *Future directions*.
+
+The admin credential likewise lives and dies inside the mint process and
+never reaches the caller.
 
 ### Mint configuration
 
 Each mint instance is configured with:
 
-1. **One or more macaroon trust roots** — the symmetric keys mint will accept
-   as valid macaroon-signing authorities. Multi-root supports multiple issuers
-   federating against the same mint (out of scope for v1; v1 supports a single
-   trust root).
-2. **One Tigris admin credential** (per backend), held in memory.
-3. **A set of role definitions** — see *Role configuration* below.
-4. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
+1. **Its own macaroon root** — the single symmetric key mint uses to
+   *both* mint and verify primary macaroons. It never leaves the
+   process and is never shared with a caller or any other authority.
+   How it is provisioned (mint-generated and persisted, vs. supplied
+   like the admin credential) is an open question; it is a secret, so
+   it is not a plaintext TOML field. (v1 is single-root; multi-root for
+   federating issuers is out of scope.)
+2. **Zero or more third-party discharge keys** — one symmetric key per
+   identity/discharge authority mint trusts to satisfy a third-party
+   caveat. Absent in the minimal self-hosted deployment (no third-party
+   caveat); present when an identity authority such as the managed login
+   service is in use.
+3. **One Tigris admin credential** (per backend), held in memory. It is
+   read from the standard AWS environment variables
+   (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, optionally
+   `AWS_SESSION_TOKEN`) — the same convention the elide coordinator uses
+   for its IAM-mode admin credential — **not** from the config file. The
+   credential is a secret delivered by the environment (systemd
+   `LoadCredential=`, a secrets manager); keeping it out of the TOML
+   keeps secrets and role definitions on separate management planes.
+4. **A set of role definitions** — see *Role configuration* below.
+5. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
    single-tenant per instance; multi-tenancy is a v2 question.
 
-Configuration is static (file-backed) in v1; a config-management API is a
-future direction.
+Role definitions, audience, and tenant metadata are static and
+file-backed. The macaroon root and admin credential are secrets and are
+not plaintext TOML fields — the admin credential comes from the AWS
+environment; the macaroon root's provisioning is an open question.
 
 ### Admin credential custody — deployment shapes
 
@@ -120,6 +165,82 @@ The same mint code supports three deployment shapes:
 
 (2) and (3) differ only in whose Tigris account the admin credential is
 issued against — the mint software is identical.
+
+## Coordinator bootstrap & macaroon lifecycle
+
+The **primary macaroon** is precisely the mint root attenuated with
+`elide:Coord=<coord-ulid>` and nothing else: the point in the chain
+where authority has been narrowed to exactly one coordinator identity.
+It *is* that coordinator's identity within the credential plane —
+"primary" means the per-coordinator anchor, not an unconstrained
+mint-root macaroon. Every credential the coordinator vends is a further
+attenuation of it.
+
+The `elide:Coord` caveat is stamped by the issuance path and bound to
+the authenticated coordinator identity (*Open questions* #13); a
+coordinator never appends its own — a self-chosen `elide:Coord` would
+let it mint credentials for another coordinator's prefix (see the
+`coord-identity` own-prefix template).
+
+A coordinator holds this macaroon long-lived: acquired once at
+provisioning and persisted in the coordinator's `data_dir` (mode 0600,
+alongside the identity key), loaded on every start and reused across
+restarts. Per request — and per managed volume — it appends further
+narrowing caveats (`elide:Volume`, a tighter `NotAfter`) before calling
+`assume-role`; the stored macaroon is never sent unattenuated.
+
+The primary is **bound to the coordinator's Ed25519 identity** by a
+first-party proof-of-possession caveat. At issuance mint seals
+`elide:CoordKey=ed25519:<coordinator.pub>` into the primary alongside
+`elide:Coord`, under the same chain MAC. `assume-role` honours the
+macaroon only when the request carries a fresh Ed25519 signature, by
+`coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
+unix-seconds)` — the tail binds the proof to this exact
+role/volume/`NotAfter`, the timestamp (±skew) bounds replay — verified
+against the sealed key. The persisted file alone is therefore inert:
+the secret stays the one identity key the coordinator already protects
+(name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
+registry — the pairing rides the token. Enrollment is a one-time
+exchange. `elide coord register` obtains an enrollment token for one
+specific coordinator (parameterised by that coordinator's
+`coordinator.pub`), carrying `elide:Coord` + `elide:CoordKey` + a
+third-party caveat (discharged via a login redirect to the identity
+authority, or operator-mediated) + a `NotAfter`. The coordinator presents it and proves possession of
+`coordinator.key`. mint verifies the discharge, the PoP against the
+token's `elide:CoordKey`, and the `elide:Coord` binding, then **re-mints
+from its root** a primary carrying the *same* `elide:Coord` +
+`elide:CoordKey`, stripped of the third-party caveat and `NotAfter`
+(Fly.io's service-token pattern — only the root holder can re-mint).
+`elide:CoordKey` is the through-line in both tokens; the exchange does
+not bind a key, it removes the identity/expiry scaffolding around a
+binding that was already there. A stolen enrollment token is therefore
+inert the same way the primary is — it can only re-enrol the one
+coordinator whose private key the thief does not hold (idempotent), not
+stand up a rogue coordinator. **The
+primary does not expire**: once PoP-bound, a primary `NotAfter` is
+security-neutral — a file-only leak is already inert and a
+`coordinator.key` compromise renews regardless — so there is no
+re-issuance cadence. The one thing expiry would force, periodic
+identity-authority re-attestation, is a deployment concern (#15). The
+identity key is not rotated: a new key is a new coordinator — new
+`coord-ulid`, new enrollment, new primary. Enrollment-exchange surface
+(#13) and the PoP wire detail (#16) are open.
+
+Refresh cadences, distinct, in increasing trust cost:
+
+- **Tigris keypair** — re-call `assume-role` with the held macaroon
+  (*Open questions* #8).
+- **Volume Tigris keypair** — the coordinator attenuates its primary
+  into `volume-ro` and calls `assume-role`, then vends the resulting
+  keypair to the volume over the local handshake. On demand per fetch
+  episode for non-lazy volumes; kept warm and refreshed proactively for
+  lazy ones (the `coord-data` cache pattern). The volume holds no
+  macaroon; the keypair `DateLessThan` is the only lifetime here.
+- **Discharge macaroon** — when a third-party caveat is present, fetched
+  from the identity authority on its own shorter cadence.
+
+The primary itself has no refresh cadence — it does not expire (see
+above); it is minted once at enrollment.
 
 ## Protocol
 
@@ -152,9 +273,12 @@ Content-Type: application/json
 
 ### Authentication
 
-The `Authorization` header carries a single macaroon, base64-encoded. The mint
-verifies its chain MAC against the configured trust root(s) (see
-`design-auth-model.md` for the construction).
+The `Authorization` header carries the primary macaroon, base64-encoded;
+any discharge macaroons for third-party caveats accompany it (bundle
+wire format per *Open questions* #15). The mint verifies the primary's
+chain MAC against its own macaroon root, and each discharge against the
+relevant third-party key (see `design-auth-model.md` for the
+construction).
 
 If verification fails — bad signature, unknown root, malformed encoding — the
 mint returns `401 Unauthorized` with no further detail (don't help an attacker
@@ -211,8 +335,8 @@ policy = """
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.Volume}}/*"
-      {{#each caveat.Ancestors}},
+      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "Volume"}}/*"
+      {{#each (caveat "Ancestors")}},
       "arn:aws:s3:::{{tenant.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
@@ -230,18 +354,35 @@ The mint substitutes three classes of variable in the policy template at
 issuance time:
 
 - `{{tenant.X}}` — values from the mint's tenant configuration (bucket name,
-  etc.). Server-side, never caller-controlled.
-- `{{caveat.X}}` — values from the verified macaroon's caveats. Scalar
-  caveats render directly; list-valued caveats are iterated with the
-  `{{#each ...}}{{/each}}` construct.
-- `{{system.X}}` — values computed by the mint at request time. v1 set:
-  `system.expiry_iso8601` (the issued credential's expiry, derived from the
-  requested or default TTL).
+  etc.), as a plain path. Server-side, never caller-controlled.
+- `{{caveat "X"}}` — the verified macaroon's caveat named `X`, resolved
+  through a built-in `caveat` lookup helper that takes the caveat name as
+  a string argument. Scalar caveats render directly
+  (`{{caveat "elide:Volume"}}`); list-valued caveats are iterated as a
+  subexpression (`{{#each (caveat "elide:Ancestors")}}…{{/each}}`). The
+  helper form (not a `{{caveat.X}}` path) is required because namespaced
+  caveat names contain `:`, which is not a legal template path segment;
+  it also keeps the caveat surface to a single named lookup rather than
+  arbitrary data-graph traversal.
+- `{{system.X}}` — values computed by the mint at request time, as a plain
+  path. v1 set: `system.expiry_iso8601` (the issued credential's expiry,
+  derived from the requested or default TTL).
 
-The mint **does not** ship a general-purpose policy DSL. Conditional blocks,
-arithmetic, value transformations, and dynamic resource construction beyond
-straight substitution are deliberately out of scope. Roles requiring more
-expressive policies should be split into multiple roles.
+The `caveat` helper resolves names against the **effective** caveat set,
+not the raw chain: list-valued caveats are intersected across every
+occurrence, repeated scalars must agree, and a self-contradictory scalar
+resolves to absent. A reference to a caveat the macaroon does not carry
+(or one that is unsatisfiable) is a hard render failure — the request is
+refused, never minted with a missing substitution. The minted policy
+therefore reflects exactly the authority the gate evaluated.
+
+The mint **does not** ship a general-purpose policy DSL. The entire
+template surface is `{{tenant.*}}` / `{{system.*}}` plain paths, the
+`caveat` lookup helper, and `{{#each}}` over a list caveat. Conditional
+blocks, arithmetic, value transformations, and dynamic resource
+construction beyond straight substitution are deliberately out of scope.
+Roles requiring more expressive policies should be split into multiple
+roles.
 
 ### Required caveats
 
@@ -297,7 +438,23 @@ to indicate their issuer or domain:
 - `elide:Coord`
 
 This avoids collisions between issuers. Role templates reference caveats by
-their full namespaced name: `{{caveat.elide:Volume}}`.
+their full namespaced name through the `caveat` helper:
+`{{caveat "elide:Volume"}}`. The string-argument form is what makes the
+`:` separator usable in a template at all.
+
+### Partitioning vs. narrowing caveats
+
+Caveats split into two kinds by where their value originates:
+
+- **Partitioning** — `elide:Coord`. Separates mutually-distrusting
+  principals. Stamped at issuance and bound to the authenticated identity
+  (see *Coordinator bootstrap*, #13); a caller never supplies it.
+- **Narrowing** — `elide:Volume`, `elide:Ancestors`, `NotAfter`.
+  Coordinator-appended, restricting an existing grant to one volume /
+  lineage / expiry for attribution and per-credential blast-radius
+  reduction. Volume ownership across coordinators is established by the
+  name-claim and body-token lineage; `elide:Volume` scopes a
+  coordinator's own credential within authority it already holds.
 
 ### List-valued caveats with intersection semantics
 
@@ -314,15 +471,16 @@ The macaroon library must understand list-valued caveats natively; see
 The complete caveat vocabulary the Elide roles draw on. A caveat serves
 one or both of two purposes: it **gates** authorization (listed in a
 role's `required_caveats`) and/or it **feeds** the policy template
-(`{{caveat.X}}` substitution). Some only gate.
+(`{{caveat "X"}}` substitution). Some only gate.
 
 | Caveat | Type | Scalar/List | Issuer | Purpose |
 |---|---|---|---|---|
 | `Audience` | string | scalar | macaroon issuer | Gate only — must equal `mint`. Cross-service replay defense. |
 | `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
 | `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
-| `elide:Coord` | string (coord-ulid) | scalar | coordinator identity | Gate on all `coord-*`. Templated only in the deferred one-time-publish split. |
-| `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat.elide:Volume}}/*`. |
+| `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
+| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key`, verified against this key. Makes the primary key-bound, not a bearer. |
+| `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
 
 Per-role gate matrix (template substitutions are listed in each role's
@@ -348,11 +506,12 @@ here so the issuer's surface is unambiguous):
 
 Notes:
 
-- **Exactly one list-valued field exists** (`elide:Ancestors`). Every
-  other caveat is scalar. The list-valued caveat type (open question #6)
-  is the only macaroon-library extension this inventory requires.
+- **Exactly one list-valued field exists** (`elide:Ancestors`); every
+  other caveat is scalar. Two macaroon-library extensions this inventory
+  requires: the list-valued caveat type (#6) and the first-party
+  holder-of-key caveat for `elide:CoordKey` (#16).
 - **`elide:Coord` templates only in `coord-identity`**
-  (`coordinators/{{caveat.elide:Coord}}/*`, own-prefix write). Every
+  (`coordinators/{{caveat "elide:Coord"}}/*`, own-prefix write). Every
   other `coord-*` role uses it as a gate only; their policies use
   prefix wildcards (`names/*`, `coordinators/*`, `events/*`).
 - **`coord-base` is the read-only baseline every coordinator holds**, and
@@ -387,10 +546,12 @@ Two consequences shape every TTL below:
   write key is strictly worse than a leaked read key for the same scope.
 - Coordinator-held keys can take short TTLs: the coordinator is a
   long-running process that refreshes proactively on a timer, and writes
-  buffer in the WAL if a refresh briefly stalls. The data-plane-held
-  `volume-ro` cannot — a refresh stall there stalls guest I/O — so it trades
-  a longer revocation window for refresh robustness, justified by it being
-  the narrowest scope in the system.
+  buffer in the WAL if a refresh briefly stalls. `volume-ro` is also
+  coordinator-assumed (the volume holds only the resulting Tigris
+  keypair); for a lazy volume the coordinator keeps that keypair warm so
+  a cache-miss demand-fetch never waits on `assume-role`. The wider
+  read-only window is justified by it being the narrowest scope in the
+  system.
 
 ### `coord-data` (Split B — per-volume)
 
@@ -406,7 +567,7 @@ prefix.
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat.elide:Volume}}/*`, single
+  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*`, single
   volume only.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
@@ -446,7 +607,7 @@ they are covered by the read-only `coord-base` baseline.
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
 - **TTL:** 6h.
 - **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat.elide:Coord}}/*`.
+  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat "elide:Coord"}}/*`.
   Coordinator-identity immutability is enforced here — no role holds
   delete on `coordinators/`. A leaked `coord-identity` key can rewrite
   only its own coordinator's identity, not impersonate another.
@@ -478,16 +639,32 @@ or remove `coord-list`; tracked as open question #12.
 
 ### `volume-ro`
 
-Per-volume, held by the volume process (vended via the macaroon handshake).
-Narrowest scope in the system and the most refresh-sensitive holder.
+Per-volume read of one volume's lineage. **Assumed by the coordinator**,
+not the volume: the coordinator attenuates its primary (`elide:Volume`,
+`elide:Ancestors`, `NotAfter`), calls `assume-role` with its
+`coordinator.key` PoP, and vends the resulting **Tigris keypair** to the
+volume process over the local handshake. The volume holds only that
+keypair — it never holds a macaroon and never calls mint, so the
+coordinator is the only principal that authenticates to mint. Used only
+when the volume reads S3 itself: hydration, or the S3 fallback when
+peer-fetch is unavailable. Peer-fetch proper does not use it — that path
+is the Ed25519 `PeerFetchToken` against a peer's local bytes
+(`design-peer-segment-fetch.md`).
 
 - **Required caveats:** `elide:Volume`, `elide:Ancestors`, `Audience=mint`,
   `NotAfter`
-- **TTL:** 30 days. Long deliberately: read-only, single volume + fixed
-  ancestor list, held by long-running data-plane processes whose refresh
-  path stalls guest I/O on failure. The 30d revocation window is the
-  accepted cost of that refresh robustness, bounded by the minimal blast
-  radius (read one volume's lineage).
+- **Keypair freshness — split by volume mode:**
+  - *Non-lazy (default):* the coordinator assumes on demand. A hydrated
+    volume serves from local cache and touches S3 only in bounded fetch
+    episodes; a refresh stall there does not stall guest I/O, so the
+    coordinator assumes a fresh keypair per episode (one local
+    attenuation + one `assume-role`).
+  - *Lazy:* cache-miss demand-fetch is synchronous to guest I/O, so the
+    coordinator keeps a warm keypair cached per `vol_ulid` and refreshes
+    it proactively (the `coord-data` cache pattern), handing the volume a
+    still-valid keypair off the hot path. Revocation window is the
+    keypair `DateLessThan`, bounded by the minimal blast radius (read one
+    volume's lineage).
 - **Policy:** the per-volume RO shape, exact ARNs for self + each ancestor.
 
 ### Why Split B is viable now
@@ -496,9 +673,9 @@ Narrowest scope in the system and the most refresh-sensitive holder.
 rejected per-volume writer keys on two grounds. The mint redesign changes
 one of them:
 
-- *Confused-deputy enforcement is "modest"* — unchanged. Volume-identity
-  correctness still lives in `volume_event_store` / claim records / the
-  directory structure; per-volume IAM is still a redundant belt.
+- *Confused-deputy enforcement is "modest"* — unchanged. `elide:Volume`
+  is a narrowing caveat (see *Partitioning vs. narrowing caveats*);
+  per-volume IAM remains a redundant belt over the name-claim lineage.
 - *Operational cost* (N persisted policies, `ListPolicies` reconciliation,
   orphan reaping, refresh churn) — **dissolved**. Mint keys are short-lived,
   vended on demand, never persisted, expired by `DateLessThan`. No
@@ -574,7 +751,8 @@ memory). Throughput-bounded by Tigris IAM API rate limits, not by mint
 itself.
 
 Standard production deployment: behind a TLS-terminating reverse proxy or
-serving TLS directly, with the admin credential delivered via systemd
+serving TLS directly, with the admin credential delivered into the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment via systemd
 `LoadCredential=` or equivalent secrets-management.
 
 ### Audit log
@@ -601,7 +779,7 @@ operational concern, not a mint concern.
   bucket if rate-limit pain emerges.
 - **Tigris admin credential rejected.** Mint returns `503` and logs loudly;
   manual operator intervention required to refresh the admin credential.
-- **Macaroon trust root rotation.** TBD — see *Open questions*.
+- **Macaroon-root rotation.** TBD — see *Open questions* #3 / #14.
 
 ### Cleanup
 
@@ -627,9 +805,12 @@ prematurely.
    root, admin credential, role set) or stay single-tenant with per-tenant
    deployments is open. Multi-tenant per instance is more useful for
    centralised offerings; single-tenant is structurally simpler.
-3. **Trust root rotation.** Static trust roots fit v1, but rotation needs a
-   story. Options: hot-reload on SIGHUP, dual-key acceptance during overlap,
-   explicit rotation endpoint. Probably defer to v2.
+3. **Macaroon-root rotation.** A single static mint-held root fits v1,
+   but rotation needs a story: rotating it invalidates every
+   outstanding macaroon (mint is the issuer, so a re-issue sweep is
+   possible but not free). Options: dual-key acceptance during an
+   overlap window, a re-issue-on-rotate flow. Tied to #14. Probably
+   defer to v2.
 4. **Peer-fetch scope — settled.** There is no dedicated peer-fetch
    role; the verifier uses `coord-base` (read-only `names/*` /
    `coordinators/*` / `events/*`). Lineage is verified by the serving
@@ -638,7 +819,7 @@ prematurely.
    conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `coord-data` uses a single-volume *trailing* wildcard
-   (`by_id/{{caveat.elide:Volume}}/*`), `volume-ro` uses exact ancestor
+   (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses exact ancestor
    ARNs, and `coord-base` touches no `by_id/` at all — none need mid-path
    `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,
@@ -687,17 +868,65 @@ prematurely.
     `design-peer-segment-fetch.md` for performance — would shrink it to
     just `volume list --remote`, or remove it entirely. Not blocking;
     the temporal mitigation (short TTL, on-demand) holds until then.
+13. **Enrollment surface.** The exchange itself is decided (see
+    *Coordinator bootstrap*): the enrollment token is `elide:Coord`- and
+    `elide:CoordKey`-bound, mint verifies discharge + PoP + binding and
+    re-mints a stripped, non-expiring primary. Open: the transport — a
+    privileged endpoint vs. an out-of-band `mint issue --coord <id>`
+    operator command — and, in the minimal deployment with no identity
+    authority, what stands in for the discharge (admin-only local
+    operation). Also open: the pubkey-first ordering this implies —
+    `elide coord register` is parameterised by `coordinator.pub`, so the
+    coordinator's identity must exist before the enrollment token is
+    minted (generate identity → `elide coord register`, login redirect
+    discharges the third-party caveat → coord-bound enrollment token →
+    exchange). Decide before any issuance code exists.
+14. **Macaroon-root provisioning.** The root is mint-held and never
+    distributed, but how it comes to exist is unspecified: mint
+    generates it on first start and persists it (like the coordinator's
+    identity key), or it is supplied via the environment like the admin
+    credential. Generation-and-persist avoids an operator step but means
+    losing mint state invalidates every outstanding macaroon; supplied
+    means another secret to manage but survives a mint rebuild. Tied to
+    rotation (#3).
+15. **Third-party-caveat construction.** Delegation to an identity
+    authority is a third-party caveat (mint shares a symmetric key per
+    discharge authority; the caveat carries a verification key encrypted
+    to that authority; the holder presents discharge macaroons).
+    `design-auth-model.md` documents only scalar first-party caveats
+    today; the third-party construction and its discharge-bundle wire
+    format on `assume-role` need specifying. Supersedes the assumption
+    in #6 that only the list-valued first-party extension is required.
+    Whether a primary macaroon with *no* third-party caveat (operator-
+    issued, trust = possession) is the supported minimal self-hosted
+    deployment — with third-party discharge the opt-in central-service
+    upgrade — is part of this question. Because the primary does not
+    expire, periodic re-attestation of a coordinator (e.g. a managed
+    customer who left) is not enforced by primary expiry; whether the
+    central service enforces it at the discharge layer for ongoing
+    operations or by refusing re-enrollment is part of this question.
+16. **PoP caveat wire detail.** `elide:CoordKey` is decided (first-party
+    holder-of-key; primary is key-bound, not a bearer — see *Coordinator
+    bootstrap*). What remains: the request-side proof format on
+    `assume-role` (header name, signature encoding) and the freshness
+    anchor — signing `BLAKE3(presented-macaroon-tail ‖ unix-seconds)`
+    with a ±skew window vs. a mint-issued nonce. Tail-binding to pin the
+    proof to the exact request is fixed; the freshness mechanism is the
+    live choice — it is DPoP's resolved `iat`-skew vs. server-`nonce`
+    tradeoff; prior art: RFC 7800 (`cnf` PoP key) and RFC 9449 (DPoP).
 
 ## Future directions
 
 These do not affect v1 but are anticipated extensions worth designing
 around:
 
-- **Third-party caveats** (from `design-auth-model.md` § *Future
-  directions*). The mint's macaroon-verification path becomes the natural
-  place to handle discharge bundles when third-party caveats are introduced.
-  No protocol change needed beyond accepting discharge macaroons in the
-  request; the chained-MAC construction already accommodates them.
+- **Third-party caveats.** No longer purely a future direction — they
+  are the mechanism for delegation to an identity authority under the
+  issuer-and-verifier model (*Trust model*; *Open questions* #15). The
+  mint's verification path handles discharge bundles; the chained-MAC
+  construction accommodates them with no change beyond accepting
+  discharge macaroons in the request. What remains future is the
+  concrete construction and wire format, tracked as #15.
 - **Backend-agnostic roles.** The role config language doesn't assume Tigris
   specifically — it's IAM-policy-template-shaped. Other backends (native
   AWS, S3-compatibles with IAM) could be plugged in by swapping the

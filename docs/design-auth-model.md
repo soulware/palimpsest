@@ -295,27 +295,16 @@ authorised" then holds *architecturally* — enforced by IAM at the single
 point write credentials are acquired — rather than by scattered
 in-coordinator checks.
 
-### The binding open question
+### Issuer and the human-authorisation point
 
-`design-mint.md` deliberately leaves the issuer abstract: *"mint is not
-an issuer; some other authority mints the macaroons."* The operator
-token's role reduces to one question — **what authority issues the
-coordinator's write-role macaroon, and where does the human
-authorisation enter that chain?** Three shapes are consistent with both
-docs; the choice is deferred to the mint cutover:
-
-- **(a) The operator token *is* the write-role macaroon.** `elide token
-  create` mints with `Role=coord-data|coord-names|…`; the coordinator
-  presents it to mint per write window. Reads use the coordinator's own
-  `coord-base`. Most direct reading of the principle.
-- **(b) Operator token as a third-party-caveat discharge.** Coordinator
-  self-issues a read/identity baseline; write roles additionally require
-  a discharge proving a human authorised this window. This is the
-  *third-party caveats for authentication* future direction below.
-- **(c) Two mint trust roots.** A coordinator-held root for
-  `coord-base` / identity; an operator-held root for write roles. Mint's
-  multi-root config (`design-mint.md` § *Mint configuration*) is built
-  for this.
+The mint cutover settles the issuer: mint is the sole issuer and
+verifier, with a single root that never leaves it (`design-mint.md` §
+*Trust model*). Human authorisation does not enter by *which authority
+issues* — it enters as a **third-party-caveat discharge**: the
+coordinator holds a primary macaroon; a write window additionally
+requires a discharge from an identity authority (the managed `elide
+login` service) attesting a human authorised it. This is the
+*third-party caveats for authentication* direction below.
 
 ### Until then
 

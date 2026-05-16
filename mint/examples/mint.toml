@@ -1,0 +1,92 @@
+# Example mint configuration — the Elide role inventory subset from
+# docs/design-mint.md § "Elide as customer: role inventory".
+#
+# trust_root_hex is a 32-byte symmetric key (here all-zero — replace for
+# any real use). Namespaced caveats are reached through the `caveat`
+# lookup helper: `{{caveat "elide:Volume"}}` and
+# `{{#each (caveat "elide:Ancestors")}}` (see src/template.rs).
+
+audience = "mint"
+trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[tenant]
+bucket = "elide-demo"
+
+# The Tigris admin credential is NOT configured here. It is read from the
+# standard AWS environment variables (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY, optional AWS_SESSION_TOKEN) — the same
+# convention the elide coordinator uses — delivered by systemd
+# LoadCredential= or a secrets manager. The prototype's faked minter
+# ignores it; absence is a startup warning, not an error.
+
+[[role]]
+name = "volume-ro"
+required_caveats = ["elide:Volume", "elide:Ancestors", "Audience", "NotAfter"]
+min_ttl_seconds = 60
+max_ttl_seconds = 2592000      # 30 days
+default_ttl_seconds = 2592000
+policy = """
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "ReadVolumeAndAncestors",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": [
+      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each (caveat "elide:Ancestors")}},
+      "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
+      {{/each}}
+    ],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+    }
+  }]
+}
+"""
+
+[[role]]
+name = "coord-data"
+required_caveats = ["elide:Coord", "elide:Volume", "Audience", "NotAfter"]
+min_ttl_seconds = 60
+max_ttl_seconds = 86400        # 24h
+default_ttl_seconds = 86400
+policy = """
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "WriteSingleVolume",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+    }
+  }]
+}
+"""
+
+[[role]]
+name = "coord-base"
+required_caveats = ["elide:Coord", "Audience", "NotAfter"]
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+policy = """
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "ControlPlaneReadOnly",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": [
+      "arn:aws:s3:::{{tenant.bucket}}/names/*",
+      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
+      "arn:aws:s3:::{{tenant.bucket}}/events/*"
+    ],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+    }
+  }]
+}
+"""
