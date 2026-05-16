@@ -167,11 +167,25 @@ issued against — the mint software is identical.
 
 ## Coordinator bootstrap & macaroon lifecycle
 
-A coordinator holds a long-lived **primary macaroon** issued by mint,
-acquired once at provisioning and persisted in the coordinator's
-`data_dir` (mode 0600, alongside the identity key), loaded on every
-start and reused across restarts. Per request it appends narrowing
-caveats (`elide:Volume`, a tighter `NotAfter`) before calling
+The **primary macaroon** is precisely the mint root attenuated with
+`elide:Coord=<coord-ulid>` and nothing else: the point in the chain
+where authority has been narrowed to exactly one coordinator identity.
+It *is* that coordinator's identity within the credential plane —
+"primary" means the per-coordinator anchor, not an unconstrained
+mint-root macaroon. Every credential the coordinator vends is a further
+attenuation of it.
+
+The `elide:Coord` caveat is stamped by the issuance path and bound to
+the authenticated coordinator identity (*Open questions* #13); a
+coordinator never appends its own — a self-chosen `elide:Coord` would
+let it mint credentials for another coordinator's prefix (see the
+`coord-identity` own-prefix template).
+
+A coordinator holds this macaroon long-lived: acquired once at
+provisioning and persisted in the coordinator's `data_dir` (mode 0600,
+alongside the identity key), loaded on every start and reused across
+restarts. Per request — and per managed volume — it appends further
+narrowing caveats (`elide:Volume`, a tighter `NotAfter`) before calling
 `assume-role`; the stored macaroon is never sent unattenuated.
 
 Issuance is triggered either out of band (an operator runs `mint issue`
@@ -410,7 +424,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `Audience` | string | scalar | macaroon issuer | Gate only — must equal `mint`. Cross-service replay defense. |
 | `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
 | `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
-| `elide:Coord` | string (coord-ulid) | scalar | coordinator identity | Gate on all `coord-*`. Templated only in the deferred one-time-publish split. |
+| `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
 
@@ -791,7 +805,12 @@ prematurely.
     bare issuance call can't hand out a coordinator token. Also open:
     whether issuance binds the macaroon to the coordinator's existing
     Ed25519 identity (a proof-of-possession caveat) so the stored file
-    is not a bare bearer token. Decide before any issuance code exists.
+    is not a bare bearer token. The issuance path **must** fix the
+    `elide:Coord` caveat to the authenticated coordinator identity (it
+    defines the primary macaroon — see *Coordinator bootstrap*); a
+    caller never supplies or appends it, since a self-chosen value would
+    cross into another coordinator's prefix. Decide before any issuance
+    code exists.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
