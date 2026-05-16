@@ -2,9 +2,10 @@
 # docs/design-mint.md § "Elide as customer: role inventory".
 #
 # trust_root_hex is a 32-byte symmetric key (here all-zero — replace for
-# any real use). Namespaced caveats are reached through the `caveat`
-# lookup helper: `{{caveat "elide:Volume"}}` and
-# `{{#each (caveat "elide:Ancestors")}}` (see src/template.rs).
+# any real use). Scalar caveats are reached through the `caveat` lookup
+# helper: `{{caveat "elide:Volume"}}`. The ancestor lineage is not a
+# caveat — it rides the PoP-signed request body as
+# `{{#each request.ancestors}}` (see src/pop.rs, src/template.rs).
 
 audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -21,7 +22,7 @@ bucket = "elide-demo"
 
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "elide:Ancestors", "Audience", "NotAfter"]
+required_caveats = ["elide:Volume", "Audience", "NotAfter"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000      # 30 days
 default_ttl_seconds = 2592000
@@ -34,7 +35,7 @@ policy = """
     "Action": ["s3:GetObject"],
     "Resource": [
       "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each (caveat "elide:Ancestors")}},
+      {{#each request.ancestors}},
       "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],

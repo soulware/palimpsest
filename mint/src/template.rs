@@ -34,7 +34,7 @@ use handlebars::{
 };
 use serde_json::{Map, Value};
 
-use crate::caveat::{Caveat, CaveatValue, EffectiveCaveats};
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved};
 use crate::config::Tenant;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,13 +45,15 @@ pub enum TemplateError {
     NotJson(serde_json::Error),
 }
 
-/// The `caveat` lookup helper. Holds the precomputed effective-caveat
-/// map; `{{caveat "name"}}` / `{{#each (caveat "name")}}` resolve
-/// against it. An unknown name is a hard render error (strict mode):
-/// a role template that references a caveat the macaroon doesn't carry
-/// must fail closed, not mint an unscoped credential.
+/// The `caveat` scalar lookup helper. Holds the resolved-caveat map;
+/// `{{caveat "name"}}` resolves against it. A name that is absent **or
+/// unsatisfiable** is a hard render error (fail closed): a role
+/// template referencing a caveat the macaroon doesn't carry — or whose
+/// occurrences contradict — must never mint an unscoped or downgraded
+/// credential. All caveats are scalar; there is no `{{#each}}` over a
+/// caveat (ancestor-style lists are PoP-signed `request.*` data).
 struct CaveatHelper {
-    effective: BTreeMap<String, Value>,
+    resolved: BTreeMap<String, String>,
 }
 
 impl HelperDef for CaveatHelper {
@@ -66,39 +68,42 @@ impl HelperDef for CaveatHelper {
             .param(0)
             .and_then(|p| p.value().as_str())
             .ok_or(RenderErrorReason::ParamNotFoundForIndex("caveat", 0))?;
-        let value = self.effective.get(name).ok_or_else(|| {
+        let value = self.resolved.get(name).ok_or_else(|| {
             RenderErrorReason::Other(format!("caveat not present or unsatisfiable: {name}"))
         })?;
-        Ok(ScopedJson::Derived(value.clone()))
+        Ok(ScopedJson::Derived(Value::String(value.clone())))
     }
 }
 
-/// Build the effective-caveat map: one entry per distinct caveat name,
-/// value computed under intersection semantics. A self-contradictory
-/// scalar caveat resolves to absent (omitted), so any template
-/// referencing it fails closed.
-fn effective_map(caveats: &[Caveat]) -> BTreeMap<String, Value> {
+/// Build the resolved-caveat map: one entry per distinct caveat name
+/// whose chain occurrences resolve to a single agreed value. `Absent`
+/// and `Unsatisfiable` names are omitted, so a template referencing
+/// either fails the render closed.
+fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
     let eff = EffectiveCaveats::new(caveats);
     let mut map = BTreeMap::new();
     for name in eff.names() {
-        if let Some(v) = eff.effective(name) {
-            let json = match v {
-                CaveatValue::Scalar(s) => Value::String(s),
-                CaveatValue::List(items) => {
-                    Value::Array(items.into_iter().map(Value::String).collect())
-                }
-            };
-            map.insert(name.to_string(), json);
+        if let Resolved::Value(v) = eff.resolve(name) {
+            map.insert(name.to_string(), v);
         }
     }
     map
 }
 
 /// Render `policy_template` into a concrete IAM policy JSON string.
+///
+/// `request` is the **PoP-verified** request body (its provenance is
+/// `coordinator.key`, bound to this macaroon and moment — see
+/// [`crate::pop`]); it is exposed as the `request.*` namespace. The
+/// caller must verify the PoP signature *before* passing the body here.
+/// Each substitution class has a distinct, explicit trust provenance:
+/// `caveat.*` MAC-bound, `request.*` PoP-bound, `tenant.*` config,
+/// `system.*` mint-computed.
 pub fn render_policy(
     policy_template: &str,
     tenant: &Tenant,
     caveats: &[Caveat],
+    request: &Value,
     expiry_iso8601: &str,
 ) -> Result<String, TemplateError> {
     let mut reg = Handlebars::new();
@@ -109,7 +114,7 @@ pub fn render_policy(
     reg.register_helper(
         "caveat",
         Box::new(CaveatHelper {
-            effective: effective_map(caveats),
+            resolved: resolved_map(caveats),
         }),
     );
 
@@ -125,6 +130,7 @@ pub fn render_policy(
     let mut data = Map::new();
     data.insert("tenant".into(), Value::Object(tenant_map));
     data.insert("system".into(), Value::Object(system_map));
+    data.insert("request".into(), request.clone());
 
     let rendered = reg.render_template(policy_template, &Value::Object(data))?;
     serde_json::from_str::<Value>(&rendered).map_err(TemplateError::NotJson)?;
@@ -148,7 +154,7 @@ mod tests {
     "Action": ["s3:GetObject"],
     "Resource": [
       "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each (caveat "elide:Ancestors")}},
+      {{#each request.ancestors}},
       "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
@@ -156,13 +162,21 @@ mod tests {
   }]
 }"#;
 
+    fn req(ancestors: &[&str]) -> Value {
+        serde_json::json!({ "ancestors": ancestors })
+    }
+
     #[test]
-    fn renders_scalar_and_list_and_system() {
-        let caveats = vec![
-            Caveat::scalar("elide:Volume", "VOL1"),
-            Caveat::list("elide:Ancestors", ["ANC1", "ANC2"]),
-        ];
-        let out = render_policy(TPL, &tenant(), &caveats, "2026-05-15T14:30:00Z").unwrap();
+    fn renders_scalar_caveat_signed_request_list_and_system() {
+        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
+        let out = render_policy(
+            TPL,
+            &tenant(),
+            &caveats,
+            &req(&["ANC1", "ANC2"]),
+            "2026-05-15T14:30:00Z",
+        )
+        .unwrap();
         assert!(out.contains("demo/by_id/VOL1/*"));
         assert!(out.contains("by_id/ANC1/*"));
         assert!(out.contains("by_id/ANC2/*"));
@@ -171,37 +185,47 @@ mod tests {
     }
 
     #[test]
-    fn list_caveat_uses_intersection_not_last_occurrence() {
-        // Issued [A,B,C], attenuated to [A,B] then [B,C]:
-        // effective authority is the intersection {B}. A last-
-        // occurrence renderer would wrongly emit B AND C.
-        let caveats = vec![
-            Caveat::scalar("elide:Volume", "VOL1"),
-            Caveat::list("elide:Ancestors", ["A", "B", "C"]),
-            Caveat::list("elide:Ancestors", ["A", "B"]),
-            Caveat::list("elide:Ancestors", ["B", "C"]),
-        ];
-        let out = render_policy(TPL, &tenant(), &caveats, "t").unwrap();
-        assert!(out.contains("by_id/B/*"), "out: {out}");
-        assert!(!out.contains("by_id/A/*"), "A leaked: {out}");
-        assert!(!out.contains("by_id/C/*"), "C leaked: {out}");
+    fn empty_request_ancestors_renders_self_only() {
+        // Maximal narrowing — zero ancestors is a coherent grant, not
+        // an error: the {{#each}} simply emits nothing.
+        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
+        let out = render_policy(TPL, &tenant(), &caveats, &req(&[]), "t").unwrap();
+        assert!(out.contains("by_id/VOL1/*"));
+        assert!(!out.contains("by_id//*"));
+        serde_json::from_str::<Value>(&out).expect("valid json");
     }
 
     #[test]
     fn unknown_caveat_is_error() {
-        let err = render_policy(r#"{{caveat "nope"}}"#, &tenant(), &[], "x");
+        let err = render_policy(r#"{{caveat "nope"}}"#, &tenant(), &[], &req(&[]), "x");
+        assert!(matches!(err, Err(TemplateError::Render(_))));
+    }
+
+    #[test]
+    fn missing_request_field_fails_closed() {
+        // Strict mode: a template referencing request.ancestors when
+        // the signed body omitted it must fail the render, not mint.
+        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
+        let err = render_policy(TPL, &tenant(), &caveats, &serde_json::json!({}), "t");
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
     #[test]
     fn contradictory_scalar_caveat_fails_closed() {
-        // Two disagreeing scalar occurrences ⇒ unsatisfiable ⇒ omitted
-        // ⇒ template referencing it errors rather than minting.
+        // Two disagreeing scalar occurrences ⇒ Unsatisfiable ⇒ omitted
+        // from the resolved map ⇒ template referencing it errors
+        // rather than minting a downgraded credential.
         let caveats = vec![
             Caveat::scalar("elide:Volume", "VOL1"),
             Caveat::scalar("elide:Volume", "VOL2"),
         ];
-        let err = render_policy(r#"{{caveat "elide:Volume"}}"#, &tenant(), &caveats, "x");
+        let err = render_policy(
+            r#"{{caveat "elide:Volume"}}"#,
+            &tenant(),
+            &caveats,
+            &req(&[]),
+            "x",
+        );
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 }

@@ -19,9 +19,10 @@ pub mod config;
 pub mod http;
 pub mod iam;
 pub mod macaroon;
+pub mod pop;
 pub mod role;
 pub mod template;
 
-pub use caveat::{Caveat, CaveatValue};
+pub use caveat::{Caveat, Resolved};
 pub use config::Config;
 pub use macaroon::Macaroon;

@@ -2,7 +2,7 @@
 //!
 //! Same construction as the elide coordinator's v2 macaroon
 //! (`elide-coordinator/src/macaroon.rs`) and `docs/design-auth-model.md`,
-//! generalised to free-form named caveats with scalar **or** list values:
+//! generalised to free-form named **scalar** caveats:
 //!
 //! ```text
 //! mac_seed = blake3_keyed(root_key, DOMAIN || nonce)
@@ -23,7 +23,7 @@
 //! nonce   16 bytes
 //! mac     32 bytes
 //! count   u16 BE
-//! repeated serialize_one(caveat)
+//! repeated serialize_one(caveat)  // u32 name-len, name, u32 val-len, val
 //! ```
 //!
 //! `serialize_one` is the canonical per-caveat encoding fed into the
@@ -35,14 +35,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 
-use crate::caveat::{Caveat, CaveatValue};
+use crate::caveat::Caveat;
 
 const MAGIC: &[u8; 5] = b"mcrn1";
 const DOMAIN: &[u8] = b"mint-macaroon-v1";
 pub const NONCE_LEN: usize = 16;
-
-const KIND_SCALAR: u8 = 0;
-const KIND_LIST: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Macaroon {
@@ -69,26 +66,12 @@ pub enum DecodeError {
 
 fn serialize_one(c: &Caveat) -> Vec<u8> {
     let name = c.name.as_bytes();
-    let mut out = Vec::with_capacity(name.len() + 16);
+    let val = c.value.as_bytes();
+    let mut out = Vec::with_capacity(name.len() + val.len() + 8);
     out.extend_from_slice(&(name.len() as u32).to_be_bytes());
     out.extend_from_slice(name);
-    match &c.value {
-        CaveatValue::Scalar(s) => {
-            out.push(KIND_SCALAR);
-            let b = s.as_bytes();
-            out.extend_from_slice(&(b.len() as u32).to_be_bytes());
-            out.extend_from_slice(b);
-        }
-        CaveatValue::List(items) => {
-            out.push(KIND_LIST);
-            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
-            for item in items {
-                let b = item.as_bytes();
-                out.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                out.extend_from_slice(b);
-            }
-        }
-    }
+    out.extend_from_slice(&(val.len() as u32).to_be_bytes());
+    out.extend_from_slice(val);
     out
 }
 
@@ -104,9 +87,9 @@ fn chain_mac(root_key: &[u8; 32], nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -
     key
 }
 
-/// Mint a macaroon under `root_key`. The mint service is a verifier, not
-/// an issuer; this exists for tests and to exercise the issuer side of
-/// the construction.
+/// Mint a macaroon under `root_key`. Mint is the issuer *and* verifier
+/// of the primary macaroon (the root never leaves the process — see
+/// `docs/design-mint.md` § *Trust model*); this is the issuer side.
 pub fn mint(root_key: &[u8; 32], caveats: Vec<Caveat>) -> Macaroon {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
@@ -125,6 +108,14 @@ impl Macaroon {
 
     pub fn nonce(&self) -> &[u8; NONCE_LEN] {
         &self.nonce
+    }
+
+    /// The trailing MAC. This is the holder-of-key PoP anchor: the
+    /// `elide:CoordKey` proof signs over `tail ‖ ts ‖ BLAKE3(body)`, so
+    /// the tail binds the proof to *this* exact attenuated macaroon
+    /// (`docs/design-mint.md` § *Coordinator bootstrap*, [`crate::pop`]).
+    pub fn tail(&self) -> &[u8; 32] {
+        &self.mac
     }
 
     /// Hex of the nonce — a stable per-token identity for the audit log.
@@ -225,19 +216,7 @@ impl<'a> Reader<'a> {
 
     fn caveat(&mut self) -> Result<Caveat, DecodeError> {
         let name = self.string()?;
-        let kind = self.take(1)?[0];
-        let value = match kind {
-            KIND_SCALAR => CaveatValue::Scalar(self.string()?),
-            KIND_LIST => {
-                let n = self.u32()?;
-                let mut items = Vec::with_capacity(n);
-                for _ in 0..n {
-                    items.push(self.string()?);
-                }
-                CaveatValue::List(items)
-            }
-            _ => return Err(DecodeError::BadCaveat),
-        };
+        let value = self.string()?;
         Ok(Caveat { name, value })
     }
 }
@@ -256,7 +235,7 @@ mod tests {
             &root(),
             vec![
                 Caveat::scalar("Audience", "mint"),
-                Caveat::list("elide:Ancestors", ["A", "B", "C"]),
+                Caveat::scalar("elide:Volume", "01ARZ"),
             ],
         );
         assert!(m.verify(&root()));
@@ -270,7 +249,7 @@ mod tests {
             vec![
                 Caveat::scalar("Audience", "mint"),
                 Caveat::scalar("elide:Volume", "01ARZ"),
-                Caveat::list("elide:Ancestors", ["P", "Q"]),
+                Caveat::scalar("NotAfter", "1700000000"),
             ],
         );
         let wire = m.encode();

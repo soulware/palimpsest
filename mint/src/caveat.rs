@@ -1,65 +1,59 @@
-//! Generic named caveats.
+//! Named scalar caveats.
 //!
 //! The mint is caveat-vocabulary-agnostic (see `docs/design-mint.md`
 //! § *Macaroon caveat conventions*): it does not hard-code which caveat
-//! names are meaningful. A caveat is a `(name, value)` pair where the
-//! value is either a scalar string or a list of strings.
-//!
-//! This is the open-question-#6 generalisation of the elide v2 typed
-//! macaroon: the existing coordinator format encodes a fixed enum of
-//! typed caveats; here the name is free-form and exactly one list-valued
-//! shape exists (the only macaroon-library extension the Elide role
-//! inventory requires).
+//! names are meaningful. A caveat is a `(name, value)` pair; **every
+//! caveat is scalar**. There is no list-valued caveat type — the only
+//! list-shaped input a role ever needed (the `volume-ro` ancestor set)
+//! rides the PoP-signed request body as `request.ancestors`, not the
+//! caveat chain (design-mint.md § *All caveats are scalar*). This keeps
+//! the macaroon library to scalar caveats plus the holder-of-key
+//! extension, with no chain whose effective value depends on
+//! occurrence order.
 
 use std::collections::BTreeSet;
 
-/// A caveat value: either a single string or an ordered list of strings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CaveatValue {
-    Scalar(String),
-    List(Vec<String>),
-}
-
-/// A single named caveat in a macaroon's chain.
+/// A single named scalar caveat in a macaroon's chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caveat {
     pub name: String,
-    pub value: CaveatValue,
+    pub value: String,
 }
 
 impl Caveat {
     pub fn scalar(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            value: CaveatValue::Scalar(value.into()),
-        }
-    }
-
-    pub fn list<I, S>(name: impl Into<String>, items: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            name: name.into(),
-            value: CaveatValue::List(items.into_iter().map(Into::into).collect()),
+            value: value.into(),
         }
     }
 }
 
-/// The effective view of a caveat chain after applying intersection
-/// semantics: a macaroon attenuates by appending caveats, so multiple
-/// occurrences of the same name **narrow** rather than override.
-///
-/// - Scalar caveats: every occurrence must carry the same value; a
-///   disagreement is a contradiction the holder constructed and the
-///   caveat resolves to "unsatisfiable" (treated as absent for gating,
-///   which fails any role that requires it).
-/// - List caveats: the effective value is the intersection across all
-///   occurrences, preserving the order of the first occurrence. This is
-///   the `elide:Ancestors` shape from the design doc.
-/// - `NotAfter` is handled out of band (caller takes the minimum) since
-///   it intersects numerically, not by set membership.
+/// The resolution of one caveat name against the chain under AND
+/// (attenuation) semantics. A macaroon attenuates by *appending*, so N
+/// occurrences of a name are AND-ed. The three outcomes are **not**
+/// collapsible to `Option`: conflating "absent" with "present but
+/// unsatisfiable" is a downgrade footgun — a gate keyed on the former
+/// would skip for the latter, and a holder can append a contradictory
+/// copy of a binding caveat using only the trailing MAC. Every
+/// consumer must handle all three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// No occurrence of this name — genuinely unconstrained.
+    Absent,
+    /// Present and satisfiable: every occurrence agreed on this value.
+    Value(String),
+    /// Present but ≥2 occurrences disagree: the AND is empty. Must
+    /// deny in **every** consumer — never silently read as `Absent`.
+    Unsatisfiable,
+}
+
+/// The effective view of a caveat chain. The one place "what does this
+/// caveat mean" is decided, shared by the gate ([`crate::role`]), the
+/// policy renderer ([`crate::template`]), and the holder-of-key check
+/// ([`crate::pop`]). Every caveat is scalar: repeated occurrences must
+/// agree (→ `Value`); ≥2 distinct → `Unsatisfiable`. `NotAfter` is
+/// handled out of band ([`Self::not_after`], numeric minimum).
 pub struct EffectiveCaveats<'a> {
     caveats: &'a [Caveat],
 }
@@ -69,49 +63,24 @@ impl<'a> EffectiveCaveats<'a> {
         Self { caveats }
     }
 
-    /// True if any caveat with this name is present (used for the
-    /// `required_caveats` gate, which only checks presence).
-    pub fn contains(&self, name: &str) -> bool {
-        self.caveats.iter().any(|c| c.name == name)
-    }
-
-    /// The effective scalar value for `name`, or `None` if absent or
-    /// self-contradictory (two occurrences with differing values).
-    pub fn scalar(&self, name: &str) -> Option<&'a str> {
-        let mut found: Option<&str> = None;
-        for c in self.caveats.iter().filter(|c| c.name == name) {
-            let v = match &c.value {
-                CaveatValue::Scalar(s) => s.as_str(),
-                CaveatValue::List(_) => return None,
-            };
-            match found {
-                None => found = Some(v),
-                Some(prev) if prev == v => {}
-                Some(_) => return None,
-            }
-        }
-        found
-    }
-
-    /// The effective list value for `name`: intersection across every
-    /// list-valued occurrence, in first-occurrence order. `None` if no
-    /// list-valued occurrence exists.
-    pub fn list(&self, name: &str) -> Option<Vec<String>> {
-        let mut iter = self
+    /// Resolve `name` against the chain under AND semantics. The single
+    /// definition of the caveat's effective meaning; tri-state so no
+    /// consumer can collapse "absent" into "unsatisfiable" (see
+    /// [`Resolved`]).
+    pub fn resolve(&self, name: &str) -> Resolved {
+        let mut occ = self
             .caveats
             .iter()
             .filter(|c| c.name == name)
-            .filter_map(|c| match &c.value {
-                CaveatValue::List(items) => Some(items),
-                CaveatValue::Scalar(_) => None,
-            });
-        let first = iter.next()?;
-        let mut acc: Vec<String> = first.clone();
-        for items in iter {
-            let allow: BTreeSet<&String> = items.iter().collect();
-            acc.retain(|x| allow.contains(x));
+            .map(|c| c.value.as_str());
+        let Some(first) = occ.next() else {
+            return Resolved::Absent;
+        };
+        if occ.all(|v| v == first) {
+            Resolved::Value(first.to_string())
+        } else {
+            Resolved::Unsatisfiable
         }
-        Some(acc)
     }
 
     /// Distinct caveat names in first-occurrence order.
@@ -126,38 +95,66 @@ impl<'a> EffectiveCaveats<'a> {
         out
     }
 
-    /// The single effective value for `name` after intersection
-    /// semantics — the *one* definition of "what this caveat means",
-    /// shared by the gate ([`crate::role`]) and the policy renderer
-    /// ([`crate::template`]).
-    ///
-    /// - Any list-valued occurrence ⇒ `List` of the intersection.
-    /// - Otherwise scalar: `Scalar` iff every occurrence agrees;
-    ///   `None` if occurrences contradict (a token the holder
-    ///   constructed to be unsatisfiable must not mint anything).
-    pub fn effective(&self, name: &str) -> Option<CaveatValue> {
-        let has_list = self
-            .caveats
-            .iter()
-            .any(|c| c.name == name && matches!(c.value, CaveatValue::List(_)));
-        if has_list {
-            self.list(name).map(CaveatValue::List)
-        } else {
-            self.scalar(name)
-                .map(|s| CaveatValue::Scalar(s.to_string()))
-        }
-    }
-
     /// Minimum `NotAfter` (unix seconds) across all `NotAfter` caveats,
-    /// or `None` if the macaroon carries no parseable `NotAfter`.
+    /// or `None` if the macaroon carries no parseable `NotAfter`. This
+    /// is a numeric intersection (the minimum binds), distinct from the
+    /// scalar-agreement resolution of [`Self::resolve`].
     pub fn not_after(&self, name: &str) -> Option<u64> {
         self.caveats
             .iter()
             .filter(|c| c.name == name)
-            .filter_map(|c| match &c.value {
-                CaveatValue::Scalar(s) => s.parse::<u64>().ok(),
-                CaveatValue::List(_) => None,
-            })
+            .filter_map(|c| c.value.parse::<u64>().ok())
             .min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cv(pairs: &[(&str, &str)]) -> Vec<Caveat> {
+        pairs.iter().map(|(n, v)| Caveat::scalar(*n, *v)).collect()
+    }
+
+    #[test]
+    fn absent_when_no_occurrence() {
+        let c = cv(&[("Audience", "mint")]);
+        assert_eq!(
+            EffectiveCaveats::new(&c).resolve("elide:Volume"),
+            Resolved::Absent
+        );
+    }
+
+    #[test]
+    fn single_and_agreeing_occurrences_resolve_to_value() {
+        let c = cv(&[("elide:Volume", "V1"), ("elide:Volume", "V1")]);
+        assert_eq!(
+            EffectiveCaveats::new(&c).resolve("elide:Volume"),
+            Resolved::Value("V1".into())
+        );
+    }
+
+    #[test]
+    fn disagreeing_occurrences_are_unsatisfiable_not_absent() {
+        // The downgrade footgun: an appended contradictory copy must
+        // resolve to Unsatisfiable, never Absent.
+        let c = cv(&[
+            ("elide:CoordKey", "ed25519:A"),
+            ("elide:CoordKey", "ed25519:B"),
+        ]);
+        assert_eq!(
+            EffectiveCaveats::new(&c).resolve("elide:CoordKey"),
+            Resolved::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn not_after_takes_the_minimum() {
+        let c = cv(&[
+            ("NotAfter", "5000"),
+            ("NotAfter", "3000"),
+            ("NotAfter", "9000"),
+        ]);
+        assert_eq!(EffectiveCaveats::new(&c).not_after("NotAfter"), Some(3000));
     }
 }

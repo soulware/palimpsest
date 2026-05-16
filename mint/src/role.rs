@@ -6,7 +6,7 @@
 //! long. This module does **not** verify the MAC — that already
 //! happened — it only evaluates caveat *values*.
 
-use crate::caveat::EffectiveCaveats;
+use crate::caveat::{EffectiveCaveats, Resolved};
 use crate::config::{Config, Role};
 
 const AUDIENCE_CAVEAT: &str = "Audience";
@@ -25,6 +25,9 @@ pub enum Denied {
     RoleNotPermitted,
     /// A caveat named in the role's `required_caveats` is absent.
     MissingRequiredCaveat(String),
+    /// A required caveat is present but its occurrences contradict
+    /// (unsatisfiable) — fail closed, never treat as absent.
+    UnsatisfiableCaveat(String),
     /// Macaroon carries no usable `NotAfter`, or it is already past.
     Expired,
     /// Requested TTL below the role's `min_ttl_seconds`.
@@ -58,32 +61,35 @@ pub fn authorize(
 
     let eff = EffectiveCaveats::new(caveats);
 
-    // Audience: cross-service replay defence. Every Audience caveat must
-    // resolve to the configured name.
-    match eff.scalar(AUDIENCE_CAVEAT) {
-        Some(a) if a == cfg.audience => {}
+    // Audience: cross-service replay defence. Must resolve to a single
+    // value equal to the configured name; absent or unsatisfiable both
+    // fail closed.
+    match eff.resolve(AUDIENCE_CAVEAT) {
+        Resolved::Value(a) if a == cfg.audience => {}
         _ => return Err(Denied::WrongAudience),
     }
 
-    // Optional Role caveat restricts which roles are assumable. Accept
-    // either a scalar (single role) or a list (subset).
-    if eff.contains(ROLE_CAVEAT) {
-        let permitted = if let Some(s) = eff.scalar(ROLE_CAVEAT) {
-            s == requested_role
-        } else if let Some(list) = eff.list(ROLE_CAVEAT) {
-            list.iter().any(|r| r == requested_role)
-        } else {
-            false
-        };
-        if !permitted {
+    // Optional Role caveat restricts which role is assumable (scalar —
+    // a caller wanting a narrower role attenuates with a tighter one).
+    // Absent = unrestricted; unsatisfiable = fail closed.
+    match eff.resolve(ROLE_CAVEAT) {
+        Resolved::Absent => {}
+        Resolved::Value(s) if s == requested_role => {}
+        Resolved::Value(_) | Resolved::Unsatisfiable => {
             return Err(Denied::RoleNotPermitted);
         }
     }
 
-    // Required caveats: presence-only gate.
+    // Required caveats: must be present *and* satisfiable. An
+    // unsatisfiable required caveat is a distinct denial, never
+    // collapsed to "missing".
     for req in &role.required_caveats {
-        if !eff.contains(req) {
-            return Err(Denied::MissingRequiredCaveat(req.clone()));
+        match eff.resolve(req) {
+            Resolved::Value(_) => {}
+            Resolved::Absent => return Err(Denied::MissingRequiredCaveat(req.clone())),
+            Resolved::Unsatisfiable => {
+                return Err(Denied::UnsatisfiableCaveat(req.clone()));
+            }
         }
     }
 

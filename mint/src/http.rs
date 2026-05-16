@@ -30,6 +30,7 @@ use crate::audit::{AuditEntry, AuditLog, sanitise_caveats};
 use crate::config::Config;
 use crate::iam::KeypairMinter;
 use crate::macaroon::Macaroon;
+use crate::pop;
 use crate::role::{self, Denied};
 use crate::template::render_policy;
 
@@ -122,7 +123,54 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         tigris_access_key_id: key,
     };
 
+    // --- Holder-of-key PoP (elide:CoordKey) ---
+    // Enforced before anything reads the body: the proof signs over the
+    // exact raw body bytes, so a verified PoP is what makes the
+    // request.* template inputs trustworthy. Any failure is the same
+    // opaque 401 as a bad MAC (don't distinguish causes); a
+    // contradictory elide:CoordKey fails closed here, never downgrades
+    // to bearer.
+    let pop_proof = match (
+        headers
+            .get("x-mint-coord-pop")
+            .and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-mint-coord-pop-ts")
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        (Some(sig), Some(ts)) => match pop::Proof::from_parts(sig, ts) {
+            Ok(p) => Some(p),
+            Err(_) => {
+                audit(entry("denied:pop", "", None, None));
+                return respond(
+                    &request_id,
+                    StatusCode::UNAUTHORIZED,
+                    json!({"error": "unauthorized"}),
+                );
+            }
+        },
+        _ => None,
+    };
+    if let Err(_e) = pop::check(
+        &caveats,
+        mac.tail(),
+        &body,
+        pop_proof,
+        now.timestamp().max(0) as u64,
+    ) {
+        audit(entry("denied:pop", "", None, None));
+        return respond(
+            &request_id,
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "unauthorized"}),
+        );
+    }
+
     // --- Request body ---
+    // Parse twice from the same bytes: the typed view (role/ttl) and
+    // the generic `request.*` template namespace. Both are derived from
+    // the exact bytes the PoP signature covers (§ pop): the policy can
+    // only ever reflect the body the coordinator signed.
     let Ok(req) = serde_json::from_slice::<AssumeRoleBody>(&body) else {
         audit(entry("denied:bad_request", "", None, None));
         return respond(
@@ -131,6 +179,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
             json!({"error": "bad request"}),
         );
     };
+    let request_json: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
 
     // Default TTL is the role's default; resolve before authorize so the
     // clamp in `role::authorize` sees a concrete number.
@@ -179,6 +229,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         &granted.role.policy,
         &state.config.tenant,
         &caveats,
+        &request_json,
         &expiry_iso,
     ) {
         Ok(p) => p,
@@ -242,6 +293,7 @@ fn denied_tag(d: &Denied) -> &'static str {
         Denied::WrongAudience => "wrong_audience",
         Denied::RoleNotPermitted => "role_not_permitted",
         Denied::MissingRequiredCaveat(_) => "missing_required_caveat",
+        Denied::UnsatisfiableCaveat(_) => "unsatisfiable_caveat",
         Denied::Expired => "expired",
         Denied::TtlTooShort => "ttl_too_short",
     }

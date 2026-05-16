@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::caveat::{Caveat, CaveatValue};
+use crate::caveat::Caveat;
 
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {
@@ -29,7 +29,7 @@ pub struct AuditEntry {
 #[derive(Debug, Serialize)]
 pub struct AuditCaveat {
     pub name: String,
-    pub value: serde_json::Value,
+    pub value: String,
 }
 
 pub fn sanitise_caveats(caveats: &[Caveat]) -> Vec<AuditCaveat> {
@@ -37,16 +37,7 @@ pub fn sanitise_caveats(caveats: &[Caveat]) -> Vec<AuditCaveat> {
         .iter()
         .map(|c| AuditCaveat {
             name: c.name.clone(),
-            value: match &c.value {
-                CaveatValue::Scalar(s) => serde_json::Value::String(s.clone()),
-                CaveatValue::List(items) => serde_json::Value::Array(
-                    items
-                        .iter()
-                        .cloned()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            },
+            value: c.value.clone(),
         })
         .collect()
 }
