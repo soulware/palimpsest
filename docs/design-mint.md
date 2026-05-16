@@ -62,13 +62,20 @@ signed session token, because Tigris has no session-token endpoint).
 
 The caller (e.g. an Elide coordinator) holds a macaroon **issued by the
 mint itself** — minted once at provisioning/login, then attenuated by
-the caller per request. It calls `mint`'s HTTP API, presenting the
-(attenuated) macaroon plus any discharge macaroons and a role name.
-`mint` verifies the macaroon against its own root and any third-party
-caveats, looks up the role, renders the role's policy template with
-values drawn from macaroon caveats, calls Tigris IAM to mint a keypair
-under that policy, and returns the keypair to the caller. The caller
-then uses the keypair directly against Tigris's S3 endpoint.
+the caller per request. The macaroon is a pure *capability* (which
+roles this key-bound principal may assume, until when); the per-request
+*exercise* parameters (role, TTL, and any role-specific scoping data
+such as the ancestor set) travel in the request **body**, which is
+covered by the caller's proof-of-possession signature (§ *Coordinator
+bootstrap*). The caller calls `mint`'s HTTP API, presenting the
+(attenuated) macaroon, the PoP-signed body, and any discharge
+macaroons. `mint` verifies the macaroon against its own root and any
+third-party caveats, verifies the PoP signature over the body against
+the macaroon's `elide:CoordKey`, looks up the role, renders the role's
+policy template from the verified caveats and the PoP-verified body,
+calls Tigris IAM to mint a keypair under that policy, and returns the
+keypair to the caller. The caller then uses the keypair directly
+against Tigris's S3 endpoint.
 
 `mint` is **never** in the data path. It is consulted only at credential
 issuance and refresh.
@@ -78,7 +85,8 @@ issuance and refresh.
 ### Layers
 
 ```
-caller ↔ mint:       macaroon authentication (HTTP + macaroon-as-bearer)
+caller ↔ mint:       capability macaroon (MAC, mint root) + per-request
+                     Ed25519 PoP over macaroon-tail ‖ ts ‖ body
 mint  ↔ Tigris IAM:  admin credential (held by mint, never disclosed)
 caller ↔ Tigris S3:  the freshly-minted scoped keypair
 ```
@@ -194,10 +202,19 @@ first-party proof-of-possession caveat. At issuance mint seals
 `elide:CoordKey=ed25519:<coordinator.pub>` into the primary alongside
 `elide:Coord`, under the same chain MAC. `assume-role` honours the
 macaroon only when the request carries a fresh Ed25519 signature, by
-`coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
-unix-seconds)` — the tail binds the proof to this exact
-role/volume/`NotAfter`, the timestamp (±skew) bounds replay — verified
-against the sealed key. The persisted file alone is therefore inert:
+`coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖ unix-seconds
+‖ BLAKE3(request-body))` — the tail binds the proof to this exact
+capability macaroon (role/`NotAfter`/`elide:Volume`), the body hash
+binds it to this exact request (the role, TTL, and role-specific
+scoping data such as the ancestor set), and the timestamp (±skew)
+bounds replay — verified against the sealed key. Folding the body hash
+into the one PoP payload is what authenticates request-supplied
+scoping data: it is not a separate signature and not a separate caveat
+(an isolated body signature, untied to the tail and freshness, would
+be replayable and splice-able onto another macaroon). The
+`elide:CoordKey` caveat is the single "this request is signed by the
+bound key" predicate; widening its signed payload to include the body
+extends that one predicate to cover the body. The persisted file alone is therefore inert:
 the secret stays the one identity key the coordinator already protects
 (name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
 registry — the pairing rides the token. Enrollment is a one-time
@@ -250,11 +267,14 @@ above); it is minted once at enrollment.
 POST /v1/assume-role
 Host: <mint-instance>
 Authorization: Macaroon <base64-encoded macaroon>
+X-Mint-Coord-Pop: <base64 Ed25519 signature>
+X-Mint-Coord-Pop-Ts: <unix seconds>
 Content-Type: application/json
 
 {
   "role": "volume-ro",
-  "ttl_seconds": 3600
+  "ttl_seconds": 3600,
+  "ancestors": ["01ARZ...", "01BXY..."]
 }
 ```
 
@@ -280,25 +300,48 @@ chain MAC against its own macaroon root, and each discharge against the
 relevant third-party key (see `design-auth-model.md` for the
 construction).
 
-If verification fails — bad signature, unknown root, malformed encoding — the
-mint returns `401 Unauthorized` with no further detail (don't help an attacker
-distinguish "wrong key" from "tampered caveats").
+The request also carries the proof-of-possession the macaroon's
+`elide:CoordKey` caveat requires: `X-Mint-Coord-Pop` is the base64
+Ed25519 signature, by `coordinator.key`, over `BLAKE3(macaroon-tail ‖
+X-Mint-Coord-Pop-Ts ‖ BLAKE3(request-body))`; `X-Mint-Coord-Pop-Ts` is
+the signing time in unix seconds. The mint recomputes the digest over
+the **exact raw body bytes it received** (hashed before parsing — no
+JSON canonicalization, which is itself a footgun) and the presented
+macaroon's tail, verifies the signature against the sealed
+`elide:CoordKey`, and rejects a timestamp outside the skew window.
+Only after this does any `request.*` body field become a trusted
+template input. A macaroon that carries no `elide:CoordKey` is a plain
+bearer and no PoP is required (the Elide enrollment path always seals
+one; bearer support is for non-Elide callers).
+
+If verification fails — bad MAC, unknown root, malformed encoding, missing
+or bad PoP when `elide:CoordKey` is present — the mint returns `401
+Unauthorized` with no further detail (don't help an attacker distinguish
+"wrong key" from "tampered caveats" from "bad PoP").
 
 ### Request body
 
-The request body specifies the **exercise of authority** — what the caller is
-asking for right now within the bounds the macaroon attests to. v1 fields:
+The request body specifies the **exercise of authority** — what the caller
+is asking for right now within the bounds the macaroon attests to. The
+whole body is covered by the PoP signature (§ *Authentication*), so every
+field is vouched for by `coordinator.key` and bound to this exact
+macaroon and moment. Mint is **body-field-agnostic** in the same way it
+is caveat-vocabulary-agnostic: it does not hard-code which fields are
+meaningful. It parses the verified body into the `request.*` template
+namespace; a role's policy template is the only thing that decides which
+fields matter, by referencing them (strict mode — a template referencing
+an absent `request.X` fails closed). Conventional fields:
 
 - `role` (required): role name from the mint's configuration.
 - `ttl_seconds` (optional): requested credential lifetime. Must be within
   the role's `min_ttl_seconds`..`max_ttl_seconds` and must not exceed the
   macaroon's `NotAfter` caveat. Defaults to the role's `default_ttl_seconds`.
-
-Future fields (Option 3 from design discussion — not in v1):
-
-- `ancestors` (optional): subset of the macaroon's `Ancestors` caveat to
-  include in the policy. Useful when a caller wants narrower-than-maximum
-  authority for a specific operation. v1 always uses the full caveat list.
+- `ancestors` (role-specific): the ancestor vol-ulid set the
+  `volume-ro` policy expands into per-ancestor ARNs. It is **not** a
+  caveat: the coordinator computes the honest lineage from signed
+  provenance and asserts it here, authenticated by the PoP rather than
+  the MAC chain. Mint neither knows nor requires this field except
+  through the role template that names it.
 
 ### Response
 
@@ -322,7 +365,7 @@ has:
 ```toml
 [[role]]
 name = "volume-ro"
-required_caveats = ["Volume", "Ancestors"]
+required_caveats = ["elide:Volume"]
 min_ttl_seconds = 60
 max_ttl_seconds = 604800     # 7 days
 default_ttl_seconds = 86400  # 1 day
@@ -335,8 +378,8 @@ policy = """
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "Volume"}}/*"
-      {{#each (caveat "Ancestors")}},
+      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each request.ancestors}},
       "arn:aws:s3:::{{tenant.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
@@ -350,39 +393,50 @@ policy = """
 
 ### Templating
 
-The mint substitutes three classes of variable in the policy template at
-issuance time:
+The mint substitutes four classes of variable in the policy template at
+issuance time, each with an explicit, distinct trust provenance:
 
-- `{{tenant.X}}` — values from the mint's tenant configuration (bucket name,
-  etc.), as a plain path. Server-side, never caller-controlled.
-- `{{caveat "X"}}` — the verified macaroon's caveat named `X`, resolved
-  through a built-in `caveat` lookup helper that takes the caveat name as
-  a string argument. Scalar caveats render directly
-  (`{{caveat "elide:Volume"}}`); list-valued caveats are iterated as a
-  subexpression (`{{#each (caveat "elide:Ancestors")}}…{{/each}}`). The
-  helper form (not a `{{caveat.X}}` path) is required because namespaced
-  caveat names contain `:`, which is not a legal template path segment;
-  it also keeps the caveat surface to a single named lookup rather than
-  arbitrary data-graph traversal.
-- `{{system.X}}` — values computed by the mint at request time, as a plain
-  path. v1 set: `system.expiry_iso8601` (the issued credential's expiry,
-  derived from the requested or default TTL).
+- `{{tenant.X}}` — values from the mint's tenant configuration (bucket
+  name, etc.), as a plain path. Server-side, never caller-controlled.
+- `{{caveat "X"}}` — the verified macaroon's caveat named `X` (MAC-bound,
+  rooted in the mint's macaroon root), resolved through a built-in
+  `caveat` lookup helper that takes the caveat name as a string argument.
+  All caveats are scalar and render directly (`{{caveat "elide:Volume"}}`).
+  The helper form (not a `{{caveat.X}}` path) is required because
+  namespaced caveat names contain `:`, which is not a legal template path
+  segment; it also keeps the caveat surface to a single named lookup
+  rather than arbitrary data-graph traversal.
+- `{{request.X}}` — fields from the PoP-verified request body (bound to
+  `coordinator.key`, this macaroon's tail, and this moment — §
+  *Authentication*). Available **only** after the PoP signature is
+  verified. Scalars render directly; arrays iterate as
+  `{{#each request.ancestors}}…{{/each}}`. This is the channel for
+  honest-but-unverified scoping data the coordinator computes (e.g. the
+  ancestor lineage): mint transmits it into the policy, the PoP
+  authenticates *who* asserted it, mint never validates the value.
+- `{{system.X}}` — values computed by the mint at request time, as a
+  plain path. v1 set: `system.expiry_iso8601` (the issued credential's
+  expiry, derived from the requested or default TTL).
 
-The `caveat` helper resolves names against the **effective** caveat set,
-not the raw chain: list-valued caveats are intersected across every
-occurrence, repeated scalars must agree, and a self-contradictory scalar
-resolves to absent. A reference to a caveat the macaroon does not carry
-(or one that is unsatisfiable) is a hard render failure — the request is
-refused, never minted with a missing substitution. The minted policy
-therefore reflects exactly the authority the gate evaluated.
+The `caveat` helper resolves names against the chain under AND
+semantics: a scalar caveat repeated across attenuations must agree on a
+single value; two disagreeing occurrences are an unsatisfiable
+restriction the holder constructed and resolve to a hard failure —
+**never** silently to "absent" (that would let a holder, who can append
+caveats with only the trailing MAC, neutralise a binding caveat by
+appending a contradictory copy). A reference to a caveat the macaroon
+does not carry, or one that is unsatisfiable, is a hard render failure:
+the request is refused, never minted with a missing or downgraded
+substitution. `{{request.X}}` is likewise strict — an absent field a
+template references fails the render closed.
 
 The mint **does not** ship a general-purpose policy DSL. The entire
 template surface is `{{tenant.*}}` / `{{system.*}}` plain paths, the
-`caveat` lookup helper, and `{{#each}}` over a list caveat. Conditional
-blocks, arithmetic, value transformations, and dynamic resource
-construction beyond straight substitution are deliberately out of scope.
-Roles requiring more expressive policies should be split into multiple
-roles.
+`caveat` scalar lookup helper, `{{request.*}}` fields, and `{{#each}}`
+over a `request.*` array. Conditional blocks, arithmetic, value
+transformations, and dynamic resource construction beyond straight
+substitution are deliberately out of scope. Roles requiring more
+expressive policies should be split into multiple roles.
 
 ### Required caveats
 
@@ -422,11 +476,13 @@ That said, several caveats are **conventional** across uses:
   from being replayed at a different service (e.g. mint). Mint config
   declares its own audience name (e.g. `"mint"`) and rejects macaroons whose
   `Audience` caveat doesn't match.
-- **`NotAfter`** (uint64 unix seconds, scalar, intersecting). Standard
-  expiry. Multiple `NotAfter` caveats narrow to the minimum.
-- **`Role`** (string, scalar — or list-valued if subsetting is wanted).
-  Restricts which roles this macaroon can assume. If absent, any role the
-  mint config exposes is reachable.
+- **`NotAfter`** (uint64 unix seconds, scalar). Standard expiry.
+  Multiple `NotAfter` caveats narrow to the minimum — a numeric
+  intersection, not a list.
+- **`Role`** (string, scalar). Restricts which role this macaroon can
+  assume. If absent, any role the mint config exposes is reachable.
+  (Scalar only — there are no list-valued caveats; a caller wanting a
+  narrower role just attenuates with a tighter `Role`.)
 
 ### Namespacing
 
@@ -434,7 +490,6 @@ Caveats other than the well-known standards above are conventionally prefixed
 to indicate their issuer or domain:
 
 - `elide:Volume`
-- `elide:Ancestors`
 - `elide:Coord`
 
 This avoids collisions between issuers. Role templates reference caveats by
@@ -442,29 +497,39 @@ their full namespaced name through the `caveat` helper:
 `{{caveat "elide:Volume"}}`. The string-argument form is what makes the
 `:` separator usable in a template at all.
 
+### All caveats are scalar
+
+There are no list-valued caveats. Every caveat is a scalar capability
+predicate that attenuates by AND (repeated occurrences must agree;
+`NotAfter` narrows to the numeric minimum). The only list-shaped input
+a role ever needed — the ancestor set for `volume-ro` — is **not** a
+caveat: it rides the PoP-signed request body as `request.ancestors`
+(§ *Request body*, § *Templating*). This keeps the macaroon library to
+scalar caveats plus the holder-of-key extension; no list-valued caveat
+type, no intersection semantics, no chain whose effective value depends
+on occurrence order.
+
 ### Partitioning vs. narrowing caveats
 
 Caveats split into two kinds by where their value originates:
 
-- **Partitioning** — `elide:Coord`. Separates mutually-distrusting
-  principals. Stamped at issuance and bound to the authenticated identity
-  (see *Coordinator bootstrap*, #13); a caller never supplies it.
-- **Narrowing** — `elide:Volume`, `elide:Ancestors`, `NotAfter`.
-  Coordinator-appended, restricting an existing grant to one volume /
-  lineage / expiry for attribution and per-credential blast-radius
-  reduction. Volume ownership across coordinators is established by the
-  name-claim and body-token lineage; `elide:Volume` scopes a
-  coordinator's own credential within authority it already holds.
+- **Partitioning** — `elide:Coord`, `elide:CoordKey`. Identify and bind
+  the principal. Stamped at issuance and bound to the authenticated
+  identity (see *Coordinator bootstrap*, #13); a caller never supplies
+  or alters them (an appended contradictory copy is unsatisfiable and
+  fails closed, never silently dropped).
+- **Narrowing** — `elide:Volume`, `NotAfter`. Coordinator-appended,
+  restricting an existing grant to one volume / expiry for attribution
+  and per-credential blast-radius reduction. Volume ownership across
+  coordinators is established by the name-claim and body-token lineage;
+  `elide:Volume` scopes a coordinator's own credential within authority
+  it already holds.
 
-### List-valued caveats with intersection semantics
-
-A list-valued caveat (e.g. `elide:Ancestors=[A,B,C]`) attenuates by
-intersection: attaching another `elide:Ancestors=[A,B]` to the chain produces
-an effective value of `[A,B]`. This preserves the "caveats only narrow"
-invariant.
-
-The macaroon library must understand list-valued caveats natively; see
-`design-auth-model.md` for the encoding (TBD addition).
+The honest-but-unverified lineage data (the ancestor set) is neither:
+it is not a capability the macaroon attests, it is a per-request
+assertion the coordinator computes from signed provenance and the PoP
+authenticates. It therefore belongs in the signed body, not the caveat
+chain — see *Request body*.
 
 ### Caveat field inventory (Elide)
 
@@ -476,40 +541,46 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | Caveat | Type | Scalar/List | Issuer | Purpose |
 |---|---|---|---|---|
 | `Audience` | string | scalar | macaroon issuer | Gate only — must equal `mint`. Cross-service replay defense. |
-| `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
-| `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
+| `NotAfter` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`); multiple narrow to the minimum. |
+| `Role` | string | scalar | issuer | Gate only — restricts the assumable role. Optional. |
 | `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
-| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key`, verified against this key. Makes the primary key-bound, not a bearer. |
+| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ ts ‖ BLAKE3(body)`, verified against this key. Makes the primary key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
-| `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
+
+The ancestor set is **not** in this table — it is not a caveat. It is
+`request.ancestors` in the PoP-signed body (§ *Request body*).
 
 Per-role gate matrix (template substitutions are listed in each role's
 definition below):
 
-| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` | `elide:Ancestors` |
-|---|---|---|---|---|---|
-| `coord-data` | ● | ● | ● | ● | |
-| `coord-names` | ● | ● | ● | | |
-| `coord-events` | ● | ● | ● | | |
-| `coord-identity` | ● | ● | ● | | |
-| `coord-list` | ● | ● | ● | | |
-| `coord-base` | ● | ● | ● | | |
-| `volume-ro` | ● | ● | | ● | ● |
+| Role | `Audience` | `NotAfter` | `elide:Coord` | `elide:Volume` |
+|---|---|---|---|---|
+| `coord-data` | ● | ● | ● | ● |
+| `coord-names` | ● | ● | ● | |
+| `coord-events` | ● | ● | ● | |
+| `coord-identity` | ● | ● | ● | |
+| `coord-list` | ● | ● | ● | |
+| `coord-base` | ● | ● | ● | |
+| `volume-ro` | ● | ● | | ● |
 
-Non-caveat template inputs (the other two substitution classes, listed
-here so the issuer's surface is unambiguous):
+Non-caveat template inputs (the other three substitution classes,
+listed here so the issuer's surface is unambiguous):
 
 - `{{tenant.X}}` — server-side config; Elide uses `tenant.bucket`. Never
   caller-controlled.
+- `{{request.X}}` — PoP-verified request body; Elide uses
+  `request.ancestors` (the `volume-ro` ancestor lineage). Vouched for
+  by `coordinator.key`, never validated by mint.
 - `{{system.X}}` — mint-computed at issuance; Elide uses
   `system.expiry_iso8601`.
 
 Notes:
 
-- **Exactly one list-valued field exists** (`elide:Ancestors`); every
-  other caveat is scalar. Two macaroon-library extensions this inventory
-  requires: the list-valued caveat type (#6) and the first-party
-  holder-of-key caveat for `elide:CoordKey` (#16).
+- **Every caveat is scalar.** The one macaroon-library extension this
+  inventory requires is the first-party holder-of-key caveat for
+  `elide:CoordKey` (#16). No list-valued caveat type is needed (#6
+  resolved): the only list-shaped input, the ancestor set, is
+  `request.ancestors` in the PoP-signed body, not a caveat.
 - **`elide:Coord` templates only in `coord-identity`**
   (`coordinators/{{caveat "elide:Coord"}}/*`, own-prefix write). Every
   other `coord-*` role uses it as a gate only; their policies use
@@ -641,9 +712,10 @@ or remove `coord-list`; tracked as open question #12.
 
 Per-volume read of one volume's lineage. **Assumed by the coordinator**,
 not the volume: the coordinator attenuates its primary (`elide:Volume`,
-`elide:Ancestors`, `NotAfter`), calls `assume-role` with its
-`coordinator.key` PoP, and vends the resulting **Tigris keypair** to the
-volume process over the local handshake. The volume holds only that
+`NotAfter`), puts the honest ancestor lineage in the request body as
+`request.ancestors`, calls `assume-role` with its `coordinator.key` PoP
+(which signs the body), and vends the resulting **Tigris keypair** to
+the volume process over the local handshake. The volume holds only that
 keypair — it never holds a macaroon and never calls mint, so the
 coordinator is the only principal that authenticates to mint. Used only
 when the volume reads S3 itself: hydration, or the S3 fallback when
@@ -651,8 +723,9 @@ peer-fetch is unavailable. Peer-fetch proper does not use it — that path
 is the Ed25519 `PeerFetchToken` against a peer's local bytes
 (`design-peer-segment-fetch.md`).
 
-- **Required caveats:** `elide:Volume`, `elide:Ancestors`, `Audience=mint`,
-  `NotAfter`
+- **Required caveats:** `elide:Volume`, `Audience=mint`, `NotAfter`
+- **Required body:** `request.ancestors` (PoP-signed; the role template
+  references it, so an absent value fails the render closed)
 - **Keypair freshness — split by volume mode:**
   - *Non-lazy (default):* the coordinator assumes on demand. A hydrated
     volume serves from local cache and touches S3 only in bounded fetch
@@ -665,7 +738,8 @@ is the Ed25519 `PeerFetchToken` against a peer's local bytes
     still-valid keypair off the hot path. Revocation window is the
     keypair `DateLessThan`, bounded by the minimal blast radius (read one
     volume's lineage).
-- **Policy:** the per-volume RO shape, exact ARNs for self + each ancestor.
+- **Policy:** the per-volume RO shape — exact ARN for self
+  (`{{caveat "elide:Volume"}}`) plus one per `request.ancestors` entry.
 
 ### Why Split B is viable now
 
@@ -824,10 +898,13 @@ prematurely.
    `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,
    but does not block the current inventory.
-6. **Caveat library schema.** List-valued caveats with intersection
-   semantics are required; `design-auth-model.md` documents only scalar
-   caveats today. Needs extending — minor work, but the encoding needs to
-   round-trip cleanly.
+6. **Caveat library schema — resolved.** No list-valued caveat is
+   needed. The only list-shaped input (the `volume-ro` ancestor set)
+   rides the PoP-signed request body as `request.ancestors`, not the
+   caveat chain. All caveats are scalar; the only macaroon-library
+   extension over `design-auth-model.md`'s scalar caveats is the
+   holder-of-key caveat (#16). This also removes the occurrence-order
+   /effective-vs-last hazard a list caveat would carry.
 7. **HTTP API surface beyond `AssumeRole`.** Likely additions: `ListRoles`
    (caller discovers what's available), `GetRole` (caller introspects role
    requirements), health endpoint. None blocking for v1; design once
@@ -895,8 +972,7 @@ prematurely.
     to that authority; the holder presents discharge macaroons).
     `design-auth-model.md` documents only scalar first-party caveats
     today; the third-party construction and its discharge-bundle wire
-    format on `assume-role` need specifying. Supersedes the assumption
-    in #6 that only the list-valued first-party extension is required.
+    format on `assume-role` need specifying.
     Whether a primary macaroon with *no* third-party caveat (operator-
     issued, trust = possession) is the supported minimal self-hosted
     deployment — with third-party discharge the opt-in central-service
@@ -906,14 +982,20 @@ prematurely.
     central service enforces it at the discharge layer for ongoing
     operations or by refusing re-enrollment is part of this question.
 16. **PoP caveat wire detail.** `elide:CoordKey` is decided (first-party
-    holder-of-key; primary is key-bound, not a bearer — see *Coordinator
-    bootstrap*). What remains: the request-side proof format on
-    `assume-role` (header name, signature encoding) and the freshness
-    anchor — signing `BLAKE3(presented-macaroon-tail ‖ unix-seconds)`
-    with a ±skew window vs. a mint-issued nonce. Tail-binding to pin the
-    proof to the exact request is fixed; the freshness mechanism is the
-    live choice — it is DPoP's resolved `iat`-skew vs. server-`nonce`
-    tradeoff; prior art: RFC 7800 (`cnf` PoP key) and RFC 9449 (DPoP).
+    holder-of-key; primary is key-bound, not a bearer; the signed
+    payload is `BLAKE3(presented-macaroon-tail ‖ unix-seconds ‖
+    BLAKE3(request-body))` so the proof also authenticates the body —
+    see *Coordinator bootstrap*, *Authentication*). The body hash is
+    over the **exact raw bytes received**, hashed before parsing — no
+    JSON canonicalization (a canonicalization mismatch is a
+    signature-bypass footgun). Freshness is a **±skew window** on
+    `X-Mint-Coord-Pop-Ts` — stateless, no mint-issued nonce (DPoP's
+    `iat`-skew anchor; prior art: RFC 7800 `cnf` PoP key, RFC 9449
+    DPoP). Tail-binding pins the proof to the exact macaroon, body-hash
+    binding to the exact request, the skew window bounds replay. What
+    remains is only the wire encoding (working draft: `X-Mint-Coord-Pop`
+    base64 Ed25519 signature, `X-Mint-Coord-Pop-Ts` unix seconds, skew
+    bound) — an implementation detail, not a design fork.
 
 ## Future directions
 

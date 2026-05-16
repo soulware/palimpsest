@@ -489,17 +489,24 @@ shared secret, and revocation rides the same force-release CAS fence
 The `PeerFetchToken` is already an instance of the holder-of-key
 pattern used mint-side for `elide:CoordKey` (`design-mint.md`): a token
 naming a key, possession proven by a per-use signature, verified
-against the published key. The two differ only in root and verifier —
-mint-path tokens root in mint's symmetric root and mint verifies; a
-peer token roots in the requester's own key and the serving peer
-verifies against `coordinators/<id>/coordinator.pub`. Re-expressing the
-token as a macaroon rooted in the requester's key would add
-attenuation: a coordinator could mint a peer "primary" and hand each
-volume process a per-volume narrowed token, symmetric with the mint-path
-primary → `volume-ro` model — one PoP-attenuable token shape across both
-planes. That uniform token model is the gain; it changes no
-authorisation (ownership stays the `names/` CAS + lineage check) and is
-deferred until per-volume peer-token attenuation is actually wanted.
+against the published key. They differ in root, verifier, and signed
+payload — mint-path roots in mint's symmetric macaroon root, mint
+verifies, and the PoP signs `macaroon-tail ‖ ts ‖ body`; a peer token
+roots in the requester's own key, the serving peer verifies against
+`coordinators/<id>/coordinator.pub`, and it signs its own
+`(name, coordinator_id)` fields. Re-expressing the peer token as a
+macaroon rooted in the requester's key would add attenuation: a
+coordinator could mint a peer "primary" and attenuate it per volume
+for its own peer requests. The mint-path analogue is **not** a
+volume-held narrowed token — under Fork A the volume holds no macaroon,
+only a coordinator-brokered Tigris keypair; the genuine symmetry is
+that `design-mint.md` deliberately keeps `elide:Volume` a scalar,
+attenuable caveat for exactly this kind of per-volume narrowing, and
+this deferred peer-path unification is the one concrete future hop that
+would exercise it. The uniform PoP-attenuable token shape is the gain;
+it changes no authorisation (ownership stays the `names/` CAS + lineage
+check) and is deferred until per-volume peer-token attenuation is
+actually wanted.
 
 Lineage is verified by the serving peer against its **own local**
 signed `volume.provenance` chain (it holds the chain for every fork it
