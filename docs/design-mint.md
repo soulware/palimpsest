@@ -199,14 +199,22 @@ role/volume/`NotAfter`, the timestamp (±skew) bounds replay — verified
 against the sealed key. The persisted file alone is therefore inert:
 the secret stays the one identity key the coordinator already protects
 (name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
-registry — the pairing rides the token. Enrollment is a one-time,
-out-of-band registration of `coordinator.pub ↔ coord-ulid` with mint
-(operator action, or attested by the identity authority); being a
-public key it leaks nothing if observed. Re-issuance before `NotAfter`
-is then in-band and automatic, authenticated by the same proof of
-possession. The identity key is not rotated: a new key is a new
-coordinator — new `coord-ulid`, new enrollment, new primary.
-Registration surface (#13) and the PoP wire detail (#16) are open.
+registry — the pairing rides the token. Enrollment is a one-time
+exchange: the coordinator presents an enrollment token carrying a
+third-party caveat (discharged by the identity authority — `elide
+login`, or operator-mediated) and a `NotAfter`, and proves possession
+of `coordinator.key`. mint verifies the discharge, the PoP, and the
+`elide:Coord` binding, then **re-mints from its root** a primary
+stripped of the third-party caveat and `NotAfter` (Fly.io's
+service-token pattern — only the root holder can re-mint). **The
+primary does not expire**: once PoP-bound, a primary `NotAfter` is
+security-neutral — a file-only leak is already inert and a
+`coordinator.key` compromise renews regardless — so there is no
+re-issuance cadence. The one thing expiry would force, periodic
+identity-authority re-attestation, is a deployment concern (#15). The
+identity key is not rotated: a new key is a new coordinator — new
+`coord-ulid`, new enrollment, new primary. Enrollment-exchange surface
+(#13) and the PoP wire detail (#16) are open.
 
 Refresh cadences, distinct, in increasing trust cost:
 
@@ -217,14 +225,12 @@ Refresh cadences, distinct, in increasing trust cost:
   keypair to the volume over the local handshake. On demand per fetch
   episode for non-lazy volumes; kept warm and refreshed proactively for
   lazy ones (the `coord-data` cache pattern). The volume holds no
-  macaroon, so nothing here couples to the primary's `NotAfter`.
-- **Primary macaroon** — re-issued before its `NotAfter`. Authenticated
-  by proof-of-possession of the coordinator's identity key, so refresh
-  is in-band/automatic; only the *first* acquisition is out-of-band
-  (operator `mint issue` or identity-authority-gated self-enrolment —
-  *Open questions* #13).
+  macaroon; the keypair `DateLessThan` is the only lifetime here.
 - **Discharge macaroon** — when a third-party caveat is present, fetched
   from the identity authority on its own shorter cadence.
+
+The primary itself has no refresh cadence — it does not expire (see
+above); it is minted once at enrollment.
 
 ## Protocol
 
@@ -852,23 +858,20 @@ prematurely.
     `design-peer-segment-fetch.md` for performance — would shrink it to
     just `volume list --remote`, or remove it entirely. Not blocking;
     the temporal mitigation (short TTL, on-demand) holds until then.
-13. **Issuance surface and what authorizes it.** mint is issuer as well
-    as verifier, so it needs an issuance path — a privileged endpoint
-    or an out-of-band `mint issue --coord <id>` operator command — that
-    mints a caller's primary macaroon. Issuance is far more powerful
-    than `assume-role` (it creates authority rather than exercising it),
-    so what authorizes *issuance itself* must be pinned down: admin-only
-    local operation, an admin-scoped endpoint, and/or issuance gated by
-    the identity authority so a bare issuance call can't hand out a
-    coordinator token. The issuance path **must** fix the `elide:Coord`
-    caveat to the authenticated coordinator identity (it defines the
-    primary macaroon — see *Coordinator bootstrap*); a caller never
-    supplies or appends it, since a self-chosen value would cross into
-    another coordinator's prefix. The primary is key-bound, not a bearer
-    (decided — see *Coordinator bootstrap*): enrollment registers
-    `coordinator.pub ↔ coord-ulid` with mint, so what is open is the
-    registration/issuance surface and what authorizes a registration,
-    not the binding. Decide before any issuance code exists.
+13. **Enrollment exchange.** The primary is minted once, by an
+    enrollment exchange: the coordinator presents an enrollment token
+    (third-party caveat discharged by the identity authority + a
+    `NotAfter`) and proves possession of `coordinator.key`; mint
+    verifies the discharge, the PoP, and the `elide:Coord` binding, then
+    re-mints from its root a stripped, non-expiring primary (see
+    *Coordinator bootstrap*). The PoP binding, the re-mint, and
+    non-expiry are decided. Open: the enrollment surface — a privileged
+    endpoint vs. an out-of-band `mint issue --coord <id>` operator
+    command — and, in the minimal deployment with no identity authority,
+    what stands in for the discharge (admin-only local operation). mint
+    **must** fix `elide:Coord` to the authenticated identity; a caller
+    never supplies it, since a self-chosen value would cross into
+    another coordinator's prefix. Decide before any issuance code exists.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
@@ -888,7 +891,11 @@ prematurely.
     Whether a primary macaroon with *no* third-party caveat (operator-
     issued, trust = possession) is the supported minimal self-hosted
     deployment — with third-party discharge the opt-in central-service
-    upgrade — is part of this question.
+    upgrade — is part of this question. Because the primary does not
+    expire, periodic re-attestation of a coordinator (e.g. a managed
+    customer who left) is not enforced by primary expiry; whether the
+    central service enforces it at the discharge layer for ongoing
+    operations or by refusing re-enrollment is part of this question.
 16. **PoP caveat wire detail.** `elide:CoordKey` is decided (first-party
     holder-of-key; primary is key-bound, not a bearer — see *Coordinator
     bootstrap*). What remains: the request-side proof format on
