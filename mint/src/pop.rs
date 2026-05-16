@@ -7,15 +7,19 @@
 //! by `coordinator.key`, over
 //!
 //! ```text
-//! BLAKE3( macaroon-tail(32) ‖ ts_be(8) ‖ BLAKE3(raw-request-body) )
+//! BLAKE3( macaroon-tail(32) ‖ BLAKE3(raw-request-body) )
 //! ```
 //!
 //! verified against the `ed25519:<pub>` sealed in `elide:CoordKey`. The
 //! tail binds the proof to this exact attenuated macaroon; the body
 //! hash binds it to this exact request (the body the policy renders
-//! from); the timestamp, within a ±skew window, bounds replay (#16:
-//! stateless `iat`-skew, no mint-issued nonce — DPoP's resolved
-//! tradeoff; prior art RFC 7800 / RFC 9449).
+//! from). Freshness is the `ts` field *inside* the body — already
+//! covered by `BLAKE3(body)`, so there is no separate signed term and
+//! no `X-Mint-Coord-Pop-Ts` header; within a ±skew window it bounds
+//! replay (#16: stateless `iat`-skew, no mint-issued nonce — DPoP's
+//! resolved tradeoff; prior art RFC 7800 / RFC 9449). Only the
+//! detached signature stays a header (`X-Mint-Coord-Pop`): it cannot
+//! live in the body it signs.
 //!
 //! Resolution of `elide:CoordKey` goes through the tri-state
 //! [`Resolved`]: `Absent` ⇒ the macaroon is a plain bearer (no PoP
@@ -67,24 +71,42 @@ pub enum PopReject {
     BadSignature,
 }
 
-/// The request-side proof: the Ed25519 signature and the timestamp it
-/// was signed at, parsed from the wire headers.
+/// JSON body field carrying the per-request freshness timestamp (unix
+/// seconds). It rides *in the body* — not a header — so it is already
+/// covered by the PoP signature via `BLAKE3(body)`; no separate signed
+/// term, no `X-Mint-Coord-Pop-Ts` header.
+pub const TS_FIELD: &str = "ts";
+
+/// The request-side proof: just the Ed25519 signature, from the
+/// `X-Mint-Coord-Pop` header. Freshness (`ts`) is a body field, not
+/// part of this struct — it is authenticated transitively by the
+/// signature over the body.
 pub struct Proof {
     sig: [u8; 64],
-    ts: u64,
 }
 
 impl Proof {
-    /// Parse from `X-Mint-Coord-Pop` (base64 64-byte signature) and
-    /// `X-Mint-Coord-Pop-Ts` (decimal unix seconds).
-    pub fn from_parts(sig_b64: &str, ts: &str) -> Result<Proof, PopReject> {
+    /// Parse from `X-Mint-Coord-Pop` (base64 64-byte signature).
+    pub fn from_b64(sig_b64: &str) -> Result<Proof, PopReject> {
         let raw = BASE64
             .decode(sig_b64.trim())
             .map_err(|_| PopReject::BadProof)?;
         let sig: [u8; 64] = raw.try_into().map_err(|_| PopReject::BadProof)?;
-        let ts: u64 = ts.trim().parse().map_err(|_| PopReject::BadProof)?;
-        Ok(Proof { sig, ts })
+        Ok(Proof { sig })
     }
+}
+
+/// Extract the freshness `ts` from the JSON body. Called **after** the
+/// signature verifies, so the value is already authenticated (parsing
+/// is not trusting; the trust comes from the verified signature over
+/// these exact bytes).
+fn body_ts(body: &[u8]) -> Result<u64, PopReject> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get(TS_FIELD))
+        .and_then(|v| v.as_u64())
+        .ok_or(PopReject::BadProof)
 }
 
 fn parse_coord_key(value: &str) -> Result<[u8; 32], PopReject> {
@@ -95,15 +117,16 @@ fn parse_coord_key(value: &str) -> Result<[u8; 32], PopReject> {
     raw.try_into().map_err(|_| PopReject::BadKey)
 }
 
-/// The signed digest: `BLAKE3(tail ‖ ts_be ‖ BLAKE3(body))`. The body
-/// is hashed as the **exact bytes received** — the caller must pass the
-/// raw request body before any parse/canonicalization (a canonical-form
-/// mismatch is a signature-bypass footgun, #16).
-fn digest(tail: &[u8; 32], ts: u64, body: &[u8]) -> [u8; 32] {
+/// The signed digest: `BLAKE3(tail ‖ BLAKE3(body))`. `ts` rides inside
+/// `body` as a conventional field, so it is already covered by
+/// `BLAKE3(body)` — no separate signed term. The body is hashed as the
+/// **exact bytes received**: the caller must pass the raw request body
+/// before any parse/canonicalization (a canonical-form mismatch is a
+/// signature-bypass footgun, #16).
+fn digest(tail: &[u8; 32], body: &[u8]) -> [u8; 32] {
     let body_hash = blake3::hash(body);
     let mut h = blake3::Hasher::new();
     h.update(tail);
-    h.update(&ts.to_be_bytes());
     h.update(body_hash.as_bytes());
     *h.finalize().as_bytes()
 }
@@ -124,13 +147,17 @@ pub fn check(
         Resolved::Value(k) => parse_coord_key(&k)?,
     };
     let proof = proof.ok_or(PopReject::MissingProof)?;
-    if now_unix.abs_diff(proof.ts) > SKEW_SECONDS {
-        return Err(PopReject::Stale);
-    }
     let vk = VerifyingKey::from_bytes(&key).map_err(|_| PopReject::BadKey)?;
     let sig = Signature::from_bytes(&proof.sig);
-    vk.verify_strict(&digest(tail, proof.ts, body), &sig)
+    vk.verify_strict(&digest(tail, body), &sig)
         .map_err(|_| PopReject::BadSignature)?;
+    // ts is inside the body the signature just authenticated; read it
+    // only now (parsing is not trusting — the trust is the verified
+    // signature over these exact bytes).
+    let ts = body_ts(body)?;
+    if now_unix.abs_diff(ts) > SKEW_SECONDS {
+        return Err(PopReject::Stale);
+    }
     Ok(PopOutcome::Verified)
 }
 
@@ -143,13 +170,14 @@ pub fn coord_key_value(seed: &[u8; 32]) -> String {
     format!("{ED25519_PREFIX}{}", BASE64.encode(vk.to_bytes()))
 }
 
-/// Reference client proof: sign `digest(tail, ts, body)` with the
-/// coordinator key seed, returning the `(X-Mint-Coord-Pop,
-/// X-Mint-Coord-Pop-Ts)` header values. This is exactly what a
-/// coordinator does per `assume-role`; mint never calls it.
-pub fn client_proof(seed: &[u8; 32], tail: &[u8; 32], body: &[u8], ts: u64) -> (String, String) {
-    let sig = SigningKey::from_bytes(seed).sign(&digest(tail, ts, body));
-    (BASE64.encode(sig.to_bytes()), ts.to_string())
+/// Reference client signature: sign `digest(tail, body)` with the
+/// coordinator key seed, returning the `X-Mint-Coord-Pop` header value.
+/// The caller must have already embedded the freshness `ts` field in
+/// `body` (it is covered by the signature via `BLAKE3(body)`). This is
+/// exactly what a coordinator does per `assume-role`; mint never calls it.
+pub fn client_signature(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> String {
+    let sig = SigningKey::from_bytes(seed).sign(&digest(tail, body));
+    BASE64.encode(sig.to_bytes())
 }
 
 #[cfg(test)]
@@ -161,9 +189,14 @@ mod tests {
         (seed, coord_key_value(&seed))
     }
 
-    fn proof_for(seed: &[u8; 32], tail: &[u8; 32], body: &[u8], ts: u64) -> Proof {
-        let (sig_b64, ts_s) = client_proof(seed, tail, body, ts);
-        Proof::from_parts(&sig_b64, &ts_s).expect("well-formed proof")
+    /// A request body carrying the freshness `ts` field plus optional
+    /// extra JSON (e.g. `,"role":"x"`).
+    fn body(ts: u64, extra: &str) -> Vec<u8> {
+        format!("{{\"ts\":{ts}{extra}}}").into_bytes()
+    }
+
+    fn proof_for(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> Proof {
+        Proof::from_b64(&client_signature(seed, tail, body)).expect("well-formed proof")
     }
 
     const TAIL: [u8; 32] = [9u8; 32];
@@ -172,7 +205,7 @@ mod tests {
     fn absent_coordkey_is_bearer() {
         let cv = vec![Caveat::scalar("Audience", "mint")];
         assert_eq!(
-            check(&cv, &TAIL, b"{}", None, 1000),
+            check(&cv, &TAIL, &body(1000, ""), None, 1000),
             Ok(PopOutcome::NotKeyBound)
         );
     }
@@ -181,9 +214,10 @@ mod tests {
     fn valid_proof_verifies() {
         let (sk, key) = signer();
         let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
-        let p = proof_for(&sk, &TAIL, b"{\"role\":\"x\"}", 1000);
+        let b = body(1000, ",\"role\":\"x\"");
+        let p = proof_for(&sk, &TAIL, &b);
         assert_eq!(
-            check(&cv, &TAIL, b"{\"role\":\"x\"}", Some(p), 1000),
+            check(&cv, &TAIL, &b, Some(p), 1000),
             Ok(PopOutcome::Verified)
         );
     }
@@ -193,7 +227,7 @@ mod tests {
         let (_, key) = signer();
         let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
         assert_eq!(
-            check(&cv, &TAIL, b"{}", None, 1000),
+            check(&cv, &TAIL, &body(1000, ""), None, 1000),
             Err(PopReject::MissingProof)
         );
     }
@@ -202,10 +236,17 @@ mod tests {
     fn tampered_body_fails() {
         let (sk, key) = signer();
         let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
-        let p = proof_for(&sk, &TAIL, b"{\"ancestors\":[\"A\"]}", 1000);
-        // Same proof, different body → digest mismatch.
+        let p = proof_for(&sk, &TAIL, &body(1000, ",\"ancestors\":[\"A\"]"));
+        // Same proof, different body → digest mismatch (verified before
+        // ts is even read).
         assert_eq!(
-            check(&cv, &TAIL, b"{\"ancestors\":[\"EVIL\"]}", Some(p), 1000),
+            check(
+                &cv,
+                &TAIL,
+                &body(1000, ",\"ancestors\":[\"EVIL\"]"),
+                Some(p),
+                1000
+            ),
             Err(PopReject::BadSignature)
         );
     }
@@ -214,11 +255,11 @@ mod tests {
     fn proof_bound_to_the_macaroon_tail() {
         let (sk, key) = signer();
         let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
-        let p = proof_for(&sk, &TAIL, b"{}", 1000);
+        let b = body(1000, "");
+        let p = proof_for(&sk, &TAIL, &b);
         // A proof minted for TAIL must not verify against another tail.
-        let other_tail = [1u8; 32];
         assert_eq!(
-            check(&cv, &other_tail, b"{}", Some(p), 1000),
+            check(&cv, &[1u8; 32], &b, Some(p), 1000),
             Err(PopReject::BadSignature)
         );
     }
@@ -227,21 +268,37 @@ mod tests {
     fn stale_timestamp_rejected() {
         let (sk, key) = signer();
         let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
-        let p = proof_for(&sk, &TAIL, b"{}", 1000);
+        let b = body(1000, "");
+        let p = proof_for(&sk, &TAIL, &b);
+        // Signature is valid; the in-body ts is outside the skew window.
         assert_eq!(
-            check(&cv, &TAIL, b"{}", Some(p), 1000 + SKEW_SECONDS + 1),
+            check(&cv, &TAIL, &b, Some(p), 1000 + SKEW_SECONDS + 1),
             Err(PopReject::Stale)
+        );
+    }
+
+    #[test]
+    fn missing_ts_in_body_rejected_after_verify() {
+        // A correctly-signed body that omits `ts`: signature verifies,
+        // but freshness can't be established → reject (not minted).
+        let (sk, key) = signer();
+        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let b = br#"{"role":"x"}"#;
+        let p = proof_for(&sk, &TAIL, b);
+        assert_eq!(
+            check(&cv, &TAIL, b, Some(p), 1000),
+            Err(PopReject::BadProof)
         );
     }
 
     #[test]
     fn wrong_key_fails() {
         let (_, key) = signer();
-        let other_seed = [3u8; 32];
         let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
-        let p = proof_for(&other_seed, &TAIL, b"{}", 1000);
+        let b = body(1000, "");
+        let p = proof_for(&[3u8; 32], &TAIL, &b);
         assert_eq!(
-            check(&cv, &TAIL, b"{}", Some(p), 1000),
+            check(&cv, &TAIL, &b, Some(p), 1000),
             Err(PopReject::BadSignature)
         );
     }
@@ -258,7 +315,7 @@ mod tests {
             Caveat::scalar(COORD_KEY_CAVEAT, "ed25519:AAAA"),
         ];
         assert_eq!(
-            check(&cv, &TAIL, b"{}", None, 1000),
+            check(&cv, &TAIL, &body(1000, ""), None, 1000),
             Err(PopReject::Unsatisfiable)
         );
     }

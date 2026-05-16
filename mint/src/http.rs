@@ -130,15 +130,11 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     // opaque 401 as a bad MAC (don't distinguish causes); a
     // contradictory elide:CoordKey fails closed here, never downgrades
     // to bearer.
-    let pop_proof = match (
-        headers
-            .get("x-mint-coord-pop")
-            .and_then(|v| v.to_str().ok()),
-        headers
-            .get("x-mint-coord-pop-ts")
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        (Some(sig), Some(ts)) => match pop::Proof::from_parts(sig, ts) {
+    let pop_proof = match headers
+        .get("x-mint-coord-pop")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(sig) => match pop::Proof::from_b64(sig) {
             Ok(p) => Some(p),
             Err(_) => {
                 audit(entry("denied:pop", "", None, None));
@@ -149,7 +145,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
                 );
             }
         },
-        _ => None,
+        None => None,
     };
     if let Err(_e) = pop::check(
         &caveats,

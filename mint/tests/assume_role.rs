@@ -103,16 +103,18 @@ fn key_bound_macaroon() -> Macaroon {
     )
 }
 
-/// Build a request carrying the macaroon and a valid PoP over `body`.
-fn signed_request(m: &Macaroon, body: &'static str) -> Request<Body> {
+/// Build a request whose body is `{"ts":<now>,<inner_fields>}`, signed
+/// by the coordinator key. `ts` rides in the body (covered by the
+/// signature); only the detached signature is a header.
+fn signed_request(m: &Macaroon, inner_fields: &str) -> Request<Body> {
     let ts = chrono::Utc::now().timestamp() as u64;
-    let (sig, ts_s) = pop::client_proof(&COORD_SEED, m.tail(), body.as_bytes(), ts);
+    let body = format!("{{\"ts\":{ts},{inner_fields}}}");
+    let sig = pop::client_signature(&COORD_SEED, m.tail(), body.as_bytes());
     Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
         .header("authorization", format!("Macaroon {}", m.encode()))
         .header("x-mint-coord-pop", sig)
-        .header("x-mint-coord-pop-ts", ts_s)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
@@ -134,7 +136,7 @@ async fn happy_path_mints_scoped_keypair() {
 
     let req = signed_request(
         &m,
-        r#"{"role":"volume-ro","ttl_seconds":3600,"ancestors":["ANC1","ANC2"]}"#,
+        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":["ANC1","ANC2"]"#,
     );
 
     let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
@@ -179,20 +181,17 @@ async fn pop_over_a_different_body_is_401() {
     // Sign one body, send another (the request.* the policy renders
     // from must be exactly what was signed).
     let ts = chrono::Utc::now().timestamp() as u64;
-    let (sig, ts_s) = pop::client_proof(
-        &COORD_SEED,
-        m.tail(),
-        br#"{"role":"volume-ro","ancestors":["ANC1"]}"#,
-        ts,
-    );
+    let signed = format!(r#"{{"ts":{ts},"role":"volume-ro","ancestors":["ANC1"]}}"#);
+    let sig = pop::client_signature(&COORD_SEED, m.tail(), signed.as_bytes());
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
         .header("authorization", format!("Macaroon {}", m.encode()))
         .header("x-mint-coord-pop", sig)
-        .header("x-mint-coord-pop-ts", ts_s)
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"role":"volume-ro","ancestors":["EVIL"]}"#))
+        .body(Body::from(format!(
+            r#"{{"ts":{ts},"role":"volume-ro","ancestors":["EVIL"]}}"#
+        )))
         .unwrap();
 
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;

@@ -14,7 +14,7 @@ The full request path runs end to end:
 
 ```
 Authorization: Macaroon <b64>  ->  verify MAC against trust root
-  ->  elide:CoordKey PoP: Ed25519 over BLAKE3(tail ‖ ts ‖ BLAKE3(body))
+  ->  elide:CoordKey PoP: Ed25519 over BLAKE3(tail ‖ BLAKE3(body))
   ->  parse {role, ttl_seconds, ...}  ->  audience / Role /
   required-caveat gate  ->  TTL clamp (min(req, role.max, NotAfter-now))
   ->  render IAM policy from caveats + PoP-verified request.*
@@ -31,13 +31,14 @@ Authorization: Macaroon <b64>  ->  verify MAC against trust root
   downgrade defence). Not wire-compatible with the elide v2 typed
   format (by design).
 - `pop` — the `elide:CoordKey` holder-of-key gate. A request bearing a
-  key-bound macaroon must carry `X-Mint-Coord-Pop` (Ed25519 sig) +
-  `X-Mint-Coord-Pop-Ts`; the signature covers `tail ‖ ts ‖
-  BLAKE3(raw-body)`, so it binds to the exact macaroon and the exact
-  body, freshness-bounded by a ±skew window (design OQ#16). No
-  `elide:CoordKey` ⇒ plain bearer (no PoP); contradictory ⇒ rejected.
-  `client_proof` / `coord_key_value` are the reference client surface
-  (what a coordinator does per request).
+  key-bound macaroon must carry `X-Mint-Coord-Pop` (Ed25519 sig); the
+  signature covers `tail ‖ BLAKE3(raw-body)`, binding it to the exact
+  macaroon and the exact body. Freshness is a `ts` field *in the body*
+  (unix seconds), already covered by the body hash — no `…-Ts` header;
+  verified, then ±skew-checked (design OQ#16). No `elide:CoordKey` ⇒
+  plain bearer (no PoP); contradictory ⇒ rejected. `client_signature`
+  / `coord_key_value` are the reference client surface (what a
+  coordinator does per request).
 - `config` — TOML: audience, single trust root, tenant, roles with TTL
   bounds and policy templates. Validated on load. The Tigris admin
   credential is **not** in the TOML — it is read from `AWS_ACCESS_KEY_ID`
@@ -81,7 +82,8 @@ prototype reads `trust_root_hex` straight from the TOML purely so the
 slice runs; that TOML root is a shortcut, not the intended provisioning
 (open question #14).
 
-**PoP wire:** header names and the ±skew freshness anchor are settled
-in the design (OQ#16); the encoding (`X-Mint-Coord-Pop` base64 Ed25519,
-`X-Mint-Coord-Pop-Ts` unix seconds, 60s skew) is an implementation
-choice in `src/pop.rs`, not a fixed protocol.
+**PoP wire:** the ±skew freshness anchor and the signed payload
+(`tail ‖ BLAKE3(body)`, `ts` in-body) are settled in the design
+(OQ#16); the encoding (`X-Mint-Coord-Pop` base64 Ed25519, body `ts`
+unix seconds, 60s skew) is an implementation choice in `src/pop.rs`,
+not a fixed protocol.

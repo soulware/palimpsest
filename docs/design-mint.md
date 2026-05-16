@@ -86,7 +86,7 @@ issuance and refresh.
 
 ```
 caller ↔ mint:       capability macaroon (MAC, mint root) + per-request
-                     Ed25519 PoP over macaroon-tail ‖ ts ‖ body
+                     Ed25519 PoP over macaroon-tail ‖ body (ts in body)
 mint  ↔ Tigris IAM:  admin credential (held by mint, never disclosed)
 caller ↔ Tigris S3:  the freshly-minted scoped keypair
 ```
@@ -202,12 +202,15 @@ first-party proof-of-possession caveat. At issuance mint seals
 `elide:CoordKey=ed25519:<coordinator.pub>` into the primary alongside
 `elide:Coord`, under the same chain MAC. `assume-role` honours the
 macaroon only when the request carries a fresh Ed25519 signature, by
-`coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖ unix-seconds
-‖ BLAKE3(request-body))` — the tail binds the proof to this exact
+`coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
+BLAKE3(request-body))` — the tail binds the proof to this exact
 capability macaroon (role/`NotAfter`/`elide:Volume`), the body hash
 binds it to this exact request (the role, TTL, and role-specific
-scoping data such as the ancestor set), and the timestamp (±skew)
-bounds replay — verified against the sealed key. Folding the body hash
+scoping data such as the ancestor set). Freshness is a `ts` field
+**inside the body** (unix seconds) — already covered by
+`BLAKE3(request-body)`, so it needs no separate signed term and no
+header; within a ±skew window it bounds replay — verified against the
+sealed key. Folding the body hash
 into the one PoP payload is what authenticates request-supplied
 scoping data: it is not a separate signature and not a separate caveat
 (an isolated body signature, untied to the tail and freshness, would
@@ -268,10 +271,10 @@ POST /v1/assume-role
 Host: <mint-instance>
 Authorization: Macaroon <base64-encoded macaroon>
 X-Mint-Coord-Pop: <base64 Ed25519 signature>
-X-Mint-Coord-Pop-Ts: <unix seconds>
 Content-Type: application/json
 
 {
+  "ts": 1747000000,
   "role": "volume-ro",
   "ttl_seconds": 3600,
   "ancestors": ["01ARZ...", "01BXY..."]
@@ -303,14 +306,17 @@ construction).
 The request also carries the proof-of-possession the macaroon's
 `elide:CoordKey` caveat requires: `X-Mint-Coord-Pop` is the base64
 Ed25519 signature, by `coordinator.key`, over `BLAKE3(macaroon-tail ‖
-X-Mint-Coord-Pop-Ts ‖ BLAKE3(request-body))`; `X-Mint-Coord-Pop-Ts` is
-the signing time in unix seconds. The mint recomputes the digest over
-the **exact raw body bytes it received** (hashed before parsing — no
-JSON canonicalization, which is itself a footgun) and the presented
-macaroon's tail, verifies the signature against the sealed
-`elide:CoordKey`, and rejects a timestamp outside the skew window.
-Only after this does any `request.*` body field become a trusted
-template input. A macaroon that carries no `elide:CoordKey` is a plain
+BLAKE3(request-body))`. The freshness timestamp is **not** a header —
+it is a `ts` field (unix seconds) *inside the body*, already covered by
+`BLAKE3(request-body)`, so it needs no separate signed term. Only the
+detached signature is a header (it cannot live in the body it signs).
+The mint recomputes the digest over the **exact raw body bytes it
+received** (hashed before parsing — no JSON canonicalization, which is
+itself a footgun) and the presented macaroon's tail, verifies the
+signature against the sealed `elide:CoordKey`, and **then** reads `ts`
+from the now-authenticated body and rejects it if outside the skew
+window. Only after the signature verifies does any `request.*` body
+field — `ts` included — become a trusted input. A macaroon that carries no `elide:CoordKey` is a plain
 bearer and no PoP is required (the Elide enrollment path always seals
 one; bearer support is for non-Elide callers).
 
@@ -332,6 +338,10 @@ namespace; a role's policy template is the only thing that decides which
 fields matter, by referencing them (strict mode — a template referencing
 an absent `request.X` fails closed). Conventional fields:
 
+- `ts` (required when the macaroon is key-bound): the PoP freshness
+  timestamp, unix seconds. Carried here, not in a header, so it is
+  covered by the signature over the body; mint rejects it outside the
+  ±skew window. Absent/garbled on a key-bound request ⇒ `401`.
 - `role` (required): role name from the mint's configuration.
 - `ttl_seconds` (optional): requested credential lifetime. Must be within
   the role's `min_ttl_seconds`..`max_ttl_seconds` and must not exceed the
@@ -544,7 +554,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `NotAfter` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`); multiple narrow to the minimum. |
 | `Role` | string | scalar | issuer | Gate only — restricts the assumable role. Optional. |
 | `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
-| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ ts ‖ BLAKE3(body)`, verified against this key. Makes the primary key-bound (not a bearer) and authenticates the request body. |
+| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the primary key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
 The ancestor set is **not** in this table — it is not a caveat. It is
@@ -983,19 +993,24 @@ prematurely.
     operations or by refusing re-enrollment is part of this question.
 16. **PoP caveat wire detail.** `elide:CoordKey` is decided (first-party
     holder-of-key; primary is key-bound, not a bearer; the signed
-    payload is `BLAKE3(presented-macaroon-tail ‖ unix-seconds ‖
-    BLAKE3(request-body))` so the proof also authenticates the body —
-    see *Coordinator bootstrap*, *Authentication*). The body hash is
-    over the **exact raw bytes received**, hashed before parsing — no
-    JSON canonicalization (a canonicalization mismatch is a
-    signature-bypass footgun). Freshness is a **±skew window** on
-    `X-Mint-Coord-Pop-Ts` — stateless, no mint-issued nonce (DPoP's
-    `iat`-skew anchor; prior art: RFC 7800 `cnf` PoP key, RFC 9449
-    DPoP). Tail-binding pins the proof to the exact macaroon, body-hash
-    binding to the exact request, the skew window bounds replay. What
-    remains is only the wire encoding (working draft: `X-Mint-Coord-Pop`
-    base64 Ed25519 signature, `X-Mint-Coord-Pop-Ts` unix seconds, skew
-    bound) — an implementation detail, not a design fork.
+    payload is `BLAKE3(presented-macaroon-tail ‖ BLAKE3(request-body))`
+    so the proof also authenticates the body — see *Coordinator
+    bootstrap*, *Authentication*). The body hash is over the **exact
+    raw bytes received**, hashed before parsing — no JSON
+    canonicalization (a canonicalization mismatch is a signature-bypass
+    footgun). Freshness is a **±skew window** on a `ts` field carried
+    *in the body* (not a header — it is already covered by the body
+    hash, so no separate signed term and one fewer header); stateless,
+    no mint-issued nonce (DPoP's `iat`-skew anchor; prior art: RFC 7800
+    `cnf` PoP key, RFC 9449 DPoP). Tail-binding pins the proof to the
+    exact macaroon, body-hash binding to the exact request, the in-body
+    `ts` + skew window bounds replay. The signature stays a header
+    (`X-Mint-Coord-Pop`) — it cannot live in the body it signs; folding
+    it in as a structural envelope would reintroduce a framing/
+    canonicalization boundary. What remains is only the encoding
+    (working draft: `X-Mint-Coord-Pop` base64 Ed25519 signature, body
+    `ts` unix seconds, skew bound) — an implementation detail, not a
+    design fork.
 
 ## Future directions
 
