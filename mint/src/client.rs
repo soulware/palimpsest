@@ -42,6 +42,12 @@ pub enum ClientError {
     BadFile(&'static str),
     #[error("{path} not found — {hint}")]
     Missing { path: String, hint: &'static str },
+    #[error(
+        "exchange refused (401) — the intermediate most likely expired \
+         (it is short-lived). Re-run `mint client enroll …` for a fresh \
+         one; your approval persists, so just `mint client exchange` again"
+    )]
+    IntermediateRejected,
     #[error("server returned {status}: {body}")]
     Server { status: u16, body: String },
     #[error("server response missing the {0} field")]
@@ -229,6 +235,11 @@ pub async fn exchange(dir: &Path, base_url: &str) -> Result<bool, ClientError> {
             Ok(true)
         }
         403 => Ok(false),
+        // The server's 401 is deliberately opaque, but at exchange the
+        // overwhelmingly likely cause is an expired intermediate (it is
+        // short-lived by design). Point at the idempotent remedy rather
+        // than echoing a bare unauthorized.
+        401 => Err(ClientError::IntermediateRejected),
         _ => Err(ClientError::Server { status, body: text }),
     }
 }
