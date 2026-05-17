@@ -975,12 +975,18 @@ A worked `examples/` script chains them: `serve` (background) →
 `client enroll` → operator `enroll approve` → `client exchange` →
 `client assume-role`, printing the returned Tigris keypair.
 
-**Backend: real Tigris.** `assume-role` calls Tigris IAM with the admin
-credential from the `AWS_*` environment — there is no stub backend. The
-demo therefore runs on a host carrying Tigris admin creds (the Elide
-test VM). Consequence for CI: the `bootstrap` / `enroll` /
-`enroll-exchange` legs are hermetic (no Tigris) and run anywhere; the
-`assume-role` leg's end-to-end is VM-only.
+**Backend.** `serve --tigris` selects the real Tigris IAM minter — a
+self-contained AWS IAM Query-API client (`CreateAccessKey` →
+`CreatePolicy` → `AttachUserPolicy`, SigV4-signed against
+`https://iam.storage.dev`, overridable via `MINT_IAM_ENDPOINT`), ported
+into `mint/` rather than shared with `elide-tigris-iam` so the crate
+keeps zero `elide-*` deps. It hard-errors at startup without a Tigris
+admin credential in the `AWS_*` environment, so a misconfiguration
+fails fast rather than at the first request. Without `--tigris`,
+`serve` wires the deterministic fake minter (no account needed).
+Consequence for CI: the `bootstrap` / `enroll` / `enroll-exchange` legs
+and the fake-minter `assume-role` are hermetic and run anywhere; the
+real-Tigris `assume-role` end-to-end is VM-only.
 
 **Demo role config** is a minimal `read` / `write` pair over a single
 `{{request.prefix}}` (shipped as `examples/demo.toml`) — distinct from

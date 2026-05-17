@@ -25,6 +25,7 @@ pub mod pop;
 pub mod role;
 pub mod state;
 pub mod template;
+pub mod tigris;
 
 pub use caveat::{Caveat, Resolved};
 pub use config::Config;

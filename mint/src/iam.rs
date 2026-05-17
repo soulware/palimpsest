@@ -5,12 +5,13 @@
 //! § *Open questions* #9). mint never deletes keys — they expire via the
 //! policy's `DateLessThan` (§ *Cleanup*).
 //!
-//! The prototype keeps this behind a trait so the HTTP/macaroon/role
-//! shape can run end-to-end without a live Tigris account. [`FakeMinter`]
-//! returns deterministic keys and records every call for assertions; a
-//! real `TigrisMinter` wrapping `elide-tigris-iam` slots in here
-//! unchanged once the shape is settled (it stays a separate concern so
-//! the eventual standalone project need not depend on elide crates).
+//! The minter is behind a trait so the HTTP/macaroon/role shape can run
+//! end-to-end without a live Tigris account. [`FakeMinter`] returns
+//! deterministic keys and records every call for assertions;
+//! [`crate::tigris::TigrisMinter`] is the real Tigris IAM Query-API
+//! implementation (`serve --tigris`). The Tigris client is ported into
+//! `mint/` rather than shared with `elide-tigris-iam` so the eventual
+//! standalone project carries no `elide-*` dependency.
 
 use std::sync::Mutex;
 use std::time::Duration;

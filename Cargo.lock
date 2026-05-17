@@ -2614,6 +2614,8 @@ name = "mint"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
+ "aws-sigv4",
  "axum",
  "base64",
  "blake3",
@@ -2621,6 +2623,8 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "handlebars",
+ "http 1.4.0",
+ "quick-xml 0.38.4",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
  "serde",

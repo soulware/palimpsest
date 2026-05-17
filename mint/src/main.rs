@@ -20,9 +20,10 @@ use clap::{Parser, Subcommand};
 use mint::audit::AuditLog;
 use mint::config::Config;
 use mint::http::{AppState, router};
-use mint::iam::FakeMinter;
+use mint::iam::{FakeMinter, KeypairMinter};
 use mint::issuance::mint_bootstrap;
 use mint::state::Store;
+use mint::tigris::TigrisMinter;
 
 #[derive(Parser)]
 #[command(about = "mint: macaroon-authenticated scoped-credential vending for Tigris")]
@@ -39,6 +40,11 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8085")]
         bind: SocketAddr,
+        /// Use the real Tigris IAM minter (requires a Tigris admin
+        /// credential in the environment). Without it, assume-role
+        /// returns a deterministic fake keypair.
+        #[arg(long)]
+        tigris: bool,
     },
     /// Print the bootstrap macaroon (reusable, non-expiring).
     ///
@@ -134,7 +140,11 @@ enum EnrollCmd {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
-        Command::Serve { config, bind } => serve(&config, bind).await,
+        Command::Serve {
+            config,
+            bind,
+            tigris,
+        } => serve(&config, bind, tigris).await,
         Command::Bootstrap { config, rotate } => bootstrap(&config, rotate),
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config),
@@ -212,7 +222,11 @@ fn open_store(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
     Ok(Store::open(&cfg.state_dir)?)
 }
 
-async fn serve(config: &Path, bind: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(
+    config: &Path,
+    bind: SocketAddr,
+    tigris: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -221,22 +235,35 @@ async fn serve(config: &Path, bind: SocketAddr) -> Result<(), Box<dyn std::error
 
     let config = Arc::new(load(config)?);
     let store = Arc::new(open_store(&config)?);
-    tracing::warn!(
-        "INTERIM: assume-role uses the FAKE keypair minter — it returns a \
-         deterministic non-production keypair. The enroll/exchange flow is \
-         real. Remove when the live Tigris SigV4 minter is wired."
-    );
+
+    // Pick the minter before binding so a misconfigured --tigris fails
+    // fast rather than at the first request.
+    let minter: Arc<dyn KeypairMinter> = if tigris {
+        let admin = config.admin.as_ref().ok_or(
+            "--tigris requires a Tigris admin credential in the environment \
+             (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
+        )?;
+        Arc::new(TigrisMinter::new(admin)?)
+    } else {
+        tracing::warn!(
+            "INTERIM: assume-role uses the FAKE keypair minter — it returns a \
+             deterministic non-production keypair. Pass --tigris for real \
+             Tigris keys. The enroll/exchange flow is real either way."
+        );
+        Arc::new(FakeMinter::new())
+    };
     tracing::info!(
         audience = %config.audience,
         roles = config.roles.len(),
         admin_credential = config.admin.is_some(),
         state_dir = %config.state_dir.display(),
+        minter = if tigris { "tigris" } else { "fake" },
         "loaded config"
     );
 
     let state = AppState {
         config,
-        minter: Arc::new(FakeMinter::new()),
+        minter,
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
     };
