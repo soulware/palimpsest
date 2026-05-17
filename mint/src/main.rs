@@ -56,6 +56,60 @@ enum Command {
         #[command(subcommand)]
         cmd: EnrollCmd,
     },
+    /// Reference client — the coordinator's half of the flow.
+    Client {
+        /// Identity + received-macaroon directory (default
+        /// `./mint_client`, analogous to the server's `./mint_data`).
+        #[arg(long)]
+        client_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: ClientCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientCmd {
+    /// Generate a fresh `client.key` / `client.pub` identity pair.
+    Keygen {
+        /// Overwrite an existing identity (a key is an identity —
+        /// off by default).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print this identity's `cnf` value + fingerprint (what the
+    /// operator compares out of band before `enroll approve`).
+    Fingerprint,
+    /// Attenuate the bootstrap macaroon with `sub`/`cnf`, enrol, and
+    /// save the returned intermediate.
+    Enroll {
+        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        url: String,
+        /// Bootstrap macaroon: a file path, or `-` for stdin.
+        #[arg(long)]
+        bootstrap: String,
+        /// Opaque principal id — the `sub` (Elide: coordinator ULID).
+        #[arg(long)]
+        id: String,
+    },
+    /// Exchange the intermediate for the primary (after approval).
+    /// Exits 2 while still awaiting operator approval.
+    Exchange {
+        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        url: String,
+    },
+    /// Assume a role with the held primary; prints the keypair JSON.
+    AssumeRole {
+        #[arg(long, default_value = "http://127.0.0.1:8085")]
+        url: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long, default_value_t = 900)]
+        ttl: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -86,6 +140,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnrollCmd::List { config } => enroll_list(&config),
             EnrollCmd::Approve { config, sub } => enroll_approve(&config, &sub),
         },
+        Command::Client { client_dir, cmd } => client_cmd(client_dir, cmd).await,
+    }
+}
+
+async fn client_cmd(
+    client_dir: Option<PathBuf>,
+    cmd: ClientCmd,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = mint::client::client_dir(client_dir);
+    match cmd {
+        ClientCmd::Keygen { force } => {
+            let (cnf, fp) = mint::client::keygen(&dir, force)?;
+            eprintln!("wrote {}/client.key (0600) + client.pub", dir.display());
+            println!("cnf={cnf}");
+            println!("fingerprint={fp}");
+            Ok(())
+        }
+        ClientCmd::Fingerprint => {
+            let (cnf, fp) = mint::client::identity(&dir)?;
+            println!("cnf={cnf}");
+            println!("fingerprint={fp}");
+            Ok(())
+        }
+        ClientCmd::Enroll { url, bootstrap, id } => {
+            mint::client::enroll(&dir, &url, &bootstrap, &id).await?;
+            eprintln!(
+                "enrolled; intermediate saved. Operator: `mint enroll approve {id}` \
+                 (compare the fingerprint out of band first)."
+            );
+            Ok(())
+        }
+        ClientCmd::Exchange { url } => {
+            if mint::client::exchange(&dir, &url).await? {
+                eprintln!("primary saved to {}/primary", dir.display());
+                Ok(())
+            } else {
+                eprintln!("awaiting operator approval — re-run `client exchange` once approved");
+                std::process::exit(2);
+            }
+        }
+        ClientCmd::AssumeRole {
+            url,
+            role,
+            prefix,
+            volume,
+            ttl,
+        } => {
+            let kp = mint::client::assume_role(
+                &dir,
+                &url,
+                &role,
+                prefix.as_deref(),
+                volume.as_deref(),
+                ttl,
+            )
+            .await?;
+            println!("{kp}");
+            Ok(())
+        }
     }
 }
 

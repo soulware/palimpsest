@@ -15,6 +15,7 @@
 
 pub mod audit;
 pub mod caveat;
+pub mod client;
 pub mod config;
 pub mod http;
 pub mod iam;
