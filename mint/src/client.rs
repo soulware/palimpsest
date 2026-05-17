@@ -107,14 +107,22 @@ fn now_unix() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
+/// Resolve a `--bootstrap` argument, in precedence order:
+/// `-` → stdin; an inline macaroon (the value itself decodes — the
+/// strict `mcrn1` magic + structure check makes this an unambiguous
+/// discriminator, no real file path collides); otherwise a file path.
 fn read_macaroon_arg(src: &str) -> Result<Macaroon, ClientError> {
-    let text = if src == "-" {
+    if src == "-" {
         let mut s = String::new();
         io::stdin().read_to_string(&mut s)?;
-        s
-    } else {
-        fs::read_to_string(src)?
-    };
+        return Macaroon::decode(s.trim()).map_err(|_| ClientError::BadFile("bootstrap macaroon"));
+    }
+    if let Ok(m) = Macaroon::decode(src.trim()) {
+        return Ok(m); // inline macaroon text
+    }
+    let text = fs::read_to_string(src).map_err(|_| {
+        ClientError::BadFile("bootstrap (not an inline macaroon nor a readable file)")
+    })?;
     Macaroon::decode(text.trim()).map_err(|_| ClientError::BadFile("bootstrap macaroon"))
 }
 
@@ -284,5 +292,22 @@ mod tests {
         fs::create_dir_all(d.path()).unwrap();
         fs::write(d.path().join(KEY_FILE), "not-hex").unwrap();
         assert!(matches!(identity(d.path()), Err(ClientError::BadFile(_))));
+    }
+
+    #[test]
+    fn bootstrap_arg_accepts_inline_or_file_and_rejects_neither() {
+        let wire = crate::issuance::mint_bootstrap(&[1u8; 32], "mint", "nonce").encode();
+        // inline: the value itself is the macaroon
+        assert!(read_macaroon_arg(&wire).is_ok());
+        // file path containing it
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("boot.txt");
+        fs::write(&p, format!("{wire}\n")).unwrap();
+        assert!(read_macaroon_arg(p.to_str().unwrap()).is_ok());
+        // neither a macaroon nor a readable file → clear error, no panic
+        assert!(matches!(
+            read_macaroon_arg("/no/such/path-and-not-a-macaroon"),
+            Err(ClientError::BadFile(_))
+        ));
     }
 }

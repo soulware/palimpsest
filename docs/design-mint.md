@@ -965,7 +965,7 @@ Reference client (the ed25519 keypair is created out-of-band; the
 client only reads it; `--id` is the opaque `sub`):
 
 ```
-mint client enroll        --bootstrap <f> --key <ed25519> --id <sub>   # → intermediate
+mint client enroll        --bootstrap <macaroon|file|-> --id <sub>     # → intermediate
 mint client exchange      --intermediate <f> --key <ed25519>           # 403 until approved → primary
 mint client assume-role   --primary <f> --key <ed25519> \
                           --role <read|write> --prefix <p>             # → Tigris keypair

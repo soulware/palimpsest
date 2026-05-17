@@ -90,7 +90,8 @@ enum ClientCmd {
     Enroll {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
-        /// Bootstrap macaroon: a file path, or `-` for stdin.
+        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// or `-` for stdin.
         #[arg(long)]
         bootstrap: String,
         /// Opaque principal id — the `sub` (Elide: coordinator ULID).
