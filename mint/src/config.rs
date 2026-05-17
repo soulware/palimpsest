@@ -1,14 +1,16 @@
 //! Configuration (`docs/design-mint.md` § *Mint configuration*). v1 is
 //! single-tenant, single-trust-root.
 //!
-//! Audience, trust root, tenant, and roles are file-backed (TOML). The
-//! Tigris admin credential is the one input that comes from the
-//! environment — `AWS_*`, resolved by [`AdminCredential::from_env`] at
-//! load — never the TOML, so secrets and role definitions stay on
-//! separate management planes. The prototype's faked minter ignores it,
-//! so it resolves to `Option`.
+//! Audience, trust root, tenant, and role metadata are file-backed
+//! (TOML). Each role's IAM-policy template lives in its own file under
+//! `roles_dir`, named by the role's `policy_file` (a single normal path
+//! component — see [`read_policy`]). The Tigris admin credential is the
+//! one input that comes from the environment — `AWS_*`, resolved by
+//! [`AdminCredential::from_env`] at load — never the TOML, so secrets
+//! and role definitions stay on separate management planes.
 
 use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -24,6 +26,18 @@ pub enum ConfigError {
     DuplicateRole(String),
     #[error("role {role}: {field} must be > 0 and min <= default <= max")]
     BadTtlBounds { role: String, field: String },
+    #[error(
+        "role {role}: policy_file {value:?} must be a single filename \
+         (no path separators, no '.' or '..', not absolute)"
+    )]
+    BadPolicyFileName { role: String, value: String },
+    #[error("role {role}: read policy_file {path}: {source}")]
+    ReadPolicyFile {
+        role: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,11 +52,18 @@ pub struct RawConfig {
     /// Directory for mint's persisted state — the current bootstrap
     /// nonce and the transient pending-enrollment table — under the
     /// same custody as `trust_root_hex` (`docs/design-mint.md`
-    /// § *Enrollment*, § *Mint configuration*). Defaults to
-    /// `./mint_data` (relative to the working directory, analogous to
-    /// `./elide_data`) when omitted.
+    /// § *Enrollment*, § *Mint configuration*). A relative value
+    /// (including the default `mint_data`) resolves against the current
+    /// working directory, not the config file's parent — the same rule
+    /// the elide coordinator uses for `data_dir`; an absolute path is
+    /// used verbatim.
     #[serde(default)]
-    pub state_dir: Option<String>,
+    pub data_dir: Option<String>,
+    /// Directory holding role policy-template files, one per role
+    /// (referenced by each role's `policy_file`). Same resolution rule
+    /// as `data_dir`; defaults to `mint_roles`.
+    #[serde(default)]
+    pub roles_dir: Option<String>,
     pub tenant: Tenant,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
@@ -110,9 +131,10 @@ pub struct RawRole {
     pub min_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
-    /// IAM policy document, a handlebars template (see
-    /// [`crate::template`]).
-    pub policy: String,
+    /// Filename of the IAM-policy handlebars template (see
+    /// [`crate::template`]), resolved against `roles_dir`. Must be a
+    /// single normal path component — validated by [`read_policy`].
+    pub policy_file: String,
 }
 
 /// Validated configuration, ready to serve.
@@ -121,9 +143,13 @@ pub struct Config {
     pub audience: String,
     pub trust_root: [u8; 32],
     /// Persisted-state directory (bootstrap nonce + pending table),
-    /// same custody as `trust_root`. Defaults to `./mint_data` when the
-    /// config omits `state_dir`.
-    pub state_dir: std::path::PathBuf,
+    /// same custody as `trust_root`. Defaults to `mint_data` when the
+    /// config omits `data_dir`.
+    pub data_dir: PathBuf,
+    /// Directory the role `policy_file`s were read from. Defaults to
+    /// `mint_roles`. Retained for diagnostics; policies are already
+    /// resolved into [`Role::policy`].
+    pub roles_dir: PathBuf,
     pub tenant: Tenant,
     /// Resolved from the AWS environment at load time. `None` when the
     /// env is unset (fine for the prototype's faked minter; a real
@@ -139,6 +165,8 @@ pub struct Role {
     pub min_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
+    /// The role's IAM-policy handlebars template, read from
+    /// `<roles_dir>/<policy_file>` at load.
     pub policy: String,
 }
 
@@ -147,12 +175,16 @@ impl Config {
         Self::from_raw(toml::from_str(s)?)
     }
 
-    pub fn load(path: &std::path::Path) -> Result<Config, ConfigError> {
+    pub fn load(path: &Path) -> Result<Config, ConfigError> {
         Self::from_toml_str(&std::fs::read_to_string(path)?)
     }
 
     fn from_raw(raw: RawConfig) -> Result<Config, ConfigError> {
         let trust_root = decode_root(&raw.trust_root_hex)?;
+        let roles_dir = raw
+            .roles_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("mint_roles"));
         let mut roles = BTreeMap::new();
         for r in raw.roles {
             if r.min_ttl_seconds == 0
@@ -164,13 +196,14 @@ impl Config {
                     field: "ttl_seconds".into(),
                 });
             }
+            let policy = read_policy(&roles_dir, &r.name, &r.policy_file)?;
             let role = Role {
                 name: r.name.clone(),
                 required_caveats: r.required_caveats,
                 min_ttl_seconds: r.min_ttl_seconds,
                 max_ttl_seconds: r.max_ttl_seconds,
                 default_ttl_seconds: r.default_ttl_seconds,
-                policy: r.policy,
+                policy,
             };
             if roles.insert(r.name.clone(), role).is_some() {
                 return Err(ConfigError::DuplicateRole(r.name));
@@ -179,15 +212,42 @@ impl Config {
         Ok(Config {
             audience: raw.audience,
             trust_root,
-            state_dir: raw
-                .state_dir
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("mint_data")),
+            data_dir: raw
+                .data_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("mint_data")),
+            roles_dir,
             tenant: raw.tenant,
             admin: AdminCredential::from_env(),
             roles,
         })
     }
+}
+
+/// Read a role's policy template from `<roles_dir>/<policy_file>`.
+///
+/// `policy_file` is parsed, not substring-checked: `Path::new` of it
+/// must yield exactly one [`Component::Normal`]. That rejects path
+/// separators, absolute paths, `.`, `..`, parent traversal, and the
+/// empty string in one predicate, so a role name cannot reach outside
+/// `roles_dir`. The guarantee is name-level — a symlink *inside*
+/// `roles_dir` is still followed, but `roles_dir` shares the config's
+/// custody, so its contents are the operator's own.
+fn read_policy(roles_dir: &Path, role: &str, policy_file: &str) -> Result<String, ConfigError> {
+    let mut comps = Path::new(policy_file).components();
+    let only = comps.next();
+    if comps.next().is_some() || !matches!(only, Some(Component::Normal(_))) {
+        return Err(ConfigError::BadPolicyFileName {
+            role: role.to_owned(),
+            value: policy_file.to_owned(),
+        });
+    }
+    let path = roles_dir.join(policy_file);
+    std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadPolicyFile {
+        role: role.to_owned(),
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 fn decode_root(hex: &str) -> Result<[u8; 32], ConfigError> {
@@ -201,6 +261,28 @@ fn decode_root(hex: &str) -> Result<[u8; 32], ConfigError> {
             .map_err(|_| ConfigError::BadTrustRoot)?;
     }
     Ok(out)
+}
+
+/// Path-A test harness (shared with `role.rs`'s unit tests): write each
+/// role policy into a tempdir, splice an absolute `roles_dir` into the
+/// TOML, then exercise the real [`Config::from_toml_str`] file-read
+/// path. The tempdir only needs to outlive the parse — `policy` is read
+/// eagerly — so it is dropped on return.
+#[cfg(test)]
+pub(crate) fn parse_for_test(toml: &str, roles: &[(&str, &str)]) -> Result<Config, ConfigError> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, body) in roles {
+        std::fs::write(dir.path().join(name), body).expect("write role file");
+    }
+    let injected = toml.replacen(
+        "[tenant]",
+        &format!(
+            "roles_dir = {:?}\n[tenant]",
+            dir.path().display().to_string()
+        ),
+        1,
+    );
+    Config::from_toml_str(&injected)
 }
 
 #[cfg(test)]
@@ -220,15 +302,15 @@ required_caveats = ["elide:Volume", "Audience", "NotAfter"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
-policy = "{}"
+policy_file = "volume-ro.json"
 "#;
 
     #[test]
     fn parses_sample() {
-        let c = Config::from_toml_str(SAMPLE).expect("parse");
+        let c = parse_for_test(SAMPLE, &[("volume-ro.json", "{}")]).expect("parse");
         assert_eq!(c.audience, "mint");
         assert_eq!(c.tenant.bucket, "demo-bucket");
-        assert!(c.roles.contains_key("volume-ro"));
+        assert_eq!(c.roles["volume-ro"].policy, "{}");
     }
 
     #[test]
@@ -238,7 +320,7 @@ policy = "{}"
             "deadbeef",
         );
         assert!(matches!(
-            Config::from_toml_str(&bad),
+            parse_for_test(&bad, &[("volume-ro.json", "{}")]),
             Err(ConfigError::BadTrustRoot)
         ));
     }
@@ -247,8 +329,42 @@ policy = "{}"
     fn rejects_inverted_ttl_bounds() {
         let bad = SAMPLE.replace("max_ttl_seconds = 2592000", "max_ttl_seconds = 10");
         assert!(matches!(
-            Config::from_toml_str(&bad),
+            parse_for_test(&bad, &[("volume-ro.json", "{}")]),
             Err(ConfigError::BadTtlBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_policy_file_traversal() {
+        // Name validation fires before any read, so roles_dir is never
+        // touched — no file is written.
+        for evil in ["../escape.json", "/etc/passwd", "a/b.json", "..", "."] {
+            let toml = SAMPLE
+                .replace("[tenant]", "roles_dir = \"mint_roles\"\n[tenant]")
+                .replace("volume-ro.json", evil);
+            assert!(
+                matches!(
+                    Config::from_toml_str(&toml),
+                    Err(ConfigError::BadPolicyFileName { .. })
+                ),
+                "expected BadPolicyFileName for {evil:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_policy_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = SAMPLE.replace(
+            "[tenant]",
+            &format!(
+                "roles_dir = {:?}\n[tenant]",
+                dir.path().display().to_string()
+            ),
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::ReadPolicyFile { .. })
         ));
     }
 }

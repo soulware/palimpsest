@@ -5,7 +5,7 @@
 //! inspectable with `ls`, never a hidden binary blob:
 //!
 //! ```text
-//! <state_dir>/
+//! <data_dir>/
 //!   bootstrap              current random nonce (hex), mode 0600
 //!   pending/<sub>.json     {pub, bootstrap, first_seen, peer_ip}
 //!   approved/<sub>         empty marker; mtime = approval time

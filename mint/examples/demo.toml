@@ -4,6 +4,7 @@
 # enough to exercise the issuance path end-to-end. This is NOT the Elide
 # role inventory (see mint.toml for that); it exists only for the
 # bootstrap → enroll → approve → exchange → assume-role walkthrough.
+# Each role's policy template lives under roles_dir (examples/demo_roles/).
 #
 # trust_root_hex is all-zero here: fine for a throwaway demo, never for
 # real use. The Tigris admin credential comes from the AWS_* environment
@@ -13,9 +14,11 @@
 
 audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-# state_dir defaults to ./mint_data (relative to the working directory,
-# analogous to ./elide_data). Uncomment to override:
-# state_dir = "mint_data"
+# data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
+# against the working directory (not this file's parent); an absolute
+# path is used verbatim. roles_dir is set so the demo runs from mint/:
+roles_dir = "examples/demo_roles"
+# data_dir = "mint_data"
 
 [tenant]
 bucket = "mint-demo"
@@ -26,20 +29,7 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
-policy = """
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "DemoRead",
-    "Effect": "Allow",
-    "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/{{request.prefix}}/*"],
-    "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
-    }
-  }]
-}
-"""
+policy_file = "read.json"
 
 [[role]]
 name = "write"
@@ -47,17 +37,4 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
-policy = """
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "DemoWrite",
-    "Effect": "Allow",
-    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/{{request.prefix}}/*"],
-    "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
-    }
-  }]
-}
-"""
+policy_file = "write.json"

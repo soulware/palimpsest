@@ -59,7 +59,9 @@ enrollments; outstanding primaries are unaffected.
   `approved/<sub>`) so the lifecycle is `ls`-inspectable. Idempotent
   same-`(sub,pub)`, conflict on a different key, GC of stale unapproved,
   consume-on-exchange.
-- `config` — TOML: audience, trust root, `state_dir`, tenant, roles.
+- `config` — TOML: audience, trust root, `data_dir`, `roles_dir`,
+  tenant, role metadata. Each role's policy template is a separate file
+  under `roles_dir` (`policy_file`, a single normal path component).
   Admin credential from `AWS_*`, never the TOML.
 - `role` / `template` / `audit` / `http` — role gate, handlebars policy
   render, JSON audit line, axum endpoints.

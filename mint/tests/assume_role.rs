@@ -17,6 +17,8 @@ use mint::pop;
 use mint::state::Store;
 use tower::ServiceExt;
 
+mod common;
+
 const ROOT: [u8; 32] = [42u8; 32];
 /// Stands in for the coordinator's Ed25519 identity-key seed.
 const COORD_SEED: [u8; 32] = [7u8; 32];
@@ -27,7 +29,10 @@ fn root_hex() -> String {
 }
 
 fn config() -> Config {
-    Config::from_toml_str(&TOML_TEMPLATE.replace("__ROOT__", &root_hex())).expect("config parses")
+    common::parse_config(
+        &TOML_TEMPLATE.replace("__ROOT__", &root_hex()),
+        &[("volume-ro.json", POLICY)],
+    )
 }
 
 const TOML_TEMPLATE: &str = r#"
@@ -41,7 +46,10 @@ required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
-policy = """
+policy_file = "volume-ro.json"
+"#;
+
+const POLICY: &str = r#"
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -56,7 +64,6 @@ policy = """
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}
   }]
 }
-"""
 "#;
 
 #[derive(Clone)]

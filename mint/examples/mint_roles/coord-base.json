@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "ControlPlaneReadOnly",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": [
+      "arn:aws:s3:::{{tenant.bucket}}/names/*",
+      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
+      "arn:aws:s3:::{{tenant.bucket}}/events/*"
+    ],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+    }
+  }]
+}

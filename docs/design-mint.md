@@ -157,6 +157,29 @@ file-backed. The macaroon root and admin credential are secrets and are
 not plaintext TOML fields — the admin credential comes from the AWS
 environment; the macaroon root's provisioning is an open question.
 
+#### On-disk layout
+
+A mint instance is named by its config file: `--config <path>`,
+defaulting to `./mint.toml`. The config declares two optional
+directories, mirroring the elide coordinator's `data_dir`
+(`coordinator.toml`):
+
+- **`data_dir`** (default `mint_data`) — persisted state under the same
+  custody as the macaroon root: the current `bootstrap` value and the
+  transient pending-enrollment table.
+- **`roles_dir`** (default `mint_roles`) — role *policy templates*, one
+  file per role (see *Role configuration*).
+
+Both follow the coordinator's resolution rule: a relative value
+(including the default) is resolved against the current working
+directory, not the config file's parent; an absolute path is used
+verbatim. Unlike the coordinator, mint has **no `--data-dir` override
+flag** — a mint instance is fully described by its config file, so
+running two instances is purely `mint.toml` + `mint2.toml` with distinct
+`data_dir` values (and, if desired, a shared `roles_dir`). The override
+flag would be unused surface; its absence is a decision, not an
+oversight.
+
 ### Admin credential custody — deployment shapes
 
 The same mint code supports three deployment shapes:
@@ -435,8 +458,9 @@ Error model is deliberately coarse; see *Open questions*.
 
 ### Schema
 
-Roles are declared in a TOML config file (loaded at mint startup). Each role
-has:
+Roles are declared in the TOML config file (loaded at mint startup).
+Each role's *metadata* stays in `mint.toml`; its *policy template* lives
+in its own file under `roles_dir`, named by `policy_file`:
 
 ```toml
 [[role]]
@@ -445,8 +469,11 @@ required_caveats = ["elide:Volume"]
 min_ttl_seconds = 60
 max_ttl_seconds = 604800     # 7 days
 default_ttl_seconds = 86400  # 1 day
+policy_file = "volume-ro.json"
+```
 
-policy = """
+```jsonc
+// <roles_dir>/volume-ro.json
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -464,8 +491,22 @@ policy = """
     }
   }]
 }
-"""
 ```
+
+`policy_file` is resolved against `roles_dir`. It must be a single
+normal path component — parsed, not substring-checked: `Path::new` of it
+must yield exactly one `Component::Normal`. That rejects path separators,
+absolute paths, `.`, `..`, parent traversal, and the empty string in one
+predicate, so a role name cannot reach outside the roles directory. The
+guarantee is name-level: a symlink *inside* `roles_dir` is still
+followed, but `roles_dir` shares `mint.toml`'s custody, so its contents
+are the operator's own, not an external-input boundary. The role
+inventory — names, required caveats, TTL bounds —
+stays visible at a glance in one `mint.toml`; only the multi-line
+handlebars-over-JSON template, which is awkward to lint and diff inside a
+TOML triple-quoted string, moves to a per-role file. A role with no
+`policy_file` is a config error: the policy is mandatory and has no
+inline form.
 
 ### Templating
 

@@ -114,7 +114,7 @@ mod tests {
     use crate::config::Config;
 
     fn cfg() -> Config {
-        Config::from_toml_str(
+        crate::config::parse_for_test(
             r#"
 audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -126,8 +126,9 @@ required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 1000
 default_ttl_seconds = 800
-policy = "{}"
+policy_file = "volume-ro.json"
 "#,
+            &[("volume-ro.json", "{}")],
         )
         .expect("cfg")
     }
