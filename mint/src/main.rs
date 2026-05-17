@@ -90,13 +90,13 @@ enum ClientCmd {
     Enroll {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
-        /// Bootstrap macaroon: the macaroon text inline, a file path,
-        /// or `-` for stdin.
-        #[arg(long)]
-        bootstrap: String,
         /// Opaque principal id — the `sub` (Elide: coordinator ULID).
         #[arg(long)]
         id: String,
+        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// or `-` for stdin.
+        #[arg(value_name = "BOOTSTRAP")]
+        bootstrap: String,
     },
     /// Exchange the intermediate for the primary (after approval).
     /// Exits 2 while still awaiting operator approval.
@@ -109,13 +109,14 @@ enum ClientCmd {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
         #[arg(long)]
-        role: String,
-        #[arg(long)]
         prefix: Option<String>,
         #[arg(long)]
         volume: Option<String>,
         #[arg(long, default_value_t = 900)]
         ttl: u64,
+        /// Role name from the mint config.
+        #[arg(value_name = "ROLE")]
+        role: String,
     },
 }
 

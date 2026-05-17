@@ -81,9 +81,9 @@ Client (the coordinator's half; identity under `./mint_client`):
 ```sh
 mint client keygen
 mint client fingerprint                                  # operator compares this during `enroll approve`
-mint client enroll      --bootstrap <macaroon|file|-> --id <sub>
+mint client enroll      --id <sub> <macaroon|file|->     # bootstrap is the final positional arg
 mint client exchange                                     # exit 2 until approved, then saves the primary
-mint client assume-role --role <r> --prefix <p>          # prints the keypair
+mint client assume-role --prefix <p> <role>              # role is the final positional arg
 ```
 
 Without `--tigris`, `serve` wires the deterministic fake minter (warns
