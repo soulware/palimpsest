@@ -149,7 +149,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         audit(base_entry("denied:unauthenticated"));
         return unauthorized(&request_id);
     };
-    if !mac.verify(&state.config.trust_root) {
+    if !mac.verify(&state.store.root_key()) {
         audit(base_entry("denied:bad_mac"));
         return unauthorized(&request_id);
     }
@@ -332,7 +332,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
-    if !mac.verify(&state.config.trust_root) {
+    if !mac.verify(&state.store.root_key()) {
         audit("denied:bad_mac", &[]);
         return unauthorized(&request_id);
     }
@@ -407,7 +407,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     }
 
     let intermediate = issuance::mint_intermediate(
-        &state.config.trust_root,
+        &state.store.root_key(),
         &state.config.audience,
         &sub,
         &cnf,
@@ -453,7 +453,7 @@ async fn enroll_exchange(
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
-    if !mac.verify(&state.config.trust_root) {
+    if !mac.verify(&state.store.root_key()) {
         audit("denied:bad_mac", &[]);
         return unauthorized(&request_id);
     }
@@ -529,7 +529,7 @@ async fn enroll_exchange(
     }
 
     let primary =
-        issuance::mint_primary(&state.config.trust_root, &state.config.audience, &sub, &cnf);
+        issuance::mint_primary(&state.store.root_key(), &state.config.audience, &sub, &cnf);
     if let Err(e) = state.store.consume(&sub) {
         // Don't hand out a primary while the record lingers — the
         // client retries; consume+re-mint is idempotent in identity.

@@ -1,18 +1,19 @@
 # Example mint configuration — the Elide role inventory subset from
 # docs/design-mint.md § "Elide as customer: role inventory".
 #
-# trust_root_hex is a 32-byte symmetric key (here all-zero — replace for
-# any real use). Each role's policy template lives in its own file under
+# The macaroon root key is not configured here — it is generated on
+# first start at <data_dir>/root_key (64 hex chars, mode 0600) and
+# never leaves the process. Each role's policy template lives under
 # roles_dir (see examples/elide_roles/). Scalar caveats are reached
 # through the `caveat` lookup helper: `{{caveat "elide:Volume"}}`. The
 # ancestor lineage is not a caveat — it rides the PoP-signed request
 # body as `{{#each request.ancestors}}` (see src/pop.rs, src/template.rs).
 
 audience = "mint"
-trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 
-# data_dir — persisted state (current bootstrap nonce + transient
-# pending-enrollment table), same custody as trust_root_hex. roles_dir —
+# data_dir — persisted state: the generated root_key, the current
+# bootstrap nonce, and the transient pending-enrollment table, one
+# custody. roles_dir —
 # the per-role policy-template files. A relative value (including the
 # defaults mint_data / mint_roles) resolves against the working
 # directory, not this file's parent; an absolute path is used verbatim.

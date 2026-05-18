@@ -24,20 +24,12 @@ const ROOT: [u8; 32] = [42u8; 32];
 const COORD_SEED: [u8; 32] = [7u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
-fn root_hex() -> String {
-    ROOT.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn config() -> Config {
-    common::parse_config(
-        &TOML_TEMPLATE.replace("__ROOT__", &root_hex()),
-        &[("volume-ro.json", POLICY)],
-    )
+    common::parse_config(TOML_TEMPLATE, &[("volume-ro.json", POLICY)])
 }
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-trust_root_hex = "__ROOT__"
 [tenant]
 bucket = "demo-bucket"
 [[role]]
@@ -90,6 +82,10 @@ fn state_with_audit() -> (
     let buf = Arc::new(Mutex::new(Vec::new()));
     let minter = Arc::new(FakeMinter::new());
     let dir = tempfile::tempdir().expect("tempdir");
+    // Seed the known root key (hex) so Store::open loads it (vs
+    // generating one) and the macaroons minted with ROOT verify.
+    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
     let state = AppState {
         config: Arc::new(config()),
         minter: minter.clone(),

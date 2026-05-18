@@ -1,7 +1,7 @@
 //! `mint` — macaroon-authenticated scoped-credential vending for Tigris.
 //!
 //! Prototype tracking `docs/design-mint.md`. The mint verifies a
-//! caller-presented macaroon against a configured trust root, looks up
+//! caller-presented macaroon against its macaroon root key, looks up
 //! a role, renders the role's IAM-policy template from the macaroon's
 //! caveats, mints a scoped short-lived keypair, and returns it. It is
 //! never in the data path.

@@ -6,12 +6,17 @@
 //!
 //! ```text
 //! <data_dir>/
+//!   root_key               32-byte macaroon root key (hex), mode 0600
 //!   bootstrap              current random nonce (hex), mode 0600
 //!   pending/<sub>.json     {pub, bootstrap, first_seen, peer_ip}
 //!   approved/<sub>         empty marker; mtime = approval time
 //! ```
 //!
-//! The bootstrap nonce shares the trust root's custody. The pending
+//! The root key is the symmetric secret mint both mints and verifies
+//! macaroons with (the "root key" of the Macaroons paper) — generated
+//! on first start, never leaving the process, mirroring the elide
+//! coordinator's `coordinator.key`. The bootstrap nonce shares its
+//! custody. The pending
 //! table is **transient, not a registry**: a record is consumed (both
 //! files unlinked) at a successful exchange, and an unapproved record
 //! ages out (`gc`). Keyed by `sub`; a second request for the same `sub`
@@ -113,11 +118,49 @@ fn write_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// Load the macaroon root key from `path` (64 hex chars → 32 bytes),
+/// generating a fresh CSPRNG one (hex, mode 0600) on first start. Hex
+/// so the secret is a single ASCII line — backup/transport friendly
+/// (an operator who loses `data_dir` loses every outstanding macaroon).
+/// The root is symmetric, so there is no public half.
+fn load_or_generate_root_key(path: &Path) -> io::Result<[u8; 32]> {
+    match fs::read_to_string(path) {
+        Ok(text) => decode_root_key(text.trim())
+            .ok_or_else(|| io::Error::other(format!("{}: not 64 hex chars", path.display()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            write_0600(path, encode_root_key(&key).as_bytes())?;
+            Ok(key)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn encode_root_key(key: &[u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn decode_root_key(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Filesystem-backed state. Mutating operations are serialised by a
 /// process-local mutex — enrollment is rare and correctness beats
 /// throughput; the lock never spans an `.await`.
 pub struct Store {
     dir: PathBuf,
+    /// The macaroon root, loaded (or generated on first start) from
+    /// `<dir>/root_key`. Symmetric: mint both mints and verifies with
+    /// it. Copied out via [`Store::root_key`]; never logged.
+    root_key: [u8; 32],
     guard: Mutex<()>,
 }
 
@@ -128,8 +171,10 @@ impl Store {
         let dir = dir.into();
         fs::create_dir_all(dir.join("pending"))?;
         fs::create_dir_all(dir.join("approved"))?;
+        let root_key = load_or_generate_root_key(&dir.join("root_key"))?;
         let store = Store {
             dir,
+            root_key,
             guard: Mutex::new(()),
         };
         if !store.bootstrap_path().exists() {
@@ -140,6 +185,11 @@ impl Store {
             write_0600(&store.bootstrap_path(), fresh_nonce().as_bytes())?;
         }
         Ok(store)
+    }
+
+    /// The macaroon root key. Symmetric — used to both mint and verify.
+    pub fn root_key(&self) -> [u8; 32] {
+        self.root_key
     }
 
     fn bootstrap_path(&self) -> PathBuf {
@@ -362,6 +412,37 @@ mod tests {
         let n2 = Store::open(d.path()).unwrap().current_bootstrap().unwrap();
         assert_eq!(n1, n2, "restart preserves the nonce");
         assert!(!n1.is_empty());
+    }
+
+    #[test]
+    fn root_key_generated_once_and_stable_across_open() {
+        let d = tempfile::tempdir().unwrap();
+        let r1 = Store::open(d.path()).unwrap().root_key();
+        let r2 = Store::open(d.path()).unwrap().root_key();
+        assert_eq!(r1, r2, "restart preserves the key");
+        assert_ne!(r1, [0u8; 32], "key is random, not zero");
+        let f = d.path().join("root_key");
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(text.trim().len(), 64, "stored as 64 hex chars");
+    }
+
+    #[test]
+    fn root_key_seeded_file_is_loaded() {
+        let d = tempfile::tempdir().unwrap();
+        let hex: String = [7u8; 32].iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(d.path().join("root_key"), hex).unwrap();
+        assert_eq!(Store::open(d.path()).unwrap().root_key(), [7u8; 32]);
+    }
+
+    #[test]
+    fn root_key_bad_format_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("root_key"), b"not hex").unwrap();
+        assert!(Store::open(d.path()).is_err());
     }
 
     #[test]

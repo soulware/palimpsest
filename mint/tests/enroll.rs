@@ -28,13 +28,8 @@ const COORD_SEED: [u8; 32] = [7u8; 32];
 const OTHER_SEED: [u8; 32] = [9u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
-fn root_hex() -> String {
-    ROOT.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-trust_root_hex = "__ROOT__"
 [tenant]
 bucket = "demo-bucket"
 [[role]]
@@ -59,10 +54,7 @@ const POLICY: &str = r#"
 "#;
 
 fn config() -> Config {
-    common::parse_config(
-        &TOML_TEMPLATE.replace("__ROOT__", &root_hex()),
-        &[("volume-ro.json", POLICY)],
-    )
+    common::parse_config(TOML_TEMPLATE, &[("volume-ro.json", POLICY)])
 }
 
 #[derive(Clone)]
@@ -91,6 +83,10 @@ fn app() -> (
 ) {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let dir = tempfile::tempdir().expect("tempdir");
+    // Seed the known root key (hex) so Store::open loads it (vs
+    // generating one) and the macaroons minted with ROOT verify.
+    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
     let store = Arc::new(Store::open(dir.path()).expect("store"));
     let state = AppState {
         config: Arc::new(config()),

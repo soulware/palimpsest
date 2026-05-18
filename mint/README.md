@@ -59,8 +59,10 @@ enrollments; outstanding primaries are unaffected.
   `approved/<sub>`) so the lifecycle is `ls`-inspectable. Idempotent
   same-`(sub,pub)`, conflict on a different key, GC of stale unapproved,
   consume-on-exchange.
-- `config` — TOML: audience, trust root, `data_dir`, `roles_dir`,
-  tenant, role metadata. Each role's policy template is a separate file
+- `config` — TOML: audience, `data_dir`, `roles_dir`, tenant, role
+  metadata. The macaroon root key is not config — `state::Store`
+  generates `<data_dir>/root_key` (64 hex, 0600) on first start.
+  Each role's policy template is a separate file
   under `roles_dir`, `<name>.json` by default (`policy_file` overrides);
   derived or explicit, it must be a single normal path component.
   Admin credential from `AWS_*`, never the TOML.
@@ -110,5 +112,6 @@ Tigris IAM and requires `AWS_*` admin creds.
 
 TLS, multi-root / root rotation, multi-tenancy, `ListRoles`/`GetRole`,
 third-party-caveat discharge for a central identity authority
-(`docs/design-mint.md` § *Open questions* #14/#15). `trust_root_hex`
-straight from TOML remains the OQ#14 shortcut.
+(`docs/design-mint.md` § *Open questions* #14/#15). The root key is
+generated at `<data_dir>/root_key` on first start; backup/replication
+of `data_dir` and root rotation remain open (OQ#14, tied to #3).

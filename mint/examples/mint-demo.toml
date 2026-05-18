@@ -6,14 +6,15 @@
 # bootstrap → enroll → approve → exchange → assume-role walkthrough.
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
 #
-# trust_root_hex is all-zero here: fine for a throwaway demo, never for
-# real use. The Tigris admin credential comes from the AWS_* environment
+# The macaroon root key is generated on first start at
+# <data_dir>/root_key (64 hex chars, mode 0600). The Tigris admin
+# credential comes
+# from the AWS_* environment
 # (the demo runs on the admin VM). Until the live Tigris SigV4 minter
 # lands, `serve` wires the FAKE minter and warns loudly — assume-role
 # returns a deterministic placeholder keypair.
 
 audience = "mint"
-trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
 # against the working directory (not this file's parent); an absolute
 # path is used verbatim. roles_dir is set so the demo runs from mint/:

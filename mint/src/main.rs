@@ -292,7 +292,7 @@ fn bootstrap(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Erro
     } else {
         store.current_bootstrap()?
     };
-    let mac = mint_bootstrap(&config.trust_root, &config.audience, &nonce);
+    let mac = mint_bootstrap(&store.root_key(), &config.audience, &nonce);
     eprintln!(
         "bootstrap macaroon for audience={} (non-expiring, reusable)",
         config.audience

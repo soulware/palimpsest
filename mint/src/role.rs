@@ -117,7 +117,6 @@ mod tests {
         crate::config::parse_for_test(
             r#"
 audience = "mint"
-trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 [tenant]
 bucket = "b"
 [[role]]

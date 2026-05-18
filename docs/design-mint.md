@@ -125,13 +125,15 @@ never reaches the caller.
 
 Each mint instance is configured with:
 
-1. **Its own macaroon root** — the single symmetric key mint uses to
-   *both* mint and verify primary macaroons. It never leaves the
-   process and is never shared with a caller or any other authority.
-   How it is provisioned (mint-generated and persisted, vs. supplied
-   like the admin credential) is an open question; it is a secret, so
-   it is not a plaintext TOML field. (v1 is single-root; multi-root for
-   federating issuers is out of scope.) The current **`bootstrap`**
+1. **Its own root key** — the single symmetric key mint uses to
+   *both* mint and verify primary macaroons (the "root key" of the
+   Macaroons paper). It never leaves the process and is never shared
+   with a caller or any other authority. It is a 32-byte CSPRNG key
+   generated on first start at `<data_dir>/root_key` (64 hex chars,
+   mode 0600), loaded thereafter — never a config field, mirroring the
+   elide coordinator's `coordinator.key`.
+   Symmetric, so there is no public half. (v1 is single-root; multi-root
+   for federating issuers is out of scope.) The current **`bootstrap`**
    is persisted alongside the root under the same custody — it must
    survive restart so the distributed bootstrap macaroon stays valid;
    only `mint bootstrap rotate` changes it.
@@ -153,9 +155,10 @@ Each mint instance is configured with:
    single-tenant per instance; multi-tenancy is a v2 question.
 
 Role definitions, audience, and tenant metadata are static and
-file-backed. The macaroon root and admin credential are secrets and are
+file-backed. The root key and admin credential are secrets and are
 not plaintext TOML fields — the admin credential comes from the AWS
-environment; the macaroon root's provisioning is an open question.
+environment; the root key is generated on first start at
+`<data_dir>/root_key` (64 hex chars, 0600) and loaded thereafter.
 
 #### On-disk layout
 
@@ -1168,15 +1171,14 @@ prematurely.
     fingerprint → `POST /v1/enroll-exchange` re-mints the primary from
     root and consumes the record. `bootstrap` is the rotation knob;
     `op` partitions the three endpoints.
-14. **Macaroon-root provisioning.** The root is mint-held and never
-    distributed, but how it comes to exist is unspecified: mint
-    generates it on first start and persists it (like the coordinator's
-    identity key), or it is supplied via the environment like the admin
-    credential. Generation-and-persist avoids an operator step but means
-    losing mint state invalidates every outstanding macaroon; supplied
-    means another secret to manage but survives a mint rebuild. The
-    persisted `bootstrap` shares this custody and the same
-    open question. Tied to rotation (#3).
+14. **Root-key durability.** *Resolved:* mint generates the root key
+    on first start and persists it at `<data_dir>/root_key` (64 hex
+    chars, 0600), like the coordinator's identity key; the `bootstrap`
+    shares this custody. The accepted consequence is that losing
+    `data_dir` invalidates every outstanding macaroon — recovery is
+    re-bootstrap + re-enroll, not state restore. Whether `data_dir`
+    warrants backup/replication, and how the root rotates, remain open
+    and are tied to rotation (#3).
 15. **Third-party-caveat construction.** Delegation to an identity
     authority is a third-party caveat (mint shares a symmetric key per
     discharge authority; the caveat carries a verification key encrypted
