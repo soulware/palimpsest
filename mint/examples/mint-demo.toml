@@ -22,8 +22,8 @@ roles_dir = "examples/demo_roles"
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 #
 #   # UDS — the bundled single-host dev shape (coordinator + mint
-#   # co-resident). "" means <data_dir>/mint.sock.
-#   socket = ""                       # client: --url unix:mint_data/mint.sock
+#   # co-resident).
+#   socket = "mint_data/mint.sock"    # client: --url unix:mint_data/mint.sock
 
 [tenant]
 bucket = "mint-demo"
