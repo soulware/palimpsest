@@ -217,7 +217,7 @@ impl ServerContext {
 /// drive it with `axum::serve` against a local listener.
 pub fn router(ctx: ServerContext) -> Router {
     Router::new()
-        .route("/v1/:vol_id/:filename", get(handle_segment))
+        .route("/v1/{vol_id}/{filename}", get(handle_segment))
         .with_state(ctx)
 }
 

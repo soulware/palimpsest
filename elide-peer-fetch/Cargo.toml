@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait   = "0.1"
-axum          = "0.7"
+axum          = "0.8"
 base64        = "0.22"
 bytes         = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
