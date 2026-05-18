@@ -300,11 +300,12 @@ fn json_str_field(body: &str, key: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other(format!("mint response missing `{key}` field")))
 }
 
-/// Per-volume RO credentialer backed by the external mint service.
-/// Sees only ULIDs — ancestor resolution happens upstream in
-/// [`MintCredentialIssuer`], the same split the in-process iam path
-/// makes, so the seam is transport-agnostic.
-pub struct MintCredentialer {
+/// A configured mint endpoint plus the coordinator identity that
+/// proves possession. Shared by every role the coordinator assumes —
+/// `volume-ro` (vended to volumes, [`MintCredentialer`]) and the
+/// `coord-*` roles (held by the coordinator, `crate::mint_stores`).
+#[derive(Clone)]
+pub struct MintEndpoint {
     url: String,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -312,7 +313,7 @@ pub struct MintCredentialer {
     identity: Arc<CoordinatorIdentity>,
 }
 
-impl MintCredentialer {
+impl MintEndpoint {
     pub fn new(cfg: &MintConfig, data_dir: PathBuf, identity: Arc<CoordinatorIdentity>) -> Self {
         Self {
             url: cfg.url.clone(),
@@ -322,22 +323,25 @@ impl MintCredentialer {
             identity,
         }
     }
-}
 
-#[async_trait]
-impl Credentialer for MintCredentialer {
-    async fn provision_volume_ro(
+    /// Load `credentials/<role>`, bound it to `ttl_secs` (`exp`
+    /// caveat) plus any role-specific narrowing caveats, exercise it
+    /// at `/v1/assume-role` with the `coordinator.key` PoP, and return
+    /// the vended Tigris keypair. `extra_body` carries role-specific
+    /// PoP-signed request fields (e.g. `volume-ro`'s `ancestors`).
+    pub async fn assume_role(
         &self,
-        vol_ulid: Ulid,
-        ancestors: &[Ulid],
+        role: &str,
+        ttl_secs: u64,
+        narrowing: &[(&str, &str)],
+        extra_body: &[(&str, serde_json::Value)],
     ) -> io::Result<IssuedCredentials> {
-        let cred_path = self.data_dir.join("credentials").join(ROLE_VOLUME_RO);
+        let cred_path = self.data_dir.join("credentials").join(role);
         let stored = std::fs::read_to_string(&cred_path).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(
-                    "reading {} credential at {}: {e} (run enrollment for this role)",
-                    ROLE_VOLUME_RO,
+                    "reading {role} credential at {}: {e} (run enrollment for this role)",
                     cred_path.display()
                 ),
             )
@@ -345,23 +349,25 @@ impl Credentialer for MintCredentialer {
         let mut mac = WireMacaroon::decode(&stored)?;
 
         let now = now_unix()?;
-        let exp = now.saturating_add(VOLUME_RO_TTL_SECS);
+        let exp = now.saturating_add(ttl_secs);
         // The credential does not expire; the role gate requires `exp`.
-        // Bound it, then scope to this one volume.
+        // Bound it, then apply any role-specific narrowing.
         mac.attenuate(CAVEAT_EXP, &exp.to_string());
-        mac.attenuate(CAVEAT_VOLUME, &vol_ulid.to_string());
+        for (n, v) in narrowing {
+            mac.attenuate(n, v);
+        }
 
-        let ancestor_strs: Vec<String> = ancestors.iter().map(Ulid::to_string).collect();
         // Build the exact body bytes once: they are both signed (via
         // BLAKE3(body)) and sent. Mint hashes the raw bytes before
         // parsing, so no canonicalization step may sit between.
-        let body = serde_json::json!({
-            "ts": now,
-            "role": ROLE_VOLUME_RO,
-            "ttl_seconds": VOLUME_RO_TTL_SECS,
-            "ancestors": ancestor_strs,
-        })
-        .to_string();
+        let mut obj = serde_json::Map::new();
+        obj.insert("ts".into(), now.into());
+        obj.insert("role".into(), role.into());
+        obj.insert("ttl_seconds".into(), ttl_secs.into());
+        for (k, v) in extra_body {
+            obj.insert((*k).to_owned(), v.clone());
+        }
+        let body = serde_json::Value::Object(obj).to_string();
 
         let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
         let auth = format!("Macaroon {}", mac.encode());
@@ -382,7 +388,7 @@ impl Credentialer for MintCredentialer {
             // surface status + a short body for the operator log.
             let snippet: String = text.chars().take(200).collect();
             return Err(io::Error::other(format!(
-                "mint assume-role for volume {vol_ulid} returned {status}: {snippet}"
+                "mint assume-role for {role} returned {status}: {snippet}"
             )));
         }
 
@@ -397,10 +403,7 @@ impl Credentialer for MintCredentialer {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
             .map(|dt| dt.timestamp().max(0) as u64)
             .unwrap_or_else(|| {
-                warn!(
-                    "[coordinator] mint volume-ro expiration unparseable; \
-                     using attenuated exp {exp}"
-                );
+                warn!("[coordinator] mint {role} expiration unparseable; using attenuated exp");
                 exp
             });
 
@@ -410,6 +413,41 @@ impl Credentialer for MintCredentialer {
             session_token: None,
             expiry_unix: Some(expiry_unix),
         })
+    }
+}
+
+/// Per-volume RO credentialer backed by the external mint service.
+/// Sees only ULIDs — ancestor resolution happens upstream in
+/// [`MintCredentialIssuer`], the same split the in-process iam path
+/// makes, so the seam is transport-agnostic.
+pub struct MintCredentialer {
+    endpoint: MintEndpoint,
+}
+
+impl MintCredentialer {
+    pub fn new(cfg: &MintConfig, data_dir: PathBuf, identity: Arc<CoordinatorIdentity>) -> Self {
+        Self {
+            endpoint: MintEndpoint::new(cfg, data_dir, identity),
+        }
+    }
+}
+
+#[async_trait]
+impl Credentialer for MintCredentialer {
+    async fn provision_volume_ro(
+        &self,
+        vol_ulid: Ulid,
+        ancestors: &[Ulid],
+    ) -> io::Result<IssuedCredentials> {
+        let ancestor_strs: Vec<String> = ancestors.iter().map(Ulid::to_string).collect();
+        self.endpoint
+            .assume_role(
+                ROLE_VOLUME_RO,
+                VOLUME_RO_TTL_SECS,
+                &[(CAVEAT_VOLUME, &vol_ulid.to_string())],
+                &[("ancestors", serde_json::json!(ancestor_strs))],
+            )
+            .await
     }
 
     async fn release_volume_ro(&self, vol_ulid: Ulid) {
