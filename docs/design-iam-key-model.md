@@ -2,7 +2,13 @@
 
 ## Status
 
-Proposed. Extracted from `architecture.md` for focused iteration.
+**Superseded by [`design-mint.md`](design-mint.md).** The per-volume
+IAM key inventory described here is now vended by the external `mint`
+service rather than minted in-process by the coordinator; the
+coordinator's in-process Tigris path and the `coordinator.toml`
+`[iam]` section are removed (see design-mint.md § *Coordinator
+configuration*). This doc is retained for the key-inventory and
+policy-scoping rationale, which mint's role definitions inherit.
 
 Applies to backends with per-access-key IAM policies — Tigris is the
 motivating case. AWS STS deployments use a different mechanism

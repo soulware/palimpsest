@@ -169,10 +169,18 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // peer-fetch is unconfigured.
     elide_coordinator::tasks::set_peer_fetch_handle(peer_fetch_handle);
 
-    // Credential issuer: the [iam] config section enables Tigris-style
-    // per-volume RO keys (docs/design-iam-key-model.md). Absent
-    // section keeps the shared-key downgrade — every volume gets the
-    // coordinator's own AWS_* key.
+    // Credential issuer. `[iam]` enables the in-process Tigris path
+    // (docs/design-iam-key-model.md); `[mint]` routes per-volume RO
+    // issuance through the external mint service
+    // (docs/design-mint.md § "Coordinator configuration"). They are
+    // two credential planes behind the same seam — mutually exclusive.
+    // Neither section keeps the shared-key downgrade (every volume
+    // gets the coordinator's own AWS_* key).
+    if config.iam.is_some() && config.mint.is_some() {
+        anyhow::bail!(
+            "[iam] and [mint] are mutually exclusive credential planes — configure one, not both"
+        );
+    }
     let credentialer: Option<std::sync::Arc<dyn crate::credential::Credentialer>> = match &config
         .iam
     {
@@ -212,10 +220,30 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             );
             Some(credentialer)
         }
-        None => {
-            set_credential_issuer(SharedKeyPassthrough::new_with_warning());
-            None
-        }
+        None => match &config.mint {
+            Some(mint_cfg) => {
+                mint_cfg.validate()?;
+                let credentialer: std::sync::Arc<dyn crate::credential::Credentialer> =
+                    std::sync::Arc::new(crate::mint_client::MintCredentialer::new(
+                        mint_cfg,
+                        config.data_dir.clone(),
+                        identity.clone(),
+                    ));
+                set_credential_issuer(crate::mint_client::MintCredentialIssuer::new(
+                    credentialer.clone(),
+                    config.data_dir.clone(),
+                ));
+                info!(
+                    "[coordinator] credential issuer: external mint service ({})",
+                    mint_cfg.url
+                );
+                Some(credentialer)
+            }
+            None => {
+                set_credential_issuer(SharedKeyPassthrough::new_with_warning());
+                None
+            }
+        },
     };
 
     info!(

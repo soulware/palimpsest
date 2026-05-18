@@ -603,7 +603,7 @@ Step 4 delegates to a `CredentialIssuer` selected at coordinator startup from `c
 |---|---|---|
 | AWS S3 | STS `AssumeRole` with a session policy narrowing `s3:GetObject` to `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` | Session duration 15 min – 12 h; the coordinator's own role needs `sts:AssumeRole` on a dedicated read-only role |
 | S3-compatible with STS (e.g. MinIO, Ceph RGW/STS) | `AssumeRole` against the backend's STS endpoint with the same session policy | Compatibility varies by backend; the session policy shape is the portable part |
-| S3-compatible with IAM-keyed policies (e.g. Tigris) | Mint a per-volume access key via `CreateAccessKey`, attach a policy granting `s3:GetObject` on `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` (plus ancestor prefixes for forks) with a `DateLessThan` condition for time-bounding | See [`design-iam-key-model.md`](design-iam-key-model.md) for the full per-volume key model: three-tier admin/writer/RO split, host-locality tagging, fetch-time ephemeral keys, and reconciliation. |
+| S3-compatible with IAM-keyed policies (e.g. Tigris) | Call the external `mint` service's `assume-role` over the `[mint]` endpoint; mint mints the per-volume key and renders its IAM policy from the request's macaroon caveats | See [`design-mint.md`](design-mint.md) for the credential plane; the key-inventory and policy-scoping rationale it inherits is in [`design-iam-key-model.md`](design-iam-key-model.md). |
 | S3-compatible without STS or per-key IAM | Coordinator returns its own configured read-only key pair with no per-volume scoping | Defense-in-depth only — the coordinator must be configured with a distinct read-only key, not the upload key. Logged as a downgrade at coordinator startup. |
 | Local filesystem (`elide_store/`) | No-op issuer — returns a sentinel the volume's fetcher treats as "no auth needed" | Used for tests and single-host deployments |
 
@@ -611,9 +611,9 @@ The volume never negotiates the backend type. It treats the returned triple as o
 
 ### Issuer: Tigris-native (no STS, IAM-policied keys)
 
-The full per-volume IAM key model — three-tier admin/writer/RO key split, ancestor-inclusive RO policies, host-locality tagging, fetch-time ephemeral keys, inventory and reconciliation — is documented in [`design-iam-key-model.md`](design-iam-key-model.md).
+Per-volume Tigris keys are vended by the external `mint` service, not minted in-process by the coordinator. The coordinator holds a per-role capability macaroon and calls mint's `assume-role`; mint renders the IAM policy from the macaroon caveats and returns a scoped keypair. The credential plane is documented in [`design-mint.md`](design-mint.md) (§ *Coordinator configuration* for the `coordinator.toml` `[mint]` wiring); the key-inventory and policy-scoping rationale mint's roles inherit is in [`design-iam-key-model.md`](design-iam-key-model.md).
 
-**Standalone-mode shortcut.** When the operator does not need per-volume scoping (single-tenant dev, no untrusted volumes), the same Tigris account can be used with the *S3-compatible without STS or per-key IAM* row above — i.e. a single static read-only key shared across volumes. The Tigris-native model is the per-volume upgrade path, not a requirement.
+**Standalone-mode shortcut.** When the operator does not need per-volume scoping (single-tenant dev, no untrusted volumes), the same Tigris account can be used with the *S3-compatible without STS or per-key IAM* row above — i.e. a single static read-only key shared across volumes. mint is the per-volume upgrade path, not a requirement.
 
 ### Token lifetime
 

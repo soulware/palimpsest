@@ -17,6 +17,7 @@ mod fork;
 mod iam;
 mod import;
 mod inbound;
+mod mint_client;
 mod pidfile;
 mod rescan;
 mod shutdown;
@@ -182,6 +183,13 @@ async fn run() -> Result<()> {
                 "[coordinator] store scoping: passthrough (single key for every \
                  op; per-volume scoping not yet wired)"
             );
+            if config.mint.is_some() {
+                tracing::info!(
+                    "[coordinator] [mint] set: per-volume RO vended via mint \
+                     volume-ro; coordinator-own S3 writes still use AWS_* env \
+                     (mint coord-* role signing not yet wired)"
+                );
+            }
             config.store.probe(store.as_ref()).await?;
             tracing::info!("[coordinator] store: reachable");
 

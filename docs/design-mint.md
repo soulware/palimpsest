@@ -1103,6 +1103,41 @@ through `hyperlocal`'s `UnixConnector`; the TCP leg stays on
 `reqwest`. mint is its own workspace, so the axum 0.8 dependency is
 contained to it.
 
+### Coordinator configuration
+
+**Proposed.** The coordinator reaches mint through one new
+`coordinator.toml` section:
+
+```toml
+# enable mint
+[mint]
+url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
+```
+
+`url` is scheme-discriminated exactly as the reference client's
+`--url` above: `unix:<path>` selects the UDS leg, `http(s)://host:port`
+the TCP leg. UDS paths follow the same resolution rule as mint's own
+(relative resolved against cwd, absolute verbatim). The section is
+presence-enables, mirroring `[iam]` / `[peer_fetch]`.
+
+The section is deliberately thin. The coordinator's mint identity is
+`coordinator.key` (already present for name-claims and provenance);
+its per-role capability macaroons live one file per role under
+`credentials/<role>` in the coordinator's `data_dir`, provisioned by
+enrollment (§ *Enrollment*), not by config; and `aud=mint` is fixed
+inside the macaroon. Only the endpoint — and optionally
+`connect_timeout` / `request_timeout` (humantime, mirroring
+`[store]`) — is configurable.
+
+`[mint]` and the in-process `[iam]` backend are mutually exclusive
+credential planes behind the same coordinator credential seam. Per
+*Elide as customer* the IAM-key inventory collapses under mint, so
+`[iam]` and the coordinator's in-process Tigris path are **removed**,
+not retained as a fallback — an optional path for the credential
+plane would mean the per-volume scoping property does not actually
+hold. The shared-key downgrade (no `[mint]` and no `[iam]` section at
+all — the local-store / no-IAM case) is unaffected.
+
 ### Reference client & demo
 
 The full flow is exercisable end-to-end from the `mint` binary alone —
