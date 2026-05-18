@@ -191,7 +191,7 @@ impl ObjectStore for RoleStore {
     }
 
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
-        self.ensure().await?.head(location).await
+        self.ensure().await?.as_ref().head(location).await
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {

@@ -63,10 +63,28 @@ impl ReadOnlyAdapter {
 #[async_trait]
 impl ReadStore for ReadOnlyAdapter {
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-        self.inner.get(location).await
+        self.inner.as_ref().get(location).await
     }
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.inner.head(location).await
+        self.inner.as_ref().head(location).await
+    }
+}
+
+/// A full [`ObjectStore`] handle also satisfies [`ReadStore`]. This is
+/// what lets a pure-read helper take `&dyn ReadStore` while both a
+/// read-only path (passing [`ScopedStores::base_ro`]) and a mutation
+/// path (passing its already-held [`ScopedStores::writer`]) call it
+/// unchanged — the credential is decided by what the call site
+/// acquired for its purpose, not by the helper. A read-only path
+/// still cannot write, because it only ever holds the narrow
+/// `base_ro()` handle.
+#[async_trait]
+impl ReadStore for Arc<dyn ObjectStore> {
+    async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
+        (**self).get(location).await
+    }
+    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        (**self).head(location).await
     }
 }
 

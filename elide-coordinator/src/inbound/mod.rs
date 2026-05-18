@@ -282,11 +282,15 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::StatusRemote { volume } => {
-            // Reads names/<volume>: coordinator-wide.
-            let store = ctx.stores.writer();
-            let result =
-                volume_status_remote_typed(&volume, &store, ctx.identity.coordinator_id_str())
-                    .await;
+            // Reads names/<volume> only — the read-only coord-base
+            // credential.
+            let store = ctx.stores.base_ro();
+            let result = volume_status_remote_typed(
+                &volume,
+                store.as_ref(),
+                ctx.identity.coordinator_id_str(),
+            )
+            .await;
             let env: Envelope<StatusRemoteReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -1187,7 +1191,7 @@ fn volume_status_typed(volume_name: &str, data_dir: &Path) -> Result<StatusReply
 /// eligibility against it.
 async fn volume_status_remote_typed(
     volume_name: &str,
-    store: &Arc<dyn ObjectStore>,
+    store: &dyn elide_coordinator::stores::ReadStore,
     coord_id: &str,
 ) -> Result<StatusRemoteReply, IpcError> {
     use elide_coordinator::bucket_position::fetch_position;

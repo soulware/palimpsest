@@ -21,10 +21,8 @@
 //! `Eligibility` stays the wire-only surface; this richer type is for
 //! verb dispatch.
 
-use std::sync::Arc;
-
 use elide_core::name_record::{NameRecord, NameState};
-use object_store::{ObjectStore, UpdateVersion};
+use object_store::UpdateVersion;
 use ulid::Ulid;
 
 use crate::eligibility::Eligibility;
@@ -182,7 +180,7 @@ impl OwnershipPosition {
 /// A missing record produces `(Absent, None)`; an S3 read error
 /// surfaces as [`NameStoreError`].
 pub async fn fetch_position(
-    store: &Arc<dyn ObjectStore>,
+    store: &dyn crate::stores::ReadStore,
     name: &str,
     our_coord_id: &str,
 ) -> Result<(OwnershipPosition, Option<(NameRecord, UpdateVersion)>), NameStoreError> {

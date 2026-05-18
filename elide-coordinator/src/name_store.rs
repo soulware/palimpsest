@@ -97,12 +97,12 @@ fn put_result_to_version(r: PutResult) -> UpdateVersion {
 /// must be supplied to `update_name_record` for any subsequent
 /// conditional update.
 pub async fn read_name_record(
-    store: &Arc<dyn ObjectStore>,
+    store: &dyn crate::stores::ReadStore,
     name: &str,
 ) -> Result<Option<(NameRecord, UpdateVersion)>, NameStoreError> {
     let key = name_key(name);
     let started = std::time::Instant::now();
-    let got = match store.get(&key).await {
+    let got = match crate::stores::ReadStore::get(store, &key).await {
         Ok(g) => g,
         Err(object_store::Error::NotFound { .. }) => {
             debug!("[name_store] GET {key} -> 404 ({:.2?})", started.elapsed());
