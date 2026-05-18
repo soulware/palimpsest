@@ -2079,3 +2079,107 @@ fn gc_interleaved_writemulti_overlap_regression() {
         );
     }
 }
+
+/// Deterministic reproducer for the `crash_recovery_oracle` failure
+/// surfaced by CI run 26021377703 (seed
+/// `cc b1c5223dc87a1a3d86f111dbae10b27598459aaf54ed53c506c84e6fa7d87237`).
+///
+/// Minimal failing op sequence:
+///   WriteMulti{0,4,241}, CoordGcLocal{2}, SignSnapshot, Write{0,0},
+///   DrainWithRedact, WriteMulti{1,4,241}, GcCheckpoint,
+///   CoordGcLocal{2}, Crash
+///
+/// The corruption is observable on the *live* volume immediately after
+/// the final CoordGcLocal{2}, before any crash: GC-local apply over a
+/// snapshot-in-place segment that was partially overwritten by the
+/// second WriteMulti loses the overwrite. Mirrors the
+/// `crash_recovery_oracle` proptest arms exactly so the repro tracks
+/// the harness.
+#[test]
+fn crash_recovery_seed_b1c5223d_regression() {
+    use elide_core::volume::Volume;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fork_dir = tmp.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    let fork_dir = fork_dir.as_path();
+    let store_dir = tmp.path().join("_store");
+    common::write_test_keypair(fork_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    // SimOp::WriteMulti
+    let write_multi = |vol: &mut Volume,
+                       oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+                       start_lba: u8,
+                       lba_count: u8,
+                       seed: u8| {
+        let mut payload = Vec::with_capacity(lba_count as usize * 4096);
+        for i in 0..lba_count {
+            payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+        }
+        let start = 40 + start_lba as u64;
+        if vol.write(start, &payload).is_ok() {
+            for i in 0..lba_count as usize {
+                let mut block = [0u8; 4096];
+                block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                oracle.insert(start + i as u64, block);
+            }
+        }
+    };
+
+    // SimOp::CoordGcLocal
+    let coord_gc_local = |vol: &mut Volume, n: usize| {
+        common::drain_with_repack(vol);
+        let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+        let to_delete =
+            if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, n) {
+                paths
+            } else {
+                vec![]
+            };
+        let applied = vol.apply_gc_handoffs().unwrap_or(0);
+        if applied > 0 {
+            for path in &to_delete {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    };
+
+    write_multi(&mut vol, &mut oracle, 0, 4, 241);
+    coord_gc_local(&mut vol, 2);
+
+    // SimOp::SignSnapshot
+    let snap_ulid = pick_snap_ulid(fork_dir);
+    let _ = vol.sign_snapshot_manifest(snap_ulid);
+
+    // SimOp::Write { lba: 0, seed: 0 }
+    let data = [0u8; 4096];
+    let _ = vol.write(0, &data);
+    oracle.insert(0, data);
+
+    // SimOp::DrainWithRedact
+    common::drain_with_repack(&mut vol);
+
+    write_multi(&mut vol, &mut oracle, 1, 4, 241);
+
+    // SimOp::GcCheckpoint
+    common::drain_with_repack(&mut vol);
+    let _ = vol.gc_checkpoint_for_test().unwrap();
+
+    // SimOp::CoordGcLocal { n: 2 } — invalidates the stashed checkpoint
+    coord_gc_local(&mut vol, 2);
+
+    // SimOp::Crash
+    drop(vol);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    common::assert_promote_recovery(&mut vol, fork_dir);
+    for (&lba, expected) in &oracle {
+        let actual = vol.read(lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {lba} wrong after crash+rebuild"
+        );
+    }
+}
