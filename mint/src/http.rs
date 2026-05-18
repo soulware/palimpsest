@@ -41,12 +41,12 @@ use crate::role::{self, Denied};
 use crate::state::{Recorded, StateError, Store};
 use crate::template::render_policy;
 
-/// Intermediate lifetime: long enough for an operator to approve out of
-/// band, short by design. If it lapses the client just re-enrols
-/// (idempotent for the same `(sub, pub)` → fresh intermediate).
-const INTERMEDIATE_TTL_SECONDS: u64 = 600;
-/// Unapproved pending records age out past this (≥ the intermediate
-/// `exp`, so a still-usable intermediate always has its record).
+/// Credential-ticket lifetime: long enough for an operator to approve
+/// out of band, short by design. If it lapses the client just re-enrols
+/// (idempotent for the same `(sub, pub)` → fresh ticket).
+const CREDENTIAL_TICKET_TTL_SECONDS: u64 = 600;
+/// Unapproved pending records age out past this (≥ the credential
+/// ticket `exp`, so a still-usable ticket always has its record).
 const PENDING_MAX_AGE_SECONDS: u64 = 3600;
 
 #[derive(Clone)]
@@ -302,7 +302,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
 /// client presents the coordinator-attenuated bootstrap macaroon
 /// (`op=enroll`, current `bootstrap`, self-asserted `sub`/`cnf`) and a
 /// PoP. Mint records a **pending** record keyed by `sub` and returns a
-/// short-lived intermediate. Always `200` for an accepted
+/// short-lived credential ticket. Always `200` for an accepted
 /// (new or idempotent) `(sub, pub)`; conflicts and auth failures are
 /// the opaque `401`.
 async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -406,25 +406,25 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         }
     }
 
-    let intermediate = issuance::mint_intermediate(
+    let ticket = issuance::mint_credential_ticket(
         &state.store.root_key(),
         &state.config.audience,
         &sub,
         &cnf,
-        now_unix.saturating_add(INTERMEDIATE_TTL_SECONDS),
+        now_unix.saturating_add(CREDENTIAL_TICKET_TTL_SECONDS),
     );
     audit("pending", &caveats);
     respond(
         &request_id,
         StatusCode::OK,
-        json!({ "intermediate": intermediate.encode() }),
+        json!({ "credential.ticket": ticket.encode() }),
     )
 }
 
 /// `POST /v1/enroll-exchange` (`docs/design-mint.md` § *Enrollment*
-/// (3)). The client presents the intermediate (`op=enroll-exchange`,
+/// (3)). The client presents the credential ticket (`op=enroll-exchange`,
 /// unexpired `exp`) and a PoP. If the pending record is approved, mint
-/// re-mints the non-expiring primary from root and **consumes** the
+/// re-mints the non-expiring credential from root and **consumes** the
 /// record. `403` (not `401`) while approval is still pending — the one
 /// awaited, non-failure outcome.
 async fn enroll_exchange(
@@ -528,10 +528,10 @@ async fn enroll_exchange(
         );
     }
 
-    let primary =
-        issuance::mint_primary(&state.store.root_key(), &state.config.audience, &sub, &cnf);
+    let credential =
+        issuance::mint_credential(&state.store.root_key(), &state.config.audience, &sub, &cnf);
     if let Err(e) = state.store.consume(&sub) {
-        // Don't hand out a primary while the record lingers — the
+        // Don't hand out a credential while the record lingers — the
         // client retries; consume+re-mint is idempotent in identity.
         tracing::error!(error = %e, "consume pending");
         return respond(
@@ -544,7 +544,7 @@ async fn enroll_exchange(
     respond(
         &request_id,
         StatusCode::OK,
-        json!({ "primary": primary.encode() }),
+        json!({ "credential": credential.encode() }),
     )
 }
 

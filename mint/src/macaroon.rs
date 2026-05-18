@@ -88,7 +88,7 @@ fn chain_mac(root_key: &[u8; 32], nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -
 }
 
 /// Mint a macaroon under `root_key`. Mint is the issuer *and* verifier
-/// of the primary macaroon (the root never leaves the process — see
+/// of the credential macaroon (the root never leaves the process — see
 /// `docs/design-mint.md` § *Trust model*); this is the issuer side.
 pub fn mint(root_key: &[u8; 32], caveats: Vec<Caveat>) -> Macaroon {
     let mut nonce = [0u8; NONCE_LEN];

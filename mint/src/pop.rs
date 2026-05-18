@@ -2,7 +2,7 @@
 //! (`docs/design-mint.md` § *Coordinator bootstrap*, § *Authentication*;
 //! open question #16).
 //!
-//! The primary macaroon is **key-bound, not a bearer**: mint honours an
+//! The credential macaroon is **key-bound, not a bearer**: mint honours an
 //! `assume-role` request only when it carries a fresh Ed25519 signature,
 //! by `coordinator.key`, over
 //!
@@ -165,7 +165,7 @@ pub fn check(
 
 /// The `cnf` caveat value for an Ed25519 seed:
 /// `ed25519:<base64 pubkey>`. This is the reference for what the
-/// issuance path seals into the primary; a coordinator's identity key
+/// issuance path seals into the credential; a coordinator's identity key
 /// seed produces the value mint must verify against.
 pub fn cnf_value(seed: &[u8; 32]) -> String {
     let vk = SigningKey::from_bytes(seed).verifying_key();
@@ -322,7 +322,7 @@ mod tests {
         // The downgrade defence: an appended second, different
         // cnf must reject — never resolve to Absent and
         // drop the PoP requirement (which would make a captured
-        // primary a usable bearer).
+        // credential a usable bearer).
         let (_, key) = signer();
         let cv = vec![
             Caveat::scalar(CNF_CAVEAT, key),
