@@ -1041,7 +1041,7 @@ and the fake-minter `assume-role` are hermetic and run anywhere; the
 real-Tigris `assume-role` end-to-end is VM-only.
 
 **Demo role config** is a minimal `read` / `write` pair over a single
-`{{request.prefix}}` (shipped as `examples/demo.toml`) — distinct from
+`{{request.prefix}}` (shipped as `examples/mint-demo.toml`) — distinct from
 the full Elide role inventory below; it exists only to exercise the
 issuance path.
 

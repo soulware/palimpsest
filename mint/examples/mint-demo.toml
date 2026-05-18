@@ -2,7 +2,7 @@
 #
 # Two roles — `read` / `write` over a single {{request.prefix}} — just
 # enough to exercise the issuance path end-to-end. This is NOT the Elide
-# role inventory (see mint.toml for that); it exists only for the
+# role inventory (see mint-elide.toml for that); it exists only for the
 # bootstrap → enroll → approve → exchange → assume-role walkthrough.
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
 #

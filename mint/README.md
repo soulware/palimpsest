@@ -85,10 +85,10 @@ cargo build && cargo test
 clap CLI (`--config` defaults to `mint.toml`). Server + operator:
 
 ```sh
-mint serve   --config demo.toml [--tigris]      # --tigris = real Tigris IAM; else fake minter
-mint bootstrap --config demo.toml               # print the bootstrap macaroon
-mint enroll list    --config demo.toml
-mint enroll approve --config demo.toml <sub>    # shows the fingerprint, interactive y/N; --yes for automation
+mint serve   --config mint-demo.toml [--tigris]      # --tigris = real Tigris IAM; else fake minter
+mint bootstrap --config mint-demo.toml               # print the bootstrap macaroon
+mint enroll list    --config mint-demo.toml
+mint enroll approve --config mint-demo.toml <sub>    # shows the fingerprint, interactive y/N; --yes for automation
 ```
 
 Client (the coordinator's half; identity under `./mint_client`):
