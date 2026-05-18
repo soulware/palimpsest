@@ -41,9 +41,14 @@ use crate::role::{self, Denied};
 use crate::state::{Recorded, StateError, Store};
 use crate::template::render_policy;
 
-/// Credential-ticket lifetime: long enough for an operator to approve
-/// out of band, short by design. If it lapses the client just re-enrols
-/// (idempotent for the same `(sub, pub)` → fresh ticket).
+/// Credential-ticket lifetime. The ticket is multi-use within this
+/// window: one operator approval, then the coordinator exchanges it
+/// once per role it needs (§ *Enrollment*). 10 min is a deliberate
+/// choice — comfortably enough to mint the handful (3–4) of per-role
+/// credentials a coordinator holds, while keeping the pending record
+/// (and so the approval) short-lived. If it lapses the client just
+/// re-enrols (idempotent for the same `(sub, pub)` → fresh ticket);
+/// a *new* role after expiry needs a fresh approval, by design.
 const CREDENTIAL_TICKET_TTL_SECONDS: u64 = 600;
 /// Unapproved pending records age out past this (≥ the credential
 /// ticket `exp`, so a still-usable ticket always has its record).
