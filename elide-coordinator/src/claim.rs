@@ -179,7 +179,7 @@ pub(crate) async fn start_claim(
     volume: String,
     ctx: ClaimContext,
 ) -> Result<ClaimStartReply, IpcError> {
-    let store = ctx.core.stores.coordinator_wide();
+    let store = ctx.core.stores.writer();
     let bucket_started = std::time::Instant::now();
     let bucket =
         claim_volume_bucket_op(&volume, &ctx.core.data_dir, &store, &ctx.core.identity).await?;
@@ -603,7 +603,7 @@ impl ClaimOrchestrator {
         // `by_id/<id>/volume.pub` to verify our parent provenance) and future
         // claimants doing release --force on a stuck fork have the file they
         // expect.
-        let store = self.ctx.core.stores.for_volume(&new_vol_ulid);
+        let store = self.ctx.core.stores.data_for_volume(&new_vol_ulid);
         elide_coordinator::upload::upload_volume_pub_initial(
             &new_fork_dir,
             &new_vol_ulid_str,
@@ -614,7 +614,7 @@ impl ClaimOrchestrator {
 
         // Bucket rebind. Peer-fetch auth accepts our coord_id from this point
         // onward.
-        let store_wide = self.ctx.core.stores.coordinator_wide();
+        let store_wide = self.ctx.core.stores.writer();
         match mark_claimed(
             &store_wide,
             &self.volume,
@@ -682,7 +682,7 @@ impl ClaimOrchestrator {
         let Some(handle) = elide_coordinator::tasks::peer_fetch_handle() else {
             return;
         };
-        let store_wide = self.ctx.core.stores.coordinator_wide();
+        let store_wide = self.ctx.core.stores.writer();
         if let Some(discovered) =
             elide_coordinator::peer_discovery::discover_peer_for_claim(&store_wide, &self.volume)
                 .await
@@ -710,7 +710,7 @@ impl ClaimOrchestrator {
             }
             self.job
                 .append(ClaimAttachEvent::PullingAncestor { vol_ulid });
-            let store = self.ctx.core.stores.for_volume(&vol_ulid);
+            let store = self.ctx.core.stores.data_for_volume(&vol_ulid);
             self.pulled_guard.record(vol_ulid);
             let reply = pull_readonly_op(
                 vol_ulid,
@@ -751,7 +751,11 @@ impl ClaimOrchestrator {
     /// up; see [`Self::early_rebind`] for the recovery story.)
     async fn resolve_handoff_key(&mut self) -> Result<(), IpcError> {
         let handoff_started = std::time::Instant::now();
-        let store = self.ctx.core.stores.for_volume(&self.released_vol_ulid);
+        let store = self
+            .ctx
+            .core
+            .stores
+            .data_for_volume(&self.released_vol_ulid);
         let key =
             resolve_handoff_key_via_recovery(self.released_vol_ulid, self.handoff_snap, &store)
                 .await?;
@@ -856,7 +860,7 @@ impl ClaimOrchestrator {
         )
         .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
 
-        let store = self.ctx.core.stores.for_volume(&new_fork.vol_ulid);
+        let store = self.ctx.core.stores.data_for_volume(&new_fork.vol_ulid);
         elide_coordinator::upload::upload_volume_provenance_initial(
             &new_fork.dir,
             &new_vol_ulid_str,
@@ -875,7 +879,7 @@ impl ClaimOrchestrator {
 
         // Local volume.toml: size from the released NameRecord (claim is a
         // continuation of the same logical volume identity, not a resize).
-        let store_wide = self.ctx.core.stores.coordinator_wide();
+        let store_wide = self.ctx.core.stores.writer();
         let size = match elide_coordinator::name_store::read_name_record(&store_wide, &self.volume)
             .await
         {
@@ -1065,7 +1069,7 @@ pub(crate) async fn skip_empty_intermediates_impl(
             IpcError::internal(format!("loading volume.pub for {effective_vol}: {e}"))
         })?;
 
-        let store = stores.for_volume(&effective_vol);
+        let store = stores.data_for_volume(&effective_vol);
         let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
             &store,
             effective_vol,
@@ -1096,7 +1100,7 @@ pub(crate) async fn skip_empty_intermediates_impl(
             job.append(ClaimAttachEvent::PullingAncestor {
                 vol_ulid: parent_vol_ulid,
             });
-            let parent_store = stores.for_volume(&parent_vol_ulid);
+            let parent_store = stores.data_for_volume(&parent_vol_ulid);
             guard.record(parent_vol_ulid);
             let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store, peer).await?;
         }

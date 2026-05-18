@@ -123,7 +123,7 @@ pub(crate) async fn start_fetch(
     // Synchronous front-half: name resolution + latest-snapshot lookup
     // so we can fail fast (NotFound on either) without registering a
     // doomed-to-fail job. The actual body-warm work runs detached.
-    let store = ctx.core.stores.coordinator_wide();
+    let store = ctx.core.stores.writer();
     let coord_id = ctx.core.identity.coordinator_id_str();
     let (vol_ulid, size_bytes, owned_by_us) = resolve_name(&volume_name, &store, coord_id).await?;
 
@@ -219,7 +219,7 @@ async fn run_orchestrator(
     let data_dir: PathBuf = (*ctx.core.data_dir).clone();
     let by_id_dir = data_dir.join("by_id");
     let fork_dir = by_id_dir.join(vol_ulid.to_string());
-    let store = ctx.core.stores.for_volume(&vol_ulid);
+    let store = ctx.core.stores.data_for_volume(&vol_ulid);
 
     // Stage 1. Pull ancestor skeleton chain (volume.pub +
     // volume.provenance per ancestor). Stops at the first ancestor

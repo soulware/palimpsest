@@ -279,7 +279,7 @@ impl ForkOrchestrator {
                 } else {
                     self.job
                         .append(ForkAttachEvent::ResolvingName { name: name.clone() });
-                    let store = self.ctx.core.stores.coordinator_wide();
+                    let store = self.ctx.core.stores.writer();
                     let reply = resolve_name_op(name, &store).await?;
                     ResolvedSource {
                         vol_ulid: reply.vol_ulid,
@@ -314,7 +314,7 @@ impl ForkOrchestrator {
             }
             self.job
                 .append(ForkAttachEvent::PullingAncestor { vol_ulid });
-            let store = self.ctx.core.stores.for_volume(&vol_ulid);
+            let store = self.ctx.core.stores.data_for_volume(&vol_ulid);
             let reply = pull_readonly_op(vol_ulid, &self.ctx.core.data_dir, &store, None).await?;
             next = reply.parent;
         }
@@ -366,7 +366,7 @@ impl ForkOrchestrator {
 
         if source_dir.join("volume.readonly").exists() {
             let snap_ulid = if self.force_snapshot {
-                let store = self.ctx.core.stores.coordinator_wide();
+                let store = self.ctx.core.stores.writer();
                 let reply =
                     force_snapshot_now_op(source_vol_ulid, &self.ctx.core.data_dir, &store).await?;
                 self.parent_key_hex = Some(reply.attestation_pubkey_hex.clone());
@@ -380,7 +380,7 @@ impl ForkOrchestrator {
             {
                 snap
             } else {
-                let store = self.ctx.core.stores.for_volume(&source_vol_ulid);
+                let store = self.ctx.core.stores.data_for_volume(&source_vol_ulid);
                 match latest_snapshot_op(source_vol_ulid, &store)
                     .await?
                     .snapshot_ulid
@@ -448,7 +448,7 @@ impl ForkOrchestrator {
                     elide_coordinator::upload::derive_names(&source_dir).map_err(|e| {
                         IpcError::internal(format!("[fork {name}] deriving source volume id: {e}"))
                     })?;
-                let store = self.ctx.core.stores.for_volume(&source_vol_ulid);
+                let store = self.ctx.core.stores.data_for_volume(&source_vol_ulid);
                 if let Err(e) = crate::inbound::promote_stop_snapshot(
                     &source_dir,
                     &volume_id,
@@ -500,7 +500,7 @@ impl ForkOrchestrator {
             source_vol_ulid,
             snap_ulid,
         });
-        let store = self.ctx.core.stores.coordinator_wide();
+        let store = self.ctx.core.stores.writer();
         let reply = fork_create_op(
             &self.new_name,
             source_vol_ulid,

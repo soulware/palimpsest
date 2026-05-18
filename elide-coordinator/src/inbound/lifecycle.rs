@@ -1288,7 +1288,7 @@ pub(crate) async fn start_volume_op(
 ) -> Result<(), IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
     let data_dir: &Path = &core.data_dir;
-    let store = core.stores.coordinator_wide();
+    let store = core.stores.writer();
     let coord_id = core.identity.coordinator_id_str();
     let hostname = core.identity.hostname();
     let link = data_dir.join("by_name").join(volume_name);

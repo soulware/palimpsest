@@ -283,7 +283,7 @@ async fn dispatch_json(
         }
         Request::StatusRemote { volume } => {
             // Reads names/<volume>: coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result =
                 volume_status_remote_typed(&volume, &store, ctx.identity.coordinator_id_str())
                     .await;
@@ -292,7 +292,7 @@ async fn dispatch_json(
         }
         Request::Stop { volume, force } => {
             // Conditional PUT on names/<volume>: coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result = lifecycle::stop_volume_op(
                 &volume,
                 force,
@@ -309,7 +309,7 @@ async fn dispatch_json(
         Request::Release { volume, force } => {
             // Mixed: per-volume snapshot publish + names/<volume> flip.
             // Coordinator-wide today; future Tigris work splits this.
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result = if force {
                 lifecycle::force_release_volume_op(&volume, &ctx.data_dir, &store, &ctx.identity)
                     .await
@@ -347,7 +347,7 @@ async fn dispatch_json(
         } => {
             // Mixed: names/<volume> mark_initial; the spawned import
             // subprocess writes locally only.
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let import_ctx = ctx.for_import();
             let result = start_import(&volume, &oci_ref, &extents_from, &store, &import_ctx).await;
             let env: Envelope<ImportStartReply> = result.into();
@@ -382,7 +382,7 @@ async fn dispatch_json(
             // Demand-fetches segment bodies from the ancestor chain
             // for filemap generation: cross-volume reads, so
             // coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result = generate_filemap_op(&volume, snap_ulid, &ctx.data_dir, &store).await;
             let env: Envelope<GenerateFilemapReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -393,7 +393,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::NotifyVolumeReady { vol_ulid } => {
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result = lifecycle::notify_volume_ready_op(vol_ulid, &ctx.data_dir, &store).await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -412,7 +412,7 @@ async fn dispatch_json(
                 let _ = ipc::write_message(writer, &env).await;
                 return;
             }
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result = remove_volume(
                 &volume,
                 force,
@@ -450,7 +450,7 @@ async fn dispatch_json(
         }
         Request::VolumeEvents { volume } => {
             // Reads events/<volume>/: coordinator-wide.
-            let store = ctx.stores.coordinator_wide();
+            let store = ctx.stores.writer();
             let result = volume_events_typed(&volume, &store).await;
             let env: Envelope<VolumeEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -905,7 +905,7 @@ pub(crate) async fn snapshot_volume_kind(
     snapshot_locks: &SnapshotLockRegistry,
     kind: elide_core::signing::SnapshotKind,
 ) -> Result<SnapshotReply, IpcError> {
-    let store = core.stores.coordinator_wide();
+    let store = core.stores.writer();
     let link = core.data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
         .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
@@ -1573,7 +1573,7 @@ async fn create_volume_op(
     core: &CoordinatorCore,
 ) -> Result<CreateReply, IpcError> {
     let identity = &core.identity;
-    let store = core.stores.coordinator_wide();
+    let store = core.stores.writer();
     let data_dir: &Path = &core.data_dir;
     let coord_id = identity.coordinator_id_str();
 
@@ -2113,7 +2113,7 @@ async fn resolve_peer_endpoint_for_volume(
     elide_coordinator::tasks::peer_fetch_handle()?;
     let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
-    let store = stores.coordinator_wide();
+    let store = stores.writer();
     elide_coordinator::peer_discovery::discover_peer_for_claim(&store, &volume_name)
         .await
         .map(|d| d.endpoint)

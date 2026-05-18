@@ -101,7 +101,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     );
     // Publishing coordinator.pub is a coordinator-wide write
     // (`coordinator/<id>.pub`), not a per-volume op.
-    let coord_wide = stores.coordinator_wide();
+    let coord_wide = stores.writer();
     if let Err(e) = identity.publish_pub(coord_wide.as_ref()).await {
         return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
     }
@@ -375,7 +375,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     //
     // Sweeps `names/` for owned volumes — coordinator-wide scope.
     tasks.spawn(elide_coordinator::reaper::run(
-        stores.coordinator_wide(),
+        stores.writer(),
         config.data_dir.clone(),
         gc_config.reaper_cadence(),
         gc_config.retention_window,
@@ -461,7 +461,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
                 {
                     // Reads/writes names/<name>: coordinator-wide.
-                    let coord_wide = stores.coordinator_wide();
+                    let coord_wide = stores.writer();
                     elide_coordinator::lifecycle::reconcile_marker(
                         &coord_wide,
                         &vol_dir,
@@ -512,18 +512,17 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     Arc::new(tokio::sync::watch::channel(None).0)
                 });
 
-                // Per-volume drain / GC / prefetch loop. Pick the
-                // volume-scoped store handle; under passthrough this is
-                // the same handle as `coordinator_wide()`, but it
-                // documents the intent so a future Tigris IAM impl can
-                // hand each volume its own scoped key.
+                // Per-volume drain / GC / prefetch loop runs against
+                // that volume's `coord-data` handle. A directory whose
+                // name is not a ULID is not a real volume; it falls
+                // back to the coordinator-wide writer handle.
                 let vol_store = match vol_dir
                     .file_name()
                     .and_then(|n| n.to_str())
                     .and_then(|s| ulid::Ulid::from_string(s).ok())
                 {
-                    Some(u) => stores.for_volume(&u),
-                    None => stores.coordinator_wide(),
+                    Some(u) => stores.data_for_volume(&u),
+                    None => stores.writer(),
                 };
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),
