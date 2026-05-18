@@ -14,6 +14,7 @@ Current inventory:
 ```
 elide-core/tests/
   volume_proptest.rs      proptest: crash-recovery oracle + ULID monotonicity
+  volume_reproducers.rs   deterministic: minimized volume_proptest failures (run with volume-invariants)
   fork_proptest.rs        proptest: fork ancestry isolation oracle
   actor_proptest.rs       proptest: actor-layer read-your-writes oracle
   fork_test.rs            deterministic: fork ancestry fixed scenarios
@@ -77,7 +78,9 @@ For design guidance when extending simulation coverage, see `.claude/agents/prop
 
 ### Materializing proptest failures as deterministic tests
 
-When proptest finds a meaningful bug (not a trivial off-by-one), promote the shrunk sequence to a named `#[test]` alongside the proptest, with a comment explaining the invariant violated and the fix. The deterministic test should fail on the unfixed code and pass after the fix. Keep the proptest regression seed too — the seed replays the failure but the deterministic test documents *why* the bug occurred and survives proptest version upgrades.
+When proptest finds a meaningful bug (not a trivial off-by-one), promote the shrunk sequence to a named `#[test]`, with a comment explaining the invariant violated and the fix. The deterministic test should fail on the unfixed code and pass after the fix. Keep the proptest regression seed too — the seed replays the failure but the deterministic test documents *why* the bug occurred and survives proptest version upgrades.
+
+Reproducers promoted from `volume_proptest.rs` go in **`tests/volume_reproducers.rs`**, not back in `volume_proptest.rs`. That target is run by the CI proptest lane with `volume-invariants` enabled (cheap on a handful of short, deterministic sequences), so structural drift panics at the introducing call site rather than surfacing as an oracle mismatch many ops later. Coverage is structural — a reproducer gets the invariant lane because it lives in that file, not because it matches a name filter — so a reproducer added to `volume_proptest.rs` instead would silently miss it. The randomized suites stay invariants-off for speed.
 
 Good candidates for promotion: concurrency/ordering bugs, bugs whose fix involves a non-obvious invariant, or any bug where diagnosis required real analysis. Simple shape bugs can stay as just a seed.
 

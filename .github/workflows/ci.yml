@@ -61,6 +61,15 @@ jobs:
       - name: cargo test (elide-core proptests)
         run: "cargo test -p elide-core --features proptest --tests --no-fail-fast"
 
+      # The materialized reproducers are a handful of short, deterministic
+      # sequences — cheap enough to run with `volume-invariants` on, which
+      # turns structural drift into a clean panic at the introducing call
+      # site rather than an oracle mismatch many ops later. Scoped to the
+      # `volume_reproducers` target only; the randomized suites above stay
+      # invariants-off for speed.
+      - name: cargo test (elide-core reproducers, volume-invariants)
+        run: "cargo test -p elide-core --features proptest,volume-invariants --test volume_reproducers --no-fail-fast"
+
       - name: cargo test (elide-coordinator proptests)
         run: "cargo test -p elide-coordinator --features proptest --tests --no-fail-fast"
 

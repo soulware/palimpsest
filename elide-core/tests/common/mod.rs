@@ -568,3 +568,39 @@ pub fn capture_and_evict_cache_body(
 
     Some(seg_id)
 }
+
+/// Pick the largest ULID present in `index/*.idx`, or mint a fresh one
+/// if `index/` is empty. Mirrors the snapshot-ULID selection in
+/// `actor_proptest.rs` so volume-level signing tests cover both the
+/// "snapshot over real data" and "degenerate empty manifest" shapes.
+pub fn pick_snap_ulid(fork_dir: &Path) -> Ulid {
+    fs::read_dir(fork_dir.join("index"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_str()?;
+            let stem = s.strip_suffix(".idx")?;
+            Ulid::from_string(stem).ok()
+        })
+        .max()
+        .unwrap_or_else(Ulid::new)
+}
+
+/// A deterministic, incompressible 4096-byte block keyed by `seed`.
+/// Distinct seeds produce distinct, non-dedupable content; the same
+/// seed always reproduces the same bytes.
+pub fn incompressible_block(seed: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    let key = [seed; 32];
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for (i, chunk) in buf.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        chunk.copy_from_slice(&hash.as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    buf
+}

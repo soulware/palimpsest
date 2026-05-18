@@ -71,6 +71,14 @@ required-features = ["proptest"]
 name = "volume_proptest"
 required-features = ["proptest"]
 
+# Materialized deterministic reproducers, split out of volume_proptest so
+# the CI proptest lane can run them with `volume-invariants` enabled
+# without slowing the randomized suites. Gated behind `proptest` like the
+# other suites so plain `cargo test -p elide-core` stays fast.
+[[test]]
+name = "volume_reproducers"
+required-features = ["proptest"]
+
 [[bench]]
 name = "compression"
 harness = false
