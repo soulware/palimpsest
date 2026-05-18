@@ -230,93 +230,92 @@ fn compact_candidates_inner(
     let gc_dir = fork_dir.join("gc");
     let _ = fs::create_dir_all(&gc_dir);
 
+    // Liveness classification routes through the *same*
+    // `segment_classify::classify_entry` the production coordinator GC
+    // uses (`elide-coordinator::gc::collect_stats`). The two planners
+    // must not drift: a hand-rolled hash-only block count here treats a
+    // later same-hash dedup-REF with a different anchor
+    // (`payload_block_offset`) as keeping the original entry alive,
+    // misclassifying a superseded entry as `FullyLive` and emitting a
+    // `Keep` whose carried geometry shadows the live REF on both apply
+    // and rebuild. The classifier's `anchor_matches` is what prevents
+    // that. The variant → `PlanOutput` mapping below mirrors production.
+    use elide_core::segment_classify::{ClassifyCtx, EntryClassification, classify_entry};
+
     let mut outputs: Vec<PlanOutput> = Vec::new();
     for (ulid, path) in &candidates {
         let Ok((_bss, entries, _)) = segment::read_and_verify_segment_index(path, &vk) else {
             continue;
         };
+        let classify_ctx = ClassifyCtx {
+            lba_map,
+            extent_index,
+            live_hashes,
+            segment_id: *ulid,
+        };
         for (entry_idx, entry) in entries.iter().enumerate() {
             let entry_idx = entry_idx as u32;
-            let extent_live = extent_index
-                .lookup(&entry.hash)
-                .is_some_and(|loc| loc.segment_id == *ulid);
-
-            // Multi-LBA partial-death classification: count how many of
-            // the entry's blocks still map to its hash via a full-range
-            // scan, not a point query at start_lba. Mirrors production
-            // `elide-coordinator::gc::collect_stats`. Without this, an
-            // entry whose head LBA is overwritten but whose tail blocks
-            // are still live would be demoted whole to Canonical, losing
-            // the surviving tail's LBA claim on rebuild.
-            let end_lba = entry.start_lba + entry.lba_length as u64;
-            let runs: Vec<_> = lba_map.extents_in_range(entry.start_lba, end_lba).collect();
-            let matching_blocks: u64 = runs
-                .iter()
-                .filter(|r| r.hash == entry.hash)
-                .map(|r| r.range_end - r.range_start)
-                .sum();
-            let total_blocks = entry.lba_length as u64;
-
-            if matching_blocks == total_blocks {
-                // Fully alive — pass through unchanged.
-                outputs.push(PlanOutput::Keep {
-                    input: *ulid,
-                    entry_idx,
-                });
-            } else if matching_blocks == 0 {
-                // Fully LBA-dead.
-                match entry.kind {
-                    EntryKind::Data | EntryKind::Inline
-                        if extent_live && live_hashes.contains(&entry.hash) =>
-                    {
+            match classify_entry(entry, &classify_ctx) {
+                EntryClassification::FullyLive => {
+                    outputs.push(PlanOutput::Keep {
+                        input: *ulid,
+                        entry_idx,
+                    });
+                }
+                EntryClassification::DemoteToCanonical => {
+                    outputs.push(PlanOutput::Canonical {
+                        input: *ulid,
+                        entry_idx,
+                    });
+                }
+                EntryClassification::ZeroSubRuns(runs) => {
+                    // One ZeroSplit per surviving sub-run; empty → drop.
+                    for ext in runs {
+                        outputs.push(PlanOutput::ZeroSplit {
+                            input: *ulid,
+                            entry_idx,
+                            start_lba: ext.range_start,
+                            lba_length: (ext.range_end - ext.range_start) as u32,
+                        });
+                    }
+                }
+                EntryClassification::PartialDeath { live_runs, .. } => {
+                    // Owned-body kinds whose composite hash is still
+                    // LBA-live emit a Canonical to preserve the body for
+                    // dedup resolution; DedupRef never does (its body
+                    // lives in a segment this pass doesn't touch).
+                    let emit_canonical = matches!(
+                        entry.kind,
+                        EntryKind::Data | EntryKind::Inline | EntryKind::Delta
+                    ) && live_hashes.contains(&entry.hash);
+                    if emit_canonical {
                         outputs.push(PlanOutput::Canonical {
                             input: *ulid,
                             entry_idx,
                         });
                     }
-                    EntryKind::DedupRef if lba_map.hash_at(entry.start_lba) == Some(entry.hash) => {
-                        // Defensive — extents_in_range said no match but
-                        // the point query agrees with the entry. Keep.
-                        outputs.push(PlanOutput::Keep {
+                    for r in live_runs.iter() {
+                        outputs.push(PlanOutput::Run {
                             input: *ulid,
                             entry_idx,
+                            payload_block_offset: r.payload_block_offset,
+                            start_lba: r.range_start,
+                            lba_length: (r.range_end - r.range_start) as u32,
                         });
-                    }
-                    _ => {
-                        // Drop entry (no body to preserve).
                     }
                 }
-            } else {
-                // Partially alive — emit one Run per surviving sub-run,
-                // each with the payload_block_offset that lets the
-                // materialise side slice the original entry's body.
-                match entry.kind {
-                    EntryKind::Data | EntryKind::Inline | EntryKind::DedupRef => {
-                        for run in &runs {
-                            if run.hash != entry.hash {
-                                continue;
-                            }
-                            let lba_length = (run.range_end - run.range_start) as u32;
-                            outputs.push(PlanOutput::Run {
-                                input: *ulid,
-                                entry_idx,
-                                payload_block_offset: run.payload_block_offset,
-                                start_lba: run.range_start,
-                                lba_length,
-                            });
-                        }
-                    }
-                    _ => {
-                        // Delta / Zero / Canonical* not exercised by the
-                        // current proptest's partial-death shapes; the
-                        // production coordinator handles them but the
-                        // test helper does not need to until those shapes
-                        // are added.
-                        outputs.push(PlanOutput::Keep {
-                            input: *ulid,
-                            entry_idx,
-                        });
-                    }
+                EntryClassification::DeferUnresolvableDelta => {
+                    // No resolvable source this pass — pass the entry
+                    // through unchanged so a later pass can retry.
+                    outputs.push(PlanOutput::Keep {
+                        input: *ulid,
+                        entry_idx,
+                    });
+                }
+                EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {
+                    // Fully dead. The post-loop pass emits a `Drop`
+                    // record for any input that contributed no output so
+                    // apply still walks its .idx to evict removed hashes.
                 }
             }
         }
