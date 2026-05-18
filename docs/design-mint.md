@@ -214,9 +214,13 @@ credential carries. Because every caveat is scalar (§ *All caveats are
 scalar*), one credential cannot enumerate a set of roles — so a
 coordinator holds **one credential file per role it is authorized
 for**, each minted by its own enrollment exchange (§ *Enrollment* (3)),
-and a subsystem loads only the role credential it needs. Each is
-persisted in `data_dir` (mode 0600, alongside the identity key), loaded
-on every start, reused across restarts. Per request and per managed
+and a subsystem loads only the role credential it needs. They live one
+file per role under a `credentials/` directory (`credentials/<role>`,
+mode 0600) — distinct from the flat, role-agnostic `credential.ticket`,
+so the `credential.` name is never overloaded and `ls credentials/`
+shows exactly which roles are held. Each is persisted in `data_dir`
+alongside the identity key, loaded on every start, reused across
+restarts. Per request and per managed
 volume the coordinator appends narrowing caveats (`elide:Volume`, a
 tighter `exp`) before calling `assume-role`; the stored macaroon is
 never sent unattenuated. **A credential does not expire**: once
@@ -1071,7 +1075,7 @@ client only reads it; `--id` is the opaque `sub`):
 ```
 mint client keygen                                       # → client.key/.pub
 mint client enroll       --id <sub> <macaroon|file|->    # → credential.ticket
-mint client exchange     --role <role>                   # 403 until approved → credential.<role>
+mint client exchange     --role <role>                   # 403 until approved → credentials/<role>
 mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
 ```
 
