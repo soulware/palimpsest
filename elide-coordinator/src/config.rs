@@ -591,18 +591,18 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # ro_key_lifetime = "720h"                # DateLessThan default
 # source_ips      = []                    # optional egress IP pins
 
-[mint]
-# Presence routes per-volume RO credential issuance through the
-# external `mint` service's `assume-role` (docs/design-mint.md
-# § "Coordinator configuration"). Mutually exclusive with [iam].
-# The coordinator's mint identity is its existing `coordinator.key`;
-# the per-role capability macaroons live under
-# <data_dir>/credentials/<role> (provisioned by enrollment, not here).
-#
-# url is scheme-discriminated exactly as mint's reference client:
+# [mint] — opt-in; uncomment the header and `url` to enable. Routes
+# per-volume RO credential issuance through the external `mint`
+# service's `assume-role` (docs/design-mint.md § "Coordinator
+# configuration"). Mutually exclusive with [iam]. The coordinator's
+# mint identity is its existing `coordinator.key`; the per-role
+# capability macaroons live under <data_dir>/credentials/<role>
+# (provisioned by enrollment, not here). `url` is required and is
+# scheme-discriminated exactly as mint's reference client:
 # `unix:<path>` selects the UDS transport (bundled single-host shape),
 # `http(s)://host:port` the TCP transport (network shapes).
 #
+# [mint]
 # url             = "unix:mint/mint_data/mint.sock"
 # connect_timeout = "5s"
 # request_timeout = "30s"
