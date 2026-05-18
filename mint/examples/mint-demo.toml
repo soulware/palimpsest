@@ -5,14 +5,6 @@
 # role inventory (see mint-elide.toml for that); it exists only for the
 # bootstrap → enroll → approve → exchange → assume-role walkthrough.
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
-#
-# The macaroon root key is generated on first start at
-# <data_dir>/root_key (64 hex chars, mode 0600). The Tigris admin
-# credential comes
-# from the AWS_* environment
-# (the demo runs on the admin VM). Until the live Tigris SigV4 minter
-# lands, `serve` wires the FAKE minter and warns loudly — assume-role
-# returns a deterministic placeholder keypair.
 
 audience = "mint"
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
@@ -23,14 +15,12 @@ roles_dir = "examples/demo_roles"
 # Each role's template defaults to <roles_dir>/<name>.json (read ->
 # examples/demo_roles/read.json); set policy_file only to override.
 
-# Listener transport (docs/design-mint.md § "Transport"). Default is
-# TCP 127.0.0.1:8085 — the reference client reaches it with
-# `--url http://127.0.0.1:8085`. For the bundled single-host dev shape
-# (coordinator + mint co-resident) select the UDS transport instead;
-# `socket = ""` binds <data_dir>/mint.sock, and the client targets it
-# with `--url unix:mint_data/mint.sock`. bind and socket are mutually
-# exclusive.
-# socket = ""
+# Listener transport (docs/design-mint.md § "Transport"). `bind` and
+# `socket` are mutually exclusive. The bundled single-host dev shape
+# (coordinator + mint co-resident) uses the UDS listener:
+socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
+# For a TCP listener instead, replace the line above with:
+#   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 
 [tenant]
 bucket = "mint-demo"

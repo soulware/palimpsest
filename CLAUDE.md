@@ -53,6 +53,14 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - If a property must hold (e.g. every segment is signed), enforce it unconditionally — no fallback mode, no warn-and-continue.
 - An optional path for a correctness invariant means the invariant doesn't actually hold.
 
+## Comments
+
+**Comments describe the thing they annotate — nothing external.**
+- A comment's scope is the code or config it sits next to. Don't pad it with surrounding context, runtime behaviour, or how other components consume it, hoping it's "useful" — it's noise.
+- In config files specifically: comment only the keys in that file (what the value means, valid forms, defaults). Do not describe what the program does with it at runtime, what is configured elsewhere, or what isn't configured here.
+- Don't write comments stating what is deliberately *not* done, not done yet, or not done here. Status and rejected-alternative rationale belong in the commit message or design docs, not the source.
+- Don't expand existing comments across successive edits. Trim or delete; never accrete rationale.
+
 ## Documentation
 
 Design documentation is indexed in `README.md` and lives in `docs/`.
