@@ -996,6 +996,61 @@ serving TLS directly, with the admin credential delivered into the
 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment via systemd
 `LoadCredential=` or equivalent secrets-management.
 
+### Transport
+
+**Status:** Proposed. No implementation. Today mint serves HTTP over a
+TCP listener only (`mint serve <cfg> [bind]`, default `127.0.0.1:8085`;
+the reference client reaches it via `--url http://127.0.0.1:8085`).
+
+The transport is a property of the deployment shape, not a global
+default. The three shapes in *Admin credential custody* are all
+network-remote — the self-hosted canonical case puts mint on a
+separate trusted machine, and central custodial/proxy are off-host by
+construction — so for them TCP behind TLS is the only correct
+transport, and the macaroon + PoP auth is load-bearing precisely
+because the link is untrusted. There is a fourth shape the bundled
+single-host dev / kick-the-tyres setup, coordinator and mint
+co-resident on one box, matching the `coord run` / `coord start`
+flavours in `docs/design-deployment-modes.md` — for which a Unix
+domain socket is the better transport:
+
+- no port allocation and no accidental network exposure;
+- no TLS to stand up for a same-host hop;
+- filesystem-permission scoped, with the socket's lifecycle and
+  inspectability tied to a path under `data_dir`, consistent with the
+  coordinator's existing UDS IPC (`control.sock`, `log.sock`: clean
+  stale dentry → bind → chmod `0o666`);
+- the auth model is unchanged — the macaroon + Ed25519 PoP still
+  applies over a UDS; UDS neither weakens it nor substitutes for it.
+
+mint therefore supports two listener transports, selected per
+deployment shape rather than replacing one with the other:
+
+- **TCP** (`bind = <host:port>`) — the network shapes; TLS terminated
+  ahead of or by mint. The current and only production transport.
+- **UDS** (`socket = <path>`, default `<data_dir>/mint.sock`) — the
+  single-host dev shape. Mutually exclusive with `bind`; selecting the
+  socket transport is what makes a mint instance local-only. The
+  socket path follows the same resolution rule as `data_dir` /
+  `roles_dir` (relative resolved against cwd, absolute verbatim) and
+  is recreated on bind (stale dentry removed first), chmod `0o666` so
+  a non-root coordinator can connect.
+
+**Implementation cost.** The server half is a one-liner: `axum::serve`
+accepts a `tokio::net::UnixListener` directly. The client half is the
+real work and is unprecedented in the tree — every existing UDS in
+Elide (`elide-coordinator`, `elide-import`, the CLI) is a bespoke
+length-prefixed protocol over a raw `UnixStream`, never HTTP, and the
+two HTTP servers (mint, `elide-peer-fetch`) are TCP-only. mint's
+client is `reqwest`, which has no native UDS support; HTTP-over-UDS on
+the client side needs `hyperlocal` or a custom hyper connector. This
+is the only genuinely new building block the proposal introduces.
+
+This is the cheapest moment to settle it: there is no coordinator↔mint
+integration yet (the mint binary's reference client is the only
+client), so the transport seam can be drawn before the coordinator
+wires in.
+
 ### Reference client & demo
 
 The full flow is exercisable end-to-end from the `mint` binary alone —
