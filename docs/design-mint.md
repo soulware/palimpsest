@@ -1119,7 +1119,7 @@ url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
 `--url` above: `unix:<path>` selects the UDS leg, `http(s)://host:port`
 the TCP leg. UDS paths follow the same resolution rule as mint's own
 (relative resolved against cwd, absolute verbatim). The section is
-presence-enables, mirroring `[iam]` / `[peer_fetch]`.
+presence-enables, mirroring `[peer_fetch]`.
 
 The section is deliberately thin. The coordinator's mint identity is
 `coordinator.key` (already present for name-claims and provenance);
@@ -1130,14 +1130,12 @@ inside the macaroon. Only the endpoint — and optionally
 `connect_timeout` / `request_timeout` (humantime, mirroring
 `[store]`) — is configurable.
 
-`[mint]` and the in-process `[iam]` backend are mutually exclusive
-credential planes behind the same coordinator credential seam. Per
-*Elide as customer* the IAM-key inventory collapses under mint, so
-`[iam]` and the coordinator's in-process Tigris path are **removed**,
-not retained as a fallback — an optional path for the credential
-plane would mean the per-volume scoping property does not actually
-hold. The shared-key downgrade (no `[mint]` and no `[iam]` section at
-all — the local-store / no-IAM case) is unaffected.
+The coordinator credential plane has exactly two states: `[mint]`
+present (per-volume scoping via the role inventory below), or absent
+(the shared-key downgrade — local-store / no-IAM, every volume gets
+the coordinator's own key). There is no in-process per-volume IAM
+path: an optional path for the credential plane would mean the
+per-volume scoping property does not actually hold.
 
 ### Coordinator store architecture
 

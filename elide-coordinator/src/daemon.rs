@@ -172,58 +172,13 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // peer-fetch is unconfigured.
     elide_coordinator::tasks::set_peer_fetch_handle(peer_fetch_handle);
 
-    // Credential issuer. `[iam]` enables the in-process Tigris path
-    // (docs/design-iam-key-model.md); `[mint]` routes per-volume RO
-    // issuance through the external mint service
-    // (docs/design-mint.md § "Coordinator configuration"). They are
-    // two credential planes behind the same seam — mutually exclusive.
-    // Neither section keeps the shared-key downgrade (every volume
-    // gets the coordinator's own AWS_* key).
-    if config.iam.is_some() && config.mint.is_some() {
-        anyhow::bail!(
-            "[iam] and [mint] are mutually exclusive credential planes — configure one, not both"
-        );
-    }
-    let credentialer: Option<std::sync::Arc<dyn crate::credential::Credentialer>> = match &config
-        .iam
-    {
-        Some(iam_cfg) => {
-            let bucket = config.store.bucket.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "[iam] section requires an S3 store with `bucket` set (no IAM keys for local stores)"
-                    )
-                })?;
-            let admin = iam_cfg.resolve_admin().with_context(
-                || "resolving IAM admin credentials from env (set via the env vars named in [iam])",
-            )?;
-            let mut tigris_cfg = elide_tigris_iam::TigrisIamConfig::tigris(
-                admin.access_key_id,
-                admin.secret_access_key,
-            );
-            tigris_cfg.endpoint = iam_cfg.endpoint.clone();
-            tigris_cfg.region = iam_cfg.region.clone();
-            let manager = crate::iam::VolumeIamManager::new(
-                tigris_cfg,
-                bucket,
-                identity.coordinator_id_str().to_owned(),
-                config.data_dir.clone(),
-                iam_cfg.ro_key_lifetime,
-                iam_cfg.source_ips.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("building IAM manager: {e}"))?;
-            let credentialer: std::sync::Arc<dyn crate::credential::Credentialer> =
-                std::sync::Arc::new(manager);
-            set_credential_issuer(crate::iam::IamCredentialIssuer::new(
-                credentialer.clone(),
-                config.data_dir.clone(),
-            ));
-            info!(
-                "[coordinator] credential issuer: per-volume Tigris IAM (endpoint {})",
-                iam_cfg.endpoint
-            );
-            Some(credentialer)
-        }
-        None => match &config.mint {
+    // Credential issuer. `[mint]` routes per-volume RO issuance
+    // through the external mint service (docs/design-mint.md
+    // § "Coordinator configuration"); its absence keeps the shared-key
+    // downgrade where every volume gets the coordinator's own AWS_*
+    // key.
+    let credentialer: Option<std::sync::Arc<dyn crate::credential::Credentialer>> =
+        match &config.mint {
             Some(mint_cfg) => {
                 mint_cfg.validate()?;
                 let credentialer: std::sync::Arc<dyn crate::credential::Credentialer> =
@@ -246,8 +201,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 set_credential_issuer(SharedKeyPassthrough::new_with_warning());
                 None
             }
-        },
-    };
+        };
 
     info!(
         "[coordinator] data_dir: {}; drain every {}, scan every {}; elide bin: {}",

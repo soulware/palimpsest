@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "elide-core", "elide-fetch", "elide-import", "elide-coordinator", "elide-peer-fetch", "elide-tigris-iam"]
+members = [".", "elide-core", "elide-fetch", "elide-import", "elide-coordinator", "elide-peer-fetch"]
 # `mint` is its own workspace (mint/Cargo.toml has [workspace]): it is
 # Standalone-OSS-to-be and must build/test/lint independently of elide.
 # Excluded so `cargo … --workspace` from the root never touches it; it

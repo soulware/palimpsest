@@ -29,7 +29,6 @@ elide-core   = { path = "../elide-core" }
 lz4_flex     = "0.11"
 elide-fetch  = { path = "../elide-fetch" }
 elide-peer-fetch = { path = "../elide-peer-fetch" }
-elide-tigris-iam = { path = "../elide-tigris-iam" }
 futures      = "0.3"
 humantime-serde = "1"
 nix          = { version = "0.31", features = ["process", "signal", "user"] }

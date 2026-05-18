@@ -97,19 +97,11 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub peer_fetch: PeerFetchConfig,
 
-    /// IAM-managed credentials. Optional; absence keeps the shared-key
-    /// downgrade (every volume gets the coordinator's own key).
-    /// Presence enables Tigris-style per-volume IAM keys
-    /// (`docs/design-iam-key-model.md`).
-    #[serde(default)]
-    pub iam: Option<IamConfig>,
-
     /// External `mint` credential service. Optional; absence keeps the
-    /// `[iam]` / shared-key behaviour. Presence routes per-volume RO
-    /// issuance through mint's `assume-role` over the configured
-    /// endpoint (`docs/design-mint.md` § "Coordinator configuration").
-    /// Mutually exclusive with `[iam]` — they are two credential
-    /// planes behind the same seam.
+    /// shared-key downgrade (every volume gets the coordinator's own
+    /// key). Presence routes per-volume RO issuance through mint's
+    /// `assume-role` over the configured endpoint
+    /// (`docs/design-mint.md` § "Coordinator configuration").
     #[serde(default)]
     pub mint: Option<MintConfig>,
 }
@@ -305,9 +297,8 @@ impl StoreSection {
 
     /// Build the S3 store with an explicitly-supplied access key pair,
     /// bypassing the `AWS_*` env vars `AmazonS3Builder::from_env`
-    /// reads. Used by the `[iam]`-mode path where the coordinator
-    /// signs S3 mutations with a minted writer key, not with env
-    /// credentials.
+    /// reads. Used by the `[mint]` path, which signs S3 ops with a
+    /// keypair mint vended for the role, not with env credentials.
     ///
     /// Behaviour matches `build` for the local-store and default
     /// fallback branches; only the S3 branch differs (explicit
@@ -328,8 +319,8 @@ impl StoreSection {
         }
         let Some(bucket) = &self.bucket else {
             bail!(
-                "[iam] mode requires an S3 [store] section (bucket set); local-only stores \
-                 cannot mint a writer key"
+                "[mint] requires an S3 [store] section (bucket set); a local-only store \
+                 has no role keypair to vend"
             );
         };
         let mut builder = AmazonS3Builder::new()
@@ -576,25 +567,11 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # retention_window     = "10m"   # how long GC inputs stay in S3 before reaping
 # max_buckets_per_tick = 4       # max independent output buckets per GC tick
 
-[iam]
-# Presence of this section enables Tigris-style per-volume IAM keys
-# (docs/design-iam-key-model.md). Absence keeps the shared-key
-# downgrade where every volume gets the coordinator's own AWS_* key.
-#
-# When [iam] is set, AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY hold the
-# IAM *admin* credential — the coordinator uses them to mint its
-# writer key on first start, then signs all S3 mutations with the
-# writer key. The admin credential is held in memory only.
-#
-# endpoint = "https://iam.storage.dev"   # Tigris IAM endpoint
-# region   = "us-east-1"                  # SigV4 signing region
-# ro_key_lifetime = "720h"                # DateLessThan default
-# source_ips      = []                    # optional egress IP pins
-
 # [mint] — opt-in; uncomment the header and `url` to enable. Routes
 # per-volume RO credential issuance through the external `mint`
 # service's `assume-role` (docs/design-mint.md § "Coordinator
-# configuration"). Mutually exclusive with [iam]. The coordinator's
+# configuration"). Absence keeps the shared-key downgrade where every
+# volume gets the coordinator's own AWS_* key. The coordinator's
 # mint identity is its existing `coordinator.key`; the per-role
 # capability macaroons live under <data_dir>/credentials/<role>
 # (provisioned by enrollment, not here). `url` is required and is
@@ -643,7 +620,6 @@ impl Default for CoordinatorConfig {
             elide_import_bin: default_elide_import_bin(),
             gc: GcConfig::default(),
             peer_fetch: PeerFetchConfig::default(),
-            iam: None,
             mint: None,
         }
     }
@@ -723,82 +699,6 @@ pub struct PeerFetchConfig {
     /// balancer). Only relevant when `port` is set.
     #[serde(default)]
     pub host: Option<String>,
-}
-
-/// IAM-managed credentials. Enables per-volume IAM keys via the
-/// Tigris IAM API (`docs/design-iam-key-model.md`).
-///
-/// When `[iam]` is present, the standard `AWS_ACCESS_KEY_ID` /
-/// `AWS_SECRET_ACCESS_KEY` env vars hold the **admin** credential —
-/// the coordinator uses them to talk to the IAM API and to bootstrap
-/// the coordinator's writer key. Subsequent S3 mutations are signed
-/// with the minted writer key, not with `AWS_*`. When `[iam]` is
-/// absent the same env vars play their conventional role: direct S3
-/// store credentials, no writer-key indirection.
-#[derive(Deserialize, Clone, Debug)]
-pub struct IamConfig {
-    /// Tigris IAM endpoint. Defaults to `https://iam.storage.dev`.
-    #[serde(default = "default_iam_endpoint")]
-    pub endpoint: String,
-
-    /// SigV4 signing region. Defaults to `us-east-1` (matches the
-    /// AWS-CLI default for IAM; Tigris IAM is region-agnostic).
-    #[serde(default = "default_iam_region")]
-    pub region: String,
-
-    /// Default lifetime of per-volume RO key policies (`DateLessThan`
-    /// in the policy condition). Refreshed on a schedule before
-    /// expiry; see `docs/design-iam-key-model.md` § "Lifecycle".
-    /// Default: 30 days.
-    #[serde(default = "default_ro_key_lifetime", with = "humantime_serde")]
-    pub ro_key_lifetime: Duration,
-
-    /// Optional egress IP CIDR(s) added as an `IpAddress` condition on
-    /// per-volume RO keys (defence-in-depth). Empty = no IP pin.
-    #[serde(default)]
-    pub source_ips: Vec<String>,
-}
-
-fn default_iam_endpoint() -> String {
-    "https://iam.storage.dev".to_owned()
-}
-fn default_iam_region() -> String {
-    "us-east-1".to_owned()
-}
-fn default_ro_key_lifetime() -> Duration {
-    Duration::from_secs(30 * 24 * 60 * 60)
-}
-
-/// Admin credentials resolved from env at startup. Held only in
-/// memory; never written to disk.
-#[derive(Clone)]
-pub struct IamAdminCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-}
-
-impl IamConfig {
-    /// Resolve the admin credentials from the standard `AWS_*` env
-    /// vars. In `[iam]` mode these vars carry the admin credential, not
-    /// the coordinator's S3 store credential. Returns an error naming
-    /// the missing var so operators can act on it directly; the values
-    /// themselves are never logged.
-    pub fn resolve_admin(&self) -> Result<IamAdminCredentials> {
-        let access_key_id =
-            std::env::var("AWS_ACCESS_KEY_ID").with_context(|| "reading AWS_ACCESS_KEY_ID")?;
-        if access_key_id.is_empty() {
-            bail!("AWS_ACCESS_KEY_ID is set but empty");
-        }
-        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-            .with_context(|| "reading AWS_SECRET_ACCESS_KEY")?;
-        if secret_access_key.is_empty() {
-            bail!("AWS_SECRET_ACCESS_KEY is set but empty");
-        }
-        Ok(IamAdminCredentials {
-            access_key_id,
-            secret_access_key,
-        })
-    }
 }
 
 impl PeerFetchConfig {
@@ -958,40 +858,6 @@ mod tests {
 
         let no_explicit_no_hostname = PeerFetchConfig::default();
         assert_eq!(no_explicit_no_hostname.advertised_host(None), "0.0.0.0");
-    }
-
-    #[test]
-    fn iam_section_absent_by_default() {
-        let cfg = CoordinatorConfig::default();
-        assert!(cfg.iam.is_none());
-    }
-
-    #[test]
-    fn iam_section_parses_with_defaults() {
-        let toml_str = "[iam]\n";
-        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
-        let iam = cfg.iam.expect("iam present");
-        assert_eq!(iam.endpoint, "https://iam.storage.dev");
-        assert_eq!(iam.region, "us-east-1");
-        assert_eq!(iam.ro_key_lifetime, Duration::from_secs(30 * 24 * 60 * 60));
-        assert!(iam.source_ips.is_empty());
-    }
-
-    #[test]
-    fn iam_section_parses_overrides() {
-        let toml_str = r#"
-            [iam]
-            endpoint = "https://iam.example.test"
-            region = "eu-west-1"
-            ro_key_lifetime = "24h"
-            source_ips = ["203.0.113.5/32"]
-        "#;
-        let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
-        let iam = cfg.iam.expect("iam present");
-        assert_eq!(iam.endpoint, "https://iam.example.test");
-        assert_eq!(iam.region, "eu-west-1");
-        assert_eq!(iam.ro_key_lifetime, Duration::from_secs(24 * 60 * 60));
-        assert_eq!(iam.source_ips, vec!["203.0.113.5/32".to_owned()]);
     }
 
     #[test]

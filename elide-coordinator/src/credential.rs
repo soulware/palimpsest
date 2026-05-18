@@ -2,12 +2,11 @@
 //
 // `CredentialIssuer` is the abstraction used by the inbound
 // `credentials` handler to turn an authenticated request into an S3
-// access triple. The minimum-viable backend is `SharedKeyPassthrough`,
-// which returns the coordinator's own configured key — a "downgrade
-// mode" with no per-volume IAM scoping, equivalent to today's
-// `get-store-creds` behaviour but reached through the macaroon
-// handshake. Per-volume backends (AWS STS, Tigris IAM) are planned
-// and slot in behind this same trait.
+// access triple. `SharedKeyPassthrough` returns the coordinator's own
+// configured key — a "downgrade mode" with no per-volume scoping,
+// reached through the macaroon handshake. The per-volume backend is
+// the external `mint` service (`crate::mint_client`), selected when
+// `[mint]` is configured; it slots in behind this same trait.
 //
 // Coordinator identity (signing key + macaroon MAC root) lives in
 // `crate::identity` — see `docs/design-portable-live-volume.md`
@@ -39,25 +38,22 @@ pub struct IssuedCredentials {
 /// macaroon handshake (volume binding, PID check, MAC verify) runs
 /// upstream and is identical for every backend.
 ///
-/// `issue` is async because the IAM-backed impl may need to call out to
-/// the IAM service to mint or rotate per-volume keys. The shared-key
+/// `issue` is async because the mint-backed impl calls out to the
+/// external mint service to vend per-volume keys. The shared-key
 /// passthrough impl returns immediately from cache.
 #[async_trait]
 pub trait CredentialIssuer: Send + Sync {
     async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials>;
 }
 
-/// Lower-layer abstraction over whatever component actually mints
-/// per-volume IAM material. The in-process Tigris implementation
-/// (`crate::iam::VolumeIamManager`) talks directly to the Tigris IAM
-/// Query API; alternative implementations could speak the same trait
-/// over a Unix-domain socket to a sidecar process or over an
-/// authenticated network channel to a central credentialer service —
-/// see `docs/design-iam-key-model.md` § "Admin key containment".
+/// Lower-layer abstraction over whatever component actually vends
+/// per-volume credential material. The implementation is
+/// `crate::mint_client::MintCredentialer`, which exercises the
+/// external mint service's `assume-role` over the configured endpoint
+/// (`docs/design-mint.md` § "Coordinator configuration").
 ///
-/// Today the trait carries only the per-volume RO key lifecycle.
-/// Writer / peer-fetch / ephemeral fetch keys land here as those
-/// slices are wired.
+/// The trait carries the per-volume RO key lifecycle; the coordinator's
+/// own coord-* roles are handled separately via `crate::mint_stores`.
 #[async_trait]
 pub trait Credentialer: Send + Sync {
     /// Mint (or return cached) per-volume read-only credentials whose
