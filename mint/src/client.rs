@@ -50,6 +50,8 @@ pub enum ClientError {
     Io(#[from] io::Error),
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("uds http: {0}")]
+    Uds(String),
     #[error("{KEY_FILE} already exists in {0} (use --force to overwrite)")]
     KeyExists(String),
     #[error("malformed {0}")]
@@ -169,24 +171,91 @@ fn read_macaroon_arg(src: &str) -> Result<Macaroon, ClientError> {
     Macaroon::decode(text.trim()).map_err(|_| ClientError::BadFile("bootstrap macaroon"))
 }
 
-/// POST `body` with the macaroon + PoP, return `(status, text)`.
+/// Listener target parsed from `--url` (`docs/design-mint.md`
+/// § *Transport*): a normal `http(s)://host:port` base (TCP — the
+/// network shapes) or `unix:<socket-path>` (UDS — the bundled
+/// single-host dev shape). The request line, macaroon, and Ed25519 PoP
+/// are identical over either; only the connector differs.
+enum Target<'a> {
+    Tcp(&'a str),
+    Uds(&'a str),
+}
+
+fn parse_target(base_url: &str) -> Target<'_> {
+    match base_url.strip_prefix("unix:") {
+        Some(path) => Target::Uds(path),
+        None => Target::Tcp(base_url),
+    }
+}
+
+/// POST `body` to `<base_url><endpoint>` with the macaroon + PoP,
+/// return `(status, text)`. The transport is selected by the `--url`
+/// scheme; auth is unchanged across both.
 async fn post(
-    url: &str,
+    base_url: &str,
+    endpoint: &str,
     mac: &Macaroon,
     seed: &[u8; 32],
     body: String,
 ) -> Result<(u16, String), ClientError> {
     let sig = pop::client_signature(seed, mac.tail(), body.as_bytes());
-    let resp = reqwest::Client::new()
-        .post(url)
-        .header("authorization", format!("Macaroon {}", mac.encode()))
+    let auth = format!("Macaroon {}", mac.encode());
+    match parse_target(base_url) {
+        Target::Tcp(base) => {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}{endpoint}"))
+                .header("authorization", auth)
+                .header("x-mint-coord-pop", sig)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            Ok((status, resp.text().await?))
+        }
+        Target::Uds(socket) => post_uds(socket, endpoint, &auth, &sig, body).await,
+    }
+}
+
+/// HTTP-over-UDS leg. `reqwest` has no UDS support, so this is the one
+/// place the client drops to `hyper` directly, dialing the socket via
+/// `hyperlocal`'s `UnixConnector`. Transport errors collapse to a
+/// single string — there is nothing the caller branches on, only
+/// surfaces.
+async fn post_uds(
+    socket: &str,
+    endpoint: &str,
+    auth: &str,
+    sig: &str,
+    body: String,
+) -> Result<(u16, String), ClientError> {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let client: Client<_, Full<bytes::Bytes>> =
+        Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
+    let uri: hyper::Uri = hyperlocal::Uri::new(socket, endpoint).into();
+    let req = hyper::Request::builder()
+        .method(hyper::Method::POST)
+        .uri(uri)
+        .header("authorization", auth)
         .header("x-mint-coord-pop", sig)
         .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await?;
+        .body(Full::new(bytes::Bytes::from(body)))
+        .map_err(|e| ClientError::Uds(e.to_string()))?;
+    let resp = client
+        .request(req)
+        .await
+        .map_err(|e| ClientError::Uds(e.to_string()))?;
     let status = resp.status().as_u16();
-    Ok((status, resp.text().await?))
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| ClientError::Uds(e.to_string()))?
+        .to_bytes();
+    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn json_field(body: &str, key: &'static str) -> Result<String, ClientError> {
@@ -288,7 +357,7 @@ pub async fn enroll(
     );
     eprintln!("  → POST {base_url}/v1/enroll  (signed with your client key)");
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
-    let (status, text) = post(&format!("{base_url}/v1/enroll"), &presented, &seed, body).await?;
+    let (status, text) = post(base_url, "/v1/enroll", &presented, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
@@ -333,13 +402,7 @@ pub async fn exchange(
         now_unix(),
         serde_json::Value::from(role)
     );
-    let (status, text) = post(
-        &format!("{base_url}/v1/enroll-exchange"),
-        &ticket,
-        &seed,
-        body,
-    )
-    .await?;
+    let (status, text) = post(base_url, "/v1/enroll-exchange", &ticket, &seed, body).await?;
     match status {
         200 => {
             let credential = json_field(&text, "credential")?;
@@ -456,7 +519,7 @@ pub async fn assume_role(
         caveats.len()
     );
     let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
-    let (status, text) = post(&format!("{base_url}/v1/assume-role"), &mac, &seed, body).await?;
+    let (status, text) = post(base_url, "/v1/assume-role", &mac, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
@@ -563,6 +626,28 @@ mod tests {
         assert!(matches!(
             build_request_body(Some("{not json"), "r", 1, 1),
             Err(ClientError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn url_scheme_selects_transport() {
+        assert!(matches!(
+            parse_target("http://127.0.0.1:8085"),
+            Target::Tcp("http://127.0.0.1:8085")
+        ));
+        assert!(matches!(
+            parse_target("https://mint.example:443"),
+            Target::Tcp(_)
+        ));
+        // `unix:` strips to the bare socket path; the HTTP request path
+        // is the endpoint, supplied separately.
+        assert!(matches!(
+            parse_target("unix:/var/lib/mint/mint.sock"),
+            Target::Uds("/var/lib/mint/mint.sock")
+        ));
+        assert!(matches!(
+            parse_target("unix:relative/mint.sock"),
+            Target::Uds("relative/mint.sock")
         ));
     }
 

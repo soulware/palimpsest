@@ -23,6 +23,15 @@ roles_dir = "examples/demo_roles"
 # Each role's template defaults to <roles_dir>/<name>.json (read ->
 # examples/demo_roles/read.json); set policy_file only to override.
 
+# Listener transport (docs/design-mint.md § "Transport"). Default is
+# TCP 127.0.0.1:8085 — the reference client reaches it with
+# `--url http://127.0.0.1:8085`. For the bundled single-host dev shape
+# (coordinator + mint co-resident) select the UDS transport instead;
+# `socket = ""` binds <data_dir>/mint.sock, and the client targets it
+# with `--url unix:mint_data/mint.sock`. bind and socket are mutually
+# exclusive.
+# socket = ""
+
 [tenant]
 bucket = "mint-demo"
 

@@ -12,6 +12,7 @@
 //! and role definitions stay on separate management planes.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
@@ -43,6 +44,17 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "bind and socket are mutually exclusive — set one (TCP) or the \
+         other (UDS), not both"
+    )]
+    ConflictingListener,
+    #[error("bind {value:?} is not a valid host:port: {source}")]
+    BadBindAddr {
+        value: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +79,23 @@ pub struct RawConfig {
     /// as `data_dir`; defaults to `mint_roles`.
     #[serde(default)]
     pub roles_dir: Option<String>,
+    /// TCP listener address (`host:port`). The network deployment
+    /// shapes — self-hosted on a separate trusted machine, central
+    /// custodial/proxy — all use this; TLS is terminated ahead of or by
+    /// mint. Mutually exclusive with `socket`. When neither is set the
+    /// listener defaults to TCP `127.0.0.1:8085`.
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Unix-domain-socket listener path — the bundled single-host dev
+    /// shape (coordinator + mint co-resident, matching `coord run` /
+    /// `coord start`). Selecting it is what makes a mint instance
+    /// local-only: no port, no accidental network exposure, no
+    /// same-host TLS, filesystem-permission scoped. Mutually exclusive
+    /// with `bind`. Same resolution rule as `data_dir` (relative
+    /// against cwd, absolute verbatim); an empty value selects UDS at
+    /// the default `<data_dir>/mint.sock`.
+    #[serde(default)]
+    pub socket: Option<String>,
     pub tenant: Tenant,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
@@ -143,6 +172,26 @@ pub struct RawRole {
     pub policy_file: Option<String>,
 }
 
+/// Resolved listener transport — a per-deployment-shape choice, not a
+/// global default (`docs/design-mint.md` § *Transport*). The macaroon +
+/// Ed25519 PoP auth is identical over either; the socket neither
+/// weakens nor substitutes for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listener {
+    /// The network shapes. TLS terminated ahead of or by mint.
+    Tcp(SocketAddr),
+    /// The single-host dev shape. Recreated on bind (stale dentry
+    /// removed first), chmod `0o666` so a non-root coordinator can
+    /// connect.
+    Uds(PathBuf),
+}
+
+/// Default TCP listener when neither `bind` nor `socket` is configured.
+pub const DEFAULT_BIND: &str = "127.0.0.1:8085";
+/// Socket filename under `data_dir` when `socket` is selected without
+/// an explicit path.
+pub const DEFAULT_SOCKET_NAME: &str = "mint.sock";
+
 /// Validated configuration, ready to serve.
 #[derive(Debug)]
 pub struct Config {
@@ -157,6 +206,9 @@ pub struct Config {
     /// `mint_roles`. Retained for diagnostics; policies are already
     /// resolved into [`Role::policy`].
     pub roles_dir: PathBuf,
+    /// The resolved listener transport. The CLI may still override this
+    /// with an explicit `--bind` (the TCP single-host override).
+    pub listener: Listener,
     pub tenant: Tenant,
     /// Resolved from the AWS environment at load time. `None` when the
     /// env is unset (fine for the prototype's faked minter; a real
@@ -218,18 +270,56 @@ impl Config {
                 return Err(ConfigError::DuplicateRole(r.name));
             }
         }
+        let data_dir = raw
+            .data_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("mint_data"));
+        let listener = resolve_listener(raw.bind.as_deref(), raw.socket.as_deref(), &data_dir)?;
         Ok(Config {
             audience: raw.audience,
-            data_dir: raw
-                .data_dir
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("mint_data")),
+            data_dir,
             roles_dir,
+            listener,
             tenant: raw.tenant,
             admin: AdminCredential::from_env(),
             roles,
         })
     }
+}
+
+/// Resolve the listener transport from the mutually-exclusive `bind` /
+/// `socket` keys (`docs/design-mint.md` § *Transport*):
+///
+/// - both set → [`ConfigError::ConflictingListener`];
+/// - `socket` non-empty → UDS at that path (relative against cwd,
+///   absolute verbatim — the `data_dir` rule);
+/// - `socket` present but empty → UDS at `<data_dir>/mint.sock`;
+/// - `bind` set → TCP at that parsed address;
+/// - neither → TCP at [`DEFAULT_BIND`] (the production default;
+///   selecting the socket is the deliberate act that makes an instance
+///   local-only).
+fn resolve_listener(
+    bind: Option<&str>,
+    socket: Option<&str>,
+    data_dir: &Path,
+) -> Result<Listener, ConfigError> {
+    match (bind, socket) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingListener),
+        (None, Some(s)) => Ok(Listener::Uds(if s.is_empty() {
+            data_dir.join(DEFAULT_SOCKET_NAME)
+        } else {
+            PathBuf::from(s)
+        })),
+        (Some(b), None) => parse_bind(b).map(Listener::Tcp),
+        (None, None) => parse_bind(DEFAULT_BIND).map(Listener::Tcp),
+    }
+}
+
+fn parse_bind(value: &str) -> Result<SocketAddr, ConfigError> {
+    value.parse().map_err(|source| ConfigError::BadBindAddr {
+        value: value.to_owned(),
+        source,
+    })
 }
 
 /// Read a role's policy template from `<roles_dir>/<policy_file>`.
@@ -367,6 +457,69 @@ policy_file = "volume-ro.json"
         let toml = SAMPLE.replace("policy_file = \"volume-ro.json\"\n", "");
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
         assert_eq!(c.roles["volume-ro"].policy, "{}");
+    }
+
+    #[test]
+    fn listener_defaults_to_tcp_8085() {
+        let c = parse_for_test(SAMPLE, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.listener, Listener::Tcp("127.0.0.1:8085".parse().unwrap()));
+    }
+
+    #[test]
+    fn explicit_bind_is_parsed() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nbind = \"0.0.0.0:9000\"",
+        );
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.listener, Listener::Tcp("0.0.0.0:9000".parse().unwrap()));
+    }
+
+    #[test]
+    fn bad_bind_is_rejected() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nbind = \"not-an-addr\"",
+        );
+        assert!(matches!(
+            parse_for_test(&toml, &[("volume-ro.json", "{}")]),
+            Err(ConfigError::BadBindAddr { .. })
+        ));
+    }
+
+    #[test]
+    fn socket_path_selects_uds_verbatim() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nsocket = \"/run/mint.sock\"",
+        );
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.listener, Listener::Uds(PathBuf::from("/run/mint.sock")));
+    }
+
+    #[test]
+    fn empty_socket_selects_uds_at_default_under_data_dir() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\ndata_dir = \"/var/lib/mint\"\nsocket = \"\"",
+        );
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(
+            c.listener,
+            Listener::Uds(PathBuf::from("/var/lib/mint/mint.sock"))
+        );
+    }
+
+    #[test]
+    fn bind_and_socket_together_are_rejected() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nbind = \"127.0.0.1:8085\"\nsocket = \"/run/mint.sock\"",
+        );
+        assert!(matches!(
+            parse_for_test(&toml, &[("volume-ro.json", "{}")]),
+            Err(ConfigError::ConflictingListener)
+        ));
     }
 
     #[test]

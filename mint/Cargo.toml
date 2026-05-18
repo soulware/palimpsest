@@ -16,14 +16,19 @@ description = "Macaroon-authenticated scoped-credential vending for Tigris (prot
 async-trait          = "0.1"
 aws-credential-types = "1"
 aws-sigv4            = { version = "1", default-features = false, features = ["sign-http", "http1"] }
-axum                 = "0.7"
+axum                 = "0.8"
 base64               = "0.22"
 blake3               = "1"
+bytes                = "1"
 chrono               = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap                 = { version = "4", features = ["derive"] }
 ed25519-dalek        = "2"
 handlebars           = "6"
 http                 = "1"
+http-body-util       = "0.1"
+hyper                = { version = "1", features = ["client", "http1"] }
+hyper-util           = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyperlocal           = { version = "0.9", default-features = false, features = ["client"] }
 quick-xml            = "0.38"
 rand_core            = { version = "0.6", features = ["getrandom"] }
 reqwest              = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }

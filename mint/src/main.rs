@@ -13,12 +13,13 @@
 //! `mint client` (the coordinator's half) is the staged tail.
 
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use mint::audit::AuditLog;
-use mint::config::Config;
+use mint::config::{Config, Listener};
 use mint::http::{AppState, router};
 use mint::iam::{FakeMinter, KeypairMinter};
 use mint::issuance::mint_bootstrap;
@@ -38,8 +39,11 @@ enum Command {
     Serve {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:8085")]
-        bind: SocketAddr,
+        /// TCP `host:port` override. Forces the TCP transport, taking
+        /// precedence over the config's `bind`/`socket`. Omit to use
+        /// the listener the config resolves to.
+        #[arg(long)]
+        bind: Option<SocketAddr>,
         /// Use the real Tigris IAM minter (requires a Tigris admin
         /// credential in the environment). Without it, assume-role
         /// returns a deterministic fake keypair.
@@ -88,6 +92,8 @@ enum ClientCmd {
     /// Attenuate the bootstrap macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
     Enroll {
+        /// mint endpoint: `http(s)://host:port` (TCP) or
+        /// `unix:<socket-path>` (the single-host UDS shape).
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
         /// Opaque principal id — the `sub` (Elide: coordinator ULID).
@@ -105,6 +111,8 @@ enum ClientCmd {
     /// Exchange the credential ticket for the credential (after
     /// approval). Exits 2 while still awaiting operator approval.
     Exchange {
+        /// mint endpoint: `http(s)://host:port` (TCP) or
+        /// `unix:<socket-path>` (the single-host UDS shape).
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
         /// Role to exchange the ticket for. One credential per role —
@@ -121,6 +129,8 @@ enum ClientCmd {
     },
     /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
+        /// mint endpoint: `http(s)://host:port` (TCP) or
+        /// `unix:<socket-path>` (the single-host UDS shape).
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
         /// Credential filename (under the client dir) to exercise.
@@ -269,7 +279,7 @@ fn open_store(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
 
 async fn serve(
     config: &Path,
-    bind: SocketAddr,
+    bind_override: Option<SocketAddr>,
     tigris: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -307,16 +317,38 @@ async fn serve(
         "loaded config"
     );
 
+    // An explicit --bind forces TCP, overriding the config's resolved
+    // listener (the single-host TCP override). Otherwise the config's
+    // bind/socket choice stands. Resolved before `config` moves into
+    // the app state.
+    let transport = match bind_override {
+        Some(addr) => Listener::Tcp(addr),
+        None => config.listener.clone(),
+    };
+
     let state = AppState {
         config,
         minter,
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
     };
-
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "mint listening");
-    axum::serve(listener, router(state)).await?;
+    match transport {
+        Listener::Tcp(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(%addr, "mint listening (tcp)");
+            axum::serve(listener, router(state)).await?;
+        }
+        Listener::Uds(path) => {
+            // Coordinator UDS idiom: clear the stale dentry, bind, then
+            // chmod 0o666 so a non-root coordinator can connect (the
+            // socket inherits the binding process's umask otherwise).
+            let _ = std::fs::remove_file(&path);
+            let listener = tokio::net::UnixListener::bind(&path)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
+            tracing::info!(path = %path.display(), "mint listening (uds)");
+            axum::serve(listener, router(state)).await?;
+        }
+    }
     Ok(())
 }
 

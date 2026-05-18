@@ -1054,10 +1054,6 @@ serving TLS directly, with the admin credential delivered into the
 
 ### Transport
 
-**Status:** Proposed. No implementation. Today mint serves HTTP over a
-TCP listener only (`mint serve <cfg> [bind]`, default `127.0.0.1:8085`;
-the reference client reaches it via `--url http://127.0.0.1:8085`).
-
 The transport is a property of the deployment shape, not a global
 default. The three shapes in *Admin credential custody* are all
 network-remote — the self-hosted canonical case puts mint on a
@@ -1079,33 +1075,33 @@ domain socket is the better transport:
 - the auth model is unchanged — the macaroon + Ed25519 PoP still
   applies over a UDS; UDS neither weakens it nor substitutes for it.
 
-mint therefore supports two listener transports, selected per
-deployment shape rather than replacing one with the other:
+mint supports two listener transports, selected per deployment shape
+rather than replacing one with the other, via two mutually-exclusive
+top-level config keys:
 
 - **TCP** (`bind = <host:port>`) — the network shapes; TLS terminated
-  ahead of or by mint. The current and only production transport.
-- **UDS** (`socket = <path>`, default `<data_dir>/mint.sock`) — the
-  single-host dev shape. Mutually exclusive with `bind`; selecting the
-  socket transport is what makes a mint instance local-only. The
-  socket path follows the same resolution rule as `data_dir` /
-  `roles_dir` (relative resolved against cwd, absolute verbatim) and
-  is recreated on bind (stale dentry removed first), chmod `0o666` so
-  a non-root coordinator can connect.
+  ahead of or by mint. The production transport, and the default: when
+  neither key is set the listener is TCP `127.0.0.1:8085`. `mint serve
+  --bind <host:port>` overrides the config and forces TCP (the
+  single-host TCP override).
+- **UDS** (`socket = <path>`) — the single-host dev shape. Mutually
+  exclusive with `bind`; selecting the socket is the deliberate act
+  that makes a mint instance local-only. The path follows the same
+  resolution rule as `data_dir` / `roles_dir` (relative resolved
+  against cwd, absolute verbatim); an empty value (`socket = ""`)
+  selects UDS at the default `<data_dir>/mint.sock`. The socket is
+  recreated on bind (stale dentry removed first), chmod `0o666` so a
+  non-root coordinator can connect. The reference client targets it
+  with `--url unix:<socket-path>`; the `unix:` scheme is the only
+  thing that differs from the TCP `--url http(s)://host:port` form —
+  the request line, macaroon, and PoP are identical.
 
-**Implementation cost.** The server half is a one-liner: `axum::serve`
-accepts a `tokio::net::UnixListener` directly. The client half is the
-real work and is unprecedented in the tree — every existing UDS in
-Elide (`elide-coordinator`, `elide-import`, the CLI) is a bespoke
-length-prefixed protocol over a raw `UnixStream`, never HTTP, and the
-two HTTP servers (mint, `elide-peer-fetch`) are TCP-only. mint's
-client is `reqwest`, which has no native UDS support; HTTP-over-UDS on
-the client side needs `hyperlocal` or a custom hyper connector. This
-is the only genuinely new building block the proposal introduces.
-
-This is the cheapest moment to settle it: there is no coordinator↔mint
-integration yet (the mint binary's reference client is the only
-client), so the transport seam can be drawn before the coordinator
-wires in.
+The server accepts a `tokio::net::UnixListener` directly through
+`axum::serve` (axum 0.8). The client UDS leg is the one place mint
+drops below `reqwest` — which has no UDS support — to `hyper` dialed
+through `hyperlocal`'s `UnixConnector`; the TCP leg stays on
+`reqwest`. mint is its own workspace, so the axum 0.8 dependency is
+contained to it.
 
 ### Reference client & demo
 
