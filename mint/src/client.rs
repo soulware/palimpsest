@@ -8,9 +8,10 @@
 //! the 32-byte Ed25519 material with a trailing newline; the private
 //! `client.key` is mode 0600. Both live under a client directory
 //! defaulting to `./mint_client` (analogous to the server's
-//! `./mint_data`), overridable with `--client-dir`. The intermediate
-//! and primary macaroons received from the server are persisted there
-//! too, so the client is self-contained.
+//! `./mint_data`), overridable with `--client-dir`. The credential
+//! ticket and credential received from the server are persisted there
+//! too (file names are `--out`/`--in` overridable), so the client is
+//! self-contained.
 
 use std::fs;
 use std::io::{self, Read};
@@ -20,15 +21,19 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 
-use crate::caveat::{Caveat, name};
+use crate::caveat::{Caveat, name, op};
 use crate::macaroon::Macaroon;
 use crate::pop;
 use crate::state::fingerprint;
 
 const KEY_FILE: &str = "client.key";
 const PUB_FILE: &str = "client.pub";
-const INTERMEDIATE_FILE: &str = "intermediate";
-const PRIMARY_FILE: &str = "primary";
+/// Default `enroll --out` / `exchange --in`: the credential ticket —
+/// the short-lived, redeem-once token you trade in at the exchange.
+pub const CREDENTIAL_TICKET_FILE: &str = "credential.ticket";
+/// Default `exchange --out` / `assume-role --in`: the credential — the
+/// long-lived, non-expiring token you actually exercise.
+pub const CREDENTIAL_FILE: &str = "credential";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -47,11 +52,11 @@ pub enum ClientError {
     #[error("--caveat must be NAME=VALUE (got {0:?})")]
     BadCaveat(String),
     #[error(
-        "exchange refused (401) — the intermediate most likely expired \
+        "exchange refused (401) — the credential ticket most likely expired \
          (it is short-lived). Re-run `mint client enroll …` for a fresh \
          one; your approval persists, so just `mint client exchange` again"
     )]
-    IntermediateRejected,
+    TicketRejected,
     #[error("server returned {status}: {body}")]
     Server { status: u16, body: String },
     #[error("server response missing the {0} field")]
@@ -190,60 +195,154 @@ fn save_macaroon(dir: &Path, file: &str, b64: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
+/// Shorten a long opaque value for display, keeping both ends so it
+/// stays recognisable. Standard caveat values here are ASCII (ULID,
+/// `ed25519:<b64>`, unix int), so byte slicing is char-safe.
+fn abbrev(s: &str) -> String {
+    if s.len() <= 28 {
+        s.to_string()
+    } else {
+        format!("{}…{}", &s[..14], &s[s.len() - 8..])
+    }
+}
+
+/// One-line plain-English gloss for a standard caveat, so the demo
+/// narration explains *why* each line is there. mint is
+/// caveat-vocabulary-agnostic; an unrecognised name glosses to nothing
+/// and is still shown verbatim.
+fn caveat_gloss(cav: &Caveat) -> &'static str {
+    match cav.name.as_str() {
+        name::OP => match cav.value.as_str() {
+            op::ENROLL => "participation gate — enroll only",
+            op::ENROLL_EXCHANGE => "redeem-once — may only be exchanged for a credential",
+            op::ASSUME_ROLE => "the working credential — mints role keypairs",
+            _ => "mint operation this token is partitioned to",
+        },
+        name::AUD => "the mint instance this token is for",
+        name::SUB => "the enrollment identity (operator-approved)",
+        name::CNF => "bound to this client's key — proof-of-possession",
+        name::EXP => "expiry, unix seconds",
+        name::ROLE => "restricts the assumable role",
+        name::BOOTSTRAP => "current bootstrap nonce",
+        _ => "",
+    }
+}
+
+/// Narrate a macaroon's caveat chain to stderr — what this token *is*,
+/// in the demo. Renders `exp` as a readable UTC instant alongside the
+/// raw seconds.
+fn describe(label: &str, m: &Macaroon) {
+    eprintln!("  {label} — {} caveat(s):", m.caveats().len());
+    for c in m.caveats() {
+        let mut shown = abbrev(&c.value);
+        let exp_instant = (c.name == name::EXP)
+            .then(|| c.value.parse::<i64>().ok())
+            .flatten()
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0));
+        if let Some(dt) = exp_instant {
+            shown = format!("{shown} ({})", dt.format("%Y-%m-%dT%H:%M:%SZ"));
+        }
+        let gloss = caveat_gloss(c);
+        if gloss.is_empty() {
+            eprintln!("    {:<10} {shown}", c.name);
+        } else {
+            eprintln!("    {:<10} {shown}  — {gloss}", c.name);
+        }
+    }
+}
+
 /// `mint client enroll`: attenuate the bootstrap macaroon with this
 /// identity's `sub`/`cnf`, prove possession, receive + persist the
-/// intermediate.
+/// credential ticket.
 pub async fn enroll(
     dir: &Path,
     base_url: &str,
     bootstrap_src: &str,
     sub: &str,
+    out: &str,
 ) -> Result<(), ClientError> {
     let seed = load_seed(dir)?;
+    let cnf = pop::cnf_value(&seed);
     let presented = read_macaroon_arg(bootstrap_src)?
         .attenuate(Caveat::scalar(name::SUB, sub))
-        .attenuate(Caveat::scalar(name::CNF, pop::cnf_value(&seed)));
+        .attenuate(Caveat::scalar(name::CNF, cnf.clone()));
+    eprintln!("enroll: attenuating the operator's bootstrap macaroon with your identity");
+    eprintln!("  sub = {sub}  (the principal you are claiming)");
+    eprintln!(
+        "  cnf = {}  (your client key — binds the token to you)",
+        abbrev(&cnf)
+    );
+    eprintln!("  → POST {base_url}/v1/enroll  (signed with your client key)");
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
     let (status, text) = post(&format!("{base_url}/v1/enroll"), &presented, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
-    save_macaroon(dir, INTERMEDIATE_FILE, &json_field(&text, "intermediate")?)
+    let ticket = json_field(&text, "credential.ticket")?;
+    if let Ok(m) = Macaroon::decode(&ticket) {
+        eprintln!("  ← 200 — mint minted a credential ticket from its root:");
+        describe("credential ticket", &m);
+    }
+    save_macaroon(dir, out, &ticket)?;
+    eprintln!(
+        "  saved to {}  (now: operator runs `mint enroll approve {sub}`)",
+        dir.join(out).display()
+    );
+    Ok(())
 }
 
-/// `mint client exchange`: present the intermediate. `Ok(true)` =
-/// primary written; `Ok(false)` = still awaiting operator approval
+/// `mint client exchange`: present the credential ticket. `Ok(true)` =
+/// credential written; `Ok(false)` = still awaiting operator approval
 /// (HTTP 403, the one non-failure non-200) — the caller decides the
 /// exit code / retry.
-pub async fn exchange(dir: &Path, base_url: &str) -> Result<bool, ClientError> {
+pub async fn exchange(
+    dir: &Path,
+    base_url: &str,
+    in_file: &str,
+    out: &str,
+) -> Result<bool, ClientError> {
     let seed = load_seed(dir)?;
-    let inter = Macaroon::decode(
-        read_text(
-            &dir.join(INTERMEDIATE_FILE),
-            "run `mint client enroll …` first",
-        )?
-        .trim(),
-    )
-    .map_err(|_| ClientError::BadFile(INTERMEDIATE_FILE))?;
+    let in_path = dir.join(in_file);
+    let ticket = Macaroon::decode(read_text(&in_path, "run `mint client enroll …` first")?.trim())
+        .map_err(|_| ClientError::BadFile("credential ticket"))?;
+    eprintln!(
+        "exchange: presenting your credential ticket ({})",
+        in_path.display()
+    );
+    describe("credential ticket (what you hold)", &ticket);
+    eprintln!(
+        "  → POST {base_url}/v1/enroll-exchange  (signed with your client key — proof-of-possession)"
+    );
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
     let (status, text) = post(
         &format!("{base_url}/v1/enroll-exchange"),
-        &inter,
+        &ticket,
         &seed,
         body,
     )
     .await?;
     match status {
         200 => {
-            save_macaroon(dir, PRIMARY_FILE, &json_field(&text, "primary")?)?;
+            let credential = json_field(&text, "credential")?;
+            if let Ok(m) = Macaroon::decode(&credential) {
+                eprintln!(
+                    "  ← 200 — mint re-minted a credential from its root (a fresh chain, not an attenuation of the ticket):"
+                );
+                describe("credential (what you received)", &m);
+            }
+            save_macaroon(dir, out, &credential)?;
+            eprintln!("  saved to {}", dir.join(out).display());
             Ok(true)
         }
-        403 => Ok(false),
+        403 => {
+            eprintln!("  ← 403 — the operator has not approved this enrollment yet");
+            Ok(false)
+        }
         // The server's 401 is deliberately opaque, but at exchange the
-        // overwhelmingly likely cause is an expired intermediate (it is
+        // overwhelmingly likely cause is an expired ticket (it is
         // short-lived by design). Point at the idempotent remedy rather
         // than echoing a bare unauthorized.
-        401 => Err(ClientError::IntermediateRejected),
+        401 => Err(ClientError::TicketRejected),
         _ => Err(ClientError::Server { status, body: text }),
     }
 }
@@ -297,9 +396,9 @@ fn build_request_body(
     Ok(serde_json::Value::Object(obj).to_string())
 }
 
-/// `mint client assume-role`: attenuate the held primary (the bounding
-/// `exp` from `ttl`, plus any caller-supplied narrowing caveats),
-/// exercise it. Returns the raw keypair JSON to print.
+/// `mint client assume-role`: attenuate the held credential (the
+/// bounding `exp` from `ttl`, plus any caller-supplied narrowing
+/// caveats), exercise it. Returns the raw keypair JSON to print.
 pub async fn assume_role(
     dir: &Path,
     base_url: &str,
@@ -307,29 +406,42 @@ pub async fn assume_role(
     request_src: Option<&str>,
     caveats: &[String],
     ttl_seconds: u64,
+    in_file: &str,
 ) -> Result<String, ClientError> {
     let caveats = parse_caveats(caveats)?;
     let seed = load_seed(dir)?;
+    let in_path = dir.join(in_file);
     let mut mac = Macaroon::decode(
         read_text(
-            &dir.join(PRIMARY_FILE),
+            &in_path,
             "run `mint client exchange` after the operator approves",
         )?
         .trim(),
     )
-    .map_err(|_| ClientError::BadFile(PRIMARY_FILE))?;
-    // The primary does not expire; the role gate requires `exp`. Bound
-    // it to the requested lifetime, then apply caller narrowing caveats.
+    .map_err(|_| ClientError::BadFile("credential"))?;
+    eprintln!(
+        "assume-role: attenuating your credential ({}) for role `{role}`",
+        in_path.display()
+    );
+    describe("credential (what you hold)", &mac);
+    // The credential does not expire; the role gate requires `exp`.
+    // Bound it to the requested lifetime, then apply caller narrowing
+    // caveats.
     let exp = now_unix().saturating_add(ttl_seconds);
     mac = mac.attenuate(Caveat::scalar(name::EXP, exp.to_string()));
     for (n, v) in &caveats {
         mac = mac.attenuate(Caveat::scalar(n.as_str(), v.as_str()));
     }
+    eprintln!(
+        "  appended exp={exp} + {} narrowing caveat(s); → POST {base_url}/v1/assume-role",
+        caveats.len()
+    );
     let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
     let (status, text) = post(&format!("{base_url}/v1/assume-role"), &mac, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
+    eprintln!("  ← 200 — mint verified the chain + PoP and minted a scoped Tigris keypair:");
     Ok(text)
 }
 

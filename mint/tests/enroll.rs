@@ -1,8 +1,8 @@
 //! End-to-end enrollment (`docs/design-mint.md` § *Enrollment*):
 //! reusable bootstrap macaroon → client self-asserts `sub`/`cnf` at
-//! `POST /v1/enroll` (pending record + intermediate) → operator
+//! `POST /v1/enroll` (pending record + credential ticket) → operator
 //! approval → `POST /v1/enroll-exchange` (403 until approved, then the
-//! non-expiring primary) → the primary attenuates and assumes a role.
+//! non-expiring credential) → the credential attenuates and assumes a role.
 //! Plus the refusals that matter: stale bootstrap, wrong-key PoP,
 //! bearer (no cnf), no pending record, conflicting key for a `sub`.
 
@@ -15,7 +15,7 @@ use mint::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
-use mint::issuance::{mint_bootstrap, mint_intermediate};
+use mint::issuance::{mint_bootstrap, mint_credential_ticket};
 use mint::macaroon::Macaroon;
 use mint::pop;
 use mint::state::Store;
@@ -145,7 +145,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     let nonce = store.current_bootstrap().unwrap();
     let cb = client_bootstrap(&nonce, &COORD_SEED);
 
-    // (1) enroll → pending + intermediate
+    // (1) enroll → pending + ticket
     let (status, body) = parts(
         app.clone()
             .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
@@ -154,18 +154,13 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    let intermediate = field(&body, "intermediate");
-    assert!(intermediate.verify(&ROOT));
+    let ticket = field(&body, "credential.ticket");
+    assert!(ticket.verify(&ROOT));
 
     // (2) exchange before approval → 403 (awaited, not a failure)
     let (status, _) = parts(
         app.clone()
-            .oneshot(signed(
-                "/v1/enroll-exchange",
-                &intermediate,
-                &COORD_SEED,
-                "",
-            ))
+            .oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, ""))
             .await
             .unwrap(),
     )
@@ -175,23 +170,18 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     // (3) operator approves the displayed sub
     assert!(store.approve(SUB).unwrap());
 
-    // (4) exchange → non-expiring primary
+    // (4) exchange → non-expiring credential
     let (status, body) = parts(
         app.clone()
-            .oneshot(signed(
-                "/v1/enroll-exchange",
-                &intermediate,
-                &COORD_SEED,
-                "",
-            ))
+            .oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, ""))
             .await
             .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    let primary = field(&body, "primary");
-    assert!(primary.verify(&ROOT));
-    let eff = EffectiveCaveats::new(primary.caveats());
+    let credential = field(&body, "credential");
+    assert!(credential.verify(&ROOT));
+    let eff = EffectiveCaveats::new(credential.caveats());
     assert_eq!(
         eff.resolve(name::OP),
         Resolved::Value(op::ASSUME_ROLE.into())
@@ -201,25 +191,20 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
         eff.resolve(name::CNF),
         Resolved::Value(pop::cnf_value(&COORD_SEED))
     );
-    assert_eq!(eff.not_after(name::EXP), None, "primary does not expire");
+    assert_eq!(eff.not_after(name::EXP), None, "credential does not expire");
 
     // record consumed: a second exchange now fails closed (no pending)
     let (status, _) = parts(
         app.clone()
-            .oneshot(signed(
-                "/v1/enroll-exchange",
-                &intermediate,
-                &COORD_SEED,
-                "",
-            ))
+            .oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, ""))
             .await
             .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // (5) attenuate the primary and assume a role with it
-    let req = primary
+    // (5) attenuate the credential and assume a role with it
+    let req = credential
         .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
         .attenuate(Caveat::scalar("elide:Volume", "VOL1"));
     let (status, body) = parts(
@@ -340,9 +325,9 @@ async fn bearer_bootstrap_without_cnf_is_opaque_401() {
 #[tokio::test]
 async fn exchange_without_a_pending_record_is_opaque_401() {
     let (app, _a, _store, _dir) = app();
-    // A perfectly well-formed intermediate (minted from root) for a sub
+    // A perfectly well-formed ticket (minted from root) for a sub
     // that was never enrolled: no pending record → fail closed.
-    let inter = mint_intermediate(
+    let inter = mint_credential_ticket(
         &ROOT,
         "mint",
         SUB,

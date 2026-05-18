@@ -8,11 +8,11 @@
 //! 1. [`mint_bootstrap`] — `op=enroll`, the reusable non-expiring
 //!    participation gate. No principal identity; carries the current
 //!    `bootstrap` nonce.
-//! 2. [`mint_intermediate`] — `op=enroll-exchange`, short-lived,
+//! 2. [`mint_credential_ticket`] — `op=enroll-exchange`, short-lived,
 //!    minted at `POST /v1/enroll` once the presented (coordinator-
 //!    attenuated) bootstrap has verified and a pending record exists.
 //!    Carries the self-asserted `sub`/`cnf` forward.
-//! 3. [`mint_primary`] — `op=assume-role`, non-expiring, minted at
+//! 3. [`mint_credential`] — `op=assume-role`, non-expiring, minted at
 //!    `POST /v1/enroll-exchange` after operator approval. Same
 //!    `sub`/`cnf`; no `exp`.
 //!
@@ -62,11 +62,11 @@ pub fn mint_bootstrap(root: &[u8; 32], audience: &str, bootstrap_nonce: &str) ->
     )
 }
 
-/// The short-lived intermediate handed back from `POST /v1/enroll`:
+/// The short-lived credential ticket handed back from `POST /v1/enroll`:
 /// `op=enroll-exchange`, `aud`, the self-asserted `sub`/`cnf`, and an
 /// `exp`. (The third-party caveat for a configured identity authority
 /// is deferred — design *Open questions* #15.)
-pub fn mint_intermediate(
+pub fn mint_credential_ticket(
     root: &[u8; 32],
     audience: &str,
     sub: &str,
@@ -85,11 +85,11 @@ pub fn mint_intermediate(
     )
 }
 
-/// The non-expiring primary, re-minted from root at a successful
+/// The non-expiring credential, re-minted from root at a successful
 /// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, **no**
-/// `exp`. A fresh chain, not an attenuation of the intermediate (only
+/// `exp`. A fresh chain, not an attenuation of the credential ticket (only
 /// the root holder can do this).
-pub fn mint_primary(root: &[u8; 32], audience: &str, sub: &str, cnf: &str) -> Macaroon {
+pub fn mint_credential(root: &[u8; 32], audience: &str, sub: &str, cnf: &str) -> Macaroon {
     macaroon::mint(
         root,
         vec![
@@ -149,29 +149,29 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_then_primary_carry_identity_with_distinct_ops() {
-        let inter = mint_intermediate(&ROOT, "mint", SUB, &cnf(), 1_700_000_000);
-        assert!(inter.verify(&ROOT));
-        let ie = EffectiveCaveats::new(inter.caveats());
+    fn ticket_then_credential_carry_identity_with_distinct_ops() {
+        let ticket = mint_credential_ticket(&ROOT, "mint", SUB, &cnf(), 1_700_000_000);
+        assert!(ticket.verify(&ROOT));
+        let ie = EffectiveCaveats::new(ticket.caveats());
         assert_eq!(
             ie.resolve(name::OP),
             Resolved::Value(op::ENROLL_EXCHANGE.into())
         );
         assert_eq!(ie.not_after(name::EXP), Some(1_700_000_000));
 
-        let prim = mint_primary(&ROOT, "mint", SUB, &cnf());
-        assert!(prim.verify(&ROOT));
-        let pe = EffectiveCaveats::new(prim.caveats());
+        let cred = mint_credential(&ROOT, "mint", SUB, &cnf());
+        assert!(cred.verify(&ROOT));
+        let pe = EffectiveCaveats::new(cred.caveats());
         assert_eq!(
             pe.resolve(name::OP),
             Resolved::Value(op::ASSUME_ROLE.into())
         );
         assert_eq!(pe.resolve(name::SUB), Resolved::Value(SUB.into()));
         assert_eq!(pe.resolve(name::CNF), Resolved::Value(cnf()));
-        // The primary does not expire.
+        // The credential does not expire.
         assert_eq!(pe.not_after(name::EXP), None);
-        // Fresh chain, not an attenuation of the intermediate.
-        assert_ne!(prim.nonce(), inter.nonce());
+        // Fresh chain, not an attenuation of the credential ticket.
+        assert_ne!(cred.nonce(), ticket.nonce());
     }
 
     #[test]

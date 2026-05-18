@@ -1,4 +1,4 @@
-//! End-to-end: a primary (op=assume-role) + holder-of-key PoP -> HTTP
+//! End-to-end: a credential (op=assume-role) + holder-of-key PoP -> HTTP
 //! -> op gate -> role gate -> policy render -> faked keypair. The whole
 //! vertical slice without a live Tigris.
 
@@ -11,7 +11,7 @@ use mint::caveat::{Caveat, name, op};
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
-use mint::issuance::mint_primary;
+use mint::issuance::mint_credential;
 use mint::macaroon::{Macaroon, mint};
 use mint::pop;
 use mint::state::Store;
@@ -99,10 +99,10 @@ fn far_future() -> u64 {
     (chrono::Utc::now().timestamp() as u64) + 365 * 24 * 3600
 }
 
-/// A held primary (op=assume-role, aud, sub, cnf) attenuated per
+/// A held credential (op=assume-role, aud, sub, cnf) attenuated per
 /// request with a tighter `exp` and an `elide:Volume`.
 fn request_macaroon() -> Macaroon {
-    mint_primary(&ROOT, "mint", SUB, &pop::cnf_value(&COORD_SEED))
+    mint_credential(&ROOT, "mint", SUB, &pop::cnf_value(&COORD_SEED))
         .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
         .attenuate(Caveat::scalar("elide:Volume", "VOL1"))
 }

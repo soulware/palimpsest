@@ -53,7 +53,7 @@ enum Command {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
         /// Draw a new bootstrap nonce first, cancelling in-flight
-        /// enrollments (outstanding primaries are unaffected).
+        /// enrollments (outstanding credentials are unaffected).
         #[arg(long)]
         rotate: bool,
     },
@@ -86,34 +86,47 @@ enum ClientCmd {
     /// operator compares out of band before `enroll approve`).
     Fingerprint,
     /// Attenuate the bootstrap macaroon with `sub`/`cnf`, enrol, and
-    /// save the returned intermediate.
+    /// save the returned credential ticket.
     Enroll {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
         /// Opaque principal id — the `sub` (Elide: coordinator ULID).
         #[arg(long)]
         id: String,
+        /// Filename (under the client dir) to write the credential
+        /// ticket to.
+        #[arg(long, default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
+        out: String,
         /// Bootstrap macaroon: the macaroon text inline, a file path,
         /// or `-` for stdin.
         #[arg(value_name = "BOOTSTRAP")]
         bootstrap: String,
     },
-    /// Exchange the intermediate for the primary (after approval).
-    /// Exits 2 while still awaiting operator approval.
+    /// Exchange the credential ticket for the credential (after
+    /// approval). Exits 2 while still awaiting operator approval.
     Exchange {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
+        /// Credential-ticket filename (under the client dir) to present.
+        #[arg(long = "in", default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
+        in_file: String,
+        /// Filename (under the client dir) to write the credential to.
+        #[arg(long, default_value_t = mint::client::CREDENTIAL_FILE.to_string())]
+        out: String,
     },
-    /// Assume a role with the held primary; prints the keypair JSON.
+    /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
+        /// Credential filename (under the client dir) to exercise.
+        #[arg(long = "in", default_value_t = mint::client::CREDENTIAL_FILE.to_string())]
+        in_file: String,
         /// PoP-signed request body as a JSON object: inline, `@file`,
         /// or `-` for stdin. Opaque pass-through into `request.*` —
         /// `ts`/`role`/`ttl_seconds` are client-owned and ignored here.
         #[arg(long, value_name = "JSON|@FILE|-")]
         request: Option<String>,
-        /// Narrowing caveat to attenuate the primary with (repeatable).
+        /// Narrowing caveat to attenuate the credential with (repeatable).
         /// Vocabulary-agnostic — e.g. `--caveat elide:Volume=01VOL`.
         #[arg(long = "caveat", value_name = "NAME=VALUE")]
         caveat: Vec<String>,
@@ -187,32 +200,42 @@ async fn client_cmd(
             println!("fingerprint={fp}");
             Ok(())
         }
-        ClientCmd::Enroll { url, bootstrap, id } => {
-            mint::client::enroll(&dir, &url, &bootstrap, &id).await?;
-            eprintln!(
-                "enrolled; intermediate saved. Operator: `mint enroll approve {id}` \
-                 (compare the fingerprint out of band first)."
-            );
+        ClientCmd::Enroll {
+            url,
+            bootstrap,
+            id,
+            out,
+        } => {
+            mint::client::enroll(&dir, &url, &bootstrap, &id, &out).await?;
+            eprintln!("  (compare the fingerprint out of band before approving)");
             Ok(())
         }
-        ClientCmd::Exchange { url } => {
-            if mint::client::exchange(&dir, &url).await? {
-                eprintln!("primary saved to {}/primary", dir.display());
+        ClientCmd::Exchange { url, in_file, out } => {
+            if mint::client::exchange(&dir, &url, &in_file, &out).await? {
                 Ok(())
             } else {
-                eprintln!("awaiting operator approval — re-run `client exchange` once approved");
+                eprintln!("  re-run `mint client exchange` once the operator approves");
                 std::process::exit(2);
             }
         }
         ClientCmd::AssumeRole {
             url,
+            in_file,
             request,
             caveat,
             ttl,
             role,
         } => {
-            let kp = mint::client::assume_role(&dir, &url, &role, request.as_deref(), &caveat, ttl)
-                .await?;
+            let kp = mint::client::assume_role(
+                &dir,
+                &url,
+                &role,
+                request.as_deref(),
+                &caveat,
+                ttl,
+                &in_file,
+            )
+            .await?;
             println!("{kp}");
             Ok(())
         }

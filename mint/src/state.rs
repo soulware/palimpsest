@@ -337,8 +337,8 @@ impl Store {
     }
 
     /// Drop unapproved pending records older than `max_age_seconds`
-    /// (keeps the table transient; the bound is ≥ the intermediate's
-    /// `exp`). Approved records survive until consumed at exchange.
+    /// (keeps the table transient; the bound is ≥ the credential
+    /// ticket's `exp`). Approved records survive until consumed at exchange.
     pub fn gc(&self, now_unix: u64, max_age_seconds: u64) -> io::Result<usize> {
         let _g = self
             .guard
