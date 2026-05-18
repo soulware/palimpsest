@@ -464,14 +464,19 @@ an absent `request.X` fails closed). Conventional fields:
   timestamp, unix seconds. Carried here, not in a header, so it is
   covered by the signature over the body; mint rejects it outside the
   ±skew window. Absent/garbled on a key-bound request ⇒ `401`.
-- `role` (optional, restating): the authoritative role is the
-  credential's `role` caveat (stamped at the enrollment exchange) — mint
-  selects the policy from it. If present here it **must equal** that
-  caveat; a mismatch fails closed (it is not a way to pick a different
-  role). Carried so the PoP-signed body stays self-describing for the
-  audit log. Required only for an (optional) omnibus credential that
-  carries no `role` caveat, where it is the sole role selector as
-  before.
+- `role` (required, asserting): the caller's **independently-stated
+  intent** — the role this subsystem believes it is exercising, sourced
+  from its own config, **not** echoed from the loaded credential. Mint
+  takes the authoritative role from the credential's `role` caveat
+  (stamped at the enrollment exchange) and selects the policy from it,
+  then requires `request.role` to **equal** that caveat; a mismatch
+  fails closed. This is not a way to pick a role — it is a guard: a
+  subsystem that loaded the wrong per-role credential file states one
+  role while the file carries another, and the request is denied
+  instead of silently exercising the wrong authority. It also keeps the
+  PoP-signed body self-describing for the audit log. (Echoing the
+  caveat back here makes the check vacuous — the value must be the
+  caller's own intent.)
 - `ttl_seconds` (optional): requested credential lifetime. Must be within
   the role's `min_ttl_seconds`..`max_ttl_seconds` and must not exceed the
   macaroon's `exp` caveat. Defaults to the role's `default_ttl_seconds`.
@@ -486,7 +491,7 @@ an absent `request.X` fails closed). Conventional fields:
 
 On success: the freshly-minted Tigris keypair plus its absolute expiration.
 
-On role mismatch (the credential's `role` is not in config, a restating
+On role mismatch (the credential's `role` is not in config,
 `request.role` disagrees with it, or caveats don't satisfy role
 requirements): `400 Bad Request` with a generic error.
 
@@ -676,12 +681,13 @@ Coined (mint-specific; no registered equivalent):
   Immutable by construction: a coordinator can only append, and a
   contradictory copy is unsatisfiable.
 - **`role`** (string, scalar). The single role this credential may
-  assume. Mint stamps it into the root chain at the enrollment exchange
-  (§ *Enrollment* (3)) — the `(sub, role)` authorization point — so it
-  is not coordinator-appendable to widen, and a contradictory second
-  copy is unsatisfiable. Mint selects the role policy from it. Absent
-  only on an (optional) omnibus credential, where any configured role
-  is reachable and `request.role` selects it instead.
+  assume — **always present** on a credential. Mint stamps it into the
+  root chain at the enrollment exchange (§ *Enrollment* (3)) — the
+  `(sub, role)` authorization point — so it is not coordinator-appendable
+  to widen, and a contradictory second copy is unsatisfiable. Mint
+  selects the role policy from it and requires the request's asserted
+  `request.role` to equal it. There is no role-less ("omnibus")
+  credential: a credential carries exactly one role.
 - **`bootstrap`** (string, scalar). Carried only by the bootstrap
   macaroon. Mint stores one current random nonce (persisted, same
   custody as the root) and rejects any bootstrap whose `bootstrap` value
@@ -755,7 +761,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `op` | string | scalar | mint, at each mint point | Gate only — endpoint partition (`enroll` / `enroll-exchange` / `assume-role`); each endpoint positively requires its value. |
 | `bootstrap` | string | scalar | mint, on first start / rotate | Gate only — bootstrap macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
-| `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries. Absent only on an optional omnibus credential. |
+| `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `request.role` must equal it. |
 | `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-identity`. |
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
