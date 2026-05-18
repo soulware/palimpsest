@@ -17,11 +17,13 @@
 //! on first start, never leaving the process, mirroring the elide
 //! coordinator's `coordinator.key`. The bootstrap nonce shares its
 //! custody. The pending
-//! table is **transient, not a registry**: a record is consumed (both
-//! files unlinked) at a successful exchange, and an unapproved record
-//! ages out (`gc`). Keyed by `sub`; a second request for the same `sub`
-//! with a different `pub` is a conflict that never auto-resolves and
-//! never overwrites.
+//! table is **transient, not a registry**: a record is *not* consumed
+//! at exchange (the credential ticket is multi-use until its `exp`, so
+//! one approval backs one credential per role), so its lifetime is the
+//! ticket's — `gc` reclaims it, approved or not, on a bound ≥ that
+//! `exp`. Keyed by `sub`; a second request for the same `sub` with a
+//! different `pub` is a conflict that never auto-resolves and never
+//! overwrites.
 
 use std::fs;
 use std::io;
@@ -317,28 +319,13 @@ impl Store {
         self.read_pending(sub).map(Some)
     }
 
-    /// Consume the record at a successful exchange — both files
-    /// unlinked. Mint holds no standing per-principal state afterward;
-    /// a later re-enrollment is a fresh pending request.
-    pub fn consume(&self, sub: &str) -> Result<(), StateError> {
-        if !safe_sub(sub) {
-            return Err(StateError::BadSub);
-        }
-        let _g = self
-            .guard
-            .lock()
-            .map_err(|_| StateError::Io(io::Error::other("poisoned")))?;
-        let _ = fs::remove_file(self.approved_path(sub));
-        match fs::remove_file(self.pending_path(sub)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StateError::Io(e)),
-        }
-    }
-
-    /// Drop unapproved pending records older than `max_age_seconds`
-    /// (keeps the table transient; the bound is ≥ the credential
-    /// ticket's `exp`). Approved records survive until consumed at exchange.
+    /// Drop records older than `max_age_seconds` by `first_seen`,
+    /// **approved or not**. The credential ticket is multi-use until
+    /// its `exp` (one approval → one credential per role), so a record
+    /// is not consumed at exchange; its lifetime *is* the ticket's, and
+    /// this is the only thing that reclaims it. The bound is ≥ the
+    /// ticket `exp`, keeping the table transient (bounded by `exp`)
+    /// rather than a registry. Both files are unlinked.
     pub fn gc(&self, now_unix: u64, max_age_seconds: u64) -> io::Result<usize> {
         let _g = self
             .guard
@@ -346,12 +333,10 @@ impl Store {
             .map_err(|_| io::Error::other("poisoned"))?;
         let mut dropped = 0;
         for sub in self.pending_subs()? {
-            if self.approved_path(&sub).exists() {
-                continue;
-            }
             if let Ok(p) = self.read_pending(&sub)
                 && now_unix.saturating_sub(p.first_seen) > max_age_seconds
             {
+                let _ = fs::remove_file(self.approved_path(&sub));
                 fs::remove_file(self.pending_path(&sub))?;
                 dropped += 1;
             }
@@ -480,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn approve_requires_existing_pending_then_consume_clears() {
+    fn approve_requires_existing_pending_and_persists() {
         let (_d, s) = store();
         let b = s.current_bootstrap().unwrap();
         assert!(!s.approve("01ARZ").unwrap(), "no pending → not approved");
@@ -488,22 +473,29 @@ mod tests {
         assert!(!s.is_approved("01ARZ"));
         assert!(s.approve("01ARZ").unwrap());
         assert!(s.is_approved("01ARZ"));
-        s.consume("01ARZ").unwrap();
-        assert!(s.get_pending("01ARZ").unwrap().is_none());
-        assert!(!s.is_approved("01ARZ"), "consume clears approval too");
+        // The record is not consumed at exchange any more — one
+        // approval backs every per-role exchange until GC reclaims it.
+        assert!(s.is_approved("01ARZ"), "approval persists across exchanges");
+        assert!(s.get_pending("01ARZ").unwrap().is_some());
     }
 
     #[test]
-    fn gc_drops_old_unapproved_but_keeps_approved() {
+    fn gc_drops_old_records_approved_or_not() {
         let (_d, s) = store();
         let b = s.current_bootstrap().unwrap();
         s.record_pending("old", PUBA, &b, "ip", 0).unwrap();
-        s.record_pending("kept", PUBB, &b, "ip", 0).unwrap();
-        s.approve("kept").unwrap();
+        s.record_pending("old-approved", PUBB, &b, "ip", 0).unwrap();
+        s.approve("old-approved").unwrap();
+        s.record_pending("fresh", PUBA, &b, "ip", 950).unwrap();
         let dropped = s.gc(1_000, 100).unwrap();
-        assert_eq!(dropped, 1);
+        assert_eq!(dropped, 2, "both stale records go, approved or not");
         assert!(s.get_pending("old").unwrap().is_none());
-        assert!(s.get_pending("kept").unwrap().is_some());
+        assert!(s.get_pending("old-approved").unwrap().is_none());
+        assert!(
+            !s.is_approved("old-approved"),
+            "approval marker cleared too"
+        );
+        assert!(s.get_pending("fresh").unwrap().is_some());
     }
 
     #[test]

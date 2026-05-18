@@ -72,6 +72,15 @@ struct AssumeRoleBody {
     ttl_seconds: Option<u64>,
 }
 
+/// `/v1/enroll-exchange` body — `{ts, role}`. `ts` is handled by the
+/// PoP machinery (it signs the whole body); `role` is the role this
+/// exchange mints a credential for, authenticated by that same
+/// signature.
+#[derive(Deserialize)]
+struct ExchangeBody {
+    role: String,
+}
+
 fn respond(request_id: &str, status: StatusCode, body: serde_json::Value) -> Response {
     let mut resp = (status, axum::Json(body)).into_response();
     if let Ok(v) = request_id.parse() {
@@ -422,10 +431,14 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
 }
 
 /// `POST /v1/enroll-exchange` (`docs/design-mint.md` § *Enrollment*
-/// (3)). The client presents the credential ticket (`op=enroll-exchange`,
-/// unexpired `exp`) and a PoP. If the pending record is approved, mint
-/// re-mints the non-expiring credential from root and **consumes** the
-/// record. `403` (not `401`) while approval is still pending — the one
+/// (3)) — the role-authorization point. The client presents the
+/// credential ticket (`op=enroll-exchange`, unexpired `exp`), a PoP,
+/// and a requested `role` in the PoP-signed body. If the pending
+/// record is approved and `role` is a configured role, mint re-mints
+/// a non-expiring, single-role credential from root. The record is
+/// **not** consumed — the ticket is multi-use until its `exp` (one
+/// approval, one credential per role); GC reclaims the record at that
+/// bound. `403` (not `401`) while approval is still pending — the one
 /// awaited, non-failure outcome.
 async fn enroll_exchange(
     State(state): State<AppState>,
@@ -528,18 +541,31 @@ async fn enroll_exchange(
         );
     }
 
-    let credential =
-        issuance::mint_credential(&state.store.root_key(), &state.config.audience, &sub, &cnf);
-    if let Err(e) = state.store.consume(&sub) {
-        // Don't hand out a credential while the record lingers — the
-        // client retries; consume+re-mint is idempotent in identity.
-        tracing::error!(error = %e, "consume pending");
-        return respond(
-            &request_id,
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": "service unavailable"}),
-        );
-    }
+    // The requested role rides the PoP-signed body (already verified
+    // above), so it is authenticated. Floor authorization (§
+    // *Enrollment* (3), option (a)): it must name a configured role —
+    // per-`sub` scoping lives in the role policy, not here. Failure is
+    // the same opaque 401 as any other (a role this `sub` may not have
+    // must not be distinguishable from a bad token).
+    let role = match serde_json::from_slice::<ExchangeBody>(&body) {
+        Ok(b) if state.config.roles.contains_key(&b.role) => b.role,
+        _ => {
+            audit("denied:unknown_role", &caveats);
+            return unauthorized(&request_id);
+        }
+    };
+
+    let credential = issuance::mint_credential(
+        &state.store.root_key(),
+        &state.config.audience,
+        &sub,
+        &cnf,
+        &role,
+    );
+    // The record is deliberately not consumed: the ticket is multi-use
+    // until its `exp` so one approval yields one credential per role.
+    // GC (opportunistic at /v1/enroll, bounded ≥ ticket `exp`) reclaims
+    // it; mint holds no standing per-coordinator state beyond that.
     audit("granted", &caveats);
     respond(
         &request_id,

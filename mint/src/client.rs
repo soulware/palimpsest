@@ -31,9 +31,18 @@ const PUB_FILE: &str = "client.pub";
 /// Default `enroll --out` / `exchange --in`: the credential ticket —
 /// the short-lived, redeem-once token you trade in at the exchange.
 pub const CREDENTIAL_TICKET_FILE: &str = "credential.ticket";
-/// Default `exchange --out` / `assume-role --in`: the credential — the
-/// long-lived, non-expiring token you actually exercise.
-pub const CREDENTIAL_FILE: &str = "credential";
+/// Per-role credentials live one file per role under this directory:
+/// `credentials/<role>`. Kept distinct from the flat `credential.ticket`
+/// so the `credential.` name is never overloaded (`docs/design-mint.md`
+/// § *Coordinator bootstrap*).
+pub const CREDENTIALS_DIR: &str = "credentials";
+
+/// The default on-disk path (under the client dir) for the credential
+/// of `role` — `credentials/<role>`. The `exchange --out` /
+/// `assume-role --in` default.
+pub fn credential_path(role: &str) -> String {
+    format!("{CREDENTIALS_DIR}/{role}")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -190,8 +199,13 @@ fn json_field(body: &str, key: &'static str) -> Result<String, ClientError> {
 fn save_macaroon(dir: &Path, file: &str, b64: &str) -> Result<(), ClientError> {
     // Parse-don't-validate: only persist something that decodes.
     Macaroon::decode(b64).map_err(|_| ClientError::BadFile("server macaroon"))?;
-    fs::create_dir_all(dir)?;
-    fs::write(dir.join(file), b64)?;
+    let path = dir.join(file);
+    // `file` may be nested (e.g. `credentials/<role>`); create the
+    // parent so per-role credentials land under their directory.
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, b64)?;
     Ok(())
 }
 
@@ -299,6 +313,7 @@ pub async fn exchange(
     dir: &Path,
     base_url: &str,
     in_file: &str,
+    role: &str,
     out: &str,
 ) -> Result<bool, ClientError> {
     let seed = load_seed(dir)?;
@@ -306,14 +321,18 @@ pub async fn exchange(
     let ticket = Macaroon::decode(read_text(&in_path, "run `mint client enroll …` first")?.trim())
         .map_err(|_| ClientError::BadFile("credential ticket"))?;
     eprintln!(
-        "exchange: presenting your credential ticket ({})",
+        "exchange: presenting your credential ticket ({}) for role `{role}`",
         in_path.display()
     );
     describe("credential ticket (what you hold)", &ticket);
     eprintln!(
-        "  → POST {base_url}/v1/enroll-exchange  (signed with your client key — proof-of-possession)"
+        "  → POST {base_url}/v1/enroll-exchange  role={role}  (signed with your client key — proof-of-possession)"
     );
-    let body = format!(r#"{{"ts":{}}}"#, now_unix());
+    let body = format!(
+        r#"{{"ts":{},"role":{}}}"#,
+        now_unix(),
+        serde_json::Value::from(role)
+    );
     let (status, text) = post(
         &format!("{base_url}/v1/enroll-exchange"),
         &ticket,

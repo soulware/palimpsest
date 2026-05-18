@@ -69,13 +69,16 @@ pub fn authorize(
         _ => return Err(Denied::WrongAudience),
     }
 
-    // Optional Role caveat restricts which role is assumable (scalar —
-    // a caller wanting a narrower role attenuates with a tighter one).
-    // Absent = unrestricted; unsatisfiable = fail closed.
+    // The Role caveat is the single role this credential carries
+    // (mint-stamped at the enrollment exchange). It must be present and
+    // equal the asserted `requested_role` — `request.role` is the
+    // caller's independent statement of intent, so a mismatch means the
+    // wrong per-role credential was loaded: fail closed. There is no
+    // role-less ("omnibus") credential — absent is also a denial, never
+    // read as unrestricted; unsatisfiable likewise.
     match eff.resolve(ROLE_CAVEAT) {
-        Resolved::Absent => {}
         Resolved::Value(s) if s == requested_role => {}
-        Resolved::Value(_) | Resolved::Unsatisfiable => {
+        Resolved::Value(_) | Resolved::Absent | Resolved::Unsatisfiable => {
             return Err(Denied::RoleNotPermitted);
         }
     }
@@ -135,6 +138,7 @@ policy_file = "volume-ro.json"
     fn good_caveats(not_after: u64) -> Vec<Caveat> {
         vec![
             Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar("elide:Volume", "01ARZ"),
             Caveat::scalar(name::EXP, not_after.to_string()),
         ]
@@ -166,6 +170,7 @@ policy_file = "volume-ro.json"
     fn missing_required_caveat_denied() {
         let cv = vec![
             Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar(name::EXP, "1000000"),
         ];
         assert_eq!(
@@ -191,12 +196,36 @@ policy_file = "volume-ro.json"
     }
 
     #[test]
-    fn role_caveat_restricts() {
+    fn role_caveat_must_equal_requested() {
+        // Credential carries role=volume-ro; caller asserts a different
+        // role (wrong per-role credential loaded) → fail closed.
+        let cv = good_caveats(1_000_000);
+        assert_eq!(
+            authorize(&cfg(), &cv, "coord-names", 800, 1000),
+            Err(Denied::UnknownRole),
+            "coord-names isn't configured here, so UnknownRole comes first"
+        );
+        // With the role configured, the role-caveat mismatch is what
+        // denies. Re-point the caveat, keep the request at volume-ro.
         let mut cv = good_caveats(1_000_000);
-        cv.push(Caveat::scalar(name::ROLE, "coord-names"));
+        cv[1] = Caveat::scalar(name::ROLE, "coord-names");
         assert_eq!(
             authorize(&cfg(), &cv, "volume-ro", 800, 1000),
             Err(Denied::RoleNotPermitted)
+        );
+    }
+
+    #[test]
+    fn absent_role_caveat_denied_no_omnibus() {
+        let cv = vec![
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar("elide:Volume", "01ARZ"),
+            Caveat::scalar(name::EXP, "1000000"),
+        ];
+        assert_eq!(
+            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            Err(Denied::RoleNotPermitted),
+            "a credential with no role caveat is not an omnibus pass"
         );
     }
 }

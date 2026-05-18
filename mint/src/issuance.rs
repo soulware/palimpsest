@@ -86,10 +86,19 @@ pub fn mint_credential_ticket(
 }
 
 /// The non-expiring credential, re-minted from root at a successful
-/// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, **no**
-/// `exp`. A fresh chain, not an attenuation of the credential ticket (only
-/// the root holder can do this).
-pub fn mint_credential(root: &[u8; 32], audience: &str, sub: &str, cnf: &str) -> Macaroon {
+/// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, the
+/// `role` it was authorized for, **no** `exp`. A fresh chain, not an
+/// attenuation of the credential ticket (only the root holder can do
+/// this). One credential carries exactly one role — a coordinator
+/// exchanges once per role it needs (`docs/design-mint.md` §
+/// *Coordinator bootstrap*).
+pub fn mint_credential(
+    root: &[u8; 32],
+    audience: &str,
+    sub: &str,
+    cnf: &str,
+    role: &str,
+) -> Macaroon {
     macaroon::mint(
         root,
         vec![
@@ -97,6 +106,7 @@ pub fn mint_credential(root: &[u8; 32], audience: &str, sub: &str, cnf: &str) ->
             Caveat::scalar(name::AUD, audience),
             Caveat::scalar(name::SUB, sub),
             Caveat::scalar(name::CNF, cnf),
+            Caveat::scalar(name::ROLE, role),
         ],
     )
 }
@@ -159,7 +169,7 @@ mod tests {
         );
         assert_eq!(ie.not_after(name::EXP), Some(1_700_000_000));
 
-        let cred = mint_credential(&ROOT, "mint", SUB, &cnf());
+        let cred = mint_credential(&ROOT, "mint", SUB, &cnf(), "volume-ro");
         assert!(cred.verify(&ROOT));
         let pe = EffectiveCaveats::new(cred.caveats());
         assert_eq!(
@@ -168,6 +178,7 @@ mod tests {
         );
         assert_eq!(pe.resolve(name::SUB), Resolved::Value(SUB.into()));
         assert_eq!(pe.resolve(name::CNF), Resolved::Value(cnf()));
+        assert_eq!(pe.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
         // The credential does not expire.
         assert_eq!(pe.not_after(name::EXP), None);
         // Fresh chain, not an attenuation of the credential ticket.

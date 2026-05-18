@@ -99,12 +99,18 @@ fn far_future() -> u64 {
     (chrono::Utc::now().timestamp() as u64) + 365 * 24 * 3600
 }
 
-/// A held credential (op=assume-role, aud, sub, cnf) attenuated per
-/// request with a tighter `exp` and an `elide:Volume`.
+/// A held `volume-ro` credential (op=assume-role, aud, sub, cnf, role)
+/// attenuated per request with a tighter `exp` and an `elide:Volume`.
 fn request_macaroon() -> Macaroon {
-    mint_credential(&ROOT, "mint", SUB, &pop::cnf_value(&COORD_SEED))
-        .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
-        .attenuate(Caveat::scalar("elide:Volume", "VOL1"))
+    mint_credential(
+        &ROOT,
+        "mint",
+        SUB,
+        &pop::cnf_value(&COORD_SEED),
+        "volume-ro",
+    )
+    .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
+    .attenuate(Caveat::scalar("elide:Volume", "VOL1"))
 }
 
 fn signed_request(m: &Macaroon, inner_fields: &str) -> Request<Body> {
@@ -248,8 +254,8 @@ async fn bad_mac_is_opaque_401() {
 
 #[tokio::test]
 async fn missing_required_caveat_is_400() {
-    // op=assume-role + aud, a plain bearer (no cnf → PoP not required),
-    // but no elide:Volume → the role gate denies with 400.
+    // op=assume-role + aud + role, a plain bearer (no cnf → PoP not
+    // required), but no elide:Volume → the role gate denies with 400.
     let (state, _, _, _dir) = state_with_audit();
     let app = router(state);
     let m = mint(
@@ -257,6 +263,7 @@ async fn missing_required_caveat_is_400() {
         vec![
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar(name::EXP, far_future().to_string()),
         ],
     )

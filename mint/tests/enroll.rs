@@ -39,7 +39,16 @@ min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
 policy_file = "volume-ro.json"
+[[role]]
+name = "coord-data"
+required_caveats = ["aud"]
+min_ttl_seconds = 60
+max_ttl_seconds = 3600
+default_ttl_seconds = 900
+policy_file = "coord-data.json"
 "#;
+
+const COORD_DATA_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
 
 const POLICY: &str = r#"
 {
@@ -54,7 +63,13 @@ const POLICY: &str = r#"
 "#;
 
 fn config() -> Config {
-    common::parse_config(TOML_TEMPLATE, &[("volume-ro.json", POLICY)])
+    common::parse_config(
+        TOML_TEMPLATE,
+        &[
+            ("volume-ro.json", POLICY),
+            ("coord-data.json", COORD_DATA_POLICY),
+        ],
+    )
 }
 
 #[derive(Clone)]
@@ -160,7 +175,12 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     // (2) exchange before approval → 403 (awaited, not a failure)
     let (status, _) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, ""))
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &COORD_SEED,
+                r#","role":"volume-ro""#,
+            ))
             .await
             .unwrap(),
     )
@@ -170,10 +190,15 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     // (3) operator approves the displayed sub
     assert!(store.approve(SUB).unwrap());
 
-    // (4) exchange → non-expiring credential
+    // (4) exchange → non-expiring, role-stamped credential
     let (status, body) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, ""))
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &COORD_SEED,
+                r#","role":"volume-ro""#,
+            ))
             .await
             .unwrap(),
     )
@@ -191,12 +216,40 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
         eff.resolve(name::CNF),
         Resolved::Value(pop::cnf_value(&COORD_SEED))
     );
+    assert_eq!(eff.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
     assert_eq!(eff.not_after(name::EXP), None, "credential does not expire");
 
-    // record consumed: a second exchange now fails closed (no pending)
+    // ticket is multi-use: the SAME ticket, same approval, exchanged
+    // again for a different role yields a second single-role credential
+    // (record not consumed).
+    let (status, body) = parts(
+        app.clone()
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &COORD_SEED,
+                r#","role":"coord-data""#,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second exchange body: {body}");
+    let cd = field(&body, "credential");
+    assert_eq!(
+        EffectiveCaveats::new(cd.caveats()).resolve(name::ROLE),
+        Resolved::Value("coord-data".into())
+    );
+
+    // floor gate: a role not in the mint config is the same opaque 401.
     let (status, _) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, ""))
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &COORD_SEED,
+                r#","role":"nope""#,
+            ))
             .await
             .unwrap(),
     )

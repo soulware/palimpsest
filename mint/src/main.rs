@@ -107,20 +107,26 @@ enum ClientCmd {
     Exchange {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
+        /// Role to exchange the ticket for. One credential per role —
+        /// run `exchange` once per role you are authorized for.
+        #[arg(long)]
+        role: String,
         /// Credential-ticket filename (under the client dir) to present.
         #[arg(long = "in", default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
         in_file: String,
         /// Filename (under the client dir) to write the credential to.
-        #[arg(long, default_value_t = mint::client::CREDENTIAL_FILE.to_string())]
-        out: String,
+        /// Defaults to `credentials/<role>`.
+        #[arg(long)]
+        out: Option<String>,
     },
     /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
         /// Credential filename (under the client dir) to exercise.
-        #[arg(long = "in", default_value_t = mint::client::CREDENTIAL_FILE.to_string())]
-        in_file: String,
+        /// Defaults to `credentials/<role>`.
+        #[arg(long = "in")]
+        in_file: Option<String>,
         /// PoP-signed request body as a JSON object: inline, `@file`,
         /// or `-` for stdin. Opaque pass-through into `request.*` —
         /// `ts`/`role`/`ttl_seconds` are client-owned and ignored here.
@@ -210,11 +216,19 @@ async fn client_cmd(
             eprintln!("  (compare the fingerprint out of band before approving)");
             Ok(())
         }
-        ClientCmd::Exchange { url, in_file, out } => {
-            if mint::client::exchange(&dir, &url, &in_file, &out).await? {
+        ClientCmd::Exchange {
+            url,
+            role,
+            in_file,
+            out,
+        } => {
+            let out = out.unwrap_or_else(|| mint::client::credential_path(&role));
+            if mint::client::exchange(&dir, &url, &in_file, &role, &out).await? {
                 Ok(())
             } else {
-                eprintln!("  re-run `mint client exchange` once the operator approves");
+                eprintln!(
+                    "  re-run `mint client exchange --role {role}` once the operator approves"
+                );
                 std::process::exit(2);
             }
         }
@@ -226,6 +240,7 @@ async fn client_cmd(
             ttl,
             role,
         } => {
+            let in_file = in_file.unwrap_or_else(|| mint::client::credential_path(&role));
             let kp = mint::client::assume_role(
                 &dir,
                 &url,
