@@ -1139,6 +1139,108 @@ plane would mean the per-volume scoping property does not actually
 hold. The shared-key downgrade (no `[mint]` and no `[iam]` section at
 all — the local-store / no-IAM case) is unaffected.
 
+### Coordinator store architecture
+
+**Proposed.** The role inventory (§ *Elide as customer*) defines the
+*credentials*; this is how the coordinator's S3 call sites acquire and
+wield them. The existing `ScopedStores` seam
+(`elide-coordinator/src/stores.rs`) carries it, widened from two scopes
+to three roles:
+
+```rust
+pub trait ScopedStores {
+    fn base_ro(&self)               -> Arc<dyn ReadStore>;       // coord-base
+    fn writer(&self)                -> Arc<dyn ObjectStore>;     // coord-writer
+    fn data_for_volume(&self, v: &Ulid) -> Arc<dyn ObjectStore>; // coord-data
+}
+```
+
+`volume-ro` is not here — it is vended *to the volume process*, not
+held by a coordinator call site (§ *Coordinator configuration*,
+already wired).
+
+**Role is a property of the code path, not of the key.** A mutation
+path uses `writer()` for its *entire* `names/`+`events/`+own-
+`coordinators/` interaction — including the reads that are part of a
+mutation (`coord-writer`'s policy holds `s3:GetObject` on those
+prefixes), so a name-claim/force-release CAS (`GET` ETag → conditional
+`PUT`) runs wholly on one credential and is never split. It uses
+`data_for_volume(v)` for that volume's `by_id/`. Read-only paths and
+the exposed peer-fetch verifier use `base_ro()`. There is **no
+prefix-routing wrapper**: which credential a path wields is explicit at
+the acquisition site and visible in review, not a runtime dispatch on
+key strings. The boundary the doc requires ("`coord-base` must never
+accrete a `by_id/` read") is then a property the type system carries,
+not a convention.
+
+**`base_ro()` returns a narrow `ReadStore`, not `ObjectStore`.**
+
+```rust
+#[async_trait] pub trait ReadStore: Send + Sync {
+    async fn get(&self, p: &Path)  -> object_store::Result<GetResult>;
+    async fn head(&self, p: &Path) -> object_store::Result<ObjectMeta>;
+}
+```
+
+`get`/`head` only — no `put`, `delete`, or `list` (`coord-base`
+carries no `ListBucket`; that is `coord-writer`'s). The exposed-surface
+containment boundary is made *unrepresentable*, not merely
+unauthorized: a path holding `base_ro()` cannot call a mutating method
+because it does not exist on the type. This is the one boundary where
+the type safety is load-bearing — `coord-base` is the credential the
+LAN/internet-exposed verifier holds. `writer()` and
+`data_for_volume()` keep the full `ObjectStore` surface (they feed
+existing mixed-prefix helpers that legitimately need it; confusing the
+two is an over-privilege *within the trusted coordinator*, not an
+exposed-surface break). The concrete impls of those two carry a
+`debug_assert!` that the key prefix matches the role — a test-time
+tripwire, not the primary mechanism.
+
+**Mixed-prefix ops** (`Release`: `by_id/` snapshot publish + `names/`
+flip; import `mark_initial`; fork/claim publish) acquire **both**
+handles, at the two touch-points where each prefix is written. The op
+genuinely exercises two authorities; the code shows it. `stores` is
+already threaded via `ctx`/`core` at nearly every call site, so this
+is "call the role method matching this touch-point," not new
+parameter plumbing.
+
+**Keypair cache and proactive refresh.** Each role's `assume-role`
+yields a short-lived Tigris keypair; the coordinator caches it and the
+`object_store` instance built from it, keyed by role (and by
+`vol_ulid` for `coord-data`). A background task refreshes each entry
+before its `DateLessThan` (the *TTL principle*: TTL is the maximum
+revocation latency, so refresh well inside it — e.g. at half-life),
+rebuilding the `object_store` on rotation; a brief refresh stall is
+absorbed by the WAL for writes and is off the hot path for reads
+(`coord-base`/`coord-writer` 1h, `coord-data` 24h; `volume-ro`
+freshness is § *Elide as customer*'s split-by-volume-mode rule).
+First use assumes lazily. `PassthroughStores` stays the impl for the
+local-store / no-`[mint]` case; the mint-backed `ScopedStores` impl is
+selected when `[mint]` is configured.
+
+This architecture is unit-testable in isolation but, like the rest of
+the `[mint]` path, is not exercisable end-to-end until enrollment
+provisions the `credentials/<role>` files.
+
+**Future direction (separate work): a domain-typed S3 layer.** The
+handles above are the *minimum* credential boundary —
+`ObjectStore`/`ReadStore` typed by verb surface. The intended next
+refinement is for each role to hand back the *operations its policy
+authorizes* rather than a generic store: `coord-writer` →
+`NameClaims` / `EventJournal` (get + append, **no** `delete` method —
+the `events/` append-only invariant as a type, not a policy-template
+property) / `OwnIdentity`; `coord-data` → `VolumeData`; `coord-base`
+→ `ControlPlaneReader`. This makes wrong-prefix keys unconstructable
+(S3 key layout moves inside the typed store, off the `format!` sites
+scattered across `upload.rs`/`claim.rs`/`name_store.rs`/…) and the
+IAM-layer invariants type-level. It is deliberately **not** part of
+the `[mint]` cutover: its value is independent of where credentials
+come from (equally worthwhile under `AWS_*`), it migrates hundreds of
+S3 call sites, and it needs its own API-design pass (how conditional-
+PUT/ETag, multipart, range-get surface as domain ops without leaking
+`object_store`). It layers on the same role handles afterward, call
+site by call site.
+
 ### Reference client & demo
 
 The full flow is exercisable end-to-end from the `mint` binary alone —
