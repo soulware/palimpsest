@@ -241,6 +241,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         &caveats,
         &request_json,
         &expiry_iso,
+        &granted.role.name,
     ) {
         Ok(p) => p,
         Err(e) => {

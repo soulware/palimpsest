@@ -41,6 +41,8 @@ use crate::config::Tenant;
 pub enum TemplateError {
     #[error("render policy: {0}")]
     Render(#[from] handlebars::RenderError),
+    #[error("compile policy template: {0}")]
+    Compile(#[from] handlebars::TemplateError),
     #[error("rendered policy is not valid JSON: {0}")]
     NotJson(serde_json::Error),
 }
@@ -105,6 +107,7 @@ pub fn render_policy(
     caveats: &[Caveat],
     request: &Value,
     expiry_iso8601: &str,
+    role: &str,
 ) -> Result<String, TemplateError> {
     let mut reg = Handlebars::new();
     // Policies are JSON, not HTML — disable entity escaping.
@@ -132,7 +135,11 @@ pub fn render_policy(
     data.insert("system".into(), Value::Object(system_map));
     data.insert("request".into(), request.clone());
 
-    let rendered = reg.render_template(policy_template, &Value::Object(data))?;
+    // Register under the role name so handlebars error messages name
+    // the role ("...rendering \"read\"...") instead of the opaque
+    // "Unnamed template" that render_template's anonymous path emits.
+    reg.register_template_string(role, policy_template)?;
+    let rendered = reg.render(role, &Value::Object(data))?;
     serde_json::from_str::<Value>(&rendered).map_err(TemplateError::NotJson)?;
     Ok(rendered)
 }
@@ -175,6 +182,7 @@ mod tests {
             &caveats,
             &req(&["ANC1", "ANC2"]),
             "2026-05-15T14:30:00Z",
+            "volume-ro",
         )
         .unwrap();
         assert!(out.contains("demo/by_id/VOL1/*"));
@@ -189,7 +197,7 @@ mod tests {
         // Maximal narrowing — zero ancestors is a coherent grant, not
         // an error: the {{#each}} simply emits nothing.
         let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
-        let out = render_policy(TPL, &tenant(), &caveats, &req(&[]), "t").unwrap();
+        let out = render_policy(TPL, &tenant(), &caveats, &req(&[]), "t", "volume-ro").unwrap();
         assert!(out.contains("by_id/VOL1/*"));
         assert!(!out.contains("by_id//*"));
         serde_json::from_str::<Value>(&out).expect("valid json");
@@ -197,7 +205,7 @@ mod tests {
 
     #[test]
     fn unknown_caveat_is_error() {
-        let err = render_policy(r#"{{caveat "nope"}}"#, &tenant(), &[], &req(&[]), "x");
+        let err = render_policy(r#"{{caveat "nope"}}"#, &tenant(), &[], &req(&[]), "x", "r");
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
@@ -206,8 +214,32 @@ mod tests {
         // Strict mode: a template referencing request.ancestors when
         // the signed body omitted it must fail the render, not mint.
         let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
-        let err = render_policy(TPL, &tenant(), &caveats, &serde_json::json!({}), "t");
+        let err = render_policy(TPL, &tenant(), &caveats, &serde_json::json!({}), "t", "r");
         assert!(matches!(err, Err(TemplateError::Render(_))));
+    }
+
+    #[test]
+    fn render_error_names_the_role_not_unnamed_template() {
+        // Operator-facing: the handlebars message must point at the
+        // role, not the opaque "Unnamed template".
+        let err = render_policy(
+            "{{request.prefix}}",
+            &tenant(),
+            &[],
+            &serde_json::json!({}),
+            "t",
+            "read",
+        )
+        .expect_err("missing request.prefix must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"read\""),
+            "message should name the role: {msg}"
+        );
+        assert!(
+            !msg.contains("Unnamed template"),
+            "message still anonymous: {msg}"
+        );
     }
 
     #[test]
@@ -225,6 +257,7 @@ mod tests {
             &caveats,
             &req(&[]),
             "x",
+            "r",
         );
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
