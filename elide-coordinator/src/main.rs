@@ -12,6 +12,7 @@
 mod claim;
 mod credential;
 mod daemon;
+mod enroll;
 mod fetch;
 mod fork;
 mod import;
@@ -76,6 +77,38 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+
+    /// Enrol this coordinator with the configured mint and provision
+    /// its per-role credentials.
+    ///
+    /// One blocking step: POST /v1/enroll, wait while the operator runs
+    /// `mint enroll approve <coordinator-id>` on the mint host, then
+    /// exchange the ticket for every role, writing
+    /// `<data_dir>/credentials/<role>`. Requires `[mint]` in the
+    /// config. Idempotent: re-running only fills missing roles (use
+    /// `--force` to re-exchange all). `coord serve` refuses to start
+    /// until this has completed.
+    Enroll {
+        #[arg(long, default_value = "coordinator.toml")]
+        config: PathBuf,
+        /// Override the data_dir from the config file.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// or `-` for stdin. Distributed out of band by the operator.
+        bootstrap: String,
+        /// Overall bound on waiting for operator approval (humantime).
+        #[arg(long, default_value = "30m", value_parser = parse_humantime)]
+        timeout: std::time::Duration,
+        /// Re-exchange and overwrite every role credential, not just
+        /// the missing ones.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+fn parse_humantime(s: &str) -> Result<std::time::Duration, String> {
+    humantime::parse_duration(s).map_err(|e| format!("invalid duration {s:?}: {e}"))
 }
 
 #[tokio::main]
@@ -149,6 +182,11 @@ async fn run() -> Result<()> {
 
             if let Some(mint_cfg) = &config.mint {
                 mint_cfg.validate()?;
+                // Refuse to start half-credentialed: every enrolled
+                // role's credential must be present and decode. The
+                // mint path is not exercisable until enrollment has
+                // provisioned them.
+                enroll::assert_enrolled(&config.data_dir)?;
                 tracing::info!(
                     "[coordinator] store: mint-backed scoped \
                      (coord-base / coord-writer / coord-data); reachability \
@@ -214,6 +252,41 @@ async fn run() -> Result<()> {
         Command::Init { config, force } => {
             elide_coordinator::log_init::init_stderr();
             init_config(&config, force)
+        }
+        Command::Enroll {
+            config,
+            data_dir,
+            bootstrap,
+            timeout,
+            force,
+        } => {
+            elide_coordinator::log_init::init_stderr();
+            let mut config = config::load(&config)?;
+            if let Some(dir) = data_dir {
+                config.data_dir = dir;
+            }
+            let mint_cfg = config.mint.as_ref().with_context(|| {
+                "`elide coord enroll` requires a [mint] section in coordinator.toml \
+                 (without it the coordinator uses the shared-key downgrade and has \
+                 nothing to enrol)"
+            })?;
+            mint_cfg.validate()?;
+            std::fs::create_dir_all(&config.data_dir)
+                .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
+            let identity = elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
+                &config.data_dir,
+            )
+            .with_context(|| "loading coordinator identity")?;
+            enroll::run(
+                mint_cfg,
+                &identity,
+                &config.data_dir,
+                &bootstrap,
+                timeout,
+                force,
+            )
+            .await
+            .map_err(anyhow::Error::from)
         }
     }
 }

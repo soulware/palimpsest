@@ -1166,6 +1166,7 @@ dependencies = [
  "elide-peer-fetch",
  "futures",
  "http-body-util",
+ "humantime",
  "humantime-serde",
  "hyper",
  "hyper-util",
