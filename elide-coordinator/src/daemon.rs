@@ -141,9 +141,11 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             Err(e) => return Err(anyhow::anyhow!("build peer-fetch client: {e}")),
         }
         // Server context for the inbound HTTP listener. The auth state
-        // uses the coord-wide (S3) store for `coordinator.pub` and the
-        // ETag-conditional `names/<name>` read (steps 2–3, the gap-free
-        // force-release fence). Lineage (step 4) is verified against a
+        // reads `coordinator.pub` and the ETag-conditional
+        // `names/<name>` (steps 2–3, the gap-free force-release fence)
+        // via the read-only `coord-base` credential — the exposed
+        // verifier holds no write-capable key. Lineage (step 4) is
+        // verified against a
         // separate local store rooted at `data_dir`: the peer walks the
         // signed `by_id/<vol>/volume.{provenance,pub}` it already holds
         // for every fork it serves — no S3 read, no credential. A fork
@@ -159,7 +161,8 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 |e| anyhow::anyhow!("peer-fetch lineage store at {:?}: {e}", data_dir.as_ref()),
             )?,
         );
-        let auth = elide_peer_fetch::auth::AuthState::new(coord_wide.clone(), lineage_store);
+        let auth =
+            elide_peer_fetch::auth::AuthState::new(stores.peer_verifier_store(), lineage_store);
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }

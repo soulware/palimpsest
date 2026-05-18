@@ -300,6 +300,10 @@ impl ScopedStores for MintScopedStores {
         Arc::clone(&self.writer) as Arc<dyn ObjectStore>
     }
 
+    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.base) as Arc<dyn ObjectStore>
+    }
+
     fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
         // Reuse a volume's facade so its keypair cache is shared
         // across ops. `try_lock` keeps this sync method non-blocking;

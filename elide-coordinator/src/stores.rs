@@ -86,6 +86,14 @@ pub trait ScopedStores: Send + Sync {
     /// `coord-data`: read+write under `by_id/<vol_ulid>/`. Uploads,
     /// GC, snapshot publish, readonly ancestor pulls.
     fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
+
+    /// The `coord-base` store as a plain [`ObjectStore`], for the one
+    /// cross-crate consumer that needs it: the peer-fetch verifier
+    /// (`elide_peer_fetch::auth::AuthState`), which reads only and
+    /// lives in a lower crate that cannot depend on [`ReadStore`].
+    /// In-coordinator code uses [`Self::base_ro`]; the read-only
+    /// guarantee for this handle rests on `coord-base`'s IAM policy.
+    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore>;
 }
 
 /// Returns the same underlying `Arc<dyn ObjectStore>` for every role
@@ -112,6 +120,10 @@ impl ScopedStores for PassthroughStores {
     }
 
     fn data_for_volume(&self, _vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.inner)
+    }
+
+    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
 }
