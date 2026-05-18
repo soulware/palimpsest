@@ -172,8 +172,13 @@ pub struct Role {
     pub min_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
+    /// The resolved source of [`policy`](Role::policy):
+    /// `<roles_dir>/<policy_file>`, or `<roles_dir>/<name>.json` when no
+    /// explicit `policy_file` was set. Retained for diagnostics
+    /// (`mint role inspect`); the template itself is already resolved.
+    pub policy_path: PathBuf,
     /// The role's IAM-policy handlebars template, read from
-    /// `<roles_dir>/<policy_file>` at load.
+    /// [`policy_path`](Role::policy_path) at load.
     pub policy: String,
 }
 
@@ -202,7 +207,7 @@ impl Config {
                     field: "ttl_seconds".into(),
                 });
             }
-            let policy = match r.policy_file {
+            let (policy_path, policy) = match r.policy_file {
                 Some(ref f) => read_policy(&roles_dir, &r.name, f, true)?,
                 None => read_policy(&roles_dir, &r.name, &format!("{}.json", r.name), false)?,
             };
@@ -212,6 +217,7 @@ impl Config {
                 min_ttl_seconds: r.min_ttl_seconds,
                 max_ttl_seconds: r.max_ttl_seconds,
                 default_ttl_seconds: r.default_ttl_seconds,
+                policy_path,
                 policy,
             };
             if roles.insert(r.name.clone(), role).is_some() {
@@ -250,7 +256,7 @@ fn read_policy(
     role: &str,
     policy_file: &str,
     explicit: bool,
-) -> Result<String, ConfigError> {
+) -> Result<(PathBuf, String), ConfigError> {
     let mut comps = Path::new(policy_file).components();
     let only = comps.next();
     if comps.next().is_some() || !matches!(only, Some(Component::Normal(_))) {
@@ -262,11 +268,13 @@ fn read_policy(
         });
     }
     let path = roles_dir.join(policy_file);
-    std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadPolicyFile {
-        role: role.to_owned(),
-        path: path.display().to_string(),
-        source,
-    })
+    let contents =
+        std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadPolicyFile {
+            role: role.to_owned(),
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok((path, contents))
 }
 
 /// Path-A test harness (shared with `role.rs`'s unit tests): write each

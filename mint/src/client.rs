@@ -464,6 +464,82 @@ pub async fn assume_role(
     Ok(text)
 }
 
+/// First value of caveat `name` in `m`, if present.
+fn caveat_value<'a>(m: &'a Macaroon, name: &str) -> Option<&'a str> {
+    m.caveats()
+        .iter()
+        .find(|c| c.name == name)
+        .map(|c| c.value.as_str())
+}
+
+/// Decode the held credential for `role` from `credentials/<role>`.
+fn load_credential(dir: &Path, role: &str) -> Result<Macaroon, ClientError> {
+    let path = dir.join(credential_path(role));
+    let raw = read_text(&path, "run `mint client exchange --role <role>` first")?;
+    Macaroon::decode(raw.trim()).map_err(|_| ClientError::BadFile("credential"))
+}
+
+/// `mint client credential list`: enumerate the per-role credentials
+/// held under `credentials/`. Local-only — no network, no PoP.
+pub fn credential_list(dir: &Path) -> Result<(), ClientError> {
+    let cdir = dir.join(CREDENTIALS_DIR);
+    let mut held: Vec<(String, Macaroon)> = match fs::read_dir(&cdir) {
+        Ok(rd) => {
+            let mut v = Vec::new();
+            for entry in rd {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let role = entry.file_name().to_string_lossy().into_owned();
+                let raw = fs::read_to_string(entry.path())?;
+                let mac =
+                    Macaroon::decode(raw.trim()).map_err(|_| ClientError::BadFile("credential"))?;
+                v.push((role, mac));
+            }
+            v
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(ClientError::Io(e)),
+    };
+    if held.is_empty() {
+        eprintln!(
+            "no credentials held in {} — run `mint client exchange --role <role>`",
+            cdir.display()
+        );
+        return Ok(());
+    }
+    held.sort_by(|a, b| a.0.cmp(&b.0));
+    println!("{:<16} {:<28} {:>7}  SUB", "ROLE", "ROLE-CAVEAT", "CAVEATS");
+    for (file_role, mac) in &held {
+        // The filename is authoritative for *which* credential this is;
+        // the `role` caveat is what the credential actually carries. A
+        // mismatch is worth seeing, so show both rather than collapsing.
+        let role_cav = caveat_value(mac, name::ROLE).unwrap_or("(none)");
+        let sub = caveat_value(mac, name::SUB).unwrap_or("(none)");
+        println!(
+            "{:<16} {:<28} {:>7}  {sub}",
+            file_role,
+            role_cav,
+            mac.caveats().len()
+        );
+    }
+    Ok(())
+}
+
+/// `mint client credential inspect <role>`: narrate the held
+/// credential's caveat chain (the same rendering `exchange` prints when
+/// it receives it). Local-only — no network, no PoP.
+pub fn credential_inspect(dir: &Path, role: &str) -> Result<(), ClientError> {
+    let mac = load_credential(dir, role)?;
+    eprintln!(
+        "credential for role `{role}` ({}):",
+        dir.join(credential_path(role)).display()
+    );
+    describe("credential (what you hold)", &mac);
+    Ok(())
+}
+
 /// Convenience for callers that take a `--client-dir`.
 pub fn client_dir(arg: Option<PathBuf>) -> PathBuf {
     arg.unwrap_or_else(|| PathBuf::from("mint_client"))
@@ -581,5 +657,38 @@ mod tests {
                 Err(ClientError::BadCaveat(_))
             ));
         }
+    }
+
+    #[test]
+    fn credential_list_and_inspect_are_local_and_fail_actionably() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+
+        // No credentials/ dir yet: list is a clean no-op (not an error),
+        // inspect of an absent role points at the prerequisite command.
+        assert!(credential_list(dir).is_ok());
+        assert!(matches!(
+            credential_inspect(dir, "write"),
+            Err(ClientError::Missing { .. })
+        ));
+
+        // Persist a real minted credential at credentials/write.
+        let cred =
+            crate::issuance::mint_credential(&[7u8; 32], "mint", "coord-1", "ed25519:k", "write");
+        save_macaroon(dir, &credential_path("write"), &cred.encode()).unwrap();
+        assert!(credential_list(dir).is_ok());
+        assert!(credential_inspect(dir, "write").is_ok());
+
+        // A corrupt credential file is reported, not panicked on, by both.
+        save_macaroon(dir, &credential_path("read"), &cred.encode()).unwrap();
+        fs::write(dir.join(credential_path("read")), "not-a-macaroon").unwrap();
+        assert!(matches!(
+            credential_list(dir),
+            Err(ClientError::BadFile("credential"))
+        ));
+        assert!(matches!(
+            credential_inspect(dir, "read"),
+            Err(ClientError::BadFile("credential"))
+        ));
     }
 }

@@ -62,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         cmd: EnrollCmd,
     },
+    /// Operator: inspect the configured role inventory (read-only).
+    Role {
+        #[command(subcommand)]
+        cmd: RoleCmd,
+    },
     /// Reference client — the coordinator's half of the flow.
     Client {
         /// Identity + received-macaroon directory (default
@@ -119,6 +124,11 @@ enum ClientCmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Inspect the per-role credentials held on disk (local-only).
+    Credential {
+        #[command(subcommand)]
+        cmd: CredentialCmd,
+    },
     /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
@@ -141,6 +151,36 @@ enum ClientCmd {
         /// Role name from the mint config.
         #[arg(value_name = "ROLE")]
         role: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialCmd {
+    /// List held per-role credentials: role, role caveat, caveat count, sub.
+    List,
+    /// Narrate one role credential's caveat chain.
+    Inspect {
+        /// Role whose credential to inspect (`credentials/<role>`).
+        #[arg(value_name = "ROLE")]
+        role: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RoleCmd {
+    /// List configured roles: name, required caveats, TTL bounds.
+    List {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+    },
+    /// Show one role: TTL bounds, required caveats, policy source, and
+    /// the raw policy template + the substitution surface it references.
+    Inspect {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+        /// Role name from the mint config.
+        #[arg(value_name = "ROLE")]
+        name: String,
     },
 }
 
@@ -182,6 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config),
             EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes),
+        },
+        Command::Role { cmd } => match cmd {
+            RoleCmd::List { config } => role_list(&config),
+            RoleCmd::Inspect { config, name } => role_inspect(&config, &name),
         },
         Command::Client { client_dir, cmd } => client_cmd(client_dir, cmd).await,
     }
@@ -232,6 +276,10 @@ async fn client_cmd(
                 std::process::exit(2);
             }
         }
+        ClientCmd::Credential { cmd } => match cmd {
+            CredentialCmd::List => Ok(mint::client::credential_list(&dir)?),
+            CredentialCmd::Inspect { role } => Ok(mint::client::credential_inspect(&dir, &role)?),
+        },
         ClientCmd::AssumeRole {
             url,
             in_file,
@@ -404,4 +452,75 @@ fn enroll_approve(config: &Path, sub: &str, yes: bool) -> Result<(), Box<dyn std
         // Raced away between get_pending and approve (e.g. GC / rotate).
         Err(format!("no pending enrollment for sub {sub}").into())
     }
+}
+
+fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(config)?;
+    if config.roles.is_empty() {
+        eprintln!("no roles configured");
+        return Ok(());
+    }
+    println!(
+        "{:<16} {:>7} {:>7} {:>7}  REQUIRED-CAVEATS",
+        "NAME", "MIN", "DEF", "MAX"
+    );
+    // config.roles is a BTreeMap, so iteration is name-sorted.
+    for r in config.roles.values() {
+        println!(
+            "{:<16} {:>7} {:>7} {:>7}  {}",
+            r.name,
+            r.min_ttl_seconds,
+            r.default_ttl_seconds,
+            r.max_ttl_seconds,
+            if r.required_caveats.is_empty() {
+                "(none)".to_string()
+            } else {
+                r.required_caveats.join(", ")
+            }
+        );
+    }
+    Ok(())
+}
+
+fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(config)?;
+    let role = config
+        .roles
+        .get(name)
+        .ok_or_else(|| format!("no role {name} in config (see `mint role list`)"))?;
+    eprintln!("role: {}", role.name);
+    eprintln!(
+        "  ttl_seconds:      min={} default={} max={}",
+        role.min_ttl_seconds, role.default_ttl_seconds, role.max_ttl_seconds
+    );
+    eprintln!(
+        "  required_caveats: {}",
+        if role.required_caveats.is_empty() {
+            "(none)".to_string()
+        } else {
+            role.required_caveats.join(", ")
+        }
+    );
+    eprintln!("  audience:         {}", config.audience);
+    eprintln!("  tenant.bucket:    {}", config.tenant.bucket);
+    eprintln!("  policy source:    {}", role.policy_path.display());
+
+    // The policy is a request-parameterised template: there is no
+    // single concrete grant to print, so show the substitution surface
+    // (by trust provenance) + the raw template, not a rendering.
+    let surface = mint::template::template_surface(&role.policy);
+    eprintln!("  policy references:");
+    for (label, vals) in [
+        ("caveat (MAC-bound)", &surface.caveats),
+        ("request (PoP-bound)", &surface.request),
+        ("tenant (config)", &surface.tenant),
+        ("system (mint-computed)", &surface.system),
+    ] {
+        if !vals.is_empty() {
+            eprintln!("    {label}: {}", vals.join(", "));
+        }
+    }
+    eprintln!("  policy template:");
+    println!("{}", role.policy);
+    Ok(())
 }

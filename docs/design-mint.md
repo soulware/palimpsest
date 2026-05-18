@@ -1122,6 +1122,8 @@ mint serve <cfg> [bind]            # HTTP service
 mint bootstrap [rotate]            # print current bootstrap macaroon / rotate the nonce
 mint enroll list                   # pending: sub, cnf fingerprint, peer ip, age
 mint enroll approve <sub>          # approve a pending record
+mint role list                     # configured roles: name, required caveats, TTL bounds
+mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```
 
 Reference client (the ed25519 keypair is created out-of-band; the
@@ -1131,6 +1133,8 @@ client only reads it; `--id` is the opaque `sub`):
 mint client keygen                                       # → client.key/.pub
 mint client enroll       --id <sub> <macaroon|file|->    # → credential.ticket
 mint client exchange     --role <role>                   # 403 until approved → credentials/<role>
+mint client credential list                              # held per-role credentials (local-only)
+mint client credential inspect <role>                    # narrate one credential's caveat chain
 mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
 ```
 

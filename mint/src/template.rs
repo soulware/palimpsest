@@ -144,6 +144,84 @@ pub fn render_policy(
     Ok(rendered)
 }
 
+/// The substitution surface a policy template references, grouped by
+/// trust provenance (`docs/design-mint.md` § *Templating*): `caveats`
+/// MAC-bound, `request` PoP-bound, `tenant` config, `system`
+/// mint-computed. Each list is sorted and de-duplicated.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TemplateSurface {
+    pub caveats: Vec<String>,
+    pub tenant: Vec<String>,
+    pub system: Vec<String>,
+    pub request: Vec<String>,
+}
+
+/// Extract the [`TemplateSurface`] of a policy template by scanning the
+/// four documented token shapes — `{{caveat "name"}}`, `{{tenant.*}}`,
+/// `{{system.*}}`, `{{request.*}}` (with optional `../`/`./` scope
+/// prefixes and `(…)` subexpression wrapping). Lets `mint role inspect`
+/// state what a role's policy depends on without rendering it:
+/// rendering needs a live verified request and fails closed on any
+/// absent caveat, so there is no static "what this grants" to show.
+pub fn template_surface(template: &str) -> TemplateSurface {
+    let mut s = TemplateSurface::default();
+    let mut i = 0;
+    while let Some(open) = template[i..].find("{{") {
+        let start = i + open + 2;
+        let Some(rel_close) = template[start..].find("}}") else {
+            break;
+        };
+        let end = start + rel_close;
+        // Inner span; trim mustache modifiers (block #, close /, raw {,
+        // unescape ~) and whitespace at the edges.
+        let inner = template[start..end]
+            .trim_matches(|c: char| c.is_whitespace() || matches!(c, '{' | '}' | '#' | '~'));
+        i = end + 2;
+        if inner.starts_with('/') || inner.starts_with('!') || inner.starts_with('>') {
+            continue; // block close, comment, partial — no data refs
+        }
+        let mut tokens = inner.split_whitespace().peekable();
+        while let Some(tok) = tokens.next() {
+            // `caveat "name"` / `(caveat "name")` — the name is the
+            // next token, quote- and paren-stripped (caveat names carry
+            // `:`, so only trim wrapping punctuation).
+            if tok.trim_start_matches('(') == "caveat" {
+                if let Some(arg) = tokens.peek() {
+                    let name = arg.trim_matches(|c: char| matches!(c, '(' | ')' | '"' | '\''));
+                    if !name.is_empty() {
+                        s.caveats.push(name.to_string());
+                    }
+                }
+                continue;
+            }
+            // A plain path: strip a leading `(`, any number of `../`
+            // and a `./` scope prefix, and a trailing `)`.
+            let mut p = tok.trim_start_matches('(').trim_end_matches(')');
+            while let Some(rest) = p.strip_prefix("../") {
+                p = rest;
+            }
+            p = p.strip_prefix("./").unwrap_or(p);
+            let bucket = if p == "tenant" || p.starts_with("tenant.") {
+                Some(&mut s.tenant)
+            } else if p == "system" || p.starts_with("system.") {
+                Some(&mut s.system)
+            } else if p == "request" || p.starts_with("request.") {
+                Some(&mut s.request)
+            } else {
+                None
+            };
+            if let Some(v) = bucket {
+                v.push(p.to_string());
+            }
+        }
+    }
+    for v in [&mut s.caveats, &mut s.tenant, &mut s.system, &mut s.request] {
+        v.sort();
+        v.dedup();
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +338,33 @@ mod tests {
             "r",
         );
         assert!(matches!(err, Err(TemplateError::Render(_))));
+    }
+
+    #[test]
+    fn surface_groups_refs_by_provenance_through_scopes_and_subexprs() {
+        // TPL exercises every shape: a scalar caveat, a `../`-scoped
+        // tenant ref inside an #each block, a request.* block path, and
+        // a system.* ref. `{{this}}` and the `each` helper are not data
+        // refs and must not leak in.
+        let s = template_surface(TPL);
+        assert_eq!(s.caveats, vec!["elide:Volume"]);
+        assert_eq!(s.tenant, vec!["tenant.bucket"]); // ../ scope folded
+        assert_eq!(s.system, vec!["system.expiry_iso8601"]);
+        assert_eq!(s.request, vec!["request.ancestors"]);
+
+        // Subexpression form `{{#each (caveat "elide:X")}}` and a bare
+        // namespace token both resolve; duplicates collapse.
+        let s = template_surface(
+            r#"{{caveat "a"}} {{caveat "a"}} {{#each (caveat "b")}}{{tenant}}{{/each}}"#,
+        );
+        assert_eq!(s.caveats, vec!["a", "b"]);
+        assert_eq!(s.tenant, vec!["tenant"]);
+        assert!(s.system.is_empty() && s.request.is_empty());
+
+        // Comments/partials contribute nothing.
+        assert_eq!(
+            template_surface("{{! caveat \"x\" }}{{> partial}}"),
+            TemplateSurface::default()
+        );
     }
 }
