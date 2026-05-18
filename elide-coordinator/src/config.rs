@@ -103,6 +103,15 @@ pub struct CoordinatorConfig {
     /// (`docs/design-iam-key-model.md`).
     #[serde(default)]
     pub iam: Option<IamConfig>,
+
+    /// External `mint` credential service. Optional; absence keeps the
+    /// `[iam]` / shared-key behaviour. Presence routes per-volume RO
+    /// issuance through mint's `assume-role` over the configured
+    /// endpoint (`docs/design-mint.md` § "Coordinator configuration").
+    /// Mutually exclusive with `[iam]` — they are two credential
+    /// planes behind the same seam.
+    #[serde(default)]
+    pub mint: Option<MintConfig>,
 }
 
 impl CoordinatorConfig {
@@ -582,6 +591,22 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # ro_key_lifetime = "720h"                # DateLessThan default
 # source_ips      = []                    # optional egress IP pins
 
+# [mint] — opt-in; uncomment the header and `url` to enable. Routes
+# per-volume RO credential issuance through the external `mint`
+# service's `assume-role` (docs/design-mint.md § "Coordinator
+# configuration"). Mutually exclusive with [iam]. The coordinator's
+# mint identity is its existing `coordinator.key`; the per-role
+# capability macaroons live under <data_dir>/credentials/<role>
+# (provisioned by enrollment, not here). `url` is required and is
+# scheme-discriminated exactly as mint's reference client:
+# `unix:<path>` selects the UDS transport (bundled single-host shape),
+# `http(s)://host:port` the TCP transport (network shapes).
+#
+# [mint]
+# url             = "unix:mint/mint_data/mint.sock"
+# connect_timeout = "5s"
+# request_timeout = "30s"
+
 [peer_fetch]
 # Setting `port` enables peer fetch: the coordinator binds an HTTP server on
 # this port and advertises it at `coordinators/<id>/peer-endpoint.toml` for
@@ -619,6 +644,57 @@ impl Default for CoordinatorConfig {
             gc: GcConfig::default(),
             peer_fetch: PeerFetchConfig::default(),
             iam: None,
+            mint: None,
+        }
+    }
+}
+
+/// External `mint` credential service (`docs/design-mint.md`). The
+/// coordinator holds a per-role capability macaroon under
+/// `<data_dir>/credentials/<role>` (provisioned by enrollment, not
+/// config) and exercises it via mint's `assume-role`. Identity is the
+/// existing `coordinator.key`; `aud=mint` is fixed inside the
+/// macaroon. The only configurable surface is the endpoint and its
+/// timeouts — see the doc's "deliberately thin" note.
+#[derive(Deserialize, Clone, Debug)]
+pub struct MintConfig {
+    /// mint endpoint, scheme-discriminated exactly as mint's reference
+    /// client `--url` (`docs/design-mint.md` § "Transport"):
+    /// `unix:<path>` selects the UDS leg (the bundled single-host
+    /// shape), `http://`/`https://` the TCP leg (the network shapes).
+    pub url: String,
+
+    /// Connection-establishment timeout. Default: 5s.
+    #[serde(default = "default_mint_connect_timeout", with = "humantime_serde")]
+    pub connect_timeout: Duration,
+
+    /// Per-request timeout for an `assume-role` call. Credential
+    /// vending is a small request; the default is generous. Default:
+    /// 30s.
+    #[serde(default = "default_mint_request_timeout", with = "humantime_serde")]
+    pub request_timeout: Duration,
+}
+
+fn default_mint_connect_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_mint_request_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+impl MintConfig {
+    /// Reject an endpoint whose scheme is neither `unix:` nor
+    /// `http(s)://`. Validated at issuer-build time so a typo fails at
+    /// startup rather than on the first `assume-role`.
+    pub fn validate(&self) -> Result<()> {
+        let u = self.url.trim();
+        if u.starts_with("unix:") || u.starts_with("http://") || u.starts_with("https://") {
+            Ok(())
+        } else {
+            bail!(
+                "[mint] url must be `unix:<path>` or `http(s)://host:port` (got {:?})",
+                self.url
+            )
         }
     }
 }

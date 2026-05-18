@@ -17,6 +17,8 @@ mod fork;
 mod iam;
 mod import;
 mod inbound;
+mod mint_client;
+mod mint_stores;
 mod pidfile;
 mod rescan;
 mod shutdown;
@@ -138,10 +140,32 @@ async fn run() -> Result<()> {
             // Hoisted above the [iam] match so the coord-id is in scope
             // for the per-coordinator caps-probe key below; daemon::run
             // also calls load_or_generate, but it's idempotent.
-            let identity = elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
-                &config.data_dir,
-            )
-            .map_err(|e| anyhow::anyhow!("loading coordinator identity: {e}"))?;
+            let identity = std::sync::Arc::new(
+                elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
+                    &config.data_dir,
+                )
+                .map_err(|e| anyhow::anyhow!("loading coordinator identity: {e}"))?,
+            );
+
+            if let Some(mint_cfg) = &config.mint {
+                mint_cfg.validate()?;
+                tracing::info!(
+                    "[coordinator] store: mint-backed scoped \
+                     (coord-base / coord-writer / coord-data); reachability \
+                     and conditional-PUT are validated lazily on first \
+                     assume-role per role"
+                );
+                let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
+                    std::sync::Arc::new(mint_stores::MintScopedStores::new(
+                        mint_cfg,
+                        config.store.clone(),
+                        config.data_dir.clone(),
+                        identity.clone(),
+                    ));
+                let result = daemon::run(config, stores).await;
+                let _ = std::fs::remove_file(&pid_path);
+                return result;
+            }
 
             let store = match &config.iam {
                 Some(iam_cfg) => {
@@ -182,6 +206,13 @@ async fn run() -> Result<()> {
                 "[coordinator] store scoping: passthrough (single key for every \
                  op; per-volume scoping not yet wired)"
             );
+            if config.mint.is_some() {
+                tracing::info!(
+                    "[coordinator] [mint] set: per-volume RO vended via mint \
+                     volume-ro; coordinator-own S3 writes still use AWS_* env \
+                     (mint coord-* role signing not yet wired)"
+                );
+            }
             config.store.probe(store.as_ref()).await?;
             tracing::info!("[coordinator] store: reachable");
 

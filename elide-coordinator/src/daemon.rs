@@ -101,7 +101,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     );
     // Publishing coordinator.pub is a coordinator-wide write
     // (`coordinator/<id>.pub`), not a per-volume op.
-    let coord_wide = stores.coordinator_wide();
+    let coord_wide = stores.writer();
     if let Err(e) = identity.publish_pub(coord_wide.as_ref()).await {
         return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
     }
@@ -141,9 +141,11 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             Err(e) => return Err(anyhow::anyhow!("build peer-fetch client: {e}")),
         }
         // Server context for the inbound HTTP listener. The auth state
-        // uses the coord-wide (S3) store for `coordinator.pub` and the
-        // ETag-conditional `names/<name>` read (steps 2–3, the gap-free
-        // force-release fence). Lineage (step 4) is verified against a
+        // reads `coordinator.pub` and the ETag-conditional
+        // `names/<name>` (steps 2–3, the gap-free force-release fence)
+        // via the read-only `coord-base` credential — the exposed
+        // verifier holds no write-capable key. Lineage (step 4) is
+        // verified against a
         // separate local store rooted at `data_dir`: the peer walks the
         // signed `by_id/<vol>/volume.{provenance,pub}` it already holds
         // for every fork it serves — no S3 read, no credential. A fork
@@ -159,7 +161,8 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 |e| anyhow::anyhow!("peer-fetch lineage store at {:?}: {e}", data_dir.as_ref()),
             )?,
         );
-        let auth = elide_peer_fetch::auth::AuthState::new(coord_wide.clone(), lineage_store);
+        let auth =
+            elide_peer_fetch::auth::AuthState::new(stores.peer_verifier_store(), lineage_store);
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }
@@ -169,10 +172,18 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // peer-fetch is unconfigured.
     elide_coordinator::tasks::set_peer_fetch_handle(peer_fetch_handle);
 
-    // Credential issuer: the [iam] config section enables Tigris-style
-    // per-volume RO keys (docs/design-iam-key-model.md). Absent
-    // section keeps the shared-key downgrade — every volume gets the
-    // coordinator's own AWS_* key.
+    // Credential issuer. `[iam]` enables the in-process Tigris path
+    // (docs/design-iam-key-model.md); `[mint]` routes per-volume RO
+    // issuance through the external mint service
+    // (docs/design-mint.md § "Coordinator configuration"). They are
+    // two credential planes behind the same seam — mutually exclusive.
+    // Neither section keeps the shared-key downgrade (every volume
+    // gets the coordinator's own AWS_* key).
+    if config.iam.is_some() && config.mint.is_some() {
+        anyhow::bail!(
+            "[iam] and [mint] are mutually exclusive credential planes — configure one, not both"
+        );
+    }
     let credentialer: Option<std::sync::Arc<dyn crate::credential::Credentialer>> = match &config
         .iam
     {
@@ -212,10 +223,30 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             );
             Some(credentialer)
         }
-        None => {
-            set_credential_issuer(SharedKeyPassthrough::new_with_warning());
-            None
-        }
+        None => match &config.mint {
+            Some(mint_cfg) => {
+                mint_cfg.validate()?;
+                let credentialer: std::sync::Arc<dyn crate::credential::Credentialer> =
+                    std::sync::Arc::new(crate::mint_client::MintCredentialer::new(
+                        mint_cfg,
+                        config.data_dir.clone(),
+                        identity.clone(),
+                    ));
+                set_credential_issuer(crate::mint_client::MintCredentialIssuer::new(
+                    credentialer.clone(),
+                    config.data_dir.clone(),
+                ));
+                info!(
+                    "[coordinator] credential issuer: external mint service ({})",
+                    mint_cfg.url
+                );
+                Some(credentialer)
+            }
+            None => {
+                set_credential_issuer(SharedKeyPassthrough::new_with_warning());
+                None
+            }
+        },
     };
 
     info!(
@@ -347,7 +378,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     //
     // Sweeps `names/` for owned volumes — coordinator-wide scope.
     tasks.spawn(elide_coordinator::reaper::run(
-        stores.coordinator_wide(),
+        stores.writer(),
         config.data_dir.clone(),
         gc_config.reaper_cadence(),
         gc_config.retention_window,
@@ -433,7 +464,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
                 {
                     // Reads/writes names/<name>: coordinator-wide.
-                    let coord_wide = stores.coordinator_wide();
+                    let coord_wide = stores.writer();
                     elide_coordinator::lifecycle::reconcile_marker(
                         &coord_wide,
                         &vol_dir,
@@ -484,18 +515,17 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     Arc::new(tokio::sync::watch::channel(None).0)
                 });
 
-                // Per-volume drain / GC / prefetch loop. Pick the
-                // volume-scoped store handle; under passthrough this is
-                // the same handle as `coordinator_wide()`, but it
-                // documents the intent so a future Tigris IAM impl can
-                // hand each volume its own scoped key.
+                // Per-volume drain / GC / prefetch loop runs against
+                // that volume's `coord-data` handle. A directory whose
+                // name is not a ULID is not a real volume; it falls
+                // back to the coordinator-wide writer handle.
                 let vol_store = match vol_dir
                     .file_name()
                     .and_then(|n| n.to_str())
                     .and_then(|s| ulid::Ulid::from_string(s).ok())
                 {
-                    Some(u) => stores.for_volume(&u),
-                    None => stores.coordinator_wide(),
+                    Some(u) => stores.data_for_volume(&u),
+                    None => stores.writer(),
                 };
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),

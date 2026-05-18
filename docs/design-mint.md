@@ -766,7 +766,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `bootstrap` | string | scalar | mint, on first start / rotate | Gate only — bootstrap macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
 | `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `request.role` must equal it. |
-| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-identity`. |
+| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-writer`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
@@ -779,10 +779,7 @@ definition below):
 | Role | `aud` | `exp` | `sub` | `elide:Volume` |
 |---|---|---|---|---|
 | `coord-data` | ● | ● | ● | ● |
-| `coord-names` | ● | ● | ● | |
-| `coord-events` | ● | ● | ● | |
-| `coord-identity` | ● | ● | ● | |
-| `coord-list` | ● | ● | ● | |
+| `coord-writer` | ● | ● | ● | |
 | `coord-base` | ● | ● | ● | |
 | `volume-ro` | ● | ● | | ● |
 
@@ -804,10 +801,11 @@ Notes:
   `cnf` (#16). No list-valued caveat type is needed (#6
   resolved): the only list-shaped input, the ancestor set, is
   `request.ancestors` in the PoP-signed body, not a caveat.
-- **`sub` templates only in `coord-identity`**
-  (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Every
-  other `coord-*` role uses it as a gate only; their policies use
-  prefix wildcards (`names/*`, `coordinators/*`, `events/*`).
+- **`sub` templates only in `coord-writer`'s own-identity statement**
+  (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Everywhere
+  else `sub` is a gate only; the other statements use prefix
+  wildcards (`names/*`, `events/*`) and `coord-base` reads
+  `coordinators/*`.
 - **`coord-base` is the read-only baseline every coordinator holds**, and
   the only credential the LAN/internet-exposed peer-fetch verifier holds.
   Coordinator-wide read of `names/*` / `coordinators/*` / `events/*`,
@@ -815,20 +813,47 @@ Notes:
 
 ## Elide as customer: role inventory
 
-Elide's existing four-key model (`design-iam-key-model.md` § *Key classes*)
-does **not** collapse to a single coordinator-wide writer under this design.
-The monolithic `coord-writer` is split two ways:
+Elide's coordinator authenticates to mint and assumes **four roles**:
 
-- **By purpose** (Split A): the five-statement writer policy fragments into
-  one role per top-level prefix, since they differ sharply in cadence, blast
-  radius, and which IAM-layer invariant they must preserve.
-- **By volume** (Split B): the `by_id/` data writer becomes *per-volume*,
-  assumed with an `elide:Volume` caveat and cached coordinator-side per
-  vol_ulid. This reopens `design-iam-key-model.md` § *Per-volume scoping for
-  writes (rejected)* — see *Why Split B is viable now* below.
+| Role | Scope | Held by |
+|---|---|---|
+| `coord-base` | read-only `names/* coordinators/* events/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
+| `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`, `ListBucket`) | the non-exposed mutation paths |
+| `coord-data` | per-volume `by_id/<vol>/*` read+write (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
+| `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
-Orthogonally, `coord-base` is the read-only control-plane baseline every
-coordinator holds (it is not a fragment of the writer policy).
+**Why not the per-purpose split (Split A).** `design-iam-key-model.md`'s
+in-process model fragmented the writer into one role per top-level
+prefix because the coordinator held a single *long-lived* writer key
+and there was no policy-rendering broker — separate keys held by
+separate code paths were the only way to bound a leaked persistent
+key's blast radius and to enforce the IAM-layer invariants
+(`events/` append-only, `coordinators/` immutable).
+
+Mint dissolves both premises. It **is** the policy-rendering broker:
+the IAM-layer invariants live in `coord-writer`'s multi-statement
+policy *template* (no `s3:DeleteObject` on `events/` or
+`coordinators/`), not in key partitioning. And the keys it vends are
+short-lived, on-demand, never persisted — the operational cost that
+made consolidation expensive is gone (the same argument *Why Split B
+is viable now* makes). Per-purpose **attribution** is free regardless,
+from the `assume-role` audit log. What a per-purpose split would still
+uniquely catch — a *vended Tigris keypair* leaking without the
+identity key, within one TTL window — is narrow: every `coord-writer`
+key is held by the one trusted coordinator process, which on
+compromise can re-assume any role it is enrolled for anyway. The split
+bought far more against a single persistent admin key than it does
+against ephemeral broker-vended keys held by one principal.
+
+Two splits survive on their own merits, not Split A's:
+
+- **`coord-base` is separate** because the peer-fetch verifier is
+  LAN/internet-exposed and must hold a credential that *structurally*
+  cannot mutate state or read `by_id/` bodies. A hard containment
+  boundary, not an operational nicety.
+- **`coord-data` is per-volume** (Split B) because it crosses into
+  per-volume blast-radius territory and is cheap precisely because
+  mint vends it ephemerally — see *Why Split B is viable now*.
 
 ### TTL principle
 
@@ -870,66 +895,42 @@ for the inputs alongside `coord-data` for the output volume rather than
 widening `coord-data`'s policy. (Reaper delete of a volume's own prefix is
 covered by `coord-data` on that volume.)
 
-### `coord-names` (Split A)
+### `coord-writer`
 
-Coordinator-wide. Name claim / rename / force-release / rollback.
-
-- **Required caveats:** `sub`, `aud=mint`, `exp`
-- **TTL:** 1h. Control-plane, infrequent; refresh-on-demand is cheap.
-- **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{tenant.bucket}}/names/*`.
-
-### `coord-events` (Split A)
-
-Coordinator-wide. Event-journal appends and reads.
+Coordinator-wide write authority: name claim / rename / force-release
+/ rollback (`names/`), event-journal appends and reads (`events/`),
+this coordinator's own identity records (`coordinators/<sub>/`), and
+bucket enumeration (`ListBucket`). One role, one credential, one
+keypair cache. The IAM-layer invariants ride the policy *template*,
+not key partitioning:
 
 - **Required caveats:** `sub`, `aud=mint`, `exp`
-- **TTL:** 1h.
-- **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-  `arn:aws:s3:::{{tenant.bucket}}/events/*`. The append-only invariant is
-  enforced here at the IAM layer — no role in the inventory holds delete on
-  `events/`.
-
-### `coord-identity` (Split A — own-prefix only)
-
-Writes this coordinator's own identity records: `coordinator.pub` and
-`peer-endpoint.toml`. Scoped to **its own** `coordinators/<ulid>/`
-prefix via `sub` templating — it cannot touch any other
-coordinator's records. Peer identity/endpoint *reads* are not here;
-they are covered by the read-only `coord-base` baseline.
-
-- **Required caveats:** `sub`, `aud=mint`, `exp`
-- **TTL:** 6h.
-- **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat "sub"}}/*`.
-  Coordinator-identity immutability is enforced here — no role holds
-  delete on `coordinators/`. A leaked `coord-identity` key can rewrite
-  only its own coordinator's identity, not impersonate another.
-
-### `coord-list` (Split A)
-
-Coordinator-wide bucket enumeration: `volume list --remote` (LIST
-`names/`), snapshot enumeration when the branch point is unknown (LIST
-`by_id/<vol>/snapshots/`), event-log find-latest / peer-discovery (LIST
-`events/<name>/`).
-
-`s3:ListBucket` is irreducibly bucket-global on Tigris. AWS scopes it
-to a prefix only via the `s3:prefix` condition key; Tigris supports
-**no string condition keys** — only `IpAddress`/`NotIpAddress` and the
-`Date*` family ([Tigris IAM policy support][tigris-iam-policies]). So
-`coord-list` cannot be prefix-scoped or folded into per-volume
-`coord-data`; it is the one structurally un-scopable role. Mitigation
-is temporal only: short TTL, assumed on demand while enumerating.
-
-- **Required caveats:** `sub`, `aud=mint`, `exp`
-- **TTL:** 6h.
-- **Policy:** `s3:ListBucket` on `arn:aws:s3:::{{tenant.bucket}}` (bucket
-  resource, no object statement).
-
-It only exposes object *keys* (ULIDs, names, coord ids), never object
-contents. Eliminating LIST dependence — `events/<name>/HEAD` pointers,
-deterministic manifest keys, a maintained `names` index — would shrink
-or remove `coord-list`; tracked as open question #12.
+- **TTL:** 1h. Control-plane, infrequent, refreshed on demand; the
+  tightest coordinator TTL since it is the broadest write capability.
+- **Policy:** a multi-statement document, each statement preserving
+  the invariant its prefix carries:
+  - `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
+    `arn:aws:s3:::{{tenant.bucket}}/names/*`.
+  - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
+    `arn:aws:s3:::{{tenant.bucket}}/events/*`. **`events/` append-only**
+    is enforced here — no statement, in any role, grants delete on
+    `events/`.
+  - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
+    `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat "sub"}}/*`
+    — own-prefix only, via `sub` templating. **`coordinators/`
+    immutability** is enforced here; a leaked key can rewrite only
+    *this* coordinator's identity, never impersonate another, and
+    never delete.
+  - `s3:ListBucket` on `arn:aws:s3:::{{tenant.bucket}}` (bucket
+    resource, no object statement). `ListBucket` is irreducibly
+    bucket-global on Tigris — AWS prefix-scopes it via the `s3:prefix`
+    condition key, but Tigris supports **no string condition keys**
+    (only `IpAddress`/`NotIpAddress` and `Date*`,
+    [Tigris IAM policy support][tigris-iam-policies]). It exposes
+    object *keys* only (ULIDs, names, coord ids), never contents;
+    eliminating LIST dependence (`events/<name>/HEAD` pointers,
+    deterministic manifest keys, a maintained `names` index) would
+    drop this statement — open question #12.
 
 ### `volume-ro`
 
@@ -987,7 +988,7 @@ active volume per TTL window per coordinator, gated by Tigris IAM rate
 limits (*Open questions* #9). The 24h TTL is the primary knob: longer →
 fewer mints, larger leaked-key window.
 
-### `coord-base` (Split A — coordinator-wide, read-only baseline)
+### `coord-base`
 
 The baseline read-only credential every coordinator holds. Covers the
 control-plane public state a coordinator reads as a matter of course:
@@ -1021,10 +1022,10 @@ makes it safe to be the *only* credential held by the LAN/internet-
 exposed peer-fetch HTTP verifier: a compromise of the exposed surface
 can neither mutate state nor read segment bodies
 (`design-iam-key-model.md` § *IAM-layer invariants*). The write-capable
-`coord-names` / `coord-identity` / `coord-events` roles stay separate
-and are held only by the non-exposed mutation paths. `coord-base` must
-never accrete a write action or any `by_id/` read; doing so silently
-breaks exposed-surface containment.
+`coord-writer` and `coord-data` roles stay separate and are held only
+by the non-exposed mutation paths. `coord-base` must never accrete a
+write action or any `by_id/` read; doing so silently breaks
+exposed-surface containment.
 
 The peer-fetch verifier needs no dedicated role and no `by_id/` access:
 it uses `coord-base` for the gap-free fence (per-request ETag-
@@ -1102,6 +1103,143 @@ drops below `reqwest` — which has no UDS support — to `hyper` dialed
 through `hyperlocal`'s `UnixConnector`; the TCP leg stays on
 `reqwest`. mint is its own workspace, so the axum 0.8 dependency is
 contained to it.
+
+### Coordinator configuration
+
+**Proposed.** The coordinator reaches mint through one new
+`coordinator.toml` section:
+
+```toml
+# enable mint
+[mint]
+url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
+```
+
+`url` is scheme-discriminated exactly as the reference client's
+`--url` above: `unix:<path>` selects the UDS leg, `http(s)://host:port`
+the TCP leg. UDS paths follow the same resolution rule as mint's own
+(relative resolved against cwd, absolute verbatim). The section is
+presence-enables, mirroring `[iam]` / `[peer_fetch]`.
+
+The section is deliberately thin. The coordinator's mint identity is
+`coordinator.key` (already present for name-claims and provenance);
+its per-role capability macaroons live one file per role under
+`credentials/<role>` in the coordinator's `data_dir`, provisioned by
+enrollment (§ *Enrollment*), not by config; and `aud=mint` is fixed
+inside the macaroon. Only the endpoint — and optionally
+`connect_timeout` / `request_timeout` (humantime, mirroring
+`[store]`) — is configurable.
+
+`[mint]` and the in-process `[iam]` backend are mutually exclusive
+credential planes behind the same coordinator credential seam. Per
+*Elide as customer* the IAM-key inventory collapses under mint, so
+`[iam]` and the coordinator's in-process Tigris path are **removed**,
+not retained as a fallback — an optional path for the credential
+plane would mean the per-volume scoping property does not actually
+hold. The shared-key downgrade (no `[mint]` and no `[iam]` section at
+all — the local-store / no-IAM case) is unaffected.
+
+### Coordinator store architecture
+
+**Proposed.** The role inventory (§ *Elide as customer*) defines the
+*credentials*; this is how the coordinator's S3 call sites acquire and
+wield them. The existing `ScopedStores` seam
+(`elide-coordinator/src/stores.rs`) carries it, widened from two scopes
+to three roles:
+
+```rust
+pub trait ScopedStores {
+    fn base_ro(&self)               -> Arc<dyn ReadStore>;       // coord-base
+    fn writer(&self)                -> Arc<dyn ObjectStore>;     // coord-writer
+    fn data_for_volume(&self, v: &Ulid) -> Arc<dyn ObjectStore>; // coord-data
+}
+```
+
+`volume-ro` is not here — it is vended *to the volume process*, not
+held by a coordinator call site (§ *Coordinator configuration*,
+already wired).
+
+**Role is a property of the code path, not of the key.** A mutation
+path uses `writer()` for its *entire* `names/`+`events/`+own-
+`coordinators/` interaction — including the reads that are part of a
+mutation (`coord-writer`'s policy holds `s3:GetObject` on those
+prefixes), so a name-claim/force-release CAS (`GET` ETag → conditional
+`PUT`) runs wholly on one credential and is never split. It uses
+`data_for_volume(v)` for that volume's `by_id/`. Read-only paths and
+the exposed peer-fetch verifier use `base_ro()`. There is **no
+prefix-routing wrapper**: which credential a path wields is explicit at
+the acquisition site and visible in review, not a runtime dispatch on
+key strings. The boundary the doc requires ("`coord-base` must never
+accrete a `by_id/` read") is then a property the type system carries,
+not a convention.
+
+**`base_ro()` returns a narrow `ReadStore`, not `ObjectStore`.**
+
+```rust
+#[async_trait] pub trait ReadStore: Send + Sync {
+    async fn get(&self, p: &Path)  -> object_store::Result<GetResult>;
+    async fn head(&self, p: &Path) -> object_store::Result<ObjectMeta>;
+}
+```
+
+`get`/`head` only — no `put`, `delete`, or `list` (`coord-base`
+carries no `ListBucket`; that is `coord-writer`'s). The exposed-surface
+containment boundary is made *unrepresentable*, not merely
+unauthorized: a path holding `base_ro()` cannot call a mutating method
+because it does not exist on the type. This is the one boundary where
+the type safety is load-bearing — `coord-base` is the credential the
+LAN/internet-exposed verifier holds. `writer()` and
+`data_for_volume()` keep the full `ObjectStore` surface (they feed
+existing mixed-prefix helpers that legitimately need it; confusing the
+two is an over-privilege *within the trusted coordinator*, not an
+exposed-surface break). The concrete impls of those two carry a
+`debug_assert!` that the key prefix matches the role — a test-time
+tripwire, not the primary mechanism.
+
+**Mixed-prefix ops** (`Release`: `by_id/` snapshot publish + `names/`
+flip; import `mark_initial`; fork/claim publish) acquire **both**
+handles, at the two touch-points where each prefix is written. The op
+genuinely exercises two authorities; the code shows it. `stores` is
+already threaded via `ctx`/`core` at nearly every call site, so this
+is "call the role method matching this touch-point," not new
+parameter plumbing.
+
+**Keypair cache and proactive refresh.** Each role's `assume-role`
+yields a short-lived Tigris keypair; the coordinator caches it and the
+`object_store` instance built from it, keyed by role (and by
+`vol_ulid` for `coord-data`). A background task refreshes each entry
+before its `DateLessThan` (the *TTL principle*: TTL is the maximum
+revocation latency, so refresh well inside it — e.g. at half-life),
+rebuilding the `object_store` on rotation; a brief refresh stall is
+absorbed by the WAL for writes and is off the hot path for reads
+(`coord-base`/`coord-writer` 1h, `coord-data` 24h; `volume-ro`
+freshness is § *Elide as customer*'s split-by-volume-mode rule).
+First use assumes lazily. `PassthroughStores` stays the impl for the
+local-store / no-`[mint]` case; the mint-backed `ScopedStores` impl is
+selected when `[mint]` is configured.
+
+This architecture is unit-testable in isolation but, like the rest of
+the `[mint]` path, is not exercisable end-to-end until enrollment
+provisions the `credentials/<role>` files.
+
+**Future direction (separate work): a domain-typed S3 layer.** The
+handles above are the *minimum* credential boundary —
+`ObjectStore`/`ReadStore` typed by verb surface. The intended next
+refinement is for each role to hand back the *operations its policy
+authorizes* rather than a generic store: `coord-writer` →
+`NameClaims` / `EventJournal` (get + append, **no** `delete` method —
+the `events/` append-only invariant as a type, not a policy-template
+property) / `OwnIdentity`; `coord-data` → `VolumeData`; `coord-base`
+→ `ControlPlaneReader`. This makes wrong-prefix keys unconstructable
+(S3 key layout moves inside the typed store, off the `format!` sites
+scattered across `upload.rs`/`claim.rs`/`name_store.rs`/…) and the
+IAM-layer invariants type-level. It is deliberately **not** part of
+the `[mint]` cutover: its value is independent of where credentials
+come from (equally worthwhile under `AWS_*`), it migrates hundreds of
+S3 call sites, and it needs its own API-design pass (how conditional-
+PUT/ETag, multipart, range-get surface as domain ops without leaking
+`object_store`). It layers on the same role handles afterward, call
+site by call site.
 
 ### Reference client & demo
 
@@ -1265,14 +1403,16 @@ prematurely.
     stated in the role inventory but not fully specified — the exact set of
     roles a GC pass assumes, and whether the reaper's delete wants its own
     narrower role, is open.
-12. **Eliminate `coord-list`.** It is the one structurally un-scopable
-    role (Tigris `ListBucket` is bucket-global; no string conditions to
+12. **Eliminate the `ListBucket` statement.** `coord-writer`'s
+    `ListBucket` statement is the one structurally un-scopable grant
+    (Tigris `ListBucket` is bucket-global; no string conditions to
     prefix-scope it). Replacing the LIST paths with `events/<name>/HEAD`
     pointers, deterministic manifest keys, and a maintained `names`
     index — ideas already floated in `design-volume-event-log.md` and
     `design-peer-segment-fetch.md` for performance — would shrink it to
-    just `volume list --remote`, or remove it entirely. Not blocking;
-    the temporal mitigation (short TTL, on-demand) holds until then.
+    just `volume list --remote`, or drop the statement entirely. Not
+    blocking; the temporal mitigation (`coord-writer`'s short TTL,
+    on-demand) holds until then.
 13. **Enrollment surface — settled.** See *Coordinator bootstrap* §
     *Enrollment*: reusable non-expiring bootstrap macaroon → coordinator
     self-asserts `sub`/`cnf` and `POST /v1/enroll` creates a pending
@@ -1373,8 +1513,11 @@ around:
 - [`design-auth-model.md`](design-auth-model.md) — macaroon construction
   shared with this design.
 - [`design-iam-key-model.md`](design-iam-key-model.md) — Elide's IAM key
-  inventory; the monolithic writer splits per-purpose and per-volume under
-  this design (Split A + Split B).
+  inventory and policy-scoping rationale. Under this design the
+  monolithic writer is kept (its invariants enforced in mint's policy
+  template, not by per-purpose key partitioning) and split per-volume
+  for `by_id/` (Split B); the per-purpose split is unnecessary with
+  mint as the policy-rendering broker.
 - AWS STS docs: [`AssumeRoleWithWebIdentity`][assume-role-web-identity],
   [session tags][session-tags] — the closest AWS analogue for the
   identity-token-to-scoped-credential flow.

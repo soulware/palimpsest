@@ -12,8 +12,18 @@ ed25519-dalek      = { version = "2", features = ["rand_core"] }
 tracing            = "0.1"
 tracing-log        = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64       = "0.22"
 bytes        = "1"
 chrono       = { version = "0.4", default-features = false, features = ["clock"] }
+# mint credential-service client (docs/design-mint.md § "Coordinator
+# configuration"). reqwest carries the TCP leg; the UDS leg drops to
+# hyper dialed through hyperlocal — reqwest has no UDS support, the
+# same split mint's reference client makes.
+reqwest        = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+hyper          = { version = "1", features = ["client", "http1"] }
+hyper-util     = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyperlocal     = { version = "0.9", default-features = false, features = ["client"] }
+http-body-util = "0.1"
 clap         = { version = "4", features = ["derive"] }
 elide-core   = { path = "../elide-core" }
 lz4_flex     = "0.11"
