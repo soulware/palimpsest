@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "WriteSingleVolume",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+    }
+  }]
+}

@@ -2,18 +2,27 @@
 # docs/design-mint.md § "Elide as customer: role inventory".
 #
 # trust_root_hex is a 32-byte symmetric key (here all-zero — replace for
-# any real use). Scalar caveats are reached through the `caveat` lookup
-# helper: `{{caveat "elide:Volume"}}`. The ancestor lineage is not a
-# caveat — it rides the PoP-signed request body as
-# `{{#each request.ancestors}}` (see src/pop.rs, src/template.rs).
+# any real use). Each role's policy template lives in its own file under
+# roles_dir (see examples/mint_roles/). Scalar caveats are reached
+# through the `caveat` lookup helper: `{{caveat "elide:Volume"}}`. The
+# ancestor lineage is not a caveat — it rides the PoP-signed request
+# body as `{{#each request.ancestors}}` (see src/pop.rs, src/template.rs).
 
 audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 
-# Persisted-state directory (current bootstrap nonce + transient
-# pending-enrollment table), same custody as trust_root_hex. Defaults
-# to ./mint_data (analogous to ./elide_data); uncomment to override:
-# state_dir = "mint_data"
+# data_dir — persisted state (current bootstrap nonce + transient
+# pending-enrollment table), same custody as trust_root_hex. roles_dir —
+# the per-role policy-template files. A relative value (including the
+# defaults mint_data / mint_roles) resolves against the working
+# directory, not this file's parent; an absolute path is used verbatim.
+# Set here so the example runs from the mint/ crate directory:
+roles_dir = "examples/mint_roles"
+# data_dir = "mint_data"
+#
+# Each role's policy template is <roles_dir>/<name>.json by default
+# (so volume-ro -> examples/mint_roles/volume-ro.json); set an explicit
+# policy_file on a role only to override that name.
 
 [tenant]
 bucket = "elide-demo"
@@ -31,25 +40,6 @@ required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000      # 30 days
 default_ttl_seconds = 2592000
-policy = """
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "ReadVolumeAndAncestors",
-    "Effect": "Allow",
-    "Action": ["s3:GetObject"],
-    "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each request.ancestors}},
-      "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
-      {{/each}}
-    ],
-    "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
-    }
-  }]
-}
-"""
 
 [[role]]
 name = "coord-data"
@@ -57,20 +47,6 @@ required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
-policy = """
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "WriteSingleVolume",
-    "Effect": "Allow",
-    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
-    "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
-    }
-  }]
-}
-"""
 
 [[role]]
 name = "coord-base"
@@ -78,21 +54,3 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
-policy = """
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "ControlPlaneReadOnly",
-    "Effect": "Allow",
-    "Action": ["s3:GetObject"],
-    "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/names/*",
-      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
-      "arn:aws:s3:::{{tenant.bucket}}/events/*"
-    ],
-    "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
-    }
-  }]
-}
-"""

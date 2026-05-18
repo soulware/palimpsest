@@ -223,10 +223,10 @@ fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config::load(path)?)
 }
 
-/// Open the persisted state store from the config's `state_dir`
-/// (defaults to `./mint_data` when the config omits it).
+/// Open the persisted state store from the config's `data_dir`
+/// (defaults to `mint_data` when the config omits it).
 fn open_store(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
-    Ok(Store::open(&cfg.state_dir)?)
+    Ok(Store::open(&cfg.data_dir)?)
 }
 
 async fn serve(
@@ -263,7 +263,8 @@ async fn serve(
         audience = %config.audience,
         roles = config.roles.len(),
         admin_credential = config.admin.is_some(),
-        state_dir = %config.state_dir.display(),
+        data_dir = %config.data_dir.display(),
+        roles_dir = %config.roles_dir.display(),
         minter = if tigris { "tigris" } else { "fake" },
         "loaded config"
     );
