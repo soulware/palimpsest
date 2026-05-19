@@ -77,6 +77,28 @@ only changes its cadence from a private timer to a tick gate;
 retention deletes *after* a multi-minute window, so tick-granularity
 lateness is immaterial — the same trade GC's gate already makes.
 
+**Reaper fold: mechanic and SLA.** The reap step mirrors GC's
+existing gate exactly — a cross-tick `last_reap: Instant` on the
+orchestrator, fired inside `run_tick` whenever
+`last_reap.elapsed() >= gc_config.reaper_cadence()` (current formula
+unchanged: `max(retention_window/10, 1s)`, default 60s at the default
+10m window). The `daemon.rs` spawn of the standalone reaper task is
+deleted; `reap_volume` itself is unchanged. Retention-SLA lateness
+goes from `reaper_cadence` (today, ≈ 60s) to `reaper_cadence +
+drain_interval` (folded, ≈ 65s); the extra `drain_interval` sits well
+inside the 10× slack the `retention_window/10` formula was built for.
+Coverage is preserved structurally: the daemon spawns one per-vol
+task per non-readonly ULID-named dir under `by_id/`, the same set
+`reaper.rs`'s `owned_volumes()` filters to today, and the per-vol
+loop keeps ticking regardless of the volume binary's run state
+(`upload.rs`: *"If volume is not running: leave pending/ in place,
+retry next tick."*). One harmless consequence to note: the
+**effective** cadence floor becomes `max(reaper_cadence,
+drain_interval)` rather than the formula's `1s`, because the gate
+only fires on tick boundaries — visible only to test configs that set
+`retention_window` smaller than `drain_interval`, never to realistic
+deployments.
+
 **Write cost is per-tick, not per-segment.** The drain uploads *all*
 of `pending/` in one tick (`upload.rs`), so a tick that drains
 thousands of segments still produces exactly **one** tail overwrite.
@@ -334,11 +356,6 @@ gated step in `tasks.rs`'s per-volume loop.
 
 ## Open questions
 
-- **Reaper fold mechanics.** Folding `reap_volume` into the per-volume
-  tick loop as a `reaper_interval`-gated step is the design above;
-  the implementation must confirm a paused/not-running volume's loop
-  still ticks often enough to honour the retention SLA (it does today
-  for drain/GC; reap inherits the same gate).
 - **Same-epoch reap without a tail read.** In-epoch the reap step
   needs no tail GET — it has the `Superseded`/`since` state it wrote
   this iteration and local `index/`. Only post-handoff must it read a
