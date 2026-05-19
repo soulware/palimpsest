@@ -515,7 +515,7 @@ pub(crate) async fn release_volume_op(
     // "already released" reply doesn't perturb the local volume.
     use elide_coordinator::bucket_position::fetch_position;
     let read_started = std::time::Instant::now();
-    let (position, _) = fetch_position(store, volume_name, coord_id)
+    let (position, fetched) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
     info!(
@@ -557,12 +557,15 @@ pub(crate) async fn release_volume_op(
                     "[release {volume_name}] OwnedByUs position has no vol_ulid"
                 ))
             })?;
-            let snap_ulid = match latest_release_handoff_snapshot(vol_ulid, store).await? {
-                Some((s, elide_core::signing::SnapshotKind::User)) => s,
-                Some((s, elide_core::signing::SnapshotKind::Stop)) => {
-                    promote_stop_in_store(&volume_id_for_promote, s, store).await?;
-                    s
-                }
+            // `ensure_release_eligible(OwnedByUs)` implies the record
+            // was fetched.
+            let rec = fetched.as_ref().map(|(r, _)| r).ok_or_else(|| {
+                IpcError::internal(format!(
+                    "[release {volume_name}] OwnedByUs but names/<name> not fetched"
+                ))
+            })?;
+            let snap_ulid = match reuse_handoff_snapshot(rec) {
+                Some(s) => s,
                 None => {
                     synthesise_empty_owner_handoff(
                         volume_name,
@@ -704,18 +707,12 @@ async fn release_breadcrumb_only(
     // is no snapshot at all (the volume was minted via `claim`, never
     // started or stopped, then removed), synthesise an empty handoff
     // signed by the volume's own key from the local shadow.
-    let snap_ulid = match latest_release_handoff_snapshot(rec.vol_ulid, store).await? {
-        Some((snap_ulid, elide_core::signing::SnapshotKind::User)) => snap_ulid,
-        Some((snap_ulid, elide_core::signing::SnapshotKind::Stop)) => {
-            // Promote stop → user in S3 before flipping. Claimants
-            // resolve the handoff key as `<vol>/snapshots/<.../>
-            // <snap>.manifest` (not `-stop.manifest`), so an
-            // unpromoted stop-snapshot would surface as a NotFound on
-            // claim.
-            promote_stop_in_store(&rec.vol_ulid.to_string(), snap_ulid, store).await?;
-            snap_ulid
-        }
-        // Breadcrumb-only: no local fork dir to materialise into.
+    let snap_ulid = match reuse_handoff_snapshot(&rec) {
+        Some(snap_ulid) => snap_ulid,
+        // No handoff recorded (root volume claimed/created and removed
+        // without ever writing): breadcrumb-only has no local fork dir
+        // to materialise into, so synthesise an empty owner-signed
+        // handoff.
         None => {
             synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store, None).await?
         }
@@ -759,40 +756,33 @@ async fn release_breadcrumb_only(
     }
 }
 
-/// List `by_id/<vol_ulid>/snapshots/` in the bucket and return the
-/// highest ULID with its kind (User from `<u>.manifest`, Auto from
-/// `<u>-stop.manifest`). Used by breadcrumb-only release to pick
-/// the handoff snapshot and decide whether to promote it before the
-/// bucket flip. On ties (both kinds at the same ULID — a transient
-/// state from an interrupted prior promotion) User wins, matching
-/// the precedence in `latest_snapshot_marker`.
-async fn latest_release_handoff_snapshot(
-    vol_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<Option<(ulid::Ulid, elide_core::signing::SnapshotKind)>, IpcError> {
-    use futures::TryStreamExt;
-    use object_store::path::Path as StorePath;
-    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> = store
-        .list(Some(&prefix))
-        .try_collect()
-        .await
-        .map_err(|e| IpcError::store(format!("listing snapshots for {vol_ulid}: {e}")))?;
-    let mut latest: Option<(ulid::Ulid, elide_core::signing::SnapshotKind)> = None;
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let Some((u, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
-            continue;
-        };
-        latest = match latest {
-            None => Some((u, kind)),
-            Some(cur) if snapshot_take_new((u, kind), cur) => Some((u, kind)),
-            cur => cur,
-        };
+/// The handoff snapshot to reuse for a breadcrumb / never-started
+/// release, read off the already-fetched `names/<name>` record — no
+/// snapshot LIST, no event walk (`docs/list-elimination-plan.md`
+/// § *Identity axes*).
+///
+/// Two structured sources, both authoritative and CAS-protected on
+/// the record:
+///   - `handoff_snapshot` — set by the prior owner's `mark_released`
+///     and *retained* across in-place reclaim (same `vol_ulid`), so
+///     it is the basis for a fork reclaimed and released again
+///     without ever being started.
+///   - `parent` (`<vol_ulid>/<snap>`) — set by cross-coordinator
+///     `mark_claimed`, which relocates the released ancestor's
+///     handoff here when it mints a new `vol_ulid`.
+///
+/// The handoff a `Released` record names is already a promoted `User`
+/// manifest (release promotes a `Stop` cover before flipping), so no
+/// per-kind promote is needed here. `None` only when neither source
+/// exists (a root volume created/claimed and released without ever
+/// writing) — the caller synthesises an empty owner-signed handoff.
+fn reuse_handoff_snapshot(record: &elide_core::name_record::NameRecord) -> Option<ulid::Ulid> {
+    if let Some(snap) = record.handoff_snapshot {
+        return Some(snap);
     }
-    Ok(latest)
+    let parent = record.parent.as_deref()?;
+    let snap = parent.rsplit_once('/').map_or(parent, |(_, s)| s);
+    ulid::Ulid::from_string(snap).ok()
 }
 
 /// Server-side promote a stop-snapshot to a stable user manifest in
@@ -1470,14 +1460,19 @@ async fn cleanup_stop_snapshots(
     vol_ulid_str: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    use futures::TryStreamExt;
-
-    // 1. Local cleanup. Remove the `-stop.manifest` and its upload
-    //    sentinel together — leaving the sentinel behind would
-    //    convince the next drain that an unchanged-ULID stop-snapshot
-    //    is already in S3, silently skipping the re-upload.
+    // The `-stop` checkpoints to drop are exactly the ones this fork
+    // sealed locally at its last stop. Enumerate the local snapshots
+    // dir for them, then delete each bucket object by its
+    // deterministic `stop_snapshot_manifest_key` — no snapshot LIST
+    // (`docs/list-elimination-plan.md` § *Identity axes*). A `-stop`
+    // with no local trace (only reachable via the old prefix LIST) is
+    // not swept here: it is best-effort residue the next `stop`
+    // overwrites and the GC floor tolerates, never a correctness
+    // datum.
     let snap_dir = fork_dir.join("snapshots");
     let sentinel_dir = fork_dir.join("uploaded").join("snapshots");
+
+    let mut stop_ulids: Vec<ulid::Ulid> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&snap_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -1487,38 +1482,21 @@ async fn cleanup_stop_snapshots(
             };
             if kind == elide_core::signing::SnapshotKind::Stop {
                 let _ = std::fs::remove_file(entry.path());
-                let _ = std::fs::remove_file(sentinel_dir.join(format!("{snap_ulid}-stop")));
+                stop_ulids.push(snap_ulid);
             }
         }
     }
 
-    // 2. Bucket cleanup. List the snapshots prefix and delete any
-    //    object whose filename parses as a stop-snapshot. Also drop
-    //    any leftover local sentinel even if step 1 missed it (e.g.
-    //    hydrate pre-marked one but the manifest was never written
-    //    locally before this cleanup ran).
-    let prefix = object_store::path::Path::from(format!("by_id/{vol_ulid_str}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> = store
-        .list(Some(&prefix))
-        .try_collect()
-        .await
-        .map_err(|e| IpcError::store(format!("listing snapshots for cleanup: {e}")))?;
-
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let Some((snap_ulid, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
-            continue;
-        };
-        if kind == elide_core::signing::SnapshotKind::Stop {
-            if let Err(e) = store.delete(&obj.location).await {
-                warn!(
-                    "[inbound] failed to delete stop-snapshot {}: {e}",
-                    obj.location
-                );
-            }
-            let _ = std::fs::remove_file(sentinel_dir.join(format!("{snap_ulid}-stop")));
+    for snap_ulid in stop_ulids {
+        // Drop the upload sentinel together with the manifest —
+        // leaving it convinces the next drain an unchanged-ULID
+        // stop-snapshot is already in S3, silently skipping re-upload.
+        let _ = std::fs::remove_file(sentinel_dir.join(format!("{snap_ulid}-stop")));
+        let key = elide_coordinator::upload::stop_snapshot_manifest_key(vol_ulid_str, snap_ulid);
+        if let Err(e) = store.delete(&key).await
+            && !matches!(e, object_store::Error::NotFound { .. })
+        {
+            warn!("[inbound] failed to delete stop-snapshot {key}: {e}");
         }
     }
     Ok(())
@@ -2045,16 +2023,21 @@ mod tests {
                 .unwrap(),
         );
 
-        // names/<vol> = Stopped owned by us (post-reclaim state).
+        // The handoff snapshot this fork was claimed from, already
+        // published under by_id/<vol>/snapshots/ in S3. Body content
+        // is irrelevant here.
+        let snap = ulid::Ulid::new();
+
+        // names/<vol> = Stopped owned by us (post in-place reclaim
+        // state): `handoff_snapshot` is retained across reclaim (same
+        // vol_ulid), so it is the authoritative basis the never-started
+        // release reuses — no snapshot LIST.
         let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
         rec.state = NameState::Stopped;
         rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
+        rec.handoff_snapshot = Some(snap);
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        // The handoff snapshot this fork was claimed from, already
-        // published under by_id/<vol>/snapshots/ in S3. Body content
-        // is irrelevant — only the filename is parsed.
-        let snap = ulid::Ulid::new();
         let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap);
         store
             .put(&key, PutPayload::from(b"fake-signed".to_vec()))

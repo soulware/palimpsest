@@ -68,26 +68,35 @@ that cannot skew for it:
   consumers fetch a basis and then catch up via segments, so an old
   basis only costs extra GETs, never data. A pointer is the right tool
   *because* the failure mode is harmless.
-- **Per-name "the handoff/fork point" — only the *terminal*
-  ownership-relinquishing events, read at the log tail.** A snapshot
-  ULID on an event is an authoritative basis **iff** it rides a
-  *terminal* event (`Released`/`ForceReleased` — and `ForkedFrom`'s
-  `source_snap_ulid` for forks) **and that event is the last on the
-  name's log**. `Released`/`ForceReleased` are terminal: nothing more
-  is ever written under that ownership episode, so their
-  `handoff_snapshot` is by construction final. Non-terminal states
-  (`Stopped`, `Claimed`) are *not* a basis: the volume can resume and
-  append segments, and an append-only log cannot tell you a recorded
-  stop was later resumed past — so there is **no `Stopped` event and
-  no event-format change**. The check is a single `HEAD[0]` look
-  (P1, newest-first): tail is `Released`/`ForceReleased` → use its
-  ULID; anything else → no reusable handoff. Covers `lifecycle.rs:560/707`
-  — `latest_release_handoff_snapshot`'s LIST is *pure redundancy*
-  (recomputes a ULID the tail `Released` event already records; the
-  releaser also knows it directly). Degrades safely: a best-effort
-  emit gap (name says `Released` but the event was missed) just means
-  the tail isn't a release → fall to synthesis, never reuse a stale
-  snapshot.
+- **Per-name "the handoff/fork point" — the CAS'd `names/<name>`
+  record, not a LIST.** The reuse path (`lifecycle.rs:560/707` —
+  breadcrumb / never-started release) needs the snapshot the prior
+  owner published as this name's handoff. That datum is already on
+  the single-owner, conditional-PUT `names/<name>` record the caller
+  has just fetched — `latest_release_handoff_snapshot`'s LIST was
+  *pure redundancy*, recomputing it. Two structured sources, in
+  precedence:
+  - `handoff_snapshot` — set by `mark_released`, and now **retained
+    across in-place reclaim** (`mark_reclaimed_local` no longer nulls
+    it): same `vol_ulid`, so the prior published handoff stays the
+    valid basis until this owner writes and re-releases. It is read
+    only in `Released` state by every other consumer, so retaining it
+    on `Live`/`Stopped` is inert elsewhere.
+  - `parent` (`<vol_ulid>/<snap>`) — set by cross-coordinator
+    `mark_claimed`, which already relocates the released ancestor's
+    handoff here when it mints a new `vol_ulid`.
+
+  Both are authoritative and cannot go stale from writes (this
+  episode's writes produce a *new* handoff via `mark_released`; these
+  fields are the inbound pin). Neither present ⇒ a root volume that
+  never wrote ⇒ synthesise an empty owner-signed handoff. The general
+  principle still holds — a snapshot is only a basis from a *terminal*
+  ownership-relinquishing fact (`Released`/`ForceReleased`/fork pin),
+  never from non-terminal `Stopped`/`Claimed` (the volume can resume,
+  and an append-only log can't say a stop wasn't resumed past) — so
+  there is **no `Stopped` event and no event-format change**; the
+  record fields *are* that terminal fact, materialised where the
+  caller already reads it.
 - **Unclean recovery never reads a snapshot off the log at all.**
   `release --force` of a crashed owner **always synthesises the basis
   from the latest durable segments** and records *that* as
@@ -225,15 +234,16 @@ handoff/fork references the per-name event spine already carries.
    walk. The common write path
    (`Created`/`Claimed`/`Released`/`Renamed`); replaces
    `latest_event_ulid`'s LIST.
-2. **Claim / peer-discovery** — the decisive event
-   (`Released`/`ForceReleased`/`ForkedFrom`) and its payload are
-   almost always within the last *N*, so they are **in the HEAD GET
-   itself — zero extra hops**. Only a pathological tail (>*N* events
-   since the last `Released`) falls back to the bounded
-   `prev_event_ulid` walk. Subsumes the redundant
-   `latest_release_handoff_snapshot` LIST. (Peer-discovery still does
-   one *keyed* GET for the releaser's `coordinators/<id>/peer-endpoint`
-   — not a walk, unavoidable.)
+2. **Peer-discovery** — the decisive event
+   (`Released`/`ForceReleased`/`ForkedFrom`) is almost always within
+   the last *N*, so it is **in the HEAD GET itself — zero extra
+   hops**. Only a pathological tail (>*N* events since the last
+   `Released`) falls back to the bounded `prev_event_ulid` walk.
+   (Peer-discovery still does one *keyed* GET for the releaser's
+   `coordinators/<id>/peer-endpoint` — not a walk, unavoidable.) The
+   handoff-*reuse* path is **not** here: it reads the snapshot off the
+   `names/<name>` record it is already CASing (above), not the event
+   log.
 3. **Operator `volume events`** — always bounded by an explicit
    count. Default = the HEAD window size *N* (served entirely from the
    one HEAD GET, **zero walk**). `--num <n>` requests the most-recent
@@ -286,9 +296,11 @@ GET or a known-key PUT/DELETE — no LIST.
    `Released{handoff_snapshot: Sh}`, then PUT the record. This event
    **already exists today**; nothing new on the name axis.
 3. **Claim (B).** B CASes `names/myvol` Released→Claimed. It learns
-   the fork point from the **single `HEAD` GET** — `Released{handoff:
-   Sh}` is in the window (no `prev` walk in the common case;
-   replacing the redundant `latest_release_handoff_snapshot` LIST). B
+   the fork point from the **`names/myvol` record it is already
+   reading to CAS** — `handoff_snapshot: Sh` is right there (cross-
+   coordinator `mark_claimed` relocates it into the new record's
+   `parent`), replacing the redundant `latest_release_handoff_snapshot`
+   LIST with zero extra round-trips. B
    appends `Claimed` (CAS `HEAD`, then PUT the record).
 4. **Hydrate (B).** From `Sh.manifest` (a GET, key known from step 3)
    B gets the segment ULID set — the manifest already enumerates
