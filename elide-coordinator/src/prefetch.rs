@@ -1448,6 +1448,16 @@ mod tests {
             .put(&manifest_key, manifest_bytes.into())
             .await
             .unwrap();
+        // The writable-head listed path resolves its basis from the
+        // `snapshots/LATEST` pointer (no LIST). Seed it as the upload
+        // path would after the manifest PUT.
+        store
+            .put(
+                &crate::upload::snapshot_latest_key(root_ulid),
+                bytes::Bytes::from(snap_ulid.as_bytes().to_vec()).into(),
+            )
+            .await
+            .unwrap();
 
         let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1, "should fetch own .idx");
@@ -1717,6 +1727,15 @@ mod tests {
             .put(
                 &crate::upload::snapshot_manifest_key(vol_ulid, snap_ulid.parse().unwrap()),
                 manifest_bytes.into(),
+            )
+            .await
+            .unwrap();
+        // Writable-head listed path resolves its basis from the
+        // `snapshots/LATEST` pointer; seed it as the upload path would.
+        store
+            .put(
+                &crate::upload::snapshot_latest_key(vol_ulid),
+                bytes::Bytes::from(snap_ulid.as_bytes().to_vec()).into(),
             )
             .await
             .unwrap();
