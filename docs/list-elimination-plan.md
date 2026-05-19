@@ -98,19 +98,60 @@ pointer plus references the per-name log already carries.
   the link that is already there. **No event-format change, no new
   event kinds.**
 
-  **HEAD is a cache, never a trust root.** Each entry is the
-  already-individually-signed event record, so a tampered or dropped
-  entry fails the existing per-event signature check or simply falls
-  back to the prev-walk; correctness rests on the per-event
-  signatures + the authoritative `prev_event_ulid` chain, exactly as
-  today. HEAD's "rebuild" *is* the prev-walk (the project invariant
-  for derived state: the rebuild defines correctness).
+  **HEAD is the ordering authority, but not the integrity authority.**
+  HEAD decides *which event is latest* (so `emit` never needs a LIST),
+  but each entry is still the already-individually-signed event
+  record, so a tampered entry fails the existing per-event signature
+  check. Integrity rests on the per-event signatures + the
+  `prev_event_ulid` chain exactly as today; only *ordering discovery*
+  moved from LIST to HEAD.
 
-  **Crash ordering:** event record PUT *before* the HEAD rewrite (same
-  discipline as the segment index). A crash between leaves HEAD
-  stale-by-one; the next reader sees the newest record's `prev` ≠
-  HEAD's top and repairs by one hop, or prev-walks. Staleness is
-  bounded and self-healing.
+  **Crash ordering — HEAD CAS *before* the record PUT.** `emit` reads
+  HEAD (+etag), derives `prev = HEAD[0]`, CAS-writes the new entry
+  onto HEAD (`If-Match` etag — concurrent appenders serialize here:
+  the loser re-reads, re-derives `prev`, retries, yielding a clean
+  linear chain), *then* PUTs the immutable record (`If-None-Match:*`).
+  A crash between leaves HEAD naming an event whose record body is
+  absent: a reader GETs that body, 404s, and **skips the phantom
+  entry** — the same tolerate-the-dangling-reference pattern the
+  segment/retention index uses (§ *Reconcile*). Ordering is never
+  wrong (no fork, no mis-order); the only residue is a benign,
+  self-describing phantom (a HEAD entry whose 404 says "announced,
+  body never landed, ignore"), optionally compacted out on the next
+  successful append.
+
+  This is the **deliberate inverse** of the segment/retention index's
+  ordering (object-before-index): there the index trails
+  object-authoritative data so a crash leaks a reclaimable object;
+  here HEAD *is* the ordering authority so it must lead, and a crash
+  leaks a skippable phantom. Two structures, two authority models, two
+  write orders — stated explicitly so neither rule is misapplied to
+  the other. HEAD's authoritative "rebuild" remains the
+  prev-walk / elevated LIST (the project invariant for derived state:
+  the rebuild defines correctness).
+
+  **Concurrent appenders / `release --force`.** Force-release is *not*
+  special-cased: `ForceReleased` goes through the same `emit` path.
+  Force bypasses the `names/<name>` ownership CAS, **not** the
+  `events/<name>/HEAD` CAS (separate object, separate CAS). Under
+  split-brain (a still-alive displaced owner A appending while
+  recoverer B force-releases): both read HEAD@e0; A wins the CAS
+  (HEAD→e1, `E_a.prev=E_k`); B's `If-Match:e0` fails, B re-reads,
+  **re-derives `prev=E_a`**, re-mints, CAS@e1 → chain `E_k→E_a→E_b`,
+  one clean linear chain, no fork, no lost event. The read-CAS-
+  retry-with-prev-re-derivation *is* the linearization (the Option-1
+  CAS, guarding only the cache, would fork here). The log thus
+  faithfully **records** contention (`displaced_coordinator_id` names
+  the victim); it does not **resolve** data-plane split-brain — that
+  remains `design-force-release-fencing.md`, unchanged. Sustained
+  contention only costs CAS retries (lifecycle events are infrequent);
+  in the limit an emit gives up = the already-documented best-effort
+  gap, never a correctness break. If A crashed mid-emit (HEAD CAS
+  done, record PUT not), the full signed record is still inline in
+  HEAD, so in-window readers are unaffected; the missing standalone
+  object only truncates a past-window prev-walk, and is optionally
+  self-healed by an idempotent `If-None-Match:*` backfill from the
+  in-HEAD copy.
 
   Replaces `peer_discovery.rs:171`, `volume_event_store.rs:155/253`.
   Key shape coordinated with `design-volume-event-log.md`. Runs under
@@ -119,8 +160,9 @@ pointer plus references the per-name log already carries.
 
 #### Access patterns (0 hops common; bounded fallback; `--all` opt-in)
 
-1. **Append** — `GET HEAD`, write the record (`prev =` HEAD's top),
-   rewrite `HEAD`. O(1), no walk. The common write path
+1. **Append** — `GET HEAD`+etag, derive `prev = HEAD[0]`, CAS `HEAD`
+   (`If-Match`), then PUT the record (`If-None-Match:*`). O(1), no
+   walk. The common write path
    (`Created`/`Claimed`/`Released`/`Renamed`); replaces
    `latest_event_ulid`'s LIST.
 2. **Claim / peer-discovery** — the decisive event
@@ -174,14 +216,14 @@ GET or a known-key PUT/DELETE — no LIST.
    per-vol, **`coord-data` only** — no event, no `coord-writer`.
 2. **Release (A).** A seals the handoff/stop snapshot `Sh` (it knows
    `Sh`'s ULID directly — it just minted it), CASes `names/myvol`
-   Live→Released, appends `Released{handoff_snapshot: Sh}` to
-   `events/myvol/`, advances `HEAD`. This event **already exists
-   today**; nothing new on the name axis.
+   Live→Released, then appends to `events/myvol/`: CAS `HEAD` with
+   `Released{handoff_snapshot: Sh}`, then PUT the record. This event
+   **already exists today**; nothing new on the name axis.
 3. **Claim (B).** B CASes `names/myvol` Released→Claimed. It learns
    the fork point from the **single `HEAD` GET** — `Released{handoff:
    Sh}` is in the window (no `prev` walk in the common case;
    replacing the redundant `latest_release_handoff_snapshot` LIST). B
-   appends `Claimed` and rewrites `HEAD`.
+   appends `Claimed` (CAS `HEAD`, then PUT the record).
 4. **Hydrate (B).** From `Sh.manifest` (a GET, key known from step 3)
    B gets the segment ULID set — the manifest already enumerates
    segments, so no LIST; any segment not local is range-GET by
@@ -243,11 +285,12 @@ the purpose and is itself an optional-correctness path).
 Ordered so each phase builds on the prior.
 
 - **P1 — event-log spine: windowed `events/<name>/HEAD`.** Add the
-  `HEAD` object carrying the last *N* signed records (rebuilt on
-  append; record PUT before HEAD rewrite). `emit_event` reads/advances
-  `HEAD` instead of LIST-max; `peer_discovery` and
-  `volume_event_store` read the window, falling back to the
-  **already-present** `prev_event_ulid` walk only on a long tail.
+  `HEAD` object carrying the last *N* signed records (HEAD CAS
+  `If-Match` *before* the record PUT — § *spine*). `emit_event`
+  reads/advances `HEAD` instead of LIST-max; `peer_discovery` and
+  `volume_event_store` read the window, 404-tolerant on entries,
+  falling back to the **already-present** `prev_event_ulid` walk only
+  on a long tail.
   **No event-format change, no new event kinds.** Change `volume
   events` to bounded recent-N (served from the window; `--all` =
   explicit to-genesis prev-walk). Align key/shape with
