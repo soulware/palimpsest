@@ -158,7 +158,7 @@ pointer plus references the per-name log already carries.
   `coord-writer`. *N* is a tuning param (default ≈16), not pinned by
   the design.
 
-#### Access patterns (0 hops common; bounded fallback; `--all` opt-in)
+#### Access patterns (always bounded; no unbounded path exists)
 
 1. **Append** — `GET HEAD`+etag, derive `prev = HEAD[0]`, CAS `HEAD`
    (`If-Match`), then PUT the record (`If-None-Match:*`). O(1), no
@@ -174,17 +174,22 @@ pointer plus references the per-name log already carries.
    `latest_release_handoff_snapshot` LIST. (Peer-discovery still does
    one *keyed* GET for the releaser's `coordinators/<id>/peer-endpoint`
    — not a walk, unavoidable.)
-3. **Operator `volume events`** — bounded **recent-N**: served
-   entirely from the HEAD window when the CLI default ≤ *N* (**zero
-   walk**); larger windows or `--all` fall back to the prev-walk
-   (`--all` = full to-genesis incl. the `inherits_log_from` rename
-   crossing, still LIST-free). Removes the unbounded default walker;
+3. **Operator `volume events`** — always bounded by an explicit
+   count. Default = the HEAD window size *N* (served entirely from the
+   one HEAD GET, **zero walk**). `--num <n>` requests the most-recent
+   *n*; `n ≤ N` is still zero-walk, `n > N` walks `prev` for the
+   extra (LIST-free, bounded by *n*, crossing `inherits_log_from`
+   only if *n* exceeds the current name's chain). **There is no
+   `--all` / unbounded / to-genesis option** — full reconstruction is
+   not a product surface; it is the elevated offline LIST rebuild in
+   § *Reconcile* (operator-privileged, not this CLI).
    `list_events`' whole-prefix LIST goes away.
 
-So at runtime the chain is essentially never walked: appends are a
-single GET+PUT, the common claim/peer-discovery and the default
-history view are answered from the one HEAD GET, and a `prev` walk
-happens only on a long unclaimed tail or an explicit `--all`.
+So at runtime the chain is never walked unboundedly: appends are a
+single GET+PUT; the common claim/peer-discovery and the default
+history view are answered from the one HEAD GET; the only `prev` walk
+is a long unclaimed tail or an operator-supplied `--num n > N`, both
+bounded.
 
 ### Maintained index (`segments`, `retention` only)
 
@@ -292,10 +297,11 @@ Ordered so each phase builds on the prior.
   falling back to the **already-present** `prev_event_ulid` walk only
   on a long tail.
   **No event-format change, no new event kinds.** Change `volume
-  events` to bounded recent-N (served from the window; `--all` =
-  explicit to-genesis prev-walk). Align key/shape with
-  `design-volume-event-log.md`. Also gives the claim path its handoff
-  from the HEAD window via the existing `Released`/`ForkedFrom`
+  events` to always-bounded: default = window size *N*, `--num <n>`
+  for more (no `--all`/unbounded option; `list_events`' whole-prefix
+  LIST is removed, not replaced by a deeper walk). Align key/shape
+  with `design-volume-event-log.md`. Also gives the claim path its
+  handoff from the HEAD window via the existing `Released`/`ForkedFrom`
   events.
 - **P2 — per-vol `snapshots/LATEST` pointer.** Write it (per kind) at
   publish under `coord-data`; migrate the latest-snapshot consumers
