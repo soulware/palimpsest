@@ -36,11 +36,8 @@ use elide_coordinator::config::{MintConfig, StoreSection};
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
-use crate::mint_client::MintEndpoint;
+use crate::mint_client::{MintEndpoint, ROLE_COORD_BASE, ROLE_COORD_DATA, ROLE_COORD_WRITER};
 
-pub const ROLE_COORD_BASE: &str = "coord-base";
-pub const ROLE_COORD_WRITER: &str = "coord-writer";
-pub const ROLE_COORD_DATA: &str = "coord-data";
 const CAVEAT_VOLUME: &str = "elide:Volume";
 
 /// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as

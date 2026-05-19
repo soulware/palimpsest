@@ -36,7 +36,25 @@ use crate::credential::{CredentialIssuer, Credentialer, IssuedCredentials};
 const MAGIC: &[u8; 5] = b"mcrn1";
 const NONCE_LEN: usize = 16;
 
-const ROLE_VOLUME_RO: &str = "volume-ro";
+/// Canonical mint role inventory — the single source of truth shared by
+/// the enrollment fan-out (`crate::enroll`), the `[mint]` startup gate,
+/// and the scoped stores (`crate::mint_stores`), so the three can never
+/// drift. `coord-data` is per-volume only at `assume-role` time (the
+/// `elide:Volume` narrowing caveat); enrollment still mints exactly one
+/// `credentials/coord-data`.
+pub(crate) const ROLE_COORD_BASE: &str = "coord-base";
+pub(crate) const ROLE_COORD_WRITER: &str = "coord-writer";
+pub(crate) const ROLE_COORD_DATA: &str = "coord-data";
+pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
+
+/// Every role the coordinator enrols for, in fan-out order.
+pub(crate) const COORD_ENROLL_ROLES: &[&str] = &[
+    ROLE_COORD_BASE,
+    ROLE_COORD_WRITER,
+    ROLE_COORD_DATA,
+    ROLE_VOLUME_RO,
+];
+
 const CAVEAT_EXP: &str = "exp";
 const CAVEAT_VOLUME: &str = "elide:Volume";
 
@@ -46,7 +64,7 @@ const CAVEAT_VOLUME: &str = "elide:Volume";
 /// default, so the `exp` we attenuate to never exceeds the role bound.
 const VOLUME_RO_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
-fn now_unix() -> io::Result<u64> {
+pub(crate) fn now_unix() -> io::Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -77,14 +95,14 @@ fn serialize_one(name: &str, value: &str) -> Vec<u8> {
 /// A decoded mint macaroon. The coordinator only ever decodes one mint
 /// gave it, appends narrowing caveats, and re-encodes — it has no root
 /// key, so it neither mints nor verifies.
-struct WireMacaroon {
+pub(crate) struct WireMacaroon {
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
     mac: [u8; 32],
 }
 
 impl WireMacaroon {
-    fn decode(s: &str) -> io::Result<Self> {
+    pub(crate) fn decode(s: &str) -> io::Result<Self> {
         let buf = BASE64
             .decode(s.trim())
             .map_err(|_| io::Error::other("credential macaroon: base64 decode failed"))?;
@@ -133,7 +151,7 @@ impl WireMacaroon {
     /// trailing MAC. Caveats are AND-evaluated, so this can only
     /// restrict authority — the additive-restriction property that
     /// lets a non-root holder attenuate.
-    fn attenuate(&mut self, name: &str, value: &str) {
+    pub(crate) fn attenuate(&mut self, name: &str, value: &str) {
         let step = serialize_one(name, value);
         self.mac = *blake3::keyed_hash(&self.mac, &step).as_bytes();
         self.caveats.push(Caveat {
@@ -142,11 +160,11 @@ impl WireMacaroon {
         });
     }
 
-    fn tail(&self) -> &[u8; 32] {
+    pub(crate) fn tail(&self) -> &[u8; 32] {
         &self.mac
     }
 
-    fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&self.nonce);
@@ -182,7 +200,7 @@ fn read_string(buf: &[u8], pos: &mut usize) -> io::Result<String> {
 
 /// `BLAKE3(tail ‖ BLAKE3(body))` — the digest the PoP signature
 /// covers. Body is hashed as the exact bytes sent (`mint/src/pop.rs`).
-fn pop_digest(tail: &[u8; 32], body: &[u8]) -> [u8; 32] {
+pub(crate) fn pop_digest(tail: &[u8; 32], body: &[u8]) -> [u8; 32] {
     let body_hash = blake3::hash(body);
     let mut h = blake3::Hasher::new();
     h.update(tail);
@@ -196,7 +214,7 @@ fn uds_socket(url: &str) -> Option<&str> {
     url.trim().strip_prefix("unix:")
 }
 
-async fn post(
+pub(crate) async fn post(
     cfg_url: &str,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -293,7 +311,7 @@ async fn post_uds(
     Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-fn json_str_field(body: &str, key: &str) -> io::Result<String> {
+pub(crate) fn json_str_field(body: &str, key: &str) -> io::Result<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get(key).and_then(|s| s.as_str()).map(str::to_owned))
