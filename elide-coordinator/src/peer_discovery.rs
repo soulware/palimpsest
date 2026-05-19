@@ -29,15 +29,12 @@ use std::sync::Arc;
 use elide_core::signing::VerifyingKey;
 use elide_core::volume_event::{EventKind, VolumeEvent};
 use elide_peer_fetch::PeerEndpoint;
-use futures::TryStreamExt;
 use object_store::ObjectStore;
-use object_store::path::Path as StorePath;
 use tracing::debug;
-use ulid::Ulid;
 
 use crate::identity;
 use crate::ipc::SignatureStatus;
-use crate::volume_event_store::verify_event_signature;
+use crate::volume_event_store::{self, verify_event_signature};
 
 /// Result of discovery: who the previous claimer was, plus where to
 /// reach them. Returned by [`discover_peer_for_claim`].
@@ -61,10 +58,10 @@ enum FindReleaserOutcome {
     Stop,
 }
 
-/// Walk `locations` (newest-first) one event at a time, fetching and
-/// verifying each lazily, returning the coordinator id of the first
-/// `Released` event found. Skips `Claimed` events; bails on anything
-/// else.
+/// Walk `events` (newest-first, already materialised from the HEAD
+/// window) one at a time, verifying each signature, returning the
+/// coordinator id of the first `Released` event found. Skips
+/// `Claimed` events; bails on anything else.
 ///
 /// `keys` is an in-out cache of `coordinator_id -> VerifyingKey`
 /// shared across iterations — a cross-host handoff log typically
@@ -73,38 +70,10 @@ enum FindReleaserOutcome {
 async fn find_releaser(
     store: &Arc<dyn ObjectStore>,
     volume_name: &str,
-    locations: &[(Ulid, StorePath)],
+    events: &[VolumeEvent],
     keys: &mut HashMap<String, VerifyingKey>,
 ) -> FindReleaserOutcome {
-    for (_ulid, location) in locations {
-        let body = match store.get(location).await {
-            Ok(g) => match g.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    debug!("[peer-discovery {volume_name}] read {location}: {e}; skip peer");
-                    return FindReleaserOutcome::Stop;
-                }
-            },
-            Err(e) => {
-                debug!("[peer-discovery {volume_name}] get {location}: {e}; skip peer");
-                return FindReleaserOutcome::Stop;
-            }
-        };
-        let text = match std::str::from_utf8(&body) {
-            Ok(s) => s,
-            Err(e) => {
-                debug!("[peer-discovery {volume_name}] {location} not utf-8: {e}; skip peer");
-                return FindReleaserOutcome::Stop;
-            }
-        };
-        let event = match VolumeEvent::from_toml(text) {
-            Ok(e) => e,
-            Err(e) => {
-                debug!("[peer-discovery {volume_name}] parse {location}: {e}; skip peer");
-                return FindReleaserOutcome::Stop;
-            }
-        };
-
+    for event in events {
         // Resolve the verifying key for this event's signer (cached).
         let coord_id = event.coordinator_id.clone();
         let vk = if let Some(vk) = keys.get(&coord_id) {
@@ -125,7 +94,7 @@ async fn find_releaser(
             }
         };
 
-        match verify_event_signature(&event, &vk) {
+        match verify_event_signature(event, &vk) {
             SignatureStatus::Valid => {}
             other => {
                 debug!("[peer-discovery {volume_name}] event signature {other:?}; skip peer");
@@ -165,27 +134,26 @@ pub async fn discover_peer_for_claim(
     store: &Arc<dyn ObjectStore>,
     volume_name: &str,
 ) -> Option<DiscoveredPeer> {
-    // List event-prefix locations once (one S3 LIST call). Filter +
-    // sort *descending* by ULID so we visit newest first.
-    let prefix = StorePath::from(format!("events/{volume_name}/"));
-    let listed: Vec<_> = match store.list(Some(&prefix)).try_collect::<Vec<_>>().await {
+    // Read the `events/<name>/HEAD` window in a single GET — no LIST.
+    // The relevant handoff (`Released`, possibly behind one
+    // `Claimed`) is always at the log tail, so the window is more
+    // than enough; the back-link walk inside `recent_events` is never
+    // exercised here.
+    let events = match volume_event_store::recent_events(
+        store,
+        volume_name,
+        volume_event_store::DEFAULT_EVENTS_LIMIT,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
-            debug!("[peer-discovery {volume_name}] event log list failed; skip peer: {e}");
+            debug!("[peer-discovery {volume_name}] reading event HEAD failed; skip peer: {e}");
             return None;
         }
     };
-    let mut locations: Vec<(Ulid, StorePath)> = listed
-        .into_iter()
-        .filter_map(|obj| {
-            let filename = obj.location.filename()?;
-            let ulid = Ulid::from_string(filename).ok()?;
-            Some((ulid, obj.location))
-        })
-        .collect();
-    locations.sort_by_key(|(ulid, _)| std::cmp::Reverse(*ulid));
 
-    // Walk newest → oldest, fetching one event body at a time.
+    // `recent_events` is newest-first. Walk newest → oldest.
     // Short-circuits on every event kind except `Claimed`:
     //   - `Released`         → return the releaser's coordinator_id
     //   - `Claimed`          → skip past (it tells us nothing about
@@ -193,14 +161,12 @@ pub async fn discover_peer_for_claim(
     //   - anything else      → no clean handoff, return None
     //   - signature failure  → defensive bail, return None
     //
-    // The typical case after a fresh claim is one or two GETs:
-    //   - log tail `[…, Released-by-A, Claimed-by-B]` → 2 GETs
-    //   - log tail `[…, Released-by-A]` (still unclaimed) → 1 GET
-    //   - log tail ending in `ForceReleased`/`Created`/etc. → 1 GET
-    // Pulling the full history was unnecessary — that's `list_events`
-    // territory, kept for the CLI's `volume events` IPC.
+    // The typical tail after a fresh claim:
+    //   - `[…, Released-by-A, Claimed-by-B]` → 2 events scanned
+    //   - `[…, Released-by-A]` (still unclaimed) → 1 event
+    //   - `[…, ForceReleased]`/`Created`/etc. → 1 event
     let mut keys: HashMap<String, VerifyingKey> = HashMap::new();
-    let coord_id = match find_releaser(store, volume_name, &locations, &mut keys).await {
+    let coord_id = match find_releaser(store, volume_name, &events, &mut keys).await {
         FindReleaserOutcome::Found(coord_id) => coord_id,
         FindReleaserOutcome::Stop => return None,
     };

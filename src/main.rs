@@ -393,14 +393,20 @@ enum VolumeCommand {
 
     /// Show the per-name event log for a volume.
     ///
-    /// Lists every entry in `events/<name>/`, one per line, in
-    /// chronological order. Each event's signature is verified
-    /// against the emitting coordinator's published pubkey; events
-    /// whose signature is invalid or whose pubkey can't be fetched
-    /// are flagged with a sigil rather than hidden.
+    /// Prints the most-recent events, one per line, in chronological
+    /// order (oldest first). The default count is the coordinator's
+    /// HEAD window; pass `--num <n>` for a different number of recent
+    /// events. Each event's signature is verified against the emitting
+    /// coordinator's published pubkey; events whose signature is
+    /// invalid or whose pubkey can't be fetched are flagged with a
+    /// sigil rather than hidden.
     Events {
         /// Volume name
         name: String,
+        /// Number of most-recent events to show. Defaults to the
+        /// coordinator's HEAD window when omitted.
+        #[arg(long)]
+        num: Option<usize>,
         /// Emit one JSON object per event instead of the human form.
         #[arg(long)]
         json: bool,
@@ -831,7 +837,7 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Events { name, json } => match coord.volume_events(&name) {
+            VolumeCommand::Events { name, num, json } => match coord.volume_events(&name, num) {
                 Ok(reply) => {
                     if json {
                         for entry in &reply.events {

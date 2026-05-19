@@ -241,10 +241,12 @@ pub enum Request {
     /// already the floor for every other coordinator operation.
     MintOperatorToken { expires_unix: u64 },
     // ── Read-only history ────────────────────────────────────────────
-    /// List the per-name event log at `events/<volume>/`,
+    /// Read the per-name event log for `volume`, newest first,
     /// verifying each entry's signature against the emitting
-    /// coordinator's published pubkey.
-    VolumeEvents { volume: String },
+    /// coordinator's published pubkey. `num` caps the number of
+    /// most-recent events returned; `None` uses the default window
+    /// (`volume_event_store::DEFAULT_EVENTS_LIMIT`).
+    VolumeEvents { volume: String, num: Option<usize> },
 
     // ── Creds + cleanup (final iteration) ────────────────────────────
     /// Vend the non-secret `[store]` config (bucket / endpoint /

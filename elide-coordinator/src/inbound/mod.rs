@@ -452,10 +452,10 @@ async fn dispatch_json(
             let env: Envelope<MintOperatorTokenReply> = Envelope::ok(reply);
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::VolumeEvents { volume } => {
-            // Reads events/<volume>/: coordinator-wide.
+        Request::VolumeEvents { volume, num } => {
+            // Reads the events/<volume>/ HEAD window: coordinator-wide.
             let store = ctx.stores.writer();
-            let result = volume_events_typed(&volume, &store).await;
+            let result = volume_events_typed(&volume, &store, num).await;
             let env: Envelope<VolumeEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -1219,18 +1219,22 @@ async fn volume_status_remote_typed(
     })
 }
 
-/// Typed implementation of the `volume-events` verb. Lists every
-/// event under `events/<volume>/`, parsed and signature-
-/// verified. A missing prefix returns an empty list — every name
-/// has a journal even if no events have been emitted yet, so
-/// "empty log" is not the same as "name doesn't exist".
+/// Typed implementation of the `volume-events` verb. Reads the
+/// `num` most-recent events for `volume` (default: the HEAD window)
+/// from `events/<volume>/HEAD`, parsed and signature-verified. An
+/// absent log returns an empty list — every name has a journal even
+/// if no events have been emitted yet, so "empty log" is not the
+/// same as "name doesn't exist".
 async fn volume_events_typed(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
+    num: Option<usize>,
 ) -> Result<VolumeEventsReply, IpcError> {
-    let entries = elide_coordinator::volume_event_store::list_and_verify_events(store, volume_name)
-        .await
-        .map_err(|e| IpcError::store(format!("listing events for {volume_name}: {e}")))?;
+    let limit = num.unwrap_or(elide_coordinator::volume_event_store::DEFAULT_EVENTS_LIMIT);
+    let entries =
+        elide_coordinator::volume_event_store::list_and_verify_events(store, volume_name, limit)
+            .await
+            .map_err(|e| IpcError::store(format!("listing events for {volume_name}: {e}")))?;
     Ok(VolumeEventsReply { events: entries })
 }
 

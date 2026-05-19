@@ -432,13 +432,15 @@ impl Client {
         .map_err(io::Error::other)
     }
 
-    /// List the per-name event log under `events/<volume>/`.
-    /// Each entry includes a `signature_status` reporting whether the
-    /// emitting coordinator's pubkey was reachable and the signature
-    /// verified.
-    pub fn volume_events(&self, volume: &str) -> io::Result<VolumeEventsReply> {
+    /// Read the per-name event log for `volume` (the reply is in
+    /// chronological order). `num` caps how many recent events come
+    /// back; `None` uses the coordinator's default window. Each entry
+    /// includes a `signature_status` reporting whether the emitting
+    /// coordinator's pubkey was reachable and the signature verified.
+    pub fn volume_events(&self, volume: &str, num: Option<usize>) -> io::Result<VolumeEventsReply> {
         self.call_typed(&Request::VolumeEvents {
             volume: volume.to_owned(),
+            num,
         })?
         .map_err(io::Error::other)
     }
@@ -1219,7 +1221,7 @@ mod tests {
         let body = r#"{"outcome":"ok","data":{"events":[]}}"#;
         let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
         let reply = Client::new(&sock)
-            .volume_events("vol")
+            .volume_events("vol", None)
             .expect("volume-events should succeed");
         server.join().unwrap();
         assert!(reply.events.is_empty());
@@ -1234,7 +1236,7 @@ mod tests {
         let body = r#"{"outcome":"ok","data":{"events":[{"event":{"version":1,"event_ulid":"01J0000000000000000000000V","at":"2024-01-01T00:00:00.000Z","name":"vol","coordinator_id":"coord-a","vol_ulid":"01J0000000000000000000000W","kind":"created","signature":"00"},"signature_status":{"status":"valid"}}]}}"#;
         let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
         let reply = Client::new(&sock)
-            .volume_events("vol")
+            .volume_events("vol", None)
             .expect("volume-events should succeed");
         server.join().unwrap();
         assert_eq!(reply.events.len(), 1);

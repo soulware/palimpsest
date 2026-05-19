@@ -98,29 +98,103 @@ pointer plus references the per-name log already carries.
   the link that is already there. **No event-format change, no new
   event kinds.**
 
-  **HEAD is a cache, never a trust root.** Each entry is the
-  already-individually-signed event record, so a tampered or dropped
-  entry fails the existing per-event signature check or simply falls
-  back to the prev-walk; correctness rests on the per-event
-  signatures + the authoritative `prev_event_ulid` chain, exactly as
-  today. HEAD's "rebuild" *is* the prev-walk (the project invariant
-  for derived state: the rebuild defines correctness).
+  **HEAD is the ordering authority, but not the integrity authority.**
+  HEAD decides *which event is latest* (so `emit` never needs a LIST),
+  but each entry is still the already-individually-signed event
+  record, so a tampered entry fails the existing per-event signature
+  check. Integrity rests on the per-event signatures + the
+  `prev_event_ulid` chain exactly as today; only *ordering discovery*
+  moved from LIST to HEAD.
 
-  **Crash ordering:** event record PUT *before* the HEAD rewrite (same
-  discipline as the segment index). A crash between leaves HEAD
-  stale-by-one; the next reader sees the newest record's `prev` ≠
-  HEAD's top and repairs by one hop, or prev-walks. Staleness is
-  bounded and self-healing.
+  **Write order — HEAD *before* the record PUT.** `emit` reads HEAD
+  (+etag), derives `prev = HEAD[0]`, writes the new entry onto HEAD
+  (`If-Match` etag for a normal emit; *unconditional* for the
+  `release --force` emit), *then* PUTs the immutable record
+  (`If-None-Match:*`). The `If-Match` is **not** a serializer with a
+  retry loop — normal appends are already single-writer by
+  `names/<name>` ownership (§ *Single-writer*), so a mismatch never
+  means "lost a race": it means **this coordinator has been
+  displaced** (only `release --force` can change HEAD under a
+  still-alive owner) → **fail hard**, no retry, no merge. A crash
+  between the HEAD write and the record PUT leaves HEAD naming an
+  event whose body is absent: a reader GETs it, 404s, and **skips the
+  phantom entry** — the same tolerate-the-dangling-reference pattern
+  the segment/retention index uses (§ *Reconcile*). Ordering is never
+  wrong; the only residue is a benign, self-describing phantom (a HEAD
+  entry whose 404 says "announced, body never landed, ignore"),
+  optionally compacted out on the next successful append.
+
+  This is the **deliberate inverse** of the segment/retention index's
+  ordering (object-before-index): there the index trails
+  object-authoritative data so a crash leaks a reclaimable object;
+  here HEAD *is* the ordering authority so it must lead, and a crash
+  leaks a skippable phantom. Two structures, two authority models, two
+  write orders — stated explicitly so neither rule is misapplied to
+  the other. HEAD's authoritative "rebuild" remains the
+  prev-walk / elevated LIST (the project invariant for derived state:
+  the rebuild defines correctness).
+
+  **Single-writer by ownership; `release --force` is the only
+  exception.** The `names/<name>` conditional update is already the
+  serialization point: an event is emitted *only after* a won
+  ownership transition (`claim.rs:628` emits `Claimed` solely on the
+  `MarkClaimedOutcome::Claimed` branch — losers never reach `emit`).
+  Fork is a fresh name; rename is single-owner. So in normal
+  operation exactly one coordinator appends to a name's log, and
+  `emit` needs no cross-coordinator concurrency control — only an
+  in-process per-name lock so a coordinator's own concurrent tasks
+  don't race (reuse the existing per-name lock registry if present).
+
+  The **sole** multi-writer case is `release --force` with a
+  still-alive displaced owner A. Authority/ordering rules:
+
+  - **Authority before journal.** The decisive act is the
+    *unconditional* `names/<name>` overwrite (Released, `handoff=Sh`,
+    `displaced=A`); the `ForceReleased` event is the journal entry
+    that *follows* it. Full order: synthesize+write `Sh` → unconditional
+    `names/<name>` overwrite → event append (HEAD then record). This
+    is unchanged behaviour — `finalize_force_release` already runs only
+    after the overwrite. Reversing it (journal before authority) lets
+    a crash leave the log asserting a `ForceReleased` the authority
+    never made *and* fence the legitimate owner with no transfer → a
+    self-inflicted **ownership vacuum**. Authority-first leaves only a
+    recoverable journal gap (best-effort contract).
+  - **The force-releaser B never fails.** Its `ForceReleased` HEAD
+    write is **unconditional** (mirroring the unconditional
+    `names/<name>` overwrite — force is the override at both layers).
+  - **The displaced A fails hard *on the name*, not its data.** A is
+    fenced at the authoritative layer the instant the name overwrite
+    lands (A's own `If-Match` name-ops fail). B's unconditional HEAD
+    write also bumps the etag, so A's next normal `If-Match` emit
+    fails — a *secondary* displacement detector → A stops touching
+    `names/<name>`/`events/<name>/`. A's `by_id/<V_a>/` lineage is
+    **untouched** and survives as an unnamed, recoverable fork
+    (claim-after-force forks a new `vol_ulid` from `Sh`; `V_a` is
+    never overwritten). "Fail hard" = lose the *name*, not the data.
+
+  `events/<name>/` therefore stays a **single clean chain** (B's, post-
+  `ForceReleased`); A's post-displacement activity is a *different
+  lineage*, not entries in this name's log. The log *records* the
+  displacement (`displaced_coordinator_id`); it does not *resolve* the
+  data-plane fork — that, and any **automatic fork-continuation** for
+  the displaced lineage, is explicitly **out of scope here** (future
+  direction; `design-force-release-fencing.md`). If A crashed mid-emit
+  (HEAD write done, record PUT not), the full signed record is still
+  inline in HEAD, so in-window readers are unaffected; the missing
+  standalone object only truncates a past-window prev-walk, optionally
+  self-healed by an idempotent `If-None-Match:*` backfill from the
+  in-HEAD copy.
 
   Replaces `peer_discovery.rs:171`, `volume_event_store.rs:155/253`.
   Key shape coordinated with `design-volume-event-log.md`. Runs under
   `coord-writer`. *N* is a tuning param (default ≈16), not pinned by
   the design.
 
-#### Access patterns (0 hops common; bounded fallback; `--all` opt-in)
+#### Access patterns (always bounded; no unbounded path exists)
 
-1. **Append** — `GET HEAD`, write the record (`prev =` HEAD's top),
-   rewrite `HEAD`. O(1), no walk. The common write path
+1. **Append** — `GET HEAD`+etag, derive `prev = HEAD[0]`, CAS `HEAD`
+   (`If-Match`), then PUT the record (`If-None-Match:*`). O(1), no
+   walk. The common write path
    (`Created`/`Claimed`/`Released`/`Renamed`); replaces
    `latest_event_ulid`'s LIST.
 2. **Claim / peer-discovery** — the decisive event
@@ -132,17 +206,22 @@ pointer plus references the per-name log already carries.
    `latest_release_handoff_snapshot` LIST. (Peer-discovery still does
    one *keyed* GET for the releaser's `coordinators/<id>/peer-endpoint`
    — not a walk, unavoidable.)
-3. **Operator `volume events`** — bounded **recent-N**: served
-   entirely from the HEAD window when the CLI default ≤ *N* (**zero
-   walk**); larger windows or `--all` fall back to the prev-walk
-   (`--all` = full to-genesis incl. the `inherits_log_from` rename
-   crossing, still LIST-free). Removes the unbounded default walker;
+3. **Operator `volume events`** — always bounded by an explicit
+   count. Default = the HEAD window size *N* (served entirely from the
+   one HEAD GET, **zero walk**). `--num <n>` requests the most-recent
+   *n*; `n ≤ N` is still zero-walk, `n > N` walks `prev` for the
+   extra (LIST-free, bounded by *n*, crossing `inherits_log_from`
+   only if *n* exceeds the current name's chain). **There is no
+   `--all` / unbounded / to-genesis option** — full reconstruction is
+   not a product surface; it is the elevated offline LIST rebuild in
+   § *Reconcile* (operator-privileged, not this CLI).
    `list_events`' whole-prefix LIST goes away.
 
-So at runtime the chain is essentially never walked: appends are a
-single GET+PUT, the common claim/peer-discovery and the default
-history view are answered from the one HEAD GET, and a `prev` walk
-happens only on a long unclaimed tail or an explicit `--all`.
+So at runtime the chain is never walked unboundedly: appends are a
+single GET+PUT; the common claim/peer-discovery and the default
+history view are answered from the one HEAD GET; the only `prev` walk
+is a long unclaimed tail or an operator-supplied `--num n > N`, both
+bounded.
 
 ### Maintained index (`segments`, `retention` only)
 
@@ -174,14 +253,14 @@ GET or a known-key PUT/DELETE — no LIST.
    per-vol, **`coord-data` only** — no event, no `coord-writer`.
 2. **Release (A).** A seals the handoff/stop snapshot `Sh` (it knows
    `Sh`'s ULID directly — it just minted it), CASes `names/myvol`
-   Live→Released, appends `Released{handoff_snapshot: Sh}` to
-   `events/myvol/`, advances `HEAD`. This event **already exists
-   today**; nothing new on the name axis.
+   Live→Released, then appends to `events/myvol/`: CAS `HEAD` with
+   `Released{handoff_snapshot: Sh}`, then PUT the record. This event
+   **already exists today**; nothing new on the name axis.
 3. **Claim (B).** B CASes `names/myvol` Released→Claimed. It learns
    the fork point from the **single `HEAD` GET** — `Released{handoff:
    Sh}` is in the window (no `prev` walk in the common case;
    replacing the redundant `latest_release_handoff_snapshot` LIST). B
-   appends `Claimed` and rewrites `HEAD`.
+   appends `Claimed` (CAS `HEAD`, then PUT the record).
 4. **Hydrate (B).** From `Sh.manifest` (a GET, key known from step 3)
    B gets the segment ULID set — the manifest already enumerates
    segments, so no LIST; any segment not local is range-GET by
@@ -243,16 +322,18 @@ the purpose and is itself an optional-correctness path).
 Ordered so each phase builds on the prior.
 
 - **P1 — event-log spine: windowed `events/<name>/HEAD`.** Add the
-  `HEAD` object carrying the last *N* signed records (rebuilt on
-  append; record PUT before HEAD rewrite). `emit_event` reads/advances
-  `HEAD` instead of LIST-max; `peer_discovery` and
-  `volume_event_store` read the window, falling back to the
-  **already-present** `prev_event_ulid` walk only on a long tail.
+  `HEAD` object carrying the last *N* signed records (HEAD CAS
+  `If-Match` *before* the record PUT — § *spine*). `emit_event`
+  reads/advances `HEAD` instead of LIST-max; `peer_discovery` and
+  `volume_event_store` read the window, 404-tolerant on entries,
+  falling back to the **already-present** `prev_event_ulid` walk only
+  on a long tail.
   **No event-format change, no new event kinds.** Change `volume
-  events` to bounded recent-N (served from the window; `--all` =
-  explicit to-genesis prev-walk). Align key/shape with
-  `design-volume-event-log.md`. Also gives the claim path its handoff
-  from the HEAD window via the existing `Released`/`ForkedFrom`
+  events` to always-bounded: default = window size *N*, `--num <n>`
+  for more (no `--all`/unbounded option; `list_events`' whole-prefix
+  LIST is removed, not replaced by a deeper walk). Align key/shape
+  with `design-volume-event-log.md`. Also gives the claim path its
+  handoff from the HEAD window via the existing `Released`/`ForkedFrom`
   events.
 - **P2 — per-vol `snapshots/LATEST` pointer.** Write it (per kind) at
   publish under `coord-data`; migrate the latest-snapshot consumers

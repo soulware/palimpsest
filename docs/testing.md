@@ -27,6 +27,10 @@ elide-core/tests/
 elide-coordinator/tests/
   gc_proptest.rs          proptest: coordinator GC oracle (segment cleanup + data)
   gc_test.rs              deterministic: coordinator GC regression reproductions
+
+elide-coordinator/src/ (in-module #[cfg(test)], white-box seams)
+  volume_event_store.rs   proptest: event-log windowed-HEAD spine
+                          (window ≡ chain prefix, crash phantom, force single-chain)
 ```
 
 The split is enforced by naming. When adding a new test file, pick the right suffix and add it to the inventory above.
