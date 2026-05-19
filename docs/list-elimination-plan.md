@@ -263,22 +263,25 @@ bounded.
 
 ### Maintained index (`segments`, `retention` only)
 
-The genuinely high-cardinality per-write sets — accreted by the WAL
-drain and GC, pruned by the reaper — are too large to fold from a
-chain on every read, so they keep a dedicated per-volume index object
-(`coord-data`, same axis as the data):
-
-- **segment index** — appended by the drain (`upload.rs`) as each
-  segment is uploaded and by GC as it writes outputs; the reaper
-  tombstones entries it deletes. Replaces `prefetch.rs:442`,
-  `fork.rs:670`, `recovery.rs:165`.
-- **retention index** — appended by GC with each supersession marker.
-  Replaces `prefetch.rs:643`, `reaper.rs:80`.
-
-These two may collapse into one per-volume append-only "manifest
-delta log" — an implementation choice deferred to its phase, but
-constrained by the next section. Snapshots are deliberately **not**
-here (per-vol pointer + per-name handoff references, above).
+The genuinely high-cardinality per-write set — accreted by the WAL
+drain and GC, pruned by the reaper — is too large for a chain shape.
+It is also not a parallel full index: the latest signed snapshot
+manifest already enumerates the full live segment set (reachable
+LIST-free via P2's `LATEST`), so the maintained object is a **second
+manifest for the post-snapshot delta** — a single per-vol object
+(`by_id/<vol>/tail`, fixed key like `snapshots/LATEST`),
+whole-object-overwritten by the per-volume tick loop, holding
+`Added`/`Superseded`/`Tombstoned` entries over the current anchor.
+P3 **folds the reaper into the per-volume tick loop** as a gated step,
+making that loop the sole writer (drain → GC → reap sequential): one
+GET reads the whole tail at any cardinality, write cost is per-tick
+not per-segment, and truncation is the writer emptying the object at
+each seal — no lock, no chain, no compaction heuristic. Replaces
+`prefetch.rs:442`, `fork.rs:670`, `recovery.rs:165`,
+`prefetch.rs:643`, `reaper.rs:80`. Full design and the rebuild
+invariant: [`design-segment-index.md`](design-segment-index.md).
+Snapshots are deliberately **not** here (per-vol pointer + per-name
+handoff references, above).
 
 ### Worked example — a release/claim cycle
 
@@ -396,11 +399,19 @@ Ordered so each phase builds on the prior.
   cleanup consumers (`lifecycle.rs:560/707/1502`) at the P1 chain
   walk / known-key delete. Removes every snapshot LIST; no new events,
   no cross-role write.
-- **P3 — segment index.** Drain + GC maintenance, crash-ordering as
-  above; migrate `prefetch`/`recovery`/`fork-verify`; define + test
-  the reconcile invariant.
-- **P4 — retention index** (or fold into P3's delta log); migrate
-  `prefetch` supersession and `reaper`.
+- **P3 (folds in P4) — segment tail-delta manifest.** Specified in
+  [`design-segment-index.md`](design-segment-index.md). A single
+  per-vol object (`by_id/<vol>/tail`) — a *second manifest* for the
+  post-snapshot delta over P2's `LATEST` anchor, whole-object
+  overwritten. The reaper is **folded into the per-volume tick loop**
+  as a gated step, making that loop the sole writer (drain → GC → reap
+  sequential): one GET reads the whole tail, write cost is per-tick,
+  truncation is the writer emptying the object at each seal — no lock,
+  no chain. Segment and retention/supersession entries fold into the
+  **one** object (the "may collapse into one" choice, taken).
+  Segment-objects-before-tail-PUT crash ordering; migrate
+  `prefetch`/`recovery`/`fork-verify` *and* `prefetch` supersession +
+  `reaper`; rebuild defines the proptested reconcile invariant.
 - **P5 — drop the grant.** Delete `s3:ListBucket` from
   `mint/examples/elide_roles/coord-writer.json`, the §*`coord-writer`*
   policy, and the role-inventory table in `design-mint.md`; add a CI
