@@ -552,43 +552,25 @@ async fn resolve_name_op(
     }
 }
 
-/// LIST `by_id/<vol_ulid>/snapshots/` and return the highest snapshot
-/// ULID. Filemap and manifest siblings (filenames containing `.`) and
-/// stop-snapshot markers (`<ulid>-stop`, hyphen-tagged) are filtered
-/// out so only the bare user-snapshot markers contribute. Stop
+/// GET the per-vol latest stable (`User`) snapshot pointer. Stop
 /// snapshots are ephemeral checkpoints owned by the stop/start
-/// lifecycle and must not be picked up as a fork basis.
+/// lifecycle and must not be picked up as a fork basis, so only the
+/// `User` pointer is consulted. Replaces the former
+/// `by_id/<vol>/snapshots/` LIST (`docs/list-elimination-plan.md`
+/// § *Identity axes*).
 async fn latest_snapshot_op(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<LatestSnapshotReply, IpcError> {
-    use futures::TryStreamExt;
-    use object_store::path::Path as StorePath;
-
-    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> = store
-        .list(Some(&prefix))
-        .try_collect()
-        .await
-        .map_err(|e| IpcError::store(format!("listing by_id/{vol_ulid}/snapshots/: {e}")))?;
-
-    let mut latest: Option<Ulid> = None;
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        if filename.contains('.') || filename.contains('-') {
-            continue;
-        }
-        if let Ok(u) = Ulid::from_string(filename)
-            && latest.is_none_or(|cur| u > cur)
-        {
-            latest = Some(u);
-        }
-    }
-    Ok(LatestSnapshotReply {
-        snapshot_ulid: latest,
-    })
+    let snapshot_ulid =
+        elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
+            .await
+            .map_err(|e| {
+                IpcError::store(format!(
+                    "reading latest-snapshot pointer for {vol_ulid}: {e}"
+                ))
+            })?;
+    Ok(LatestSnapshotReply { snapshot_ulid })
 }
 
 /// Synthesize a "now" snapshot for a readonly source volume.

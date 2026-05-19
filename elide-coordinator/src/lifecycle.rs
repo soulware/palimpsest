@@ -432,7 +432,15 @@ pub async fn mark_reclaimed_local(
     record.coordinator_id = Some(coord_id.to_owned());
     record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
     record.hostname = hostname.map(str::to_owned);
-    record.handoff_snapshot = None;
+    // `handoff_snapshot` is intentionally retained. In-place reclaim
+    // keeps the same `vol_ulid`; the prior owner's published handoff
+    // under that vol_ulid stays the valid basis until this owner
+    // writes and `mark_released` overwrites it. It is the only
+    // structured pointer to that basis for a fork reclaimed and
+    // released again without ever being started, and it is read only
+    // in `Released` state, so retaining it on `Live`/`Stopped` is
+    // inert for every other consumer (`docs/list-elimination-plan.md`
+    // § *Identity axes* — replaces the snapshot-prefix LIST).
 
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkReclaimedLocalOutcome::Reclaimed)
@@ -1347,8 +1355,12 @@ mod tests {
         assert_eq!(got.vol_ulid, sample_ulid(), "vol_ulid preserved");
         assert!(got.coordinator_id.is_some());
         assert!(got.claimed_at.is_some());
-        // handoff_snapshot was set on release; cleared on reclaim.
-        assert!(got.handoff_snapshot.is_none());
+        // handoff_snapshot is retained across in-place reclaim: same
+        // vol_ulid, so the prior owner's published handoff stays the
+        // valid basis until this owner writes and re-releases. It is
+        // the only structured pointer to that basis for a
+        // never-started reclaimed fork (replaces the snapshot LIST).
+        assert_eq!(got.handoff_snapshot, Some(snap()));
     }
 
     #[tokio::test]

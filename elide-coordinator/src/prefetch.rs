@@ -942,74 +942,38 @@ async fn prefetch_snapshots(
         .await;
     }
 
-    // Listed path: no branch, or no peer. Either way LIST is the only
-    // way to discover what to fetch.
-    let prefix = StorePath::from(format!("by_id/{volume_id}/snapshots/"));
-    let objects: Vec<_> = store
-        .list(Some(&prefix))
-        .try_collect()
-        .await
-        .with_context(|| format!("listing by_id/{volume_id}/snapshots/"))?;
+    // Pointer path: no branch+peer fast path available. Resolve the
+    // single basis manifest by known key — the explicit branch when
+    // set, else the latest stable (`User`) snapshot from the per-vol
+    // pointer — and fetch just that. No LIST. Older stable snapshots
+    // are not a writable head's basis (ancestors resolve via signed
+    // provenance) and stop-snapshots never flow into prefetch, per
+    // `docs/list-elimination-plan.md` § *Identity axes*.
+    let basis = match branch_ulid {
+        Some(b) => Ulid::from_string(b).with_context(|| format!("parsing branch ulid {b}"))?,
+        None => match crate::upload::read_latest_snapshot(store, volume_id).await? {
+            Some(u) => u,
+            None => return Ok(()),
+        },
+    };
 
-    // Filter + skip-if-local synchronously, then fetch the remaining
-    // artifacts concurrently. Bounded with `buffer_unordered` so a
-    // very wide snapshot dir doesn't blast the store with hundreds
-    // of in-flight GETs.
-    // Snapshots are recorded as `<ulid>.manifest`; everything else
-    // under `snapshots/` (pre-#212 `.filemap` siblings, pre-#215
-    // bare-ULID markers, ephemeral `<ulid>-stop.manifest` checkpoints)
-    // is skipped — stop-snapshots are owned by the stop/start lifecycle
-    // and should not flow into a prefetching peer.
-    let to_fetch: Vec<(object_store::path::Path, String)> = objects
-        .into_iter()
-        .filter_map(|obj| {
-            let filename = obj.location.filename()?.to_owned();
-            let (stem_ulid, kind) = elide_core::signing::parse_snapshot_filename(&filename)?;
-            if kind != elide_core::signing::SnapshotKind::User {
-                return None;
-            }
-            let stem = stem_ulid.to_string();
-            if let Some(branch) = branch_ulid
-                && stem != branch
-            {
-                return None;
-            }
-            if snap_dir.join(&filename).exists() {
-                return None;
-            }
-            Some((obj.location, filename))
-        })
-        .collect();
-
-    if to_fetch.is_empty() {
+    let filename = elide_core::signing::snapshot_manifest_filename(&basis);
+    if snap_dir.join(&filename).exists() {
         return Ok(());
     }
     std::fs::create_dir_all(&snap_dir).context("creating snapshots dir")?;
 
-    let snap_dir_owned = snap_dir.clone();
-    let n = to_fetch.len();
-    futures::stream::iter(to_fetch.into_iter().map(|(location, filename)| {
-        let store = store.clone();
-        let snap_dir = snap_dir_owned.clone();
-        async move {
-            let data = store
-                .get(&location)
-                .await
-                .with_context(|| format!("downloading {location}"))?
-                .bytes()
-                .await
-                .with_context(|| format!("reading {location}"))?;
-
-            write_snapshot_artifact_atomic(&snap_dir, &filename, &data)?;
-            info!("[prefetch] fetched snapshot artifact: {filename}");
-            anyhow::Ok(())
-        }
-    }))
-    .buffer_unordered(PREFETCH_CONCURRENCY)
-    .try_collect::<Vec<()>>()
-    .await?;
-
-    result.snapshots_fetched += n;
+    let key = crate::upload::snapshot_manifest_key(volume_id, basis);
+    let data = store
+        .get(&key)
+        .await
+        .with_context(|| format!("downloading {key}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading {key}"))?;
+    write_snapshot_artifact_atomic(&snap_dir, &filename, &data)?;
+    info!("[prefetch] fetched snapshot artifact: {filename}");
+    result.snapshots_fetched += 1;
 
     Ok(())
 }
@@ -1484,6 +1448,16 @@ mod tests {
             .put(&manifest_key, manifest_bytes.into())
             .await
             .unwrap();
+        // The writable-head listed path resolves its basis from the
+        // `snapshots/LATEST` pointer (no LIST). Seed it as the upload
+        // path would after the manifest PUT.
+        store
+            .put(
+                &crate::upload::snapshot_latest_key(root_ulid),
+                bytes::Bytes::from(snap_ulid.as_bytes().to_vec()).into(),
+            )
+            .await
+            .unwrap();
 
         let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1, "should fetch own .idx");
@@ -1753,6 +1727,15 @@ mod tests {
             .put(
                 &crate::upload::snapshot_manifest_key(vol_ulid, snap_ulid.parse().unwrap()),
                 manifest_bytes.into(),
+            )
+            .await
+            .unwrap();
+        // Writable-head listed path resolves its basis from the
+        // `snapshots/LATEST` pointer; seed it as the upload path would.
+        store
+            .put(
+                &crate::upload::snapshot_latest_key(vol_ulid),
+                bytes::Bytes::from(snap_ulid.as_bytes().to_vec()).into(),
             )
             .await
             .unwrap();

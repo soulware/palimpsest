@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 use object_store::ObjectStore;
-use object_store::path::Path as StorePath;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -144,31 +143,25 @@ async fn pull_skeleton_chain(
     Ok(())
 }
 
+/// GET the per-vol latest stable (`User`) snapshot pointer. Replaces
+/// the former `by_id/<vol>/snapshots/` LIST
+/// (`docs/list-elimination-plan.md` § *Identity axes*). The stop /
+/// handoff basis is a name-axis fact resolved from the event spine,
+/// not this pointer.
 async fn latest_snapshot_in_store(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<Option<(Ulid, elide_core::signing::SnapshotKind)>, IpcError> {
-    use futures::TryStreamExt;
-    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> = store
-        .list(Some(&prefix))
-        .try_collect()
-        .await
-        .map_err(|e| IpcError::store(format!("listing by_id/{vol_ulid}/snapshots/: {e}")))?;
-
-    let mut latest: Option<(Ulid, elide_core::signing::SnapshotKind)> = None;
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let Some((u, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
-            continue;
-        };
-        if latest.is_none_or(|(cur, _)| u > cur) {
-            latest = Some((u, kind));
-        }
-    }
-    Ok(latest)
+    Ok(
+        elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
+            .await
+            .map_err(|e| {
+                IpcError::store(format!(
+                    "reading latest-snapshot pointer for {vol_ulid}: {e}"
+                ))
+            })?
+            .map(|u| (u, elide_core::signing::SnapshotKind::User)),
+    )
 }
 
 async fn install_basis_under_leaf(
