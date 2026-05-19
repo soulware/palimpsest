@@ -14,10 +14,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
+
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, PutResult};
+use object_store::{ObjectStore, PutResult, UpdateVersion};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -33,7 +38,100 @@ use elide_core::volume_event::{EventKind, VolumeEvent};
 
 use crate::identity::{self, CoordinatorIdentity};
 use crate::ipc::{SignatureStatus, VolumeEventEntry};
-use crate::portable::{ConditionalPutError, MIME_TOML, put_if_absent_with_type};
+use crate::portable::{
+    ConditionalPutError, MIME_TOML, put_if_absent_with_type, put_with_match_with_type,
+};
+
+/// Number of most-recent signed events carried inline in the
+/// `events/<name>/HEAD` window. Tuning parameter, not pinned by the
+/// design (`docs/list-elimination-plan.md` § *event-log spine*):
+/// large enough that claim / peer-discovery / the default
+/// `volume events` view are answered from the single HEAD GET without
+/// any `prev_event_ulid` walk.
+const HEAD_WINDOW: usize = 16;
+
+fn head_key(name: &str) -> StorePath {
+    StorePath::from(format!("events/{name}/HEAD"))
+}
+
+/// Per-name in-process serialization of this coordinator's own emits
+/// (the plan's "small Mutex map"). Cross-coordinator concurrency is
+/// handled by the `names/<name>` ownership CAS upstream; this only
+/// stops a coordinator's own concurrent tasks from racing each other's
+/// HEAD read-modify-write (which would otherwise misfire the
+/// `If-Match` displacement detector on a purely local race). One entry
+/// per distinct name ever emitted — bounded by the coordinator's
+/// volume count, same as the snapshot-lock registry.
+static NAME_EMIT_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn name_emit_lock(name: &str) -> Arc<AsyncMutex<()>> {
+    let mut map = NAME_EMIT_LOCKS
+        .lock()
+        .expect("name-emit lock registry poisoned");
+    map.entry(name.to_owned())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// The `events/<name>/HEAD` window: the last [`HEAD_WINDOW`] signed
+/// events, newest-first (`events[0]` is the latest). HEAD is the
+/// ordering authority for `emit` (so no LIST is needed) but **not**
+/// the integrity authority — each entry is the same individually
+/// signed `VolumeEvent` stored standalone, so a tampered entry still
+/// fails the per-event signature check.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct EventHead {
+    #[serde(default)]
+    events: Vec<VolumeEvent>,
+}
+
+impl EventHead {
+    /// Newest event, or `None` for an empty/just-created log.
+    fn latest(&self) -> Option<&VolumeEvent> {
+        self.events.first()
+    }
+
+    /// `[new] ++ self.events`, truncated to [`HEAD_WINDOW`].
+    fn pushed(&self, new: VolumeEvent) -> EventHead {
+        let mut events = Vec::with_capacity((self.events.len() + 1).min(HEAD_WINDOW));
+        events.push(new);
+        events.extend(self.events.iter().take(HEAD_WINDOW - 1).cloned());
+        EventHead { events }
+    }
+}
+
+/// GET `events/<name>/HEAD`. `Ok(None)` means the object is absent —
+/// a genuinely empty log (first event for this name). A transient
+/// store error is propagated, **not** mapped to `None`: under Option 3
+/// `None` means "first event", so swallowing an error would set
+/// `prev_event_ulid = None` on a name that has history and fork the
+/// chain (`docs/list-elimination-plan.md`, Note A). The returned
+/// [`UpdateVersion`] is the `If-Match` precondition for the rewrite.
+async fn read_head(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+) -> Result<Option<(EventHead, UpdateVersion)>, VolumeEventStoreError> {
+    let key = head_key(name);
+    let got = match store.get(&key).await {
+        Ok(g) => g,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(VolumeEventStoreError::Store(e)),
+    };
+    let version = UpdateVersion {
+        e_tag: got.meta.e_tag.clone(),
+        version: got.meta.version.clone(),
+    };
+    let bytes = got.bytes().await.map_err(VolumeEventStoreError::Store)?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| {
+        VolumeEventStoreError::Store(object_store::Error::Generic {
+            store: "events",
+            source: format!("HEAD not utf-8: {e}").into(),
+        })
+    })?;
+    let head: EventHead = toml::from_str(text).map_err(VolumeEventStoreError::ParseHead)?;
+    Ok(Some((head, version)))
+}
 
 /// Errors from `volume_event_store` operations.
 #[derive(Debug)]
@@ -50,6 +148,14 @@ pub enum VolumeEventStoreError {
     /// `DateTime<Utc>`. Practically impossible for ULIDs minted in
     /// this century.
     UnrepresentableTimestamp,
+    /// `events/<name>/HEAD` did not parse as an [`EventHead`].
+    ParseHead(toml::de::Error),
+    /// The `If-Match` HEAD rewrite failed: `events/<name>/HEAD`
+    /// changed under us. The only writer that can do that to a name
+    /// we own is a concurrent `release --force` — i.e. **this
+    /// coordinator has been displaced**. Caller must fail hard, not
+    /// retry (`docs/list-elimination-plan.md` § *Single-writer*).
+    Displaced,
 }
 
 impl std::fmt::Display for VolumeEventStoreError {
@@ -61,6 +167,12 @@ impl std::fmt::Display for VolumeEventStoreError {
             Self::UnrepresentableTimestamp => {
                 write!(f, "event_ulid timestamp out of DateTime<Utc> range")
             }
+            Self::ParseHead(e) => write!(f, "parsing events HEAD: {e}"),
+            Self::Displaced => write!(
+                f,
+                "event-log HEAD changed under us — this coordinator has been displaced \
+                 (concurrent release --force)"
+            ),
         }
     }
 }
@@ -70,6 +182,7 @@ impl std::error::Error for VolumeEventStoreError {
         match self {
             Self::Serialise(e) => Some(e),
             Self::Store(e) => Some(e),
+            Self::ParseHead(e) => Some(e),
             _ => None,
         }
     }
@@ -169,26 +282,31 @@ pub async fn latest_event_ulid(
     Ok(best)
 }
 
-/// Mint a fresh event, sign it with `identity`, and append it to
-/// `events/<name>/`.
+/// Mint a fresh event, sign it, and append it to `events/<name>/`,
+/// keeping the `events/<name>/HEAD` window the ordering authority
+/// (`docs/list-elimination-plan.md` § *event-log spine*).
 ///
-/// Steps:
-///   1. Look up `prev_event_ulid` (best-effort — list failures fall
-///      back to `None`, which produces a small audit gap rather
-///      than blocking the emit).
-///   2. Mint a fresh `event_ulid`. When a `prev_event_ulid` was
-///      observed, seed a [`UlidMint`] with it so the new ULID is
-///      strictly greater — this guarantees monotonic ordering across
-///      rapid back-to-back emits within the same millisecond and
-///      across emits from different coordinators (each
-///      re-seeds from the latest S3 state). When no prior event
-///      exists, mint via `Ulid::new()` directly.
-///   3. Build the `VolumeEvent` with `at` derived from the ULID.
-///   4. Sign with `identity.signing_key()` over the canonical
-///      payload.
-///   5. PUT under `If-None-Match: *`.
+/// Steps (Option 3 — HEAD before record):
+///   1. Acquire the in-process per-name lock (intra-coordinator
+///      serialization; cross-coordinator is the upstream
+///      `names/<name>` CAS).
+///   2. `read_head` → `prev = HEAD[0]`. A transient store error
+///      **fails the emit** (it is *not* mapped to `None`; see Note A).
+///   3. Mint a strictly-greater `event_ulid` via [`UlidMint`] seeded
+///      from `prev` (unchanged ordering guarantee), build, sign.
+///   4. Write the new HEAD window: `If-Match` the version read in (2)
+///      for a normal emit; **unconditional** for the `release
+///      --force` emit (`ForceReleased` — force is the override at the
+///      event layer exactly as at `names/<name>`); `If-None-Match:*`
+///      when the log is empty. An `If-Match` mismatch means this
+///      coordinator was displaced → [`Displaced`], fail hard, no
+///      retry.
+///   5. PUT the immutable record under `If-None-Match: *`. A crash
+///      between (4) and (5) leaves a benign phantom (full signed
+///      record still inline in HEAD; readers 404-skip the standalone
+///      object).
 ///
-/// Returns the constructed signed event on success.
+/// [`Displaced`]: VolumeEventStoreError::Displaced
 pub async fn emit_event(
     store: &Arc<dyn ObjectStore>,
     identity: &CoordinatorIdentity,
@@ -196,30 +314,25 @@ pub async fn emit_event(
     kind: EventKind,
     vol_ulid: Ulid,
 ) -> Result<VolumeEvent, VolumeEventStoreError> {
-    let prev_event_ulid = match latest_event_ulid(store, name).await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "[volume_event_store] failed to list prior events for {name}: {e}; \
-                 emitting with prev_event_ulid=None"
-            );
-            None
-        }
-    };
+    let lock = name_emit_lock(name);
+    let _guard = lock.lock().await;
 
-    // Seed a `UlidMint` from `prev_event_ulid` so the new event's
-    // ULID is strictly greater than the highest known event in the
-    // log. This is the architectural fix for the same-millisecond
-    // ordering race: two `Ulid::new()` calls within one ms produce
-    // ULIDs in random order, but `UlidMint::next()` advances the
-    // random portion when the clock hasn't moved past `last`. Cross-
-    // coordinator emits inherit the same property as long as each
-    // emitter re-seeds from S3 — which `latest_event_ulid` above does.
+    // (2) HEAD is the ordering authority. Absent => first event;
+    //     a transient error propagates (Note A — never prev=None).
+    let head = read_head(store, name).await?;
+    let (prev_head, expected) = match head {
+        Some((h, ver)) => (Some(h), Some(ver)),
+        None => (None, None),
+    };
+    let prev_event_ulid = prev_head
+        .as_ref()
+        .and_then(|h| h.latest())
+        .map(|e| e.event_ulid);
+
+    // (3) Strictly-greater ULID, seeded from prev (unchanged: the
+    //     same-millisecond ordering fix). Build + sign.
     let event_ulid = match prev_event_ulid {
-        Some(prev) => {
-            let mut mint = elide_core::ulid_mint::UlidMint::new(prev);
-            mint.next()
-        }
+        Some(prev) => elide_core::ulid_mint::UlidMint::new(prev).next(),
         None => Ulid::new(),
     };
     let mut event = VolumeEvent::new(
@@ -232,8 +345,47 @@ pub async fn emit_event(
         kind,
     )
     .ok_or(VolumeEventStoreError::UnrepresentableTimestamp)?;
-
     sign_event(&mut event, identity);
+
+    // (4) HEAD first. Force-release is the unconditional override at
+    //     this layer just as at `names/<name>`; it must never fail.
+    let new_head = prev_head.unwrap_or_default().pushed(event.clone());
+    let body = Bytes::from(
+        toml::to_string(&new_head)
+            .map_err(VolumeEventStoreError::Serialise)?
+            .into_bytes(),
+    );
+    let key = head_key(name);
+    let is_force = matches!(event.kind, EventKind::ForceReleased { .. });
+    if is_force {
+        store
+            .put(&key, body.into())
+            .await
+            .map_err(VolumeEventStoreError::Store)?;
+    } else {
+        match expected {
+            Some(ver) => {
+                put_with_match_with_type(store.as_ref(), &key, body, ver, MIME_TOML)
+                    .await
+                    .map_err(|e| match e {
+                        ConditionalPutError::PreconditionFailed => VolumeEventStoreError::Displaced,
+                        ConditionalPutError::Other(e) => VolumeEventStoreError::Store(e),
+                    })?;
+            }
+            None => {
+                // Empty log: create-only. A lost race here likewise
+                // means someone else owns the name now.
+                put_if_absent_with_type(store.as_ref(), &key, body, MIME_TOML)
+                    .await
+                    .map_err(|e| match e {
+                        ConditionalPutError::PreconditionFailed => VolumeEventStoreError::Displaced,
+                        ConditionalPutError::Other(e) => VolumeEventStoreError::Store(e),
+                    })?;
+            }
+        }
+    }
+
+    // (5) Immutable standalone record second (idempotent create).
     append_event(store, name, &event).await?;
     Ok(event)
 }
