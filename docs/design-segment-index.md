@@ -101,6 +101,47 @@ manifest already reflects all GC that completed before it, so — like
 segments — supersession only matters in the post-snapshot window. One
 object, one truncation event, no separate `retention/` prefix.
 
+## Body format
+
+Plaintext, line-oriented, sectioned by entry kind. Direct precedent:
+`SnapshotManifest` (`signing.rs`, `segments:` header + one ULID per
+line, sorted lex) and the retention marker (`retention.rs`, *"one
+input segment ULID per line, plain text"*). Matches both, matches the
+"on-disk layout inspectable with standard tools" principle, and at
+thousands of entries is still tens of KB.
+
+```
+anchor: <snap_ulid|nil>
+added:
+  <ulid>
+  ...
+superseded:
+  <input-ulid> <output-ulid> <since-rfc3339>
+  ...
+tombstoned:
+  <ulid>
+  ...
+```
+
+- Crockford-Base32 ULIDs throughout; parsed through `Ulid::from_string`
+  (parse-don't-validate).
+- **Sorted lex within each section** — chronological for ULIDs;
+  matches the manifest convention; gives the rebuild invariant a
+  deterministic canonical form.
+- Empty sections present-but-empty regardless of state (canonical form).
+- `anchor:` names the manifest this tail is a delta of (`nil` on a
+  fresh volume). Self-describing for operators and lets the proptest
+  assert anchor equality; not load-bearing for correctness — the
+  manifest set is the arbiter regardless.
+- `since` is RFC3339, matching the manifest's `recovered_at`. Replaces
+  the role the retention marker's filename ULID plays today.
+- **No `sig:`** — derived, unsigned state (see *Derived state*).
+- **No hard cap.** Truncation at seal bounds the body; a cap would
+  contradict the "thousands is fine" premise.
+
+Parser/writer follows the `retention.rs` pattern — a dedicated module
+exposing `render` / `parse` with explicit error types.
+
 ## Entry kinds
 
 The tail body carries three entry kinds:
@@ -293,10 +334,6 @@ gated step in `tasks.rs`'s per-volume loop.
 
 ## Open questions
 
-- **Tail body format.** Sorted ULID lines per kind (a literal second
-  manifest, maximally inspectable) vs. a compact framed encoding. The
-  manifest's own text format is the natural precedent; size at
-  thousands of entries is tens of KB either way.
 - **Reaper fold mechanics.** Folding `reap_volume` into the per-volume
   tick loop as a `reaper_interval`-gated step is the design above;
   the implementation must confirm a paused/not-running volume's loop
