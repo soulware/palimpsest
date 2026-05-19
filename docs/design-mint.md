@@ -927,10 +927,11 @@ not key partitioning:
     condition key, but Tigris supports **no string condition keys**
     (only `IpAddress`/`NotIpAddress` and `Date*`,
     [Tigris IAM policy support][tigris-iam-policies]). It exposes
-    object *keys* only (ULIDs, names, coord ids), never contents;
-    eliminating LIST dependence (`events/<name>/HEAD` pointers,
-    deterministic manifest keys, a maintained `names` index) would
-    drop this statement — open question #12.
+    object *keys* only (ULIDs, names, coord ids), never contents.
+    **Proposed (#12, `docs/list-elimination-plan.md`): this statement
+    is removed** — every LIST becomes a deterministic GET (latest-
+    pointer or maintained index), after which no role carries
+    `ListBucket`.
 
 ### `volume-ro`
 
@@ -1401,16 +1402,49 @@ prematurely.
     stated in the role inventory but not fully specified — the exact set of
     roles a GC pass assumes, and whether the reaper's delete wants its own
     narrower role, is open.
-12. **Eliminate the `ListBucket` statement.** `coord-writer`'s
-    `ListBucket` statement is the one structurally un-scopable grant
-    (Tigris `ListBucket` is bucket-global; no string conditions to
-    prefix-scope it). Replacing the LIST paths with `events/<name>/HEAD`
-    pointers, deterministic manifest keys, and a maintained `names`
-    index — ideas already floated in `design-volume-event-log.md` and
-    `design-peer-segment-fetch.md` for performance — would shrink it to
-    just `volume list --remote`, or drop the statement entirely. Not
-    blocking; the temporal mitigation (`coord-writer`'s short TTL,
-    on-demand) holds until then.
+12. **Eliminate the `ListBucket` statement — resolved; see
+    `docs/list-elimination-plan.md`.** Decision: the coordinator
+    stops using `ListBucket` entirely, independent of whether any
+    given backend can prefix-scope it. `ListBucket` is the one grant
+    that is bucket-level by S3 design (prefix restriction is the
+    `s3:prefix` *condition*, not the Resource ARN); on Tigris the
+    standard lever is unavailable (only `IpAddress`/`Date*`
+    conditions), so a listing credential there can enumerate the whole
+    bucket's key space. Whether Tigris honours a non-standard
+    prefix-ARN `ListBucket` is untested and explicitly *not* relied
+    on. Removing the dependency is the robust, backend-portable answer
+    and also a long-wanted perf win; the coordinator's per-volume data
+    plane is pervasively LIST-driven over `by_id/<vol>/{snapshots,
+    segments,retention}/` (prefetch, recovery, fork-verify, the
+    reaper, snapshot resolution), so this is structural, not a corner.
+
+    **Proposed:** every LIST is replaced by a deterministic GET,
+    respecting the name/`vol_ulid` identity split. The per-name event
+    log is the spine (append-only, self-linking, a bounded
+    `events/<name>/HEAD` window of the last N signed records) and
+    already carries the cross-epoch handoff/fork snapshot
+    references (`Released`/`ForceReleased`/`ForkedFrom`) — no new event
+    kinds. The per-vol "latest snapshot" is a
+    `by_id/<vol>/snapshots/LATEST` pointer written under `coord-data`
+    (no cross-role write); no consumer needs a per-vol snapshot *set*.
+    Only the high-cardinality per-write sets keep a separate
+    **maintained index**:
+
+    - a per-volume segment index replaces the `segments/` LIST
+      (the WAL drain and GC append to it as they create objects); a
+      per-volume retention index replaces the `retention/` LIST (GC
+      appends supersession markers). The index, not LIST, is the
+      authoritative live set; a no-LIST reconcile/repair path covers
+      index/object divergence (LIST is today's implicit reconcile, so
+      its removal must be replaced, not merely dropped).
+
+    End state: **no role needs `ListBucket`** — `coord-writer`'s
+    `ListBucket` statement is deleted from its role template and from
+    the inventory above; `coord-data` never had it. The bucket-global
+    enumeration hole closes entirely rather than being confined.
+    Until this lands the per-volume LIST paths fail on Tigris under
+    `coord-data` (no `ListBucket`); the interim credential posture is a
+    separate decision, out of scope for this resolution.
 13. **Enrollment surface — settled.** See *Coordinator bootstrap* §
     *Enrollment*: reusable non-expiring bootstrap macaroon → coordinator
     self-asserts `sub`/`cnf` and `POST /v1/enroll` creates a pending
