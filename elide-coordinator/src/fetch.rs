@@ -23,7 +23,6 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 
 use object_store::ObjectStore;
-use object_store::path::Path as StorePath;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -319,37 +318,21 @@ async fn resolve_name(
     ))
 }
 
-/// LIST `by_id/<vol_ulid>/snapshots/` and return the highest snapshot
-/// ULID, ignoring filemap and other dotted siblings. Returns `None`
-/// when the volume has no snapshot in the store.
+/// GET the per-vol latest stable (`User`) snapshot pointer. Returns
+/// `None` when the volume has no published stable snapshot. Replaces
+/// the former `by_id/<vol>/snapshots/` LIST
+/// (`docs/list-elimination-plan.md` § *Identity axes*).
 async fn latest_snapshot_in_store(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<Option<Ulid>, IpcError> {
-    use futures::TryStreamExt;
-    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> = store
-        .list(Some(&prefix))
-        .try_collect()
+    elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
         .await
-        .map_err(|e| IpcError::store(format!("listing by_id/{vol_ulid}/snapshots/: {e}")))?;
-
-    let mut latest: Option<Ulid> = None;
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let stem = match filename.strip_suffix(".manifest") {
-            Some(s) => s,
-            None => continue,
-        };
-        if let Ok(u) = Ulid::from_string(stem)
-            && latest.is_none_or(|cur| u > cur)
-        {
-            latest = Some(u);
-        }
-    }
-    Ok(latest)
+        .map_err(|e| {
+            IpcError::store(format!(
+                "reading latest-snapshot pointer for {vol_ulid}: {e}"
+            ))
+        })
 }
 
 async fn pull_ancestor_chain(

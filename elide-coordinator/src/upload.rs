@@ -216,6 +216,74 @@ pub fn stop_snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
     ))
 }
 
+/// Object-store key for the per-vol latest stable-snapshot pointer:
+/// `by_id/<vol>/snapshots/LATEST`. A single fixed key per volume —
+/// the pointer the clean data-axis consumers GET instead of LISTing
+/// the snapshot prefix (`docs/list-elimination-plan.md` § *Identity
+/// axes*). Tracks the newest `User` (stable) snapshot only; body is
+/// the bare ULID. There is deliberately **no `-stop` pointer**: the
+/// unclean-recovery basis lives on the event spine
+/// (`Stopped`/`Released`/`ForceReleased`), where there is no
+/// manifest-then-crash-before-bump window to lose.
+pub fn snapshot_latest_key(volume_id: &str) -> StorePath {
+    StorePath::from(format!("by_id/{volume_id}/snapshots/LATEST"))
+}
+
+/// GET the per-vol latest stable-snapshot pointer. `Ok(None)` when
+/// absent (no stable snapshot yet, or the pointer not yet written —
+/// it self-heals on the next publish). An unparseable body is treated
+/// as absent (logged), not fatal: it is a perf hint, not a
+/// correctness datum (the correctness-sensitive recovery basis is on
+/// the event spine, not here).
+pub async fn read_latest_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    volume_id: &str,
+) -> Result<Option<Ulid>> {
+    let key = snapshot_latest_key(volume_id);
+    let bytes = match store.get(&key).await {
+        Ok(g) => g.bytes().await.context("reading latest-snapshot pointer")?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("getting {key}: {e}")),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .context("latest-snapshot pointer not utf-8")?
+        .trim();
+    match Ulid::from_string(text) {
+        Ok(u) => Ok(Some(u)),
+        Err(e) => {
+            warn!("[upload] {key} unparseable ({e}); ignoring (self-heals on next publish)");
+            Ok(None)
+        }
+    }
+}
+
+/// Bump the per-vol latest stable-snapshot pointer to `snap_ulid`
+/// when it is newer (ULID order) than what is there. Single-writer
+/// per vol (the owning coordinator's coord-data seal path), so a
+/// plain GET-max-PUT — no CAS. A lost race only drops a perf hint the
+/// next publish restores.
+async fn bump_latest_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    volume_id: &str,
+    snap_ulid: Ulid,
+) -> Result<()> {
+    if let Some(cur) = read_latest_snapshot(store, volume_id).await?
+        && cur >= snap_ulid
+    {
+        return Ok(());
+    }
+    let key = snapshot_latest_key(volume_id);
+    put_with_content_type(
+        store,
+        &key,
+        Bytes::from(snap_ulid.to_string().into_bytes()),
+        MIME_TEXT,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("writing {key}: {e}"))?;
+    Ok(())
+}
+
 /// Upload all committed segments from `pending/` to the object store, then
 /// promote each segment to the local cache.
 ///
@@ -495,6 +563,16 @@ pub async fn upload_snapshot_metadata(
                 info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
                 if let Err(e) = mark_uploaded(&sentinel, &[]) {
                     warn!("failed to mark snapshot {snap_ulid} sentinel: {e}");
+                }
+                // Best-effort perf hint for the clean data-axis
+                // consumers — `User` snapshots only. `Stop` checkpoints
+                // are not pointed at: their recovery role is served by
+                // the `Stopped` event on the spine. A failure here must
+                // not fail the upload (self-heals on the next publish).
+                if kind == elide_core::signing::SnapshotKind::User
+                    && let Err(e) = bump_latest_snapshot(store, volume_id, snap_ulid).await
+                {
+                    warn!("[upload] bumping snapshots/LATEST for {snap_ulid}: {e}");
                 }
             }
             Err(e) => warn!("snapshot manifest upload failed for {key}: {e:#}"),
