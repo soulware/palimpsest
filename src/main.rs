@@ -220,6 +220,34 @@ enum CoordCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Enrol this coordinator with the configured mint and provision
+    /// its per-role credentials.
+    ///
+    /// Thin wrapper that execs the sibling `elide-coordinator enroll`
+    /// binary with stdio inherited. One blocking step: it POSTs to
+    /// `/v1/enroll`, waits while the operator runs `mint enroll approve
+    /// <coordinator-id>` on the mint host, then exchanges the ticket
+    /// for every role under `<data_dir>/credentials/`. Requires a
+    /// `[mint]` section in the config; `coord run`/`start` refuse to
+    /// start until this has completed.
+    Enroll {
+        /// Path to the coordinator config file. Defaults to
+        /// `coordinator.toml` in the working directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// or `-` for stdin. Distributed out of band by the operator.
+        bootstrap: String,
+        /// Overall bound on waiting for operator approval (humantime,
+        /// e.g. `30m`). Defaults to the daemon's own default.
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Re-exchange and overwrite every role credential, not just
+        /// the missing ones.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1271,6 +1299,26 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+            CoordCommand::Enroll {
+                config,
+                bootstrap,
+                timeout,
+                force,
+            } => {
+                // Like `run`: exec the sibling and let it own data_dir
+                // resolution from --config; exec returns only on
+                // failure (success replaces this process, so the
+                // daemon's exit code flows through).
+                let e = coord_enroll(
+                    cli_data_dir.as_deref(),
+                    config.as_deref(),
+                    &bootstrap,
+                    timeout.as_deref(),
+                    force,
+                );
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         },
 
         Command::Token { command } => match command {
@@ -1413,6 +1461,44 @@ fn coord_run(cli_data_dir: Option<&Path>, config: Option<&Path>) -> std::io::Err
     // exec() returns only on failure; the success path replaces this
     // process image with the coordinator's, so signals (SIGINT,
     // SIGTERM, SIGHUP) and the exit code flow through directly.
+    let err = cmd.exec();
+    std::io::Error::other(format!("execing {}: {err}", bin.display()))
+}
+
+/// Exec the sibling `elide-coordinator enroll` with stdio inherited.
+/// Returns only on failure — on success, exec replaces this process so
+/// the blocking enrollment's exit status and signals flow through.
+fn coord_enroll(
+    cli_data_dir: Option<&Path>,
+    config: Option<&Path>,
+    bootstrap: &str,
+    timeout: Option<&str>,
+    force: bool,
+) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let bin = sibling_bin("elide-coordinator");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("enroll");
+    // Only forward --data-dir if the user explicitly set it; otherwise
+    // let the coordinator's config loader own the default so the
+    // `data_dir` field in coordinator.toml is honoured.
+    if let Some(dd) = cli_data_dir {
+        cmd.arg("--data-dir").arg(dd);
+    }
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    if let Some(t) = timeout {
+        cmd.arg("--timeout").arg(t);
+    }
+    if force {
+        cmd.arg("--force");
+    }
+    // Positional bootstrap last, so a value like `-` (stdin) is
+    // unambiguous after the flags.
+    cmd.arg(bootstrap);
     let err = cmd.exec();
     std::io::Error::other(format!("execing {}: {err}", bin.display()))
 }

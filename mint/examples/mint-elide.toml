@@ -44,3 +44,10 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
+
+[[role]]
+name = "coord-writer"
+required_caveats = ["sub", "aud", "exp"]
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
