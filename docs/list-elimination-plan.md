@@ -106,19 +106,23 @@ pointer plus references the per-name log already carries.
   `prev_event_ulid` chain exactly as today; only *ordering discovery*
   moved from LIST to HEAD.
 
-  **Crash ordering — HEAD CAS *before* the record PUT.** `emit` reads
-  HEAD (+etag), derives `prev = HEAD[0]`, CAS-writes the new entry
-  onto HEAD (`If-Match` etag — concurrent appenders serialize here:
-  the loser re-reads, re-derives `prev`, retries, yielding a clean
-  linear chain), *then* PUTs the immutable record (`If-None-Match:*`).
-  A crash between leaves HEAD naming an event whose record body is
-  absent: a reader GETs that body, 404s, and **skips the phantom
-  entry** — the same tolerate-the-dangling-reference pattern the
-  segment/retention index uses (§ *Reconcile*). Ordering is never
-  wrong (no fork, no mis-order); the only residue is a benign,
-  self-describing phantom (a HEAD entry whose 404 says "announced,
-  body never landed, ignore"), optionally compacted out on the next
-  successful append.
+  **Write order — HEAD *before* the record PUT.** `emit` reads HEAD
+  (+etag), derives `prev = HEAD[0]`, writes the new entry onto HEAD
+  (`If-Match` etag for a normal emit; *unconditional* for the
+  `release --force` emit), *then* PUTs the immutable record
+  (`If-None-Match:*`). The `If-Match` is **not** a serializer with a
+  retry loop — normal appends are already single-writer by
+  `names/<name>` ownership (§ *Single-writer*), so a mismatch never
+  means "lost a race": it means **this coordinator has been
+  displaced** (only `release --force` can change HEAD under a
+  still-alive owner) → **fail hard**, no retry, no merge. A crash
+  between the HEAD write and the record PUT leaves HEAD naming an
+  event whose body is absent: a reader GETs it, 404s, and **skips the
+  phantom entry** — the same tolerate-the-dangling-reference pattern
+  the segment/retention index uses (§ *Reconcile*). Ordering is never
+  wrong; the only residue is a benign, self-describing phantom (a HEAD
+  entry whose 404 says "announced, body never landed, ignore"),
+  optionally compacted out on the next successful append.
 
   This is the **deliberate inverse** of the segment/retention index's
   ordering (object-before-index): there the index trails
@@ -130,26 +134,54 @@ pointer plus references the per-name log already carries.
   prev-walk / elevated LIST (the project invariant for derived state:
   the rebuild defines correctness).
 
-  **Concurrent appenders / `release --force`.** Force-release is *not*
-  special-cased: `ForceReleased` goes through the same `emit` path.
-  Force bypasses the `names/<name>` ownership CAS, **not** the
-  `events/<name>/HEAD` CAS (separate object, separate CAS). Under
-  split-brain (a still-alive displaced owner A appending while
-  recoverer B force-releases): both read HEAD@e0; A wins the CAS
-  (HEAD→e1, `E_a.prev=E_k`); B's `If-Match:e0` fails, B re-reads,
-  **re-derives `prev=E_a`**, re-mints, CAS@e1 → chain `E_k→E_a→E_b`,
-  one clean linear chain, no fork, no lost event. The read-CAS-
-  retry-with-prev-re-derivation *is* the linearization (the Option-1
-  CAS, guarding only the cache, would fork here). The log thus
-  faithfully **records** contention (`displaced_coordinator_id` names
-  the victim); it does not **resolve** data-plane split-brain — that
-  remains `design-force-release-fencing.md`, unchanged. Sustained
-  contention only costs CAS retries (lifecycle events are infrequent);
-  in the limit an emit gives up = the already-documented best-effort
-  gap, never a correctness break. If A crashed mid-emit (HEAD CAS
-  done, record PUT not), the full signed record is still inline in
-  HEAD, so in-window readers are unaffected; the missing standalone
-  object only truncates a past-window prev-walk, and is optionally
+  **Single-writer by ownership; `release --force` is the only
+  exception.** The `names/<name>` conditional update is already the
+  serialization point: an event is emitted *only after* a won
+  ownership transition (`claim.rs:628` emits `Claimed` solely on the
+  `MarkClaimedOutcome::Claimed` branch — losers never reach `emit`).
+  Fork is a fresh name; rename is single-owner. So in normal
+  operation exactly one coordinator appends to a name's log, and
+  `emit` needs no cross-coordinator concurrency control — only an
+  in-process per-name lock so a coordinator's own concurrent tasks
+  don't race (reuse the existing per-name lock registry if present).
+
+  The **sole** multi-writer case is `release --force` with a
+  still-alive displaced owner A. Authority/ordering rules:
+
+  - **Authority before journal.** The decisive act is the
+    *unconditional* `names/<name>` overwrite (Released, `handoff=Sh`,
+    `displaced=A`); the `ForceReleased` event is the journal entry
+    that *follows* it. Full order: synthesize+write `Sh` → unconditional
+    `names/<name>` overwrite → event append (HEAD then record). This
+    is unchanged behaviour — `finalize_force_release` already runs only
+    after the overwrite. Reversing it (journal before authority) lets
+    a crash leave the log asserting a `ForceReleased` the authority
+    never made *and* fence the legitimate owner with no transfer → a
+    self-inflicted **ownership vacuum**. Authority-first leaves only a
+    recoverable journal gap (best-effort contract).
+  - **The force-releaser B never fails.** Its `ForceReleased` HEAD
+    write is **unconditional** (mirroring the unconditional
+    `names/<name>` overwrite — force is the override at both layers).
+  - **The displaced A fails hard *on the name*, not its data.** A is
+    fenced at the authoritative layer the instant the name overwrite
+    lands (A's own `If-Match` name-ops fail). B's unconditional HEAD
+    write also bumps the etag, so A's next normal `If-Match` emit
+    fails — a *secondary* displacement detector → A stops touching
+    `names/<name>`/`events/<name>/`. A's `by_id/<V_a>/` lineage is
+    **untouched** and survives as an unnamed, recoverable fork
+    (claim-after-force forks a new `vol_ulid` from `Sh`; `V_a` is
+    never overwritten). "Fail hard" = lose the *name*, not the data.
+
+  `events/<name>/` therefore stays a **single clean chain** (B's, post-
+  `ForceReleased`); A's post-displacement activity is a *different
+  lineage*, not entries in this name's log. The log *records* the
+  displacement (`displaced_coordinator_id`); it does not *resolve* the
+  data-plane fork — that, and any **automatic fork-continuation** for
+  the displaced lineage, is explicitly **out of scope here** (future
+  direction; `design-force-release-fencing.md`). If A crashed mid-emit
+  (HEAD write done, record PUT not), the full signed record is still
+  inline in HEAD, so in-window readers are unaffected; the missing
+  standalone object only truncates a past-window prev-walk, optionally
   self-healed by an idempotent `If-None-Match:*` backfill from the
   in-HEAD copy.
 
