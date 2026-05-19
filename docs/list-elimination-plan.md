@@ -68,42 +68,47 @@ that cannot skew for it:
   consumers fetch a basis and then catch up via segments, so an old
   basis only costs extra GETs, never data. A pointer is the right tool
   *because* the failure mode is harmless.
-- **Per-name "the handoff/fork/stop point" — on the event-log spine,
-  not a pointer.** The cross-epoch references are name-axis facts and
-  must commit atomically with the ordered, CAS'd `events/<name>/HEAD`
-  (P1), so there is no separate mutable object to skew:
-  - `Released`/`ForceReleased` carry `handoff_snapshot`, `ForkedFrom`
-    carries `source_snap_ulid` (already today). Covers the claim path
-    and `lifecycle.rs:560/707` — `latest_release_handoff_snapshot`'s
-    LIST is *pure redundancy* (recomputes a ULID the `Released` event
-    already records; the releaser also knows it directly).
-  - **New `EventKind::Stopped { checkpoint_snapshot }`**, emitted at
-    `volume stop`. `Stopped` is a durable resting state (a host can
-    die while a volume is parked, having cleanly stopped but never
-    released — `Released` never fires, so its `handoff_snapshot`
-    cannot carry the basis). This is the missing `Live→Stopped`
-    lifecycle transition the event log should record anyway; it is
-    *not* per-snapshot spam (one event per `volume stop`, lifecycle
-    cadence — steady-state `User` snapshots emit nothing). Recovery
-    (`recovery.rs:379/384`) reads the latest of
-    `{Released, ForceReleased, Stopped}` checkpoint off the HEAD
-    window; absent → segment-list synthesis exactly as today. This is
-    why there is **no `LATEST-stop` pointer**: the recovery basis is
-    the one place a pointer's manifest-then-crash-before-bump window
-    *would* lose committed data (no "next seal" after a crash), so it
-    goes on the spine where the event append *is* the commit point.
-  - **Leftover `-stop` cleanup** (`lifecycle.rs:1502`) — the `-stop`
-    being swept is the `Stopped`/`Released` checkpoint; delete by
-    known key from the event, no per-vol enumeration.
+- **Per-name "the handoff/fork point" — only the *terminal*
+  ownership-relinquishing events, read at the log tail.** A snapshot
+  ULID on an event is an authoritative basis **iff** it rides a
+  *terminal* event (`Released`/`ForceReleased` — and `ForkedFrom`'s
+  `source_snap_ulid` for forks) **and that event is the last on the
+  name's log**. `Released`/`ForceReleased` are terminal: nothing more
+  is ever written under that ownership episode, so their
+  `handoff_snapshot` is by construction final. Non-terminal states
+  (`Stopped`, `Claimed`) are *not* a basis: the volume can resume and
+  append segments, and an append-only log cannot tell you a recorded
+  stop was later resumed past — so there is **no `Stopped` event and
+  no event-format change**. The check is a single `HEAD[0]` look
+  (P1, newest-first): tail is `Released`/`ForceReleased` → use its
+  ULID; anything else → no reusable handoff. Covers `lifecycle.rs:560/707`
+  — `latest_release_handoff_snapshot`'s LIST is *pure redundancy*
+  (recomputes a ULID the tail `Released` event already records; the
+  releaser also knows it directly). Degrades safely: a best-effort
+  emit gap (name says `Released` but the event was missed) just means
+  the tail isn't a release → fall to synthesis, never reuse a stale
+  snapshot.
+- **Unclean recovery never reads a snapshot off the log at all.**
+  `release --force` of a crashed owner **always synthesises the basis
+  from the latest durable segments** and records *that* as
+  `ForceReleased{handoff_snapshot}`. The stop-snapshot fast-path
+  (`recovery.rs:379/384`) is unsound under append-only events (a stale
+  stop checkpoint whose volume resumed) and is **dropped**; recovery's
+  segment enumeration is a P3 concern (the maintained segment index),
+  not P2. So P2 does **not** change `recovery.rs` — its snapshot LIST
+  is honestly carried to P3, not papered with a `Stopped` event.
+- **Leftover `-stop` cleanup** (`lifecycle.rs:1502`) — the local
+  volume sealed the `-stop` itself, so its ULID is known locally;
+  delete by known key, no per-vol enumeration, no event needed.
 
 A full sweep confirms **no consumer needs a per-vol snapshot *set***:
 there is no stable-snapshot retention/GC enumerator, and `prefetch`
 resolves ancestor snapshots from the *branch ULID in signed
 provenance* (name-axis lineage), only the writable head wanting the
 per-vol `LATEST`. So no `SnapshotPublished`/`SnapshotDeleted` events,
-no snapshot projection, no snapshot index — snapshots are a single
-benign per-vol pointer plus the handoff/fork/stop references the
-per-name event spine carries.
+no snapshot projection, no snapshot index, **no event-format change** —
+snapshots are a single benign per-vol pointer plus the terminal
+handoff/fork references the per-name event spine already carries.
 
 ### The event-log spine (existing events, existing back-links)
 
@@ -294,13 +299,15 @@ GET or a known-key PUT/DELETE — no LIST.
    known from step 3's event walk: B `DELETE`s `Sh` by known key. No
    LIST, no new marker.
 
-**Unclean variant.** If A had instead `stop`ped `myvol` and the host
-died while it was parked (never reaching step 2's `Released`), step 2
-is absent — but A's `volume stop` emitted `Stopped{checkpoint: Sh}` on
-the same HEAD spine. B's force-release reads `Sh` from the HEAD window
-exactly as step 3 reads `Released`; the recovery basis never depended
-on the per-vol pointer, so the manifest-then-crash-before-bump window
-cannot lose it.
+**Unclean variant.** If A instead crashed (never reaching step 2's
+`Released` — whether it had stopped-then-resumed or never stopped),
+the tail of `events/myvol/` is *not* a terminal event. B's
+`release --force` does **not** read any snapshot off the log: it
+synthesises the basis from A's latest durable segments and records
+that as `ForceReleased{handoff_snapshot}`. A recorded `Stopped` could
+not be trusted (A may have resumed past it), so no such event exists;
+the recovery basis is segment-derived (P3 segment index), never a
+pointer or a stale checkpoint.
 
 The invariant the example illustrates: **the name axis (event log)
 carries ownership and the cross-epoch handoff/fork snapshot
@@ -323,10 +330,9 @@ it, not merely delete it:
   reconstructable from local volume state, and is overwritten by the
   next publish, so a lost/stale pointer self-heals — a perf event, not
   a correctness one. This holds *because* the one
-  correctness-sensitive case — the unclean-recovery basis — was kept
-  off the pointer and put on the event spine (`Stopped` / `Released` /
-  `ForceReleased`), where there is no manifest-then-crash-before-bump
-  window to lose.
+  correctness-sensitive case — the unclean-recovery basis — never
+  reads the pointer (or any snapshot off the log): `release --force`
+  synthesises from the latest durable segments (P3 segment index).
 - **The segment/retention index is authoritative for the runtime**;
   readers trust it. Divergence is bounded and one-directional by
   construction if the
