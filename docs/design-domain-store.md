@@ -12,8 +12,7 @@ handles that speak in elide nouns (segments, snapshots, names, events)
 rather than `object_store`'s generic bytes-and-paths verbs.
 
 The work is independent of `[mint]`: it pays off equally under
-`AWS_*`. It is also independent of the LIST-elimination series — this
-re-types the surviving call sites, it does not remove any.
+`AWS_*`.
 
 ## What is wrong with the current shape
 
@@ -179,23 +178,13 @@ computed inside the handle from the `Ulid` timestamp.
 | Delete | `delete` | `delete(SnapshotId)` |
 | Read LATEST pointer | `GET snapshots/LATEST` | `read_latest() -> Option<LatestPointer>` |
 | CAS LATEST pointer | conditional `PUT` | `advance_latest(prev, new) -> Result<LatestPointer, LatestConflict>` |
-| List under prefix | *(none in runtime)* | **not exposed** |
-
-LIST has no domain shape because LIST has no domain meaning at
-runtime. The `s3:ListBucket` grant left `coord-writer`'s policy in
-P5 of `list-elimination-plan.md` (PR #406); every per-volume and
-per-name prefix LIST was replaced by a deterministic GET against a
-maintained pointer or HEAD object. The only remaining LIST use case
-is the offline-rebuild operator path described in
-`list-elimination-plan.md` § *Reconcile*, which takes a separate
-elevated-credential handle, not this one.
 
 ### `VolumeData::retention()` (`coord-data`, `by_id/<vol>/retention/`)
 
 | Op | Today | Domain shape |
 |---|---|---|
 | Record supersession | `put_opts` | `record_supersession(inputs, output, ts)` |
-| Read supersessions | LIST + `get` | folds into per-vol HEAD (P3 of list-elim); no domain LIST here |
+| Read supersessions | `GET by_id/<vol>/HEAD` | enumerated from the per-vol HEAD; no separate retention read op |
 | Delete (reaper) | `delete` | `delete_supersession(ulid)` |
 
 ### `VolumeData::head()` (`coord-data`, `by_id/<vol>/HEAD`)
