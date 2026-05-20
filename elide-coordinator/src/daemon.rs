@@ -411,14 +411,10 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
                 {
                     // Reads/writes names/<name>: coordinator-wide.
-                    let coord_wide = stores.writer();
-                    elide_coordinator::lifecycle::reconcile_marker(
-                        &coord_wide,
-                        &vol_dir,
-                        &name,
-                        identity.coordinator_id_str(),
-                    )
-                    .await;
+                    stores
+                        .name_claims()
+                        .reconcile_marker(&vol_dir, &name, identity.coordinator_id_str())
+                        .await;
                 }
 
                 let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(4);

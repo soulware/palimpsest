@@ -153,19 +153,36 @@ plus the `vol_ulid`).
 The complete coordinator-side object surface, by handle. Each row is
 "what the call sites already do today, restated as a domain op".
 
-### `NameClaims` (`coord-writer`, `names/<name>`)
+### `NameClaims` (`coord-writer` for mutations, `coord-base` for reads)
 
-| Op | Today | Domain shape |
-|---|---|---|
-| Read claim | `GET names/<name>` | `read(name) -> Option<NameClaim>` (carries ETag) |
-| Claim | conditional `PUT names/<name>` (`If-None-Match: *`) | `try_claim(name, NameClaim) -> Result<ClaimToken, ClaimConflict>` |
-| Replace | conditional `PUT` (`If-Match: <etag>`) | `replace(token, NameClaim) -> Result<ClaimToken, ClaimConflict>` |
-| Release | conditional `DELETE` (`If-Match: <etag>`) | `release(token) -> Result<(), ClaimConflict>` |
-| Force-release | unconditional `DELETE` + audit | `force_release(name, reason) -> Result<()>` |
+The `names/<name>` record carries a small state machine
+(`Live`/`Stopped`/`Released`/`Readonly`) plus ownership identity.
+The trait's mutation surface is the set of typed state-transition
+verbs (the existing `lifecycle::mark_*` ops), not an untyped
+update/overwrite. The trait deliberately exposes no general `update`
+or `overwrite`: every state change folds the lifecycle invariants
+(owner check, valid-transition check, idempotency) into the store
+call so they are impossible to bypass at the call site.
 
-`ClaimToken` carries the ETag; callers cannot construct one
-externally, so an `If-Match` write is impossible without first
-reading.
+| Op | Verb today | Domain shape | Trait |
+|---|---|---|---|
+| Read record | `GET names/<name>` | `read(name) -> Option<NameRecord>` | `NameClaimsReader` |
+| Initial claim (writable) | `mark_initial` — `If-None-Match: *` | `mark_initial(name, coord, host, vol_ulid, size) -> MarkInitialOutcome` | `NameClaims` |
+| Initial claim (readonly import) | `mark_initial_readonly` — `If-None-Match: *` | `mark_initial_readonly(name, vol_ulid, size) -> MarkInitialOutcome` | `NameClaims` |
+| Stop (Live → Stopped) | `mark_stopped` — read + `If-Match` CAS | `mark_stopped(name, coord, host) -> MarkStoppedOutcome` | `NameClaims` |
+| Release (Live/Stopped → Released) | `mark_released` — read + `If-Match` CAS | `mark_released(name, coord, handoff) -> MarkReleasedOutcome` | `NameClaims` |
+| Force-release (unconditional → Released) | `mark_released_force` — unconditional `PUT` | `mark_released_force(name, handoff) -> ForceReleaseOutcome` | `NameClaims` |
+| Resume (Stopped → Live, local) | `mark_live` — read + `If-Match` CAS | `mark_live(name, coord, host) -> MarkLiveOutcome` | `NameClaims` |
+| Claim Released (cross-coord) | `mark_claimed` — read + `If-Match` CAS, rebinds vol_ulid | `mark_claimed(name, coord, host, new_vol_ulid, target_state) -> MarkClaimedOutcome` | `NameClaims` |
+| In-place reclaim of own Released | `mark_reclaimed_local` — read + `If-Match` CAS, keeps vol_ulid | `mark_reclaimed_local(name, coord, host, local_vol_ulid, target_state) -> MarkReclaimedLocalOutcome` | `NameClaims` |
+| Reconcile local park markers | `reconcile_marker` | `reconcile_marker(vol_dir, name, coord)` | `NameClaims` |
+
+Same reader/writer split as `EventJournal`: pure-read sites
+(`Request::ResolveName`, the read for `size` after rebind) take
+`&dyn NameClaimsReader` and cannot mutate at the type level. Each
+`mark_*` runs its full read-modify-write on `coord-writer` (the
+"one credential per mutation" rule); the inherited `read` goes on
+`coord-base`.
 
 ### `EventJournal` (`coord-writer` for emit, `coord-base` for reads)
 

@@ -296,13 +296,11 @@ async fn dispatch_json(
         }
         Request::Stop { volume, force } => {
             // Conditional PUT on names/<volume>: coordinator-wide.
-            let store = ctx.stores.writer();
             let result = lifecycle::stop_volume_op(
                 &volume,
                 force,
                 &ctx.core(),
                 &ctx.snapshot_locks,
-                &store,
                 ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
             )
@@ -361,9 +359,8 @@ async fn dispatch_json(
         } => {
             // Mixed: names/<volume> mark_initial; the spawned import
             // subprocess writes locally only.
-            let store = ctx.stores.writer();
             let import_ctx = ctx.for_import();
-            let result = start_import(&volume, &oci_ref, &extents_from, &store, &import_ctx).await;
+            let result = start_import(&volume, &oci_ref, &extents_from, &import_ctx).await;
             let env: Envelope<ImportStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -686,7 +683,6 @@ async fn start_import(
     volume: &str,
     oci_ref: &str,
     extents_from: &[String],
-    store: &Arc<dyn ObjectStore>,
     ctx: &crate::import::ImportContext,
 ) -> Result<ImportStartReply, IpcError> {
     let req = import::ImportRequest {
@@ -694,7 +690,7 @@ async fn start_import(
         oci_ref,
         extents_from,
     };
-    let ulid_str = import::spawn_import(req, store.clone(), ctx)
+    let ulid_str = import::spawn_import(req, ctx)
         .await
         .map_err(|e| IpcError::internal(format!("{e}")))?;
     let import_ulid = ulid::Ulid::from_string(&ulid_str)
@@ -1690,16 +1686,12 @@ async fn create_volume_op(
     // record exists in the bucket and references a vol_ulid whose
     // volume.pub is already uploaded — recovery via `release --force`
     // is always possible from here on.
-    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-    match mark_initial(
-        &store,
-        name,
-        coord_id,
-        identity.hostname(),
-        vol_ulid,
-        size_bytes,
-    )
-    .await
+    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome};
+    match core
+        .stores
+        .name_claims()
+        .mark_initial(name, coord_id, identity.hostname(), vol_ulid, size_bytes)
+        .await
     {
         Ok(MarkInitialOutcome::Claimed) => {
             core.stores

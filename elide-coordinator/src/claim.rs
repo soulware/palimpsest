@@ -181,12 +181,14 @@ pub(crate) async fn start_claim(
 ) -> Result<ClaimStartReply, IpcError> {
     let store = ctx.core.stores.writer();
     let journal = ctx.core.stores.event_journal();
+    let claims = ctx.core.stores.name_claims();
     let bucket_started = std::time::Instant::now();
     let bucket = claim_volume_bucket_op(
         &volume,
         &ctx.core.data_dir,
         &store,
         journal.as_ref(),
+        claims.as_ref(),
         &ctx.core.identity,
     )
     .await?;
@@ -250,6 +252,7 @@ async fn claim_volume_bucket_op(
     data_dir: &std::path::Path,
     store: &Arc<dyn ObjectStore>,
     journal: &dyn elide_coordinator::event_journal::EventJournal,
+    claims: &dyn elide_coordinator::name_claims::NameClaims,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ClaimReply, IpcError> {
     use elide_coordinator::bucket_position::fetch_position;
@@ -343,18 +346,16 @@ async fn claim_volume_bucket_op(
                     }
                 });
             }
-            use elide_coordinator::lifecycle::{
-                LifecycleError, MarkReclaimedLocalOutcome, mark_reclaimed_local,
-            };
-            match mark_reclaimed_local(
-                store,
-                volume_name,
-                coord_id,
-                identity.hostname(),
-                released_vol_ulid,
-                NameState::Stopped,
-            )
-            .await
+            use elide_coordinator::lifecycle::{LifecycleError, MarkReclaimedLocalOutcome};
+            match claims
+                .mark_reclaimed_local(
+                    volume_name,
+                    coord_id,
+                    identity.hostname(),
+                    released_vol_ulid,
+                    NameState::Stopped,
+                )
+                .await
             {
                 Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
                     info!(
@@ -577,7 +578,7 @@ impl ClaimOrchestrator {
     /// an empty synthesised handoff manifest). After force-release, a fresh
     /// `claim` mints a new vol_ulid and proceeds.
     async fn early_rebind(&mut self) -> Result<(), IpcError> {
-        use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
+        use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome};
         use elide_core::name_record::NameState;
         use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PUB_FILE, generate_keypair};
 
@@ -622,16 +623,19 @@ impl ClaimOrchestrator {
 
         // Bucket rebind. Peer-fetch auth accepts our coord_id from this point
         // onward.
-        let store_wide = self.ctx.core.stores.writer();
-        match mark_claimed(
-            &store_wide,
-            &self.volume,
-            self.ctx.core.identity.coordinator_id_str(),
-            self.ctx.core.identity.hostname(),
-            new_vol_ulid,
-            NameState::Stopped,
-        )
-        .await
+        match self
+            .ctx
+            .core
+            .stores
+            .name_claims()
+            .mark_claimed(
+                &self.volume,
+                self.ctx.core.identity.coordinator_id_str(),
+                self.ctx.core.identity.hostname(),
+                new_vol_ulid,
+                NameState::Stopped,
+            )
+            .await
         {
             Ok(MarkClaimedOutcome::Claimed) => {
                 let vol = &self.volume;
@@ -902,11 +906,9 @@ impl ClaimOrchestrator {
 
         // Local volume.toml: size from the released NameRecord (claim is a
         // continuation of the same logical volume identity, not a resize).
-        let store_wide = self.ctx.core.stores.writer();
-        let size = match elide_coordinator::name_store::read_name_record(&store_wide, &self.volume)
-            .await
-        {
-            Ok(Some((rec, _))) => rec.size,
+        let claims = self.ctx.core.stores.name_claims_ro();
+        let size = match claims.read(&self.volume).await {
+            Ok(Some(rec)) => rec.size,
             Ok(None) => {
                 return Err(IpcError::not_found(format!(
                     "names/{} disappeared during finalize",

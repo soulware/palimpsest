@@ -17,12 +17,11 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use object_store::ObjectStore;
 use tokio::io::AsyncBufReadExt;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use elide_coordinator::lifecycle::{MarkInitialOutcome, mark_initial_readonly};
+use elide_coordinator::lifecycle::MarkInitialOutcome;
 use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
 
 use crate::inbound::CoordinatorCore;
@@ -269,11 +268,7 @@ pub struct ImportRequest<'a> {
 /// writes `volume.name`, `volume.readonly`, and `volume.importing`, then spawns
 /// `elide-import`. On success, creates the `<data_dir>/by_name/<vol_name>`
 /// symlink. Returns the import job ULID.
-pub async fn spawn_import(
-    req: ImportRequest<'_>,
-    store: Arc<dyn ObjectStore>,
-    ctx: &ImportContext,
-) -> std::io::Result<String> {
+pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::io::Result<String> {
     let elide_import_bin = elide_coordinator::bins::elide_import_bin();
     let data_dir: &Path = &ctx.core.data_dir;
     let registry = &ctx.registry;
@@ -426,8 +421,8 @@ pub async fn spawn_import(
     }
 
     let import_ulid_clone = import_ulid.clone();
-    let async_store = store.clone();
     let async_journal = ctx.core.stores.event_journal();
+    let async_claims = ctx.core.stores.name_claims();
     let async_vol_name = vol_name.to_owned();
     let async_identity = identity.clone();
     let async_vol_dir = vol_dir.clone();
@@ -480,7 +475,8 @@ pub async fn spawn_import(
             })();
             match claim_outcome {
                 Ok((size, _)) => {
-                    match mark_initial_readonly(&async_store, &async_vol_name, vol_ulid_value, size)
+                    match async_claims
+                        .mark_initial_readonly(&async_vol_name, vol_ulid_value, size)
                         .await
                     {
                         Ok(MarkInitialOutcome::Claimed) => {

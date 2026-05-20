@@ -14,6 +14,7 @@ pub mod local_cond_store;
 pub mod log_init;
 pub mod log_relay;
 pub mod macaroon;
+pub mod name_claims;
 pub mod name_store;
 pub mod park;
 pub mod peer_discovery;

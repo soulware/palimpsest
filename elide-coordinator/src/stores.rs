@@ -40,6 +40,7 @@ use ulid::Ulid;
 use crate::event_journal::{
     BucketEventJournal, EventJournal, EventJournalReader, ReadOnlyEventJournal,
 };
+use crate::name_claims::{BucketNameClaims, NameClaims, NameClaimsReader, ReadOnlyNameClaims};
 
 /// Read-only S3 surface — `coord-base`. Exposes `get` and `head`. A
 /// holder can read individual objects; the containment boundary the
@@ -140,6 +141,28 @@ pub trait ScopedStores: Send + Sync {
     /// [`ReadStore`] vs `ObjectStore` split.
     fn event_journal_ro(&self) -> Arc<dyn EventJournalReader> {
         Arc::new(ReadOnlyEventJournal::new(self.peer_verifier_store()))
+    }
+
+    /// Full read+write handle for the `names/<name>` claim records.
+    /// Backed by both `coord-writer` (for the `mark_*` CAS verbs,
+    /// which run wholly on one credential per mutation) and
+    /// `coord-base` (for the inherited reads). The trait exposes no
+    /// untyped `update` / `overwrite` — every state change is a typed
+    /// `mark_*` verb.
+    fn name_claims(&self) -> Arc<dyn NameClaims> {
+        Arc::new(BucketNameClaims::new(
+            self.writer(),
+            self.peer_verifier_store(),
+        ))
+    }
+
+    /// Read-only handle for the `names/<name>` claim records —
+    /// `coord-base` scope. A holder cannot invoke any `mark_*` verb
+    /// at the type level. Used by `Request::ResolveName`,
+    /// `bucket_position::fetch_position`, and the few pure-display
+    /// readers.
+    fn name_claims_ro(&self) -> Arc<dyn NameClaimsReader> {
+        Arc::new(ReadOnlyNameClaims::new(self.peer_verifier_store()))
     }
 }
 
