@@ -484,6 +484,13 @@ pub fn verify_event_signature(
 /// Fetch failures collapse into `SignatureStatus::KeyUnavailable`
 /// for every event signed by that coordinator — the per-event
 /// status surfaces the failure rather than aborting the whole read.
+///
+/// `store` must be a `coord-base`-scoped handle (e.g.
+/// `ScopedStores::peer_verifier_store`). Events recorded by other
+/// coordinators are signed under their own keys, so the per-event
+/// `fetch_coordinator_pub` call reads
+/// `coordinators/<other>/coordinator.pub` — a key only `coord-base`
+/// can read across all ids.
 pub async fn list_and_verify_events(
     store: &Arc<dyn ObjectStore>,
     name: &str,

@@ -463,8 +463,9 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume, num } => {
-            // Reads the events/<volume>/ HEAD window: coordinator-wide.
-            let store = ctx.stores.writer();
+            // Pure read: events/<volume>/HEAD plus coordinators/<other>/coordinator.pub
+            // for per-event signature verify. coord-base scope.
+            let store = ctx.stores.peer_verifier_store();
             let result = volume_events_typed(&volume, &store, num).await;
             let env: Envelope<VolumeEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
