@@ -424,16 +424,25 @@ impl std::error::Error for ResolveHandoffError {}
 ///      uses the source volume's own `volume.pub` (the regular
 ///      block-reader path).
 ///
+/// `data_store` is scoped to `by_id/<vol_ulid>/` (`coord-data`) and
+/// reads the manifest. `base_ro_store` is the coordinator-wide
+/// `coord-base` read scope and is used only to fetch the recovering
+/// coordinator's `coordinators/<id>/coordinator.pub` — a key outside
+/// any single volume's `by_id/` prefix and therefore not reachable
+/// under `coord-data`. The split mirrors `volume release --force`'s
+/// per-credential routing (see PR #405).
+///
 /// Failures at any step refuse cleanly with a typed
 /// [`ResolveHandoffError`] so the caller can surface a clear error
 /// to the operator.
 pub async fn resolve_handoff_verifier(
-    store: &Arc<dyn ObjectStore>,
+    data_store: &Arc<dyn ObjectStore>,
+    base_ro_store: &Arc<dyn ObjectStore>,
     vol_ulid: Ulid,
     snap_ulid: Ulid,
 ) -> Result<HandoffVerifier, ResolveHandoffError> {
     let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-    let bytes = store
+    let bytes = data_store
         .get(&key)
         .await
         .map_err(|e| {
@@ -456,10 +465,12 @@ pub async fn resolve_handoff_verifier(
         return Ok(HandoffVerifier::Normal);
     };
 
-    let manifest_pubkey =
-        crate::identity::fetch_coordinator_pub(store.as_ref(), &recovery.recovering_coordinator_id)
-            .await
-            .map_err(ResolveHandoffError::PubkeyResolution)?;
+    let manifest_pubkey = crate::identity::fetch_coordinator_pub(
+        base_ro_store.as_ref(),
+        &recovery.recovering_coordinator_id,
+    )
+    .await
+    .map_err(ResolveHandoffError::PubkeyResolution)?;
 
     // Verify the manifest signature under the resolved pubkey. This
     // re-validates the signing input including the recovery metadata
@@ -494,7 +505,8 @@ pub async fn resolve_handoff_verifier(
 /// Used by the claim path to inspect the released fork's segment
 /// list and decide whether to skip an empty intermediate fork.
 pub async fn fetch_verified_handoff_manifest(
-    store: &Arc<dyn ObjectStore>,
+    data_store: &Arc<dyn ObjectStore>,
+    base_ro_store: &Arc<dyn ObjectStore>,
     vol_ulid: Ulid,
     snap_ulid: Ulid,
     fallback_pubkey: &VerifyingKey,
@@ -520,10 +532,10 @@ pub async fn fetch_verified_handoff_manifest(
             tracing::trace!(
                 "[handoff-fetch] peer miss for manifest {vol_ulid}/{snap_ulid}; falling through to S3"
             );
-            fetch_manifest_from_store(store, vol_ulid, snap_ulid).await?
+            fetch_manifest_from_store(data_store, vol_ulid, snap_ulid).await?
         }
     } else {
-        fetch_manifest_from_store(store, vol_ulid, snap_ulid).await?
+        fetch_manifest_from_store(data_store, vol_ulid, snap_ulid).await?
     };
 
     let recovery =
@@ -537,7 +549,7 @@ pub async fn fetch_verified_handoff_manifest(
         }
         Some(recovery) => {
             let manifest_pubkey = crate::identity::fetch_coordinator_pub(
-                store.as_ref(),
+                base_ro_store.as_ref(),
                 &recovery.recovering_coordinator_id,
             )
             .await
@@ -1039,7 +1051,7 @@ mod tests {
         let key = snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
         store.put(&key, PutPayload::from(bytes)).await.unwrap();
 
-        let outcome = resolve_handoff_verifier(&store, dead_vol, snap_ulid)
+        let outcome = resolve_handoff_verifier(&store, &store, dead_vol, snap_ulid)
             .await
             .unwrap();
         assert!(matches!(outcome, HandoffVerifier::Normal));
@@ -1063,7 +1075,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = resolve_handoff_verifier(&store, dead_vol, published.snap_ulid)
+        let outcome = resolve_handoff_verifier(&store, &store, dead_vol, published.snap_ulid)
             .await
             .unwrap();
         match outcome {
@@ -1104,7 +1116,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = resolve_handoff_verifier(&store, dead_vol, published.snap_ulid)
+        let err = resolve_handoff_verifier(&store, &store, dead_vol, published.snap_ulid)
             .await
             .expect_err("missing coordinator.pub must refuse");
         assert!(
@@ -1116,7 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_refuses_when_manifest_object_is_missing() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let err = resolve_handoff_verifier(&store, Ulid::new(), Ulid::new())
+        let err = resolve_handoff_verifier(&store, &store, Ulid::new(), Ulid::new())
             .await
             .expect_err("missing manifest must refuse");
         assert!(matches!(err, ResolveHandoffError::ManifestRead(_)));

@@ -756,9 +756,14 @@ impl ClaimOrchestrator {
             .core
             .stores
             .data_for_volume(&self.released_vol_ulid);
-        let key =
-            resolve_handoff_key_via_recovery(self.released_vol_ulid, self.handoff_snap, &store)
-                .await?;
+        let base_ro = self.ctx.core.stores.peer_verifier_store();
+        let key = resolve_handoff_key_via_recovery(
+            self.released_vol_ulid,
+            self.handoff_snap,
+            &store,
+            &base_ro,
+        )
+        .await?;
         info!(
             "[claim {}] handoff key resolved in {:.2?}",
             self.volume,
@@ -970,11 +975,12 @@ impl ClaimOrchestrator {
 async fn resolve_handoff_key_via_recovery(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
-    store: &Arc<dyn ObjectStore>,
+    data_store: &Arc<dyn ObjectStore>,
+    base_ro_store: &Arc<dyn ObjectStore>,
 ) -> Result<ResolveHandoffKeyReply, IpcError> {
     use elide_coordinator::recovery::{HandoffVerifier, resolve_handoff_verifier};
 
-    match resolve_handoff_verifier(store, vol_ulid, snap_ulid).await {
+    match resolve_handoff_verifier(data_store, base_ro_store, vol_ulid, snap_ulid).await {
         Ok(HandoffVerifier::Normal) => Ok(ResolveHandoffKeyReply::Normal),
         Ok(HandoffVerifier::Synthesised {
             manifest_pubkey, ..
@@ -1070,8 +1076,10 @@ pub(crate) async fn skip_empty_intermediates_impl(
         })?;
 
         let store = stores.data_for_volume(&effective_vol);
+        let base_ro = stores.peer_verifier_store();
         let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
             &store,
+            &base_ro,
             effective_vol,
             effective_snap,
             &fallback_pubkey,
