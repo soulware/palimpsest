@@ -3,6 +3,7 @@ pub mod bucket_position;
 pub mod config;
 pub mod control;
 pub mod eligibility;
+pub mod event_journal;
 pub mod gc;
 pub mod gc_cycle;
 pub mod identity;
@@ -27,7 +28,6 @@ pub mod segment_head;
 pub mod stores;
 pub mod tasks;
 pub mod upload;
-pub mod volume_event_store;
 pub mod volume_state;
 
 use std::collections::HashMap;

@@ -188,7 +188,7 @@ impl CoordinatorIdentity {
     /// Used for any artefact attributed to this coordinator's
     /// identity — synthesised handoff snapshots (via the
     /// `SegmentSigner` impl) and per-name event log entries (via
-    /// `volume_event_store::emit_event`). Domain separation between
+    /// `event_journal::EventJournal::emit`). Domain separation between
     /// these uses is enforced by the *callers' canonical-form
     /// pre-images*, not by separate keys.
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
@@ -259,7 +259,7 @@ impl CoordinatorIdentity {
 ///
 /// Used by claimants on `start --remote` to verify a synthesised
 /// handoff snapshot's signature against the recovering coordinator,
-/// and by [`crate::volume_event_store::list_and_verify_events`] to
+/// and by [`crate::event_journal::EventJournal::list_and_verify`] to
 /// verify per-name event log signatures.
 pub async fn fetch_coordinator_pub(
     store: &dyn ObjectStore,

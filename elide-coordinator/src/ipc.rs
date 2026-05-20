@@ -245,7 +245,7 @@ pub enum Request {
     /// verifying each entry's signature against the emitting
     /// coordinator's published pubkey. `num` caps the number of
     /// most-recent events returned; `None` uses the default window
-    /// (`volume_event_store::DEFAULT_EVENTS_LIMIT`).
+    /// (`event_journal::DEFAULT_EVENTS_LIMIT`).
     VolumeEvents { volume: String, num: Option<usize> },
 
     // ── Creds + cleanup (final iteration) ────────────────────────────

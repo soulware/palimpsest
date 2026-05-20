@@ -312,10 +312,11 @@ pub(crate) async fn force_release_volume_op(
 
     // Unconditional flip of names/<name>.
     let outcome = lifecycle::mark_released_force(&writer, volume_name, published.snap_ulid).await;
+    let journal = stores.event_journal();
     finalize_force_release(
         volume_name,
         data_dir,
-        &writer,
+        journal.as_ref(),
         identity,
         published.snap_ulid,
         outcome,
@@ -332,7 +333,7 @@ pub(crate) async fn force_release_volume_op(
 async fn finalize_force_release(
     volume_name: &str,
     data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    journal: &dyn elide_coordinator::event_journal::EventJournal,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     handoff_snapshot: ulid::Ulid,
     outcome: Result<
@@ -358,7 +359,7 @@ async fn finalize_force_release(
                 std::fs::canonicalize(data_dir.join("by_name").join(volume_name)).ok();
             emit_release_aftermath(
                 data_dir,
-                store,
+                journal,
                 identity,
                 volume_name,
                 local_vol_dir.as_deref(),
@@ -448,10 +449,12 @@ pub(crate) async fn release_volume_op(
             // This makes `stop → remove → release` work without forcing
             // the operator to detour through `start → stop` first just
             // to hand off a name they've already mentally given up.
+            let journal = ctx.stores.event_journal();
             return release_breadcrumb_only(
                 volume_name,
                 data_dir,
                 store,
+                journal.as_ref(),
                 identity,
                 coord_id,
                 started,
@@ -556,9 +559,17 @@ pub(crate) async fn release_volume_op(
                 "[release {volume_name}] reusing S3 handoff snapshot {snap_ulid} \
                  (clean fork, never started)"
             );
-            let result =
-                perform_release_flip(volume_name, data_dir, &vol_dir, store, identity, snap_ulid)
-                    .await;
+            let journal = ctx.stores.event_journal();
+            let result = perform_release_flip(
+                volume_name,
+                data_dir,
+                &vol_dir,
+                store,
+                journal.as_ref(),
+                identity,
+                snap_ulid,
+            )
+            .await;
             info!(
                 "[release {volume_name}] complete in {:.2?}",
                 started.elapsed()
@@ -598,11 +609,13 @@ pub(crate) async fn release_volume_op(
         "[release {volume_name}] reusing snapshot {} (clean stopped volume)",
         cover.snap_ulid
     );
+    let journal = ctx.stores.event_journal();
     let result = perform_release_flip(
         volume_name,
         data_dir,
         &vol_dir,
         store,
+        journal.as_ref(),
         identity,
         cover.snap_ulid,
     )
@@ -637,10 +650,12 @@ pub(crate) async fn release_volume_op(
 ///     stop-snapshot was somehow lost; cross-host recovery via
 ///     `release --force` is the only remaining path, and even that
 ///     would synthesise).
+#[allow(clippy::too_many_arguments)]
 async fn release_breadcrumb_only(
     volume_name: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
+    journal: &dyn elide_coordinator::event_journal::EventJournal,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     coord_id: &str,
     started: std::time::Instant,
@@ -707,7 +722,7 @@ async fn release_breadcrumb_only(
             );
             emit_release_aftermath(
                 data_dir,
-                store,
+                journal,
                 identity,
                 volume_name,
                 None,
@@ -891,11 +906,13 @@ async fn promote_stop_in_store(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_release_flip(
     volume_name: &str,
     data_dir: &Path,
     vol_dir: &Path,
     store: &Arc<dyn ObjectStore>,
+    journal: &dyn elide_coordinator::event_journal::EventJournal,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     snap_ulid: ulid::Ulid,
 ) -> Result<ReleaseReply, IpcError> {
@@ -919,7 +936,7 @@ async fn perform_release_flip(
             // written (`remove` is the only producer).
             emit_release_aftermath(
                 data_dir,
-                store,
+                journal,
                 identity,
                 volume_name,
                 Some(vol_dir),
