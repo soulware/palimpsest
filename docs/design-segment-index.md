@@ -1,4 +1,4 @@
-# Segment tail-delta manifest
+# Per-volume HEAD
 
 **Status:** Proposed.
 
@@ -6,6 +6,15 @@ P3 (folding in P4) of [`list-elimination-plan.md`](list-elimination-plan.md):
 remove the remaining per-volume `segments/` and `retention/` prefix
 LISTs from the coordinator runtime. This document specifies the
 replacement and the invariant that makes it correct.
+
+The object is named `HEAD` by analogy with
+[`events/<name>/HEAD`](design-volume-event-log.md): both name the
+*leading edge of activity* over their respective axis (per-name for
+events, per-vol for segments). They differ structurally — the event
+HEAD is a windowed pointer with a `prev`-chain backing; the per-vol
+HEAD is a whole-object manifest of the post-snapshot delta — but the
+naming convention and the "current state at the head of the stream"
+intent are the same.
 
 ## The set we need, and the set we already have
 
@@ -34,27 +43,28 @@ three runtime LIST sites in scope (`prefetch.rs:442`, `fork.rs:670`,
 So the maintained object is not a parallel full segment index that
 duplicates the manifest. It is a small **per-vol delta over the latest
 signed manifest**, covering only the post-snapshot window. The
-manifest stays the authoritative full set; the delta carries what has
+manifest stays the authoritative full set; HEAD carries what has
 happened since it was sealed.
 
 ## Shape: a second manifest, not a log
 
 The post-snapshot set is the *high-cardinality per-write set* — a
-write-heavy volume drains thousands of segments between snapshots. That
-rules out an event-log shape. The event log's windowed-`HEAD` +
-`prev`-chain works only because a name sees *dozens* of events over its
-life; a fixed-N window over thousands of segments misses almost
-everything and the `prev`-walk fallback is thousands of sequential
-GETs — worse than the LIST it replaces.
+write-heavy volume drains thousands of segments between snapshots.
+That rules out a log/chain shape. The event-log shape (windowed
+pointer + `prev`-chain, as `events/<name>/HEAD` is) works there only
+because a name sees *dozens* of events over its life; a fixed-N window
+over thousands of segments misses almost everything and the
+`prev`-walk fallback is thousands of sequential GETs — worse than the
+LIST it replaces.
 
 The right primitive is the one the system already proves works for
 "enumerate the whole segment set in one object, no LIST": **the
-snapshot manifest**. The tail is simply a *second* manifest for the
-not-yet-sealed delta — a single object, whole-object overwrite, **one
-GET reads the entire tail at any cardinality**:
+snapshot manifest**. Per-vol HEAD is simply a *second* manifest for
+the not-yet-sealed delta — a single object, whole-object overwrite,
+**one GET reads the entire HEAD at any cardinality**:
 
 ```
-by_id/<vol_ulid>/tail        (single fixed key, like snapshots/LATEST)
+by_id/<vol_ulid>/HEAD        (single fixed key, like snapshots/LATEST)
 ```
 
 `coord-data`, same axis as the data it indexes. Body: the current
@@ -67,15 +77,28 @@ of `Tombstoned` ULIDs. Sorted; no signature (see *Derived state*).
 GC when `gc_interval` has elapsed. P3 **folds the reaper in as a third
 gated step** (reap when `reaper_interval` has elapsed) and deletes the
 separate coordinator-wide reaper task. The tick loop is then the
-*sole* writer of the tail for its volume, and drain → GC → reap run
-**sequentially within one iteration**. So a single whole-object PUT of
-the tail at the end of each iteration — after that iteration's segment
-PUTs/DELETEs — suffices. "Single-writer-per-vol-epoch" stops being a
-careful argument and becomes a structural fact (matching P2's
-`LATEST`, also a single-writer per-vol overwrite). Folding reap in
-only changes its cadence from a private timer to a tick gate;
-retention deletes *after* a multi-minute window, so tick-granularity
-lateness is immaterial — the same trade GC's gate already makes.
+*sole* writer of HEAD for its volume, with drain → GC → reap running
+**sequentially within one tick iteration**. "Single-writer-per-vol-
+epoch" stops being a careful argument and becomes a structural fact
+(matching P2's `LATEST`, also a single-writer per-vol overwrite).
+
+**Cadence: per drain tick, on state change.** The tick base is
+`drain_interval` (5s default); HEAD is PUT at the end of any tick
+**that touched any S3 segment op**, after that tick's PUTs/DELETEs.
+That means:
+
+- Drain-only tick that uploaded segments: PUT HEAD (refreshed `Added`).
+- Tick where GC also fired: PUT HEAD (Added outputs + Superseded).
+- Tick where reap also fired: PUT HEAD (drop reaped Supersededs, add
+  Tombstoned).
+- Idle tick (empty `pending/`, no GC, no reap firing): no PUT.
+
+So `Added` entries appear in HEAD within one `drain_interval` of
+upload — the per-segment tracking lives in the owner's local
+`pending/` → `cache/` → `index/` chain (volume binary at promote-
+time), and the per-tick HEAD PUT publishes the post-upload set.
+"Per-tick" never means "per GC tick" or "per reap tick"; both are
+gated sub-steps within the same drain tick.
 
 **Reaper fold: mechanic and SLA.** The reap step mirrors GC's
 existing gate exactly — a cross-tick `last_reap: Instant` on the
@@ -99,12 +122,12 @@ only fires on tick boundaries — visible only to test configs that set
 `retention_window` smaller than `drain_interval`, never to realistic
 deployments.
 
-**Write cost is per-tick, not per-segment.** The drain uploads *all*
-of `pending/` in one tick (`upload.rs`), so a tick that drains
-thousands of segments still produces exactly **one** tail overwrite.
-Cumulative write amplification is O(ticks between snapshots), not
-O(segments) — a handful of low-MB PUTs, far cheaper than thousands of
-per-record objects *or* a chain walk.
+**Write cost is per drain tick, not per segment.** The drain uploads
+*all* of `pending/` in one tick (`upload.rs`), so a tick that drains
+thousands of segments still produces exactly **one** HEAD overwrite.
+Cumulative write amplification is O(active ticks between snapshots),
+not O(segments) — a handful of low-MB PUTs, far cheaper than thousands
+of per-record objects *or* a chain walk.
 
 **Why a separate object, not the segment headers.** An enumeration
 object must outlive what it enumerates, so it cannot *be* the
@@ -113,9 +136,10 @@ segments: the reaper deletes them. `Tombstoned`/`Superseded` are facts
 ordering/aggregation point is the single-writer tick loop — the same
 place that already sequences this volume's `index/` — not a per-object
 field that concurrent writers could never agree on. Unlike the event
-log the tail keeps no history: it is *only* the delta over the current
-manifest anchor (the authority is the manifest, not accumulated
-records), so it is reset wholesale at each seal, not compacted.
+log HEAD, the per-vol HEAD keeps no history: it is *only* the delta
+over the current manifest anchor (the authority is the manifest, not
+accumulated records), so it is reset wholesale at each seal, not
+compacted.
 
 Retention/supersession is **folded into this same object** (P3+P4
 collapsed, per the plan's "may collapse into one"): a snapshot
@@ -151,7 +175,7 @@ tombstoned:
   matches the manifest convention; gives the rebuild invariant a
   deterministic canonical form.
 - Empty sections present-but-empty regardless of state (canonical form).
-- `anchor:` names the manifest this tail is a delta of (`nil` on a
+- `anchor:` names the manifest this HEAD is a delta of (`nil` on a
   fresh volume). Self-describing for operators and lets the proptest
   assert anchor equality; not load-bearing for correctness — the
   manifest set is the arbiter regardless.
@@ -166,7 +190,7 @@ exposing `render` / `parse` with explicit error types.
 
 ## Entry kinds
 
-The tail body carries three entry kinds:
+The HEAD body carries three entry kinds:
 
 - **`Added{seg_ulid}`** — a segment was uploaded (drain) or produced
   (GC output) and is durable in S3.
@@ -184,18 +208,18 @@ The tail body carries three entry kinds:
   `input` once `since + retention < now`. `since` must be carried
   explicitly because the GC *output* ULID is history-derived
   (`max(inputs).increment()`, `design-gc-ulid-ordering.md`), not
-  wall-clock. This is why `retention/` folds *into* the tail rather
+  wall-clock. This is why `retention/` folds *into* HEAD rather
   than being dropped in favour of the inputs tables.
 - **`Tombstoned{seg_ulid}`** — the reaper deleted `seg_ulid` from S3.
 
 ## Derived state
 
-The tail is **derived, unsigned state**. It is not an authenticity
+HEAD is **derived, unsigned state**. It is not an authenticity
 root: every segment carries its own Ed25519 signature, verified at
 fetch time on both the manifest and the LIST paths today. A forged or
-corrupt tail can only point at a segment that then fails its own
+corrupt HEAD can only point at a segment that then fails its own
 signature check, or 404s — and readers already tolerate a 404 on
-segment fetch (`list_supersessions` explicitly does). The tail is an
+segment fetch (`list_supersessions` explicitly does). HEAD is an
 availability/enumeration hint over a signed substrate, not a trusted
 set; its correctness floor is the rebuild (below), not a signature.
 
@@ -205,7 +229,7 @@ A reader resolves the live set with two GETs and one more:
 
 ```
 anchor   = LATEST -> manifest          (one GET each, P2)
-tail     = GET by_id/<vol>/tail        (one GET, whole object)
+head     = GET by_id/<vol>/HEAD        (one GET, whole object)
 live     = manifest.segment_ulids
          ∪ { e.seg_ulid   : Added e }
          − { e.input_ulid : Superseded e }
@@ -213,19 +237,19 @@ live     = manifest.segment_ulids
 ```
 
 The **manifest's `segment_ulids` is authoritative for the
-snapshot/tail boundary**: the tail is a delta over *that* set.
+snapshot/HEAD boundary**: HEAD is a delta over *that* set.
 `Superseded` is applied over the manifest set too, not just over
 `Added` — a pre-snapshot input that GC superseded *after* the snapshot
 is in `manifest.segment_ulids` but must still be skipped, and its
-`Superseded` entry lives in the tail.
+`Superseded` entry lives in HEAD.
 
-### The tail is cross-coordinator only
+### HEAD is cross-coordinator only
 
-The tail, like the manifest, exists for *other* readers — never the
+HEAD, like the manifest, exists for *other* readers — never the
 writer. A coordinator wrote every segment it drained, so its local
 `index/` is the authoritative complete set; the normal
 `snapshot_take_new` seal just enumerates local `index/` (LIST-free,
-not a tail consumer). **A host never reads the tail for a volume it
+not a HEAD consumer). **A host never reads HEAD for a volume it
 owns in the current epoch.** The read happens only for
 segments/supersessions a *different or prior* coordinator produced
 that this host lacks locally:
@@ -235,62 +259,62 @@ that this host lacks locally:
   coordinator's volume; no local `index/` for it at all.
 - **`force_snapshot_now` on a readonly source** (`fork.rs:367` →
   `force_snapshot_now_op`) — the source's local `index/` was hydrated
-  manifest-only by `prefetch_indexes`; its owner has the tail, this
+  manifest-only by `prefetch_indexes`; its owner has HEAD, this
   host does not. The pinned-snapshot fork branch beside it never reads
-  the tail.
+  HEAD.
 - **Post-handoff reap** — a new owner's tick-loop reap step must
   reclaim inputs a *prior* owner superseded. Same-epoch the reap step
-  needs no tail read (it just wrote the tail itself this iteration);
-  only across a handoff is the prior owner's tail consulted.
+  needs no HEAD read (it just wrote HEAD itself this iteration);
+  only across a handoff is the prior owner's HEAD consulted.
 
 Consequently the steady-state hot path (`prefetch_indexes` for
 claim/start, pinned-snapshot fork, ancestor reads) touches neither
-tail nor S3 LIST, and the host that pays the tail *write* never pays a
-*read*.
+HEAD nor S3 LIST, and the host that pays the HEAD *write* never pays
+a *read*.
 
 ## Writers and crash ordering
 
 The per-volume tick loop is the single writer. The correctness rule is
 unconditional: **all S3 segment object operations happen first, then
-the single tail overwrite, then the iteration reports success.**
+the single HEAD overwrite, then the tick reports success.**
 
 - **Drain (`upload.rs`)** — PUT every `segments/<seg>` for the tick,
-  then overwrite the tail to include them. Crash before the tail PUT:
-  segments exist with no tail entry — simply not consumed (a
+  then overwrite HEAD to include them. Crash before the HEAD PUT:
+  segments exist with no HEAD entry — simply not consumed (a
   reclaimable space leak, never a correctness loss; an un-indexed
   segment cannot corrupt a read).
-- **GC** — PUT `segments/<output>`, then the same tick's tail PUT adds
+- **GC** — PUT `segments/<output>`, then the same tick's HEAD PUT adds
   `Added{output}` and `Superseded{input, output, since}`. Output
   segment is durable before any reader can see the `Superseded` that
   depends on it.
-- **Reap** — DELETE the superseded input objects, then the tail PUT
+- **Reap** — DELETE the superseded input objects, then the HEAD PUT
   drops them / records `Tombstoned`. Crash after DELETE, before the
-  tail PUT: object gone but tail still lists it — the reader gets a
+  HEAD PUT: object gone but HEAD still lists it — the reader gets a
   404 it already tolerates, never a skipped-live segment.
 
-The forbidden direction — the tail asserting a segment is live with no
+The forbidden direction — HEAD asserting a segment is live with no
 object behind it on a path that matters — cannot arise: objects are
-always durable before the tail naming them, and the only
-object-without-tail and tail-without-object windows are both
-404-tolerant or benign-leak by construction. Because one iteration's
-drain/GC/reap are sequential and collapse into one tail PUT, there is
+always durable before HEAD names them, and the only
+object-without-HEAD and HEAD-without-object windows are both
+404-tolerant or benign-leak by construction. Because one tick's
+drain/GC/reap are sequential and collapse into one HEAD PUT, there is
 no intra-host ordering between writers to reason about.
 
 ## Truncation
 
 Truncation is trivial because the writer is also the sealer. When the
 tick loop seals a new snapshot it writes the manifest, bumps `LATEST`
-(P2), and — in the same sequential iteration — **overwrites the tail
+(P2), and — in the same sequential tick — **overwrites HEAD
 to empty**. The new manifest's `segment_ulids` already absorbs every
 live segment (the post-previous-snapshot drain and all completed GC),
-so the emptied tail plus the new anchor still computes the identical
+so the emptied HEAD plus the new anchor still computes the identical
 `live` set. No lazy reclamation, no compaction heuristic, no
 cross-task coordination: a single writer resets a single object as
 part of the seal it is already performing.
 
-A reader that races the seal (reads old `LATEST` + new empty tail, or
-new `LATEST` + old tail) still computes correct `live`: the manifest
-set is the arbiter and the tail is a pure delta over whichever anchor
+A reader that races the seal (reads old `LATEST` + new empty HEAD, or
+new `LATEST` + old HEAD) still computes correct `live`: the manifest
+set is the arbiter and HEAD is a pure delta over whichever anchor
 the reader resolved. The two are never required to be mutually
 consistent at an instant.
 
@@ -306,14 +330,14 @@ The rebuild is small and anchor-bounded: an elevated, offline,
 privileged LIST of `by_id/<vol>/segments/` **restricted to objects not
 in the latest manifest**, reconstructing the delta. The invariant the
 proptest asserts after every op (including a crash injected between
-the segment object ops and the tail PUT):
+the segment object ops and the HEAD PUT):
 
-> `live(manifest, tail)` ≡ `live(manifest, rebuilt-tail-from-LIST)`
+> `live(manifest, HEAD)` ≡ `live(manifest, rebuilt-HEAD-from-LIST)`
 
 Crash injection is expected to produce only the benign one-directional
 divergence above (un-indexed object / tolerated 404), never a live-set
 difference. This is `proptest-guardian` scope: the existing simulation
-already drives drain/GC/reap; it is extended so the *tail object* —
+already drives drain/GC/reap; it is extended so the *HEAD object* —
 not a LIST — is the queried set, with the reap step now inside the
 tick loop.
 
@@ -324,12 +348,12 @@ Removing it from the runtime does not remove the need:
 
 - The **manifest spine has no reconcile to add** — it is signed and
   durable on its own (P1/P2, `design-volume-event-log.md`).
-- The **tail is authoritative for the runtime**; readers trust it.
+- **HEAD is authoritative for the runtime**; readers trust it.
   Bounded one-directional divergence is by construction (above), and a
-  lost tail self-heals: the owning tick loop rewrites it whole next
-  iteration from local `index/` + GC/reap state.
+  lost HEAD self-heals: the owning tick loop rewrites it whole on its
+  next active tick from local `index/` + GC/reap state.
 - **Orphan reclamation** (un-indexed objects from a crash between the
-  segment PUT and the tail PUT) is an *explicit operator maintenance
+  segment PUT and the HEAD PUT) is an *explicit operator maintenance
   pass* that may use a privileged LIST under a separate elevated
   credential — deliberately not the coordinator runtime and not the
   exposed surface. Runtime stays LIST-free; repair is explicit and
@@ -340,26 +364,26 @@ Removing it from the runtime does not remove the need:
 
 | Site | Today | After |
 |---|---|---|
-| `prefetch.rs:442` (`pull_indexes_via_list`) | LIST `segments/` | manifest ∪ tail |
-| `prefetch.rs:643` (`list_supersessions`) | LIST `retention/` | `Superseded` entries in tail |
-| `fork.rs:670` | LIST `segments/` to verify pins present | manifest ∪ tail membership check |
-| `recovery.rs:165` (force-release synthesis) | LIST `segments/` to re-sign | manifest ∪ tail; synthesised manifest absorbs the tail |
-| `reaper.rs:80` | LIST `retention/`, separate task | `Superseded` entries in tail; reap step folded into the per-volume tick loop |
+| `prefetch.rs:442` (`pull_indexes_via_list`) | LIST `segments/` | manifest ∪ HEAD |
+| `prefetch.rs:643` (`list_supersessions`) | LIST `retention/` | `Superseded` entries in HEAD |
+| `fork.rs:670` | LIST `segments/` to verify pins present | manifest ∪ HEAD membership check |
+| `recovery.rs:165` (force-release synthesis) | LIST `segments/` to re-sign | manifest ∪ HEAD; synthesised manifest absorbs HEAD |
+| `reaper.rs:80` | LIST `retention/`, separate task | `Superseded` entries in HEAD; reap step folded into the per-volume tick loop |
 
 `pull_indexes_via_list` and `list_supersessions` collapse into one
-manifest-anchored tail GET; `force_snapshot_now`'s "synthesise from
+manifest-anchored HEAD GET; `force_snapshot_now`'s "synthesise from
 whatever is in S3 including segments past the latest snapshot" becomes
-"latest manifest ∪ tail", and the synthesised handoff manifest it
-writes absorbs the tail by the same truncation rule as any seal. The
+"latest manifest ∪ HEAD", and the synthesised handoff manifest it
+writes absorbs HEAD by the same truncation rule as any seal. The
 coordinator-wide reaper task is removed; `reap_volume` becomes a
 gated step in `tasks.rs`'s per-volume loop.
 
 ## Open questions
 
-- **Same-epoch reap without a tail read.** In-epoch the reap step
-  needs no tail GET — it has the `Superseded`/`since` state it wrote
+- **Same-epoch reap without a HEAD read.** In-epoch the reap step
+  needs no HEAD GET — it has the `Superseded`/`since` state it wrote
   this iteration and local `index/`. Only post-handoff must it read a
-  prior owner's tail. Whether to special-case the same-epoch path or
-  keep one uniform "read tail" path is an implementation call;
+  prior owner's HEAD. Whether to special-case the same-epoch path or
+  keep one uniform "read HEAD" path is an implementation call;
   correctness is identical (the durability-ordering delete gate is
   unchanged).
