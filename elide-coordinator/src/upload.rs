@@ -86,7 +86,7 @@ fn put_opts_with_type(content_type: &'static str) -> PutOptions {
 /// `NotImplemented` for attribute options (as `LocalFileSystem` does —
 /// tests hit this path), retry without attributes. Production S3 always
 /// uses the typed path.
-async fn put_with_content_type(
+pub(crate) async fn put_with_content_type(
     store: &Arc<dyn ObjectStore>,
     key: &StorePath,
     payload: Bytes,
