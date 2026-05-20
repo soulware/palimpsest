@@ -344,19 +344,54 @@ specification** and the incremental tick-loop updates must
 proptest model, not by convention.
 
 The rebuild is small and anchor-bounded: an elevated, offline,
-privileged LIST of `by_id/<vol>/segments/` **restricted to objects not
-in the latest manifest**, reconstructing the delta. The invariant the
-proptest asserts after every op (including a crash injected between
-the segment object ops and the HEAD PUT):
+privileged LIST of `by_id/<vol>/segments/` reconstructing the delta
+over the latest manifest. It synthesises:
 
-> `live(manifest, HEAD)` ≡ `live(manifest, rebuilt-HEAD-from-LIST)`
+- `added` — every S3 segment not named by the manifest (the
+  post-snapshot drain + GC outputs);
+- `superseded` — for each S3 segment that carries a non-empty
+  `inputs` table in its signed header (i.e. it is a GC output), one
+  edge per consumed input (the *authority* for the edge, per
+  *Entry kinds*);
+- `tombstoned` — every *manifest* segment that is **absent from S3**.
+  The manifest only ever lists live-at-seal segments, so a manifest
+  segment missing from S3 was definitively reaped. This signal is
+  load-bearing for chains of supersessions where intermediate GC
+  outputs get themselves reaped: by the time `X → Y → Z` has had both
+  `X` and `Y` reaped, only `Z` survives, and `Z.inputs` mentions `Y`,
+  not `X`. The manifest-absence rule recovers the tombstone for `X`
+  that the inputs-table chain alone cannot.
 
-Crash injection is expected to produce only the benign one-directional
-divergence above (un-indexed object / tolerated 404), never a live-set
-difference. This is `proptest-guardian` scope: the existing simulation
-already drives drain/GC/reap; it is extended so the *HEAD object* —
-not a LIST — is the queried set, with the reap step now inside the
-tick loop.
+The proptest invariant the rebuild supports is **one-directional**:
+
+> `live(manifest, HEAD)` ⊆ `live(manifest, rebuilt-HEAD-from-LIST)`
+
+i.e. HEAD never claims a segment is live that the rebuild cannot
+also see. Strict equality does **not** hold under two legitimate
+operational patterns, both of which leave the rebuild as a safe
+superset:
+
+- **Crash between segment PUT and HEAD PUT.** S3 has the object;
+  HEAD doesn't. Rebuild sees it; actual HEAD doesn't. Reader using
+  actual HEAD doesn't fetch the orphan (harmless); operator
+  reclamation handles it eventually.
+- **Pre-seal orphan.** A segment superseded by GC but not yet
+  reaped when a seal lands: the seal truncates HEAD, the manifest
+  records only post-supersession live segments, and any subsequent
+  reap pass operates on the *new* HEAD which never knew about the
+  pre-seal supersession. The orphan input lingers in S3 indefinitely,
+  visible only to the privileged orphan-reclamation pass (next
+  section). The chain back to it (via the GC output's `inputs`
+  header) is also lost once that output is itself reaped.
+
+Both divergences are exactly the kind *Reconcile and orphan
+reclamation* is for. The dangerous direction — actual claims live
+that the rebuild cannot see — never arises by construction, and the
+proptest enforces this.
+
+This is `proptest-guardian` scope. The check is a standalone proptest
+(`tests/segment_head_proptest.rs`) over Drain/Gc/Reap/Seal sequences,
+plus deterministic crash-before-HEAD-PUT scenarios for each op kind.
 
 ## Reconcile and orphan reclamation
 

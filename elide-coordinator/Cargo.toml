@@ -73,3 +73,7 @@ tempfile    = "3"
 [[test]]
 name = "gc_proptest"
 required-features = ["proptest"]
+
+[[test]]
+name = "segment_head_proptest"
+required-features = ["proptest"]

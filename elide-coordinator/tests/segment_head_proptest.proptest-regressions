@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1c4c7b8c8f5384270d8840d98948563742c9e3a784f35dffdfe414ce84eb61b6 # shrinks to ops = [Drain { count: 1 }, Seal, Gc { input_count: 1 }, Gc { input_count: 1 }, Reap]
