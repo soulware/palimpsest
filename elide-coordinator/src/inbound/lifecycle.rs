@@ -1584,7 +1584,12 @@ mod tests {
     }
 
     /// Build a single-entry signed segment via the canonical writer and
-    /// upload it under `by_id/<vol_ulid>/segments/<seg_ulid>`.
+    /// upload it under the production `upload::segment_key` (date-
+    /// sharded), then mark it `Added` in HEAD. HEAD-driven recovery
+    /// (`recovery::list_and_verify_segments`) reads HEAD to discover
+    /// segments and uses `upload::segment_key` to build the GET key,
+    /// so test fixtures must mirror both production conventions to
+    /// be reachable.
     async fn upload_signed_segment(
         store: &Arc<dyn ObjectStore>,
         vol_ulid: ulid::Ulid,
@@ -1604,8 +1609,29 @@ mod tests {
         )];
         write_segment(&path, &mut entries, signer).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let key = StorePath::from(format!("by_id/{vol_ulid}/segments/{seg_ulid}"));
+        let key = elide_coordinator::upload::segment_key(&vol_ulid.to_string(), seg_ulid);
         store.put(&key, PutPayload::from(bytes)).await.unwrap();
+        seed_head_added(store, vol_ulid, &[seg_ulid]).await;
+    }
+
+    /// Add `segs` to the volume's HEAD `Added` set, merging with any
+    /// existing entries. Test fixtures that publish segments to S3
+    /// directly need this so HEAD-driven enumeration (the recovery
+    /// path under test) finds them.
+    async fn seed_head_added(
+        store: &Arc<dyn ObjectStore>,
+        vol_ulid: ulid::Ulid,
+        segs: &[ulid::Ulid],
+    ) {
+        let mut head = elide_coordinator::segment_head::read_head(store, vol_ulid)
+            .await
+            .unwrap();
+        for s in segs {
+            head.added.insert(*s);
+        }
+        elide_coordinator::segment_head::put_head(store, vol_ulid, &head)
+            .await
+            .unwrap();
     }
 
     /// Fixture: a name in `Live` state pointing at a dead fork that has
@@ -1787,8 +1813,14 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         // Header is 100 bytes; first index entry starts at offset 100.
         bytes[104] ^= 0xff;
-        let bad_key = StorePath::from(format!("by_id/{dead_vol}/segments/{bad_id}"));
+        let bad_key = elide_coordinator::upload::segment_key(&dead_vol.to_string(), bad_id);
         store.put(&bad_key, PutPayload::from(bytes)).await.unwrap();
+        // HEAD must list the tampered segment too — recovery enumerates
+        // through HEAD and verifies each. Without this entry, the
+        // resolver wouldn't even attempt to fetch + verify `bad_id`,
+        // so the "tampered segment is dropped" assertion would pass
+        // vacuously.
+        seed_head_added(&store, dead_vol, &[bad_id]).await;
 
         let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
         rec.coordinator_id = Some("dead-owner".into());
