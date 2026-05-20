@@ -27,15 +27,6 @@
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
       }
-    },
-    {
-      "Sid": "BucketEnumeration",
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::{{tenant.bucket}}"],
-      "Condition": {
-        "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
-      }
     }
   ]
 }

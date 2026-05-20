@@ -50,11 +50,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures::StreamExt;
 use humantime_serde::re::humantime;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::local::LocalFileSystem;
-use object_store::path::Path as StorePath;
 use object_store::{ClientOptions, ObjectStore};
 use serde::Deserialize;
 
@@ -264,19 +262,17 @@ impl StoreSection {
         }
     }
 
-    /// Verify that the store is reachable with the configured credentials.
-    /// Fails fast at startup so operators see "bad credentials" once rather
-    /// than as a spinning retry in every per-volume task.
+    /// Validate startup-time inputs that must be present before any
+    /// object-store I/O. For S3 stores, bails immediately if
+    /// `AWS_ACCESS_KEY_ID` is unset — without that, the object_store
+    /// client falls back to the EC2 IMDS credential provider and spends
+    /// ~11s per call on retries.
     ///
-    /// For S3 stores, bails immediately if `AWS_ACCESS_KEY_ID` is unset —
-    /// without that, the object_store client falls back to the EC2 IMDS
-    /// credential provider and spends ~11s per call on retries. Then issues
-    /// a single `list` request against the configured bucket to surface
-    /// auth/permission errors (e.g. 403) with clean context.
-    ///
-    /// For local stores, issues the same `list` request as a minimal
-    /// readability check on the store root.
-    pub async fn probe(&self, store: &dyn ObjectStore) -> Result<()> {
+    /// Reachability + auth are proven by the subsequent
+    /// `portable::probe_capabilities` call (PUT + conditional PUT +
+    /// DELETE on a per-coordinator probe key); no separate read probe
+    /// is needed.
+    pub fn precheck_env(&self) -> Result<()> {
         if self.bucket.is_some() && std::env::var_os("AWS_ACCESS_KEY_ID").is_none() {
             bail!(
                 "object store configured for S3 (bucket={}) but AWS_ACCESS_KEY_ID \
@@ -285,14 +281,7 @@ impl StoreSection {
                 self.bucket.as_deref().unwrap_or("?"),
             );
         }
-        let prefix = StorePath::from("by_id/");
-        let mut stream = store.list(Some(&prefix));
-        match stream.next().await {
-            None | Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => {
-                Err(anyhow::Error::new(e).context(format!("probing store ({})", self.describe())))
-            }
-        }
+        Ok(())
     }
 
     /// Build the S3 store with an explicitly-supplied access key pair,
